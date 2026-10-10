@@ -69,7 +69,7 @@ impl Linux {
                 Ok(count as u64)
             }
             FdKind::Stdin => Err(Errno(9)),
-            FdKind::Node(_) | FdKind::PipeRead | FdKind::PipeWrite => {
+            FdKind::Node(_) | FdKind::PipeRead | FdKind::PipeWrite | FdKind::Socket => {
                 Ok(self.vfs.write(fd, bytes)? as u64)
             }
             FdKind::Terminal => Err(Errno(25)),
@@ -253,6 +253,7 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            198..=212 | 242 => self.network_syscall(number, a, memory),
             37 => {
                 if a[4] & !0x400 != 0 {
                     return Err(Errno(22));
@@ -459,8 +460,11 @@ impl Linux {
                 }
             }
             29 => {
-                self.vfs.fd_kind(a[0] as u32)?;
-                Err(Errno(25))
+                if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
+                    self.network_ioctl(a, memory)
+                } else {
+                    Err(Errno(25))
+                }
             }
             48 => {
                 if a[2] & !7 != 0 {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 mod namespace;
+mod network;
 mod storage;
 #[cfg(test)]
 mod storage_tests;
@@ -11,6 +12,7 @@ use std::{
     rc::{Rc, Weak},
 };
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
+pub use trames_net::{NetworkMode, Socket as NetSocket};
 pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
@@ -40,6 +42,7 @@ pub enum FdKind {
     PipeRead,
     PipeWrite,
     Terminal,
+    Socket,
 }
 struct Pipe {
     bytes: VecDeque<u8>,
@@ -56,6 +59,7 @@ struct OpenDescription {
     position: u64,
     node: Option<Rc<RefCell<Node>>>,
     pipe: Option<Rc<PipeEnd>>,
+    socket: Option<Rc<NetSocket>>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -85,6 +89,7 @@ struct Filesystem {
 }
 #[derive(Clone)]
 pub struct Vfs {
+    network: trames_net::Network,
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
     cwd_node: Option<Rc<RefCell<Node>>>,
@@ -93,6 +98,7 @@ pub struct Vfs {
 impl Default for Vfs {
     fn default() -> Self {
         let mut v = Self {
+            network: trames_net::Network::default(),
             fs: Rc::new(RefCell::new(Filesystem {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -126,6 +132,7 @@ impl Default for Vfs {
                         position: 0,
                         node: None,
                         pipe: None,
+                        socket: None,
                     })),
                     cloexec: false,
                 },
@@ -155,6 +162,9 @@ impl Vfs {
             return 32;
         };
         let o = d.open.borrow();
+        if let Some(socket) = &o.socket {
+            return socket.poll(events).unwrap_or(8);
+        }
         let mut ready = events & 5;
         if let Some(end) = &o.pipe {
             let p = end.pipe.borrow();
@@ -188,6 +198,7 @@ impl Vfs {
                         position: 0,
                         node: None,
                         pipe: None,
+                        socket: None,
                     })),
                     cloexec: false,
                 },
@@ -589,6 +600,7 @@ impl Vfs {
                     position: 0,
                     node: Some(node),
                     pipe: None,
+                    socket: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -691,6 +703,7 @@ impl Vfs {
                         position: 0,
                         node: None,
                         pipe: Some(end),
+                        socket: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -702,6 +715,12 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(socket) = &o.socket {
+            return socket
+                .recv(count, 0)
+                .map(|r| r.data)
+                .map_err(|e| Errno(e.0));
         }
         if count == 0 {
             return Ok(Vec::new());
@@ -738,6 +757,9 @@ impl Vfs {
         let o = self.descriptor(fd)?.open.borrow();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(socket) = &o.socket {
+            return socket.send(bytes, 0, None).map_err(|e| Errno(e.0));
         }
         if let Some(end) = &o.pipe {
             if end.read {
@@ -923,7 +945,13 @@ impl Vfs {
         }
         Self::stat_node(&Node {
             content: Content::Null,
-            mode: if o.pipe.is_some() { 0o10600 } else { 0o20666 },
+            mode: if o.socket.is_some() {
+                0o140600
+            } else if o.pipe.is_some() {
+                0o10600
+            } else {
+                0o20666
+            },
             inode: fd as u64 + 0x10000,
             links: 1,
             times: [storage::Timestamp::default(); 3],

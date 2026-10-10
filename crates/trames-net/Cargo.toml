@@ -1,0 +1,13 @@
+[package]
+name = "trames-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["poll"] }
+socket2 = { version = "=0.6.1", features = ["all"] }
+
+[lints]
+workspace = true
