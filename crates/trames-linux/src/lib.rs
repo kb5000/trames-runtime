@@ -3,6 +3,8 @@
 use std::io;
 use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
+mod state;
+pub use state::Linux;
 
 pub const SYS_WRITE: u64 = 64;
 pub const SYS_EXIT: u64 = 93;
@@ -17,14 +19,27 @@ pub enum OutputFd {
 
 pub trait GuestOutput {
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize>;
+    fn read_stdin(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
 }
 
 #[derive(Default)]
 pub struct CapturedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdin: Vec<u8>,
+    input_position: usize,
 }
 impl GuestOutput for CapturedOutput {
+    fn read_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.input_position = self.input_position.min(self.stdin.len());
+        let count = bytes.len().min(self.stdin.len() - self.input_position);
+        bytes[..count]
+            .copy_from_slice(&self.stdin[self.input_position..self.input_position + count]);
+        self.input_position += count;
+        Ok(count)
+    }
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize> {
         match fd {
             OutputFd::Stdout => &mut self.stdout,

@@ -70,6 +70,7 @@ struct Page {
 pub struct Memory {
     pages: BTreeMap<u64, Page>,
     limit: usize,
+    revision: u64,
 }
 
 impl Default for Memory {
@@ -83,10 +84,100 @@ impl Memory {
         Self {
             pages: BTreeMap::new(),
             limit,
+            revision: 0,
         }
     }
     pub fn mapped_bytes(&self) -> usize {
         self.pages.len() * PAGE_SIZE as usize
+    }
+
+    pub fn highest_mapped_end(&self) -> u64 {
+        self.pages
+            .last_key_value()
+            .map_or(0, |(&address, _)| address + PAGE_SIZE)
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn is_free(&self, address: u64, len: u64) -> bool {
+        Self::mapping_end(address, len)
+            .is_ok_and(|end| self.pages.range(address..end).next().is_none())
+    }
+    pub fn find_free(&self, start: u64, len: u64) -> Option<u64> {
+        let mut candidate = start.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        Self::mapping_end(candidate, len).ok()?;
+        for (&base, _) in self.pages.range(candidate..) {
+            if base >= candidate.checked_add(len)? {
+                return Some(candidate);
+            }
+            if base >= candidate {
+                candidate = base + PAGE_SIZE;
+            }
+        }
+        Self::mapping_end(candidate, len).ok().map(|_| candidate)
+    }
+    /// Atomic anonymous MAP_FIXED: account for replaced pages before changing data.
+    pub fn map_fixed(
+        &mut self,
+        address: u64,
+        len: u64,
+        permissions: Permissions,
+    ) -> Result<(), MemoryError> {
+        let end = Self::mapping_end(address, len)?;
+        let replaced = self.pages.range(address..end).count() * PAGE_SIZE as usize;
+        let size = usize::try_from(len).map_err(|_| MemoryError::Limit)?;
+        if self
+            .mapped_bytes()
+            .saturating_sub(replaced)
+            .checked_add(size)
+            .is_none_or(|n| n > self.limit)
+        {
+            return Err(MemoryError::Limit);
+        }
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            self.pages.insert(
+                base,
+                Page {
+                    bytes: Box::new([0; PAGE_SIZE as usize]),
+                    permissions,
+                },
+            );
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Linux munmap permits holes; validate the range before removing mapped pages.
+    pub fn unmap(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
+        let end = Self::mapping_end(address, len)?;
+        let keys: Vec<_> = self
+            .pages
+            .range(address..end)
+            .map(|(&base, _)| base)
+            .collect();
+        for base in keys {
+            self.pages.remove(&base);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Read a bounded NUL-terminated byte string, without UTF-8 assumptions.
+    pub fn read_c_string(&self, address: u64, limit: usize) -> Result<Vec<u8>, MemoryError> {
+        let mut bytes = Vec::new();
+        for index in 0..limit {
+            let current = address
+                .checked_add(index as u64)
+                .ok_or(MemoryError::InvalidRange)?;
+            let mut byte = [0];
+            self.read(current, &mut byte)?;
+            if byte[0] == 0 {
+                return Ok(bytes);
+            }
+            bytes.push(byte[0]);
+        }
+        Err(MemoryError::Limit)
     }
 
     fn end(address: u64, len: u64) -> Result<u64, MemoryError> {
@@ -133,6 +224,7 @@ impl Memory {
                 },
             );
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -154,6 +246,7 @@ impl Memory {
                 .expect("validated page")
                 .permissions = permissions;
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -198,6 +291,9 @@ impl Memory {
 
     pub fn write(&mut self, mut address: u64, mut input: &[u8]) -> Result<(), MemoryError> {
         self.check(address, input.len(), Access::Write)?;
+        if !input.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         while !input.is_empty() {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
@@ -278,5 +374,57 @@ mod tests {
         assert_eq!(m.read_u64(0x1ffc).unwrap(), 0);
         m.write(0x1ffc, &42u64.to_le_bytes()).unwrap();
         assert_eq!(m.read_u64(0x1ffc).unwrap(), 42);
+    }
+
+    #[test]
+    fn unmap_holes_and_remapping_zeroes_old_data() {
+        let mut m = Memory::new(8192);
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write(0x1000, b"old").unwrap();
+        assert!(!m.is_free(0x1000, PAGE_SIZE));
+        assert!(m.unmap(0x1001, PAGE_SIZE).is_err());
+        assert_eq!(m.mapped_bytes(), 4096);
+        m.unmap(0x1000, PAGE_SIZE * 2).unwrap();
+        assert!(m.is_free(0x1000, PAGE_SIZE));
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        assert_eq!(m.read_u64(0x1000).unwrap(), 0);
+    }
+
+    #[test]
+    fn c_strings_obey_bounds_and_accept_non_utf8() {
+        let mut m = Memory::default();
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write(0x1ffe, &[0xff, 0]).unwrap();
+        assert_eq!(m.read_c_string(0x1ffe, 2).unwrap(), [0xff]);
+        assert_eq!(m.read_c_string(0x1ffe, 1), Err(MemoryError::Limit));
+        m.write(0x1fff, &[1]).unwrap();
+        assert!(m.read_c_string(0x1ffe, 4).is_err());
+    }
+
+    #[test]
+    fn fixed_mapping_failure_preserves_existing_bytes() {
+        let mut m = Memory::new(4096);
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write(0x1000, b"data").unwrap();
+        assert_eq!(
+            m.map_fixed(0x1000, PAGE_SIZE * 2, Permissions::R),
+            Err(MemoryError::Limit)
+        );
+        let mut bytes = [0; 4];
+        m.read(0x1000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"data");
+        m.map_fixed(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        assert_eq!(m.read_u64(0x1000).unwrap(), 0);
+        assert!(m.write(0x1000, b"x").is_err());
+    }
+
+    #[test]
+    fn free_range_search_skips_only_conflicting_pages() {
+        let mut m = Memory::default();
+        m.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.map(0x5000, PAGE_SIZE, Permissions::RW).unwrap();
+        assert_eq!(m.find_free(0x1000, PAGE_SIZE), Some(0x1000));
+        assert_eq!(m.find_free(0x1000, PAGE_SIZE * 2), Some(0x3000));
+        assert_eq!(m.find_free(ADDRESS_LIMIT - PAGE_SIZE, PAGE_SIZE * 2), None);
     }
 }

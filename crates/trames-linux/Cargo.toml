@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 trames-cpu = { path = "../trames-cpu" }
 trames-memory = { path = "../trames-memory" }
+trames-vfs = { path = "../trames-vfs" }
 
 [lints]
 workspace = true

@@ -9,6 +9,7 @@ dependencies = [
  "trames-core",
  "trames-elf",
  "trames-linux",
+ "trames-vfs",
 ]
 
 [[package]]
@@ -41,8 +42,13 @@ version = "0.1.0"
 dependencies = [
  "trames-cpu",
  "trames-memory",
+ "trames-vfs",
 ]
 
 [[package]]
 name = "trames-memory"
+version = "0.1.0"
+
+[[package]]
+name = "trames-vfs"
 version = "0.1.0"
