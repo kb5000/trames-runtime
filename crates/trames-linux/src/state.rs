@@ -5,6 +5,7 @@ use trames_memory::{Access, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAG
 use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH};
 
 type Result<T> = std::result::Result<T, Errno>;
+#[derive(Clone)]
 pub struct Linux {
     pub vfs: Vfs,
     pub trace: bool,
@@ -15,6 +16,14 @@ pub struct Linux {
 }
 
 impl Linux {
+    pub fn fork_tid(&mut self, address: u64) {
+        self.clear_child_tid = address;
+    }
+    pub fn exit_tid(&mut self, memory: &mut Memory) {
+        if self.clear_child_tid != 0 {
+            let _ = memory.write(self.clear_child_tid, &[0; 4]);
+        }
+    }
     pub fn new(brk_base: u64) -> Self {
         Self {
             vfs: Vfs::default(),
@@ -25,7 +34,7 @@ impl Linux {
             clear_child_tid: 0,
         }
     }
-    fn path(memory: &Memory, address: u64) -> Result<Vec<u8>> {
+    pub fn path(memory: &Memory, address: u64) -> Result<Vec<u8>> {
         memory.read_c_string(address, MAX_PATH).map_err(|e| {
             if e == MemoryError::Limit {
                 Errno(36)
@@ -34,7 +43,7 @@ impl Linux {
             }
         })
     }
-    fn check(memory: &Memory, address: u64, count: usize, access: Access) -> Result<()> {
+    pub fn check(memory: &Memory, address: u64, count: usize, access: Access) -> Result<()> {
         if address >= ADDRESS_LIMIT {
             return Err(Errno(14));
         }
@@ -43,7 +52,7 @@ impl Linux {
     fn write_bytes(&mut self, fd: u32, bytes: &[u8], io: &mut impl GuestOutput) -> Result<u64> {
         match self.vfs.fd_kind(fd)? {
             FdKind::Stdout | FdKind::Stderr => {
-                let stream = if self.vfs.fd_kind(fd)? == &FdKind::Stdout {
+                let stream = if self.vfs.fd_kind(fd)? == FdKind::Stdout {
                     OutputFd::Stdout
                 } else {
                     OutputFd::Stderr
@@ -60,7 +69,10 @@ impl Linux {
                 Ok(count as u64)
             }
             FdKind::Stdin => Err(Errno(9)),
-            FdKind::Node(_) => Ok(self.vfs.write(fd, bytes)? as u64),
+            FdKind::Node(_) | FdKind::PipeRead | FdKind::PipeWrite => {
+                Ok(self.vfs.write(fd, bytes)? as u64)
+            }
+            FdKind::Terminal => Err(Errno(25)),
         }
     }
     fn read(&mut self, a: [u64; 6], memory: &mut Memory, io: &mut impl GuestOutput) -> Result<u64> {
@@ -75,7 +87,7 @@ impl Linux {
             let mut bytes = vec![0; count];
             if count != 0 {
                 let n = io
-                    .read_stdin(&mut bytes)
+                    .poll_stdin(&mut bytes)
                     .map_err(|e| Errno(io_errno(e) as u32))?;
                 if n > count {
                     return Err(Errno(5));
@@ -241,6 +253,23 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),
+            24 => Ok(self.vfs.dup3(a[0] as u32, a[1] as u32, a[2] as u32)? as u64),
+            59 => {
+                Self::check(memory, a[0], 8, Access::Write)?;
+                let fds = self.vfs.pipe(a[1] as u32)?;
+                let bytes: Vec<_> = fds.into_iter().flat_map(u32::to_le_bytes).collect();
+                memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            35 => {
+                if a[2] & !0x200 != 0 {
+                    return Err(Errno(22));
+                }
+                let path = Self::path(memory, a[1])?;
+                self.vfs.unlink_at(a[0] as i32, &path, a[2] != 0)?;
+                Ok(0)
+            }
             63 => self.read(a, memory, io),
             64 => self.write(a, memory, io),
             66 => self.writev(a, memory, io),
@@ -308,6 +337,7 @@ impl Linux {
             25 => {
                 let flags = self.vfs.flags(a[0] as u32)?;
                 match a[1] {
+                    0 | 1030 => Ok(self.vfs.dup(a[0] as u32, a[2] as u32, a[1] == 1030)? as u64),
                     1 => Ok(if flags & 0x80000 != 0 { 1 } else { 0 }),
                     2 => {
                         self.vfs.set_cloexec(a[0] as u32, a[2] & 1 != 0)?;

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
@@ -62,11 +62,13 @@ impl fmt::Display for MemoryError {
 }
 impl std::error::Error for MemoryError {}
 
+#[derive(Clone)]
 struct Page {
-    bytes: Box<[u8; PAGE_SIZE as usize]>,
+    bytes: Arc<[u8; PAGE_SIZE as usize]>,
     permissions: Permissions,
 }
 
+#[derive(Clone)]
 pub struct Memory {
     pages: BTreeMap<u64, Page>,
     limit: usize,
@@ -80,6 +82,13 @@ impl Default for Memory {
 }
 
 impl Memory {
+    pub fn set_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
+        if self.mapped_bytes() > limit {
+            return Err(MemoryError::Limit);
+        }
+        self.limit = limit;
+        Ok(())
+    }
     pub fn new(limit: usize) -> Self {
         Self {
             pages: BTreeMap::new(),
@@ -139,7 +148,7 @@ impl Memory {
             self.pages.insert(
                 base,
                 Page {
-                    bytes: Box::new([0; PAGE_SIZE as usize]),
+                    bytes: Arc::new([0; PAGE_SIZE as usize]),
                     permissions,
                 },
             );
@@ -219,7 +228,7 @@ impl Memory {
             self.pages.insert(
                 base,
                 Page {
-                    bytes: Box::new([0; PAGE_SIZE as usize]),
+                    bytes: Arc::new([0; PAGE_SIZE as usize]),
                     permissions,
                 },
             );
@@ -298,7 +307,8 @@ impl Memory {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = input.len().min(PAGE_SIZE as usize - offset);
-            self.pages.get_mut(&base).expect("validated page").bytes[offset..offset + len]
+            Arc::make_mut(&mut self.pages.get_mut(&base).expect("validated page").bytes)
+                [offset..offset + len]
                 .copy_from_slice(&input[..len]);
             address += len as u64;
             input = &input[len..];
@@ -426,5 +436,28 @@ mod tests {
         assert_eq!(m.find_free(0x1000, PAGE_SIZE), Some(0x1000));
         assert_eq!(m.find_free(0x1000, PAGE_SIZE * 2), Some(0x3000));
         assert_eq!(m.find_free(ADDRESS_LIMIT - PAGE_SIZE, PAGE_SIZE * 2), None);
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    #[test]
+    fn fork_copies_pages_on_write_and_keeps_protection_independent() {
+        let mut parent = Memory::default();
+        parent.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        parent.write(0x1fff, b"ab").unwrap();
+        let mut child = parent.clone();
+        child.write(0x1fff, b"XY").unwrap();
+        let mut bytes = [0; 2];
+        parent.read(0x1fff, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"ab");
+        child.read(0x1fff, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"XY");
+        child.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        assert!(parent.write(0x1000, b"z").is_ok());
+        assert!(child.write(0x1000, b"z").is_err());
+        child.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(parent.read(0x1000, &mut bytes).is_ok());
     }
 }

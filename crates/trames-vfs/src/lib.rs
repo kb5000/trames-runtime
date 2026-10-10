@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Bounded in-memory filesystem. No guest operation touches a host path.
-use std::{collections::BTreeMap, fmt};
-
+//! Shared virtual filesystem and open descriptions; guest paths never reach host IO.
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    rc::{Rc, Weak},
+};
 pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
 pub const MAX_FDS: u32 = 256;
+pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
-// Linux AArch64 differs from x86_64 for these open flags.
 pub const O_DIRECTORY: u32 = 0x4000;
 pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_LARGEFILE: u32 = 0x20000;
 pub const O_CLOEXEC: u32 = 0x80000;
-
+pub const O_NONBLOCK: u32 = 0x800;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Errno(pub u32);
 impl fmt::Display for Errno {
@@ -22,44 +26,71 @@ impl fmt::Display for Errno {
 }
 impl std::error::Error for Errno {}
 type Result<T> = std::result::Result<T, Errno>;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FdKind {
     Stdin,
     Stdout,
     Stderr,
     Node(Vec<u8>),
+    PipeRead,
+    PipeWrite,
+    Terminal,
 }
-struct Descriptor {
+struct Pipe {
+    bytes: VecDeque<u8>,
+    reader: Weak<PipeEnd>,
+    writer: Weak<PipeEnd>,
+}
+struct PipeEnd {
+    pipe: Rc<RefCell<Pipe>>,
+    read: bool,
+}
+struct OpenDescription {
     kind: FdKind,
     flags: u32,
     position: usize,
+    node: Option<Rc<RefCell<Node>>>,
+    pipe: Option<Rc<PipeEnd>>,
+}
+#[derive(Clone)]
+struct Descriptor {
+    open: Rc<RefCell<OpenDescription>>,
+    cloexec: bool,
 }
 enum Content {
     Directory,
     File(Vec<u8>),
     Null,
+    Terminal,
 }
 struct Node {
     content: Content,
     mode: u32,
     inode: u64,
+    links: u32,
 }
-
+struct Filesystem {
+    paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
+    inodes: Vec<Weak<RefCell<Node>>>,
+    next_inode: u64,
+}
+#[derive(Clone)]
 pub struct Vfs {
-    nodes: BTreeMap<Vec<u8>, Node>,
+    fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
     cwd: Vec<u8>,
-    next_inode: u64,
     pub umask: u32,
 }
 impl Default for Vfs {
     fn default() -> Self {
         let mut v = Self {
-            nodes: BTreeMap::new(),
+            fs: Rc::new(RefCell::new(Filesystem {
+                paths: BTreeMap::new(),
+                inodes: Vec::new(),
+                next_inode: 1,
+            })),
             fds: BTreeMap::new(),
             cwd: b"/".to_vec(),
-            next_inode: 1,
             umask: 0o022,
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
@@ -76,37 +107,113 @@ impl Default for Vfs {
             v.fds.insert(
                 fd,
                 Descriptor {
-                    kind,
-                    flags,
-                    position: 0,
+                    open: Rc::new(RefCell::new(OpenDescription {
+                        kind,
+                        flags,
+                        position: 0,
+                        node: None,
+                        pipe: None,
+                    })),
+                    cloexec: false,
                 },
             );
         }
         v
     }
 }
-
 impl Vfs {
-    fn insert(&mut self, path: Vec<u8>, content: Content, mode: u32) -> Result<()> {
-        if self.nodes.len() >= MAX_NODES {
-            return Err(Errno(28));
-        }
-        let inode = self.next_inode;
-        self.next_inode += 1;
-        self.nodes.insert(
-            path,
-            Node {
-                content,
-                mode,
-                inode,
-            },
-        );
+    pub fn import_executable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
+        self.import_file(path, bytes)?;
+        let canonical = self.resolve(AT_FDCWD, path)?;
+        self.node(&canonical)?.borrow_mut().mode |= 0o111;
         Ok(())
     }
+    fn check_parent_write(&self, path: &[u8]) -> Result<()> {
+        let end = path
+            .iter()
+            .rposition(|&b| b == b'/')
+            .ok_or(Errno(22))?
+            .max(1);
+        if self.node(&path[..end])?.borrow().mode & 0o300 != 0o300 {
+            return Err(Errno(13));
+        }
+        Ok(())
+    }
+    pub fn poll(&self, fd: u32, events: u16) -> u16 {
+        let Ok(d) = self.descriptor(fd) else {
+            return 32;
+        };
+        let o = d.open.borrow();
+        let mut ready = events & 5;
+        if let Some(end) = &o.pipe {
+            let p = end.pipe.borrow();
+            ready = 0;
+            if end.read {
+                if !p.bytes.is_empty() || p.writer.strong_count() == 0 {
+                    ready |= events & 1;
+                }
+                if p.writer.strong_count() == 0 {
+                    ready |= 16;
+                }
+            } else if p.reader.strong_count() == 0 {
+                ready |= 8;
+            } else if PIPE_CAPACITY - p.bytes.len() >= 4096 {
+                ready |= events & 4;
+            }
+        }
+        ready
+    }
+    pub fn enable_terminal(&mut self) -> Result<()> {
+        if self.node(b"/dev/tty").is_err() {
+            self.insert(b"/dev/tty".to_vec(), Content::Terminal, 0o20666)?;
+        }
+        for fd in 0..=2 {
+            self.fds.insert(
+                fd,
+                Descriptor {
+                    open: Rc::new(RefCell::new(OpenDescription {
+                        kind: FdKind::Terminal,
+                        flags: 2,
+                        position: 0,
+                        node: None,
+                        pipe: None,
+                    })),
+                    cloexec: false,
+                },
+            );
+        }
+        Ok(())
+    }
+    fn insert(&mut self, path: Vec<u8>, content: Content, mode: u32) -> Result<()> {
+        let mut fs = self.fs.borrow_mut();
+        fs.inodes.retain(|n| n.strong_count() != 0);
+        if fs.inodes.len() >= MAX_NODES {
+            return Err(Errno(28));
+        }
+        let node = Rc::new(RefCell::new(Node {
+            content,
+            mode,
+            inode: fs.next_inode,
+            links: 1,
+        }));
+        fs.next_inode += 1;
+        fs.inodes.push(Rc::downgrade(&node));
+        fs.paths.insert(path, node);
+        Ok(())
+    }
+    fn node(&self, path: &[u8]) -> Result<Rc<RefCell<Node>>> {
+        self.fs.borrow().paths.get(path).cloned().ok_or(Errno(2))
+    }
+    fn descriptor(&self, fd: u32) -> Result<&Descriptor> {
+        self.fds.get(&fd).ok_or(Errno(9))
+    }
     pub fn allocated_bytes(&self) -> usize {
-        self.nodes
-            .values()
-            .map(|n| match &n.content {
+        self.fs
+            .borrow()
+            .inodes
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|n| match &n.borrow().content {
                 Content::File(b) => b.len(),
                 _ => 0,
             })
@@ -115,24 +222,22 @@ impl Vfs {
     pub fn cwd(&self) -> &[u8] {
         &self.cwd
     }
-    pub fn fd_kind(&self, fd: u32) -> Result<&FdKind> {
-        Ok(&self.fds.get(&fd).ok_or(Errno(9))?.kind)
+    pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
+        Ok(self.descriptor(fd)?.open.borrow().kind.clone())
     }
     fn is_directory(&self, path: &[u8]) -> bool {
-        self.nodes
-            .get(path)
-            .is_some_and(|n| matches!(n.content, Content::Directory))
+        self.node(path)
+            .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
     }
-    fn base(&self, dirfd: i32) -> Result<&[u8]> {
+    fn base(&self, dirfd: i32) -> Result<Vec<u8>> {
         if dirfd == AT_FDCWD {
-            return Ok(&self.cwd);
+            return Ok(self.cwd.clone());
         }
         match self.fd_kind(dirfd as u32)? {
-            FdKind::Node(p) if self.is_directory(p) => Ok(p),
+            FdKind::Node(p) if self.is_directory(&p) => Ok(p),
             _ => Err(Errno(20)),
         }
     }
-    /// Resolve components as they are traversed: `file/..` is ENOTDIR, not root.
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
         if path.is_empty() {
             return Err(Errno(2));
@@ -143,56 +248,55 @@ impl Vfs {
         let mut current = if path[0] == b'/' {
             b"/".to_vec()
         } else {
-            self.base(dirfd)?.to_vec()
+            self.base(dirfd)?
         };
-        let components: Vec<_> = path
+        let parts: Vec<_> = path
             .split(|&b| b == b'/')
             .filter(|p| !p.is_empty())
             .collect();
-        for (index, component) in components.iter().enumerate() {
-            if !self.is_directory(&current) {
-                return Err(if self.nodes.contains_key(&current) {
-                    Errno(20)
-                } else {
-                    Errno(2)
-                });
+        for (i, part) in parts.iter().enumerate() {
+            let n = self.node(&current)?;
+            let n = n.borrow();
+            if !matches!(n.content, Content::Directory) {
+                return Err(Errno(20));
             }
-            if self.nodes[&current].mode & 0o100 == 0 {
+            if n.mode & 0o100 == 0 {
                 return Err(Errno(13));
             }
-            if *component == b"." {
+            if *part == b"." {
                 continue;
             }
-            if *component == b".." {
+            if *part == b".." {
                 if current != b"/" {
-                    current.truncate(current.iter().rposition(|&b| b == b'/').unwrap().max(1));
+                    current.truncate(
+                        current
+                            .iter()
+                            .rposition(|&b| b == b'/')
+                            .expect("absolute")
+                            .max(1),
+                    );
                 }
                 continue;
             }
-            if component.len() > 255 {
+            if part.len() > 255 {
                 return Err(Errno(36));
             }
             if current != b"/" {
                 current.push(b'/');
             }
-            current.extend_from_slice(component);
+            current.extend_from_slice(part);
             if current.len() >= MAX_PATH {
                 return Err(Errno(36));
             }
-            if index + 1 == components.len()
-                && path.last() == Some(&b'/')
-                && !self.is_directory(&current)
-            {
-                return Err(if self.nodes.contains_key(&current) {
-                    Errno(20)
-                } else {
-                    Errno(2)
-                });
+            if i + 1 == parts.len() && path.last() == Some(&b'/') {
+                let n = self.node(&current)?;
+                if !matches!(n.borrow().content, Content::Directory) {
+                    return Err(Errno(20));
+                }
             }
         }
         Ok(current)
     }
-    /// Explicit embedding API: import one file's bytes and create its virtual parents.
     pub fn import_file(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
         if !path.starts_with(b"/")
             || path.contains(&0)
@@ -220,22 +324,27 @@ impl Vfs {
         }
         let mut current = Vec::new();
         let mut parents = Vec::new();
-        for (index, part) in parts.iter().enumerate() {
+        for (i, part) in parts.iter().enumerate() {
             current.push(b'/');
             current.extend_from_slice(part);
-            if index + 1 == parts.len() {
-                if self.nodes.contains_key(&current) {
+            if i + 1 == parts.len() {
+                if self.node(&current).is_ok() {
                     return Err(Errno(17));
                 }
-            } else if !self.nodes.contains_key(&current) {
+            } else if self.node(&current).is_err() {
                 parents.push(current.clone());
             } else if !self.is_directory(&current) {
                 return Err(Errno(20));
             }
         }
-        if self
-            .nodes
-            .len()
+        let live = self
+            .fs
+            .borrow()
+            .inodes
+            .iter()
+            .filter(|n| n.strong_count() != 0)
+            .count();
+        if live
             .checked_add(parents.len() + 1)
             .is_none_or(|n| n > MAX_NODES)
         {
@@ -246,16 +355,82 @@ impl Vfs {
         }
         self.insert(current, Content::File(bytes), 0o100644)
     }
-    pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
-        let p = self.resolve(dirfd, path)?;
-        if self.nodes.contains_key(&p) {
+    /// Explicit embedding API: install an executable/hard link, without duplicating file data.
+    pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
+        let source = self.node(existing)?;
+        let dest = self.resolve(AT_FDCWD, alias)?;
+        if self.node(&dest).is_ok() {
             return Err(Errno(17));
         }
+        if !matches!(source.borrow().content, Content::File(_)) {
+            return Err(Errno(1));
+        }
+        {
+            let mut n = source.borrow_mut();
+            n.links += 1;
+            if executable {
+                n.mode |= 0o111;
+            }
+        }
+        self.fs.borrow_mut().paths.insert(dest, source);
+        Ok(())
+    }
+    pub fn executable(&self, path: &[u8]) -> Result<Vec<u8>> {
+        let p = self.resolve(AT_FDCWD, path)?;
+        let node = self.node(&p)?;
+        let n = node.borrow();
+        if n.mode & 0o100 == 0 {
+            return Err(Errno(13));
+        }
+        match &n.content {
+            Content::File(b) => Ok(b.clone()),
+            _ => Err(Errno(13)),
+        }
+    }
+    pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
+        let p = self.resolve(dirfd, path)?;
+        if self.node(&p).is_ok() {
+            return Err(Errno(17));
+        }
+        self.check_parent_write(&p)?;
         self.insert(
             p,
             Content::Directory,
             0o40000 | (mode & 0o777 & !self.umask),
         )
+    }
+    pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
+        let p = self.resolve(dirfd, path)?;
+        if p == b"/" {
+            return Err(Errno(16));
+        }
+        let node = self.node(&p)?;
+        let is_dir = matches!(node.borrow().content, Content::Directory);
+        if directory != is_dir {
+            return Err(Errno(if is_dir { 21 } else { 20 }));
+        }
+        self.check_parent_write(&p)?;
+        if is_dir {
+            let mut prefix = p.clone();
+            prefix.push(b'/');
+            if self
+                .fs
+                .borrow()
+                .paths
+                .keys()
+                .any(|n| n.starts_with(&prefix))
+            {
+                return Err(Errno(39));
+            }
+        }
+        node.borrow_mut().links -= 1;
+        self.fs.borrow_mut().paths.remove(&p);
+        Ok(())
+    }
+    fn available(&self, min: u32) -> Result<u32> {
+        (min..MAX_FDS)
+            .find(|n| !self.fds.contains_key(n))
+            .ok_or(Errno(24))
     }
     pub fn open_at(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<u32> {
         const ALLOWED: u32 = 3
@@ -269,60 +444,62 @@ impl Vfs {
             | O_NOFOLLOW
             | O_LARGEFILE
             | O_CLOEXEC;
-        if flags & !ALLOWED != 0 || flags & 3 == 3 {
+        if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
             return Err(Errno(22));
         }
-        if flags & 0x200 != 0 && flags & 3 == 0 {
-            return Err(Errno(22));
-        }
-        let fd = (0..MAX_FDS)
-            .find(|n| !self.fds.contains_key(n))
-            .ok_or(Errno(24))?;
+        let fd = self.available(0)?;
         let p = self.resolve(dirfd, path)?;
-        let existed = self.nodes.contains_key(&p);
+        let existed = self.node(&p).is_ok();
         if existed && flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
         }
         if !existed {
-            if flags & O_DIRECTORY != 0 {
+            if flags & O_DIRECTORY != 0 || flags & 0x40 == 0 {
                 return Err(Errno(2));
             }
-            if flags & 0x40 == 0 {
-                return Err(Errno(2));
-            }
+            self.check_parent_write(&p)?;
             self.insert(
                 p.clone(),
                 Content::File(Vec::new()),
                 0o100000 | (mode & 0o777 & !self.umask),
             )?;
         }
-        let node = self.nodes.get_mut(&p).expect("resolved node");
-        if matches!(node.content, Content::Directory) && flags & 3 != 0 {
-            return Err(Errno(21));
-        }
-        if flags & O_DIRECTORY != 0 && !matches!(node.content, Content::Directory) {
-            return Err(Errno(20));
-        }
-        if existed
-            && ((flags & 3 != 1 && node.mode & 0o400 == 0)
-                || (flags & 3 != 0 && node.mode & 0o200 == 0))
+        let node = self.node(&p)?;
         {
-            return Err(Errno(13));
-        }
-        if flags & 0x200 != 0 {
-            if flags & 3 == 0 {
-                return Err(Errno(22));
+            let mut n = node.borrow_mut();
+            if matches!(n.content, Content::Directory) && flags & 3 != 0 {
+                return Err(Errno(21));
             }
-            if let Content::File(b) = &mut node.content {
-                b.clear();
+            if flags & O_DIRECTORY != 0 && !matches!(n.content, Content::Directory) {
+                return Err(Errno(20));
+            }
+            if existed
+                && ((flags & 3 != 1 && n.mode & 0o400 == 0)
+                    || (flags & 3 != 0 && n.mode & 0o200 == 0))
+            {
+                return Err(Errno(13));
+            }
+            if flags & 0x200 != 0 {
+                if let Content::File(b) = &mut n.content {
+                    b.clear();
+                }
             }
         }
         self.fds.insert(
             fd,
             Descriptor {
-                kind: FdKind::Node(p),
-                flags,
-                position: 0,
+                open: Rc::new(RefCell::new(OpenDescription {
+                    kind: if matches!(node.borrow().content, Content::Terminal) {
+                        FdKind::Terminal
+                    } else {
+                        FdKind::Node(p)
+                    },
+                    flags: flags & !O_CLOEXEC,
+                    position: 0,
+                    node: Some(node),
+                    pipe: None,
+                })),
+                cloexec: flags & O_CLOEXEC != 0,
             },
         );
         Ok(fd)
@@ -330,72 +507,181 @@ impl Vfs {
     pub fn close(&mut self, fd: u32) -> Result<()> {
         self.fds.remove(&fd).map(|_| ()).ok_or(Errno(9))
     }
+    pub fn close_all(&mut self) {
+        self.fds.clear();
+    }
+    pub fn close_exec(&mut self) {
+        self.fds.retain(|_, d| !d.cloexec);
+    }
+    pub fn dup(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
+        let mut d = self.descriptor(old)?.clone();
+        if min >= MAX_FDS {
+            return Err(Errno(22));
+        }
+        let fd = self.available(min)?;
+        d.cloexec = cloexec;
+        self.fds.insert(fd, d);
+        Ok(fd)
+    }
+    pub fn dup3(&mut self, old: u32, new: u32, flags: u32) -> Result<u32> {
+        if old == new || flags & !O_CLOEXEC != 0 {
+            return Err(Errno(22));
+        }
+        if new >= MAX_FDS {
+            return Err(Errno(9));
+        }
+        let mut d = self.descriptor(old)?.clone();
+        d.cloexec = flags & O_CLOEXEC != 0;
+        self.fds.insert(new, d);
+        Ok(new)
+    }
     pub fn flags(&self, fd: u32) -> Result<u32> {
-        Ok(self.fds.get(&fd).ok_or(Errno(9))?.flags)
+        let d = self.descriptor(fd)?;
+        Ok(d.open.borrow().flags | if d.cloexec { O_CLOEXEC } else { 0 })
     }
     pub fn set_cloexec(&mut self, fd: u32, enabled: bool) -> Result<()> {
-        let d = self.fds.get_mut(&fd).ok_or(Errno(9))?;
-        if enabled {
-            d.flags |= O_CLOEXEC;
-        } else {
-            d.flags &= !O_CLOEXEC;
-        }
+        self.fds.get_mut(&fd).ok_or(Errno(9))?.cloexec = enabled;
         Ok(())
     }
     pub fn set_status_flags(&mut self, fd: u32, flags: u32) -> Result<()> {
-        let d = self.fds.get_mut(&fd).ok_or(Errno(9))?;
-        if !matches!(d.kind, FdKind::Node(_)) && flags & 0x800 != 0 {
+        let d = self.descriptor(fd)?;
+        let mut o = d.open.borrow_mut();
+        if matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
+            && flags & O_NONBLOCK != 0
+        {
             return Err(Errno(38));
         }
-        const CHANGEABLE: u32 = 0x400 | 0x800;
+        const CHANGEABLE: u32 = 0x400 | O_NONBLOCK;
         if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE) != 0 {
             return Err(Errno(22));
         }
-        d.flags = (d.flags & !CHANGEABLE) | (flags & CHANGEABLE);
+        o.flags = (o.flags & !CHANGEABLE) | (flags & CHANGEABLE);
         Ok(())
     }
+    pub fn pipe(&mut self, flags: u32) -> Result<[u32; 2]> {
+        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+            return Err(Errno(22));
+        }
+        let free: Vec<_> = (0..MAX_FDS)
+            .filter(|n| !self.fds.contains_key(n))
+            .take(2)
+            .collect();
+        if free.len() != 2 {
+            return Err(Errno(24));
+        }
+        let p = Rc::new(RefCell::new(Pipe {
+            bytes: VecDeque::new(),
+            reader: Weak::new(),
+            writer: Weak::new(),
+        }));
+        let read = Rc::new(PipeEnd {
+            pipe: p.clone(),
+            read: true,
+        });
+        let write = Rc::new(PipeEnd {
+            pipe: p.clone(),
+            read: false,
+        });
+        {
+            let mut p = p.borrow_mut();
+            p.reader = Rc::downgrade(&read);
+            p.writer = Rc::downgrade(&write);
+        }
+        for (fd, end, kind, access) in [
+            (free[0], read, FdKind::PipeRead, 0),
+            (free[1], write, FdKind::PipeWrite, 1),
+        ] {
+            self.fds.insert(
+                fd,
+                Descriptor {
+                    open: Rc::new(RefCell::new(OpenDescription {
+                        kind,
+                        flags: (flags & O_NONBLOCK) | access,
+                        position: 0,
+                        node: None,
+                        pipe: Some(end),
+                    })),
+                    cloexec: flags & O_CLOEXEC != 0,
+                },
+            );
+        }
+        Ok([free[0], free[1]])
+    }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
-        let d = self.fds.get_mut(&fd).ok_or(Errno(9))?;
-        if d.flags & 3 == 1 {
+        let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.flags & 3 == 1 {
             return Err(Errno(9));
         }
-        let p = match &d.kind {
-            FdKind::Node(p) => p,
-            _ => return Err(Errno(9)),
-        };
-        match &self.nodes.get(p).ok_or(Errno(2))?.content {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(end) = &o.pipe {
+            if !end.read {
+                return Err(Errno(9));
+            }
+            let mut p = end.pipe.borrow_mut();
+            if p.bytes.is_empty() && p.writer.strong_count() != 0 {
+                return Err(Errno(11));
+            }
+            let n = count.min(p.bytes.len());
+            return Ok(p.bytes.drain(..n).collect());
+        }
+        let node = o.node.clone().ok_or(Errno(9))?;
+        let n = node.borrow();
+        match &n.content {
             Content::File(b) => {
-                let start = d.position.min(b.len());
+                let start = o.position.min(b.len());
                 let end = start.saturating_add(count).min(b.len());
-                let bytes = b[start..end].to_vec();
-                d.position = end;
-                Ok(bytes)
+                let out = b[start..end].to_vec();
+                o.position = end;
+                Ok(out)
             }
             Content::Null => Ok(Vec::new()),
             Content::Directory => Err(Errno(21)),
+            Content::Terminal => Err(Errno(11)),
         }
     }
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
         let allocated = self.allocated_bytes();
-        let d = self.fds.get_mut(&fd).ok_or(Errno(9))?;
-        if d.flags & 3 == 0 {
+        let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.flags & 3 == 0 {
             return Err(Errno(9));
         }
-        let p = match &d.kind {
-            FdKind::Node(p) => p,
-            _ => return Err(Errno(9)),
-        };
-        match &mut self.nodes.get_mut(p).ok_or(Errno(2))?.content {
+        if let Some(end) = &o.pipe {
+            if end.read {
+                return Err(Errno(9));
+            }
+            let mut p = end.pipe.borrow_mut();
+            if p.reader.strong_count() == 0 {
+                return Err(Errno(32));
+            }
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let room = PIPE_CAPACITY - p.bytes.len();
+            if room == 0 || (bytes.len() <= 4096 && room < bytes.len()) {
+                return Err(Errno(11));
+            }
+            let n = room.min(bytes.len());
+            p.bytes.extend(&bytes[..n]);
+            return Ok(n);
+        }
+        let node = o.node.clone().ok_or(Errno(9))?;
+        let mut n = node.borrow_mut();
+        match &mut n.content {
             Content::Null => Ok(bytes.len()),
             Content::Directory => Err(Errno(21)),
+            Content::Terminal => Err(Errno(11)),
             Content::File(b) => {
                 if bytes.is_empty() {
                     return Ok(0);
                 }
-                if d.flags & 0x400 != 0 {
-                    d.position = b.len();
-                }
-                let end = d.position.checked_add(bytes.len()).ok_or(Errno(27))?;
+                let position = if o.flags & 0x400 != 0 {
+                    b.len()
+                } else {
+                    o.position
+                };
+                let end = position.checked_add(bytes.len()).ok_or(Errno(27))?;
                 if allocated
                     .saturating_sub(b.len())
                     .checked_add(end.max(b.len()))
@@ -404,26 +690,25 @@ impl Vfs {
                     return Err(Errno(28));
                 }
                 b.resize(end.max(b.len()), 0);
-                b[d.position..end].copy_from_slice(bytes);
-                d.position = end;
+                b[position..end].copy_from_slice(bytes);
+                o.position = end;
                 Ok(bytes.len())
             }
         }
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
-        let d = self.fds.get_mut(&fd).ok_or(Errno(9))?;
-        let p = match &d.kind {
-            FdKind::Node(p) => p,
-            _ => return Err(Errno(29)),
-        };
-        let length = match &self.nodes.get(p).ok_or(Errno(2))?.content {
+        let mut o = self.descriptor(fd)?.open.borrow_mut();
+        let node = o.node.clone().ok_or(Errno(29))?;
+        let n = node.borrow();
+        let length = match &n.content {
             Content::File(b) => b.len(),
             Content::Directory => 0,
             Content::Null => return Ok(0),
+            Content::Terminal => return Err(Errno(29)),
         };
         let base = match whence {
             0 => 0,
-            1 => d.position as i64,
+            1 => o.position as i64,
             2 => length as i64,
             _ => return Err(Errno(22)),
         };
@@ -431,14 +716,14 @@ impl Vfs {
             .checked_add(offset)
             .filter(|&n| n >= 0)
             .ok_or(Errno(22))?;
-        d.position = usize::try_from(new).map_err(|_| Errno(22))?;
+        o.position = usize::try_from(new).map_err(|_| Errno(22))?;
         Ok(new as u64)
     }
     fn stat_node(node: &Node) -> [u8; 128] {
         let mut out = [0; 128];
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         out[16..20].copy_from_slice(&node.mode.to_le_bytes());
-        out[20..24].copy_from_slice(&1u32.to_le_bytes());
+        out[20..24].copy_from_slice(&node.links.to_le_bytes());
         out[24..28].copy_from_slice(&1000u32.to_le_bytes());
         out[28..32].copy_from_slice(&1000u32.to_le_bytes());
         let size = match &node.content {
@@ -452,52 +737,49 @@ impl Vfs {
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8]) -> Result<[u8; 128]> {
         let p = self.resolve(dirfd, path)?;
-        Ok(Self::stat_node(self.nodes.get(&p).ok_or(Errno(2))?))
+        let n = self.node(&p)?;
+        let out = Self::stat_node(&n.borrow());
+        Ok(out)
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
-        match self.fd_kind(fd)? {
-            FdKind::Node(p) => Ok(Self::stat_node(self.nodes.get(p).ok_or(Errno(2))?)),
-            _ => Ok(Self::stat_node(&Node {
-                content: Content::Null,
-                mode: 0o20666,
-                inode: fd as u64 + 0x10000,
-            })),
+        let d = self.descriptor(fd)?;
+        let o = d.open.borrow();
+        if let Some(n) = &o.node {
+            return Ok(Self::stat_node(&n.borrow()));
         }
+        Ok(Self::stat_node(&Node {
+            content: Content::Null,
+            mode: if o.pipe.is_some() { 0o10600 } else { 0o20666 },
+            inode: fd as u64 + 0x10000,
+            links: 1,
+        }))
     }
     pub fn chdir(&mut self, path: &[u8]) -> Result<()> {
         let p = self.resolve(AT_FDCWD, path)?;
-        if !self.is_directory(&p) {
-            return Err(if self.nodes.contains_key(&p) {
-                Errno(20)
-            } else {
-                Errno(2)
-            });
+        let n = self.node(&p)?;
+        if !matches!(n.borrow().content, Content::Directory) {
+            return Err(Errno(20));
         }
         self.cwd = p;
         Ok(())
     }
     pub fn getdents(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
-        let d = self.fds.get(&fd).ok_or(Errno(9))?;
-        let p = match &d.kind {
+        let d = self.descriptor(fd)?;
+        let mut o = d.open.borrow_mut();
+        let p = match &o.kind {
             FdKind::Node(p) if self.is_directory(p) => p.clone(),
             _ => return Err(Errno(20)),
         };
-        let inode = self.nodes[&p].inode;
-        let parent_end = p
-            .iter()
-            .rposition(|&b| b == b'/')
-            .expect("absolute path")
-            .max(1);
-        let parent_inode = self.nodes[&p[..parent_end]].inode;
-        let mut entries = vec![
-            (b".".to_vec(), inode, 4u8),
-            (b"..".to_vec(), parent_inode, 4),
-        ];
+        let fs = self.fs.borrow();
+        let inode = fs.paths[&p].borrow().inode;
+        let parent_end = p.iter().rposition(|&b| b == b'/').expect("absolute").max(1);
+        let parent = fs.paths[&p[..parent_end]].borrow().inode;
+        let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];
         let mut prefix = p.clone();
         if prefix != b"/" {
             prefix.push(b'/');
         }
-        for (path, node) in self.nodes.range(prefix.clone()..) {
+        for (path, node) in fs.paths.range(prefix.clone()..) {
             if !path.starts_with(&prefix) {
                 break;
             }
@@ -505,19 +787,19 @@ impl Vfs {
             if name.is_empty() || name.contains(&b'/') {
                 continue;
             }
+            let n = node.borrow();
             entries.push((
                 name.to_vec(),
-                node.inode,
-                match node.content {
+                n.inode,
+                match n.content {
                     Content::Directory => 4,
                     Content::File(_) => 8,
-                    Content::Null => 2,
+                    Content::Null | Content::Terminal => 2,
                 },
             ));
         }
-        let mut position = d.position;
         let mut out = Vec::new();
-        while let Some((name, ino, kind)) = entries.get(position) {
+        while let Some((name, ino, kind)) = entries.get(o.position) {
             let size = (19 + name.len() + 1 + 7) & !7;
             if out.len() + size > count {
                 if out.is_empty() {
@@ -528,17 +810,15 @@ impl Vfs {
             let start = out.len();
             out.resize(start + size, 0);
             out[start..start + 8].copy_from_slice(&ino.to_le_bytes());
-            out[start + 8..start + 16].copy_from_slice(&(position as u64 + 1).to_le_bytes());
+            out[start + 8..start + 16].copy_from_slice(&((o.position + 1) as u64).to_le_bytes());
             out[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
             out[start + 18] = *kind;
             out[start + 19..start + 19 + name.len()].copy_from_slice(name);
-            position += 1;
+            o.position += 1;
         }
-        self.fds.get_mut(&fd).expect("descriptor").position = position;
         Ok(out)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +911,119 @@ mod tests {
         v.seek(fd, 1_000_000, 0).unwrap();
         assert_eq!(v.write(fd, b"").unwrap(), 0);
         assert_eq!(v.allocated_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    #[test]
+    fn fork_shares_storage_and_open_position_but_not_descriptor_table() {
+        let mut parent = Vfs::default();
+        parent.import_file(b"/file", b"abcd".to_vec()).unwrap();
+        let fd = parent.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        let mut child = parent.clone();
+        assert_eq!(child.read(fd, 1).unwrap(), b"a");
+        assert_eq!(parent.read(fd, 1).unwrap(), b"b");
+        child.close(fd).unwrap();
+        assert_eq!(parent.read(fd, 1).unwrap(), b"c");
+        child.open_at(AT_FDCWD, b"/child", 0x41, 0o600).unwrap();
+        assert!(parent.stat_at(AT_FDCWD, b"/child").is_ok());
+        child.chdir(b"/dev").unwrap();
+        assert_eq!(parent.cwd(), b"/");
+    }
+    #[test]
+    fn dup_and_fork_share_status_flags_but_cloexec_is_per_descriptor() {
+        let mut parent = Vfs::default();
+        parent.import_file(b"/file", vec![]).unwrap();
+        let fd = parent.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        let duplicate = parent.dup(fd, 10, true).unwrap();
+        let mut child = parent.clone();
+        child.set_status_flags(fd, 2 | 0x400).unwrap();
+        assert_ne!(parent.flags(duplicate).unwrap() & 0x400, 0);
+        child.set_cloexec(fd, true).unwrap();
+        assert_eq!(parent.flags(fd).unwrap() & O_CLOEXEC, 0);
+        child.close_exec();
+        assert_eq!(child.fd_kind(fd), Err(Errno(9)));
+        assert!(parent.fd_kind(fd).is_ok());
+        assert_eq!(child.fd_kind(duplicate), Err(Errno(9)));
+    }
+    #[test]
+    fn pipe_eof_waits_for_last_shared_writer_and_broken_pipe_for_last_reader() {
+        let mut parent = Vfs::default();
+        let [r, w] = parent.pipe(0).unwrap();
+        let mut child = parent.clone();
+        parent.close(w).unwrap();
+        assert_eq!(parent.read(r, 1), Err(Errno(11)));
+        child.write(w, b"x").unwrap();
+        child.close(w).unwrap();
+        assert_eq!(parent.read(r, 1).unwrap(), b"x");
+        assert!(parent.read(r, 1).unwrap().is_empty());
+        let [r, w] = parent.pipe(0).unwrap();
+        let mut child = parent.clone();
+        parent.close(r).unwrap();
+        assert_eq!(parent.write(w, b"x").unwrap(), 1);
+        child.close(r).unwrap();
+        assert_eq!(parent.write(w, b"x"), Err(Errno(32)));
+    }
+    #[test]
+    fn pipe_small_writes_are_atomic_under_backpressure() {
+        let mut v = Vfs::default();
+        let [r, w] = v.pipe(O_NONBLOCK).unwrap();
+        assert_eq!(v.write(w, &vec![7; PIPE_CAPACITY]).unwrap(), PIPE_CAPACITY);
+        assert_eq!(v.poll(r, 1), 1);
+        assert_eq!(v.poll(w, 4), 0);
+        assert_eq!(v.read(r, 1).unwrap(), vec![7]);
+        assert_eq!(v.write(w, b"ab"), Err(Errno(11)));
+        assert_eq!(
+            v.read(r, PIPE_CAPACITY).unwrap(),
+            vec![7; PIPE_CAPACITY - 1]
+        );
+        v.close(w).unwrap();
+        assert_eq!(v.poll(r, 1), 17);
+    }
+    #[test]
+    fn unlink_keeps_open_file_and_quota_until_last_close() {
+        let mut v = Vfs::default();
+        v.import_file(b"/file", b"abc".to_vec()).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/file", 0, 0).unwrap();
+        v.unlink_at(AT_FDCWD, b"/file", false).unwrap();
+        assert_eq!(v.stat_at(AT_FDCWD, b"/file"), Err(Errno(2)));
+        assert_eq!(v.allocated_bytes(), 3);
+        assert_eq!(v.read(fd, 3).unwrap(), b"abc");
+        v.close(fd).unwrap();
+        assert_eq!(v.allocated_bytes(), 0);
+    }
+    #[test]
+    fn failed_dup3_does_not_close_the_target() {
+        let mut v = Vfs::default();
+        let old = v.fd_kind(1).unwrap();
+        assert_eq!(v.dup3(200, 1, 0), Err(Errno(9)));
+        assert_eq!(v.fd_kind(1).unwrap(), old);
+        assert_eq!(v.dup3(1, 1, 0), Err(Errno(22)));
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    #[test]
+    fn directory_mutations_require_parent_write_and_import_uses_canonical_path() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/readonly", 0o555).unwrap();
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/readonly/new", 0x41, 0o600),
+            Err(Errno(13))
+        );
+        assert_eq!(
+            v.mkdir_at(AT_FDCWD, b"/readonly/sub", 0o755),
+            Err(Errno(13))
+        );
+        v.import_executable(b"/readonly//program", vec![1]).unwrap();
+        assert_eq!(v.executable(b"/readonly/program").unwrap(), vec![1]);
+        assert_eq!(
+            v.unlink_at(AT_FDCWD, b"/readonly/program", false),
+            Err(Errno(13))
+        );
     }
 }

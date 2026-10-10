@@ -16,11 +16,28 @@ pub enum OutputFd {
     Stdout,
     Stderr,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    Resize { rows: u16, columns: u16 },
+    Signal(u32),
+}
 
 pub trait GuestOutput {
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize>;
     fn read_stdin(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
         Ok(0)
+    }
+    /// Nonblocking input for the cooperative scheduler. Interactive adapters must
+    /// return WouldBlock until bytes or EOF are available.
+    fn poll_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.read_stdin(bytes)
+    }
+    fn stdin_ready(&mut self) -> io::Result<bool> {
+        Ok(true)
+    }
+    /// Events from the embedding application's PTY master, scoped to guest jobs.
+    fn terminal_event(&mut self) -> Option<TerminalEvent> {
+        None
     }
 }
 
