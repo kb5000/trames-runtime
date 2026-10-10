@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared virtual filesystem and open descriptions; guest paths never reach host IO.
+//! Shared virtual namespace; host IO is confined to an explicitly selected store.
+mod namespace;
+mod storage;
+#[cfg(test)]
+mod storage_tests;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     fmt,
     rc::{Rc, Weak},
 };
+pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
@@ -48,7 +53,7 @@ struct PipeEnd {
 struct OpenDescription {
     kind: FdKind,
     flags: u32,
-    position: usize,
+    position: u64,
     node: Option<Rc<RefCell<Node>>>,
     pipe: Option<Rc<PipeEnd>>,
 }
@@ -59,7 +64,7 @@ struct Descriptor {
 }
 enum Content {
     Directory,
-    File(Vec<u8>),
+    File(storage::FileData),
     Null,
     Terminal,
 }
@@ -68,17 +73,21 @@ struct Node {
     mode: u32,
     inode: u64,
     links: u32,
+    times: [storage::Timestamp; 3],
 }
 struct Filesystem {
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
     inodes: Vec<Weak<RefCell<Node>>>,
     next_inode: u64,
+    limits: StorageLimits,
+    disk: Option<Rc<storage::DiskStore>>,
+    volume: Option<(VolumeSpace, u64)>,
 }
 #[derive(Clone)]
 pub struct Vfs {
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
-    cwd: Vec<u8>,
+    cwd_node: Option<Rc<RefCell<Node>>>,
     pub umask: u32,
 }
 impl Default for Vfs {
@@ -88,13 +97,17 @@ impl Default for Vfs {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: 1,
+                limits: StorageLimits::memory(),
+                disk: None,
+                volume: None,
             })),
             fds: BTreeMap::new(),
-            cwd: b"/".to_vec(),
+            cwd_node: None,
             umask: 0o022,
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
             .expect("root");
+        v.cwd_node = Some(v.node(b"/").expect("root inode"));
         v.insert(b"/dev".to_vec(), Content::Directory, 0o40755)
             .expect("dev");
         v.insert(b"/dev/null".to_vec(), Content::Null, 0o20666)
@@ -123,10 +136,8 @@ impl Default for Vfs {
 }
 impl Vfs {
     pub fn import_executable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
-        self.import_file(path, bytes)?;
-        let canonical = self.resolve(AT_FDCWD, path)?;
-        self.node(&canonical)?.borrow_mut().mode |= 0o111;
-        Ok(())
+        self.import_reader(path, &mut bytes.as_slice(), true)
+            .map(|_| ())
     }
     fn check_parent_write(&self, path: &[u8]) -> Result<()> {
         let end = path
@@ -187,18 +198,39 @@ impl Vfs {
     fn insert(&mut self, path: Vec<u8>, content: Content, mode: u32) -> Result<()> {
         let mut fs = self.fs.borrow_mut();
         fs.inodes.retain(|n| n.strong_count() != 0);
-        if fs.inodes.len() >= MAX_NODES {
+        if fs.inodes.len() >= fs.limits.nodes || fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
+        }
+        let old_next = fs.next_inode;
+        let inode = if let Content::File(data) = &content {
+            data.inode().unwrap_or(fs.next_inode)
+        } else {
+            fs.next_inode
+        };
+        if inode == fs.next_inode {
+            fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
+        }
+        if let Content::File(data) = &content {
+            data.sync(false)?;
         }
         let node = Rc::new(RefCell::new(Node {
             content,
             mode,
-            inode: fs.next_inode,
+            inode,
             links: 1,
+            times: [storage::Timestamp::now(); 3],
         }));
-        fs.next_inode += 1;
         fs.inodes.push(Rc::downgrade(&node));
-        fs.paths.insert(path, node);
+        fs.paths.insert(path.clone(), node.clone());
+        if let Err(e) = fs.checkpoint() {
+            fs.paths.remove(&path);
+            fs.inodes.pop();
+            fs.next_inode = old_next;
+            return Err(e);
+        }
+        if let Content::File(data) = &mut node.borrow_mut().content {
+            data.orphan(false);
+        }
         Ok(())
     }
     fn node(&self, path: &[u8]) -> Result<Rc<RefCell<Node>>> {
@@ -207,7 +239,7 @@ impl Vfs {
     fn descriptor(&self, fd: u32) -> Result<&Descriptor> {
         self.fds.get(&fd).ok_or(Errno(9))
     }
-    pub fn allocated_bytes(&self) -> usize {
+    pub fn allocated_bytes(&self) -> u64 {
         self.fs
             .borrow()
             .inodes
@@ -219,8 +251,17 @@ impl Vfs {
             })
             .sum()
     }
-    pub fn cwd(&self) -> &[u8] {
-        &self.cwd
+    pub fn cwd(&self) -> Result<Vec<u8>> {
+        self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?)
+    }
+    fn path_of(&self, node: &Rc<RefCell<Node>>) -> Result<Vec<u8>> {
+        self.fs
+            .borrow()
+            .paths
+            .iter()
+            .find(|(_, n)| Rc::ptr_eq(n, node))
+            .map(|(p, _)| p.clone())
+            .ok_or(Errno(2))
     }
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
         Ok(self.descriptor(fd)?.open.borrow().kind.clone())
@@ -231,12 +272,14 @@ impl Vfs {
     }
     fn base(&self, dirfd: i32) -> Result<Vec<u8>> {
         if dirfd == AT_FDCWD {
-            return Ok(self.cwd.clone());
+            return self.cwd();
         }
-        match self.fd_kind(dirfd as u32)? {
-            FdKind::Node(p) if self.is_directory(&p) => Ok(p),
-            _ => Err(Errno(20)),
+        let o = self.descriptor(dirfd as u32)?.open.borrow();
+        let n = o.node.as_ref().ok_or(Errno(20))?;
+        if !matches!(n.borrow().content, Content::Directory) {
+            return Err(Errno(20));
         }
+        self.path_of(n)
     }
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
         if path.is_empty() {
@@ -298,6 +341,27 @@ impl Vfs {
         Ok(current)
     }
     pub fn import_file(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
+        self.import_reader(path, &mut bytes.as_slice(), false)
+            .map(|_| ())
+    }
+    fn import_data(
+        &mut self,
+        path: &[u8],
+        data: storage::FileData,
+        executable: bool,
+    ) -> Result<()> {
+        let (current, parents) = self.import_plan(path)?;
+        self.check_growth(0, data.len())?;
+        for parent in parents {
+            self.insert(parent, Content::Directory, 0o40755)?;
+        }
+        self.insert(
+            current,
+            Content::File(data),
+            if executable { 0o100755 } else { 0o100644 },
+        )
+    }
+    fn import_plan(&self, path: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
         if !path.starts_with(b"/")
             || path.contains(&0)
             || path.len() >= MAX_PATH
@@ -314,13 +378,6 @@ impl Vfs {
             .any(|p| *p == b"." || *p == b".." || p.len() > 255)
         {
             return Err(Errno(22));
-        }
-        if self
-            .allocated_bytes()
-            .checked_add(bytes.len())
-            .is_none_or(|n| n > MAX_FILE_BYTES)
-        {
-            return Err(Errno(28));
         }
         let mut current = Vec::new();
         let mut parents = Vec::new();
@@ -346,14 +403,18 @@ impl Vfs {
             .count();
         if live
             .checked_add(parents.len() + 1)
-            .is_none_or(|n| n > MAX_NODES)
+            .is_none_or(|n| n > self.fs.borrow().limits.nodes)
+            || self
+                .fs
+                .borrow()
+                .paths
+                .len()
+                .saturating_add(parents.len() + 1)
+                > self.fs.borrow().limits.nodes
         {
             return Err(Errno(28));
         }
-        for parent in parents {
-            self.insert(parent, Content::Directory, 0o40755)?;
-        }
-        self.insert(current, Content::File(bytes), 0o100644)
+        Ok((current, parents))
     }
     /// Explicit embedding API: install an executable/hard link, without duplicating file data.
     pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
@@ -365,6 +426,10 @@ impl Vfs {
         if !matches!(source.borrow().content, Content::File(_)) {
             return Err(Errno(1));
         }
+        if self.fs.borrow().paths.len() >= self.fs.borrow().limits.nodes {
+            return Err(Errno(28));
+        }
+        let old_mode = source.borrow().mode;
         {
             let mut n = source.borrow_mut();
             n.links += 1;
@@ -372,7 +437,15 @@ impl Vfs {
                 n.mode |= 0o111;
             }
         }
-        self.fs.borrow_mut().paths.insert(dest, source);
+        let mut fs = self.fs.borrow_mut();
+        fs.paths.insert(dest.clone(), source.clone());
+        if let Err(e) = fs.checkpoint() {
+            fs.paths.remove(&dest);
+            let mut n = source.borrow_mut();
+            n.links -= 1;
+            n.mode = old_mode;
+            return Err(e);
+        }
         Ok(())
     }
     pub fn executable(&self, path: &[u8]) -> Result<Vec<u8>> {
@@ -383,7 +456,7 @@ impl Vfs {
             return Err(Errno(13));
         }
         match &n.content {
-            Content::File(b) => Ok(b.clone()),
+            Content::File(b) => Self::executable_data(b),
             _ => Err(Errno(13)),
         }
     }
@@ -424,7 +497,19 @@ impl Vfs {
             }
         }
         node.borrow_mut().links -= 1;
-        self.fs.borrow_mut().paths.remove(&p);
+        let mut fs = self.fs.borrow_mut();
+        fs.paths.remove(&p);
+        if let Err(e) = fs.checkpoint() {
+            node.borrow_mut().links += 1;
+            fs.paths.insert(p, node);
+            return Err(e);
+        }
+        let mut n = node.borrow_mut();
+        if n.links == 0 {
+            if let Content::File(data) = &mut n.content {
+                data.orphan(true);
+            }
+        }
         Ok(())
     }
     fn available(&self, min: u32) -> Result<u32> {
@@ -443,7 +528,8 @@ impl Vfs {
             | O_DIRECTORY
             | O_NOFOLLOW
             | O_LARGEFILE
-            | O_CLOEXEC;
+            | O_CLOEXEC
+            | 0x101000;
         if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
             return Err(Errno(22));
         }
@@ -460,7 +546,7 @@ impl Vfs {
             self.check_parent_write(&p)?;
             self.insert(
                 p.clone(),
-                Content::File(Vec::new()),
+                Content::File(self.empty_data()?),
                 0o100000 | (mode & 0o777 & !self.umask),
             )?;
         }
@@ -481,9 +567,14 @@ impl Vfs {
             }
             if flags & 0x200 != 0 {
                 if let Content::File(b) = &mut n.content {
-                    b.clear();
+                    b.truncate(0)?;
+                    n.times[1] = storage::Timestamp::now();
+                    n.times[2] = n.times[1];
                 }
             }
+        }
+        if flags & 0x200 != 0 {
+            self.checkpoint()?;
         }
         self.fds.insert(
             fd,
@@ -552,7 +643,7 @@ impl Vfs {
             return Err(Errno(38));
         }
         const CHANGEABLE: u32 = 0x400 | O_NONBLOCK;
-        if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE) != 0 {
+        if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | 0x101000) != 0 {
             return Err(Errno(22));
         }
         o.flags = (o.flags & !CHANGEABLE) | (flags & CHANGEABLE);
@@ -627,23 +718,24 @@ impl Vfs {
             return Ok(p.bytes.drain(..n).collect());
         }
         let node = o.node.clone().ok_or(Errno(9))?;
-        let n = node.borrow();
-        match &n.content {
+        let mut n = node.borrow_mut();
+        let result = match &n.content {
             Content::File(b) => {
-                let start = o.position.min(b.len());
-                let end = start.saturating_add(count).min(b.len());
-                let out = b[start..end].to_vec();
-                o.position = end;
+                let out = b.read_at(o.position, count)?;
+                o.position += out.len() as u64;
                 Ok(out)
             }
             Content::Null => Ok(Vec::new()),
             Content::Directory => Err(Errno(21)),
             Content::Terminal => Err(Errno(11)),
+        };
+        if result.is_ok() {
+            n.times[0] = storage::Timestamp::now();
         }
+        result
     }
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
-        let allocated = self.allocated_bytes();
-        let mut o = self.descriptor(fd)?.open.borrow_mut();
+        let o = self.descriptor(fd)?.open.borrow();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
         }
@@ -666,9 +758,20 @@ impl Vfs {
             p.bytes.extend(&bytes[..n]);
             return Ok(n);
         }
-        let node = o.node.clone().ok_or(Errno(9))?;
+        drop(o);
+        self.file_write(fd, bytes, None)
+    }
+    fn file_write(&mut self, fd: u32, bytes: &[u8], offset: Option<u64>) -> Result<usize> {
+        let available = self.capacity().available_bytes;
+        let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.flags & 3 == 0 {
+            return Err(Errno(9));
+        }
+        let node = o.node.clone().ok_or(Errno(29))?;
         let mut n = node.borrow_mut();
-        match &mut n.content {
+        let count = bytes.len().min(storage::MAX_TRANSFER);
+        let bytes = &bytes[..count];
+        let result = match &mut n.content {
             Content::Null => Ok(bytes.len()),
             Content::Directory => Err(Errno(21)),
             Content::Terminal => Err(Errno(11)),
@@ -679,22 +782,84 @@ impl Vfs {
                 let position = if o.flags & 0x400 != 0 {
                     b.len()
                 } else {
-                    o.position
+                    offset.unwrap_or(o.position)
                 };
-                let end = position.checked_add(bytes.len()).ok_or(Errno(27))?;
-                if allocated
-                    .saturating_sub(b.len())
-                    .checked_add(end.max(b.len()))
-                    .is_none_or(|n| n > MAX_FILE_BYTES)
-                {
+                let end = position
+                    .checked_add(bytes.len() as u64)
+                    .filter(|&n| n <= i64::MAX as u64)
+                    .ok_or(Errno(27))?;
+                if end.saturating_sub(b.len()) > available {
                     return Err(Errno(28));
                 }
-                b.resize(end.max(b.len()), 0);
-                b[position..end].copy_from_slice(bytes);
-                o.position = end;
-                Ok(bytes.len())
+                let written = b.write_at(position, bytes)?;
+                if offset.is_none() {
+                    o.position = position + written as u64;
+                }
+                Ok(written)
             }
+        };
+        if result.is_ok_and(|n| n != 0) {
+            n.times[1] = storage::Timestamp::now();
+            n.times[2] = n.times[1];
         }
+        let synchronous = o.flags & 0x1000 != 0;
+        drop(n);
+        drop(o);
+        if result.is_ok() && synchronous {
+            self.sync_fd(fd, false)?;
+        }
+        result
+    }
+    pub fn pread(&self, fd: u32, count: usize, offset: u64) -> Result<Vec<u8>> {
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        let o = self.descriptor(fd)?.open.borrow();
+        if o.flags & 3 == 1 {
+            return Err(Errno(9));
+        }
+        let n = o.node.as_ref().ok_or(Errno(29))?.borrow();
+        match &n.content {
+            Content::File(b) => b.read_at(offset, count),
+            Content::Null => Ok(Vec::new()),
+            Content::Directory => Err(Errno(21)),
+            Content::Terminal => Err(Errno(29)),
+        }
+    }
+    pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        self.file_write(fd, bytes, Some(offset))
+    }
+    pub fn truncate_fd(&mut self, fd: u32, length: u64) -> Result<()> {
+        let available = self.capacity().available_bytes;
+        let o = self.descriptor(fd)?.open.borrow();
+        if o.flags & 3 == 0 {
+            return Err(Errno(22));
+        }
+        let mut n = o.node.as_ref().ok_or(Errno(22))?.borrow_mut();
+        let Content::File(b) = &mut n.content else {
+            return Err(Errno(22));
+        };
+        if length > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        if length.saturating_sub(b.len()) > available {
+            return Err(Errno(28));
+        }
+        b.truncate(length)?;
+        n.times[1] = storage::Timestamp::now();
+        n.times[2] = n.times[1];
+        drop(n);
+        drop(o);
+        self.checkpoint()
+    }
+    pub fn truncate_at(&mut self, path: &[u8], length: u64) -> Result<()> {
+        let fd = self.open_at(AT_FDCWD, path, 1, 0)?;
+        let result = self.truncate_fd(fd, length);
+        self.close(fd)?;
+        result
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
@@ -716,10 +881,10 @@ impl Vfs {
             .checked_add(offset)
             .filter(|&n| n >= 0)
             .ok_or(Errno(22))?;
-        o.position = usize::try_from(new).map_err(|_| Errno(22))?;
+        o.position = new as u64;
         Ok(new as u64)
     }
-    fn stat_node(node: &Node) -> [u8; 128] {
+    fn stat_node(node: &Node) -> Result<[u8; 128]> {
         let mut out = [0; 128];
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         out[16..20].copy_from_slice(&node.mode.to_le_bytes());
@@ -727,32 +892,42 @@ impl Vfs {
         out[24..28].copy_from_slice(&1000u32.to_le_bytes());
         out[28..32].copy_from_slice(&1000u32.to_le_bytes());
         let size = match &node.content {
-            Content::File(b) => b.len() as u64,
+            Content::File(b) => b.len(),
             _ => 0,
         };
         out[48..56].copy_from_slice(&size.to_le_bytes());
         out[56..60].copy_from_slice(&4096u32.to_le_bytes());
-        out[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-        out
+        let blocks = if let Content::File(data) = &node.content {
+            data.blocks()?
+        } else {
+            0
+        };
+        out[64..72].copy_from_slice(&blocks.to_le_bytes());
+        for (offset, t) in [72, 88, 104].into_iter().zip(node.times) {
+            out[offset..offset + 8].copy_from_slice(&t.seconds.to_le_bytes());
+            out[offset + 8..offset + 16].copy_from_slice(&(t.nanos as u64).to_le_bytes());
+        }
+        Ok(out)
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8]) -> Result<[u8; 128]> {
         let p = self.resolve(dirfd, path)?;
         let n = self.node(&p)?;
         let out = Self::stat_node(&n.borrow());
-        Ok(out)
+        out
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
         let d = self.descriptor(fd)?;
         let o = d.open.borrow();
         if let Some(n) = &o.node {
-            return Ok(Self::stat_node(&n.borrow()));
+            return Self::stat_node(&n.borrow());
         }
-        Ok(Self::stat_node(&Node {
+        Self::stat_node(&Node {
             content: Content::Null,
             mode: if o.pipe.is_some() { 0o10600 } else { 0o20666 },
             inode: fd as u64 + 0x10000,
             links: 1,
-        }))
+            times: [storage::Timestamp::default(); 3],
+        })
     }
     pub fn chdir(&mut self, path: &[u8]) -> Result<()> {
         let p = self.resolve(AT_FDCWD, path)?;
@@ -760,16 +935,17 @@ impl Vfs {
         if !matches!(n.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        self.cwd = p;
+        self.cwd_node = Some(n);
         Ok(())
     }
     pub fn getdents(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         let d = self.descriptor(fd)?;
         let mut o = d.open.borrow_mut();
-        let p = match &o.kind {
-            FdKind::Node(p) if self.is_directory(p) => p.clone(),
-            _ => return Err(Errno(20)),
-        };
+        let node = o.node.as_ref().ok_or(Errno(20))?;
+        if !matches!(node.borrow().content, Content::Directory) {
+            return Err(Errno(20));
+        }
+        let p = self.path_of(node)?;
         let fs = self.fs.borrow();
         let inode = fs.paths[&p].borrow().inode;
         let parent_end = p.iter().rposition(|&b| b == b'/').expect("absolute").max(1);
@@ -799,7 +975,7 @@ impl Vfs {
             ));
         }
         let mut out = Vec::new();
-        while let Some((name, ino, kind)) = entries.get(o.position) {
+        while let Some((name, ino, kind)) = entries.get(o.position as usize) {
             let size = (19 + name.len() + 1 + 7) & !7;
             if out.len() + size > count {
                 if out.is_empty() {
@@ -810,7 +986,7 @@ impl Vfs {
             let start = out.len();
             out.resize(start + size, 0);
             out[start..start + 8].copy_from_slice(&ino.to_le_bytes());
-            out[start + 8..start + 16].copy_from_slice(&((o.position + 1) as u64).to_le_bytes());
+            out[start + 8..start + 16].copy_from_slice(&(o.position + 1).to_le_bytes());
             out[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
             out[start + 18] = *kind;
             out[start + 19..start + 19 + name.len()].copy_from_slice(name);
@@ -930,7 +1106,7 @@ mod process_tests {
         child.open_at(AT_FDCWD, b"/child", 0x41, 0o600).unwrap();
         assert!(parent.stat_at(AT_FDCWD, b"/child").is_ok());
         child.chdir(b"/dev").unwrap();
-        assert_eq!(parent.cwd(), b"/");
+        assert_eq!(parent.cwd().unwrap(), b"/");
     }
     #[test]
     fn dup_and_fork_share_status_flags_but_cloexec_is_per_descriptor() {

@@ -1,4 +1,5 @@
 /target/
+/.trames/
 /tests/fixtures/bin/
 *.o
 __pycache__/

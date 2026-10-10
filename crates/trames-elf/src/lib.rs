@@ -167,7 +167,7 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
             size: page_end - base,
         });
     }
-    if entry % 4 != 0
+    if !entry.is_multiple_of(4)
         || !segments
             .iter()
             .any(|s| s.permissions.execute && entry >= s.address && entry < s.address + s.memsz)

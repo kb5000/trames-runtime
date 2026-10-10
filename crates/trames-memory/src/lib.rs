@@ -198,7 +198,7 @@ impl Memory {
     }
 
     fn mapping_end(address: u64, len: u64) -> Result<u64, MemoryError> {
-        if len == 0 || address % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+        if len == 0 || !address.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::UnalignedMapping);
         }
         Self::end(address, len)
@@ -317,7 +317,7 @@ impl Memory {
     }
 
     pub fn fetch_u32(&self, address: u64) -> Result<u32, MemoryError> {
-        if address % 4 != 0 {
+        if !address.is_multiple_of(4) {
             return Err(MemoryError::InvalidRange);
         }
         self.check(address, 4, Access::Execute)?;

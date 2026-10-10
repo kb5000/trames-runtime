@@ -180,12 +180,12 @@ impl Linux {
             || flags & !ALLOWED != 0
             || flags & 2 == 0
             || flags & 0x20 == 0
-            || a[5] % PAGE_SIZE != 0
+            || !a[5].is_multiple_of(PAGE_SIZE)
         {
             return Err(Errno(22));
         }
         let fixed = flags & (0x10 | 0x100000) != 0;
-        if fixed && a[0] % PAGE_SIZE != 0 {
+        if fixed && !a[0].is_multiple_of(PAGE_SIZE) {
             return Err(Errno(22));
         }
         let address = if fixed {
@@ -253,6 +253,113 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            37 => {
+                if a[4] & !0x400 != 0 {
+                    return Err(Errno(22));
+                }
+                let old = Self::path(memory, a[1])?;
+                let new = Self::path(memory, a[3])?;
+                self.vfs.link_at(a[0] as i32, &old, a[2] as i32, &new)?;
+                Ok(0)
+            }
+            38 | 276 => {
+                let old = Self::path(memory, a[1])?;
+                let new = Self::path(memory, a[3])?;
+                self.vfs.rename_at(
+                    a[0] as i32,
+                    &old,
+                    a[2] as i32,
+                    &new,
+                    if number == 276 { a[4] as u32 } else { 0 },
+                )?;
+                Ok(0)
+            }
+            43 | 44 => {
+                if number == 43 {
+                    let path = Self::path(memory, a[0])?;
+                    self.vfs.stat_at(-100, &path)?;
+                } else {
+                    self.vfs.fd_kind(a[0] as u32)?;
+                }
+                Self::check(memory, a[1], 120, Access::Write)?;
+                memory
+                    .write(a[1], &self.vfs.storage_stat())
+                    .map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            45 => {
+                let path = Self::path(memory, a[0])?;
+                self.vfs.truncate_at(&path, a[1])?;
+                Ok(0)
+            }
+            46 => {
+                self.vfs.truncate_fd(a[0] as u32, a[1])?;
+                Ok(0)
+            }
+            52 => {
+                self.vfs.chmod_fd(a[0] as u32, a[1] as u32)?;
+                Ok(0)
+            }
+            53 => {
+                let path = Self::path(memory, a[1])?;
+                self.vfs.chmod_at(a[0] as i32, &path, a[2] as u32)?;
+                Ok(0)
+            }
+            67 | 68 => {
+                self.vfs.fd_kind(a[0] as u32)?;
+                let count = a[2].min(MAX_WRITE as u64) as usize;
+                Self::check(
+                    memory,
+                    a[1],
+                    count,
+                    if number == 67 {
+                        Access::Write
+                    } else {
+                        Access::Read
+                    },
+                )?;
+                if number == 67 {
+                    let bytes = self.vfs.pread(a[0] as u32, count, a[3])?;
+                    memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+                    Ok(bytes.len() as u64)
+                } else {
+                    let mut bytes = vec![0; count];
+                    memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
+                    Ok(self.vfs.pwrite(a[0] as u32, &bytes, a[3])? as u64)
+                }
+            }
+            82 | 83 => {
+                self.vfs.sync_fd(a[0] as u32, number == 83)?;
+                Ok(0)
+            }
+            162 => {
+                self.vfs.sync()?;
+                Ok(0)
+            }
+            88 => {
+                if a[3] & !0x100 != 0 {
+                    return Err(Errno(22));
+                }
+                let path = if a[1] == 0 {
+                    None
+                } else {
+                    Some(Self::path(memory, a[1])?)
+                };
+                let times = if a[2] == 0 {
+                    None
+                } else {
+                    Self::check(memory, a[2], 32, Access::Read)?;
+                    Some(std::array::from_fn(|i| {
+                        std::array::from_fn(|j| {
+                            memory
+                                .read_u64(a[2] + (i * 16 + j * 8) as u64)
+                                .expect("validated timespec") as i64
+                        })
+                    }))
+                };
+                self.vfs.set_times(a[0] as i32, path.as_deref(), times)?;
+                Ok(0)
+            }
             23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),
             24 => Ok(self.vfs.dup3(a[0] as u32, a[1] as u32, a[2] as u32)? as u64),
             59 => {
@@ -319,12 +426,12 @@ impl Linux {
                 Ok(0)
             }
             17 => {
-                let len = self.vfs.cwd().len() + 1;
+                let mut bytes = self.vfs.cwd()?;
+                let len = bytes.len() + 1;
                 if a[1] < len as u64 {
                     return Err(Errno(34));
                 }
                 Self::check(memory, a[0], len, Access::Write)?;
-                let mut bytes = self.vfs.cwd().to_vec();
                 bytes.push(0);
                 memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
                 Ok(len as u64)
@@ -381,7 +488,7 @@ impl Linux {
                 Ok(1)
             }
             98 => {
-                if a[0] % 4 != 0 {
+                if !a[0].is_multiple_of(4) {
                     return Err(Errno(22));
                 }
                 Self::check(memory, a[0], 4, Access::Read)?;
@@ -419,7 +526,7 @@ impl Linux {
                     return Err(Errno(22));
                 }
                 if a[1] == 0 {
-                    return if a[0] % PAGE_SIZE == 0 {
+                    return if a[0].is_multiple_of(PAGE_SIZE) {
                         Ok(0)
                     } else {
                         Err(Errno(22))
