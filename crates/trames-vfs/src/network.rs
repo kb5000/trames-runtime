@@ -11,6 +11,25 @@ impl Vfs {
         self.network = trames_net::Network::new(mode);
         Ok(())
     }
+    pub fn configure_virtual_network(
+        &mut self,
+        fabric: &trames_net::Fabric,
+        id: u8,
+        mode: NetworkMode,
+    ) -> Result<()> {
+        if self.network.live_sockets() != 0 {
+            return Err(Errno(16));
+        }
+        self.network =
+            trames_net::Network::virtual_network(fabric, id, mode).map_err(|e| Errno(e.0))?;
+        Ok(())
+    }
+    pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
+        self.network.info()
+    }
+    pub fn finish_network(&self) {
+        self.network.finish();
+    }
     pub fn socket(&mut self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
         if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
             return Err(Errno(22));

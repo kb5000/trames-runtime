@@ -123,10 +123,100 @@ impl Vectors {
     }
 }
 impl Linux {
-    pub(super) fn network_ioctl(&mut self, a: [u64; 6], memory: &Memory) -> Result<u64> {
+    pub(super) fn network_ioctl(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         self.vfs.socket_fd(a[0] as u32)?;
-        if a[1] as u32 != 0x5421 {
-            return Err(Errno(25));
+        let request = a[1] as u32;
+        if request != 0x5421 {
+            let info = self.vfs.network_info().ok_or(Errno(25))?;
+            if request == 0x8912 {
+                // SIOCGIFCONF: AArch64 ifconf and two IPv4 ifreq entries.
+                let capacity = u32_at(memory, a[2])?;
+                if capacity > i32::MAX as u32 {
+                    return Err(Errno(22));
+                }
+                let pointer = u64_at(memory, a[2] + 8)?;
+                Self::check(memory, a[2], 16, Access::Write)?;
+                let size = if pointer == 0 {
+                    80
+                } else {
+                    (capacity as usize / 40).min(2) * 40
+                };
+                if pointer != 0 {
+                    Self::check(memory, pointer, size, Access::Write)?;
+                    let mut entries = vec![0; size];
+                    for (i, (name, ip)) in [
+                        (b"lo".as_slice(), std::net::Ipv4Addr::LOCALHOST),
+                        (b"trames0".as_slice(), info.ipv4),
+                    ]
+                    .into_iter()
+                    .take(size / 40)
+                    .enumerate()
+                    {
+                        let e = &mut entries[i * 40..(i + 1) * 40];
+                        e[..name.len()].copy_from_slice(name);
+                        e[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
+                    }
+                    memory.write(pointer, &entries).map_err(|_| Errno(14))?;
+                }
+                memory
+                    .write(a[2], &(size as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
+            if !matches!(request, 0x8910 | 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8933) {
+                return Err(Errno(25));
+            }
+            Self::check(memory, a[2], 40, Access::Write)?;
+            let mut entry = [0; 40];
+            memory.read(a[2], &mut entry).map_err(|_| Errno(14))?;
+            let loopback = if request == 0x8910 {
+                match u32::from_le_bytes(entry[16..20].try_into().unwrap()) {
+                    1 => true,
+                    2 => false,
+                    _ => return Err(Errno(19)),
+                }
+            } else {
+                let end = entry[..16].iter().position(|b| *b == 0).unwrap_or(16);
+                match &entry[..end] {
+                    b"lo" => true,
+                    b"trames0" => false,
+                    _ => return Err(Errno(19)),
+                }
+            };
+            match request {
+                0x8910 => {
+                    entry[..16].fill(0);
+                    let name = if loopback {
+                        b"lo".as_slice()
+                    } else {
+                        b"trames0".as_slice()
+                    };
+                    entry[..name.len()].copy_from_slice(name);
+                }
+                0x8913 => entry[16..18]
+                    .copy_from_slice(&(if loopback { 0x49u16 } else { 0xc1u16 }).to_le_bytes()),
+                0x8915 | 0x891b => {
+                    let ip = if request == 0x891b {
+                        std::net::Ipv4Addr::new(
+                            255,
+                            if loopback { 0 } else { 255 },
+                            if loopback { 0 } else { 255 },
+                            0,
+                        )
+                    } else if loopback {
+                        std::net::Ipv4Addr::LOCALHOST
+                    } else {
+                        info.ipv4
+                    };
+                    entry[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
+                }
+                0x8921 => entry[16..20].copy_from_slice(&info.mtu.to_le_bytes()),
+                0x8933 => entry[16..20]
+                    .copy_from_slice(&(if loopback { 1u32 } else { 2u32 }).to_le_bytes()),
+                _ => unreachable!(),
+            }
+            memory.write(a[2], &entry).map_err(|_| Errno(14))?;
+            return Ok(0);
         }
         let enabled = u32_at(memory, a[2])? != 0;
         let mut flags = self.vfs.flags(a[0] as u32)? & !trames_vfs::O_CLOEXEC;
