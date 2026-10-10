@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/trames-memory", "crates/trames-elf", "crates/trames-cpu",
+    "crates/trames-linux", "crates/trames-core", "crates/trames-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kb5000/trames"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
