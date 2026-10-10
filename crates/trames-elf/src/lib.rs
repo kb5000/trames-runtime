@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Strict little-endian ELF64/AArch64 ET_EXEC loading for M0.
+//! Checked ELF64/AArch64 loading; the guest interpreter performs dynamic relocation.
 use std::fmt;
 use trames_memory::{Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
 
@@ -11,6 +11,7 @@ pub const MAX_ELF_SIZE: usize = 64 * 1024 * 1024;
 pub enum ElfError {
     Invalid(&'static str),
     Unsupported(&'static str),
+    Interpreter(u32),
     Memory(MemoryError),
 }
 impl fmt::Display for ElfError {
@@ -18,6 +19,7 @@ impl fmt::Display for ElfError {
         match self {
             Self::Invalid(s) => write!(f, "invalid ELF: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported ELF: {s}"),
+            Self::Interpreter(n) => write!(f, "guest ELF interpreter: Linux errno {n}"),
             Self::Memory(e) => e.fmt(f),
         }
     }
@@ -34,6 +36,9 @@ pub struct LoadedElf {
     pub entry: u64,
     pub phdr: Option<u64>,
     pub phnum: u16,
+    pub start_entry: u64,
+    pub interpreter_base: u64,
+    pub brk_base: u64,
 }
 
 #[derive(Debug)]
@@ -70,6 +75,52 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
+    load_with_interpreter(bytes, memory_limit, |_| {
+        Err(ElfError::Unsupported(
+            "interpreter requires a guest filesystem",
+        ))
+    })
+}
+
+pub fn load_with_interpreter(
+    bytes: &[u8],
+    memory_limit: usize,
+    mut resolve: impl FnMut(&[u8]) -> Result<Vec<u8>, ElfError>,
+) -> Result<LoadedElf, ElfError> {
+    let mut memory = Memory::new(memory_limit);
+    let main = map_image(bytes, &mut memory, 0x4000_0000)?;
+    let (start_entry, interpreter_base) = if let Some(path) = &main.interpreter {
+        let interpreter = resolve(path)?;
+        let loader = map_image(&interpreter, &mut memory, 0x7000_0000)?;
+        if loader.interpreter.is_some() {
+            return Err(ElfError::Invalid("nested PT_INTERP"));
+        }
+        if loader.bias == 0 {
+            return Err(ElfError::Unsupported("interpreter must be ET_DYN"));
+        }
+        (loader.entry, loader.bias)
+    } else {
+        (main.entry, 0)
+    };
+    Ok(LoadedElf {
+        memory,
+        entry: main.entry,
+        phdr: main.phdr,
+        phnum: main.phnum,
+        start_entry,
+        interpreter_base,
+        brk_base: main.end,
+    })
+}
+struct Image {
+    entry: u64,
+    phdr: Option<u64>,
+    phnum: u16,
+    interpreter: Option<Vec<u8>>,
+    bias: u64,
+    end: u64,
+}
+fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Image, ElfError> {
     use ElfError::{Invalid, Unsupported};
     if bytes.len() < EH_SIZE || bytes.len() > MAX_ELF_SIZE {
         return Err(Invalid("file size"));
@@ -80,9 +131,11 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
     if bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
         return Err(Unsupported("requires ELF64 little-endian version 1"));
     }
-    if u16_at(bytes, 16) != 2 {
-        return Err(Unsupported("only static ET_EXEC is supported in M0"));
-    }
+    let bias = match u16_at(bytes, 16) {
+        2 => 0,
+        3 => dynamic_bias,
+        _ => return Err(Unsupported("requires ET_EXEC or ET_DYN")),
+    };
     if u16_at(bytes, 18) != 183 {
         return Err(Unsupported("machine must be AArch64"));
     }
@@ -92,7 +145,9 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
     if u32_at(bytes, 48) != 0 {
         return Err(Invalid("AArch64 e_flags must be zero"));
     }
-    let entry = u64_at(bytes, 24);
+    let entry = u64_at(bytes, 24)
+        .checked_add(bias)
+        .ok_or(Invalid("entry overflow"))?;
     let phoff = usize::try_from(u64_at(bytes, 32)).map_err(|_| Invalid("program header offset"))?;
     let phnum = u16_at(bytes, 56);
     if u16_at(bytes, 54) != PH_SIZE as u16 || phnum == 0 || phnum > 1024 || phoff < EH_SIZE {
@@ -103,10 +158,31 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
         .filter(|&end| end <= bytes.len())
         .ok_or(Invalid("truncated program headers"))?;
     let mut segments: Vec<Segment> = Vec::new();
+    let mut interpreter = None;
     for pos in (phoff..phend).step_by(PH_SIZE) {
         match u32_at(bytes, pos) {
-            2 => return Err(Unsupported("PT_DYNAMIC")),
-            3 => return Err(Unsupported("PT_INTERP")),
+            3 => {
+                if interpreter.is_some() {
+                    return Err(Invalid("duplicate PT_INTERP"));
+                }
+                let offset = usize::try_from(u64_at(bytes, pos + 8))
+                    .map_err(|_| Invalid("interpreter offset"))?;
+                let size = usize::try_from(u64_at(bytes, pos + 32))
+                    .map_err(|_| Invalid("interpreter size"))?;
+                let end = offset
+                    .checked_add(size)
+                    .filter(|&e| e <= bytes.len())
+                    .ok_or(Invalid("interpreter range"))?;
+                if !(2..=4096).contains(&size) {
+                    return Err(Invalid("interpreter size"));
+                }
+                let path = &bytes[offset..end];
+                if path[0] != b'/' || path[size - 1] != 0 || path[..size - 1].contains(&0) {
+                    return Err(Invalid("interpreter path"));
+                }
+                interpreter = Some(path[..size - 1].to_vec());
+                continue;
+            }
             1 => {}
             _ => continue,
         }
@@ -116,7 +192,9 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
         }
         let offset =
             usize::try_from(u64_at(bytes, pos + 8)).map_err(|_| Invalid("segment offset"))?;
-        let address = u64_at(bytes, pos + 16);
+        let address = u64_at(bytes, pos + 16)
+            .checked_add(bias)
+            .ok_or(Invalid("segment bias overflow"))?;
         let filesz =
             usize::try_from(u64_at(bytes, pos + 32)).map_err(|_| Invalid("segment size"))?;
         let memsz = u64_at(bytes, pos + 40);
@@ -181,7 +259,11 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
             None
         }
     });
-    let mut memory = Memory::new(memory_limit);
+    let end = segments
+        .iter()
+        .map(|s| s.base + s.size)
+        .max()
+        .ok_or(Invalid("no load segments"))?;
     for s in segments {
         memory.map(s.base, s.size, Permissions::RW)?;
         if s.filesz != 0 {
@@ -189,11 +271,13 @@ pub fn load(bytes: &[u8], memory_limit: usize) -> Result<LoadedElf, ElfError> {
         }
         memory.protect(s.base, s.size, s.permissions)?;
     }
-    Ok(LoadedElf {
-        memory,
+    Ok(Image {
         entry,
         phdr,
         phnum,
+        interpreter,
+        bias,
+        end,
     })
 }
 
@@ -251,7 +335,7 @@ mod tests {
     #[test]
     fn rejects_dynamic_elf_and_memory_exhaustion() {
         let mut b = image();
-        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[16..18].copy_from_slice(&1u16.to_le_bytes());
         assert!(load(&b, 4096).is_err());
         b = image();
         b[64..68].copy_from_slice(&3u32.to_le_bytes());
@@ -283,5 +367,34 @@ mod tests {
                 let _ = load(&mutated, 8192);
             }
         }
+    }
+
+    #[test]
+    fn pie_load_bias_and_interpreter_metadata_are_distinct() {
+        let mut main = image();
+        main.resize(210, 0);
+        main[16..18].copy_from_slice(&3u16.to_le_bytes());
+        main[56..58].copy_from_slice(&2u16.to_le_bytes());
+        main[96..104].copy_from_slice(&210u64.to_le_bytes());
+        main[24..32].copy_from_slice(&0x10b0u64.to_le_bytes());
+        main[120..124].copy_from_slice(&3u32.to_le_bytes());
+        main[128..136].copy_from_slice(&192u64.to_le_bytes());
+        let path = b"/lib/ld-test.so\0";
+        main[152..160].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        main[192..192 + path.len()].copy_from_slice(path);
+        let mut loader = image();
+        loader[16..18].copy_from_slice(&3u16.to_le_bytes());
+        let e = load_with_interpreter(&main, 8192, |p| {
+            assert_eq!(p, &path[..path.len() - 1]);
+            Ok(loader.clone())
+        })
+        .unwrap();
+        assert_eq!(e.entry, 0x400010b0);
+        assert_eq!(e.start_entry, 0x70001078);
+        assert_eq!(e.interpreter_base, 0x70000000);
+        assert_eq!(e.phdr, Some(0x40001040));
+        assert_eq!(e.brk_base, 0x40002000);
+        main[192] = b'x';
+        assert!(load_with_interpreter(&main, 8192, |_| Ok(loader.clone())).is_err());
     }
 }

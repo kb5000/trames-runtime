@@ -7,6 +7,10 @@ mod network;
 mod state;
 pub use state::Linux;
 
+pub fn fill_entropy(bytes: &mut [u8]) -> Result<(), trames_vfs::Errno> {
+    getrandom::fill(bytes).map_err(|_| trames_vfs::Errno(5))
+}
+
 pub const SYS_WRITE: u64 = 64;
 pub const SYS_EXIT: u64 = 93;
 pub const SYS_EXIT_GROUP: u64 = 94;

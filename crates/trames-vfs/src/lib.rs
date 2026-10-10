@@ -69,6 +69,7 @@ struct Descriptor {
 enum Content {
     Directory,
     File(storage::FileData),
+    Symlink(Vec<u8>),
     Null,
     Terminal,
 }
@@ -79,10 +80,12 @@ struct Node {
     links: u32,
     times: [storage::Timestamp; 3],
 }
+type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
     inodes: Vec<Weak<RefCell<Node>>>,
     next_inode: u64,
+    flock: BTreeMap<u64, FlockOwners>,
     limits: StorageLimits,
     disk: Option<Rc<storage::DiskStore>>,
     volume: Option<(VolumeSpace, u64)>,
@@ -103,6 +106,7 @@ impl Default for Vfs {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: 1,
+                flock: BTreeMap::new(),
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
@@ -293,6 +297,9 @@ impl Vfs {
         self.path_of(n)
     }
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
+        self.resolve_final(dirfd, path, true)
+    }
+    pub fn resolve_final(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Vec<u8>> {
         if path.is_empty() {
             return Err(Errno(2));
         }
@@ -304,23 +311,27 @@ impl Vfs {
         } else {
             self.base(dirfd)?
         };
-        let parts: Vec<_> = path
+        let mut parts: VecDeque<Vec<u8>> = path
             .split(|&b| b == b'/')
             .filter(|p| !p.is_empty())
+            .map(|p| p.to_vec())
             .collect();
-        for (i, part) in parts.iter().enumerate() {
-            let n = self.node(&current)?;
-            let n = n.borrow();
+        let trailing = path.last() == Some(&b'/');
+        let mut links = 0;
+        while let Some(part) = parts.pop_front() {
+            let node = self.node(&current)?;
+            let n = node.borrow();
             if !matches!(n.content, Content::Directory) {
                 return Err(Errno(20));
             }
             if n.mode & 0o100 == 0 {
                 return Err(Errno(13));
             }
-            if *part == b"." {
+            drop(n);
+            if part == b"." {
                 continue;
             }
-            if *part == b".." {
+            if part == b".." {
                 if current != b"/" {
                     current.truncate(
                         current
@@ -335,21 +346,70 @@ impl Vfs {
             if part.len() > 255 {
                 return Err(Errno(36));
             }
+            let parent = current.clone();
             if current != b"/" {
                 current.push(b'/');
             }
-            current.extend_from_slice(part);
+            current.extend_from_slice(&part);
             if current.len() >= MAX_PATH {
                 return Err(Errno(36));
             }
-            if i + 1 == parts.len() && path.last() == Some(&b'/') {
-                let n = self.node(&current)?;
-                if !matches!(n.borrow().content, Content::Directory) {
-                    return Err(Errno(20));
+            if !parts.is_empty() || follow_final || trailing {
+                if let Ok(node) = self.node(&current) {
+                    if let Content::Symlink(target) = &node.borrow().content {
+                        links += 1;
+                        if links > 40 {
+                            return Err(Errno(40));
+                        }
+                        current = if target.starts_with(b"/") {
+                            b"/".to_vec()
+                        } else {
+                            parent
+                        };
+                        let mut expanded: VecDeque<_> = target
+                            .split(|&b| b == b'/')
+                            .filter(|p| !p.is_empty())
+                            .map(|p| p.to_vec())
+                            .collect();
+                        if target.ends_with(b"/") {
+                            expanded.push_back(b".".to_vec());
+                        }
+                        expanded.append(&mut parts);
+                        if expanded.iter().map(|p| p.len() + 1).sum::<usize>() >= MAX_PATH {
+                            return Err(Errno(36));
+                        }
+                        parts = expanded;
+                    }
                 }
             }
         }
+        if trailing && !self.is_directory(&current) {
+            return Err(Errno(20));
+        }
         Ok(current)
+    }
+    pub fn symlink_at(&mut self, target: &[u8], dirfd: i32, path: &[u8]) -> Result<()> {
+        if target.is_empty() {
+            return Err(Errno(2));
+        }
+        if target.len() >= MAX_PATH || target.contains(&0) {
+            return Err(Errno(36));
+        }
+        let dest = self.resolve_final(dirfd, path, false)?;
+        if self.node(&dest).is_ok() {
+            return Err(Errno(17));
+        }
+        self.check_parent_write(&dest)?;
+        self.insert(dest, Content::Symlink(target.to_vec()), 0o120777)
+    }
+    pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
+        let dest = self.resolve_final(dirfd, path, false)?;
+        let node = self.node(&dest)?;
+        let n = node.borrow();
+        match &n.content {
+            Content::Symlink(target) => Ok(target.clone()),
+            _ => Err(Errno(22)),
+        }
     }
     pub fn import_file(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
         self.import_reader(path, &mut bytes.as_slice(), false)
@@ -430,7 +490,7 @@ impl Vfs {
     /// Explicit embedding API: install an executable/hard link, without duplicating file data.
     pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
         let source = self.node(existing)?;
-        let dest = self.resolve(AT_FDCWD, alias)?;
+        let dest = self.resolve_final(AT_FDCWD, alias, false)?;
         if self.node(&dest).is_ok() {
             return Err(Errno(17));
         }
@@ -472,7 +532,7 @@ impl Vfs {
         }
     }
     pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
-        let p = self.resolve(dirfd, path)?;
+        let p = self.resolve_final(dirfd, path, false)?;
         if self.node(&p).is_ok() {
             return Err(Errno(17));
         }
@@ -484,7 +544,7 @@ impl Vfs {
         )
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
-        let p = self.resolve(dirfd, path)?;
+        let p = self.resolve_final(dirfd, path, false)?;
         if p == b"/" {
             return Err(Errno(16));
         }
@@ -545,7 +605,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         let fd = self.available(0)?;
-        let p = self.resolve(dirfd, path)?;
+        let p = self.resolve_final(dirfd, path, flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0)?;
         let existed = self.node(&p).is_ok();
         if existed && flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
@@ -564,6 +624,9 @@ impl Vfs {
         let node = self.node(&p)?;
         {
             let mut n = node.borrow_mut();
+            if matches!(n.content, Content::Symlink(_)) {
+                return Err(Errno(40));
+            }
             if matches!(n.content, Content::Directory) && flags & 3 != 0 {
                 return Err(Errno(21));
             }
@@ -746,6 +809,7 @@ impl Vfs {
             }
             Content::Null => Ok(Vec::new()),
             Content::Directory => Err(Errno(21)),
+            Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
         };
         if result.is_ok() {
@@ -796,6 +860,7 @@ impl Vfs {
         let result = match &mut n.content {
             Content::Null => Ok(bytes.len()),
             Content::Directory => Err(Errno(21)),
+            Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
             Content::File(b) => {
                 if bytes.is_empty() {
@@ -845,6 +910,7 @@ impl Vfs {
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
             Content::Directory => Err(Errno(21)),
+            Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(29)),
         }
     }
@@ -890,6 +956,7 @@ impl Vfs {
         let length = match &n.content {
             Content::File(b) => b.len(),
             Content::Directory => 0,
+            Content::Symlink(_) => return Err(Errno(40)),
             Content::Null => return Ok(0),
             Content::Terminal => return Err(Errno(29)),
         };
@@ -915,6 +982,7 @@ impl Vfs {
         out[28..32].copy_from_slice(&1000u32.to_le_bytes());
         let size = match &node.content {
             Content::File(b) => b.len(),
+            Content::Symlink(target) => target.len() as u64,
             _ => 0,
         };
         out[48..56].copy_from_slice(&size.to_le_bytes());
@@ -932,7 +1000,10 @@ impl Vfs {
         Ok(out)
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8]) -> Result<[u8; 128]> {
-        let p = self.resolve(dirfd, path)?;
+        self.stat_at_flags(dirfd, path, false)
+    }
+    pub fn stat_at_flags(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<[u8; 128]> {
+        let p = self.resolve_final(dirfd, path, !nofollow)?;
         let n = self.node(&p)?;
         let out = Self::stat_node(&n.borrow());
         out
@@ -956,6 +1027,23 @@ impl Vfs {
             links: 1,
             times: [storage::Timestamp::default(); 3],
         })
+    }
+    pub fn chdir_fd(&mut self, fd: u32) -> Result<()> {
+        let node = self
+            .descriptor(fd)?
+            .open
+            .borrow()
+            .node
+            .clone()
+            .ok_or(Errno(20))?;
+        if !matches!(node.borrow().content, Content::Directory) {
+            return Err(Errno(20));
+        }
+        if node.borrow().mode & 0o100 == 0 {
+            return Err(Errno(13));
+        }
+        self.cwd_node = Some(node);
+        Ok(())
     }
     pub fn chdir(&mut self, path: &[u8]) -> Result<()> {
         let p = self.resolve(AT_FDCWD, path)?;
@@ -998,6 +1086,7 @@ impl Vfs {
                 match n.content {
                     Content::Directory => 4,
                     Content::File(_) => 8,
+                    Content::Symlink(_) => 10,
                     Content::Null | Content::Terminal => 2,
                 },
             ));

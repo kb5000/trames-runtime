@@ -11,5 +11,7 @@ trames-memory = { path = "../trames-memory" }
 trames-vfs = { path = "../trames-vfs" }
 trames-net = { path = "../trames-net" }
 
+getrandom = "=0.3.4"
+
 [lints]
 workspace = true

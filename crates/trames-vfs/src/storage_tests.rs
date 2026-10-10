@@ -345,3 +345,87 @@ fn symlinked_private_objects_and_dangling_lock_are_rejected() {
     );
     assert!(!target.exists());
 }
+
+#[test]
+fn symlinks_persist_resolve_relative_and_do_not_follow_on_unlink() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data/file", b"payload".to_vec()).unwrap();
+    v.symlink_at(b"../data/file", AT_FDCWD, b"/dev/alias")
+        .unwrap();
+    v.symlink_at(b"/dev/alias", AT_FDCWD, b"/other").unwrap();
+    assert_eq!(v.resolve(AT_FDCWD, b"/other").unwrap(), b"/data/file");
+    assert_eq!(
+        v.open_at(AT_FDCWD, b"/other", O_NOFOLLOW, 0),
+        Err(Errno(40))
+    );
+    assert_eq!(
+        size(v.stat_at_flags(AT_FDCWD, b"/other", true).unwrap()),
+        10
+    );
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(
+        v.readlink_at(AT_FDCWD, b"/dev/alias").unwrap(),
+        b"../data/file"
+    );
+    v.unlink_at(AT_FDCWD, b"/other", false).unwrap();
+    assert!(v.stat_at(AT_FDCWD, b"/data/file").is_ok());
+    v.symlink_at(b"loop", AT_FDCWD, b"/loop").unwrap();
+    assert_eq!(v.resolve(AT_FDCWD, b"/loop"), Err(Errno(40)));
+    v.symlink_at(b"/../../data", AT_FDCWD, b"/dir").unwrap();
+    assert_eq!(v.resolve(AT_FDCWD, b"/dir/file").unwrap(), b"/data/file");
+}
+#[test]
+fn flock_is_shared_by_dup_fork_and_released_by_last_close() {
+    let mut v = Vfs::default();
+    v.import_file(b"/lock", vec![]).unwrap();
+    let a = v.open_at(AT_FDCWD, b"/lock", 2, 0).unwrap();
+    let b = v.open_at(AT_FDCWD, b"/lock", 2, 0).unwrap();
+    v.flock(a, 2 | 4).unwrap();
+    assert_eq!(v.flock(b, 1 | 4), Err(Errno(11)));
+    let mut child = v.clone();
+    let alias = child.dup(a, 0, false).unwrap();
+    v.close(a).unwrap();
+    child.close(a).unwrap();
+    assert_eq!(v.flock(b, 2 | 4), Err(Errno(11)));
+    child.close(alias).unwrap();
+    v.flock(b, 1 | 4).unwrap();
+    let c = v.open_at(AT_FDCWD, b"/lock", 2, 0).unwrap();
+    v.flock(c, 1 | 4).unwrap();
+    assert_eq!(v.flock(c, 2 | 4), Err(Errno(11)));
+    v.flock(b, 8).unwrap();
+    v.flock(c, 2 | 4).unwrap();
+}
+
+#[test]
+fn version_one_store_is_readable_and_upgrades_on_checkpoint() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/old", b"v1 data".to_vec()).unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let data = fs::read(dir.0.join("manifest")).unwrap();
+    let count = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
+    let mut legacy = data[..40].to_vec();
+    legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let mut offset = 40;
+    for _ in 0..count {
+        legacy.extend_from_slice(&data[offset..offset + 64]);
+        assert_eq!(&data[offset + 64..offset + 68], &[0; 4]);
+        offset += 68;
+    }
+    legacy.extend_from_slice(&data[offset..data.len() - 8]);
+    legacy.extend(storage::checksum(&legacy).to_le_bytes());
+    fs::write(dir.0.join("manifest"), legacy).unwrap();
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/old", 0, 0).unwrap();
+    assert_eq!(v.read(fd, 32).unwrap(), b"v1 data");
+    v.checkpoint().unwrap();
+    drop(v);
+    assert_eq!(
+        &fs::read(dir.0.join("manifest")).unwrap()[8..12],
+        &2u32.to_le_bytes()
+    );
+}

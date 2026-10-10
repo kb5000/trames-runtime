@@ -174,12 +174,14 @@ impl Linux {
     }
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
+        if len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+            return Err(Errno(12));
+        }
         let flags = a[3];
-        const ALLOWED: u64 = 2 | 0x10 | 0x20 | 0x100000;
+        const ALLOWED: u64 = 2 | 0x10 | 0x20 | 0x800 | 0x100000;
         if a[2] & !7 != 0
             || flags & !ALLOWED != 0
             || flags & 2 == 0
-            || flags & 0x20 == 0
             || !a[5].is_multiple_of(PAGE_SIZE)
         {
             return Err(Errno(22));
@@ -203,12 +205,45 @@ impl Linux {
             write: a[2] & 2 != 0,
             execute: a[2] & 4 != 0,
         };
-        let result = if flags & 0x10 != 0 {
-            memory.map_fixed(address, len, permissions)
+        // Read and validate the backing descriptor before MAP_FIXED changes memory.
+        let file_bytes = if flags & 0x20 == 0 {
+            let fd = a[4] as u32;
+            let flags = self.vfs.flags(fd)?;
+            if flags & 3 == 1 {
+                return Err(Errno(13));
+            }
+            let stat = self.vfs.stat_fd(fd)?;
+            if u32::from_le_bytes(stat[16..20].try_into().expect("stat")) & 0o170000 != 0o100000 {
+                return Err(Errno(19));
+            }
+            let mut bytes = Vec::new();
+            while bytes.len() < len as usize {
+                let chunk = self.vfs.pread(
+                    fd,
+                    (len as usize - bytes.len()).min(MAX_WRITE),
+                    a[5].checked_add(bytes.len() as u64).ok_or(Errno(22))?,
+                )?;
+                if chunk.is_empty() {
+                    break;
+                }
+                bytes.extend(chunk);
+            }
+            Some(bytes)
         } else {
-            memory.map(address, len, permissions)
+            None
+        };
+        let result = if flags & 0x10 != 0 {
+            memory.map_fixed(address, len, Permissions::RW)
+        } else {
+            memory.map(address, len, Permissions::RW)
         };
         result.map_err(|_| Errno(12))?;
+        if let Some(bytes) = file_bytes {
+            memory.write(address, &bytes).map_err(|_| Errno(14))?;
+        }
+        memory
+            .protect(address, len, permissions)
+            .map_err(|_| Errno(12))?;
         if !fixed {
             self.mmap_next = address + len;
         }
@@ -253,6 +288,21 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            32 => {
+                self.vfs.flock(a[0] as u32, a[1] as u32)?;
+                Ok(0)
+            }
+            278 => {
+                if a[2] & !3 != 0 {
+                    return Err(Errno(22));
+                }
+                let count = a[1].min(MAX_WRITE as u64) as usize;
+                Self::check(memory, a[0], count, Access::Write)?;
+                let mut bytes = vec![0; count];
+                super::fill_entropy(&mut bytes)?;
+                memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
+                Ok(count as u64)
+            }
             198..=212 | 242 => self.network_syscall(number, a, memory),
             37 => {
                 if a[4] & !0x400 != 0 {
@@ -415,7 +465,8 @@ impl Linux {
                 let stat = if path.is_empty() && a[3] & 0x1000 != 0 {
                     self.vfs.stat_fd(a[0] as u32)?
                 } else {
-                    self.vfs.stat_at(a[0] as i32, &path)?
+                    self.vfs
+                        .stat_at_flags(a[0] as i32, &path, a[3] & 0x100 != 0)?
                 };
                 memory.write(a[2], &stat).map_err(|_| Errno(14))?;
                 Ok(0)
@@ -436,6 +487,10 @@ impl Linux {
                 bytes.push(0);
                 memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
                 Ok(len as u64)
+            }
+            50 => {
+                self.vfs.chdir_fd(a[0] as u32)?;
+                Ok(0)
             }
             49 => {
                 let path = Self::path(memory, a[0])?;
@@ -479,11 +534,25 @@ impl Linux {
                     Ok(0)
                 }
             }
+            36 => {
+                let target = Self::path(memory, a[0])?;
+                let path = Self::path(memory, a[2])?;
+                self.vfs.symlink_at(&target, a[1] as i32, &path)?;
+                Ok(0)
+            }
             78 => {
+                if a[3] == 0 {
+                    return Err(Errno(22));
+                }
                 let path = Self::path(memory, a[1])?;
-                self.vfs.stat_at(a[0] as i32, &path)?;
-                Err(Errno(22))
-            } // no symlinks in M1
+                let target = self.vfs.readlink_at(a[0] as i32, &path)?;
+                let count = (a[3] as usize).min(target.len());
+                Self::check(memory, a[2], count, Access::Write)?;
+                memory
+                    .write(a[2], &target[..count])
+                    .map_err(|_| Errno(14))?;
+                Ok(count as u64)
+            }
             96 => {
                 if a[0] != 0 {
                     Self::check(memory, a[0], 4, Access::Write)?;

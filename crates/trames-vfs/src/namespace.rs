@@ -1,9 +1,49 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Vfs {
+    pub fn flock(&mut self, fd: u32, operation: u32) -> Result<()> {
+        if operation & !15 != 0 || !matches!(operation & !4, 1 | 2 | 8) {
+            return Err(Errno(22));
+        }
+        let open = self.descriptor(fd)?.open.clone();
+        let inode = open.borrow().node.as_ref().ok_or(Errno(9))?.borrow().inode;
+        let mut fs = self.fs.borrow_mut();
+        fs.flock.retain(|_, owners| {
+            owners.retain(|(owner, _)| owner.strong_count() != 0);
+            !owners.is_empty()
+        });
+        let owners = fs.flock.entry(inode).or_default();
+        let kind = operation & !4;
+        // Linux conversion drops this description's old lock before competing
+        // for the new one; it is not an atomic lock upgrade.
+        owners.retain(|(owner, _)| {
+            !owner
+                .upgrade()
+                .is_some_and(|other| Rc::ptr_eq(&other, &open))
+        });
+        if kind != 8
+            && owners.iter().any(|(owner, lock)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|other| !Rc::ptr_eq(&other, &open) && (kind == 2 || *lock == 2))
+            })
+        {
+            return Err(Errno(11));
+        }
+        owners.retain(|(owner, _)| {
+            !owner
+                .upgrade()
+                .is_some_and(|other| Rc::ptr_eq(&other, &open))
+        });
+        if kind != 8 {
+            owners.push((Rc::downgrade(&open), kind));
+        }
+        Ok(())
+    }
+
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
-        let source = self.resolve(oldfd, old)?;
-        let dest = self.resolve(newfd, new)?;
+        let source = self.resolve_final(oldfd, old, false)?;
+        let dest = self.resolve_final(newfd, new, false)?;
         self.check_parent_write(&dest)?;
         self.import_alias(&source, &dest, false)
     }
@@ -20,8 +60,8 @@ impl Vfs {
         if flags & !1 != 0 {
             return Err(Errno(22));
         }
-        let source = self.resolve(oldfd, old)?;
-        let dest = self.resolve(newfd, new)?;
+        let source = self.resolve_final(oldfd, old, false)?;
+        let dest = self.resolve_final(newfd, new, false)?;
         if source == b"/" || dest == b"/" {
             return Err(Errno(16));
         }

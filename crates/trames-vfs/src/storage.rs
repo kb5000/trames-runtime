@@ -386,7 +386,7 @@ impl Filesystem {
             nodes.insert(n.borrow().inode, n.clone());
         }
         let mut out = b"TRAMESFS".to_vec();
-        out.extend(1u32.to_le_bytes());
+        out.extend(2u32.to_le_bytes());
         out.extend(self.limits.file_bytes.to_le_bytes());
         out.extend((self.limits.nodes as u32).to_le_bytes());
         out.extend(self.next_inode.to_le_bytes());
@@ -402,6 +402,7 @@ impl Filesystem {
                     Content::File(_) => 1,
                     Content::Null => 2,
                     Content::Terminal => 3,
+                    Content::Symlink(_) => 4,
                 },
                 0,
                 0,
@@ -411,6 +412,12 @@ impl Filesystem {
                 out.extend(t.seconds.to_le_bytes());
                 out.extend(t.nanos.to_le_bytes());
                 out.extend([0; 4]);
+            }
+            if let Content::Symlink(target) = &n.content {
+                out.extend((target.len() as u32).to_le_bytes());
+                out.extend(target);
+            } else {
+                out.extend(0u32.to_le_bytes());
             }
         }
         for (path, n) in &self.paths {
@@ -460,7 +467,11 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         return Err(Errno(22));
     }
     let mut d = Decoder { data, at: 0 };
-    if d.take(8)? != b"TRAMESFS" || d.u32()? != 1 {
+    if d.take(8)? != b"TRAMESFS" {
+        return Err(Errno(22));
+    }
+    let version = d.u32()?;
+    if version != 1 && version != 2 {
         return Err(Errno(22));
     }
     let limits = StorageLimits {
@@ -491,11 +502,24 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 return Err(Errno(22));
             }
         }
+        let target = if version == 2 {
+            let size = d.u32()? as usize;
+            if size >= MAX_PATH {
+                return Err(Errno(22));
+            }
+            d.take(size)?.to_vec()
+        } else {
+            Vec::new()
+        };
+        if (kind[0] == 4) == target.is_empty() || target.contains(&0) {
+            return Err(Errno(22));
+        }
         let (content, type_) = match kind[0] {
             0 => (Content::Directory, 0o40000),
             1 => (Content::File(disk.load(ino)?), 0o100000),
             2 => (Content::Null, 0o20000),
             3 => (Content::Terminal, 0o20000),
+            4 => (Content::Symlink(target), 0o120000),
             _ => return Err(Errno(22)),
         };
         if mode & !0o777 != type_ {
@@ -572,6 +596,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     }
     disk.recover(&nodes)?;
     Ok(Filesystem {
+        flock: BTreeMap::new(),
         paths,
         inodes: nodes.values().map(Rc::downgrade).collect(),
         next_inode,
@@ -580,7 +605,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         volume: None,
     })
 }
-fn checksum(data: &[u8]) -> u64 {
+pub(super) fn checksum(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
     })
