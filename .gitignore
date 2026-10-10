@@ -4,3 +4,7 @@
 *.o
 __pycache__/
 *.py[cod]
+**/.build/
+apps/ios/build/
+**/xcuserdata/
+*.xcuserstate

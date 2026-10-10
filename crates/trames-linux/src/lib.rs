@@ -28,6 +28,11 @@ pub enum TerminalEvent {
 }
 
 pub trait GuestOutput {
+    /// Embedding control at each scheduler round. Returning false cancels the
+    /// entire session. Host adapters may perform queued, authorized VFS work here.
+    fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
+        Ok(true)
+    }
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize>;
     fn read_stdin(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
         Ok(0)
