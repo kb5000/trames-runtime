@@ -58,6 +58,7 @@ impl Vfs {
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
                     id: self.open_id(),
+                    owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Socket,
                     flags: 2 | (flags & O_NONBLOCK),
                     position: 0,
@@ -65,6 +66,8 @@ impl Vfs {
                     pipe: None,
                     socket: Some(socket),
                     bridge: None,
+                    anonymous: None,
+                    local: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },

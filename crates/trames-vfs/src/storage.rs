@@ -424,6 +424,7 @@ impl Filesystem {
                     Content::Null => 2,
                     Content::Terminal => 3,
                     Content::Symlink(_) => 4,
+                    Content::Fifo(_) => 5,
                     Content::Device(_) => return Err(Errno(95)),
                 },
                 0,
@@ -539,6 +540,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             2 => (Content::Null, 0o20000),
             3 => (Content::Terminal, 0o20000),
             4 => (Content::Symlink(target), 0o120000),
+            5 => (Content::Fifo(Pipe::new(ino)), 0o10000),
             _ => return Err(Errno(22)),
         };
         if mode & !0o7777 != type_ {
@@ -620,6 +622,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     disk.recover(&nodes)?;
     Ok(Filesystem {
         flock: BTreeMap::new(),
+        record_locks: BTreeMap::new(),
         paths,
         inodes: nodes.values().map(Rc::downgrade).collect(),
         next_inode,

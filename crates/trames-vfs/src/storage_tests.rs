@@ -30,6 +30,24 @@ fn size(stat: [u8; 128]) -> u64 {
     u64::from_le_bytes(stat[48..56].try_into().unwrap())
 }
 #[test]
+fn fifo_inode_persists_but_live_channel_does_not() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mknod_at(AT_FDCWD, b"/fifo", 0o10640, 0).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/fifo", 2 | O_NONBLOCK, 0).unwrap();
+    v.write(fd, b"unpersisted").unwrap();
+    let stat = v.stat_fd(fd).unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    let reopened = v.stat_at(AT_FDCWD, b"/fifo").unwrap();
+    assert_eq!(&stat[..32], &reopened[..32]);
+    let fd = v.open_at(AT_FDCWD, b"/fifo", 2 | O_NONBLOCK, 0).unwrap();
+    assert_eq!(v.read(fd, 32), Err(Errno(11)));
+    v.write(fd, b"live").unwrap();
+    assert_eq!(v.read(fd, 32).unwrap(), b"live");
+}
+#[test]
 #[cfg(target_os = "linux")]
 fn closed_inodes_do_not_retain_native_file_descriptors() {
     let dir = Temp::new();

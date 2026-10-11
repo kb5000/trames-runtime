@@ -127,7 +127,9 @@ impl Vectors {
 }
 impl Linux {
     pub(super) fn network_ioctl(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
-        self.vfs.socket_fd(a[0] as u32)?;
+        if self.vfs.local_socket(a[0] as u32)?.is_none() {
+            self.vfs.socket_fd(a[0] as u32)?;
+        }
         let request = a[1] as u32;
         if request != 0x5421 {
             let info = self.vfs.network_info().ok_or(Errno(25))?;
@@ -253,8 +255,15 @@ impl Linux {
             return Ok(self.vfs.socket(a[0] as u32, a[1] as u32, a[2] as u32)? as u64);
         }
         if number == 199 {
-            return Err(Errno(97));
-        } // AF_UNIX/socketpair is a separate virtual IPC backend
+            Self::check(memory, a[3], 8, Access::Write)?;
+            let fds = self.vfs.socketpair(a[0] as u32, a[1] as u32, a[2] as u32)?;
+            let bytes: Vec<_> = fds.into_iter().flat_map(u32::to_le_bytes).collect();
+            memory.write(a[3], &bytes).map_err(|_| Errno(14))?;
+            return Ok(0);
+        }
+        if let Some(socket) = self.vfs.local_socket(a[0] as u32)? {
+            return self.local_network_syscall(&socket, number, a, memory);
+        }
         let socket = self.vfs.socket_fd(a[0] as u32)?;
         match number {
             200 | 203 => {
@@ -452,6 +461,140 @@ impl Linux {
                 }
             }
             _ => Err(Errno(38)),
+        }
+    }
+    fn local_network_syscall(
+        &self,
+        socket: &trames_vfs::LocalSocket,
+        number: u64,
+        a: [u64; 6],
+        memory: &mut Memory,
+    ) -> Result<u64> {
+        match number {
+            204 | 205 => {
+                let output = AddressOutput::prepare(memory, a[1], a[2], 2)?.ok_or(Errno(14))?;
+                output.write_bytes(memory, &[1, 0])?;
+                Ok(0)
+            }
+            206 => {
+                if a[4] != 0 {
+                    return Err(Errno(106));
+                }
+                let count = a[2].min(super::MAX_WRITE as u64) as usize;
+                Self::check(memory, a[1], count, Access::Read)?;
+                let mut bytes = vec![0; count];
+                memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
+                Ok(socket.send(&bytes, a[3] as u32)? as u64)
+            }
+            207 => {
+                let count = a[2].min(super::MAX_WRITE as u64) as usize;
+                Self::check(memory, a[1], count, Access::Write)?;
+                let output = AddressOutput::prepare(memory, a[4], a[5], 2)?;
+                let received = socket.recv(count, a[3] as u32)?;
+                memory.write(a[1], &received.data).map_err(|_| Errno(14))?;
+                if let Some(output) = output {
+                    output.write_bytes(memory, if socket.kind() == 1 { &[] } else { &[1, 0] })?;
+                }
+                Ok(if a[3] & MSG_TRUNC as u64 != 0 {
+                    received.length
+                } else {
+                    received.data.len()
+                } as u64)
+            }
+            209 => {
+                if a[1] != 1 {
+                    return Err(Errno(92));
+                }
+                let value: u32 = match a[2] {
+                    3 => socket.kind(),
+                    4 => 0,
+                    7 | 8 => trames_vfs::PIPE_CAPACITY as u32,
+                    16 => 0,
+                    38 => 0,
+                    39 => 1,
+                    _ => return Err(Errno(92)),
+                };
+                let size = u32_at(memory, a[4])? as usize;
+                Self::check(memory, a[4], 4, Access::Write)?;
+                Self::check(memory, a[3], size.min(4), Access::Write)?;
+                memory
+                    .write(a[3], &value.to_le_bytes()[..size.min(4)])
+                    .map_err(|_| Errno(14))?;
+                memory
+                    .write(a[4], &(size.min(4) as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            210 => {
+                socket.shutdown(a[1] as u32)?;
+                Ok(0)
+            }
+            211 | 212 => {
+                let receive = number == 212;
+                Self::check(memory, a[1], 56, Access::Read)?;
+                if receive {
+                    Self::check(memory, a[1], 56, Access::Write)?;
+                }
+                let name = u64_at(memory, a[1])?;
+                let control_size = u64_at(memory, a[1] + 40)?;
+                if !receive && control_size != 0 {
+                    return Err(Errno(95));
+                }
+                if !receive && name != 0 {
+                    return Err(Errno(106));
+                }
+                if receive && control_size != 0 {
+                    if control_size > super::MAX_WRITE as u64 {
+                        return Err(Errno(22));
+                    }
+                    Self::check(
+                        memory,
+                        u64_at(memory, a[1] + 32)?,
+                        control_size as usize,
+                        Access::Write,
+                    )?;
+                }
+                let output = if receive {
+                    AddressOutput::prepare(memory, name, a[1] + 8, 2)?
+                } else {
+                    None
+                };
+                let vectors = Vectors::prepare(
+                    memory,
+                    u64_at(memory, a[1] + 16)?,
+                    u64_at(memory, a[1] + 24)?,
+                    if receive { Access::Write } else { Access::Read },
+                )?;
+                if receive {
+                    let received = socket.recv(vectors.size, a[2] as u32)?;
+                    vectors.write(memory, &received.data)?;
+                    if let Some(output) = output {
+                        output
+                            .write_bytes(memory, if socket.kind() == 1 { &[] } else { &[1, 0] })?;
+                    } else {
+                        memory
+                            .write(a[1] + 8, &0u32.to_le_bytes())
+                            .map_err(|_| Errno(14))?;
+                    }
+                    memory
+                        .write(a[1] + 40, &0u64.to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                    memory
+                        .write(
+                            a[1] + 48,
+                            &(if received.truncated { MSG_TRUNC } else { 0 }).to_le_bytes(),
+                        )
+                        .map_err(|_| Errno(14))?;
+                    Ok(if a[2] & MSG_TRUNC as u64 != 0 {
+                        received.length
+                    } else {
+                        received.data.len()
+                    } as u64)
+                } else {
+                    Ok(socket.send(&vectors.read(memory)?, a[2] as u32)? as u64)
+                }
+            }
+            _ => Err(Errno(95)),
         }
     }
 }

@@ -2,7 +2,7 @@
 use super::{errno, io_errno, GuestOutput, OutputFd, SyscallOutcome, MAX_WRITE};
 use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
-use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH};
+use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH, O_NONBLOCK};
 
 type Result<T> = std::result::Result<T, Errno>;
 #[derive(Clone)]
@@ -63,6 +63,22 @@ impl Linux {
             }
         })
     }
+    pub fn record_lock_holder(&self, memory: &Memory, a: [u64; 6]) -> Result<Option<u32>> {
+        Self::check(memory, a[2], 32, Access::Read)?;
+        let mut bytes = [0; 32];
+        memory.read(a[2], &mut bytes).map_err(|_| Errno(14))?;
+        let requested = self.vfs.normalize_lock(
+            a[0] as u32,
+            u16::from_le_bytes(bytes[..2].try_into().expect("lock type")),
+            u16::from_le_bytes(bytes[2..4].try_into().expect("lock whence")),
+            i64::from_le_bytes(bytes[8..16].try_into().expect("lock start")),
+            i64::from_le_bytes(bytes[16..24].try_into().expect("lock length")),
+        )?;
+        Ok(self
+            .vfs
+            .record_lock_conflict(a[0] as u32, requested)?
+            .map(|lock| lock.owner))
+    }
     pub fn check(memory: &Memory, address: u64, count: usize, access: Access) -> Result<()> {
         if address >= ADDRESS_LIMIT {
             return Err(Errno(14));
@@ -89,9 +105,11 @@ impl Linux {
                 Ok(count as u64)
             }
             FdKind::Stdin => Err(Errno(9)),
-            FdKind::Node(_) | FdKind::PipeRead | FdKind::PipeWrite | FdKind::Socket => {
-                Ok(self.vfs.write(fd, bytes)? as u64)
-            }
+            FdKind::Node(_)
+            | FdKind::PipeRead
+            | FdKind::PipeWrite
+            | FdKind::Socket
+            | FdKind::Anonymous => Ok(self.vfs.write(fd, bytes)? as u64),
             FdKind::Terminal => Err(Errno(25)),
         }
     }
@@ -365,6 +383,24 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            19 => Ok(self.vfs.eventfd(a[0] as u32, a[1] as u32)? as u64),
+            20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
+            21 => {
+                let (events, data) = if a[1] == 2 {
+                    (0, 0)
+                } else {
+                    Self::check(memory, a[3], 16, Access::Read)?;
+                    let mut bytes = [0; 4];
+                    memory.read(a[3], &mut bytes).map_err(|_| Errno(14))?;
+                    (
+                        u32::from_le_bytes(bytes),
+                        memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
+                    )
+                };
+                self.vfs
+                    .epoll_ctl(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
+                Ok(0)
+            }
             32 => {
                 self.vfs.flock(a[0] as u32, a[1] as u32)?;
                 Ok(0)
@@ -540,6 +576,11 @@ impl Linux {
                 self.vfs.close(a[0] as u32)?;
                 Ok(0)
             }
+            33 => {
+                let path = Self::path(memory, a[1])?;
+                self.vfs.mknod_at(a[0] as i32, &path, a[2] as u32, a[3])?;
+                Ok(0)
+            }
             34 => {
                 let path = Self::path(memory, a[1])?;
                 self.vfs.mkdir_at(a[0] as i32, &path, a[2] as u32)?;
@@ -609,11 +650,70 @@ impl Linux {
                         self.vfs.set_status_flags(a[0] as u32, a[2] as u32)?;
                         Ok(0)
                     }
+                    5..=7 => {
+                        Self::check(memory, a[2], 32, Access::Read)?;
+                        if a[1] == 5 {
+                            Self::check(memory, a[2], 32, Access::Write)?;
+                        }
+                        let mut bytes = [0; 32];
+                        memory.read(a[2], &mut bytes).map_err(|_| Errno(14))?;
+                        let kind = u16::from_le_bytes(bytes[..2].try_into().expect("flock type"));
+                        let whence =
+                            u16::from_le_bytes(bytes[2..4].try_into().expect("flock whence"));
+                        let start =
+                            i64::from_le_bytes(bytes[8..16].try_into().expect("flock start"));
+                        let length =
+                            i64::from_le_bytes(bytes[16..24].try_into().expect("flock length"));
+                        let requested =
+                            self.vfs
+                                .normalize_lock(a[0] as u32, kind, whence, start, length)?;
+                        if a[1] == 5 {
+                            if kind == 2 {
+                                return Err(Errno(22));
+                            }
+                            if let Some(conflict) =
+                                self.vfs.record_lock_conflict(a[0] as u32, requested)?
+                            {
+                                bytes[..2].copy_from_slice(&conflict.kind.to_le_bytes());
+                                bytes[2..4].copy_from_slice(&0u16.to_le_bytes());
+                                bytes[8..16].copy_from_slice(&conflict.start.to_le_bytes());
+                                bytes[16..24].copy_from_slice(
+                                    &(if conflict.end == u64::MAX {
+                                        0
+                                    } else {
+                                        conflict.end - conflict.start
+                                    })
+                                    .to_le_bytes(),
+                                );
+                                bytes[24..28].copy_from_slice(&conflict.owner.to_le_bytes());
+                            } else {
+                                bytes[..2].copy_from_slice(&2u16.to_le_bytes());
+                            }
+                            memory.write(a[2], &bytes).map_err(|_| Errno(14))?;
+                        } else {
+                            self.vfs.record_lock_set(a[0] as u32, requested)?;
+                        }
+                        Ok(0)
+                    }
                     _ => Err(Errno(22)),
                 }
             }
             29 => {
-                if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
+                if a[1] as u32 == 0x5421 {
+                    let flags = self.vfs.flags(a[0] as u32)? & (3 | 0x400 | O_NONBLOCK);
+                    let mut value = [0; 4];
+                    memory.read(a[2], &mut value).map_err(|_| Errno(14))?;
+                    let nonblock = u32::from_le_bytes(value) != 0;
+                    self.vfs.set_status_flags(
+                        a[0] as u32,
+                        if nonblock {
+                            flags | O_NONBLOCK
+                        } else {
+                            flags & !O_NONBLOCK
+                        },
+                    )?;
+                    Ok(0)
+                } else if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
                     self.network_ioctl(a, memory)
                 } else {
                     Err(Errno(25))

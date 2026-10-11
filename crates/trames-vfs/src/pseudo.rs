@@ -248,6 +248,9 @@ pub struct RuntimeInfo {
     pub cpu_features: &'static str,
     pub processes: Vec<ProcessInfo>,
     pub uptime: Duration,
+    pub boot_time: u64,
+    pub context_switches: u64,
+    pub cpu_user_ticks: u64,
     pub idle: Duration,
     pub memory_limit: usize,
     pub load: [f64; 3],
@@ -411,6 +414,7 @@ impl Vfs {
     pub fn fd_snapshot(&self) -> Vec<FdInfo> {
         self.fds
             .iter()
+            .filter(|(fd, _)| self.descriptor(**fd).is_ok())
             .map(|(&fd, d)| {
                 let o = d.open.borrow();
                 let node = o.node.clone().or_else(|| {
@@ -438,6 +442,12 @@ impl Vfs {
                         .as_ref()
                         .and_then(|n| self.path_of(n).ok())
                         .unwrap_or_else(|| b"/dev/pts/0".to_vec()),
+                    FdKind::Anonymous => o
+                        .anonymous
+                        .as_ref()
+                        .expect("anonymous description")
+                        .name()
+                        .to_vec(),
                     FdKind::Socket => format!("socket:[{inode}]").into_bytes(),
                     FdKind::PipeRead | FdKind::PipeWrite => format!("pipe:[{inode}]").into_bytes(),
                     FdKind::Stdin | FdKind::Stdout | FdKind::Stderr => {
@@ -570,7 +580,7 @@ impl Vfs {
         if flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
         }
-        if original.socket.is_some() {
+        if original.socket.is_some() || original.local.is_some() || original.anonymous.is_some() {
             return Err(Errno(6));
         }
         if flags & O_DIRECTORY != 0
@@ -594,6 +604,7 @@ impl Vfs {
         }
         let descriptor = OpenDescription {
             id: self.open_id(),
+            owner: original.owner,
             kind: original.kind.clone(),
             flags: flags & !O_CLOEXEC,
             position: 0,
@@ -601,6 +612,8 @@ impl Vfs {
             pipe: original.pipe.clone(),
             socket: None,
             bridge: original.bridge.clone(),
+            anonymous: None,
+            local: None,
         };
         drop(original);
         let fd = self.available(0)?;
@@ -662,9 +675,15 @@ impl Vfs {
         } else {
             self.storage_stat()
         };
-        if o.socket.is_some() || o.pipe.is_some() {
+        if o.socket.is_some()
+            || o.local.is_some()
+            || (o.pipe.is_some() && o.node.is_none())
+            || o.anonymous.is_some()
+        {
             out.fill(0);
-            let magic = if o.socket.is_some() {
+            let magic = if o.anonymous.is_some() {
+                0x09041934u64
+            } else if o.socket.is_some() || o.local.is_some() {
                 0x534f434bu64
             } else {
                 0x50495045
@@ -781,10 +800,10 @@ impl Vfs {
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
             b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\n".to_vec())),
             b"/proc/stat" => {
-                let user: u64 = r.processes.iter().map(|p| p.user_ticks).sum();
+                let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;
                 let running = r.processes.iter().filter(|p| p.state == 'R').count();
-                return Ok(regular(format!("cpu {user} 0 0 {idle} 0 0 0 0 0 0\ncpu0 {user} 0 0 {idle} 0 0 0 0 0 0\nprocesses {}\nprocs_running {running}\nprocs_blocked 0\n", r.processes_created).into_bytes()));
+                return Ok(regular(format!("cpu {user} 0 0 {idle} 0 0 0 0 0 0\ncpu0 {user} 0 0 {idle} 0 0 0 0 0 0\nintr 0\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {running}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n", r.context_switches, r.boot_time, r.processes_created).into_bytes()));
             }
             b"/proc/loadavg" => {
                 let running = r.processes.iter().filter(|p| p.state == 'R').count();
@@ -871,7 +890,7 @@ impl Vfs {
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.mapped_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
-                        b"limits" => format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             32                   32                   processes\nMax address space         67108864             67108864             bytes\nMax file size             {0:<20} {0:<20} bytes\n", self.capacity().budget_bytes).into_bytes(),
+                        b"limits" => format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             32                   32                   processes\nMax address space         536870912            536870912             bytes\nMax file size             {0:<20} {0:<20} bytes\n", self.capacity().budget_bytes).into_bytes(),
                         _ => return Ok(None),
                     };
                     return Ok(regular(value));

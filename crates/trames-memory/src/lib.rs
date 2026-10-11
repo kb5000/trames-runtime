@@ -4,7 +4,7 @@ use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, sync::Arc};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
-pub const DEFAULT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {

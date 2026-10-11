@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 mod credentials;
+mod events;
+mod ipc;
+mod locks;
+pub use ipc::{LocalReceived, LocalSocket};
+pub use locks::RecordLock;
 mod namespace;
 mod network;
 mod pseudo;
@@ -47,19 +52,77 @@ pub enum FdKind {
     PipeWrite,
     Terminal,
     Socket,
+    Anonymous,
 }
 struct Pipe {
     inode: u64,
     bytes: VecDeque<u8>,
-    reader: Weak<PipeEnd>,
-    writer: Weak<PipeEnd>,
+    readers: u32,
+    writers: u32,
+    read_epoch: u64,
+    write_epoch: u64,
 }
 struct PipeEnd {
     pipe: Rc<RefCell<Pipe>>,
     read: bool,
+    write: bool,
+    waiting: Cell<Option<u64>>,
+    initial_write_epoch: u64,
+}
+impl Pipe {
+    fn new(inode: u64) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            inode,
+            bytes: VecDeque::new(),
+            readers: 0,
+            writers: 0,
+            read_epoch: 0,
+            write_epoch: 0,
+        }))
+    }
+}
+impl PipeEnd {
+    fn new(pipe: Rc<RefCell<Pipe>>, read: bool, write: bool, block: bool) -> Rc<Self> {
+        let mut p = pipe.borrow_mut();
+        let initial_write_epoch = p.write_epoch.wrapping_sub(u64::from(p.writers != 0));
+        let waiting = if block && read && !write && p.writers == 0 {
+            Some(p.write_epoch)
+        } else if block && write && !read && p.readers == 0 {
+            Some(p.read_epoch)
+        } else {
+            None
+        };
+        if read {
+            p.readers += 1;
+            p.read_epoch = p.read_epoch.wrapping_add(1);
+        }
+        if write {
+            p.writers += 1;
+            p.write_epoch = p.write_epoch.wrapping_add(1);
+        }
+        drop(p);
+        Rc::new(Self {
+            pipe,
+            read,
+            write,
+            waiting: Cell::new(waiting),
+            initial_write_epoch,
+        })
+    }
+}
+impl Drop for PipeEnd {
+    fn drop(&mut self) {
+        let mut p = self.pipe.borrow_mut();
+        p.readers -= u32::from(self.read);
+        p.writers -= u32::from(self.write);
+        if p.readers == 0 && p.writers == 0 {
+            p.bytes.clear();
+        }
+    }
 }
 struct OpenDescription {
     id: u64,
+    owner: (u32, u32),
     kind: FdKind,
     flags: u32,
     position: u64,
@@ -67,6 +130,8 @@ struct OpenDescription {
     pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
+    anonymous: Option<events::Anonymous>,
+    local: Option<Rc<LocalSocket>>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -80,6 +145,7 @@ enum Content {
     Null,
     Terminal,
     Device(pseudo::Device),
+    Fifo(Rc<RefCell<Pipe>>),
 }
 struct Node {
     device: u64,
@@ -98,6 +164,7 @@ struct Filesystem {
     inodes: Vec<Weak<RefCell<Node>>>,
     next_inode: u64,
     flock: BTreeMap<u64, FlockOwners>,
+    record_locks: BTreeMap<u64, Vec<RecordLock>>,
     limits: StorageLimits,
     disk: Option<Rc<storage::DiskStore>>,
     volume: Option<(VolumeSpace, u64)>,
@@ -112,6 +179,7 @@ pub struct Vfs {
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     pid: u32,
+    lock_owner: u32,
     next_open: Rc<Cell<u64>>,
     bridge: Option<trames_bridge::Broker>,
 }
@@ -124,6 +192,7 @@ impl Default for Vfs {
                 inodes: Vec::new(),
                 next_inode: 1,
                 flock: BTreeMap::new(),
+                record_locks: BTreeMap::new(),
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
@@ -134,6 +203,7 @@ impl Default for Vfs {
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             pid: 1,
+            lock_owner: 1,
             next_open: Rc::new(Cell::new(1)),
             bridge: None,
         };
@@ -154,6 +224,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
                         id: v.open_id(),
+                        owner: (v.credentials.fsuid, v.credentials.fsgid),
                         kind,
                         flags,
                         position: 0,
@@ -161,6 +232,8 @@ impl Default for Vfs {
                         pipe: None,
                         socket: None,
                         bridge: None,
+                        anonymous: None,
+                        local: None,
                     })),
                     cloexec: false,
                 },
@@ -215,7 +288,18 @@ impl Vfs {
         let Ok(d) = self.descriptor(fd) else {
             return 32;
         };
-        let o = d.open.borrow();
+        Self::poll_open(&d.open.borrow(), events)
+    }
+    fn poll_open(o: &OpenDescription, events: u16) -> u16 {
+        if matches!(o.kind, FdKind::Stdout | FdKind::Stderr) {
+            return events & 4;
+        }
+        if let Some(local) = &o.local {
+            return local.poll(events);
+        }
+        if let Some(anonymous) = &o.anonymous {
+            return anonymous.poll(events);
+        }
         if let Some(bridge) = &o.bridge {
             return bridge.poll(events);
         }
@@ -227,16 +311,19 @@ impl Vfs {
             let p = end.pipe.borrow();
             ready = 0;
             if end.read {
-                if !p.bytes.is_empty() || p.writer.strong_count() == 0 {
+                if !p.bytes.is_empty() {
                     ready |= events & 1;
                 }
-                if p.writer.strong_count() == 0 {
+                if p.writers == 0 && p.write_epoch != end.initial_write_epoch {
                     ready |= 16;
                 }
-            } else if p.reader.strong_count() == 0 {
-                ready |= 8;
-            } else if PIPE_CAPACITY - p.bytes.len() >= 4096 {
-                ready |= events & 4;
+            }
+            if end.write {
+                if p.readers == 0 {
+                    ready |= 8;
+                } else if PIPE_CAPACITY - p.bytes.len() >= 4096 {
+                    ready |= events & 4;
+                }
             }
         }
         ready
@@ -251,6 +338,7 @@ impl Vfs {
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
                         id: self.open_id(),
+                        owner: (self.credentials.fsuid, self.credentials.fsgid),
                         kind: FdKind::Terminal,
                         flags: 2,
                         position: 0,
@@ -258,6 +346,8 @@ impl Vfs {
                         pipe: None,
                         socket: None,
                         bridge: None,
+                        anonymous: None,
+                        local: None,
                     })),
                     cloexec: false,
                 },
@@ -328,7 +418,16 @@ impl Vfs {
         self.fs.borrow().paths.get(path).cloned().ok_or(Errno(2))
     }
     fn descriptor(&self, fd: u32) -> Result<&Descriptor> {
-        self.fds.get(&fd).ok_or(Errno(9))
+        let d = self.fds.get(&fd).ok_or(Errno(9))?;
+        if d.open
+            .borrow()
+            .pipe
+            .as_ref()
+            .is_some_and(|p| p.waiting.get().is_some())
+        {
+            return Err(Errno(9));
+        }
+        Ok(d)
     }
     pub fn allocated_bytes(&self) -> u64 {
         self.fs
@@ -462,8 +561,11 @@ impl Vfs {
                 }
             }
         }
-        if trailing && !self.is_directory(&current) {
-            return Err(Errno(20));
+        if trailing {
+            let node = self.node(&current)?;
+            if !matches!(node.borrow().content, Content::Directory) {
+                return Err(Errno(20));
+            }
         }
         Ok(current)
     }
@@ -611,6 +713,15 @@ impl Vfs {
         }
     }
     pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
+        if path.len() >= MAX_PATH {
+            return Err(Errno(36));
+        }
+        // mkdir creates the last dentry even when its spelling ends in '/'.
+        // It must not follow an existing final symlink to create its target.
+        let mut path = path;
+        while path.len() > 1 && path.last() == Some(&b'/') {
+            path = &path[..path.len() - 1];
+        }
         let p = self.resolve_final(dirfd, path, false)?;
         if self.node(&p).is_ok() {
             return Err(Errno(17));
@@ -621,6 +732,24 @@ impl Vfs {
             Content::Directory,
             0o40000 | (mode & 0o7777 & !self.umask),
         )
+    }
+    pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
+        let type_ = mode & 0o170000;
+        if device != 0 || !matches!(type_, 0 | 0o100000 | 0o10000) {
+            return Err(Errno(95));
+        }
+        let p = self.resolve_final(dirfd, path, false)?;
+        if self.node(&p).is_ok() {
+            return Err(Errno(17));
+        }
+        self.check_parent_write(&p)?;
+        let content = if type_ == 0o10000 {
+            Content::Fifo(Pipe::new(self.open_id()))
+        } else {
+            Content::File(self.empty_data()?)
+        };
+        let type_ = if type_ == 0 { 0o100000 } else { type_ };
+        self.insert(p, content, type_ | (mode & 0o7777 & !self.umask))
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
         let p = self.resolve_final(dirfd, path, false)?;
@@ -683,6 +812,17 @@ impl Vfs {
             | 0x101000;
         if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
             return Err(Errno(22));
+        }
+        if flags & 0x40 != 0 && path.last() == Some(&b'/') {
+            if path.len() >= MAX_PATH {
+                return Err(Errno(36));
+            }
+            let mut plain = path;
+            while plain.len() > 1 && plain.last() == Some(&b'/') {
+                plain = &plain[..plain.len() - 1];
+            }
+            self.resolve_final(dirfd, plain, true)?;
+            return Err(Errno(21));
         }
         if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
             return Ok(fd);
@@ -753,11 +893,27 @@ impl Vfs {
         } else {
             None
         };
+        let pipe = if let Content::Fifo(pipe) = &node.borrow().content {
+            let read = flags & 3 != 1;
+            let write = flags & 3 != 0;
+            if write && !read && flags & O_NONBLOCK != 0 && pipe.borrow().readers == 0 {
+                return Err(Errno(6));
+            }
+            Some(PipeEnd::new(
+                pipe.clone(),
+                read,
+                write,
+                flags & O_NONBLOCK == 0,
+            ))
+        } else {
+            None
+        };
         self.fds.insert(
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
                     id: self.open_id(),
+                    owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: if matches!(
                         node.borrow().content,
                         Content::Terminal | Content::Device(pseudo::Device::Pts)
@@ -769,9 +925,11 @@ impl Vfs {
                     flags: flags & !O_CLOEXEC,
                     position: 0,
                     node: Some(node),
-                    pipe: None,
+                    pipe,
                     socket: None,
                     bridge,
+                    anonymous: None,
+                    local: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -779,13 +937,47 @@ impl Vfs {
         Ok(fd)
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
-        self.fds.remove(&fd).map(|_| ()).ok_or(Errno(9))
+        self.descriptor(fd)?;
+        let descriptor = self.fds.remove(&fd).ok_or(Errno(9))?;
+        self.release_record_locks(&descriptor);
+        Ok(())
+    }
+    pub fn fifo_open_ready(&self, fd: u32) -> Result<bool> {
+        let d = self.fds.get(&fd).ok_or(Errno(9))?;
+        let o = d.open.borrow();
+        let Some(end) = &o.pipe else { return Ok(true) };
+        let Some(epoch) = end.waiting.get() else {
+            return Ok(true);
+        };
+        let p = end.pipe.borrow();
+        let ready = if end.read {
+            p.writers != 0 || p.write_epoch != epoch
+        } else {
+            p.readers != 0 || p.read_epoch != epoch
+        };
+        if ready {
+            end.waiting.set(None);
+        }
+        Ok(ready)
+    }
+    pub fn cancel_fifo_open(&mut self, fd: u32) {
+        self.fds.remove(&fd);
     }
     pub fn close_all(&mut self) {
-        self.fds.clear();
+        let descriptors = std::mem::take(&mut self.fds);
+        for d in descriptors.values() {
+            self.release_record_locks(d);
+        }
     }
     pub fn close_exec(&mut self) {
-        self.fds.retain(|_, d| !d.cloexec);
+        let closed: Vec<_> = self
+            .fds
+            .iter()
+            .filter_map(|(&fd, d)| d.cloexec.then_some(fd))
+            .collect();
+        for fd in closed {
+            let _ = self.close(fd);
+        }
     }
     pub fn dup(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
         let mut d = self.descriptor(old)?.clone();
@@ -806,6 +998,9 @@ impl Vfs {
         }
         let mut d = self.descriptor(old)?.clone();
         d.cloexec = flags & O_CLOEXEC != 0;
+        if self.fds.contains_key(&new) {
+            self.close(new)?;
+        }
         self.fds.insert(new, d);
         Ok(new)
     }
@@ -843,25 +1038,9 @@ impl Vfs {
         if free.len() != 2 {
             return Err(Errno(24));
         }
-        let p = Rc::new(RefCell::new(Pipe {
-            inode: self.open_id(),
-            bytes: VecDeque::new(),
-            reader: Weak::new(),
-            writer: Weak::new(),
-        }));
-        let read = Rc::new(PipeEnd {
-            pipe: p.clone(),
-            read: true,
-        });
-        let write = Rc::new(PipeEnd {
-            pipe: p.clone(),
-            read: false,
-        });
-        {
-            let mut p = p.borrow_mut();
-            p.reader = Rc::downgrade(&read);
-            p.writer = Rc::downgrade(&write);
-        }
+        let p = Pipe::new(self.open_id());
+        let read = PipeEnd::new(p.clone(), true, false, false);
+        let write = PipeEnd::new(p, false, true, false);
         for (fd, end, kind, access) in [
             (free[0], read, FdKind::PipeRead, 0),
             (free[1], write, FdKind::PipeWrite, 1),
@@ -871,6 +1050,7 @@ impl Vfs {
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
                         id: self.open_id(),
+                        owner: (self.credentials.fsuid, self.credentials.fsgid),
                         kind,
                         flags: (flags & O_NONBLOCK) | access,
                         position: 0,
@@ -878,6 +1058,8 @@ impl Vfs {
                         pipe: Some(end),
                         socket: None,
                         bridge: None,
+                        anonymous: None,
+                        local: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -890,6 +1072,12 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(local) = &o.local {
+            return local.recv(count, 0).map(|r| r.data);
+        }
+        if let Some(anonymous) = &mut o.anonymous {
+            return anonymous.read(count);
         }
         if let Some(bridge) = &o.bridge {
             return bridge.read(count).map_err(Errno);
@@ -908,7 +1096,7 @@ impl Vfs {
                 return Err(Errno(9));
             }
             let mut p = end.pipe.borrow_mut();
-            if p.bytes.is_empty() && p.writer.strong_count() != 0 {
+            if p.bytes.is_empty() && p.writers != 0 {
                 return Err(Errno(11));
             }
             let n = count.min(p.bytes.len());
@@ -927,6 +1115,7 @@ impl Vfs {
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
+            Content::Fifo(_) => Err(Errno(29)),
         };
         if result.is_ok() {
             n.times[0] = storage::Timestamp::now();
@@ -934,9 +1123,15 @@ impl Vfs {
         result
     }
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(local) = &o.local {
+            return local.send(bytes, 0);
+        }
+        if let Some(anonymous) = &mut o.anonymous {
+            return anonymous.write(bytes);
         }
         if let Some(bridge) = &o.bridge {
             return bridge.write(bytes).map_err(Errno);
@@ -945,11 +1140,11 @@ impl Vfs {
             return socket.send(bytes, 0, None).map_err(|e| Errno(e.0));
         }
         if let Some(end) = &o.pipe {
-            if end.read {
+            if !end.write {
                 return Err(Errno(9));
             }
             let mut p = end.pipe.borrow_mut();
-            if p.reader.strong_count() == 0 {
+            if p.readers == 0 {
                 return Err(Errno(32));
             }
             if bytes.is_empty() {
@@ -980,6 +1175,7 @@ impl Vfs {
         let result = match &mut n.content {
             Content::Null => Ok(bytes.len()),
             Content::Device(device) => device.write(bytes),
+            Content::Fifo(_) => Err(Errno(29)),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
@@ -1043,7 +1239,7 @@ impl Vfs {
             Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
-            Content::Terminal => Err(Errno(29)),
+            Content::Terminal | Content::Fifo(_) => Err(Errno(29)),
         }
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
@@ -1105,7 +1301,7 @@ impl Vfs {
             Content::Symlink(_) => return Err(Errno(40)),
             Content::Null => return Ok(0),
             Content::Device(_) => return Ok(0),
-            Content::Terminal => return Err(Errno(29)),
+            Content::Terminal | Content::Fifo(_) => return Err(Errno(29)),
         };
         let base = match whence {
             0 => 0,
@@ -1238,7 +1434,9 @@ impl Vfs {
             }
         }
         self.stat_node(&Node {
-            device: if o.socket.is_some() {
+            device: if o.anonymous.is_some() {
+                16
+            } else if o.socket.is_some() || o.local.is_some() {
                 5
             } else if o.pipe.is_some() {
                 6
@@ -1246,7 +1444,9 @@ impl Vfs {
                 1
             },
             content: Content::Null,
-            mode: if o.socket.is_some() {
+            mode: if o.anonymous.is_some() {
+                0o600
+            } else if o.socket.is_some() || o.local.is_some() {
                 0o140600
             } else if o.pipe.is_some()
                 || matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
@@ -1257,8 +1457,8 @@ impl Vfs {
             },
             inode: o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
             links: 1,
-            uid: self.credentials.euid,
-            gid: self.credentials.egid,
+            uid: o.owner.0,
+            gid: o.owner.1,
             volatile: false,
             times: [storage::Timestamp::default(); 3],
         })
@@ -1285,6 +1485,9 @@ impl Vfs {
         let n = self.node(&p)?;
         if !matches!(n.borrow().content, Content::Directory) {
             return Err(Errno(20));
+        }
+        if !self.allowed(&n.borrow(), 1) {
+            return Err(Errno(13));
         }
         self.cwd_node = Some(n);
         Ok(())
@@ -1323,6 +1526,7 @@ impl Vfs {
                         Content::Directory => 4,
                         Content::File(_) => 8,
                         Content::Symlink(_) => 10,
+                        Content::Fifo(_) => 1,
                         Content::Null | Content::Terminal | Content::Device(_) => 2,
                     },
                 ),
@@ -1532,7 +1736,7 @@ mod process_tests {
             vec![7; PIPE_CAPACITY - 1]
         );
         v.close(w).unwrap();
-        assert_eq!(v.poll(r, 1), 17);
+        assert_eq!(v.poll(r, 1), 16); // Linux reports HUP, with no data readiness.
     }
     #[test]
     fn unlink_keeps_open_file_and_quota_until_last_close() {
