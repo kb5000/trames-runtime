@@ -14,6 +14,12 @@ impl Vfs {
     pub fn set_lock_owner(&mut self, owner: u32) {
         self.lock_owner = owner;
     }
+    pub fn release_process_locks(&self) {
+        self.fs.borrow_mut().record_locks.retain(|_, locks| {
+            locks.retain(|lock| lock.owner != self.lock_owner);
+            !locks.is_empty()
+        });
+    }
     pub(super) fn release_record_locks(&self, descriptor: &Descriptor) {
         if let Some(node) = &descriptor.open.borrow().node {
             let inode = node.borrow().inode;

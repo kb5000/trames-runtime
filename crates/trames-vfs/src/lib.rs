@@ -969,6 +969,11 @@ impl Vfs {
             self.release_record_locks(d);
         }
     }
+    /// Detach a task's view while another task retains the shared file table.
+    /// No descriptor has actually closed, so POSIX process locks stay held.
+    pub fn detach_file_table(&mut self) {
+        self.fds.clear();
+    }
     pub fn close_exec(&mut self) {
         let closed: Vec<_> = self
             .fds
