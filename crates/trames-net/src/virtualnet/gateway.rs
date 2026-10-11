@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+#[path = "icmp_gateway.rs"]
+mod icmp_gateway;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     IpProtocol, IpRepr, Ipv4Repr, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
@@ -59,6 +61,7 @@ pub(super) struct Gateway {
     dns_tcp: Vec<DnsTcp>,
     resolver: dns::Resolver,
     pending_dns: Vec<PendingDns>,
+    icmp: Vec<icmp_gateway::Flow>,
 }
 impl Gateway {
     pub fn new() -> Result<Self> {
@@ -95,13 +98,14 @@ impl Gateway {
             dns_tcp,
             resolver: dns::Resolver::new(),
             pending_dns: Vec::new(),
+            icmp: Vec::new(),
         })
     }
     pub fn pending_handles(&self) -> usize {
         self.tcp.iter().filter(|f| f.handle.is_none()).count()
     }
     pub fn flow_count(&self) -> usize {
-        self.tcp.len() + self.udp.len()
+        self.tcp.len() + self.udp.len() + self.icmp.len()
     }
     fn owner(nodes: &BTreeMap<u64, Node>, key: u64, tuple: Tuple, kind: u32) -> Weak<Socket> {
         nodes
@@ -211,6 +215,8 @@ impl Gateway {
                 .iface
                 .poll(now, &mut self.node.port, &mut self.node.sockets);
             accepted
+        } else if matches!(h.protocol, 1 | 58) {
+            self.icmp_ingress(key, &p, h, nodes)
         } else {
             false
         }
@@ -265,6 +271,7 @@ impl Gateway {
         self.node.port.tx.push_back(bytes);
     }
     pub fn service(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
+        self.icmp_service(nodes);
         let mut gone = Vec::new();
         let mut failures = Vec::new();
         for (index, flow) in self.tcp.iter_mut().enumerate() {
@@ -506,6 +513,11 @@ impl Gateway {
     }
     pub fn waiters(&self) -> Vec<(Rc<native::Socket>, u16)> {
         let mut waiters = Vec::new();
+        waiters.extend(
+            self.icmp
+                .iter()
+                .map(|f| (f.native.clone(), if f.pending.is_some() { 5 } else { 1 })),
+        );
         for f in &self.tcp {
             let events = if let Some(h) = f.handle {
                 let t = self.node.sockets.get::<tcp::Socket>(h);
@@ -546,6 +558,7 @@ impl Gateway {
             }
         });
         self.udp.retain(|f| f.node != key);
+        self.icmp.retain(|f| f.node != key);
         self.pending_dns
             .retain(|p| !matches!(p.to,ReplyTo::Udp{node,..} if node==key));
     }

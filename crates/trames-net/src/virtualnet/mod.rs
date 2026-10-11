@@ -11,7 +11,7 @@ use super::native::{
 use packet::{Port, Tuple};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
-    socket::{icmp, tcp, udp},
+    socket::{icmp, raw, tcp, udp},
     wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint},
 };
 use std::{
@@ -43,6 +43,15 @@ pub struct NetworkStats {
     pub stack_sockets: usize,
     pub environments: usize,
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinkStats {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_dropped: u64,
+}
 #[derive(Clone)]
 pub struct Fabric(Rc<RefCell<Inner>>);
 struct Inner {
@@ -63,6 +72,7 @@ struct Node {
     registry: Vec<Weak<Socket>>,
     detached: Vec<(SocketHandle, Instant)>,
     resets: Vec<(Weak<Socket>, Connection)>,
+    links: [LinkStats; 2],
 }
 struct Namespace {
     fabric: Fabric,
@@ -97,6 +107,14 @@ struct State {
     keepalive: bool,
     backlog: usize,
     icmp_pending: Option<(Vec<u8>, IpAddr)>,
+    hop_limit: u8,
+    receive_hops: bool,
+    last_hop: Option<u8>,
+    broadcast: bool,
+    icmp6_filter: [u8; 32],
+    hop_message: u32,
+    device: Option<u32>,
+    raw_identifiers: std::collections::BTreeSet<u16>,
 }
 pub(super) struct Socket {
     network: Network,
@@ -174,6 +192,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         registry: Vec::new(),
         detached: Vec::new(),
         resets: Vec::new(),
+        links: [LinkStats::default(); 2],
     })
 }
 impl Fabric {
@@ -350,10 +369,19 @@ impl Inner {
                 break;
             }
             for (source, mut p) in packets {
+                let lo = packet::header(&p).is_some_and(|h| h.tuple.destination.ip().is_loopback());
+                if let Some(n) = self.nodes.get_mut(&source) {
+                    let s = &mut n.links[usize::from(!lo)];
+                    s.tx_packets += 1;
+                    s.tx_bytes += p.len() as u64;
+                }
                 self.stats.packets += 1;
                 if self.drop_every != 0 && self.stats.packets.is_multiple_of(self.drop_every as u64)
                 {
                     self.stats.dropped += 1;
+                    if let Some(n) = self.nodes.get_mut(&source) {
+                        n.links[usize::from(!lo)].tx_dropped += 1;
+                    }
                     continue;
                 }
                 if self.corrupt_every != 0
@@ -366,6 +394,9 @@ impl Inner {
                 }
                 let Some(h) = packet::header(&p) else {
                     self.stats.dropped += 1;
+                    if let Some(n) = self.nodes.get_mut(&source) {
+                        n.links[usize::from(!lo)].tx_dropped += 1;
+                    }
                     continue;
                 };
                 let dst = h.tuple.destination.ip();
@@ -427,8 +458,14 @@ impl Inner {
                             && (source == key
                                 || matches!(ns.mode, NetworkMode::Outbound | NetworkMode::Full))
                     });
+                    let size = p.len() as u64;
                     if !permitted || !enabled || !node.port.receive_packet(p) {
+                        node.links[usize::from(!lo)].rx_dropped += 1;
                         self.stats.dropped += 1;
+                    } else {
+                        let s = &mut node.links[usize::from(!lo)];
+                        s.rx_packets += 1;
+                        s.rx_bytes += size;
                     }
                 } else if source != 0
                     && (!private_ip(dst) || dst == IpAddr::V4(v4(1)) || dst == IpAddr::V6(v6(1)))
@@ -445,6 +482,9 @@ impl Inner {
                     }
                 } else {
                     self.stats.dropped += 1;
+                    if let Some(n) = self.nodes.get_mut(&source) {
+                        n.links[usize::from(!lo)].tx_dropped += 1;
+                    }
                 }
             }
         }
@@ -510,6 +550,15 @@ impl Drop for Namespace {
     }
 }
 impl Network {
+    pub fn links(&self) -> [LinkStats; 2] {
+        self.0
+            .fabric
+            .0
+            .borrow()
+            .nodes
+            .get(&self.0.key)
+            .map_or([LinkStats::default(); 2], |n| n.links)
+    }
     pub fn live_sockets(&self) -> usize {
         self.0.live.get()
     }
@@ -534,17 +583,19 @@ impl Network {
         if !matches!(family, 2 | 10) {
             return Err(NetError(97));
         }
-        if kind == 3 {
-            return Err(NetError(94));
+        if kind == 3 && !((family == 2 && protocol == 1) || (family == 10 && protocol == 58)) {
+            return Err(NetError(93));
         }
-        let kind =
-            if kind == 2 && ((family == 2 && protocol == 1) || (family == 10 && protocol == 58)) {
-                3
-            } else {
-                kind
-            };
+        let kind = if kind == 3 {
+            4
+        } else if kind == 2 && ((family == 2 && protocol == 1) || (family == 10 && protocol == 58))
+        {
+            3
+        } else {
+            kind
+        };
         match (kind, protocol) {
-            (1, 0 | 6) | (2, 0 | 17) | (3, 1 | 58) => {}
+            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) => {}
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
@@ -567,6 +618,14 @@ impl Network {
                 keepalive: false,
                 backlog: 1,
                 icmp_pending: None,
+                hop_limit: 64,
+                receive_hops: false,
+                last_hop: None,
+                broadcast: false,
+                icmp6_filter: [0; 32],
+                hop_message: 52,
+                device: None,
+                raw_identifiers: std::collections::BTreeSet::new(),
             },
         ))
     }

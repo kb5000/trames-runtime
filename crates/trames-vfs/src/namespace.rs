@@ -68,7 +68,11 @@ impl Vfs {
         let src = self.node(&source)?;
         self.check_parent_write(&source)?;
         self.check_parent_write(&dest)?;
+        self.check_remove(&source)?;
         let target = self.node(&dest).ok();
+        if target.is_some() {
+            self.check_remove(&dest)?;
+        }
         if target.is_some() && flags == 1 {
             return Err(Errno(17));
         }
@@ -144,13 +148,17 @@ impl Vfs {
         Ok(())
     }
     fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32) -> Result<()> {
-        if mode & 0o7000 != 0 {
-            return Err(Errno(95));
-        }
+        self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
+        if self.credentials.fsuid != 0 && self.credentials.fsuid != n.uid {
+            return Err(Errno(1));
+        }
         let old_mode = n.mode;
         let old_time = n.times[2];
-        n.mode = (n.mode & !0o777) | (mode & 0o777);
+        n.mode = (n.mode & !0o7777) | (mode & 0o7777);
+        if self.credentials.fsuid != 0 && !self.credentials.in_group(n.gid) {
+            n.mode &= !0o2000;
+        }
         n.times[2] = storage::Timestamp::now();
         drop(n);
         if let Err(e) = self.checkpoint() {
@@ -205,6 +213,7 @@ impl Vfs {
                 .clone()
                 .ok_or(Errno(22))?,
         };
+        self.pseudo_immutable(&node)?;
         if values.iter().all(Option::is_none) {
             return Ok(());
         }

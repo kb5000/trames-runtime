@@ -1,6 +1,78 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Socket {
+    pub fn info(&self) -> crate::SocketInfo {
+        let state = self.state.borrow();
+        let fabric = self.network.0.fabric.0.borrow();
+        let mut code = if state.peer.is_some() { 1 } else { 7 };
+        let (mut tx, mut rx) = (0, 0);
+        if let Some(n) = fabric.nodes.get(&self.network.0.key) {
+            for h in &state.handles {
+                let (a, b) = match self.kind {
+                    1 => {
+                        let s = n.sockets.get::<tcp::Socket>(*h);
+                        code = if state.connection == Connection::Listening {
+                            10
+                        } else {
+                            match s.state() {
+                                tcp::State::Established => 1,
+                                tcp::State::SynSent => 2,
+                                tcp::State::SynReceived => 3,
+                                tcp::State::FinWait1 => 4,
+                                tcp::State::FinWait2 => 5,
+                                tcp::State::TimeWait => 6,
+                                tcp::State::Closed => 7,
+                                tcp::State::CloseWait => 8,
+                                tcp::State::LastAck => 9,
+                                tcp::State::Listen => 10,
+                                tcp::State::Closing => 11,
+                            }
+                        };
+                        (s.send_queue(), s.recv_queue())
+                    }
+                    2 => {
+                        let s = n.sockets.get::<udp::Socket>(*h);
+                        (s.send_queue(), s.recv_queue())
+                    }
+                    3 => {
+                        let s = n.sockets.get::<icmp::Socket>(*h);
+                        (s.send_queue(), s.recv_queue())
+                    }
+                    _ => {
+                        let s = n.sockets.get::<raw::Socket>(*h);
+                        (s.send_queue(), s.recv_queue())
+                    }
+                };
+                tx += a;
+                rx += b;
+            }
+        }
+        rx += state.icmp_pending.as_ref().map_or(0, |p| p.0.len());
+        crate::SocketInfo {
+            family: self.family,
+            kind: if self.kind == 4 {
+                3
+            } else if self.kind == 3 {
+                2
+            } else {
+                self.kind
+            },
+            protocol: if self.kind == 1 {
+                6
+            } else if self.kind == 2 {
+                17
+            } else if self.family == 2 {
+                1
+            } else {
+                58
+            },
+            state: code,
+            local: state.bound.map(|a| self.presented(a)),
+            peer: state.peer.map(|a| self.presented(a)),
+            tx_queue: Some(tx),
+            rx_queue: Some(rx),
+        }
+    }
     pub fn fabric(&self) -> Fabric {
         self.network.0.fabric.clone()
     }
@@ -59,7 +131,7 @@ impl Socket {
             || a == IpAddr::V6(Ipv6Addr::LOCALHOST)
     }
     fn destination(&self, a: SocketAddr) -> Result<()> {
-        if a.port() == 0 && self.kind != 3 {
+        if a.port() == 0 && !matches!(self.kind, 3 | 4) {
             return Err(NetError(22));
         }
         let v = a.ip();
@@ -155,7 +227,9 @@ impl Socket {
         if !self.own(a.ip()) {
             return Err(NetError(99));
         }
-        if a.port() == 0 {
+        if self.kind == 4 {
+            a.set_port(0);
+        } else if a.port() == 0 {
             a.set_port(self.choose_port(a.ip())?);
         } else if !self.port_free(a) {
             return Err(NetError(98));
@@ -171,6 +245,26 @@ impl Socket {
             s.bind(icmp::Endpoint::Ident(a.port()))
                 .map_err(|_| NetError(22))?;
             self.state.borrow_mut().handles = vec![n.sockets.add(s)];
+        }
+        if self.kind == 4 {
+            let mut i = self.network.0.fabric.0.borrow_mut();
+            i.reserve(1)?;
+            let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+            let socket = raw::Socket::new(
+                if self.family == 2 {
+                    smoltcp::wire::IpVersion::Ipv4
+                } else {
+                    smoltcp::wire::IpVersion::Ipv6
+                },
+                if self.family == 2 {
+                    smoltcp::wire::IpProtocol::Icmp
+                } else {
+                    smoltcp::wire::IpProtocol::Icmpv6
+                },
+                raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
+                raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
+            );
+            self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
         }
         if self.kind == 2 {
             let addresses = self.addresses(a);
@@ -266,6 +360,14 @@ impl Socket {
             keepalive: state.keepalive,
             backlog: 1,
             icmp_pending: None,
+            hop_limit: state.hop_limit,
+            receive_hops: state.receive_hops,
+            last_hop: None,
+            broadcast: state.broadcast,
+            icmp6_filter: state.icmp6_filter,
+            hop_message: state.hop_message,
+            device: state.device,
+            raw_identifiers: std::collections::BTreeSet::new(),
         };
         drop(state);
         drop(i);
@@ -412,6 +514,9 @@ impl Socket {
         if self.kind == 3 {
             return self.send_icmp(bytes, destination);
         }
+        if self.kind == 4 {
+            return self.send_raw(bytes, destination);
+        }
         if self.kind == 2 {
             let a = if let Some(a) = destination {
                 self.normalize(a)?
@@ -494,6 +599,9 @@ impl Socket {
         self.fabric().tick();
         if self.kind == 3 {
             return self.recv_icmp(count, flags);
+        }
+        if self.kind == 4 {
+            return self.recv_raw(count, flags);
         }
         if self.kind == 1 {
             self.before_io()?;
@@ -609,6 +717,14 @@ impl Socket {
                         ready |= 16;
                     }
                 }
+            } else if self.kind == 4 {
+                let s = n.sockets.get::<raw::Socket>(*h);
+                if s.can_recv() || state.icmp_pending.is_some() {
+                    ready |= 1;
+                }
+                if s.can_send() {
+                    ready |= 4;
+                }
             } else if self.kind == 3 {
                 let s = n.sockets.get::<icmp::Socket>(*h);
                 if s.can_recv() || state.icmp_pending.is_some() {
@@ -637,6 +753,19 @@ impl Socket {
         match (level, name) {
             (1, 2) => state.reuse = value != 0,
             (1, 9) => state.keepalive = value != 0,
+            (1, 6) => state.broadcast = value != 0,
+            (0, 2) if self.family == 2 && (1..=255).contains(&value) => {
+                state.hop_limit = value as u8
+            }
+            (41, 16) if self.family == 10 && (-1..=255).contains(&value) => {
+                state.hop_limit = if value == -1 { 64 } else { value as u8 }
+            }
+            (0, 12) if self.family == 2 && self.kind == 4 => state.receive_hops = value != 0,
+            (41, 51 | 8) if self.family == 10 && self.kind == 4 => {
+                state.receive_hops = value != 0;
+                state.hop_message = if name == 8 { 8 } else { 52 };
+            }
+            (255, 7) if self.family == 10 && self.kind == 4 && value == 2 => {}
             (1, 7 | 8) => {
                 if value <= 0 || value as usize > MAX_BUFFER {
                     return Err(NetError(22));
@@ -644,7 +773,7 @@ impl Socket {
             }
             (6, 1) if self.kind == 1 => state.nodelay = value != 0,
             (41, 26) if self.family == 10 => {
-                if self.kind == 3 && value == 0 {
+                if matches!(self.kind, 3 | 4) && value == 0 {
                     return Err(NetError(95));
                 }
                 if state.bound.is_some() {
@@ -677,11 +806,17 @@ impl Socket {
         }
         let state = self.state.borrow();
         match (level, name) {
-            (1, 3) => Ok(if self.kind == 3 { 2 } else { self.kind as i32 }),
+            (1, 3) => Ok(if self.kind == 3 {
+                2
+            } else if self.kind == 4 {
+                3
+            } else {
+                self.kind as i32
+            }),
             (1, 39) => Ok(self.family as i32),
             (1, 38) => Ok(if self.kind == 1 {
                 6
-            } else if self.kind == 3 {
+            } else if matches!(self.kind, 3 | 4) {
                 if self.family == 2 {
                     1
                 } else {
@@ -693,6 +828,10 @@ impl Socket {
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 9) => Ok(i32::from(state.keepalive)),
+            (1, 6) => Ok(i32::from(state.broadcast)),
+            (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),
+            (41, 16) if self.family == 10 => Ok(state.hop_limit as i32),
+            (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
             (1, 7 | 8) => Ok(BUFFER as i32),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
             (41, 26) if self.family == 10 => Ok(i32::from(state.v6_only)),
@@ -702,6 +841,225 @@ impl Socket {
 }
 
 impl Socket {
+    pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {
+            if value.len() != 32 {
+                return Err(NetError(22));
+            }
+            self.state.borrow_mut().icmp6_filter.copy_from_slice(value);
+            return Ok(());
+        }
+        if (level, name) == (1, 25) {
+            if value.len() > 16 {
+                return Err(NetError(22));
+            }
+            let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+            let device = match &value[..end] {
+                b"" => None,
+                b"lo" => Some(1),
+                b"trames0" => Some(2),
+                _ => return Err(NetError(19)),
+            };
+            if self.kind != 4 {
+                return Err(NetError(95));
+            }
+            self.state.borrow_mut().device = device;
+            return Ok(());
+        }
+        if value.len() < 4 {
+            return Err(NetError(22));
+        }
+        self.set_option(
+            level,
+            name,
+            i32::from_le_bytes(value[..4].try_into().unwrap()),
+        )
+    }
+    pub fn ancillary_hop(&self) -> Option<(u32, u32, u8)> {
+        let state = self.state.borrow();
+        if !state.receive_hops {
+            return None;
+        }
+        state.last_hop.map(|hop| {
+            if self.family == 2 {
+                (0, 2, hop)
+            } else {
+                (41, state.hop_message, hop)
+            }
+        })
+    }
+    fn send_raw(&self, bytes: &[u8], destination: Option<SocketAddr>) -> Result<usize> {
+        let a = destination
+            .map(|a| self.normalize(a))
+            .transpose()?
+            .or(self.state.borrow().peer)
+            .ok_or(NetError(89))?;
+        self.destination(a)?;
+        if bytes.len() < 8 || bytes.len() > 1400 {
+            return Err(NetError(90));
+        }
+        if self.state.borrow().bound.is_none() {
+            self.bind(self.wildcard())?;
+        }
+        if bytes[0] == if self.family == 2 { 8 } else { 128 } && bytes[1] == 0 {
+            let mut state = self.state.borrow_mut();
+            let identifier = u16::from_be_bytes([bytes[4], bytes[5]]);
+            if state.raw_identifiers.len() >= 32 && !state.raw_identifiers.contains(&identifier) {
+                return Err(NetError(105));
+            }
+            state.raw_identifiers.insert(identifier);
+        }
+        let state = self.state.borrow();
+        if state.write_closed {
+            return Err(NetError(32));
+        }
+        if state
+            .device
+            .is_some_and(|i| (i == 1) != a.ip().is_loopback())
+        {
+            return Err(NetError(101));
+        }
+        let bound = state.bound.unwrap().ip();
+        let source = if !bound.is_unspecified() {
+            bound
+        } else if a.ip().is_loopback() {
+            if self.family == 2 {
+                Ipv4Addr::LOCALHOST.into()
+            } else {
+                Ipv6Addr::LOCALHOST.into()
+            }
+        } else if self.family == 2 {
+            self.network.0.info.ipv4.into()
+        } else {
+            self.network.0.info.ipv6.into()
+        };
+        let mut data = if self.family == 2 {
+            let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, a.ip()) else {
+                return Err(NetError(97));
+            };
+            let mut header = vec![0; 20];
+            header[0] = 0x45;
+            header[2..4].copy_from_slice(&((20 + bytes.len()) as u16).to_be_bytes());
+            header[8] = state.hop_limit;
+            header[9] = 1;
+            header[12..16].copy_from_slice(&source.octets());
+            header[16..20].copy_from_slice(&destination.octets());
+            smoltcp::wire::Ipv4Packet::new_unchecked(&mut header).fill_checksum();
+            header.extend_from_slice(bytes);
+            header
+        } else {
+            let (IpAddr::V6(source), IpAddr::V6(destination)) = (source, a.ip()) else {
+                return Err(NetError(97));
+            };
+            let mut header = vec![0; 40];
+            header[0] = 0x60;
+            header[4..6].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
+            header[6] = 58;
+            header[7] = state.hop_limit;
+            header[8..24].copy_from_slice(&source.octets());
+            header[24..40].copy_from_slice(&destination.octets());
+            header.extend_from_slice(bytes);
+            smoltcp::wire::Icmpv6Packet::new_unchecked(&mut header[40..])
+                .fill_checksum(&source, &destination);
+            header
+        };
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let n = fabric
+            .nodes
+            .get_mut(&self.network.0.key)
+            .ok_or(NetError(100))?;
+        n.sockets
+            .get_mut::<raw::Socket>(state.handles[0])
+            .send_slice(&data)
+            .map_err(|_| NetError(11))?;
+        data.clear();
+        drop(fabric);
+        drop(state);
+        self.fabric().tick();
+        if let Some(errno) = self.state.borrow_mut().error.take() {
+            Err(NetError(errno))
+        } else {
+            Ok(bytes.len())
+        }
+    }
+    fn recv_raw(&self, count: usize, flags: u32) -> Result<Received> {
+        if self.state.borrow().bound.is_none() {
+            self.bind(self.wildcard())?;
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(errno) = state.error.take() {
+            return Err(NetError(errno));
+        }
+        if state.read_closed {
+            return Ok(Received {
+                data: Vec::new(),
+                address: None,
+                length: 0,
+                truncated: false,
+            });
+        }
+        if state.icmp_pending.is_none() {
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
+            let n = fabric
+                .nodes
+                .get_mut(&self.network.0.key)
+                .ok_or(NetError(100))?;
+            for _ in 0..16 {
+                let data = n
+                    .sockets
+                    .get_mut::<raw::Socket>(state.handles[0])
+                    .recv()
+                    .map_err(|_| NetError(11))?;
+                let Some(header) = packet::header(data) else {
+                    continue;
+                };
+                let peer = header.tuple.source.ip();
+                if state.peer.is_some_and(|a| a.ip() != peer)
+                    || state.bound.is_some_and(|a| {
+                        !a.ip().is_unspecified() && a.ip() != header.tuple.destination.ip()
+                    })
+                {
+                    continue;
+                }
+                if state
+                    .device
+                    .is_some_and(|i| (i == 1) != header.tuple.destination.ip().is_loopback())
+                {
+                    continue;
+                }
+                if self.family == 10 {
+                    let Some(&kind) = data.get(header.offset) else {
+                        continue;
+                    };
+                    if state.icmp6_filter[kind as usize / 8] & (1 << (kind % 8)) != 0 {
+                        continue;
+                    }
+                }
+                state.last_hop = Some(if self.family == 2 { data[8] } else { data[7] });
+                state.icmp_pending = Some((
+                    if self.family == 2 {
+                        data.to_vec()
+                    } else {
+                        data[header.offset..].to_vec()
+                    },
+                    peer,
+                ));
+                break;
+            }
+        }
+        let (data, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
+        let length = data.len();
+        let received = Received {
+            data: data[..count.min(length)].to_vec(),
+            address: Some(SocketAddr::new(*peer, 0)),
+            length,
+            truncated: count < length,
+        };
+        if flags & MSG_PEEK == 0 {
+            state.icmp_pending = None;
+        }
+        Ok(received)
+    }
     fn send_icmp(&self, bytes: &[u8], destination: Option<SocketAddr>) -> Result<usize> {
         let a = if let Some(a) = destination {
             self.normalize(a)?
@@ -709,9 +1067,6 @@ impl Socket {
             self.state.borrow().peer.ok_or(NetError(89))?
         };
         self.destination(a)?;
-        if !private_ip(a.ip()) && !a.ip().is_loopback() {
-            return Err(NetError(95));
-        }
         if bytes.len() < 8
             || bytes.len() > 1400
             || bytes[0] != if a.is_ipv4() { 8 } else { 128 }
@@ -750,10 +1105,17 @@ impl Socket {
         drop(i);
         drop(state);
         self.fabric().tick();
-        Ok(bytes.len())
+        if let Some(errno) = self.state.borrow_mut().error.take() {
+            Err(NetError(errno))
+        } else {
+            Ok(bytes.len())
+        }
     }
     fn recv_icmp(&self, count: usize, flags: u32) -> Result<Received> {
         let mut state = self.state.borrow_mut();
+        if let Some(errno) = state.error.take() {
+            return Err(NetError(errno));
+        }
         if state.read_closed {
             return Ok(Received {
                 data: Vec::new(),

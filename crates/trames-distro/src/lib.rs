@@ -46,6 +46,8 @@ enum Content {
 struct Entry {
     path: Vec<u8>,
     mode: u32,
+    uid: u32,
+    gid: u32,
     content: Content,
 }
 fn path(bytes: &[u8]) -> Result<Vec<u8>, Error> {
@@ -101,7 +103,11 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
         if entries.len() >= ENTRY_LIMIT || !names.insert(path.clone()) {
             return Err(Error::Invalid("duplicate entry or entry limit"));
         }
-        let mode = item.header().mode()? & 0o777;
+        let mode = item.header().mode()? & 0o7777;
+        let uid =
+            u32::try_from(item.header().uid()?).map_err(|_| Error::Invalid("uid overflow"))?;
+        let gid =
+            u32::try_from(item.header().gid()?).map_err(|_| Error::Invalid("gid overflow"))?;
         let content = match item.header().entry_type() {
             tar::EntryType::Directory => Content::Directory,
             tar::EntryType::Regular => {
@@ -130,6 +136,8 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
         entries.push(Entry {
             path,
             mode,
+            uid,
+            gid,
             content,
         });
     }
@@ -171,6 +179,7 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
         .map(|e| (e.path.clone(), e.mode))
         .collect();
     for e in entries {
+        let regular = matches!(&e.content, Content::File(_));
         match e.content {
             Content::Directory => match vfs.mkdir_at(AT_FDCWD, &e.path, 0o755) {
                 Ok(()) | Err(Errno(17)) => {}
@@ -178,9 +187,13 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
             },
             Content::File(data) => {
                 vfs.import_reader(&e.path, &mut data.as_slice(), e.mode & 0o111 != 0)?;
-                vfs.chmod_at(AT_FDCWD, &e.path, e.mode)?;
             }
             Content::Link(target) => vfs.symlink_at(&target, AT_FDCWD, &e.path)?,
+        }
+        vfs.chown_at(AT_FDCWD, &e.path, e.uid, e.gid, true)?;
+        if regular {
+            // Restore set-ID bits after ownership changes, as a tar installer does.
+            vfs.chmod_at(AT_FDCWD, &e.path, e.mode)?;
         }
     }
     for (path, mode) in directory_modes.into_iter().rev() {

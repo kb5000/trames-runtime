@@ -386,7 +386,7 @@ impl Filesystem {
             nodes.insert(n.borrow().inode, n.clone());
         }
         let mut out = b"TRAMESFS".to_vec();
-        out.extend(2u32.to_le_bytes());
+        out.extend(3u32.to_le_bytes());
         out.extend(self.limits.file_bytes.to_le_bytes());
         out.extend((self.limits.nodes as u32).to_le_bytes());
         out.extend(self.next_inode.to_le_bytes());
@@ -396,6 +396,8 @@ impl Filesystem {
             let n = node.borrow();
             out.extend(ino.to_le_bytes());
             out.extend(n.mode.to_le_bytes());
+            out.extend(n.uid.to_le_bytes());
+            out.extend(n.gid.to_le_bytes());
             out.extend([
                 match n.content {
                     Content::Directory => 0,
@@ -403,6 +405,7 @@ impl Filesystem {
                     Content::Null => 2,
                     Content::Terminal => 3,
                     Content::Symlink(_) => 4,
+                    Content::Device(_) => return Err(Errno(95)),
                 },
                 0,
                 0,
@@ -471,7 +474,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         return Err(Errno(22));
     }
     let version = d.u32()?;
-    if version != 1 && version != 2 {
+    if !matches!(version, 1..=3) {
         return Err(Errno(22));
     }
     let limits = StorageLimits {
@@ -490,6 +493,11 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     for _ in 0..count {
         let ino = d.u64()?;
         let mode = d.u32()?;
+        let (uid, gid) = if version >= 3 {
+            (d.u32()?, d.u32()?)
+        } else {
+            (1000, 1000)
+        };
         let kind = d.take(4)?;
         if ino == 0 || ino >= next_inode || nodes.contains_key(&ino) || kind[1..] != [0, 0, 0] {
             return Err(Errno(22));
@@ -502,7 +510,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 return Err(Errno(22));
             }
         }
-        let target = if version == 2 {
+        let target = if version >= 2 {
             let size = d.u32()? as usize;
             if size >= MAX_PATH {
                 return Err(Errno(22));
@@ -522,7 +530,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             4 => (Content::Symlink(target), 0o120000),
             _ => return Err(Errno(22)),
         };
-        if mode & !0o777 != type_ {
+        if mode & !0o7777 != type_ {
             return Err(Errno(22));
         }
         if let Content::File(b) = &content {
@@ -534,8 +542,12 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         nodes.insert(
             ino,
             Rc::new(RefCell::new(Node {
+                device: 1,
                 content,
                 mode,
+                uid,
+                gid,
+                volatile: false,
                 inode: ino,
                 links: 0,
                 times,
@@ -662,8 +674,12 @@ impl Vfs {
         }
         let links = old.borrow().links;
         let new = Rc::new(RefCell::new(Node {
+            device: 1,
             content: Content::File(data),
             mode: 0o100755,
+            uid: old.borrow().uid,
+            gid: old.borrow().gid,
+            volatile: false,
             inode,
             links,
             times: [Timestamp::now(); 3],
@@ -883,7 +899,7 @@ impl Vfs {
         let canonical = self.resolve(AT_FDCWD, path)?;
         let node = self.node(&canonical)?;
         let n = node.borrow();
-        if n.mode & 0o400 == 0 {
+        if !self.allowed(&n, 4) {
             return Err(Errno(13));
         }
         let Content::File(data) = &n.content else {

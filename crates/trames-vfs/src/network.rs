@@ -24,13 +24,23 @@ impl Vfs {
             trames_net::Network::virtual_network(fabric, id, mode).map_err(|e| Errno(e.0))?;
         Ok(())
     }
+    pub fn configure_local_fabric(&mut self, mode: NetworkMode) -> Result<()> {
+        let fabric = trames_net::Fabric::new().map_err(|e| Errno(e.0))?;
+        self.configure_virtual_network(&fabric, 2, mode)
+    }
     pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
         self.network.info()
+    }
+    pub fn network_links(&self) -> Option<[trames_net::LinkStats; 2]> {
+        self.network.links()
     }
     pub fn finish_network(&self) {
         self.network.finish();
     }
     pub fn socket(&mut self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
+        if matches!(family, 2 | 10) && kind & 0xf == 3 && self.credentials.euid != 0 {
+            return Err(Errno(1));
+        }
         if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
             return Err(Errno(22));
         }
@@ -47,6 +57,7 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
+                    id: self.open_id(),
                     kind: FdKind::Socket,
                     flags: 2 | (flags & O_NONBLOCK),
                     position: 0,

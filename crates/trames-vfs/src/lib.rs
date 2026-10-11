@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
+mod credentials;
 mod namespace;
 mod network;
+mod pseudo;
 mod storage;
 #[cfg(test)]
 mod storage_tests;
+pub use credentials::Credentials;
+pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     fmt,
     rc::{Rc, Weak},
@@ -45,6 +49,7 @@ pub enum FdKind {
     Socket,
 }
 struct Pipe {
+    inode: u64,
     bytes: VecDeque<u8>,
     reader: Weak<PipeEnd>,
     writer: Weak<PipeEnd>,
@@ -54,6 +59,7 @@ struct PipeEnd {
     read: bool,
 }
 struct OpenDescription {
+    id: u64,
     kind: FdKind,
     flags: u32,
     position: u64,
@@ -72,10 +78,15 @@ enum Content {
     Symlink(Vec<u8>),
     Null,
     Terminal,
+    Device(pseudo::Device),
 }
 struct Node {
+    device: u64,
     content: Content,
     mode: u32,
+    uid: u32,
+    gid: u32,
+    volatile: bool,
     inode: u64,
     links: u32,
     times: [storage::Timestamp; 3],
@@ -97,6 +108,10 @@ pub struct Vfs {
     fds: BTreeMap<u32, Descriptor>,
     cwd_node: Option<Rc<RefCell<Node>>>,
     pub umask: u32,
+    pub credentials: Credentials,
+    pseudo: Rc<RefCell<pseudo::PseudoFs>>,
+    pid: u32,
+    next_open: Rc<Cell<u64>>,
 }
 impl Default for Vfs {
     fn default() -> Self {
@@ -114,6 +129,10 @@ impl Default for Vfs {
             fds: BTreeMap::new(),
             cwd_node: None,
             umask: 0o022,
+            credentials: Credentials::default(),
+            pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
+            pid: 1,
+            next_open: Rc::new(Cell::new(1)),
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
             .expect("root");
@@ -131,6 +150,7 @@ impl Default for Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        id: v.open_id(),
                         kind,
                         flags,
                         position: 0,
@@ -146,17 +166,33 @@ impl Default for Vfs {
     }
 }
 impl Vfs {
+    fn open_id(&self) -> u64 {
+        let id = self.next_open.get();
+        self.next_open.set(id.wrapping_add(1));
+        (1u64 << 62) | id
+    }
+    /// Cooperatively shared clone resources are synchronized at syscall boundaries.
+    pub fn share_descriptors_from(&mut self, other: &Self) {
+        self.fds.clone_from(&other.fds);
+    }
+    pub fn share_context_from(&mut self, other: &Self) {
+        self.cwd_node.clone_from(&other.cwd_node);
+        self.umask = other.umask;
+    }
     pub fn import_executable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
         self.import_reader(path, &mut bytes.as_slice(), true)
             .map(|_| ())
     }
     fn check_parent_write(&self, path: &[u8]) -> Result<()> {
+        if self.pseudo_readonly(path) {
+            return Err(Errno(30));
+        }
         let end = path
             .iter()
             .rposition(|&b| b == b'/')
             .ok_or(Errno(22))?
             .max(1);
-        if self.node(&path[..end])?.borrow().mode & 0o300 != 0o300 {
+        if !self.allowed(&self.node(&path[..end])?.borrow(), 3) {
             return Err(Errno(13));
         }
         Ok(())
@@ -197,6 +233,7 @@ impl Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        id: self.open_id(),
                         kind: FdKind::Terminal,
                         flags: 2,
                         position: 0,
@@ -210,7 +247,21 @@ impl Vfs {
         }
         Ok(())
     }
-    fn insert(&mut self, path: Vec<u8>, content: Content, mode: u32) -> Result<()> {
+    fn insert(&mut self, path: Vec<u8>, content: Content, mut mode: u32) -> Result<()> {
+        let parent = if path == b"/" {
+            None
+        } else {
+            path.iter()
+                .rposition(|b| *b == b'/')
+                .and_then(|i| self.node(&path[..i.max(1)]).ok())
+        };
+        let inherited = parent.as_ref().and_then(|p| {
+            let p = p.borrow();
+            (p.mode & 0o2000 != 0).then_some(p.gid)
+        });
+        if inherited.is_some() && matches!(content, Content::Directory) {
+            mode |= 0o2000;
+        }
         let mut fs = self.fs.borrow_mut();
         fs.inodes.retain(|n| n.strong_count() != 0);
         if fs.inodes.len() >= fs.limits.nodes || fs.paths.len() >= fs.limits.nodes {
@@ -229,8 +280,12 @@ impl Vfs {
             data.sync(false)?;
         }
         let node = Rc::new(RefCell::new(Node {
+            device: 1,
             content,
             mode,
+            uid: self.credentials.fsuid,
+            gid: inherited.unwrap_or(self.credentials.fsgid),
+            volatile: false,
             inode,
             links: 1,
             times: [storage::Timestamp::now(); 3],
@@ -249,6 +304,9 @@ impl Vfs {
         Ok(())
     }
     fn node(&self, path: &[u8]) -> Result<Rc<RefCell<Node>>> {
+        if let Some(node) = self.pseudo_node(path)? {
+            return Ok(node);
+        }
         self.fs.borrow().paths.get(path).cloned().ok_or(Errno(2))
     }
     fn descriptor(&self, fd: u32) -> Result<&Descriptor> {
@@ -270,6 +328,9 @@ impl Vfs {
         self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?)
     }
     fn path_of(&self, node: &Rc<RefCell<Node>>) -> Result<Vec<u8>> {
+        if let Some(path) = self.pseudo.borrow().path_of(node) {
+            return Ok(path);
+        }
         self.fs
             .borrow()
             .paths
@@ -324,7 +385,7 @@ impl Vfs {
             if !matches!(n.content, Content::Directory) {
                 return Err(Errno(20));
             }
-            if n.mode & 0o100 == 0 {
+            if !self.allowed(&n, 1) {
                 return Err(Errno(13));
             }
             drop(n);
@@ -523,7 +584,7 @@ impl Vfs {
         let p = self.resolve(AT_FDCWD, path)?;
         let node = self.node(&p)?;
         let n = node.borrow();
-        if n.mode & 0o100 == 0 {
+        if !self.allowed(&n, 1) {
             return Err(Errno(13));
         }
         match &n.content {
@@ -540,7 +601,7 @@ impl Vfs {
         self.insert(
             p,
             Content::Directory,
-            0o40000 | (mode & 0o777 & !self.umask),
+            0o40000 | (mode & 0o7777 & !self.umask),
         )
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
@@ -549,6 +610,7 @@ impl Vfs {
             return Err(Errno(16));
         }
         let node = self.node(&p)?;
+        self.check_remove(&p)?;
         let is_dir = matches!(node.borrow().content, Content::Directory);
         if directory != is_dir {
             return Err(Errno(if is_dir { 21 } else { 20 }));
@@ -604,8 +666,14 @@ impl Vfs {
         if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
             return Err(Errno(22));
         }
+        if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
+            return Ok(fd);
+        }
         let fd = self.available(0)?;
         let p = self.resolve_final(dirfd, path, flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0)?;
+        if self.pseudo_readonly(&p) && (flags & 3 != 0 || flags & 0x240 != 0) {
+            return Err(Errno(30));
+        }
         let existed = self.node(&p).is_ok();
         if existed && flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
@@ -618,10 +686,13 @@ impl Vfs {
             self.insert(
                 p.clone(),
                 Content::File(self.empty_data()?),
-                0o100000 | (mode & 0o777 & !self.umask),
+                0o100000 | (mode & 0o7777 & !self.umask),
             )?;
         }
         let node = self.node(&p)?;
+        if matches!(node.borrow().content, Content::Device(pseudo::Device::Ptmx)) {
+            return Err(Errno(95));
+        }
         {
             let mut n = node.borrow_mut();
             if matches!(n.content, Content::Symlink(_)) {
@@ -634,8 +705,8 @@ impl Vfs {
                 return Err(Errno(20));
             }
             if existed
-                && ((flags & 3 != 1 && n.mode & 0o400 == 0)
-                    || (flags & 3 != 0 && n.mode & 0o200 == 0))
+                && ((flags & 3 != 1 && !self.allowed(&n, 4))
+                    || (flags & 3 != 0 && !self.allowed(&n, 2)))
             {
                 return Err(Errno(13));
             }
@@ -654,7 +725,11 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
-                    kind: if matches!(node.borrow().content, Content::Terminal) {
+                    id: self.open_id(),
+                    kind: if matches!(
+                        node.borrow().content,
+                        Content::Terminal | Content::Device(pseudo::Device::Pts)
+                    ) {
                         FdKind::Terminal
                     } else {
                         FdKind::Node(p)
@@ -736,6 +811,7 @@ impl Vfs {
             return Err(Errno(24));
         }
         let p = Rc::new(RefCell::new(Pipe {
+            inode: self.open_id(),
             bytes: VecDeque::new(),
             reader: Weak::new(),
             writer: Weak::new(),
@@ -761,6 +837,7 @@ impl Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        id: self.open_id(),
                         kind,
                         flags: (flags & O_NONBLOCK) | access,
                         position: 0,
@@ -775,6 +852,7 @@ impl Vfs {
         Ok([free[0], free[1]])
     }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
+        self.refresh_pseudo_fd(fd)?;
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 1 {
             return Err(Errno(9));
@@ -808,6 +886,7 @@ impl Vfs {
                 Ok(out)
             }
             Content::Null => Ok(Vec::new()),
+            Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
@@ -854,11 +933,13 @@ impl Vfs {
             return Err(Errno(9));
         }
         let node = o.node.clone().ok_or(Errno(29))?;
+        self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let count = bytes.len().min(storage::MAX_TRANSFER);
         let bytes = &bytes[..count];
         let result = match &mut n.content {
             Content::Null => Ok(bytes.len()),
+            Content::Device(device) => device.write(bytes),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
@@ -886,6 +967,12 @@ impl Vfs {
             }
         };
         if result.is_ok_and(|n| n != 0) {
+            if self.credentials.fsuid != 0 && matches!(n.content, Content::File(_)) {
+                n.mode &= !0o4000;
+                if n.mode & 0o10 != 0 {
+                    n.mode &= !0o2000;
+                }
+            }
             n.times[1] = storage::Timestamp::now();
             n.times[2] = n.times[1];
         }
@@ -898,6 +985,7 @@ impl Vfs {
         result
     }
     pub fn pread(&self, fd: u32, count: usize, offset: u64) -> Result<Vec<u8>> {
+        self.refresh_pseudo_fd(fd)?;
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
@@ -909,6 +997,7 @@ impl Vfs {
         match &n.content {
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
+            Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(29)),
@@ -926,7 +1015,9 @@ impl Vfs {
         if o.flags & 3 == 0 {
             return Err(Errno(22));
         }
-        let mut n = o.node.as_ref().ok_or(Errno(22))?.borrow_mut();
+        let node = o.node.as_ref().ok_or(Errno(22))?;
+        self.pseudo_immutable(node)?;
+        let mut n = node.borrow_mut();
         let Content::File(b) = &mut n.content else {
             return Err(Errno(22));
         };
@@ -937,6 +1028,12 @@ impl Vfs {
             return Err(Errno(28));
         }
         b.truncate(length)?;
+        if self.credentials.fsuid != 0 {
+            n.mode &= !0o4000;
+            if n.mode & 0o10 != 0 {
+                n.mode &= !0o2000;
+            }
+        }
         n.times[1] = storage::Timestamp::now();
         n.times[2] = n.times[1];
         drop(n);
@@ -958,6 +1055,7 @@ impl Vfs {
             Content::Directory => 0,
             Content::Symlink(_) => return Err(Errno(40)),
             Content::Null => return Ok(0),
+            Content::Device(_) => return Ok(0),
             Content::Terminal => return Err(Errno(29)),
         };
         let base = match whence {
@@ -973,22 +1071,86 @@ impl Vfs {
         o.position = new as u64;
         Ok(new as u64)
     }
-    fn stat_node(node: &Node) -> Result<[u8; 128]> {
+    fn stat_node(&self, node: &Node) -> Result<[u8; 128]> {
         let mut out = [0; 128];
+        out[..8].copy_from_slice(&node.device.to_le_bytes());
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         out[16..20].copy_from_slice(&node.mode.to_le_bytes());
-        out[20..24].copy_from_slice(&node.links.to_le_bytes());
-        out[24..28].copy_from_slice(&1000u32.to_le_bytes());
-        out[28..32].copy_from_slice(&1000u32.to_le_bytes());
+        let mut links = node.links;
+        if links != 0 && matches!(node.content, Content::Directory) {
+            // Persistent links count path owners; stat counts . and children's .. too.
+            let fs = self.fs.borrow();
+            let path = fs
+                .paths
+                .iter()
+                .find(|(_, n)| n.borrow().inode == node.inode)
+                .map(|(p, _)| p.clone())
+                .or_else(|| {
+                    self.pseudo
+                        .borrow()
+                        .nodes
+                        .iter()
+                        .find(|(_, n)| n.borrow().inode == node.inode)
+                        .map(|(p, _)| p.clone())
+                });
+            if let Some(path) = path {
+                let mut prefix = path.clone();
+                if prefix != b"/" {
+                    prefix.push(b'/');
+                }
+                let mut directories = std::collections::BTreeSet::new();
+                for (p, n) in fs.paths.range(prefix.clone()..) {
+                    if !p.starts_with(&prefix) {
+                        break;
+                    }
+                    let name = &p[prefix.len()..];
+                    if !name.is_empty()
+                        && !name.contains(&b'/')
+                        && matches!(n.borrow().content, Content::Directory)
+                    {
+                        directories.insert(name.to_vec());
+                    }
+                }
+                for name in self.pseudo_children(&path)? {
+                    let mut child = prefix.clone();
+                    child.extend_from_slice(&name);
+                    if self
+                        .node(&child)
+                        .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
+                    {
+                        directories.insert(name);
+                    }
+                }
+                links = 2 + directories.len() as u32;
+            }
+        }
+        out[20..24].copy_from_slice(&links.to_le_bytes());
+        out[24..28].copy_from_slice(&node.uid.to_le_bytes());
+        out[28..32].copy_from_slice(&node.gid.to_le_bytes());
+        let rdev = if node.mode & 0o170000 != 0o20000 {
+            0
+        } else {
+            match node.content {
+                Content::Null => 0x103u64,
+                Content::Terminal => 0x500,
+                Content::Device(device) => device.rdev(),
+                _ => 0,
+            }
+        };
+        out[32..40].copy_from_slice(&rdev.to_le_bytes());
         let size = match &node.content {
-            Content::File(b) => b.len(),
+            Content::File(b) if !node.volatile => b.len(),
             Content::Symlink(target) => target.len() as u64,
             _ => 0,
         };
         out[48..56].copy_from_slice(&size.to_le_bytes());
         out[56..60].copy_from_slice(&4096u32.to_le_bytes());
         let blocks = if let Content::File(data) = &node.content {
-            data.blocks()?
+            if node.volatile {
+                0
+            } else {
+                data.blocks()?
+            }
         } else {
             0
         };
@@ -1003,28 +1165,52 @@ impl Vfs {
         self.stat_at_flags(dirfd, path, false)
     }
     pub fn stat_at_flags(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<[u8; 128]> {
+        if !nofollow {
+            if let Some(open) = self.proc_fd_description(dirfd, path)? {
+                return self.stat_open(&open.borrow());
+            }
+        }
         let p = self.resolve_final(dirfd, path, !nofollow)?;
         let n = self.node(&p)?;
-        let out = Self::stat_node(&n.borrow());
+        let out = self.stat_node(&n.borrow());
         out
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
         let d = self.descriptor(fd)?;
-        let o = d.open.borrow();
+        self.stat_open(&d.open.borrow())
+    }
+    fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
         if let Some(n) = &o.node {
-            return Self::stat_node(&n.borrow());
+            return self.stat_node(&n.borrow());
         }
-        Self::stat_node(&Node {
+        if matches!(o.kind, FdKind::Terminal) {
+            if let Ok(n) = self.node(b"/dev/pts/0") {
+                return self.stat_node(&n.borrow());
+            }
+        }
+        self.stat_node(&Node {
+            device: if o.socket.is_some() {
+                5
+            } else if o.pipe.is_some() {
+                6
+            } else {
+                1
+            },
             content: Content::Null,
             mode: if o.socket.is_some() {
                 0o140600
-            } else if o.pipe.is_some() {
+            } else if o.pipe.is_some()
+                || matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
+            {
                 0o10600
             } else {
                 0o20666
             },
-            inode: fd as u64 + 0x10000,
+            inode: o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
             links: 1,
+            uid: self.credentials.euid,
+            gid: self.credentials.egid,
+            volatile: false,
             times: [storage::Timestamp::default(); 3],
         })
     }
@@ -1039,7 +1225,7 @@ impl Vfs {
         if !matches!(node.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        if node.borrow().mode & 0o100 == 0 {
+        if !self.allowed(&node.borrow(), 1) {
             return Err(Errno(13));
         }
         self.cwd_node = Some(node);
@@ -1063,10 +1249,10 @@ impl Vfs {
         }
         let p = self.path_of(node)?;
         let fs = self.fs.borrow();
-        let inode = fs.paths[&p].borrow().inode;
+        let inode = node.borrow().inode;
         let parent_end = p.iter().rposition(|&b| b == b'/').expect("absolute").max(1);
-        let parent = fs.paths[&p[..parent_end]].borrow().inode;
-        let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];
+        let parent = self.node(&p[..parent_end])?.borrow().inode;
+        let mut children = BTreeMap::new();
         let mut prefix = p.clone();
         if prefix != b"/" {
             prefix.push(b'/');
@@ -1080,17 +1266,39 @@ impl Vfs {
                 continue;
             }
             let n = node.borrow();
-            entries.push((
+            children.insert(
                 name.to_vec(),
-                n.inode,
-                match n.content {
-                    Content::Directory => 4,
-                    Content::File(_) => 8,
-                    Content::Symlink(_) => 10,
-                    Content::Null | Content::Terminal => 2,
-                },
-            ));
+                (
+                    n.inode,
+                    match n.content {
+                        Content::Directory => 4,
+                        Content::File(_) => 8,
+                        Content::Symlink(_) => 10,
+                        Content::Null | Content::Terminal | Content::Device(_) => 2,
+                    },
+                ),
+            );
         }
+        drop(fs);
+        for name in self.pseudo_children(&p)? {
+            let mut child = prefix.clone();
+            child.extend_from_slice(&name);
+            let n = self.node(&child)?;
+            let n = n.borrow();
+            let kind = match n.content {
+                Content::Directory => 4,
+                Content::Symlink(_) => 10,
+                Content::File(_) => 8,
+                _ => 2,
+            };
+            children.insert(name, (n.inode, kind));
+        }
+        let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];
+        entries.extend(
+            children
+                .into_iter()
+                .map(|(name, (inode, kind))| (name, inode, kind)),
+        );
         let mut out = Vec::new();
         while let Some((name, ino, kind)) = entries.get(o.position as usize) {
             let size = (19 + name.len() + 1 + 7) & !7;
@@ -1195,6 +1403,8 @@ mod tests {
     #[test]
     fn directory_search_permissions_and_zero_length_writes() {
         let mut v = Vfs::default();
+        v.chown_at(AT_FDCWD, b"/", 1000, 1000, false).unwrap();
+        v.credentials = Credentials::user(1000, 1000);
         v.mkdir_at(AT_FDCWD, b"/hidden", 0o400).unwrap();
         assert_eq!(
             v.open_at(AT_FDCWD, b"/hidden/file", 0x41, 0o600),
@@ -1303,6 +1513,8 @@ mod permission_tests {
     #[test]
     fn directory_mutations_require_parent_write_and_import_uses_canonical_path() {
         let mut v = Vfs::default();
+        v.chown_at(AT_FDCWD, b"/", 1000, 1000, false).unwrap();
+        v.credentials = Credentials::user(1000, 1000);
         v.mkdir_at(AT_FDCWD, b"/readonly", 0o555).unwrap();
         assert_eq!(
             v.open_at(AT_FDCWD, b"/readonly/new", 0x41, 0o600),

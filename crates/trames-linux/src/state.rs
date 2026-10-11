@@ -9,6 +9,12 @@ type Result<T> = std::result::Result<T, Errno>;
 pub struct Linux {
     pub vfs: Vfs,
     pub trace: bool,
+    pub arguments: Vec<Vec<u8>>,
+    pub environment: Vec<Vec<u8>>,
+    pub executable_path: Vec<u8>,
+    pub command_name: Vec<u8>,
+    pub argument_pointers: Vec<u64>,
+    pub auxiliary: Vec<u8>,
     brk_base: u64,
     brk: u64,
     mmap_next: u64,
@@ -16,6 +22,14 @@ pub struct Linux {
 }
 
 impl Linux {
+    pub fn share_heap_from(&mut self, other: &Self) {
+        self.brk_base = other.brk_base;
+        self.brk = other.brk;
+        self.mmap_next = other.mmap_next;
+    }
+    pub fn clear_tid_address(&self) -> u64 {
+        self.clear_child_tid
+    }
     pub fn fork_tid(&mut self, address: u64) {
         self.clear_child_tid = address;
     }
@@ -28,6 +42,12 @@ impl Linux {
         Self {
             vfs: Vfs::default(),
             trace: false,
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            executable_path: Vec::new(),
+            command_name: Vec::new(),
+            argument_pointers: Vec::new(),
+            auxiliary: Vec::new(),
             brk_base,
             brk: brk_base,
             mmap_next: 0x1000_0000,
@@ -77,12 +97,18 @@ impl Linux {
     }
     fn read(&mut self, a: [u64; 6], memory: &mut Memory, io: &mut impl GuestOutput) -> Result<u64> {
         let fd = a[0] as u32;
+        self.vfs.fd_kind(fd)?;
+        let count = a[2].min(MAX_WRITE as u64) as usize;
+        Self::check(memory, a[1], count, Access::Write)?;
+        let bytes = self.read_bytes(fd, count, io)?;
+        memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+        Ok(bytes.len() as u64)
+    }
+    fn read_bytes(&mut self, fd: u32, count: usize, io: &mut impl GuestOutput) -> Result<Vec<u8>> {
         let kind = self.vfs.fd_kind(fd)?.clone();
         if matches!(kind, FdKind::Stdout | FdKind::Stderr) {
             return Err(Errno(9));
         }
-        let count = a[2].min(MAX_WRITE as u64) as usize;
-        Self::check(memory, a[1], count, Access::Write)?;
         let bytes = if kind == FdKind::Stdin {
             let mut bytes = vec![0; count];
             if count != 0 {
@@ -98,7 +124,58 @@ impl Linux {
         } else {
             self.vfs.read(fd, count)?
         };
-        memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+        Ok(bytes)
+    }
+    pub fn readv_parts(memory: &Memory, a: [u64; 6]) -> Result<(Vec<(u64, usize)>, usize)> {
+        if a[2] > 1024 {
+            return Err(Errno(22));
+        }
+        Self::check(memory, a[1], a[2] as usize * 16, Access::Read)?;
+        let mut parts = Vec::new();
+        let mut total = 0usize;
+        let mut requested = 0u64;
+        for i in 0..a[2] {
+            let pointer = memory.read_u64(a[1] + i * 16).map_err(|_| Errno(14))?;
+            let length = memory.read_u64(a[1] + i * 16 + 8).map_err(|_| Errno(14))?;
+            requested = requested
+                .checked_add(length)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or(Errno(22))?;
+            let take = length.min((MAX_WRITE - total) as u64) as usize;
+            if take != 0 {
+                Self::check(memory, pointer, take, Access::Write)?;
+            }
+            parts.push((pointer, take));
+            total += take;
+        }
+        Ok((parts, total))
+    }
+    pub fn scatter(memory: &mut Memory, parts: &[(u64, usize)], bytes: &[u8]) -> Result<()> {
+        let mut offset = 0;
+        for &(pointer, length) in parts {
+            let take = length.min(bytes.len() - offset);
+            if take != 0 {
+                memory
+                    .write(pointer, &bytes[offset..offset + take])
+                    .map_err(|_| Errno(14))?;
+            }
+            offset += take;
+            if offset == bytes.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn readv(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut Memory,
+        io: &mut impl GuestOutput,
+    ) -> Result<u64> {
+        self.vfs.fd_kind(a[0] as u32)?;
+        let (parts, count) = Self::readv_parts(memory, a)?;
+        let bytes = self.read_bytes(a[0] as u32, count, io)?;
+        Self::scatter(memory, &parts, &bytes)?;
         Ok(bytes.len() as u64)
     }
     fn write(&mut self, a: [u64; 6], memory: &Memory, io: &mut impl GuestOutput) -> Result<u64> {
@@ -304,6 +381,7 @@ impl Linux {
                 Ok(count as u64)
             }
             198..=212 | 242 => self.network_syscall(number, a, memory),
+            65 => self.readv(a, memory, io),
             37 => {
                 if a[4] & !0x400 != 0 {
                     return Err(Errno(22));
@@ -326,16 +404,14 @@ impl Linux {
                 Ok(0)
             }
             43 | 44 => {
-                if number == 43 {
+                let stat = if number == 43 {
                     let path = Self::path(memory, a[0])?;
-                    self.vfs.stat_at(-100, &path)?;
+                    self.vfs.statfs_at(&path)?
                 } else {
-                    self.vfs.fd_kind(a[0] as u32)?;
-                }
+                    self.vfs.statfs_fd(a[0] as u32)?
+                };
                 Self::check(memory, a[1], 120, Access::Write)?;
-                memory
-                    .write(a[1], &self.vfs.storage_stat())
-                    .map_err(|_| Errno(14))?;
+                memory.write(a[1], &stat).map_err(|_| Errno(14))?;
                 Ok(0)
             }
             45 => {
@@ -354,6 +430,28 @@ impl Linux {
             53 => {
                 let path = Self::path(memory, a[1])?;
                 self.vfs.chmod_at(a[0] as i32, &path, a[2] as u32)?;
+                Ok(0)
+            }
+            54 => {
+                if a[4] & !0x1100 != 0 {
+                    return Err(Errno(22));
+                }
+                let path = Self::path(memory, a[1])?;
+                if path.is_empty() && a[4] & 0x1000 != 0 {
+                    self.vfs.chown_fd(a[0] as u32, a[2] as u32, a[3] as u32)?;
+                } else {
+                    self.vfs.chown_at(
+                        a[0] as i32,
+                        &path,
+                        a[2] as u32,
+                        a[3] as u32,
+                        a[4] & 0x100 != 0,
+                    )?;
+                }
+                Ok(0)
+            }
+            55 => {
+                self.vfs.chown_fd(a[0] as u32, a[1] as u32, a[2] as u32)?;
                 Ok(0)
             }
             67 | 68 => {
@@ -521,18 +619,23 @@ impl Linux {
                     Err(Errno(25))
                 }
             }
-            48 => {
+            48 | 439 => {
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));
                 }
                 let path = Self::path(memory, a[1])?;
-                let stat = self.vfs.stat_at(a[0] as i32, &path)?;
-                let mode = u32::from_le_bytes(stat[16..20].try_into().expect("stat"));
-                if mode & ((a[2] as u32) << 6) != (a[2] as u32) << 6 {
-                    Err(Errno(13))
-                } else {
-                    Ok(0)
+                let flags = if number == 439 { a[3] } else { 0 };
+                if flags & !0x300 != 0 {
+                    return Err(Errno(22));
                 }
+                self.vfs.access_at(
+                    a[0] as i32,
+                    &path,
+                    a[2] as u32,
+                    flags & 0x200 != 0,
+                    flags & 0x100 != 0,
+                )?;
+                Ok(0)
             }
             36 => {
                 let target = Self::path(memory, a[0])?;
@@ -581,7 +684,184 @@ impl Linux {
             }
             172 => Ok(1),
             173 => Ok(0),
-            174..=177 => Ok(1000),
+            174..=177 => {
+                let c = &self.vfs.credentials;
+                Ok(match number {
+                    174 => c.uid,
+                    175 => c.euid,
+                    176 => c.gid,
+                    _ => c.egid,
+                } as u64)
+            }
+            160 => {
+                Self::check(memory, a[0], 390, Access::Write)?;
+                let mut fields = [0; 390];
+                for (i, text) in [
+                    b"Linux".as_slice(),
+                    b"trames",
+                    b"6.0.0-trames",
+                    b"#1 Trames compatibility runtime",
+                    b"aarch64",
+                    b"(none)",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    fields[i * 65..i * 65 + text.len()].copy_from_slice(text);
+                }
+                memory.write(a[0], &fields).map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            167 if matches!(a[0], 15 | 16) => {
+                if a[0] == 15 {
+                    let mut name = Vec::new();
+                    for i in 0..15 {
+                        let mut byte = [0];
+                        memory.read(a[1] + i, &mut byte).map_err(|_| Errno(14))?;
+                        if byte[0] == 0 {
+                            break;
+                        }
+                        name.push(byte[0]);
+                    }
+                    self.command_name = name;
+                } else {
+                    Self::check(memory, a[1], 16, Access::Write)?;
+                    let mut name = [0; 16];
+                    let len = self.command_name.len().min(15);
+                    name[..len].copy_from_slice(&self.command_name[..len]);
+                    memory.write(a[1], &name).map_err(|_| Errno(14))?;
+                }
+                Ok(0)
+            }
+            169 => {
+                if a[0] != 0 {
+                    Self::check(memory, a[0], 16, Access::Write)?;
+                }
+                if a[1] != 0 {
+                    Self::check(memory, a[1], 8, Access::Write)?;
+                }
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| Errno(5))?;
+                if a[0] != 0 {
+                    memory
+                        .write(a[0], &time.as_secs().to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                    memory
+                        .write(a[0] + 8, &(time.subsec_micros() as u64).to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                if a[1] != 0 {
+                    memory.write(a[1], &[0; 8]).map_err(|_| Errno(14))?;
+                }
+                Ok(0)
+            }
+            144 | 146 => {
+                self.vfs.credentials.set_id(number == 144, a[0] as u32)?;
+                Ok(0)
+            }
+            143 | 145 | 147 | 149 => {
+                let group = matches!(number, 143 | 149);
+                let values = if matches!(number, 143 | 145) {
+                    let c = &self.vfs.credentials;
+                    let old_real = if group { c.gid } else { c.uid };
+                    [
+                        a[0] as u32,
+                        a[1] as u32,
+                        if a[0] as u32 != u32::MAX
+                            || (a[1] as u32 != u32::MAX && a[1] as u32 != old_real)
+                        {
+                            if a[1] as u32 == u32::MAX {
+                                if group {
+                                    c.egid
+                                } else {
+                                    c.euid
+                                }
+                            } else {
+                                a[1] as u32
+                            }
+                        } else {
+                            u32::MAX
+                        },
+                    ]
+                } else {
+                    [a[0] as u32, a[1] as u32, a[2] as u32]
+                };
+                self.vfs.credentials.set_res_ids(group, values)?;
+                Ok(0)
+            }
+            148 | 150 => {
+                for pointer in a[..3].iter() {
+                    Self::check(memory, *pointer, 4, Access::Write)?;
+                }
+                let c = &self.vfs.credentials;
+                let values = if number == 148 {
+                    [c.uid, c.euid, c.suid]
+                } else {
+                    [c.gid, c.egid, c.sgid]
+                };
+                for i in 0..3 {
+                    memory
+                        .write(a[i], &values[i].to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                Ok(0)
+            }
+            151 | 152 => {
+                let c = &mut self.vfs.credentials;
+                let group = number == 152;
+                let old = if group { c.fsgid } else { c.fsuid };
+                let ids = if group {
+                    [c.gid, c.egid, c.sgid, old]
+                } else {
+                    [c.uid, c.euid, c.suid, old]
+                };
+                if c.euid == 0 || ids.contains(&(a[0] as u32)) {
+                    if group {
+                        c.fsgid = a[0] as u32;
+                    } else {
+                        c.fsuid = a[0] as u32;
+                    }
+                }
+                Ok(old as u64)
+            }
+            158 | 159 => {
+                let count = a[0] as usize;
+                if count > 65536 {
+                    return Err(Errno(22));
+                }
+                if number == 158 {
+                    let groups = &self.vfs.credentials.groups;
+                    if count == 0 {
+                        return Ok(groups.len() as u64);
+                    }
+                    if count < groups.len() {
+                        return Err(Errno(22));
+                    }
+                    Self::check(memory, a[1], groups.len() * 4, Access::Write)?;
+                    for (i, value) in groups.iter().enumerate() {
+                        memory
+                            .write(a[1] + (i * 4) as u64, &value.to_le_bytes())
+                            .map_err(|_| Errno(14))?;
+                    }
+                    Ok(groups.len() as u64)
+                } else {
+                    if self.vfs.credentials.euid != 0 {
+                        return Err(Errno(1));
+                    }
+                    Self::check(memory, a[1], count * 4, Access::Read)?;
+                    let mut groups = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let mut value = [0; 4];
+                        memory
+                            .read(a[1] + (i * 4) as u64, &mut value)
+                            .map_err(|_| Errno(14))?;
+                        groups.push(u32::from_le_bytes(value));
+                    }
+                    self.vfs.credentials.groups = groups;
+                    Ok(0)
+                }
+            }
             166 => {
                 let previous = self.vfs.umask;
                 self.vfs.umask = a[0] as u32 & 0o777;
@@ -672,6 +952,36 @@ mod tests {
         let mut bytes = [0; 5];
         m.read(0x1000, &mut bytes).unwrap();
         assert_eq!(&bytes, b"input");
+    }
+
+    #[test]
+    fn readv_preflights_every_destination_before_consuming_input() {
+        let mut linux = Linux::new(0x3000);
+        let mut m = memory();
+        let mut io = CapturedOutput {
+            stdin: b"abcd".to_vec(),
+            ..CapturedOutput::default()
+        };
+        for (i, value) in [0x1100u64, 1, ADDRESS_LIMIT, 3].into_iter().enumerate() {
+            m.write(0x1000 + i as u64 * 8, &value.to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            linux.syscall(65, [0, 0x1000, 2, 0, 0, 0], &mut m, &mut io),
+            Err(Errno(14))
+        );
+        assert_eq!(io.stdin, b"abcd");
+        m.write(0x1010, &0x1200u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            linux.syscall(65, [0, 0x1000, 2, 0, 0, 0], &mut m, &mut io),
+            Ok(4)
+        );
+        let mut first = [0];
+        let mut rest = [0; 3];
+        m.read(0x1100, &mut first).unwrap();
+        m.read(0x1200, &mut rest).unwrap();
+        assert_eq!(first, b"a"[..]);
+        assert_eq!(rest, b"bcd"[..]);
     }
 
     #[test]

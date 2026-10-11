@@ -29,6 +29,102 @@ impl Drop for Temp {
 fn size(stat: [u8; 128]) -> u64 {
     u64::from_le_bytes(stat[48..56].try_into().unwrap())
 }
+#[test]
+fn pseudo_views_do_not_enter_the_manifest_or_consume_disk_quota() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let used = v.capacity().used_bytes;
+    v.set_runtime_info(
+        1,
+        RuntimeInfo {
+            processes: vec![ProcessInfo {
+                pid: 1,
+                tgid: 1,
+                command: b"ash".to_vec(),
+                ..ProcessInfo::default()
+            }],
+            ..RuntimeInfo::default()
+        },
+    );
+    let fd = v.open_at(AT_FDCWD, b"/proc/self/status", 0, 0).unwrap();
+    assert!(!v.read(fd, 1024).unwrap().is_empty());
+    v.close(fd).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/dev/zero", 0, 0).unwrap();
+    assert_eq!(v.read(fd, 4096).unwrap(), vec![0; 4096]);
+    v.close(fd).unwrap();
+    v.sync().unwrap();
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert_eq!(v.capacity().used_bytes, used);
+    drop(v);
+    let v = dir.open();
+    assert_eq!(v.stat_at(AT_FDCWD, b"/proc/1/status"), Err(Errno(2)));
+}
+#[test]
+fn setgid_inheritance_and_setid_bits_follow_guest_ownership() {
+    let mut v = Vfs::default();
+    v.mkdir_at(AT_FDCWD, b"/shared", 0o777).unwrap();
+    v.chown_at(AT_FDCWD, b"/shared", 1000, 3000, false).unwrap();
+    v.chmod_at(AT_FDCWD, b"/shared", 0o2777).unwrap();
+    v.credentials = Credentials::user(1000, 1000);
+    v.credentials.groups.push(3000);
+    let fd = v.open_at(AT_FDCWD, b"/shared/data", 0x42, 0o6770).unwrap();
+    assert_eq!(&v.stat_fd(fd).unwrap()[28..32], &3000u32.to_le_bytes());
+    v.write(fd, b"changed").unwrap();
+    assert_eq!(
+        u32::from_le_bytes(v.stat_fd(fd).unwrap()[16..20].try_into().unwrap()) & 0o6000,
+        0
+    );
+    v.mkdir_at(AT_FDCWD, b"/shared/sub", 0o755).unwrap();
+    let stat = v.stat_at(AT_FDCWD, b"/shared/sub").unwrap();
+    assert_eq!(&stat[28..32], &3000u32.to_le_bytes());
+    assert_ne!(
+        u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o2000,
+        0
+    );
+}
+
+#[test]
+fn ownership_sticky_modes_and_symlink_ownership_survive_reopening() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/shared", 0o755).unwrap();
+    v.chmod_at(AT_FDCWD, b"/shared", 0o1777).unwrap();
+    v.import_file(b"/shared/data", b"durable".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/shared/data", 2, 0).unwrap();
+    v.chown_fd(fd, 2000, 4000).unwrap();
+    v.chmod_fd(fd, 0o640).unwrap();
+    v.symlink_at(b"data", AT_FDCWD, b"/shared/link").unwrap();
+    v.chown_at(AT_FDCWD, b"/shared/link", 1234, 4321, true)
+        .unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    let stat = v.stat_at(AT_FDCWD, b"/shared/data").unwrap();
+    assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 2000);
+    assert_eq!(u32::from_le_bytes(stat[28..32].try_into().unwrap()), 4000);
+    let link = v.stat_at_flags(AT_FDCWD, b"/shared/link", true).unwrap();
+    assert_eq!(u32::from_le_bytes(link[24..28].try_into().unwrap()), 1234);
+    let mode = v.stat_at(AT_FDCWD, b"/shared").unwrap();
+    assert_eq!(
+        u32::from_le_bytes(mode[16..20].try_into().unwrap()) & 0o7777,
+        0o1777
+    );
+    v.credentials = Credentials::user(3000, 3000);
+    assert_eq!(v.open_at(AT_FDCWD, b"/shared/data", 0, 0), Err(Errno(13)));
+    v.credentials.groups.push(4000);
+    let fd = v.open_at(AT_FDCWD, b"/shared/data", 0, 0).unwrap();
+    assert_eq!(v.read(fd, 32).unwrap(), b"durable");
+    assert_eq!(v.open_at(AT_FDCWD, b"/shared/data", 1, 0), Err(Errno(13)));
+    assert_eq!(v.unlink_at(AT_FDCWD, b"/shared/data", false), Err(Errno(1)));
+    assert_eq!(
+        v.chown_at(AT_FDCWD, b"/shared/data", 3000, 3000, false),
+        Err(Errno(1))
+    );
+    assert_eq!(v.credentials.set_id(false, 0), Err(Errno(1)));
+    v.credentials = Credentials::user(2000, 4000);
+    v.unlink_at(AT_FDCWD, b"/shared/data", false).unwrap();
+}
 
 #[test]
 fn reopen_restores_byte_paths_hard_links_modes_times_and_bytes() {
@@ -400,32 +496,41 @@ fn flock_is_shared_by_dup_fork_and_released_by_last_close() {
 }
 
 #[test]
-fn version_one_store_is_readable_and_upgrades_on_checkpoint() {
-    let dir = Temp::new();
-    let mut v = dir.open();
-    v.import_file(b"/old", b"v1 data".to_vec()).unwrap();
-    v.sync().unwrap();
-    drop(v);
-    let data = fs::read(dir.0.join("manifest")).unwrap();
-    let count = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
-    let mut legacy = data[..40].to_vec();
-    legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
-    let mut offset = 40;
-    for _ in 0..count {
-        legacy.extend_from_slice(&data[offset..offset + 64]);
-        assert_eq!(&data[offset + 64..offset + 68], &[0; 4]);
-        offset += 68;
+fn legacy_stores_preserve_owner_and_data_when_upgrading_on_checkpoint() {
+    for version in [1u32, 2] {
+        let dir = Temp::new();
+        let mut v = dir.open();
+        v.import_file(b"/old", b"legacy data".to_vec()).unwrap();
+        v.sync().unwrap();
+        drop(v);
+        let data = fs::read(dir.0.join("manifest")).unwrap();
+        let count = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
+        let mut legacy = data[..40].to_vec();
+        legacy[8..12].copy_from_slice(&version.to_le_bytes());
+        let mut offset = 40;
+        for _ in 0..count {
+            legacy.extend_from_slice(&data[offset..offset + 12]);
+            // v1 predates persisted uid/gid and the v2 symlink payload field.
+            legacy
+                .extend_from_slice(&data[offset + 20..offset + if version == 1 { 72 } else { 76 }]);
+            assert_eq!(&data[offset + 72..offset + 76], &[0; 4]);
+            offset += 76;
+        }
+        legacy.extend_from_slice(&data[offset..data.len() - 8]);
+        legacy.extend(storage::checksum(&legacy).to_le_bytes());
+        fs::write(dir.0.join("manifest"), legacy).unwrap();
+        let mut v = dir.open();
+        let fd = v.open_at(AT_FDCWD, b"/old", 0, 0).unwrap();
+        assert_eq!(v.read(fd, 32).unwrap(), b"legacy data");
+        assert_eq!(
+            &v.stat_fd(fd).unwrap()[24..32],
+            &[1000u32.to_le_bytes(), 1000u32.to_le_bytes()].concat()
+        );
+        v.checkpoint().unwrap();
+        drop(v);
+        assert_eq!(
+            &fs::read(dir.0.join("manifest")).unwrap()[8..12],
+            &3u32.to_le_bytes()
+        );
     }
-    legacy.extend_from_slice(&data[offset..data.len() - 8]);
-    legacy.extend(storage::checksum(&legacy).to_le_bytes());
-    fs::write(dir.0.join("manifest"), legacy).unwrap();
-    let mut v = dir.open();
-    let fd = v.open_at(AT_FDCWD, b"/old", 0, 0).unwrap();
-    assert_eq!(v.read(fd, 32).unwrap(), b"v1 data");
-    v.checkpoint().unwrap();
-    drop(v);
-    assert_eq!(
-        &fs::read(dir.0.join("manifest")).unwrap()[8..12],
-        &2u32.to_le_bytes()
-    );
 }

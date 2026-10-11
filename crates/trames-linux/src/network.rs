@@ -4,7 +4,7 @@
 use super::Linux;
 use std::net::SocketAddr;
 use trames_memory::{Access, Memory};
-use trames_net::{decode_address, encode_address, NetError, MSG_TRUNC};
+use trames_net::{encode_address, NetError, MSG_TRUNC};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
 fn net(error: NetError) -> Errno {
@@ -19,14 +19,14 @@ fn u32_at(memory: &Memory, address: u64) -> Result<u32> {
 fn u64_at(memory: &Memory, address: u64) -> Result<u64> {
     memory.read_u64(address).map_err(|_| Errno(14))
 }
-fn address(memory: &Memory, pointer: u64, length: u64) -> Result<SocketAddr> {
+fn address(memory: &Memory, pointer: u64, length: u64) -> Result<Vec<u8>> {
     if !(2..=128).contains(&length) {
         return Err(Errno(22));
     }
     Linux::check(memory, pointer, length as usize, Access::Read)?;
     let mut bytes = vec![0; length as usize];
     memory.read(pointer, &mut bytes).map_err(|_| Errno(14))?;
-    decode_address(&bytes).map_err(net)
+    Ok(bytes)
 }
 struct AddressOutput {
     pointer: u64,
@@ -62,6 +62,9 @@ impl AddressOutput {
     }
     fn write(self, memory: &mut Memory, address: Option<SocketAddr>) -> Result<()> {
         let bytes = address.map_or_else(Vec::new, encode_address);
+        self.write_bytes(memory, &bytes)
+    }
+    fn write_bytes(self, memory: &mut Memory, bytes: &[u8]) -> Result<()> {
         memory
             .write(self.pointer, &bytes[..bytes.len().min(self.capacity)])
             .map_err(|_| Errno(14))?;
@@ -163,7 +166,10 @@ impl Linux {
                     .map_err(|_| Errno(14))?;
                 return Ok(0);
             }
-            if !matches!(request, 0x8910 | 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8933) {
+            if !matches!(
+                request,
+                0x8910 | 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8933 | 0x8942 | 0x8927
+            ) {
                 return Err(Errno(25));
             }
             Self::check(memory, a[2], 40, Access::Write)?;
@@ -184,6 +190,12 @@ impl Linux {
                 }
             };
             match request {
+                0x8942 => entry[16..20].copy_from_slice(&0u32.to_le_bytes()),
+                0x8927 => {
+                    entry[16..32].fill(0);
+                    entry[16..18]
+                        .copy_from_slice(&(if loopback { 772u16 } else { 65534 }).to_le_bytes());
+                }
                 0x8910 => {
                     entry[..16].fill(0);
                     let name = if loopback {
@@ -248,9 +260,9 @@ impl Linux {
             200 | 203 => {
                 let peer = address(memory, a[1], a[2])?;
                 if number == 200 {
-                    socket.bind(peer).map_err(net)?;
+                    socket.bind_bytes(&peer).map_err(net)?;
                 } else {
-                    socket.connect(peer).map_err(net)?;
+                    socket.connect_bytes(&peer).map_err(net)?;
                 }
                 Ok(0)
             }
@@ -272,12 +284,12 @@ impl Linux {
                 let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?
                     .ok_or(Errno(14))?;
                 let address = if number == 204 {
-                    socket.local_addr()
+                    socket.local_bytes()
                 } else {
-                    socket.peer_addr()
+                    socket.peer_bytes()
                 }
                 .map_err(net)?;
-                output.write(memory, Some(address))?;
+                output.write_bytes(memory, &address)?;
                 Ok(0)
             }
             206 => {
@@ -292,7 +304,9 @@ impl Linux {
                 };
                 let mut bytes = vec![0; a[2] as usize];
                 memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(socket.send(&bytes, a[3] as u32, peer).map_err(net)? as u64)
+                Ok(socket
+                    .send_bytes(&bytes, a[3] as u32, peer.as_deref())
+                    .map_err(net)? as u64)
             }
             207 => {
                 let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
@@ -301,7 +315,7 @@ impl Linux {
                 let received = socket.recv(count, a[3] as u32).map_err(net)?;
                 memory.write(a[1], &received.data).map_err(|_| Errno(14))?;
                 if let Some(output) = output {
-                    output.write(memory, received.address)?;
+                    output.write_bytes(memory, &socket.received_address(&received))?;
                 }
                 Ok(if a[3] as u32 & MSG_TRUNC != 0 {
                     received.length
@@ -318,9 +332,14 @@ impl Linux {
                 if a[1] == 1 && matches!(a[2], 20 | 21) {
                     return Err(Errno(95));
                 }
-                let value = u32_at(memory, a[3])? as i32;
+                if a[4] > 65536 {
+                    return Err(Errno(22));
+                }
+                Self::check(memory, a[3], a[4] as usize, Access::Read)?;
+                let mut value = vec![0; a[4] as usize];
+                memory.read(a[3], &mut value).map_err(|_| Errno(14))?;
                 socket
-                    .set_option(a[1] as u32, a[2] as u32, value)
+                    .set_option_bytes(a[1] as u32, a[2] as u32, &value)
                     .map_err(net)?;
                 Ok(0)
             }
@@ -381,19 +400,39 @@ impl Linux {
                     let received = socket.recv(vectors.size, a[2] as u32).map_err(net)?;
                     vectors.write(memory, &received.data)?;
                     if let Some(output) = output {
-                        output.write(memory, received.address)?;
+                        output.write_bytes(memory, &socket.received_address(&received))?;
                     } else {
                         memory
                             .write(a[1] + 8, &0u32.to_le_bytes())
                             .map_err(|_| Errno(14))?;
                     }
+                    let mut ancillary = Vec::new();
+                    if let Some((level, kind, hop)) = socket.ancillary_hop() {
+                        ancillary.resize(24, 0);
+                        ancillary[..8].copy_from_slice(&20u64.to_le_bytes());
+                        ancillary[8..12].copy_from_slice(&level.to_le_bytes());
+                        ancillary[12..16].copy_from_slice(&kind.to_le_bytes());
+                        ancillary[16..20].copy_from_slice(&(hop as u32).to_le_bytes());
+                    }
+                    let control_count = ancillary.len().min(control_size as usize);
+                    if control_count != 0 {
+                        memory
+                            .write(control, &ancillary[..control_count])
+                            .map_err(|_| Errno(14))?;
+                    }
                     memory
-                        .write(a[1] + 40, &0u64.to_le_bytes())
+                        .write(a[1] + 40, &(control_count as u64).to_le_bytes())
                         .map_err(|_| Errno(14))?;
                     memory
                         .write(
                             a[1] + 48,
-                            &(if received.truncated { MSG_TRUNC } else { 0 }).to_le_bytes(),
+                            &((if received.truncated { MSG_TRUNC } else { 0 })
+                                | if control_count < ancillary.len() {
+                                    8
+                                } else {
+                                    0
+                                })
+                            .to_le_bytes(),
                         )
                         .map_err(|_| Errno(14))?;
                     Ok(if a[2] as u32 & MSG_TRUNC != 0 {
@@ -408,7 +447,7 @@ impl Linux {
                         Some(address(memory, name, name_size as u64)?)
                     };
                     Ok(socket
-                        .send(&vectors.read(memory)?, a[2] as u32, peer)
+                        .send_bytes(&vectors.read(memory)?, a[2] as u32, peer.as_deref())
                         .map_err(net)? as u64)
                 }
             }

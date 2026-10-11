@@ -107,6 +107,8 @@ impl Network {
         let (ty, native_protocol) = match (kind, protocol) {
             (1, 0 | 6) => (Type::STREAM, Protocol::TCP),
             (2, 0 | 17) => (Type::DGRAM, Protocol::UDP),
+            (2, 1) if family == 2 => (Type::DGRAM, Protocol::ICMPV4),
+            (2, 58) if family == 10 => (Type::DGRAM, Protocol::ICMPV6),
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
@@ -116,7 +118,16 @@ impl Network {
         if family == 10 {
             native.set_only_v6(true).map_err(from_io)?;
         }
-        Ok(self.wrap(native, family, kind, Connection::Idle))
+        Ok(self.wrap(
+            native,
+            family,
+            if kind == 2 && matches!(protocol, 1 | 58) {
+                3
+            } else {
+                kind
+            },
+            Connection::Idle,
+        ))
     }
     fn reserve(&self) -> Result<()> {
         if self.0.mode == NetworkMode::Off {
@@ -172,7 +183,7 @@ impl Network {
         // DNS clients commonly explicitly bind INADDR_ANY:0. This allows an
         // ephemeral UDP endpoint, not a guest-selected public service port.
         if self.0.mode == NetworkMode::Outbound
-            && kind == 2
+            && matches!(kind, 2 | 3)
             && address.ip().is_unspecified()
             && address.port() == 0
         {
@@ -251,6 +262,41 @@ pub struct Received {
     pub truncated: bool,
 }
 impl Socket {
+    pub fn info(&self) -> super::SocketInfo {
+        super::SocketInfo {
+            family: self.family,
+            kind: if self.kind == 3 { 2 } else { self.kind },
+            protocol: if self.kind == 1 {
+                6
+            } else if self.kind == 3 {
+                if self.family == 2 {
+                    1
+                } else {
+                    58
+                }
+            } else {
+                17
+            },
+            state: if self.kind != 1 {
+                if self.peer_addr().is_ok() {
+                    1
+                } else {
+                    7
+                }
+            } else {
+                match self.connection.get() {
+                    Connection::Listening => 10,
+                    Connection::Connecting => 2,
+                    Connection::Connected => 1,
+                    _ => 7,
+                }
+            },
+            local: self.local_addr().ok(),
+            peer: self.peer_addr().ok(),
+            tx_queue: None,
+            rx_queue: None,
+        }
+    }
     pub fn address_size(&self) -> usize {
         if self.family == 2 {
             16
@@ -471,7 +517,7 @@ impl Socket {
         }
         // Receive a complete UDP datagram into one bounded scratch buffer, even
         // for a zero-sized guest buffer. This preserves MSG_TRUNC and datagrams.
-        let mut data = vec![0; if self.kind == 2 { 65536 } else { count }];
+        let mut data = vec![0; if self.kind != 1 { 65536 } else { count }];
         let (length, address) = match &self.native {
             NativeSocket::Tcp(socket) => {
                 let length = if flags & MSG_PEEK != 0 {
@@ -568,9 +614,19 @@ impl Socket {
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
-            (1, 3) => Ok(self.kind as i32),
+            (1, 3) => Ok(if self.kind == 3 { 2 } else { self.kind as i32 }),
             (1, 39) => Ok(self.family as i32),
-            (1, 38) => Ok(if self.kind == 1 { 6 } else { 17 }),
+            (1, 38) => Ok(if self.kind == 1 {
+                6
+            } else if self.kind == 3 {
+                if self.family == 2 {
+                    1
+                } else {
+                    58
+                }
+            } else {
+                17
+            }),
             (1, 30) => Ok(i32::from(self.connection.get() == Connection::Listening)),
             (1, 4) => {
                 if self.connection.get() == Connection::Connecting {

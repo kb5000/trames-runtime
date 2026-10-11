@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, sync::Arc};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
@@ -68,11 +68,25 @@ struct Page {
     permissions: Permissions,
 }
 
-#[derive(Clone)]
 pub struct Memory {
     pages: BTreeMap<u64, Page>,
     limit: usize,
     revision: u64,
+    shared: Option<Rc<RefCell<Memory>>>,
+}
+impl Clone for Memory {
+    fn clone(&self) -> Self {
+        // fork always takes a COW snapshot, including when its parent has threads.
+        if let Some(shared) = &self.shared {
+            return shared.borrow().clone();
+        }
+        Self {
+            pages: self.pages.clone(),
+            limit: self.limit,
+            revision: self.revision,
+            shared: None,
+        }
+    }
 }
 
 impl Default for Memory {
@@ -82,7 +96,24 @@ impl Default for Memory {
 }
 
 impl Memory {
+    /// CLONE_VM shares mappings, protections, bytes and the decoder revision.
+    /// The inner address space remains private; no RefCell guard crosses an API call.
+    pub fn share(&mut self) -> Self {
+        if self.shared.is_none() {
+            let owned = std::mem::replace(self, Self::new(self.limit));
+            self.shared = Some(Rc::new(RefCell::new(owned)));
+        }
+        Self {
+            pages: BTreeMap::new(),
+            limit: self.limit,
+            revision: 0,
+            shared: self.shared.clone(),
+        }
+    }
     pub fn set_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().set_limit(limit);
+        }
         if self.mapped_bytes() > limit {
             return Err(MemoryError::Limit);
         }
@@ -94,26 +125,60 @@ impl Memory {
             pages: BTreeMap::new(),
             limit,
             revision: 0,
+            shared: None,
         }
     }
     pub fn mapped_bytes(&self) -> usize {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().mapped_bytes();
+        }
         self.pages.len() * PAGE_SIZE as usize
     }
 
+    /// Contiguous guest mappings for procfs; no native address is exposed.
+    pub fn regions(&self) -> Vec<(u64, u64, Permissions)> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().regions();
+        }
+        let mut regions: Vec<(u64, u64, Permissions)> = Vec::new();
+        for (&address, page) in &self.pages {
+            if let Some(last) = regions.last_mut() {
+                if last.1 == address && last.2 == page.permissions {
+                    last.1 += PAGE_SIZE;
+                    continue;
+                }
+            }
+            regions.push((address, address + PAGE_SIZE, page.permissions));
+        }
+        regions
+    }
+
     pub fn highest_mapped_end(&self) -> u64 {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().highest_mapped_end();
+        }
         self.pages
             .last_key_value()
             .map_or(0, |(&address, _)| address + PAGE_SIZE)
     }
     pub fn revision(&self) -> u64 {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().revision();
+        }
         self.revision
     }
 
     pub fn is_free(&self, address: u64, len: u64) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().is_free(address, len);
+        }
         Self::mapping_end(address, len)
             .is_ok_and(|end| self.pages.range(address..end).next().is_none())
     }
     pub fn find_free(&self, start: u64, len: u64) -> Option<u64> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().find_free(start, len);
+        }
         let mut candidate = start.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
         Self::mapping_end(candidate, len).ok()?;
         for (&base, _) in self.pages.range(candidate..) {
@@ -133,6 +198,9 @@ impl Memory {
         len: u64,
         permissions: Permissions,
     ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().map_fixed(address, len, permissions);
+        }
         let end = Self::mapping_end(address, len)?;
         let replaced = self.pages.range(address..end).count() * PAGE_SIZE as usize;
         let size = usize::try_from(len).map_err(|_| MemoryError::Limit)?;
@@ -159,6 +227,9 @@ impl Memory {
 
     /// Linux munmap permits holes; validate the range before removing mapped pages.
     pub fn unmap(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().unmap(address, len);
+        }
         let end = Self::mapping_end(address, len)?;
         let keys: Vec<_> = self
             .pages
@@ -174,6 +245,9 @@ impl Memory {
 
     /// Read a bounded NUL-terminated byte string, without UTF-8 assumptions.
     pub fn read_c_string(&self, address: u64, limit: usize) -> Result<Vec<u8>, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().read_c_string(address, limit);
+        }
         let mut bytes = Vec::new();
         for index in 0..limit {
             let current = address
@@ -211,6 +285,9 @@ impl Memory {
         len: u64,
         permissions: Permissions,
     ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().map(address, len, permissions);
+        }
         let end = Self::mapping_end(address, len)?;
         let len = usize::try_from(len).map_err(|_| MemoryError::Limit)?;
         if self
@@ -243,6 +320,9 @@ impl Memory {
         len: u64,
         permissions: Permissions,
     ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().protect(address, len, permissions);
+        }
         let end = Self::mapping_end(address, len)?;
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             if !self.pages.contains_key(&base) {
@@ -260,6 +340,9 @@ impl Memory {
     }
 
     pub fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().check(address, len, access);
+        }
         if len == 0 {
             return Ok(());
         }
@@ -293,12 +376,18 @@ impl Memory {
     }
 
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().read(address, out);
+        }
         self.check(address, out.len(), Access::Read)?;
         self.copy_read(address, out);
         Ok(())
     }
 
     pub fn write(&mut self, mut address: u64, mut input: &[u8]) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().write(address, input);
+        }
         self.check(address, input.len(), Access::Write)?;
         if !input.is_empty() {
             self.revision = self.revision.wrapping_add(1);
@@ -317,6 +406,9 @@ impl Memory {
     }
 
     pub fn fetch_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().fetch_u32(address);
+        }
         if !address.is_multiple_of(4) {
             return Err(MemoryError::InvalidRange);
         }
@@ -442,6 +534,30 @@ mod tests {
 #[cfg(test)]
 mod fork_tests {
     use super::*;
+    #[test]
+    fn shared_vm_updates_mappings_bytes_and_revision_but_fork_is_private() {
+        let mut parent = Memory::default();
+        parent.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut thread = parent.share();
+        let revision = parent.revision();
+        thread.write(0x1000, b"thread").unwrap();
+        assert!(parent.revision() > revision);
+        let mut bytes = [0; 6];
+        parent.read(0x1000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"thread");
+        let mut fork = thread.clone();
+        fork.write(0x1000, b"forked").unwrap();
+        parent.read(0x1000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"thread");
+        thread.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        assert!(parent.write(0x1000, b"x").is_err());
+        assert!(fork.write(0x1000, b"x").is_ok());
+        parent.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        assert_eq!(thread.mapped_bytes(), PAGE_SIZE as usize * 2);
+        thread.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(parent.read(0x1000, &mut bytes).is_err());
+        assert!(fork.read(0x1000, &mut bytes).is_ok());
+    }
     #[test]
     fn fork_copies_pages_on_write_and_keeps_protection_independent() {
         let mut parent = Memory::default();
