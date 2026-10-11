@@ -72,6 +72,7 @@ pub struct Memory {
     pages: BTreeMap<u64, Page>,
     limit: usize,
     revision: u64,
+    code_revision: u64,
     shared: Option<Rc<RefCell<Memory>>>,
 }
 impl Clone for Memory {
@@ -84,6 +85,7 @@ impl Clone for Memory {
             pages: self.pages.clone(),
             limit: self.limit,
             revision: self.revision,
+            code_revision: self.code_revision,
             shared: None,
         }
     }
@@ -107,6 +109,7 @@ impl Memory {
             pages: BTreeMap::new(),
             limit: self.limit,
             revision: 0,
+            code_revision: 0,
             shared: self.shared.clone(),
         }
     }
@@ -125,6 +128,7 @@ impl Memory {
             pages: BTreeMap::new(),
             limit,
             revision: 0,
+            code_revision: 0,
             shared: None,
         }
     }
@@ -166,6 +170,14 @@ impl Memory {
             return shared.borrow().revision();
         }
         self.revision
+    }
+    /// Decode-cache epoch: data stores preserve checked executable blocks.
+    /// Mapping/protection changes and writes into executable pages invalidate.
+    pub fn instruction_revision(&self) -> u64 {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().instruction_revision();
+        }
+        self.code_revision
     }
 
     pub fn is_free(&self, address: u64, len: u64) -> bool {
@@ -222,6 +234,7 @@ impl Memory {
             );
         }
         self.revision = self.revision.wrapping_add(1);
+        self.code_revision = self.code_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -240,6 +253,7 @@ impl Memory {
             self.pages.remove(&base);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.code_revision = self.code_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -311,6 +325,7 @@ impl Memory {
             );
         }
         self.revision = self.revision.wrapping_add(1);
+        self.code_revision = self.code_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -336,6 +351,7 @@ impl Memory {
                 .permissions = permissions;
         }
         self.revision = self.revision.wrapping_add(1);
+        self.code_revision = self.code_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -392,15 +408,19 @@ impl Memory {
         if !input.is_empty() {
             self.revision = self.revision.wrapping_add(1);
         }
+        let mut executable = false;
         while !input.is_empty() {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = input.len().min(PAGE_SIZE as usize - offset);
-            Arc::make_mut(&mut self.pages.get_mut(&base).expect("validated page").bytes)
-                [offset..offset + len]
-                .copy_from_slice(&input[..len]);
+            let page = self.pages.get_mut(&base).expect("validated page");
+            executable |= page.permissions.execute;
+            Arc::make_mut(&mut page.bytes)[offset..offset + len].copy_from_slice(&input[..len]);
             address += len as u64;
             input = &input[len..];
+        }
+        if executable {
+            self.code_revision = self.code_revision.wrapping_add(1);
         }
         Ok(())
     }
@@ -534,6 +554,38 @@ mod tests {
 #[cfg(test)]
 mod fork_tests {
     use super::*;
+    #[test]
+    fn instruction_revision_tracks_shared_code_but_not_data_writes() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory
+            .protect(
+                0x1000,
+                PAGE_SIZE,
+                Permissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        let mut thread = memory.share();
+        let code = memory.instruction_revision();
+        let all = memory.revision();
+        thread.write(0x2000, b"data").unwrap();
+        assert_eq!(memory.instruction_revision(), code);
+        assert!(memory.revision() > all);
+        thread.write(0x1000, &0xd503201fu32.to_le_bytes()).unwrap();
+        assert!(memory.instruction_revision() > code);
+        let code = memory.instruction_revision();
+        assert!(thread
+            .protect(0x2000, PAGE_SIZE * 2, Permissions::RX)
+            .is_err());
+        assert_eq!(memory.instruction_revision(), code);
+        thread.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(memory.instruction_revision() > code);
+    }
     #[test]
     fn shared_vm_updates_mappings_bytes_and_revision_but_fork_is_private() {
         let mut parent = Memory::default();

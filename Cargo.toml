@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/trames-memory", "crates/trames-elf", "crates/trames-cpu",
-    "crates/trames-linux", "crates/trames-core", "crates/trames-cli", "crates/trames-vfs", "crates/trames-net", "crates/trames-distro", "crates/trames-ffi",
+    "crates/trames-linux", "crates/trames-core", "crates/trames-cli", "crates/trames-vfs", "crates/trames-net", "crates/trames-distro", "crates/trames-ffi", "crates/trames-bridge", "crates/trames-accel", "crates/trames-interpreter-cpp",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.90"
 license = "GPL-3.0-or-later"

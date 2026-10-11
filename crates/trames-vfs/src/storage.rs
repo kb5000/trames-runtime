@@ -11,7 +11,8 @@ use std::{
 };
 
 pub const DEFAULT_DISK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-pub const MAX_DISK_NODES: usize = 16_384;
+pub const DEFAULT_DISK_NODES: usize = 131_072;
+pub const MAX_DISK_NODES: usize = 262_144;
 pub const MAX_TRANSFER: usize = 1024 * 1024;
 const MAX_MANIFEST: u64 = 128 * 1024 * 1024;
 const MAX_EXECUTABLE: u64 = 64 * 1024 * 1024;
@@ -31,7 +32,7 @@ impl StorageLimits {
     pub fn disk() -> Self {
         Self {
             file_bytes: DEFAULT_DISK_BYTES,
-            nodes: MAX_DISK_NODES,
+            nodes: DEFAULT_DISK_NODES,
         }
     }
     fn validate(self) -> Result<()> {
@@ -70,6 +71,12 @@ pub struct DiskOptions {
 }
 
 pub(super) fn host_errno(e: io::Error) -> Errno {
+    // These Unix descriptor exhaustion codes are shared by Linux and Darwin.
+    // ErrorKind does not classify them, so otherwise they become a misleading EIO.
+    #[cfg(unix)]
+    if let Some(code @ (23 | 24)) = e.raw_os_error() {
+        return Errno(code as u32);
+    }
     Errno(match e.kind() {
         io::ErrorKind::NotFound => 2,
         io::ErrorKind::Interrupted => 4,
@@ -104,13 +111,31 @@ pub(super) enum FileData {
     Disk(DiskObject),
 }
 pub(super) struct DiskObject {
-    file: File,
     length: u64,
     path: PathBuf,
     remove_on_drop: bool,
     // An open-unlinked file must keep the store's exclusive lock alive.
     _store: Rc<DiskStore>,
     inode: u64,
+}
+impl DiskObject {
+    // Guest inode lifetime is independent of host descriptor lifetime. A store
+    // with thousands of closed files must not consume thousands of iOS handles.
+    // Orphans retain their private object path until the last guest reference dies.
+    fn open(&self, write: bool) -> Result<File> {
+        regular(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(write);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0x20000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        let file = options.open(&self.path).map_err(host_errno)?;
+        if !file.metadata().map_err(host_errno)?.is_file() {
+            return Err(Errno(22));
+        }
+        Ok(file)
+    }
 }
 impl Drop for DiskObject {
     fn drop(&mut self) {
@@ -123,7 +148,7 @@ impl FileData {
     pub fn blocks(&self) -> Result<u64> {
         #[cfg(unix)]
         if let Self::Disk(d) = self {
-            return Ok(d.file.metadata().map_err(host_errno)?.blocks());
+            return Ok(fs::symlink_metadata(&d.path).map_err(host_errno)?.blocks());
         }
         Ok(self.len().div_ceil(512))
     }
@@ -149,7 +174,7 @@ impl FileData {
         match self {
             Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
             Self::Disk(d) => {
-                let mut file = &d.file;
+                let mut file = d.open(false)?;
                 file.seek(SeekFrom::Start(offset)).map_err(host_errno)?;
                 let mut bytes = vec![0; count];
                 let n = file.read(&mut bytes).map_err(host_errno)?;
@@ -173,7 +198,7 @@ impl FileData {
                 Ok(bytes.len())
             }
             Self::Disk(d) => {
-                let mut file = &d.file;
+                let mut file = d.open(true)?;
                 file.seek(SeekFrom::Start(offset)).map_err(host_errno)?;
                 let n = file.write(bytes).map_err(host_errno)?;
                 d.length = d.length.max(offset + n as u64);
@@ -191,7 +216,7 @@ impl FileData {
                 b.resize(n, 0);
             }
             Self::Disk(d) => {
-                d.file.set_len(length).map_err(host_errno)?;
+                d.open(true)?.set_len(length).map_err(host_errno)?;
                 d.length = length;
             }
         }
@@ -199,10 +224,11 @@ impl FileData {
     }
     pub fn sync(&self, data_only: bool) -> Result<()> {
         if let Self::Disk(d) = self {
+            let file = d.open(false)?;
             if data_only {
-                d.file.sync_data()
+                file.sync_data()
             } else {
-                d.file.sync_all()
+                file.sync_all()
             }
             .map_err(host_errno)?;
         }
@@ -281,9 +307,8 @@ impl DiskStore {
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(&path).map_err(host_errno)?;
+        drop(options.open(&path).map_err(host_errno)?);
         Ok(FileData::Disk(DiskObject {
-            file,
             length: 0,
             path,
             remove_on_drop: true,
@@ -294,14 +319,8 @@ impl DiskStore {
     fn load(self: &Rc<Self>, inode: u64) -> Result<FileData> {
         let path = self.object_path(inode);
         regular(&path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(host_errno)?;
-        let length = file.metadata().map_err(host_errno)?.len();
+        let length = fs::symlink_metadata(&path).map_err(host_errno)?.len();
         Ok(FileData::Disk(DiskObject {
-            file,
             length,
             path,
             remove_on_drop: false,
@@ -474,7 +493,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         return Err(Errno(22));
     }
     let version = d.u32()?;
-    if !matches!(version, 1..=3) {
+    if version != 3 {
         return Err(Errno(22));
     }
     let limits = StorageLimits {
@@ -493,11 +512,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     for _ in 0..count {
         let ino = d.u64()?;
         let mode = d.u32()?;
-        let (uid, gid) = if version >= 3 {
-            (d.u32()?, d.u32()?)
-        } else {
-            (1000, 1000)
-        };
+        let (uid, gid) = (d.u32()?, d.u32()?);
         let kind = d.take(4)?;
         if ino == 0 || ino >= next_inode || nodes.contains_key(&ino) || kind[1..] != [0, 0, 0] {
             return Err(Errno(22));
@@ -510,15 +525,11 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 return Err(Errno(22));
             }
         }
-        let target = if version >= 2 {
-            let size = d.u32()? as usize;
-            if size >= MAX_PATH {
-                return Err(Errno(22));
-            }
-            d.take(size)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        let size = d.u32()? as usize;
+        if size >= MAX_PATH {
+            return Err(Errno(22));
+        }
+        let target = d.take(size)?.to_vec();
         if (kind[0] == 4) == target.is_empty() || target.contains(&0) {
             return Err(Errno(22));
         }
@@ -624,6 +635,13 @@ pub(super) fn checksum(data: &[u8]) -> u64 {
 }
 
 impl Vfs {
+    /// Native-only destructive reset of an app-owned private store. The caller
+    /// must serialize reset with new opens. A live worker/orphan keeps the lock
+    /// and returns EBUSY; unsupported/corrupt manifests need not be decoded.
+    pub fn reset_disk(path: impl AsRef<Path>) -> Result<()> {
+        let disk = DiskStore::open(path.as_ref())?;
+        fs::remove_dir_all(&disk.root).map_err(host_errno)
+    }
     /// Explicit application installer: replace every alias of this executable in
     /// one namespace commit. Existing open descriptions retain the previous inode.
     pub fn install_executable(&mut self, path: &[u8], mut bytes: &[u8]) -> Result<()> {

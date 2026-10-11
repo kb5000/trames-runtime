@@ -66,6 +66,7 @@ struct OpenDescription {
     node: Option<Rc<RefCell<Node>>>,
     pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
+    bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -112,6 +113,7 @@ pub struct Vfs {
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     pid: u32,
     next_open: Rc<Cell<u64>>,
+    bridge: Option<trames_bridge::Broker>,
 }
 impl Default for Vfs {
     fn default() -> Self {
@@ -133,6 +135,7 @@ impl Default for Vfs {
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             pid: 1,
             next_open: Rc::new(Cell::new(1)),
+            bridge: None,
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
             .expect("root");
@@ -157,6 +160,7 @@ impl Default for Vfs {
                         node: None,
                         pipe: None,
                         socket: None,
+                        bridge: None,
                     })),
                     cloexec: false,
                 },
@@ -166,6 +170,16 @@ impl Default for Vfs {
     }
 }
 impl Vfs {
+    pub fn attach_bridge(&mut self, broker: trames_bridge::Broker) {
+        self.bridge = Some(broker);
+    }
+    pub fn bridge_fd(&self, fd: u32) -> bool {
+        self.descriptor(fd)
+            .is_ok_and(|d| d.open.borrow().bridge.is_some())
+    }
+    pub fn has_bridge_descriptors(&self) -> bool {
+        self.fds.values().any(|d| d.open.borrow().bridge.is_some())
+    }
     fn open_id(&self) -> u64 {
         let id = self.next_open.get();
         self.next_open.set(id.wrapping_add(1));
@@ -202,6 +216,9 @@ impl Vfs {
             return 32;
         };
         let o = d.open.borrow();
+        if let Some(bridge) = &o.bridge {
+            return bridge.poll(events);
+        }
         if let Some(socket) = &o.socket {
             return socket.poll(events).unwrap_or(8);
         }
@@ -240,6 +257,7 @@ impl Vfs {
                         node: None,
                         pipe: None,
                         socket: None,
+                        bridge: None,
                     })),
                     cloexec: false,
                 },
@@ -721,6 +739,20 @@ impl Vfs {
         if flags & 0x200 != 0 {
             self.checkpoint()?;
         }
+        let bridge = if matches!(
+            node.borrow().content,
+            Content::Device(pseudo::Device::Bridge)
+        ) {
+            Some(
+                self.bridge
+                    .as_ref()
+                    .ok_or(Errno(19))?
+                    .connect()
+                    .map_err(Errno)?,
+            )
+        } else {
+            None
+        };
         self.fds.insert(
             fd,
             Descriptor {
@@ -739,6 +771,7 @@ impl Vfs {
                     node: Some(node),
                     pipe: None,
                     socket: None,
+                    bridge,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -844,6 +877,7 @@ impl Vfs {
                         node: None,
                         pipe: Some(end),
                         socket: None,
+                        bridge: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -856,6 +890,9 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(bridge) = &o.bridge {
+            return bridge.read(count).map_err(Errno);
         }
         if let Some(socket) = &o.socket {
             return socket
@@ -900,6 +937,9 @@ impl Vfs {
         let o = self.descriptor(fd)?.open.borrow();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(bridge) = &o.bridge {
+            return bridge.write(bytes).map_err(Errno);
         }
         if let Some(socket) = &o.socket {
             return socket.send(bytes, 0, None).map_err(|e| Errno(e.0));
@@ -990,6 +1030,9 @@ impl Vfs {
             return Err(Errno(22));
         }
         let o = self.descriptor(fd)?.open.borrow();
+        if o.bridge.is_some() {
+            return Err(Errno(29));
+        }
         if o.flags & 3 == 1 {
             return Err(Errno(9));
         }
@@ -1004,6 +1047,9 @@ impl Vfs {
         }
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
+        if self.bridge_fd(fd) {
+            return Err(Errno(29));
+        }
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
@@ -1048,6 +1094,9 @@ impl Vfs {
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.bridge.is_some() {
+            return Err(Errno(29));
+        }
         let node = o.node.clone().ok_or(Errno(29))?;
         let n = node.borrow();
         let length = match &n.content {

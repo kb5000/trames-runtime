@@ -30,6 +30,90 @@ fn size(stat: [u8; 128]) -> u64 {
     u64::from_le_bytes(stat[48..56].try_into().unwrap())
 }
 #[test]
+#[cfg(target_os = "linux")]
+fn closed_inodes_do_not_retain_native_file_descriptors() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    for n in 0..600 {
+        v.import_file(format!("/usr/test/{n}").as_bytes(), b"retained".to_vec())
+            .unwrap();
+    }
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/usr/test/599", 2, 0).unwrap();
+    v.unlink_at(AT_FDCWD, b"/usr/test/599", false).unwrap();
+    assert_eq!(v.read(fd, 8).unwrap(), b"retained");
+    v.pwrite(fd, b"X", 0).unwrap();
+    v.sync_fd(fd, false).unwrap();
+    for entry in fs::read_dir("/proc/self/fd").unwrap() {
+        if let Ok(path) = fs::read_link(entry.unwrap().path()) {
+            assert!(
+                !path.starts_with(dir.0.join("objects")),
+                "retained host descriptor: {path:?}"
+            );
+        }
+    }
+    v.close(fd).unwrap();
+}
+#[test]
+fn recorded_limits_and_writable_usr_survive_reopen() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.set_storage_limits(StorageLimits {
+        file_bytes: 1234567,
+        nodes: 16_384,
+    })
+    .unwrap();
+    v.import_file(b"/usr/local/test", b"writable".to_vec())
+        .unwrap();
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(v.capacity().node_limit, 16_384);
+    assert_eq!(v.capacity().budget_bytes, 1234567);
+    let fd = v.open_at(AT_FDCWD, b"/usr/local/test", 2, 0).unwrap();
+    v.write(fd, b"changed").unwrap();
+    v.close(fd).unwrap();
+    v.set_storage_limits(StorageLimits {
+        file_bytes: 1234567,
+        nodes: 1000,
+    })
+    .unwrap();
+    drop(v);
+    let v = dir.open();
+    assert_eq!(v.capacity().node_limit, 1000);
+    assert_eq!(v.capacity().budget_bytes, 1234567);
+}
+#[test]
+fn bridge_device_is_volatile_nonseekable_and_shared_by_dup() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let broker = trames_bridge::Broker::default();
+    v.attach_bridge(broker.clone());
+    v.set_runtime_info(1, RuntimeInfo::default());
+    let fd = v
+        .open_at(AT_FDCWD, b"/dev/trames-bridge", 2 | O_NONBLOCK, 0)
+        .unwrap();
+    assert_eq!(v.read(fd, 1), Err(Errno(11)));
+    assert_eq!(v.poll(fd, 5), 4);
+    assert_eq!(v.seek(fd, 0, 0), Err(Errno(29)));
+    assert_eq!(v.pread(fd, 1, 0), Err(Errno(29)));
+    let other = v.dup(fd, 0, false).unwrap();
+    v.write(
+        fd,
+        b"{\"version\":1,\"id\":1,\"method\":\"bridge.info\",\"params\":{}}\n",
+    )
+    .unwrap();
+    assert_eq!(v.poll(other, 5), 5);
+    assert!(!v.read(other, 65536).unwrap().is_empty());
+    v.close(fd).unwrap();
+    v.close(other).unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let v = dir.open();
+    assert_eq!(v.stat_at(AT_FDCWD, b"/dev/trames-bridge"), Err(Errno(2)));
+}
+#[test]
 fn pseudo_views_do_not_enter_the_manifest_or_consume_disk_quota() {
     let dir = Temp::new();
     let mut v = dir.open();
@@ -496,41 +580,37 @@ fn flock_is_shared_by_dup_fork_and_released_by_last_close() {
 }
 
 #[test]
-fn legacy_stores_preserve_owner_and_data_when_upgrading_on_checkpoint() {
-    for version in [1u32, 2] {
+fn unsupported_manifest_versions_are_rejected_without_deleting_data() {
+    for version in [1u32, 2, 4] {
         let dir = Temp::new();
         let mut v = dir.open();
-        v.import_file(b"/old", b"legacy data".to_vec()).unwrap();
-        v.sync().unwrap();
+        v.import_file(b"/data", b"retained".to_vec()).unwrap();
         drop(v);
-        let data = fs::read(dir.0.join("manifest")).unwrap();
-        let count = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
-        let mut legacy = data[..40].to_vec();
-        legacy[8..12].copy_from_slice(&version.to_le_bytes());
-        let mut offset = 40;
-        for _ in 0..count {
-            legacy.extend_from_slice(&data[offset..offset + 12]);
-            // v1 predates persisted uid/gid and the v2 symlink payload field.
-            legacy
-                .extend_from_slice(&data[offset + 20..offset + if version == 1 { 72 } else { 76 }]);
-            assert_eq!(&data[offset + 72..offset + 76], &[0; 4]);
-            offset += 76;
-        }
-        legacy.extend_from_slice(&data[offset..data.len() - 8]);
-        legacy.extend(storage::checksum(&legacy).to_le_bytes());
-        fs::write(dir.0.join("manifest"), legacy).unwrap();
-        let mut v = dir.open();
-        let fd = v.open_at(AT_FDCWD, b"/old", 0, 0).unwrap();
-        assert_eq!(v.read(fd, 32).unwrap(), b"legacy data");
-        assert_eq!(
-            &v.stat_fd(fd).unwrap()[24..32],
-            &[1000u32.to_le_bytes(), 1000u32.to_le_bytes()].concat()
-        );
-        v.checkpoint().unwrap();
-        drop(v);
-        assert_eq!(
-            &fs::read(dir.0.join("manifest")).unwrap()[8..12],
-            &3u32.to_le_bytes()
-        );
+        let mut data = fs::read(dir.0.join("manifest")).unwrap();
+        data[8..12].copy_from_slice(&version.to_le_bytes());
+        let end = data.len() - 8;
+        let hash = storage::checksum(&data[..end]).to_le_bytes();
+        data[end..].copy_from_slice(&hash);
+        fs::write(dir.0.join("manifest"), &data).unwrap();
+        assert!(matches!(
+            Vfs::open_disk(&dir.0, DiskOptions::default()),
+            Err(Errno(22))
+        ));
+        assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), data);
+        assert_eq!(fs::read_dir(dir.0.join("objects")).unwrap().count(), 1);
     }
+}
+#[test]
+fn explicit_reset_refuses_live_stores_and_clears_unsupported_metadata() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"data".to_vec()).unwrap();
+    assert_eq!(Vfs::reset_disk(&dir.0), Err(Errno(16)));
+    assert!(dir.0.join("manifest").exists());
+    drop(v);
+    fs::write(dir.0.join("manifest"), b"unsupported old format").unwrap();
+    Vfs::reset_disk(&dir.0).unwrap();
+    assert!(!dir.0.exists());
+    let v = dir.open();
+    assert_eq!(v.stat_at(AT_FDCWD, b"/data"), Err(Errno(2)));
 }

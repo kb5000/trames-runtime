@@ -264,6 +264,7 @@ pub(super) enum Device {
     Urandom,
     Pts,
     Ptmx,
+    Bridge,
 }
 impl Device {
     pub(super) fn rdev(self) -> u64 {
@@ -274,6 +275,7 @@ impl Device {
             Self::Urandom => 0x109,
             Self::Pts => 0x8800,
             Self::Ptmx => 0x502,
+            Self::Bridge => 0xf000,
         }
     }
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
@@ -283,6 +285,7 @@ impl Device {
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
             Self::Pts => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
+            Self::Bridge => return Err(Errno(19)),
         }
         Ok(data)
     }
@@ -291,6 +294,7 @@ impl Device {
             Self::Full if !data.is_empty() => Err(Errno(28)),
             Self::Pts => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
+            Self::Bridge => Err(Errno(19)),
             _ => Ok(data.len()),
         }
     }
@@ -540,6 +544,7 @@ impl Vfs {
             node: original.node.clone(),
             pipe: original.pipe.clone(),
             socket: None,
+            bridge: original.bridge.clone(),
         };
         drop(original);
         let fd = self.available(0)?;
@@ -686,6 +691,7 @@ impl Vfs {
                 let fd = if path == b"/dev/stdin" { 0 } else if path == b"/dev/stdout" { 1 } else { 2 };
                 return Ok(link(format!("/proc/self/fd/{fd}").into_bytes()));
             }
+            b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
             b"/dev/zero" | b"/dev/full" | b"/dev/random" | b"/dev/urandom" | b"/dev/ptmx" => {
                 let d = match path { b"/dev/zero" => Device::Zero, b"/dev/full" => Device::Full,
                     b"/dev/random" => Device::Random, b"/dev/urandom" => Device::Urandom, _ => Device::Ptmx };
@@ -1001,7 +1007,16 @@ impl Vfs {
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/dev" => [
-                "zero", "full", "random", "urandom", "ptmx", "pts", "fd", "stdin", "stdout",
+                "zero",
+                "full",
+                "random",
+                "urandom",
+                "ptmx",
+                "pts",
+                "fd",
+                "stdin",
+                "stdout",
+                "trames-bridge",
                 "stderr",
             ]
             .iter()

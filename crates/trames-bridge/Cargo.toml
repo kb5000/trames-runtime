@@ -1,0 +1,12 @@
+[package]
+name = "trames-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+trames-accel = { path = "../trames-accel" }
+[lints]
+workspace = true

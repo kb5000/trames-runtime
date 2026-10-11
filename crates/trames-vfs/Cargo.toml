@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 getrandom = "=0.3.4"
 trames-net = { path = "../trames-net" }
+trames-bridge = { path = "../trames-bridge" }
 
 [lints]
 workspace = true

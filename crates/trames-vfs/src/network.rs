@@ -64,6 +64,7 @@ impl Vfs {
                     node: None,
                     pipe: None,
                     socket: Some(socket),
+                    bridge: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
