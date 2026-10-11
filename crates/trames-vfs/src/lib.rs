@@ -298,7 +298,7 @@ impl Vfs {
             data.sync(false)?;
         }
         let node = Rc::new(RefCell::new(Node {
-            device: 1,
+            device: 0xfd01,
             content,
             mode,
             uid: self.credentials.fsuid,
@@ -1176,7 +1176,7 @@ impl Vfs {
         out[20..24].copy_from_slice(&links.to_le_bytes());
         out[24..28].copy_from_slice(&node.uid.to_le_bytes());
         out[28..32].copy_from_slice(&node.gid.to_le_bytes());
-        let rdev = if node.mode & 0o170000 != 0o20000 {
+        let rdev = if !matches!(node.mode & 0o170000, 0o20000 | 0o60000) {
             0
         } else {
             match node.content {

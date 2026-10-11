@@ -857,7 +857,7 @@ impl Socket {
             let device = match &value[..end] {
                 b"" => None,
                 b"lo" => Some(1),
-                b"trames0" => Some(2),
+                b"eth0" => Some(2),
                 _ => return Err(NetError(19)),
             };
             if self.kind != 4 {

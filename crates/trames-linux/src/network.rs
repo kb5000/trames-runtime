@@ -149,7 +149,7 @@ impl Linux {
                     let mut entries = vec![0; size];
                     for (i, (name, ip)) in [
                         (b"lo".as_slice(), std::net::Ipv4Addr::LOCALHOST),
-                        (b"trames0".as_slice(), info.ipv4),
+                        (b"eth0".as_slice(), info.ipv4),
                     ]
                     .into_iter()
                     .take(size / 40)
@@ -185,7 +185,7 @@ impl Linux {
                 let end = entry[..16].iter().position(|b| *b == 0).unwrap_or(16);
                 match &entry[..end] {
                     b"lo" => true,
-                    b"trames0" => false,
+                    b"eth0" => false,
                     _ => return Err(Errno(19)),
                 }
             };
@@ -201,7 +201,7 @@ impl Linux {
                     let name = if loopback {
                         b"lo".as_slice()
                     } else {
-                        b"trames0".as_slice()
+                        b"eth0".as_slice()
                     };
                     entry[..name.len()].copy_from_slice(name);
                 }

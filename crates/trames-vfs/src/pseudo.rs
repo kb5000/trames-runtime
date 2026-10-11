@@ -47,6 +47,49 @@ mod tests {
         out
     }
     #[test]
+    fn logical_block_identity_agrees_across_mounts_stat_and_sysfs() {
+        let mut v = Vfs::default();
+        let capacity = v.capacity();
+        snapshot(&mut v);
+        let root = v.stat_at(AT_FDCWD, b"/").unwrap();
+        let block = v.stat_at(AT_FDCWD, b"/dev/vda1").unwrap();
+        assert_eq!(&root[..8], &0xfd01u64.to_le_bytes());
+        assert_eq!(&block[32..40], &root[..8]);
+        assert_eq!(
+            u32::from_le_bytes(block[16..20].try_into().unwrap()) & 0o170000,
+            0o60000
+        );
+        for alias in [
+            b"/sys/class/block/vda1/dev".as_slice(),
+            b"/sys/dev/block/253:1/dev",
+        ] {
+            assert_eq!(read(&mut v, alias), b"253:1\n");
+        }
+        assert_eq!(
+            read(&mut v, b"/sys/block/vda/size"),
+            format!("{}\n", capacity.budget_bytes / 512).as_bytes()
+        );
+        assert_eq!(
+            read(&mut v, b"/sys/class/block/vda1/size"),
+            format!("{}\n", capacity.budget_bytes / 512).as_bytes()
+        );
+        assert_eq!(read(&mut v, b"/sys/class/block/vda1/partition"), b"1\n");
+        assert!(read(&mut v, b"/proc/self/mountinfo")
+            .starts_with(b"1 1 253:1 / / rw,relatime - rootfs /dev/vda1 rw\n"));
+        let fd = v.open_at(AT_FDCWD, b"/dev/vda1", 2, 0).unwrap();
+        assert_eq!(v.read(fd, 512), Err(Errno(95)));
+        assert_eq!(v.write(fd, &[0; 512]), Err(Errno(95)));
+        assert_eq!(
+            v.fd_snapshot()
+                .into_iter()
+                .find(|f| f.fd == fd)
+                .unwrap()
+                .mount_id,
+            1
+        );
+        assert_eq!(v.capacity().used_bytes, capacity.used_bytes);
+    }
+    #[test]
     fn directory_links_and_mount_identity_match_live_namespace() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -202,6 +245,7 @@ pub struct ProcessInfo {
 }
 #[derive(Clone, Default)]
 pub struct RuntimeInfo {
+    pub cpu_features: &'static str,
     pub processes: Vec<ProcessInfo>,
     pub uptime: Duration,
     pub idle: Duration,
@@ -246,7 +290,7 @@ impl PseudoFs {
             } else if path == b"/dev/pts" || path.starts_with(b"/dev/pts/") {
                 4
             } else {
-                1
+                0xfd01
             },
             inode: (1u64 << 63) + self.next_inode,
             links: 1,
@@ -265,6 +309,8 @@ pub(super) enum Device {
     Pts,
     Ptmx,
     Bridge,
+    Vda,
+    Vda1,
 }
 impl Device {
     pub(super) fn rdev(self) -> u64 {
@@ -276,6 +322,8 @@ impl Device {
             Self::Pts => 0x8800,
             Self::Ptmx => 0x502,
             Self::Bridge => 0xf000,
+            Self::Vda => 0xfd00,
+            Self::Vda1 => 0xfd01,
         }
     }
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
@@ -286,6 +334,7 @@ impl Device {
             Self::Pts => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
             Self::Bridge => return Err(Errno(19)),
+            Self::Vda | Self::Vda1 => return Err(Errno(95)),
         }
         Ok(data)
     }
@@ -295,6 +344,7 @@ impl Device {
             Self::Pts => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
             Self::Bridge => Err(Errno(19)),
+            Self::Vda | Self::Vda1 => Err(Errno(95)),
             _ => Ok(data.len()),
         }
     }
@@ -318,10 +368,10 @@ fn comm(p: &ProcessInfo) -> Vec<u8> {
     name
 }
 fn mounts() -> &'static [u8] {
-    b"trames / tramesfs rw,relatime 0 0\nproc /proc proc ro,nosuid,nodev,noexec 0 0\nsysfs /sys sysfs ro,nosuid,nodev,noexec 0 0\ndevpts /dev/pts devpts rw,nosuid,noexec 0 0\n"
+    b"/dev/vda1 / rootfs rw,relatime 0 0\nproc /proc proc ro,nosuid,nodev,noexec 0 0\nsysfs /sys sysfs ro,nosuid,nodev,noexec 0 0\ndevpts /dev/pts devpts rw,nosuid,noexec 0 0\n"
 }
 fn mountinfo() -> &'static [u8] {
-    b"1 1 0:1 / / rw,relatime - tramesfs trames rw\n2 1 0:2 / /proc ro,nosuid,nodev,noexec - proc proc ro\n3 1 0:3 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro\n4 1 0:4 / /dev/pts rw,nosuid,noexec - devpts devpts rw\n"
+    b"1 1 253:1 / / rw,relatime - rootfs /dev/vda1 rw\n2 1 0:2 / /proc ro,nosuid,nodev,noexec - proc proc ro\n3 1 0:3 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro\n4 1 0:4 / /dev/pts rw,nosuid,noexec - devpts devpts rw\n"
 }
 impl Vfs {
     pub fn set_runtime_info(&mut self, pid: u32, runtime: RuntimeInfo) {
@@ -400,7 +450,13 @@ impl Vfs {
                     position: o.position,
                     flags: o.flags | if d.cloexec { O_CLOEXEC } else { 0 },
                     inode,
-                    mount_id: node.as_ref().map_or(1, |n| n.borrow().device),
+                    mount_id: node.as_ref().map_or(1, |n| {
+                        if n.borrow().device == 0xfd01 {
+                            1
+                        } else {
+                            n.borrow().device
+                        }
+                    }),
                     socket: o.socket.as_ref().and_then(|s| s.info()),
                     open: Rc::downgrade(&d.open),
                 }
@@ -679,7 +735,10 @@ impl Vfs {
         let info = self.network_info();
         match path {
             b"/proc" | b"/sys" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
-            b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/proc/sys" |
+            b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
+            b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
+            b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
+            b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
             b"/proc/sys/kernel" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/proc/self" => return Ok(link(own.map_or(self.pid, |p| p.tgid).to_string().into_bytes())),
@@ -692,6 +751,15 @@ impl Vfs {
                 return Ok(link(format!("/proc/self/fd/{fd}").into_bytes()));
             }
             b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
+            b"/dev/vda" => return Ok(Some((Content::Device(Device::Vda),0o60600))),
+            b"/dev/vda1" => return Ok(Some((Content::Device(Device::Vda1),0o60600))),
+            b"/dev/block/253:0" => return Ok(link(b"../vda".to_vec())),
+            b"/dev/block/253:1" => return Ok(link(b"../vda1".to_vec())),
+            b"/sys/block/vda" => return Ok(link(b"../devices/virtual/block/vda".to_vec())),
+            b"/sys/class/block/vda" => return Ok(link(b"../../devices/virtual/block/vda".to_vec())),
+            b"/sys/class/block/vda1" => return Ok(link(b"../../devices/virtual/block/vda/vda1".to_vec())),
+            b"/sys/dev/block/253:0" => return Ok(link(b"../../devices/virtual/block/vda".to_vec())),
+            b"/sys/dev/block/253:1" => return Ok(link(b"../../devices/virtual/block/vda/vda1".to_vec())),
             b"/dev/zero" | b"/dev/full" | b"/dev/random" | b"/dev/urandom" | b"/dev/ptmx" => {
                 let d = match path { b"/dev/zero" => Device::Zero, b"/dev/full" => Device::Full,
                     b"/dev/random" => Device::Random, b"/dev/urandom" => Device::Urandom, _ => Device::Ptmx };
@@ -705,13 +773,13 @@ impl Vfs {
                 let free = total.saturating_sub(used);
                 return Ok(regular(format!("MemTotal: {total:8} kB\nMemFree: {free:8} kB\nMemAvailable: {free:8} kB\nBuffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").into_bytes()));
             }
-            b"/proc/cpuinfo" => return Ok(regular(b"processor\t: 0\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t:\n\n".to_vec())),
+            b"/proc/cpuinfo" => return Ok(regular(format!("processor\t: 0\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t: {}\n\n", self.pseudo.borrow().runtime.cpu_features).into_bytes())),
             b"/proc/swaps" => return Ok(regular(b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_vec())),
-            b"/proc/partitions" => return Ok(regular(b"major minor  #blocks  name\n\n".to_vec())),
-            b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n".to_vec())),
-            b"/proc/diskstats" => return Ok(regular(Vec::new())),
+            b"/proc/partitions" => return Ok(regular(format!("major minor  #blocks  name\n\n 253 0 {} vda\n 253 1 {} vda1\n",self.capacity().budget_bytes/1024,self.capacity().budget_bytes/1024).into_bytes())),
+            b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),
+            b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\ttramesfs\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\n".to_vec())),
             b"/proc/stat" => {
                 let user: u64 = r.processes.iter().map(|p| p.user_ticks).sum();
                 let idle = r.idle.as_millis() / 10;
@@ -890,7 +958,7 @@ impl Vfs {
                         b"dev" => {
                             let mut data=String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
                             if let Some(links) = self.network_links() {
-                                for (name, s) in ["lo", "trames0"].into_iter().zip(links) {
+                                for (name, s) in ["lo", "eth0"].into_iter().zip(links) {
                                     data.push_str(&format!(
                                         "{name:>6}: {} {} 0 {} 0 0 0 0 {} {} 0 {} 0 0 0 0\n",
                                         s.rx_bytes,
@@ -905,7 +973,7 @@ impl Vfs {
                             regular(data.into_bytes())
                         }
                         b"route" => regular(if let Some(n) = info {
-                            format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\ntrames0\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0\ntrames0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n", u32::from_le_bytes(n.gateway4.octets())).into_bytes()
+                            format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0\neth0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n", u32::from_le_bytes(n.gateway4.octets())).into_bytes()
                         } else {
                             b"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n".to_vec()
                         }),
@@ -913,7 +981,7 @@ impl Vfs {
                             format!(
                                 "00000000000000000000000000000001 01 80 10 80 lo\n{}",
                                 info.map_or(String::new(), |n| format!(
-                                    "{:032x} 02 40 00 80 trames0\n",
+                                    "{:032x} 02 40 00 80 eth0\n",
                                     u128::from_be_bytes(n.ipv6.octets())
                                 ))
                             )
@@ -924,8 +992,32 @@ impl Vfs {
                 }
             }
         }
+        if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/block/vda/") {
+            let partition = rest.starts_with(b"vda1/");
+            let attribute = if partition { &rest[5..] } else { rest };
+            let value = match attribute {
+                b"size" => format!("{}\n", self.capacity().budget_bytes / 512),
+                b"dev" => format!("253:{}\n", u8::from(partition)),
+                b"ro" | b"removable" | b"alignment_offset" | b"discard_alignment" | b"start" => {
+                    "0\n".into()
+                }
+                b"partition" if partition => "1\n".into(),
+                b"stat" => "0 0 0 0 0 0 0 0 0 0 0\n".into(),
+                b"uevent" => if partition {
+                    "MAJOR=253\nMINOR=1\nDEVNAME=vda1\nDEVTYPE=partition\nPARTN=1\n"
+                } else {
+                    "MAJOR=253\nMINOR=0\nDEVNAME=vda\nDEVTYPE=disk\n"
+                }
+                .into(),
+                b"queue/logical_block_size" => "512\n".into(),
+                b"queue/physical_block_size" | b"queue/minimum_io_size" => "4096\n".into(),
+                b"queue/optimal_io_size" | b"queue/rotational" => "0\n".into(),
+                _ => return Ok(None),
+            };
+            return Ok(regular(value.into_bytes()));
+        }
         if let Some(name) = path.strip_prefix(b"/sys/class/net/") {
-            if matches!(name, b"lo" | b"trames0") && (name == b"lo" || info.is_some()) {
+            if matches!(name, b"lo" | b"eth0") && (name == b"lo" || info.is_some()) {
                 let mut target = b"../../devices/virtual/net/".to_vec();
                 target.extend_from_slice(name);
                 return Ok(link(target));
@@ -933,8 +1025,7 @@ impl Vfs {
         }
         if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/net/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-            if !matches!(parts[0], b"lo" | b"trames0") || (parts[0] == b"trames0" && info.is_none())
-            {
+            if !matches!(parts[0], b"lo" | b"eth0") || (parts[0] == b"eth0" && info.is_none()) {
                 return Ok(None);
             }
             if parts.len() == 1 {
@@ -1018,18 +1109,69 @@ impl Vfs {
                 "stdout",
                 "trames-bridge",
                 "stderr",
+                "vda",
+                "vda1",
+                "block",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
-            b"/sys" => vec![b"class".to_vec(), b"devices".to_vec()],
-            b"/sys/class" => vec![b"net".to_vec()],
+            b"/sys" => vec![
+                b"class".to_vec(),
+                b"devices".to_vec(),
+                b"block".to_vec(),
+                b"dev".to_vec(),
+            ],
+            b"/sys/class" => vec![b"net".to_vec(), b"block".to_vec()],
             b"/sys/devices" => vec![b"virtual".to_vec()],
-            b"/sys/devices/virtual" => vec![b"net".to_vec()],
+            b"/sys/devices/virtual" => vec![b"net".to_vec(), b"block".to_vec()],
+            b"/sys/dev" => vec![b"block".to_vec()],
+            b"/dev/block" | b"/sys/dev/block" => vec![b"253:0".to_vec(), b"253:1".to_vec()],
+            b"/sys/block" | b"/sys/devices/virtual/block" => vec![b"vda".to_vec()],
+            b"/sys/class/block" => vec![b"vda".to_vec(), b"vda1".to_vec()],
+            b"/sys/devices/virtual/block/vda" => [
+                "vda1",
+                "queue",
+                "dev",
+                "size",
+                "ro",
+                "removable",
+                "stat",
+                "uevent",
+                "alignment_offset",
+                "discard_alignment",
+            ]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
+            b"/sys/devices/virtual/block/vda/vda1" => [
+                "dev",
+                "size",
+                "ro",
+                "stat",
+                "uevent",
+                "start",
+                "partition",
+                "alignment_offset",
+                "discard_alignment",
+            ]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
+            b"/sys/devices/virtual/block/vda/queue" => [
+                "logical_block_size",
+                "physical_block_size",
+                "minimum_io_size",
+                "optimal_io_size",
+                "rotational",
+            ]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
             b"/sys/class/net" | b"/sys/devices/virtual/net" => {
                 let mut n = vec![b"lo".to_vec()];
                 if self.network_info().is_some() {
-                    n.push(b"trames0".to_vec());
+                    n.push(b"eth0".to_vec());
                 }
                 n
             }
@@ -1152,7 +1294,7 @@ impl Vfs {
             }
         }
         if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/net/") {
-            if matches!(rest, b"lo" | b"trames0") {
+            if matches!(rest, b"lo" | b"eth0") {
                 names.extend(
                     [
                         "ifindex",
@@ -1170,10 +1312,10 @@ impl Vfs {
                     .map(|s| s.as_bytes().to_vec()),
                 );
             }
-            if matches!(rest, b"lo" | b"trames0") && self.network_links().is_some() {
+            if matches!(rest, b"lo" | b"eth0") && self.network_links().is_some() {
                 names.push(b"statistics".to_vec());
             }
-            if matches!(rest, b"lo/statistics" | b"trames0/statistics")
+            if matches!(rest, b"lo/statistics" | b"eth0/statistics")
                 && self.network_links().is_some()
             {
                 names.extend(

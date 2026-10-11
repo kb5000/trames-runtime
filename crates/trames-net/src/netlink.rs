@@ -226,7 +226,7 @@ impl Socket {
                     data[4..8].copy_from_slice(&i.to_le_bytes());
                     data[8..12].copy_from_slice(&(if lo { 0x49u32 } else { 0xc1 }).to_le_bytes());
                     data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-                    attr(&mut data, 3, if lo { b"lo\0" } else { b"trames0\0" });
+                    attr(&mut data, 3, if lo { b"lo\0" } else { b"eth0\0" });
                     attr(
                         &mut data,
                         4,
@@ -276,7 +276,7 @@ impl Socket {
                         };
                         attr(&mut data, 1, &bytes);
                         attr(&mut data, 2, &bytes);
-                        attr(&mut data, 3, if lo { b"lo\0" } else { b"trames0\0" });
+                        attr(&mut data, 3, if lo { b"lo\0" } else { b"eth0\0" });
                         attr(&mut data, 8, &0x80u32.to_le_bytes());
                         out.push(message(20, multipart, sequence, self.port.get(), &data));
                     }

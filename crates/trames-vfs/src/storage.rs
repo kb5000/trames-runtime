@@ -553,7 +553,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         nodes.insert(
             ino,
             Rc::new(RefCell::new(Node {
-                device: 1,
+                device: 0xfd01,
                 content,
                 mode,
                 uid,
@@ -692,7 +692,7 @@ impl Vfs {
         }
         let links = old.borrow().links;
         let new = Rc::new(RefCell::new(Node {
-            device: 1,
+            device: 0xfd01,
             content: Content::File(data),
             mode: 0o100755,
             uid: old.borrow().uid,

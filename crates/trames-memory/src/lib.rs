@@ -355,6 +355,19 @@ impl Memory {
         Ok(())
     }
 
+    /// Cache maintenance translates a virtual address without doing a data read.
+    pub fn check_translation(&self, address: u64) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().check_translation(address);
+        }
+        Self::end(address, 1)?;
+        if self.pages.contains_key(&(address & !(PAGE_SIZE - 1))) {
+            Ok(())
+        } else {
+            Err(MemoryError::Unmapped(address))
+        }
+    }
+
     pub fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
             return shared.borrow().check(address, len, access);
@@ -391,9 +404,36 @@ impl Memory {
         }
     }
 
+    // Callers handle shared memory and ensure the range fits within one page.
+    fn page_for_access(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+    ) -> Result<&Page, MemoryError> {
+        Self::end(address, len as u64)?;
+        let page = self
+            .pages
+            .get(&(address & !(PAGE_SIZE - 1)))
+            .ok_or(MemoryError::Unmapped(address))?;
+        if !page.permissions.allows(access) {
+            return Err(MemoryError::Permission { address, access });
+        }
+        Ok(page)
+    }
+
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
             return shared.borrow().read(address, out);
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        if out.len() <= PAGE_SIZE as usize - offset {
+            let page = self.page_for_access(address, out.len(), Access::Read)?;
+            out.copy_from_slice(&page.bytes[offset..offset + out.len()]);
+            return Ok(());
         }
         self.check(address, out.len(), Access::Read)?;
         self.copy_read(address, out);
@@ -403,6 +443,29 @@ impl Memory {
     pub fn write(&mut self, mut address: u64, mut input: &[u8]) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().write(address, input);
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        if input.len() <= PAGE_SIZE as usize - offset {
+            Self::end(address, input.len() as u64)?;
+            let page = self
+                .pages
+                .get_mut(&(address & !(PAGE_SIZE - 1)))
+                .ok_or(MemoryError::Unmapped(address))?;
+            if !page.permissions.write {
+                return Err(MemoryError::Permission {
+                    address,
+                    access: Access::Write,
+                });
+            }
+            Arc::make_mut(&mut page.bytes)[offset..offset + input.len()].copy_from_slice(input);
+            self.revision = self.revision.wrapping_add(1);
+            if page.permissions.execute {
+                self.code_revision = self.code_revision.wrapping_add(1);
+            }
+            return Ok(());
         }
         self.check(address, input.len(), Access::Write)?;
         if !input.is_empty() {
@@ -432,9 +495,12 @@ impl Memory {
         if !address.is_multiple_of(4) {
             return Err(MemoryError::InvalidRange);
         }
-        self.check(address, 4, Access::Execute)?;
-        let mut bytes = [0; 4];
-        self.copy_read(address, &mut bytes);
+        // An aligned A64 instruction cannot straddle a 4 KiB page.
+        let page = self.page_for_access(address, 4, Access::Execute)?;
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        let bytes = page.bytes[offset..offset + 4]
+            .try_into()
+            .expect("four instruction bytes");
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -448,6 +514,53 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optimized_access_preserves_fault_atomicity_and_execute_only_pages() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory.write(0x1ffc, &0xd503201fu32.to_le_bytes()).unwrap();
+        memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        let revision = memory.revision();
+        let code_revision = memory.instruction_revision();
+        assert!(matches!(
+            memory.write(0x1fff, &[1, 2]),
+            Err(MemoryError::Permission {
+                address: 0x2000,
+                access: Access::Write
+            })
+        ));
+        assert!(matches!(
+            memory.write(0x2000, &[1]),
+            Err(MemoryError::Permission {
+                address: 0x2000,
+                access: Access::Write
+            })
+        ));
+        assert_eq!(memory.revision(), revision);
+        assert_eq!(memory.instruction_revision(), code_revision);
+        let mut output = [0xaa; 8];
+        assert!(memory.read(0x2ffc, &mut output).is_err());
+        assert_eq!(output, [0xaa; 8]);
+        memory
+            .protect(
+                0x1000,
+                PAGE_SIZE,
+                Permissions {
+                    read: false,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(memory.fetch_u32(0x1ffc).unwrap(), 0xd503201f);
+        assert!(memory.read(0x1ffc, &mut output[..4]).is_err());
+        assert_eq!(output, [0xaa; 8]);
+        assert!(memory.read(ADDRESS_LIMIT, &mut output[..1]).is_err());
+        assert!(memory.write(ADDRESS_LIMIT, &[1]).is_err());
+        assert!(memory.fetch_u32(ADDRESS_LIMIT).is_err());
+        assert!(memory.read(u64::MAX, &mut []).is_ok());
+        assert!(memory.write(u64::MAX, &[]).is_ok());
+    }
     #[test]
     fn cross_page_write_is_atomic_on_fault() {
         let mut m = Memory::default();

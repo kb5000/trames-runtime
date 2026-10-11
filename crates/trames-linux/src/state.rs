@@ -481,7 +481,7 @@ impl Linux {
                 self.vfs.sync_fd(a[0] as u32, number == 83)?;
                 Ok(0)
             }
-            162 => {
+            81 => {
                 self.vfs.sync()?;
                 Ok(0)
             }
@@ -920,6 +920,34 @@ mod tests {
         m
     }
 
+    #[test]
+    fn canonical_sync_persists_open_file_length_and_contents() {
+        let directory = std::env::temp_dir().join(format!(
+            "trames-linux-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut linux = Linux::new(0x3000);
+        linux.vfs = Vfs::open_disk(&directory, trames_vfs::DiskOptions::default()).unwrap();
+        let fd = linux.vfs.open_at(-100, b"/sync-data", 0x42, 0o600).unwrap();
+        linux.vfs.write(fd, b"durable length and data").unwrap();
+        let mut memory = memory();
+        let mut io = CapturedOutput::default();
+        assert_eq!(
+            linux.syscall(162, [0; 6], &mut memory, &mut io),
+            Err(Errno(38))
+        );
+        assert_eq!(linux.syscall(81, [0; 6], &mut memory, &mut io), Ok(0));
+        drop(linux);
+        let mut reopened = Vfs::open_disk(&directory, trames_vfs::DiskOptions::default()).unwrap();
+        let fd = reopened.open_at(-100, b"/sync-data", 0, 0).unwrap();
+        assert_eq!(reopened.read(fd, 64).unwrap(), b"durable length and data");
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn invalid_read_buffer_does_not_consume_file_or_stdin() {
         let mut linux = Linux::new(0x3000);
