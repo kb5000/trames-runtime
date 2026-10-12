@@ -58,6 +58,8 @@ impl Permissions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryError {
     InvalidRange,
+    AddressRange(u64),
+    Alignment(u64),
     UnalignedMapping,
     Overlap(u64),
     Limit,
@@ -265,7 +267,7 @@ impl Memory {
     /// code writes keep this token, while replacement/protection changes do not.
     pub fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64), MemoryError> {
         if !address.is_multiple_of(4) {
-            return Err(MemoryError::InvalidRange);
+            return Err(MemoryError::Alignment(address));
         }
         if let Some(shared) = &self.shared {
             return shared.borrow().instruction_page_identity(address);
@@ -359,6 +361,7 @@ impl Memory {
 
     /// Read a bounded NUL-terminated byte string, without UTF-8 assumptions.
     pub fn read_c_string(&self, address: u64, limit: usize) -> Result<Vec<u8>, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow().read_c_string(address, limit);
         }
@@ -381,9 +384,11 @@ impl Memory {
     }
 
     fn end(address: u64, len: u64) -> Result<u64, MemoryError> {
-        let end = address.checked_add(len).ok_or(MemoryError::InvalidRange)?;
+        let end = address
+            .checked_add(len)
+            .ok_or(MemoryError::AddressRange(address))?;
         if address >= ADDRESS_LIMIT || end > ADDRESS_LIMIT {
-            return Err(MemoryError::InvalidRange);
+            return Err(MemoryError::AddressRange(address));
         }
         Ok(end)
     }
@@ -456,6 +461,7 @@ impl Memory {
 
     /// Cache maintenance translates a virtual address without doing a data read.
     pub fn check_translation(&self, address: u64) -> Result<(), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow().check_translation(address);
         }
@@ -468,6 +474,11 @@ impl Memory {
     }
 
     pub fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
+        let address = if access == Access::Execute {
+            address
+        } else {
+            address & 0x00ffffffffffffff
+        };
         if let Some(shared) = &self.shared {
             return shared.borrow().check(address, len, access);
         }
@@ -525,6 +536,7 @@ impl Memory {
     }
 
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow().read(address, out);
         }
@@ -543,6 +555,7 @@ impl Memory {
     }
 
     pub fn write(&mut self, mut address: u64, mut input: &[u8]) -> Result<(), MemoryError> {
+        address &= 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().write(address, input);
         }
@@ -600,7 +613,7 @@ impl Memory {
             return shared.borrow().fetch_u32(address);
         }
         if !address.is_multiple_of(4) {
-            return Err(MemoryError::InvalidRange);
+            return Err(MemoryError::Alignment(address));
         }
         // An aligned A64 instruction cannot straddle a 4 KiB page.
         let page = self.page_for_access(address, 4, Access::Execute)?;
@@ -615,6 +628,7 @@ impl Memory {
     /// path still validates a complete cross-page operation before any effect.
     #[inline]
     pub fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
+        let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow().read_array(address);
         }
@@ -639,6 +653,7 @@ impl Memory {
         address: u64,
         bytes: [u8; N],
     ) -> Result<(), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().write_array(address, bytes);
         }
