@@ -181,16 +181,17 @@ impl Vfs {
     pub fn log(&self, priority: u32, message: &str) {
         self.kernel_log.borrow_mut().append(priority, message);
     }
-    pub fn log_syscall(&self, number: u64, pc: u64, args: [u64; 6], errno: u32) {
+    pub fn log_syscall(&self, number: u64, pc: u64, args: [u64; 6], errno: u32, comm: &[u8]) {
         self.log(
             4,
             &format!(
-                "pid={} syscall={}({}) pc={:#x} args={:x?} unsupported errno={errno}",
+                "pid={} syscall={}({}) pc={:#x} args={:x?} unsupported errno={errno} comm={:?}",
                 self.pid,
                 number,
                 syscall_names::name(number),
                 pc,
-                args
+                args,
+                String::from_utf8_lossy(&comm[..comm.len().min(15)])
             ),
         );
     }

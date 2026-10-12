@@ -238,6 +238,7 @@ pub struct ProcessInfo {
     pub terminal: bool,
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
+    pub file_size_limits: Option<(u64, u64)>,
     pub pending: u64,
     pub blocked: u64,
     pub ignored: u64,
@@ -876,28 +877,61 @@ impl Vfs {
                         b"maps" => p.maps.clone(),
                         b"mounts" => mounts().to_vec(),
                         b"mountinfo" => mountinfo().to_vec(),
-                        b"statm" => format!("{} {} 0 0 0 0 0\n", p.mapped_bytes / 4096, p.mapped_bytes / 4096).into_bytes(),
+                        b"statm" => format!(
+                            "{} {} 0 0 0 0 0\n",
+                            p.mapped_bytes / 4096,
+                            p.mapped_bytes / 4096
+                        )
+                        .into_bytes(),
                         b"stat" => {
-                            let name = String::from_utf8_lossy(&comm(p)).trim_end().replace(['\n', ')'], "_");
+                            let name = String::from_utf8_lossy(&comm(p))
+                                .trim_end()
+                                .replace(['\n', ')'], "_");
                             let mut fields = vec!["0".to_string(); 50];
-                            fields[0] = p.state.to_string(); fields[1] = p.parent.to_string();
-                            fields[2] = p.group.to_string(); fields[3] = p.session.to_string();
-                            fields[4] = if p.terminal { "34816".into() } else { "0".into() };
+                            fields[0] = p.state.to_string();
+                            fields[1] = p.parent.to_string();
+                            fields[2] = p.group.to_string();
+                            fields[3] = p.session.to_string();
+                            fields[4] = if p.terminal {
+                                "34816".into()
+                            } else {
+                                "0".into()
+                            };
                             fields[5] = p.group.to_string();
-                            fields[11] = p.user_ticks.to_string(); fields[15] = "20".into();
-                            fields[17] = r.processes.iter().filter(|t| t.tgid == p.tgid).count().to_string();
-                            fields[19] = p.start_ticks.to_string(); fields[20] = p.mapped_bytes.to_string();
-                            fields[21] = (p.mapped_bytes / 4096).to_string(); fields[22] = u64::MAX.to_string();
+                            fields[11] = p.user_ticks.to_string();
+                            fields[15] = "20".into();
+                            fields[17] = r
+                                .processes
+                                .iter()
+                                .filter(|t| t.tgid == p.tgid)
+                                .count()
+                                .to_string();
+                            fields[19] = p.start_ticks.to_string();
+                            fields[20] = p.mapped_bytes.to_string();
+                            fields[21] = (p.mapped_bytes / 4096).to_string();
+                            fields[22] = u64::MAX.to_string();
                             format!("{} ({name}) {}\n", p.pid, fields.join(" ")).into_bytes()
                         }
                         b"status" => {
                             let c = &p.credentials;
-                            let name = String::from_utf8_lossy(&comm(p)).trim_end().replace('\n', "_");
+                            let name = String::from_utf8_lossy(&comm(p))
+                                .trim_end()
+                                .replace('\n', "_");
                             let threads = r.processes.iter().filter(|t| t.tgid == p.tgid).count();
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.mapped_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
-                        b"limits" => format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             32                   32                   processes\nMax address space         536870912            536870912             bytes\nMax file size             {0:<20} {0:<20} bytes\n", self.capacity().budget_bytes).into_bytes(),
+                        b"limits" => {
+                            let (soft, hard) = p.file_size_limits.unwrap_or((u64::MAX, u64::MAX));
+                            let limit = |v: u64| {
+                                if v == u64::MAX {
+                                    "unlimited".to_owned()
+                                } else {
+                                    v.to_string()
+                                }
+                            };
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             32                   32                   processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
+                        }
                         _ => return Ok(None),
                     };
                     return Ok(regular(value));

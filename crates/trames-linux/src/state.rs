@@ -516,6 +516,7 @@ impl Linux {
                 cpu.pc.saturating_sub(4),
                 a,
                 raw.wrapping_neg() as u32,
+                &self.command_name,
             );
         }
         if self.trace {

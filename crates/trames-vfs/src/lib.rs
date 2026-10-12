@@ -190,6 +190,8 @@ pub struct Vfs {
     kernel_log: Rc<RefCell<kernel_log::KernelLog>>,
     pid: u32,
     lock_owner: u32,
+    file_size_limit: u64,
+    file_size_signal: Cell<bool>,
     next_open: Rc<Cell<u64>>,
     proc_accessed: Cell<bool>,
     bridge: Option<trames_bridge::Broker>,
@@ -216,6 +218,8 @@ impl Default for Vfs {
             kernel_log: Rc::new(RefCell::new(kernel_log::KernelLog::default())),
             pid: 1,
             lock_owner: 1,
+            file_size_limit: u64::MAX,
+            file_size_signal: Cell::new(false),
             next_open: Rc::new(Cell::new(1)),
             proc_accessed: Cell::new(false),
             bridge: None,
@@ -1228,6 +1232,14 @@ impl Vfs {
         drop(o);
         self.file_write(fd, bytes, None)
     }
+    /// Per-task RLIMIT_FSIZE; disk quota remains a separate ENOSPC constraint.
+    pub fn set_file_size_limit(&mut self, limit: u64) {
+        self.file_size_limit = limit;
+        self.file_size_signal.set(false);
+    }
+    pub fn take_file_size_signal(&self) -> bool {
+        self.file_size_signal.replace(false)
+    }
     fn file_write(&mut self, fd: u32, bytes: &[u8], offset: Option<u64>) -> Result<usize> {
         let available = self.capacity().available_bytes;
         let memfd_available = self.memfd_available();
@@ -1257,6 +1269,13 @@ impl Vfs {
                 } else {
                     offset.unwrap_or(o.position)
                 };
+                if position >= self.file_size_limit {
+                    self.file_size_signal.set(true);
+                    return Err(Errno(27));
+                }
+                let bytes = &bytes[..bytes
+                    .len()
+                    .min(usize::try_from(self.file_size_limit - position).unwrap_or(usize::MAX))];
                 let end = position
                     .checked_add(bytes.len() as u64)
                     .filter(|&n| n <= i64::MAX as u64)
@@ -1347,6 +1366,10 @@ impl Vfs {
         }
         if seals.is_some_and(|s| s & 2 != 0 && length < b.len() || s & 4 != 0 && length > b.len()) {
             return Err(Errno(1));
+        }
+        if length > b.len() && length > self.file_size_limit {
+            self.file_size_signal.set(true);
+            return Err(Errno(27));
         }
         let available = if seals.is_some() {
             memfd_available
