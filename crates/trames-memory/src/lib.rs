@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod backing;
+mod native_access;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
+pub use native_access::Transfer;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
