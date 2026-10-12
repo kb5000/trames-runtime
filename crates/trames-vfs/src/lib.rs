@@ -3,7 +3,9 @@
 mod credentials;
 mod events;
 mod ipc;
+mod kernel_log;
 mod locks;
+mod syscall_names;
 pub use ipc::{LocalReceived, LocalSocket};
 pub use locks::RecordLock;
 mod namespace;
@@ -22,6 +24,9 @@ use std::{
 };
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub use trames_net::{NetworkMode, Socket as NetSocket};
+pub fn kernel_log_capacity() -> usize {
+    kernel_log::LOG_CAPACITY
+}
 pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
@@ -130,6 +135,7 @@ struct OpenDescription {
     pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
+    kernel_log: Option<Rc<RefCell<kernel_log::KernelLog>>>,
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
 }
@@ -178,6 +184,7 @@ pub struct Vfs {
     pub umask: u32,
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
+    kernel_log: Rc<RefCell<kernel_log::KernelLog>>,
     pid: u32,
     lock_owner: u32,
     next_open: Rc<Cell<u64>>,
@@ -203,6 +210,7 @@ impl Default for Vfs {
             umask: 0o022,
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
+            kernel_log: Rc::new(RefCell::new(kernel_log::KernelLog::default())),
             pid: 1,
             lock_owner: 1,
             next_open: Rc::new(Cell::new(1)),
@@ -234,6 +242,7 @@ impl Default for Vfs {
                         pipe: None,
                         socket: None,
                         bridge: None,
+                        kernel_log: None,
                         anonymous: None,
                         local: None,
                     })),
@@ -293,6 +302,9 @@ impl Vfs {
         Self::poll_open(&d.open.borrow(), events)
     }
     fn poll_open(o: &OpenDescription, events: u16) -> u16 {
+        if let Some(log) = &o.kernel_log {
+            return log.borrow().poll(o.position, events);
+        }
         if matches!(o.kind, FdKind::Stdout | FdKind::Stderr) {
             return events & 4;
         }
@@ -348,6 +360,7 @@ impl Vfs {
                         pipe: None,
                         socket: None,
                         bridge: None,
+                        kernel_log: None,
                         anonymous: None,
                         local: None,
                     })),
@@ -906,6 +919,9 @@ impl Vfs {
         } else {
             None
         };
+        let kernel_log = matches!(node.borrow().content, Content::Device(pseudo::Device::Kmsg))
+            .then(|| self.kernel_log.clone());
+        let position = kernel_log.as_ref().map_or(0, |log| log.borrow().oldest());
         let pipe = if let Content::Fifo(pipe) = &node.borrow().content {
             let read = flags & 3 != 1;
             let write = flags & 3 != 0;
@@ -936,11 +952,12 @@ impl Vfs {
                         FdKind::Node(p)
                     },
                     flags: flags & !O_CLOEXEC,
-                    position: 0,
+                    position,
                     node: Some(node),
                     pipe,
                     socket: None,
                     bridge,
+                    kernel_log,
                     anonymous: None,
                     local: None,
                 })),
@@ -975,6 +992,21 @@ impl Vfs {
     }
     pub fn cancel_fifo_open(&mut self, fd: u32) {
         self.fds.remove(&fd);
+    }
+    pub fn close_range(&mut self, first: u32, last: u32, flags: u32) -> Result<()> {
+        if first > last || flags & !6 != 0 {
+            return Err(Errno(22));
+        }
+        // The scheduler detaches CLONE_FILES views before UNSHARE reaches here.
+        let fds: Vec<_> = self.fds.range(first..=last).map(|(&fd, _)| fd).collect();
+        for fd in fds {
+            if flags & 4 != 0 {
+                self.set_cloexec(fd, true)?;
+            } else {
+                self.close(fd)?;
+            }
+        }
+        Ok(())
     }
     pub fn close_all(&mut self) {
         let descriptors = std::mem::take(&mut self.fds);
@@ -1076,6 +1108,7 @@ impl Vfs {
                         pipe: Some(end),
                         socket: None,
                         bridge: None,
+                        kernel_log: None,
                         anonymous: None,
                         local: None,
                     })),
@@ -1090,6 +1123,9 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(log) = o.kernel_log.clone() {
+            return log.borrow().kmsg_read(&mut o.position, count);
         }
         if let Some(local) = &o.local {
             return local.recv(count, 0).map(|r| r.data);
@@ -1144,6 +1180,15 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(log) = &o.kernel_log {
+            if bytes.len() > 1024 {
+                return Err(Errno(22));
+            }
+            if !bytes.is_empty() {
+                log.borrow_mut().append(14, &String::from_utf8_lossy(bytes));
+            }
+            return Ok(bytes.len());
         }
         if let Some(local) = &o.local {
             return local.send(bytes, 0);
@@ -1244,7 +1289,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         let o = self.descriptor(fd)?.open.borrow();
-        if o.bridge.is_some() {
+        if o.bridge.is_some() || o.kernel_log.is_some() {
             return Err(Errno(29));
         }
         if o.flags & 3 == 1 {
@@ -1261,7 +1306,7 @@ impl Vfs {
         }
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
-        if self.bridge_fd(fd) {
+        if self.bridge_fd(fd) || self.descriptor(fd)?.open.borrow().kernel_log.is_some() {
             return Err(Errno(29));
         }
         if offset > i64::MAX as u64 {
@@ -1313,6 +1358,11 @@ impl Vfs {
         }
         let node = o.node.clone().ok_or(Errno(29))?;
         let n = node.borrow();
+        if let Some(log) = &o.kernel_log {
+            let position = log.borrow().seek(offset, whence)?;
+            o.position = position;
+            return Ok(0);
+        }
         let length = match &n.content {
             Content::File(b) => b.len(),
             Content::Directory => 0,

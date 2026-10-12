@@ -305,6 +305,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Kmsg,
     Zero,
     Full,
     Random,
@@ -318,6 +319,7 @@ pub(super) enum Device {
 impl Device {
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::Kmsg => 0x10b,
             Self::Zero => 0x105,
             Self::Full => 0x107,
             Self::Random => 0x108,
@@ -334,6 +336,7 @@ impl Device {
         match self {
             Self::Zero | Self::Full => {}
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
+            Self::Kmsg => return Err(Errno(29)),
             Self::Pts => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
             Self::Bridge => return Err(Errno(19)),
@@ -344,6 +347,7 @@ impl Device {
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
             Self::Full if !data.is_empty() => Err(Errno(28)),
+            Self::Kmsg => Err(Errno(29)),
             Self::Pts => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
             Self::Bridge => Err(Errno(19)),
@@ -612,6 +616,7 @@ impl Vfs {
             pipe: original.pipe.clone(),
             socket: None,
             bridge: original.bridge.clone(),
+            kernel_log: None,
             anonymous: None,
             local: None,
         };
@@ -770,6 +775,7 @@ impl Vfs {
                 return Ok(link(format!("/proc/self/fd/{fd}").into_bytes()));
             }
             b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
+            b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
             b"/dev/vda" => return Ok(Some((Content::Device(Device::Vda),0o60600))),
             b"/dev/vda1" => return Ok(Some((Content::Device(Device::Vda1),0o60600))),
             b"/dev/block/253:0" => return Ok(link(b"../vda".to_vec())),
@@ -1121,6 +1127,7 @@ impl Vfs {
                 "full",
                 "random",
                 "urandom",
+                "kmsg",
                 "ptmx",
                 "pts",
                 "fd",

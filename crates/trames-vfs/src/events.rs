@@ -151,6 +151,7 @@ impl Vfs {
                     pipe: None,
                     socket: None,
                     bridge: None,
+                    kernel_log: None,
                     anonymous: Some(anonymous),
                     local: None,
                 })),

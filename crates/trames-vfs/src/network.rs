@@ -66,6 +66,7 @@ impl Vfs {
                     pipe: None,
                     socket: Some(socket),
                     bridge: None,
+                    kernel_log: None,
                     anonymous: None,
                     local: None,
                 })),

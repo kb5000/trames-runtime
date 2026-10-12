@@ -214,6 +214,7 @@ impl Vfs {
                         pipe: None,
                         socket: None,
                         bridge: None,
+                        kernel_log: None,
                         anonymous: None,
                         local: Some(local),
                     })),

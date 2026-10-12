@@ -235,6 +235,105 @@ impl Linux {
         }
         self.write_bytes(a[0] as u32, &bytes, io)
     }
+    fn positioned_vector(&mut self, a: [u64; 6], memory: &mut Memory, write: bool) -> Result<u64> {
+        self.vfs.fd_kind(a[0] as u32)?;
+        // Native arm64 uses the full 64-bit offset in pos_l (x3), not a 32-bit split.
+        let offset = a[3];
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        if a[2] > 1024 {
+            return Err(Errno(22));
+        }
+        Self::check(memory, a[1], a[2] as usize * 16, Access::Read)?;
+        let mut parts = Vec::new();
+        let mut total = 0usize;
+        let mut requested = 0u64;
+        for i in 0..a[2] {
+            let pointer = memory.read_u64(a[1] + i * 16).map_err(|_| Errno(14))?;
+            let length = memory.read_u64(a[1] + i * 16 + 8).map_err(|_| Errno(14))?;
+            requested = requested
+                .checked_add(length)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or(Errno(22))?;
+            let take = length.min((MAX_WRITE - total) as u64) as usize;
+            if take != 0 {
+                Self::check(
+                    memory,
+                    pointer,
+                    take,
+                    if write { Access::Read } else { Access::Write },
+                )?;
+            }
+            parts.push((pointer, take));
+            total += take;
+        }
+        if write {
+            let mut bytes = vec![0; total];
+            let mut cursor = 0;
+            for (pointer, take) in parts {
+                if take != 0 {
+                    memory
+                        .read(pointer, &mut bytes[cursor..cursor + take])
+                        .map_err(|_| Errno(14))?;
+                }
+                cursor += take;
+            }
+            Ok(self.vfs.pwrite(a[0] as u32, &bytes, offset)? as u64)
+        } else {
+            let bytes = self.vfs.pread(a[0] as u32, total, offset)?;
+            Self::scatter(memory, &parts, &bytes)?;
+            Ok(bytes.len() as u64)
+        }
+    }
+    fn statx(&self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+        let flags = a[2] as u32;
+        if flags & !0x7900 != 0 || flags & 0x6000 == 0x6000 || a[3] as u32 & 0x80000000 != 0 {
+            return Err(Errno(22));
+        }
+        Self::check(memory, a[4], 256, Access::Write)?;
+        let path = if a[1] == 0 && flags & 0x1000 != 0 {
+            Vec::new()
+        } else {
+            Self::path(memory, a[1])?
+        };
+        let stat = if path.is_empty() && flags & 0x1000 != 0 {
+            if a[0] as i32 == -100 {
+                self.vfs.stat_at(-100, b".")?
+            } else {
+                self.vfs.stat_fd(a[0] as u32)?
+            }
+        } else {
+            self.vfs
+                .stat_at_flags(a[0] as i32, &path, flags & 0x100 != 0)?
+        };
+        let mut out = [0u8; 256];
+        out[..4].copy_from_slice(&0x17ffu32.to_le_bytes()); // BASIC_STATS and MNT_ID; no birth time.
+        out[4..8].copy_from_slice(&stat[56..60]);
+        out[16..20].copy_from_slice(&stat[20..24]);
+        out[20..24].copy_from_slice(&stat[24..28]);
+        out[24..28].copy_from_slice(&stat[28..32]);
+        out[28..30].copy_from_slice(&stat[16..18]);
+        out[32..40].copy_from_slice(&stat[8..16]);
+        out[40..48].copy_from_slice(&stat[48..56]);
+        out[48..56].copy_from_slice(&stat[64..72]);
+        for (to, from) in [(64, 72), (96, 104), (112, 88)] {
+            out[to..to + 8].copy_from_slice(&stat[from..from + 8]);
+            out[to + 8..to + 12].copy_from_slice(&stat[from + 8..from + 12]);
+        }
+        let dev = u64::from_le_bytes(stat[..8].try_into().expect("stat dev"));
+        let rdev = u64::from_le_bytes(stat[32..40].try_into().expect("stat rdev"));
+        for (offset, value) in [(128, rdev), (136, dev)] {
+            let major = ((value >> 8) & 0xfff) | ((value >> 32) & 0xfffff000);
+            let minor = (value & 0xff) | ((value >> 12) & 0xffffff00);
+            out[offset..offset + 4].copy_from_slice(&(major as u32).to_le_bytes());
+            out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
+        }
+        let mount = if dev == 0xfd01 { 1 } else { dev };
+        out[144..152].copy_from_slice(&mount.to_le_bytes());
+        memory.write(a[4], &out).map_err(|_| Errno(14))?;
+        Ok(0)
+    }
     fn page_length(len: u64) -> Result<u64> {
         if len == 0 {
             return Err(Errno(22));
@@ -366,6 +465,14 @@ impl Linux {
             Ok(value) => value,
             Err(e) => errno(e.0 as u64),
         };
+        if raw == errno(38) || raw == errno(95) {
+            self.vfs.log_syscall(
+                number,
+                cpu.pc.saturating_sub(4),
+                a,
+                raw.wrapping_neg() as u32,
+            );
+        }
         if self.trace {
             eprintln!(
                 "trames syscall {number}({:#x}, {:#x}, {:#x}) = {}",
@@ -383,6 +490,34 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            69 | 70 => self.positioned_vector(a, memory, number == 70),
+            291 => self.statx(a, memory),
+            436 => {
+                self.vfs
+                    .close_range(a[0] as u32, a[1] as u32, a[2] as u32)?;
+                Ok(0)
+            }
+            116 => {
+                let action = a[0] as u32;
+                if matches!(action, 9 | 10) {
+                    return self.vfs.syslog_size(action);
+                }
+                let count = if matches!(action, 2..=4) {
+                    if (a[2] as u32 as i32) < 0 {
+                        return Err(Errno(22));
+                    }
+                    let count = (a[2] as u32 as usize).min(trames_vfs::kernel_log_capacity());
+                    Self::check(memory, a[1], count, Access::Write)?;
+                    count
+                } else {
+                    0
+                };
+                let bytes = self.vfs.syslog(action, count)?;
+                if !bytes.is_empty() {
+                    memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+                }
+                Ok(bytes.len() as u64)
+            }
             19 => Ok(self.vfs.eventfd(a[0] as u32, a[1] as u32)? as u64),
             20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
             21 => {
@@ -1020,6 +1155,92 @@ mod tests {
         m
     }
 
+    #[test]
+    fn positioned_vectors_preserve_offset_and_preflight_all_buffers() {
+        let mut l = Linux::new(0x3000);
+        let mut m = memory();
+        let mut io = CapturedOutput::default();
+        l.vfs.import_file(b"/file", b"abcdef".to_vec()).unwrap();
+        let fd = l.vfs.open_at(-100, b"/file", 2, 0).unwrap() as u64;
+        l.vfs.seek(fd as u32, 3, 0).unwrap();
+        for (i, value) in [0x1100u64, 2, 0x1200, 2].into_iter().enumerate() {
+            m.write(0x1000 + i as u64 * 8, &value.to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            l.syscall(69, [fd, 0x1000, 2, 1, 0, 0], &mut m, &mut io),
+            Ok(4)
+        );
+        assert_eq!(m.read_array::<2>(0x1100).unwrap(), *b"bc");
+        assert_eq!(m.read_array::<2>(0x1200).unwrap(), *b"de");
+        assert_eq!(l.vfs.seek(fd as u32, 0, 1).unwrap(), 3);
+        m.write(0x1010, &ADDRESS_LIMIT.to_le_bytes()).unwrap();
+        assert_eq!(
+            l.syscall(70, [fd, 0x1000, 2, 0, 0, 0], &mut m, &mut io),
+            Err(Errno(14))
+        );
+        assert_eq!(l.vfs.pread(fd as u32, 6, 0).unwrap(), b"abcdef");
+        assert_eq!(
+            l.syscall(69, [fd, 0x1000, 0, u64::MAX, 0, 0], &mut m, &mut io),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            l.syscall(69, [fd, 0x1000, 1025, 0, 0, 0], &mut m, &mut io),
+            Err(Errno(22))
+        );
+    }
+    #[test]
+    fn statx_has_real_identity_and_does_not_claim_birth_time() {
+        let mut l = Linux::new(0x3000);
+        let mut m = memory();
+        let mut io = CapturedOutput::default();
+        l.vfs.import_file(b"/file", b"abc".to_vec()).unwrap();
+        let fd = l.vfs.open_at(-100, b"/file", 0, 0).unwrap() as u64;
+        m.write(0x1000, b"/file\0").unwrap();
+        assert_eq!(
+            l.syscall(
+                291,
+                [(-100i64) as u64, 0x1000, 0, 0x7ff, 0x1200, 0],
+                &mut m,
+                &mut io
+            ),
+            Ok(0)
+        );
+        assert_eq!(m.read_array::<4>(0x1200).unwrap(), 0x17ffu32.to_le_bytes());
+        assert_eq!(m.read_u64(0x1228).unwrap(), 3);
+        let inode = m.read_u64(0x1220).unwrap();
+        assert_eq!(m.read_u64(0x1290).unwrap(), 1);
+        assert_eq!(
+            l.syscall(291, [fd, 0, 0x1000, 0, 0x1300, 0], &mut m, &mut io),
+            Ok(0)
+        );
+        assert_eq!(m.read_u64(0x1320).unwrap(), inode);
+        assert_eq!(
+            l.syscall(291, [fd, 0, 0x7000, 0, 0x1300, 0], &mut m, &mut io),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            l.syscall(291, [fd, 0, 0x1000, 0x80000000, 0x1300, 0], &mut m, &mut io),
+            Err(Errno(22))
+        );
+    }
+    #[test]
+    fn invalid_syslog_buffer_cannot_consume_or_clear_diagnostics() {
+        let mut l = Linux::new(0x3000);
+        let mut m = memory();
+        let mut io = CapturedOutput::default();
+        l.vfs.log(4, "retained diagnostic");
+        for action in [2, 4] {
+            assert_eq!(
+                l.syscall(116, [action, ADDRESS_LIMIT, 100, 0, 0, 0], &mut m, &mut io),
+                Err(Errno(14))
+            );
+        }
+        assert!(String::from_utf8(l.vfs.syslog(3, 4096).unwrap())
+            .unwrap()
+            .contains("retained diagnostic"));
+        assert!(l.vfs.syslog_size(9).unwrap() > 0);
+    }
     #[test]
     fn canonical_sync_persists_open_file_length_and_contents() {
         let directory = std::env::temp_dir().join(format!(
