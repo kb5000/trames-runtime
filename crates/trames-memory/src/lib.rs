@@ -76,6 +76,7 @@ impl std::error::Error for MemoryError {}
 struct Page {
     bytes: Arc<[u8; PAGE_SIZE as usize]>,
     permissions: Permissions,
+    instruction_revision: u64,
 }
 
 const TRANSLATION_SLOTS: usize = 256;
@@ -214,6 +215,7 @@ impl Memory {
         let page = Page {
             bytes: Arc::new([0; PAGE_SIZE as usize]),
             permissions,
+            instruction_revision: self.code_revision,
         };
         if let Some(&frame) = self.pages.get(&base) {
             self.frames[frame] = Some(page);
@@ -257,6 +259,27 @@ impl Memory {
             return shared.borrow().instruction_identity();
         }
         (self.identity, self.code_revision)
+    }
+
+    /// Checked identity of the reached executable page. Unrelated mappings and
+    /// code writes keep this token, while replacement/protection changes do not.
+    pub fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64), MemoryError> {
+        if !address.is_multiple_of(4) {
+            return Err(MemoryError::InvalidRange);
+        }
+        if let Some(shared) = &self.shared {
+            return shared.borrow().instruction_page_identity(address);
+        }
+        let page = self.page_for_access(address, 4, Access::Execute)?;
+        Ok((self.identity, page.instruction_revision))
+    }
+
+    fn advance_code_revision(&mut self) {
+        self.code_revision = self.code_revision.wrapping_add(1);
+        if self.code_revision == 0 {
+            // Repeated page tokens after wrap must belong to a new space key.
+            self.identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn is_free(&self, address: u64, len: u64) -> bool {
@@ -303,11 +326,11 @@ impl Memory {
         {
             return Err(MemoryError::Limit);
         }
+        self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.code_revision = self.code_revision.wrapping_add(1);
         self.invalidate_translations();
         Ok(())
     }
@@ -329,7 +352,7 @@ impl Memory {
             self.free_frames.push(frame);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.code_revision = self.code_revision.wrapping_add(1);
+        self.advance_code_revision();
         self.invalidate_translations();
         Ok(())
     }
@@ -395,11 +418,11 @@ impl Memory {
         if let Some((&base, _)) = self.pages.range(address..end).next() {
             return Err(MemoryError::Overlap(base));
         }
+        self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.code_revision = self.code_revision.wrapping_add(1);
         self.invalidate_translations();
         Ok(())
     }
@@ -419,15 +442,14 @@ impl Memory {
                 return Err(MemoryError::Unmapped(base));
             }
         }
+        self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             let frame = self.pages[&base];
-            self.frames[frame]
-                .as_mut()
-                .expect("validated page")
-                .permissions = permissions;
+            let page = self.frames[frame].as_mut().expect("validated page");
+            page.permissions = permissions;
+            page.instruction_revision = self.code_revision;
         }
         self.revision = self.revision.wrapping_add(1);
-        self.code_revision = self.code_revision.wrapping_add(1);
         self.invalidate_translations();
         Ok(())
     }
@@ -543,7 +565,8 @@ impl Memory {
             Arc::make_mut(&mut page.bytes)[offset..offset + input.len()].copy_from_slice(input);
             self.revision = self.revision.wrapping_add(1);
             if page.permissions.execute {
-                self.code_revision = self.code_revision.wrapping_add(1);
+                page.instruction_revision = self.code_revision.wrapping_add(1);
+                self.advance_code_revision();
             }
             return Ok(());
         }
@@ -559,12 +582,15 @@ impl Memory {
             let frame = self.frame(base).expect("validated page");
             let page = self.frames[frame].as_mut().expect("mapped frame");
             executable |= page.permissions.execute;
+            if page.permissions.execute {
+                page.instruction_revision = self.code_revision.wrapping_add(1);
+            }
             Arc::make_mut(&mut page.bytes)[offset..offset + len].copy_from_slice(&input[..len]);
             address += len as u64;
             input = &input[len..];
         }
         if executable {
-            self.code_revision = self.code_revision.wrapping_add(1);
+            self.advance_code_revision();
         }
         Ok(())
     }
@@ -637,7 +663,8 @@ impl Memory {
         Arc::make_mut(&mut page.bytes)[offset..offset + N].copy_from_slice(&bytes);
         self.revision = self.revision.wrapping_add(1);
         if page.permissions.execute {
-            self.code_revision = self.code_revision.wrapping_add(1);
+            page.instruction_revision = self.code_revision.wrapping_add(1);
+            self.advance_code_revision();
         }
         Ok(())
     }
@@ -650,6 +677,51 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn page_code_tokens_preserve_unrelated_code_and_track_wrap_shared_and_failed_writes() {
+        let mut memory = Memory::default();
+        let rwx = Permissions {
+            execute: true,
+            ..Permissions::RW
+        };
+        memory.map(0x1000, PAGE_SIZE * 2, rwx).unwrap();
+        let first = memory.instruction_page_identity(0x1000).unwrap();
+        let second = memory.instruction_page_identity(0x2000).unwrap();
+        memory.map(0x9000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x9000, [7; 8]).unwrap();
+        assert_eq!(memory.instruction_page_identity(0x1000).unwrap(), first);
+        memory.write_array(0x2000, [8; 8]).unwrap();
+        assert_eq!(memory.instruction_page_identity(0x1000).unwrap(), first);
+        assert_ne!(memory.instruction_page_identity(0x2000).unwrap(), second);
+        memory.write_array(0x1ffc, [9; 8]).unwrap();
+        let updated = memory.instruction_page_identity(0x1000).unwrap();
+        assert_ne!(updated, first);
+        assert_eq!(updated, memory.instruction_page_identity(0x2000).unwrap());
+        memory.protect(0x2000, PAGE_SIZE, Permissions::RX).unwrap();
+        assert!(memory.write_array(0x1ffc, [10; 8]).is_err());
+        assert_eq!(memory.instruction_page_identity(0x1000).unwrap(), updated);
+        assert!(memory
+            .protect(0x1000, PAGE_SIZE * 3, Permissions::R)
+            .is_err());
+        assert_eq!(memory.instruction_page_identity(0x1000).unwrap(), updated);
+        // Wrap invalidates the space key, including otherwise unchanged pages.
+        memory.code_revision = u64::MAX;
+        memory.map(0xa000, PAGE_SIZE, Permissions::RW).unwrap();
+        assert_ne!(
+            memory.instruction_page_identity(0x1000).unwrap().0,
+            updated.0
+        );
+        let mut shared = memory.share();
+        shared.write_array(0x1000, [11; 4]).unwrap();
+        assert_eq!(
+            memory.instruction_page_identity(0x1000),
+            shared.instruction_page_identity(0x1000)
+        );
+        assert_ne!(
+            memory.clone().instruction_page_identity(0x1000).unwrap().0,
+            memory.instruction_page_identity(0x1000).unwrap().0
+        );
+    }
     #[test]
     fn fixed_operands_match_generic_access_across_pages_and_faults() {
         fn compare<const N: usize>(memory: &Memory, address: u64) {
