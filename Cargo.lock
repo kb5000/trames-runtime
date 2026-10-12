@@ -404,6 +404,8 @@ version = "0.9.0"
 dependencies = [
  "serde",
  "sha2",
+ "trames-memory",
+ "trames-native",
 ]
 
 [[package]]
@@ -419,6 +421,7 @@ dependencies = [
 name = "trames-cli"
 version = "0.9.0"
 dependencies = [
+ "serde_json",
  "trames-core",
  "trames-distro",
  "trames-elf",
@@ -435,6 +438,7 @@ version = "0.9.0"
 name = "trames-core"
 version = "0.9.0"
 dependencies = [
+ "trames-accel",
  "trames-cpu",
  "trames-elf",
  "trames-linux",
@@ -495,6 +499,10 @@ dependencies = [
 
 [[package]]
 name = "trames-memory"
+version = "0.9.0"
+
+[[package]]
+name = "trames-native"
 version = "0.9.0"
 
 [[package]]
