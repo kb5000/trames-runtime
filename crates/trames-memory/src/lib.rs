@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
+mod backing;
+use backing::Backed;
+pub use backing::{backing_changed, PageBacking};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -64,6 +67,8 @@ pub enum MemoryError {
     Overlap(u64),
     Limit,
     Unmapped(u64),
+    Bus(u64),
+    BackingIo(u32),
     Permission { address: u64, access: Access },
 }
 
@@ -79,6 +84,8 @@ struct Page {
     bytes: Arc<[u8; PAGE_SIZE as usize]>,
     permissions: Permissions,
     instruction_revision: u64,
+    backing: Option<Backed>,
+    mapping: u64,
 }
 
 const TRANSLATION_SLOTS: usize = 256;
@@ -107,6 +114,7 @@ pub struct Memory {
     code_revision: u64,
     identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
+    has_backings: bool,
 }
 impl Clone for Memory {
     fn clone(&self) -> Self {
@@ -124,6 +132,7 @@ impl Clone for Memory {
             code_revision: self.code_revision,
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
+            has_backings: self.has_backings,
         }
     }
 }
@@ -168,6 +177,7 @@ impl Memory {
             code_revision: 0,
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
+            has_backings: false,
         }
     }
     pub fn mapped_bytes(&self) -> usize {
@@ -218,6 +228,8 @@ impl Memory {
             bytes: Arc::new([0; PAGE_SIZE as usize]),
             permissions,
             instruction_revision: self.code_revision,
+            backing: None,
+            mapping: self.code_revision,
         };
         if let Some(&frame) = self.pages.get(&base) {
             self.frames[frame] = Some(page);
@@ -245,7 +257,11 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().revision();
         }
-        self.revision
+        self.revision.wrapping_add(if self.has_backings {
+            backing::backing_revision()
+        } else {
+            0
+        })
     }
     /// Decode-cache epoch: data stores preserve checked executable blocks.
     /// Mapping/protection changes and writes into executable pages invalidate.
@@ -256,16 +272,24 @@ impl Memory {
         self.code_revision
     }
     /// A decoder must also distinguish independent spaces with equal epochs.
-    pub fn instruction_identity(&self) -> (u64, u64) {
+    pub fn instruction_identity(&self) -> (u64, u64, u64) {
         if let Some(shared) = &self.shared {
             return shared.borrow().instruction_identity();
         }
-        (self.identity, self.code_revision)
+        (
+            self.identity,
+            self.code_revision,
+            if self.has_backings {
+                backing::backing_revision()
+            } else {
+                0
+            },
+        )
     }
 
     /// Checked identity of the reached executable page. Unrelated mappings and
     /// code writes keep this token, while replacement/protection changes do not.
-    pub fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64), MemoryError> {
+    pub fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64, u64), MemoryError> {
         if !address.is_multiple_of(4) {
             return Err(MemoryError::Alignment(address));
         }
@@ -273,7 +297,14 @@ impl Memory {
             return shared.borrow().instruction_page_identity(address);
         }
         let page = self.page_for_access(address, 4, Access::Execute)?;
-        Ok((self.identity, page.instruction_revision))
+        Ok((
+            self.identity,
+            page.instruction_revision,
+            page.backing
+                .as_ref()
+                .filter(|b| b.shared || !b.private_copy)
+                .map_or(0, |b| b.object.version()),
+        ))
     }
 
     fn advance_code_revision(&mut self) {
@@ -373,7 +404,9 @@ impl Memory {
             let offset = (current & (PAGE_SIZE - 1)) as usize;
             let length = (limit - bytes.len()).min(PAGE_SIZE as usize - offset);
             let page = self.page_for_access(current, length, Access::Read)?;
-            let part = &page.bytes[offset..offset + length];
+            let mut bytes_part = vec![0; length];
+            page.read_bytes(offset, &mut bytes_part)?;
+            let part = &bytes_part;
             if let Some(end) = part.iter().position(|&byte| byte == 0) {
                 bytes.extend_from_slice(&part[..end]);
                 return Ok(bytes);
@@ -446,6 +479,17 @@ impl Memory {
             if !self.pages.contains_key(&base) {
                 return Err(MemoryError::Unmapped(base));
             }
+            let p = self.frames[self.pages[&base]].as_ref().expect("page");
+            if permissions.write
+                && p.backing
+                    .as_ref()
+                    .is_some_and(|b| b.shared && !b.object.writable())
+            {
+                return Err(MemoryError::Permission {
+                    address: base,
+                    access: Access::Write,
+                });
+            }
         }
         self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
@@ -499,22 +543,25 @@ impl Memory {
                     access,
                 });
             }
+            page.check_backing(fault_address)?;
         }
         Ok(())
     }
 
-    fn copy_read(&self, mut address: u64, mut out: &mut [u8]) {
+    fn copy_read(&self, mut address: u64, mut out: &mut [u8]) -> Result<(), MemoryError> {
         while !out.is_empty() {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = out.len().min(PAGE_SIZE as usize - offset);
             let frame = self.frame(base).expect("validated page");
-            out[..len].copy_from_slice(
-                &self.frames[frame].as_ref().expect("mapped frame").bytes[offset..offset + len],
-            );
+            self.frames[frame]
+                .as_ref()
+                .expect("mapped frame")
+                .read_bytes(offset, &mut out[..len])?;
             address += len as u64;
             out = &mut out[len..];
         }
+        Ok(())
     }
 
     // Callers handle shared memory and ensure the range fits within one page.
@@ -532,6 +579,7 @@ impl Memory {
         if !page.permissions.allows(access) {
             return Err(MemoryError::Permission { address, access });
         }
+        page.check_backing(address)?;
         Ok(page)
     }
 
@@ -546,11 +594,11 @@ impl Memory {
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if out.len() <= PAGE_SIZE as usize - offset {
             let page = self.page_for_access(address, out.len(), Access::Read)?;
-            out.copy_from_slice(&page.bytes[offset..offset + out.len()]);
+            page.read_bytes(offset, out)?;
             return Ok(());
         }
         self.check(address, out.len(), Access::Read)?;
-        self.copy_read(address, out);
+        self.copy_read(address, out)?;
         Ok(())
     }
 
@@ -575,7 +623,8 @@ impl Memory {
                     access: Access::Write,
                 });
             }
-            Arc::make_mut(&mut page.bytes)[offset..offset + input.len()].copy_from_slice(input);
+            page.check_backing(address)?;
+            page.write_bytes(offset, input)?;
             self.revision = self.revision.wrapping_add(1);
             if page.permissions.execute {
                 page.instruction_revision = self.code_revision.wrapping_add(1);
@@ -598,7 +647,7 @@ impl Memory {
             if page.permissions.execute {
                 page.instruction_revision = self.code_revision.wrapping_add(1);
             }
-            Arc::make_mut(&mut page.bytes)[offset..offset + len].copy_from_slice(&input[..len]);
+            page.write_bytes(offset, &input[..len])?;
             address += len as u64;
             input = &input[len..];
         }
@@ -618,9 +667,8 @@ impl Memory {
         // An aligned A64 instruction cannot straddle a 4 KiB page.
         let page = self.page_for_access(address, 4, Access::Execute)?;
         let offset = (address & (PAGE_SIZE - 1)) as usize;
-        let bytes = page.bytes[offset..offset + 4]
-            .try_into()
-            .expect("four instruction bytes");
+        let mut bytes = [0; 4];
+        page.read_bytes(offset, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -638,9 +686,9 @@ impl Memory {
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if N <= PAGE_SIZE as usize - offset {
             let page = self.page_for_access(address, N, Access::Read)?;
-            return Ok(page.bytes[offset..offset + N]
-                .try_into()
-                .expect("fixed operand"));
+            let mut bytes = [0; N];
+            page.read_bytes(offset, &mut bytes)?;
+            return Ok(bytes);
         }
         let mut bytes = [0; N];
         self.read(address, &mut bytes)?;
@@ -675,7 +723,8 @@ impl Memory {
                 access: Access::Write,
             });
         }
-        Arc::make_mut(&mut page.bytes)[offset..offset + N].copy_from_slice(&bytes);
+        page.check_backing(address)?;
+        page.write_bytes(offset, &bytes)?;
         self.revision = self.revision.wrapping_add(1);
         if page.permissions.execute {
             page.instruction_revision = self.code_revision.wrapping_add(1);

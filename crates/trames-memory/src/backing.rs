@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Page-sized virtual backing objects, with no host pointers exposed to guests.
+use super::*;
+static BACKING_REVISION: AtomicU64 = AtomicU64::new(0);
+/// Notify decoder caches and exclusive monitors about externally visible changes.
+pub fn backing_changed() {
+    BACKING_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+pub(super) fn backing_revision() -> u64 {
+    BACKING_REVISION.load(Ordering::Relaxed)
+}
+pub trait PageBacking {
+    fn check(&self, address: u64) -> Result<(), MemoryError>;
+    fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
+    fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
+    fn sync(&self) -> Result<(), MemoryError>;
+    fn sync_key(&self) -> Option<u64> {
+        None
+    }
+    fn version(&self) -> u64;
+    fn writable(&self) -> bool;
+    fn next_page(&self, pages: u64) -> Result<Rc<dyn PageBacking>, MemoryError>;
+}
+#[derive(Clone)]
+pub(super) struct Backed {
+    pub object: Rc<dyn PageBacking>,
+    pub shared: bool,
+    pub private_copy: bool,
+}
+impl Page {
+    pub(super) fn check_backing(&self, address: u64) -> Result<(), MemoryError> {
+        if let Some(b) = &self.backing {
+            b.object.check(address)?;
+        }
+        Ok(())
+    }
+    pub(super) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+        if let Some(b) = &self.backing {
+            if b.shared || !b.private_copy {
+                return b.object.read(offset, out);
+            }
+        }
+        out.copy_from_slice(&self.bytes[offset..offset + out.len()]);
+        Ok(())
+    }
+    pub(super) fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
+        if let Some(b) = &mut self.backing {
+            if b.shared {
+                return b.object.write(offset, bytes);
+            }
+            if !b.private_copy {
+                let mut page = [0; PAGE_SIZE as usize];
+                b.object.read(0, &mut page)?;
+                self.bytes = Arc::new(page);
+                b.private_copy = true;
+            }
+        }
+        Arc::make_mut(&mut self.bytes)[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+impl Memory {
+    pub fn map_backed(
+        &mut self,
+        address: u64,
+        objects: Vec<Rc<dyn PageBacking>>,
+        shared_mapping: bool,
+        permissions: Permissions,
+        fixed: bool,
+    ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().map_backed(
+                address,
+                objects,
+                shared_mapping,
+                permissions,
+                fixed,
+            );
+        }
+        let len = (objects.len() as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(MemoryError::Limit)?;
+        Self::mapping_end(address, len)?;
+        if shared_mapping && permissions.write && objects.iter().any(|b| !b.writable()) {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Write,
+            });
+        }
+        if fixed {
+            self.map_fixed(address, len, permissions)?;
+        } else {
+            self.map(address, len, permissions)?;
+        }
+        let zero = Arc::new([0; PAGE_SIZE as usize]);
+        for (i, object) in objects.into_iter().enumerate() {
+            let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
+            let page = self.frames[frame].as_mut().expect("mapped page");
+            page.bytes = zero.clone();
+            page.backing = Some(Backed {
+                object,
+                shared: shared_mapping,
+                private_copy: false,
+            });
+        }
+        self.has_backings = true;
+        Ok(())
+    }
+    pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().sync_range(address, len);
+        }
+        let end = Self::mapping_end(address, len)?;
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            if !self.pages.contains_key(&base) {
+                return Err(MemoryError::Unmapped(base));
+            }
+        }
+        let mut synced = std::collections::BTreeSet::new();
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            if let Some(b) = &self.frames[self.pages[&base]]
+                .as_ref()
+                .expect("page")
+                .backing
+            {
+                if b.shared && b.object.sync_key().is_none_or(|key| synced.insert(key)) {
+                    b.object.sync()?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn resident(&self, address: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().resident(address, len);
+        }
+        let end = Self::mapping_end(address, len)?;
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            if !self.pages.contains_key(&base) {
+                return Err(MemoryError::Unmapped(base));
+            }
+        }
+        Ok((address..end)
+            .step_by(PAGE_SIZE as usize)
+            .map(|base| {
+                let page = self.frames[self.pages[&base]].as_ref().expect("page");
+                u8::from(page.check_backing(base).is_ok())
+            })
+            .collect()) // Existing valid page objects are eagerly resident.
+    }
+    pub fn discard(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().discard(address, len);
+        }
+        let end = Self::mapping_end(address, len)?;
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            if !self.pages.contains_key(&base) {
+                return Err(MemoryError::Unmapped(base));
+            }
+        }
+        self.advance_code_revision();
+        for base in (address..end).step_by(PAGE_SIZE as usize) {
+            let page = self.frames[self.pages[&base]].as_mut().expect("page");
+            if page.backing.as_ref().is_some_and(|b| b.shared) {
+                continue;
+            }
+            page.bytes = Arc::new([0; PAGE_SIZE as usize]);
+            if let Some(b) = &mut page.backing {
+                b.private_copy = false;
+            }
+            page.instruction_revision = self.code_revision;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
+    }
+    /// Transactional page-table movement; page bytes/backing identity are retained.
+    pub fn remap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new: u64,
+        new_len: u64,
+        fixed: bool,
+    ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().remap(old, old_len, new, new_len, fixed);
+        }
+        let old_end = Self::mapping_end(old, old_len)?;
+        let new_end = Self::mapping_end(new, new_len)?;
+        if fixed && old == new {
+            return Err(MemoryError::InvalidRange);
+        }
+        if old != new && new < old_end && old < new_end {
+            return Err(MemoryError::InvalidRange);
+        }
+        let mut pages = Vec::new();
+        for base in (old..old_end).step_by(PAGE_SIZE as usize) {
+            pages.push(
+                self.frames[*self.pages.get(&base).ok_or(MemoryError::Unmapped(base))?]
+                    .as_ref()
+                    .expect("page")
+                    .clone(),
+            );
+        }
+        // Linux requires a single mapping; reject mixed protection/backing ranges.
+        let permissions = pages[0].permissions;
+        let first_backed = pages[0].backing.is_some();
+        let mapping = pages[0].mapping;
+        if pages.iter().any(|p| {
+            p.mapping != mapping
+                || p.permissions != permissions
+                || p.backing.is_some() != first_backed
+        }) {
+            return Err(MemoryError::InvalidRange);
+        }
+        let replaced = if old == new {
+            old_len
+        } else if fixed {
+            (self.pages.range(new..new_end).count() as u64) * PAGE_SIZE
+        } else {
+            0
+        };
+        if old != new && !fixed && !self.is_free(new, new_len) {
+            return Err(MemoryError::Overlap(new));
+        }
+        if (self.mapped_bytes() as u64)
+            .saturating_sub(old_len + if old == new { 0 } else { replaced })
+            .checked_add(new_len)
+            .is_none_or(|n| n > self.limit as u64)
+        {
+            return Err(MemoryError::Limit);
+        }
+        if old == new && new_len > old_len && !self.is_free(old_end, new_len - old_len) {
+            return Err(MemoryError::Overlap(old_end));
+        }
+        let count = (new_len / PAGE_SIZE) as usize;
+        if count > pages.len() {
+            let last = pages.last().expect("page").clone();
+            let original_count = pages.len();
+            for i in original_count..count {
+                let mut page = last.clone();
+                page.bytes = Arc::new([0; PAGE_SIZE as usize]);
+                if let Some(b) = &mut page.backing {
+                    b.object = last
+                        .backing
+                        .as_ref()
+                        .expect("backed")
+                        .object
+                        .next_page((i + 1 - original_count) as u64)?;
+                    b.private_copy = false;
+                }
+                pages.push(page);
+            }
+        }
+        self.unmap(old, old_len)?;
+        if fixed && old != new {
+            self.unmap(new, new_len)?;
+        }
+        self.map_fixed(new, new_len, permissions)?;
+        for (i, mut page) in pages.into_iter().take(count).enumerate() {
+            page.instruction_revision = self.code_revision;
+            let frame = self.pages[&(new + i as u64 * PAGE_SIZE)];
+            self.frames[frame] = Some(page);
+        }
+        Ok(())
+    }
+}
+
+struct AnonymousPage {
+    bytes: RefCell<Box<[u8; PAGE_SIZE as usize]>>,
+    revision: Cell<u64>,
+}
+impl AnonymousPage {
+    fn allocate() -> Rc<dyn PageBacking> {
+        Rc::new(Self {
+            bytes: RefCell::new(Box::new([0; PAGE_SIZE as usize])),
+            revision: Cell::new(0),
+        })
+    }
+}
+impl PageBacking for AnonymousPage {
+    fn check(&self, _: u64) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+        out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+        Ok(())
+    }
+    fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.revision.set(self.revision.get().wrapping_add(1));
+        backing_changed();
+        Ok(())
+    }
+    fn sync(&self) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn version(&self) -> u64 {
+        self.revision.get()
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+        Ok(Self::allocate())
+    }
+}
+impl Memory {
+    pub fn map_shared_anonymous(
+        &mut self,
+        address: u64,
+        len: u64,
+        permissions: Permissions,
+        fixed: bool,
+    ) -> Result<(), MemoryError> {
+        Self::mapping_end(address, len)?;
+        let objects = (0..len / PAGE_SIZE)
+            .map(|_| AnonymousPage::allocate())
+            .collect();
+        self.map_backed(address, objects, true, permissions, fixed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fork_shares_anonymous_bytes_but_not_protections_or_mapping_table() {
+        let mut m = Memory::default();
+        m.map_shared_anonymous(0x1000, PAGE_SIZE, Permissions::RW, false)
+            .unwrap();
+        let mut child = m.clone();
+        child.write_array(0x1000, [7; 8]).unwrap();
+        assert_eq!(m.read_array::<8>(0x1000).unwrap(), [7; 8]);
+        child.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        m.write_array(0x1000, [8; 8]).unwrap();
+        assert_eq!(child.read_array::<8>(0x1000).unwrap(), [8; 8]);
+        child.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(m.read_array::<8>(0x1000).is_ok());
+    }
+    #[test]
+    fn failed_remap_is_atomic_and_success_preserves_bytes_and_zero_grows() {
+        let mut m = Memory::new(PAGE_SIZE as usize * 4);
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.map(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        m.write_array(0x1000, [3; 8]).unwrap();
+        assert!(m
+            .remap(0x1000, PAGE_SIZE, 0x1000, PAGE_SIZE * 2, false)
+            .is_err());
+        assert_eq!(m.read_array::<8>(0x1000).unwrap(), [3; 8]);
+        assert!(m
+            .remap(0x1000, PAGE_SIZE, 0x8000, PAGE_SIZE * 5, false)
+            .is_err());
+        assert!(m.is_free(0x8000, PAGE_SIZE * 3));
+        m.remap(0x1000, PAGE_SIZE, 0x8000, PAGE_SIZE * 3, false)
+            .unwrap();
+        assert!(m.is_free(0x1000, PAGE_SIZE));
+        assert_eq!(m.read_array::<8>(0x8000).unwrap(), [3; 8]);
+        assert_eq!(m.read_array::<8>(0xa000).unwrap(), [0; 8]);
+    }
+}

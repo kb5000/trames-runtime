@@ -5,6 +5,8 @@ mod events;
 mod ipc;
 mod kernel_log;
 mod locks;
+mod mapped;
+mod memfd;
 mod syscall_names;
 pub use ipc::{LocalReceived, LocalSocket};
 pub use locks::RecordLock;
@@ -163,6 +165,7 @@ struct Node {
     inode: u64,
     links: u32,
     times: [storage::Timestamp; 3],
+    seals: Option<u32>,
 }
 type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
@@ -412,6 +415,7 @@ impl Vfs {
             inode,
             links: 1,
             times: [storage::Timestamp::now(); 3],
+            seals: None,
         }));
         fs.inodes.push(Rc::downgrade(&node));
         fs.paths.insert(path.clone(), node.clone());
@@ -454,7 +458,7 @@ impl Vfs {
             .iter()
             .filter_map(Weak::upgrade)
             .map(|n| match &n.borrow().content {
-                Content::File(b) => b.len(),
+                Content::File(b) if n.borrow().seals.is_none() => b.len(),
                 _ => 0,
             })
             .sum()
@@ -1226,6 +1230,7 @@ impl Vfs {
     }
     fn file_write(&mut self, fd: u32, bytes: &[u8], offset: Option<u64>) -> Result<usize> {
         let available = self.capacity().available_bytes;
+        let memfd_available = self.memfd_available();
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 0 {
             return Err(Errno(9));
@@ -1233,6 +1238,7 @@ impl Vfs {
         let node = o.node.clone().ok_or(Errno(29))?;
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
+        let seals = n.seals;
         let count = bytes.len().min(storage::MAX_TRANSFER);
         let bytes = &bytes[..count];
         let result = match &mut n.content {
@@ -1255,6 +1261,14 @@ impl Vfs {
                     .checked_add(bytes.len() as u64)
                     .filter(|&n| n <= i64::MAX as u64)
                     .ok_or(Errno(27))?;
+                if seals.is_some_and(|s| s & 8 != 0 || s & 4 != 0 && end > b.len()) {
+                    return Err(Errno(1));
+                }
+                let available = if seals.is_some() {
+                    memfd_available
+                } else {
+                    available
+                };
                 if end.saturating_sub(b.len()) > available {
                     return Err(Errno(28));
                 }
@@ -1316,6 +1330,7 @@ impl Vfs {
     }
     pub fn truncate_fd(&mut self, fd: u32, length: u64) -> Result<()> {
         let available = self.capacity().available_bytes;
+        let memfd_available = self.memfd_available();
         let o = self.descriptor(fd)?.open.borrow();
         if o.flags & 3 == 0 {
             return Err(Errno(22));
@@ -1323,12 +1338,21 @@ impl Vfs {
         let node = o.node.as_ref().ok_or(Errno(22))?;
         self.pseudo_immutable(node)?;
         let mut n = node.borrow_mut();
+        let seals = n.seals;
         let Content::File(b) = &mut n.content else {
             return Err(Errno(22));
         };
         if length > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        if seals.is_some_and(|s| s & 2 != 0 && length < b.len() || s & 4 != 0 && length > b.len()) {
+            return Err(Errno(1));
+        }
+        let available = if seals.is_some() {
+            memfd_available
+        } else {
+            available
+        };
         if length.saturating_sub(b.len()) > available {
             return Err(Errno(28));
         }
@@ -1529,6 +1553,7 @@ impl Vfs {
             gid: o.owner.1,
             volatile: false,
             times: [storage::Timestamp::default(); 3],
+            seals: None,
         })
     }
     pub fn chdir_fd(&mut self, fd: u32) -> Result<()> {

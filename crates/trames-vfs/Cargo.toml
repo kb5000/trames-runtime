@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+trames-memory = { path = "../trames-memory" }
 getrandom = "=0.3.4"
 trames-net = { path = "../trames-net" }
 trames-bridge = { path = "../trames-bridge" }

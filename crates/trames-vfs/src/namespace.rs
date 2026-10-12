@@ -172,6 +172,19 @@ impl Vfs {
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
         self.chmod_node(self.node(&self.resolve(dirfd, path)?)?, mode)
     }
+    pub fn chmod_at_flags(
+        &mut self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u32,
+        nofollow: bool,
+    ) -> Result<()> {
+        let node = self.node(&self.resolve_final(dirfd, path, !nofollow)?)?;
+        if matches!(node.borrow().content, Content::Symlink(_)) {
+            return Err(Errno(95));
+        }
+        self.chmod_node(node, mode)
+    }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
         let n = self
             .descriptor(fd)?

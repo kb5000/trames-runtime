@@ -298,6 +298,7 @@ impl PseudoFs {
             inode: (1u64 << 63) + self.next_inode,
             links: 1,
             times: [storage::Timestamp::default(); 3],
+            seals: None,
         }));
         self.nodes.insert(path.to_vec(), node.clone());
         Ok(node)

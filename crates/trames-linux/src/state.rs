@@ -85,7 +85,12 @@ impl Linux {
         }
         memory.check(address, count, access).map_err(|_| Errno(14))
     }
-    fn write_bytes(&mut self, fd: u32, bytes: &[u8], io: &mut impl GuestOutput) -> Result<u64> {
+    pub(super) fn write_bytes(
+        &mut self,
+        fd: u32,
+        bytes: &[u8],
+        io: &mut impl GuestOutput,
+    ) -> Result<u64> {
         match self.vfs.fd_kind(fd)? {
             FdKind::Stdout | FdKind::Stderr => {
                 let stream = if self.vfs.fd_kind(fd)? == FdKind::Stdout {
@@ -184,7 +189,7 @@ impl Linux {
         }
         Ok(())
     }
-    fn readv(
+    pub(super) fn readv(
         &mut self,
         a: [u64; 6],
         memory: &mut Memory,
@@ -204,7 +209,12 @@ impl Linux {
         memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
         self.write_bytes(a[0] as u32, &bytes, io)
     }
-    fn writev(&mut self, a: [u64; 6], memory: &Memory, io: &mut impl GuestOutput) -> Result<u64> {
+    pub(super) fn writev(
+        &mut self,
+        a: [u64; 6],
+        memory: &Memory,
+        io: &mut impl GuestOutput,
+    ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         if a[2] > 1024 {
             return Err(Errno(22));
@@ -235,7 +245,12 @@ impl Linux {
         }
         self.write_bytes(a[0] as u32, &bytes, io)
     }
-    fn positioned_vector(&mut self, a: [u64; 6], memory: &mut Memory, write: bool) -> Result<u64> {
+    pub(super) fn positioned_vector(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut Memory,
+        write: bool,
+    ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         // Native arm64 uses the full 64-bit offset in pos_l (x3), not a 32-bit split.
         let offset = a[3];
@@ -366,18 +381,32 @@ impl Linux {
         self.brk = address;
         address
     }
+    fn memory_errno(e: MemoryError) -> Errno {
+        Errno(match e {
+            MemoryError::UnalignedMapping
+            | MemoryError::InvalidRange
+            | MemoryError::AddressRange(_) => 22,
+            MemoryError::Permission { .. } => 13,
+            MemoryError::BackingIo(e) => e,
+            _ => 12,
+        })
+    }
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
         if len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
             return Err(Errno(12));
         }
         let flags = a[3];
-        const ALLOWED: u64 = 2 | 0x10 | 0x20 | 0x800 | 0x100000;
+        let shared = flags & 3 != 2;
+        const ALLOWED: u64 = 3 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x100000;
         if a[2] & !7 != 0
             || flags & !ALLOWED != 0
-            || flags & 2 == 0
+            || flags & 3 == 0
             || !a[5].is_multiple_of(PAGE_SIZE)
         {
+            return Err(Errno(22));
+        }
+        if flags & 3 == 3 && flags & 0x20 != 0 {
             return Err(Errno(22));
         }
         let fixed = flags & (0x10 | 0x100000) != 0;
@@ -399,47 +428,63 @@ impl Linux {
             write: a[2] & 2 != 0,
             execute: a[2] & 4 != 0,
         };
-        // Read and validate the backing descriptor before MAP_FIXED changes memory.
-        let file_bytes = if flags & 0x20 == 0 {
-            let fd = a[4] as u32;
-            let flags = self.vfs.flags(fd)?;
-            if flags & 3 == 1 {
-                return Err(Errno(13));
-            }
-            let stat = self.vfs.stat_fd(fd)?;
-            if u32::from_le_bytes(stat[16..20].try_into().expect("stat")) & 0o170000 != 0o100000 {
-                return Err(Errno(19));
-            }
-            let mut bytes = Vec::new();
-            while bytes.len() < len as usize {
-                let chunk = self.vfs.pread(
-                    fd,
-                    (len as usize - bytes.len()).min(MAX_WRITE),
-                    a[5].checked_add(bytes.len() as u64).ok_or(Errno(22))?,
-                )?;
-                if chunk.is_empty() {
-                    break;
-                }
-                bytes.extend(chunk);
-            }
-            Some(bytes)
+        if flags & 0x20 == 0 {
+            a[5].checked_add(len)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or(Errno(75))?;
+            let objects =
+                self.vfs
+                    .mapping_pages(a[4] as u32, a[5], len, shared, permissions.write)?;
+            memory
+                .map_backed(address, objects, shared, permissions, flags & 0x10 != 0)
+                .map_err(Self::memory_errno)?;
+        } else if shared {
+            memory
+                .map_shared_anonymous(address, len, permissions, flags & 0x10 != 0)
+                .map_err(Self::memory_errno)?;
+        } else if flags & 0x10 != 0 {
+            memory
+                .map_fixed(address, len, permissions)
+                .map_err(Self::memory_errno)?;
         } else {
-            None
-        };
-        let result = if flags & 0x10 != 0 {
-            memory.map_fixed(address, len, Permissions::RW)
-        } else {
-            memory.map(address, len, Permissions::RW)
-        };
-        result.map_err(|_| Errno(12))?;
-        if let Some(bytes) = file_bytes {
-            memory.write(address, &bytes).map_err(|_| Errno(14))?;
+            memory
+                .map(address, len, permissions)
+                .map_err(Self::memory_errno)?;
         }
-        memory
-            .protect(address, len, permissions)
-            .map_err(|_| Errno(12))?;
         if !fixed {
             self.mmap_next = address + len;
+        }
+        Ok(address)
+    }
+    fn mremap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+        let old_len = Self::page_length(a[1])?;
+        let new_len = Self::page_length(a[2])?;
+        if a[3] & !3 != 0 || a[3] & 2 != 0 && a[3] & 1 == 0 {
+            return Err(Errno(22));
+        }
+        if new_len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+            return Err(Errno(12));
+        }
+        let fixed = a[3] & 2 != 0;
+        let address = if fixed {
+            a[4]
+        } else if new_len <= old_len
+            || memory.is_free(
+                a[0].checked_add(old_len).ok_or(Errno(22))?,
+                new_len - old_len,
+            )
+        {
+            a[0]
+        } else if a[3] & 1 != 0 {
+            memory.find_free(self.mmap_next, new_len).ok_or(Errno(12))?
+        } else {
+            return Err(Errno(12));
+        };
+        memory
+            .remap(a[0], old_len, address, new_len, fixed)
+            .map_err(Self::memory_errno)?;
+        if address != a[0] {
+            self.mmap_next = address + new_len;
         }
         Ok(address)
     }
@@ -490,6 +535,13 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            71 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
+                self.file_syscall(number, a, memory, io)
+            }
+            279 => {
+                let name = Self::path(memory, a[0])?;
+                Ok(self.vfs.memfd_create(&name, a[1] as u32)? as u64)
+            }
             69 | 70 => self.positioned_vector(a, memory, number == 70),
             291 => self.statx(a, memory),
             436 => {
@@ -774,6 +826,8 @@ impl Linux {
             25 => {
                 let flags = self.vfs.flags(a[0] as u32)?;
                 match a[1] {
+                    1033 => Ok(self.vfs.seals(a[0] as u32, Some(a[2] as u32))? as u64),
+                    1034 => Ok(self.vfs.seals(a[0] as u32, None)? as u64),
                     0 | 1030 => Ok(self.vfs.dup(a[0] as u32, a[2] as u32, a[1] == 1030)? as u64),
                     1 => Ok(if flags & 0x80000 != 0 { 1 } else { 0 }),
                     2 => {
@@ -916,6 +970,30 @@ impl Linux {
                     }
                     _ => Err(Errno(38)),
                 }
+            }
+            125 | 126 => Ok(match a[0] as u32 {
+                1 | 2 => {
+                    if number == 125 {
+                        99
+                    } else {
+                        1
+                    }
+                }
+                0 | 3 | 5 | 6 => 0,
+                _ => return Err(Errno(22)),
+            }),
+            168 => {
+                for pointer in &a[..2] {
+                    if *pointer != 0 {
+                        Self::check(memory, *pointer, 4, Access::Write)?;
+                    }
+                }
+                for pointer in &a[..2] {
+                    if *pointer != 0 {
+                        memory.write(*pointer, &[0; 4]).map_err(|_| Errno(14))?;
+                    }
+                }
+                Ok(0)
             }
             172 => Ok(1),
             173 => Ok(0),
@@ -1102,6 +1180,53 @@ impl Linux {
                 self.vfs.umask = a[0] as u32 & 0o777;
                 Ok(previous as u64)
             }
+            216 => self.mremap(a, memory),
+            227 => {
+                if !a[0].is_multiple_of(PAGE_SIZE) || a[2] & !7 != 0 || a[2] & 5 == 5 {
+                    return Err(Errno(22));
+                }
+                if a[1] == 0 {
+                    return Ok(0);
+                }
+                let len = Self::page_length(a[1])?;
+                memory.sync_range(a[0], len).map_err(Self::memory_errno)?;
+                Ok(0)
+            }
+            232 => {
+                if a[1] == 0 {
+                    return if a[0].is_multiple_of(PAGE_SIZE) {
+                        Ok(0)
+                    } else {
+                        Err(Errno(22))
+                    };
+                }
+                let len = Self::page_length(a[1])?;
+                if len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+                    return Err(Errno(12));
+                }
+                let resident = memory.resident(a[0], len).map_err(Self::memory_errno)?;
+                Self::check(memory, a[2], resident.len(), Access::Write)?;
+                memory.write(a[2], &resident).map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            233 => {
+                if !a[0].is_multiple_of(PAGE_SIZE) {
+                    return Err(Errno(22));
+                }
+                if !matches!(a[2] as u32,0..=4|14..=17) {
+                    return Err(Errno(22));
+                }
+                if a[1] == 0 {
+                    return Ok(0);
+                }
+                let len = Self::page_length(a[1])?;
+                if a[2] as u32 == 4 {
+                    memory.discard(a[0], len).map_err(Self::memory_errno)?;
+                } else {
+                    memory.resident(a[0], len).map_err(Self::memory_errno)?;
+                }
+                Ok(0)
+            }
             214 => Ok(self.brk(a[0], memory)),
             222 => self.mmap(a, memory),
             215 => {
@@ -1131,13 +1256,7 @@ impl Linux {
                             execute: a[2] & 4 != 0,
                         },
                     )
-                    .map_err(|e| {
-                        if e == MemoryError::UnalignedMapping {
-                            Errno(22)
-                        } else {
-                            Errno(12)
-                        }
-                    })?;
+                    .map_err(Self::memory_errno)?;
                 Ok(0)
             }
             _ => Err(Errno(38)),

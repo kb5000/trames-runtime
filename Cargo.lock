@@ -513,6 +513,7 @@ version = "0.8.0"
 dependencies = [
  "getrandom",
  "trames-bridge",
+ "trames-memory",
  "trames-net",
 ]
 

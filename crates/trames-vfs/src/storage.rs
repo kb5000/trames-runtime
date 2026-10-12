@@ -109,6 +109,7 @@ impl Timestamp {
 pub(super) enum FileData {
     Memory(Vec<u8>),
     Disk(DiskObject),
+    Mapped(Box<mapped::MappedData>),
 }
 pub(super) struct DiskObject {
     length: u64,
@@ -146,6 +147,9 @@ impl Drop for DiskObject {
 }
 impl FileData {
     pub fn blocks(&self) -> Result<u64> {
+        if let Self::Mapped(data) = self {
+            return data.blocks();
+        }
         #[cfg(unix)]
         if let Self::Disk(d) = self {
             return Ok(fs::symlink_metadata(&d.path).map_err(host_errno)?.blocks());
@@ -153,18 +157,29 @@ impl FileData {
         Ok(self.len().div_ceil(512))
     }
     pub fn inode(&self) -> Option<u64> {
+        if let Self::Mapped(data) = self {
+            return data.inode();
+        }
         match self {
+            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(_) => None,
             Self::Disk(d) => Some(d.inode),
         }
     }
     pub fn len(&self) -> u64 {
+        if let Self::Mapped(data) = self {
+            return data.len();
+        }
         match self {
+            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => b.len() as u64,
             Self::Disk(d) => d.length,
         }
     }
     pub fn read_at(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
+        if let Self::Mapped(data) = self {
+            return data.read_at(offset, count);
+        }
         let count = count
             .min(MAX_TRANSFER)
             .min(self.len().saturating_sub(offset) as usize);
@@ -172,6 +187,7 @@ impl FileData {
             return Ok(Vec::new());
         }
         match self {
+            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
             Self::Disk(d) => {
                 let mut file = d.open(false)?;
@@ -184,7 +200,11 @@ impl FileData {
         }
     }
     pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        if let Self::Mapped(data) = self {
+            return data.write_at(offset, bytes);
+        }
         match self {
+            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => {
                 let end = usize::try_from(offset)
                     .ok()
@@ -207,7 +227,11 @@ impl FileData {
         }
     }
     pub fn truncate(&mut self, length: u64) -> Result<()> {
+        if let Self::Mapped(data) = self {
+            return data.truncate(length);
+        }
         match self {
+            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => {
                 let n = usize::try_from(length).map_err(|_| Errno(27))?;
                 if n > b.len() {
@@ -223,6 +247,9 @@ impl FileData {
         Ok(())
     }
     pub fn sync(&self, data_only: bool) -> Result<()> {
+        if let Self::Mapped(data) = self {
+            return data.sync(data_only);
+        }
         if let Self::Disk(d) = self {
             let file = d.open(false)?;
             if data_only {
@@ -235,6 +262,9 @@ impl FileData {
         Ok(())
     }
     pub fn orphan(&mut self, value: bool) {
+        if let Self::Mapped(data) = self {
+            return data.orphan(value);
+        }
         if let Self::Disk(d) = self {
             d.remove_on_drop = value;
         }
@@ -564,6 +594,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 inode: ino,
                 links: 0,
                 times,
+                seals: None,
             })),
         );
     }
@@ -704,6 +735,7 @@ impl Vfs {
             inode,
             links,
             times: [Timestamp::now(); 3],
+            seals: None,
         }));
         for n in fs.paths.values_mut() {
             if Rc::ptr_eq(n, &old) {
