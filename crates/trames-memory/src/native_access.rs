@@ -12,6 +12,30 @@ pub struct Transfer {
 }
 
 impl Memory {
+    /// Whether a checked readable range can also be written without live backing
+    /// I/O. Used for operations whose guest-owned continuation must remain safe
+    /// to retry at a page-level checkpoint. Read-only/live mappings use fallback.
+    pub fn native_writable_range(&self, address: u64, len: usize) -> Result<bool, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        if let Some(shared) = &self.shared {
+            return shared.borrow().native_writable_range(address, len);
+        }
+        self.check(address, len, Access::Read)?;
+        if len == 0 {
+            return Ok(true);
+        }
+        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
+            .step_by(PAGE_SIZE as usize)
+            .all(|base| {
+                let p = self.frames[self.pages[&base]]
+                    .as_ref()
+                    .expect("checked page");
+                p.permissions.write
+                    && p.backing
+                        .as_ref()
+                        .is_none_or(|b| !b.shared && b.private_copy)
+            }))
+    }
     /// Borrow one readable page fragment for the duration of a pure callback.
     /// Live backing objects use a bounded snapshot; private COW pages can borrow.
     /// The bool reports whether the supplied slice directly refers to guest bytes.
