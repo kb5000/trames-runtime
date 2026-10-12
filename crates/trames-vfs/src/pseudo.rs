@@ -1356,3 +1356,26 @@ impl Vfs {
         Ok(names)
     }
 }
+
+#[cfg(test)]
+mod proc_probe_tests {
+    use super::*;
+    #[test]
+    fn proc_probe_follows_aliases_cwd_and_dirfd_even_for_missing_processes() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.mkdir_at(AT_FDCWD, b"/work", 0o755).unwrap();
+        v.symlink_at(b"/proc", AT_FDCWD, b"/work/p").unwrap();
+        v.symlink_at(b"../proc", AT_FDCWD, b"/alias").unwrap();
+        assert!(!v.accesses_proc(AT_FDCWD, b"/work/file"));
+        assert!(!v.accesses_proc(AT_FDCWD, b"/missing/proc/file"));
+        assert!(v.accesses_proc(AT_FDCWD, b"/proc/12345/status"));
+        assert!(v.accesses_proc(AT_FDCWD, b"/work/p/12345/status"));
+        assert!(v.accesses_proc(AT_FDCWD, b"/alias/stat"));
+        let fd = v.open_at(AT_FDCWD, b"/proc", O_DIRECTORY, 0).unwrap();
+        assert!(v.accesses_proc(fd as i32, b"12345/status"));
+        v.chdir(b"/proc").unwrap();
+        assert!(v.accesses_proc(AT_FDCWD, b"12345/status"));
+        assert!(!v.accesses_proc(AT_FDCWD, b"/work/file"));
+    }
+}

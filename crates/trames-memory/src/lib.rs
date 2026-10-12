@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
-use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    fmt,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
 pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+static NEXT_SPACE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -68,11 +78,31 @@ struct Page {
     permissions: Permissions,
 }
 
+const TRANSLATION_SLOTS: usize = 256;
+#[derive(Clone, Copy, Debug)]
+struct Translation {
+    base: u64,
+    frame: usize,
+}
+impl Translation {
+    const EMPTY: Self = Self {
+        base: u64::MAX,
+        frame: 0,
+    };
+}
+
 pub struct Memory {
-    pages: BTreeMap<u64, Page>,
+    // Ordered mappings serve mmap and procfs; stable frame indices serve the
+    // interpreter. The translation cache owns no bytes, so it cannot trigger
+    // false COW or retain an old allocation after a write.
+    pages: BTreeMap<u64, usize>,
+    frames: Vec<Option<Page>>,
+    free_frames: Vec<usize>,
+    translations: [Cell<Translation>; TRANSLATION_SLOTS],
     limit: usize,
     revision: u64,
     code_revision: u64,
+    identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
 }
 impl Clone for Memory {
@@ -83,9 +113,13 @@ impl Clone for Memory {
         }
         Self {
             pages: self.pages.clone(),
+            frames: self.frames.clone(),
+            free_frames: self.free_frames.clone(),
+            translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit: self.limit,
             revision: self.revision,
             code_revision: self.code_revision,
+            identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
         }
     }
@@ -106,11 +140,8 @@ impl Memory {
             self.shared = Some(Rc::new(RefCell::new(owned)));
         }
         Self {
-            pages: BTreeMap::new(),
-            limit: self.limit,
-            revision: 0,
-            code_revision: 0,
             shared: self.shared.clone(),
+            ..Self::new(self.limit)
         }
     }
     pub fn set_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
@@ -126,9 +157,13 @@ impl Memory {
     pub fn new(limit: usize) -> Self {
         Self {
             pages: BTreeMap::new(),
+            frames: Vec::new(),
+            free_frames: Vec::new(),
+            translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit,
             revision: 0,
             code_revision: 0,
+            identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
         }
     }
@@ -145,7 +180,8 @@ impl Memory {
             return shared.borrow().regions();
         }
         let mut regions: Vec<(u64, u64, Permissions)> = Vec::new();
-        for (&address, page) in &self.pages {
+        for (&address, &frame) in &self.pages {
+            let page = self.frames[frame].as_ref().expect("mapped frame");
             if let Some(last) = regions.last_mut() {
                 if last.1 == address && last.2 == page.permissions {
                     last.1 += PAGE_SIZE;
@@ -155,6 +191,42 @@ impl Memory {
             regions.push((address, address + PAGE_SIZE, page.permissions));
         }
         regions
+    }
+
+    fn invalidate_translations(&self) {
+        for entry in &self.translations {
+            entry.set(Translation::EMPTY);
+        }
+    }
+
+    fn frame(&self, base: u64) -> Option<usize> {
+        let slot = ((base / PAGE_SIZE) as usize) & (TRANSLATION_SLOTS - 1);
+        let entry = self.translations[slot].get();
+        if entry.base == base {
+            return Some(entry.frame);
+        }
+        let frame = *self.pages.get(&base)?;
+        self.translations[slot].set(Translation { base, frame });
+        Some(frame)
+    }
+
+    fn insert_page(&mut self, base: u64, permissions: Permissions) {
+        let page = Page {
+            bytes: Arc::new([0; PAGE_SIZE as usize]),
+            permissions,
+        };
+        if let Some(&frame) = self.pages.get(&base) {
+            self.frames[frame] = Some(page);
+        } else {
+            let frame = if let Some(frame) = self.free_frames.pop() {
+                self.frames[frame] = Some(page);
+                frame
+            } else {
+                self.frames.push(Some(page));
+                self.frames.len() - 1
+            };
+            self.pages.insert(base, frame);
+        }
     }
 
     pub fn highest_mapped_end(&self) -> u64 {
@@ -178,6 +250,13 @@ impl Memory {
             return shared.borrow().instruction_revision();
         }
         self.code_revision
+    }
+    /// A decoder must also distinguish independent spaces with equal epochs.
+    pub fn instruction_identity(&self) -> (u64, u64) {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().instruction_identity();
+        }
+        (self.identity, self.code_revision)
     }
 
     pub fn is_free(&self, address: u64, len: u64) -> bool {
@@ -225,16 +304,11 @@ impl Memory {
             return Err(MemoryError::Limit);
         }
         for base in (address..end).step_by(PAGE_SIZE as usize) {
-            self.pages.insert(
-                base,
-                Page {
-                    bytes: Arc::new([0; PAGE_SIZE as usize]),
-                    permissions,
-                },
-            );
+            self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
         self.code_revision = self.code_revision.wrapping_add(1);
+        self.invalidate_translations();
         Ok(())
     }
 
@@ -250,10 +324,13 @@ impl Memory {
             .map(|(&base, _)| base)
             .collect();
         for base in keys {
-            self.pages.remove(&base);
+            let frame = self.pages.remove(&base).expect("mapped frame");
+            self.frames[frame] = None;
+            self.free_frames.push(frame);
         }
         self.revision = self.revision.wrapping_add(1);
         self.code_revision = self.code_revision.wrapping_add(1);
+        self.invalidate_translations();
         Ok(())
     }
 
@@ -263,16 +340,19 @@ impl Memory {
             return shared.borrow().read_c_string(address, limit);
         }
         let mut bytes = Vec::new();
-        for index in 0..limit {
+        while bytes.len() < limit {
             let current = address
-                .checked_add(index as u64)
+                .checked_add(bytes.len() as u64)
                 .ok_or(MemoryError::InvalidRange)?;
-            let mut byte = [0];
-            self.read(current, &mut byte)?;
-            if byte[0] == 0 {
+            let offset = (current & (PAGE_SIZE - 1)) as usize;
+            let length = (limit - bytes.len()).min(PAGE_SIZE as usize - offset);
+            let page = self.page_for_access(current, length, Access::Read)?;
+            let part = &page.bytes[offset..offset + length];
+            if let Some(end) = part.iter().position(|&byte| byte == 0) {
+                bytes.extend_from_slice(&part[..end]);
                 return Ok(bytes);
             }
-            bytes.push(byte[0]);
+            bytes.extend_from_slice(part);
         }
         Err(MemoryError::Limit)
     }
@@ -316,16 +396,11 @@ impl Memory {
             return Err(MemoryError::Overlap(base));
         }
         for base in (address..end).step_by(PAGE_SIZE as usize) {
-            self.pages.insert(
-                base,
-                Page {
-                    bytes: Arc::new([0; PAGE_SIZE as usize]),
-                    permissions,
-                },
-            );
+            self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
         self.code_revision = self.code_revision.wrapping_add(1);
+        self.invalidate_translations();
         Ok(())
     }
 
@@ -345,13 +420,15 @@ impl Memory {
             }
         }
         for base in (address..end).step_by(PAGE_SIZE as usize) {
-            self.pages
-                .get_mut(&base)
+            let frame = self.pages[&base];
+            self.frames[frame]
+                .as_mut()
                 .expect("validated page")
                 .permissions = permissions;
         }
         self.revision = self.revision.wrapping_add(1);
         self.code_revision = self.code_revision.wrapping_add(1);
+        self.invalidate_translations();
         Ok(())
     }
 
@@ -379,10 +456,10 @@ impl Memory {
         let first = address & !(PAGE_SIZE - 1);
         for base in (first..end).step_by(PAGE_SIZE as usize) {
             let fault_address = base.max(address);
-            let page = self
-                .pages
-                .get(&base)
+            let frame = self
+                .frame(base)
                 .ok_or(MemoryError::Unmapped(fault_address))?;
+            let page = self.frames[frame].as_ref().expect("mapped frame");
             if !page.permissions.allows(access) {
                 return Err(MemoryError::Permission {
                     address: fault_address,
@@ -398,7 +475,10 @@ impl Memory {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = out.len().min(PAGE_SIZE as usize - offset);
-            out[..len].copy_from_slice(&self.pages[&base].bytes[offset..offset + len]);
+            let frame = self.frame(base).expect("validated page");
+            out[..len].copy_from_slice(
+                &self.frames[frame].as_ref().expect("mapped frame").bytes[offset..offset + len],
+            );
             address += len as u64;
             out = &mut out[len..];
         }
@@ -412,10 +492,10 @@ impl Memory {
         access: Access,
     ) -> Result<&Page, MemoryError> {
         Self::end(address, len as u64)?;
-        let page = self
-            .pages
-            .get(&(address & !(PAGE_SIZE - 1)))
+        let frame = self
+            .frame(address & !(PAGE_SIZE - 1))
             .ok_or(MemoryError::Unmapped(address))?;
+        let page = self.frames[frame].as_ref().expect("mapped frame");
         if !page.permissions.allows(access) {
             return Err(MemoryError::Permission { address, access });
         }
@@ -450,10 +530,10 @@ impl Memory {
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if input.len() <= PAGE_SIZE as usize - offset {
             Self::end(address, input.len() as u64)?;
-            let page = self
-                .pages
-                .get_mut(&(address & !(PAGE_SIZE - 1)))
+            let frame = self
+                .frame(address & !(PAGE_SIZE - 1))
                 .ok_or(MemoryError::Unmapped(address))?;
+            let page = self.frames[frame].as_mut().expect("mapped frame");
             if !page.permissions.write {
                 return Err(MemoryError::Permission {
                     address,
@@ -476,7 +556,8 @@ impl Memory {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = input.len().min(PAGE_SIZE as usize - offset);
-            let page = self.pages.get_mut(&base).expect("validated page");
+            let frame = self.frame(base).expect("validated page");
+            let page = self.frames[frame].as_mut().expect("mapped frame");
             executable |= page.permissions.execute;
             Arc::make_mut(&mut page.bytes)[offset..offset + len].copy_from_slice(&input[..len]);
             address += len as u64;
@@ -504,16 +585,173 @@ impl Memory {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    pub fn read_u64(&self, address: u64) -> Result<u64, MemoryError> {
-        let mut bytes = [0; 8];
+    /// Fixed-size interpreter operands avoid a variable-size memcpy. The slow
+    /// path still validates a complete cross-page operation before any effect.
+    #[inline]
+    pub fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().read_array(address);
+        }
+        if N == 0 {
+            return Ok([0; N]);
+        }
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        if N <= PAGE_SIZE as usize - offset {
+            let page = self.page_for_access(address, N, Access::Read)?;
+            return Ok(page.bytes[offset..offset + N]
+                .try_into()
+                .expect("fixed operand"));
+        }
+        let mut bytes = [0; N];
         self.read(address, &mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
+        Ok(bytes)
+    }
+
+    #[inline]
+    pub fn write_array<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+    ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().write_array(address, bytes);
+        }
+        if N == 0 {
+            return Ok(());
+        }
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        if N > PAGE_SIZE as usize - offset {
+            return self.write(address, &bytes);
+        }
+        Self::end(address, N as u64)?;
+        let frame = self
+            .frame(address & !(PAGE_SIZE - 1))
+            .ok_or(MemoryError::Unmapped(address))?;
+        let page = self.frames[frame].as_mut().expect("mapped frame");
+        if !page.permissions.write {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Write,
+            });
+        }
+        Arc::make_mut(&mut page.bytes)[offset..offset + N].copy_from_slice(&bytes);
+        self.revision = self.revision.wrapping_add(1);
+        if page.permissions.execute {
+            self.code_revision = self.code_revision.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn read_u64(&self, address: u64) -> Result<u64, MemoryError> {
+        Ok(u64::from_le_bytes(self.read_array(address)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_operands_match_generic_access_across_pages_and_faults() {
+        fn compare<const N: usize>(memory: &Memory, address: u64) {
+            let mut fast = memory.clone();
+            let mut generic = memory.clone();
+            let mut bytes = [0; N];
+            let expected = generic.read(address, &mut bytes).map(|_| bytes);
+            assert_eq!(fast.read_array::<N>(address), expected);
+            let bytes = [0x5a; N];
+            assert_eq!(
+                fast.write_array(address, bytes),
+                generic.write(address, &bytes)
+            );
+            assert_eq!(fast.revision(), generic.revision());
+            assert_eq!(fast.instruction_revision(), generic.instruction_revision());
+            let mut a = [0; 8192];
+            let mut b = [0; 8192];
+            fast.read(0x1000, &mut a).unwrap();
+            generic.read(0x1000, &mut b).unwrap();
+            assert_eq!(a, b);
+        }
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        for address in [0x1000, 0x1ff8, 0x1fff, 0x2ff8, ADDRESS_LIMIT - 4, u64::MAX] {
+            compare::<0>(&memory, address);
+            compare::<1>(&memory, address);
+            compare::<2>(&memory, address);
+            compare::<4>(&memory, address);
+            compare::<8>(&memory, address);
+            compare::<16>(&memory, address);
+            compare::<32>(&memory, address);
+        }
+        memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        compare::<8>(&memory, 0x1ffc);
+        compare::<32>(&memory, 0x1ff8);
+        let mut thread = memory.share();
+        thread.write_array(0x1000, 42u64.to_le_bytes()).unwrap();
+        assert_eq!(memory.read_array::<8>(0x1000).unwrap(), 42u64.to_le_bytes());
+        assert!(thread.write_array::<8>(0x1ffc, [0; 8]).is_err());
+    }
+    #[test]
+    fn cached_frames_reuse_slots_without_stale_bytes_permissions_or_false_cow() {
+        let mut memory = Memory::default();
+        memory.map(0, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write(0, b"first").unwrap();
+        let mut bytes = [0; 5];
+        memory.read(0, &mut bytes).unwrap();
+        let frame = memory.pages[&0];
+        assert_eq!(
+            Arc::strong_count(&memory.frames[frame].as_ref().unwrap().bytes),
+            1
+        );
+        let mut child = memory.clone();
+        child.write(0, b"child").unwrap();
+        memory.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"first");
+        // A colliding translation and a reused slab index cannot alias an old mapping.
+        memory
+            .map(
+                PAGE_SIZE * TRANSLATION_SLOTS as u64,
+                PAGE_SIZE,
+                Permissions::RW,
+            )
+            .unwrap();
+        memory
+            .write(PAGE_SIZE * TRANSLATION_SLOTS as u64, b"other")
+            .unwrap();
+        memory.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"first");
+        memory.unmap(0, PAGE_SIZE).unwrap();
+        memory.map(PAGE_SIZE, PAGE_SIZE, Permissions::RW).unwrap();
+        assert!(matches!(
+            memory.read(0, &mut bytes),
+            Err(MemoryError::Unmapped(0))
+        ));
+        memory
+            .map_fixed(PAGE_SIZE, PAGE_SIZE, Permissions::R)
+            .unwrap();
+        assert_eq!(memory.read_u64(PAGE_SIZE).unwrap(), 0);
+        assert!(memory.write(PAGE_SIZE, b"x").is_err());
+        for _ in 0..100 {
+            memory.unmap(PAGE_SIZE, PAGE_SIZE).unwrap();
+            memory.map(PAGE_SIZE, PAGE_SIZE, Permissions::RW).unwrap();
+        }
+        assert_eq!(memory.frames.len(), 2);
+        memory
+            .protect(
+                PAGE_SIZE,
+                PAGE_SIZE,
+                Permissions {
+                    read: false,
+                    write: false,
+                    execute: false,
+                },
+            )
+            .unwrap();
+        assert!(memory.read(PAGE_SIZE, &mut bytes).is_err());
+        memory
+            .protect(PAGE_SIZE, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        assert!(memory.write(PAGE_SIZE, b"x").is_ok());
+    }
     #[test]
     fn optimized_access_preserves_fault_atomicity_and_execute_only_pages() {
         let mut memory = Memory::default();

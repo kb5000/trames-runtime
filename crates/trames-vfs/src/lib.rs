@@ -181,6 +181,7 @@ pub struct Vfs {
     pid: u32,
     lock_owner: u32,
     next_open: Rc<Cell<u64>>,
+    proc_accessed: Cell<bool>,
     bridge: Option<trames_bridge::Broker>,
 }
 impl Default for Vfs {
@@ -205,6 +206,7 @@ impl Default for Vfs {
             pid: 1,
             lock_owner: 1,
             next_open: Rc::new(Cell::new(1)),
+            proc_accessed: Cell::new(false),
             bridge: None,
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
@@ -412,6 +414,9 @@ impl Vfs {
         Ok(())
     }
     fn node(&self, path: &[u8]) -> Result<Rc<RefCell<Node>>> {
+        if path == b"/proc" || path.starts_with(b"/proc/") {
+            self.proc_accessed.set(true);
+        }
         if let Some(node) = self.pseudo_node(path)? {
             return Ok(node);
         }
@@ -476,6 +481,14 @@ impl Vfs {
     }
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
         self.resolve_final(dirfd, path, true)
+    }
+    /// Observe the actual traversal, including cwd/dirfd, symlinks and failed
+    /// lookups of newly created process directories. A textual prefix check
+    /// would miss aliases such as /dev/fd and links into another process's proc.
+    pub fn accesses_proc(&self, dirfd: i32, path: &[u8]) -> bool {
+        self.proc_accessed.set(false);
+        let _ = self.resolve(dirfd, path);
+        self.proc_accessed.replace(false)
     }
     pub fn resolve_final(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Vec<u8>> {
         if path.is_empty() {
