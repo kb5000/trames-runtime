@@ -8,3 +8,5 @@ __pycache__/
 apps/ios/build/
 **/xcuserdata/
 *.xcuserstate
+
+/apps/ios/Trames/GuestMusl/

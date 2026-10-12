@@ -12,6 +12,41 @@ pub const ALPINE_SHA256: &str = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e
 const ARCHIVE_LIMIT: usize = 16 * 1024 * 1024;
 const EXPANDED_LIMIT: u64 = 128 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 16_384;
+pub const MUSL_LOADER: &[u8] = b"/lib/ld-musl-aarch64.so.1";
+/// Replace the standard loader inode before starting any guest process.
+/// A sibling file is synced before one atomic namespace rename; the ordinary
+/// Alpine libc symlink continues to refer to that loader. Identical bytes are
+/// a no-op, so opening an existing environment does not rewrite its library.
+pub fn install_musl(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take(trames_elf::MAX_ELF_SIZE as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > trames_elf::MAX_ELF_SIZE || bytes.get(16..18) != Some(&3u16.to_le_bytes()) {
+        return Err(Error::Invalid("musl must be an AArch64 shared ELF"));
+    }
+    trames_elf::load(&bytes, trames_memory::DEFAULT_MEMORY_LIMIT)
+        .map_err(|_| Error::Invalid("invalid musl ELF or segment layout"))?;
+    let alias = vfs.readlink_at(AT_FDCWD, b"/lib/libc.musl-aarch64.so.1")?;
+    if alias != b"ld-musl-aarch64.so.1" && alias != MUSL_LOADER {
+        return Err(Error::Invalid("unexpected libc alias"));
+    }
+    if vfs.executable(MUSL_LOADER)? == bytes {
+        return Ok(false);
+    }
+    let staging = b"/lib/.ld-musl-aarch64.so.1.new";
+    vfs.import_reader(staging, &mut bytes.as_slice(), true)?;
+    let result = (|| {
+        vfs.chown_at(AT_FDCWD, staging, 0, 0, false)?;
+        vfs.chmod_at(AT_FDCWD, staging, 0o755)?;
+        vfs.rename_at(AT_FDCWD, staging, AT_FDCWD, MUSL_LOADER, 0)?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        let _ = vfs.unlink_at(AT_FDCWD, staging, false);
+    }
+    result
+}
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -205,6 +240,20 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_musl_does_not_modify_existing_loader_or_user_data() {
+        let mut vfs = Vfs::default();
+        vfs.mkdir_at(AT_FDCWD, b"/lib", 0o755).unwrap();
+        vfs.import_executable(MUSL_LOADER, b"original".to_vec())
+            .unwrap();
+        vfs.import_file(b"/user-data", b"retained".to_vec())
+            .unwrap();
+        let before = vfs.capacity();
+        assert!(install_musl(&mut b"untrusted".as_slice(), &mut vfs).is_err());
+        assert_eq!(vfs.executable(MUSL_LOADER).unwrap(), b"original");
+        assert_eq!(vfs.capacity().nodes_used, before.nodes_used);
+        assert_eq!(vfs.capacity().used_bytes, before.used_bytes);
+    }
     #[test]
     fn rejects_host_paths_and_traversal() {
         for p in [
