@@ -10,6 +10,11 @@ pub(super) fn backing_revision() -> u64 {
     BACKING_REVISION.load(Ordering::Relaxed)
 }
 pub trait PageBacking {
+    /// Stable backing-page identity for quiescent parallel snapshots. External
+    /// shared backings must opt in; no thread ever receives this Rc object.
+    fn parallel_key(&self) -> Option<(u64, u64)> {
+        None
+    }
     fn check(&self, address: u64) -> Result<(), MemoryError>;
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
@@ -276,16 +281,21 @@ impl Memory {
 struct AnonymousPage {
     bytes: RefCell<Box<[u8; PAGE_SIZE as usize]>>,
     revision: Cell<u64>,
+    identity: u64,
 }
 impl AnonymousPage {
     fn allocate() -> Rc<dyn PageBacking> {
         Rc::new(Self {
             bytes: RefCell::new(Box::new([0; PAGE_SIZE as usize])),
             revision: Cell::new(0),
+            identity: new_backing_identity(),
         })
     }
 }
 impl PageBacking for AnonymousPage {
+    fn parallel_key(&self) -> Option<(u64, u64)> {
+        Some((self.identity, 0))
+    }
     fn check(&self, _: u64) -> Result<(), MemoryError> {
         Ok(())
     }

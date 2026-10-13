@@ -129,6 +129,7 @@ impl Memory {
     }
 
     fn mark_native_write(&mut self, frame: usize) {
+        self.note_parallel_write(frame);
         self.revision = self.revision.wrapping_add(1);
         if self.frames[frame]
             .as_ref()

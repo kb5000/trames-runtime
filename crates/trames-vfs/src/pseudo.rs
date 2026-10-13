@@ -220,6 +220,8 @@ mod tests {
 #[derive(Clone, Default)]
 pub struct ProcessInfo {
     pub pid: u32,
+    pub processor: u32,
+    pub affinity: u64,
     pub tgid: u32,
     pub parent: u32,
     pub group: u32,
@@ -247,6 +249,8 @@ pub struct ProcessInfo {
 }
 #[derive(Clone, Default)]
 pub struct RuntimeInfo {
+    pub cpu_count: usize,
+    pub per_cpu_ticks: Vec<u64>,
     pub cpu_features: &'static str,
     pub processes: Vec<ProcessInfo>,
     pub uptime: Duration,
@@ -760,14 +764,39 @@ impl Vfs {
         let regular = |value: Vec<u8>| Some((file(value), 0o100444));
         let link = |value: Vec<u8>| Some((Content::Symlink(value), 0o120777));
         let info = self.network_info();
+        if let Some(tail) = path.strip_prefix(b"/sys/devices/system/cpu/cpu") {
+            let parts: Vec<_> = tail.split(|c| *c == b'/').collect();
+            if let Some(cpu) = std::str::from_utf8(parts[0])
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| *n < r.cpu_count.max(1))
+            {
+                if parts.len() == 1
+                    || parts.as_slice().get(1) == Some(&b"topology".as_slice()) && parts.len() == 2
+                {
+                    return Ok(directory());
+                }
+                let value = match parts[1..] {
+                    [b"online"] => "1\n".to_string(),
+                    [b"topology", b"core_id"] => format!("{cpu}\n"),
+                    [b"topology", b"physical_package_id"] => "0\n".to_string(),
+                    [b"topology", b"thread_siblings_list"] => format!("{cpu}\n"),
+                    [b"topology", b"thread_siblings"] => format!("{:08x}\n", 1u32 << cpu),
+                    _ => return Ok(None),
+                };
+                return Ok(regular(value.into_bytes()));
+            }
+        }
         match path {
             b"/proc" | b"/sys" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
-            b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
+            b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
             b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
             b"/proc/sys/kernel" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
+            b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
+            b"/sys/devices/system/cpu/offline"=>return Ok(regular(b"\n".to_vec())),
             b"/proc/self" => return Ok(link(own.map_or(self.pid, |p| p.tgid).to_string().into_bytes())),
             b"/proc/thread-self" => return Ok(link(format!("{}/task/{}", own.map_or(self.pid, |p| p.tgid), self.pid).into_bytes())),
             b"/proc/mounts" => return Ok(link(b"self/mounts".to_vec())),
@@ -801,7 +830,7 @@ impl Vfs {
                 let free = total.saturating_sub(used);
                 return Ok(regular(format!("MemTotal: {total:8} kB\nMemFree: {free:8} kB\nMemAvailable: {free:8} kB\nBuffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").into_bytes()));
             }
-            b"/proc/cpuinfo" => return Ok(regular(format!("processor\t: 0\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t: {}\n\n", self.pseudo.borrow().runtime.cpu_features).into_bytes())),
+            b"/proc/cpuinfo" => return Ok(regular((0..r.cpu_count.max(1)).map(|cpu|format!("processor\t: {cpu}\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t: {}\n\n",r.cpu_features)).collect::<String>().into_bytes())),
             b"/proc/swaps" => return Ok(regular(b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_vec())),
             b"/proc/partitions" => return Ok(regular(format!("major minor  #blocks  name\n\n 253 0 {} vda\n 253 1 {} vda1\n",self.capacity().budget_bytes/1024,self.capacity().budget_bytes/1024).into_bytes())),
             b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),
@@ -812,7 +841,10 @@ impl Vfs {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;
                 let running = r.processes.iter().filter(|p| p.state == 'R').count();
-                return Ok(regular(format!("cpu {user} 0 0 {idle} 0 0 0 0 0 0\ncpu0 {user} 0 0 {idle} 0 0 0 0 0 0\nintr 0\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {running}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n", r.context_switches, r.boot_time, r.processes_created).into_bytes()));
+                let mut text=format!("cpu {user} 0 0 {idle} 0 0 0 0 0 0\n");
+                for cpu in 0..r.cpu_count.max(1){let ticks=r.per_cpu_ticks.get(cpu).copied().unwrap_or(if cpu==0{user}else{0});text.push_str(&format!("cpu{cpu} {ticks} 0 0 {} 0 0 0 0 0 0\n",idle/r.cpu_count.max(1) as u128));}
+                text.push_str(&format!("intr 0\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {running}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",r.context_switches,r.boot_time,r.processes_created));
+                return Ok(regular(text.into_bytes()));
             }
             b"/proc/loadavg" => {
                 let running = r.processes.iter().filter(|p| p.state == 'R').count();
@@ -911,6 +943,7 @@ impl Vfs {
                             fields[20] = p.virtual_bytes.to_string();
                             fields[21] = (p.mapped_bytes / 4096).to_string();
                             fields[22] = u64::MAX.to_string();
+                            fields[36] = p.processor.to_string();
                             format!("{} ({name}) {}\n", p.pid, fields.join(" ")).into_bytes()
                         }
                         b"status" => {
@@ -918,6 +951,15 @@ impl Vfs {
                             let name = String::from_utf8_lossy(&comm(p))
                                 .trim_end()
                                 .replace('\n', "_");
+                            let name = format!(
+                                "{name}\nCpus_allowed:\t{:08x}\nCpus_allowed_list:\t{}",
+                                p.affinity,
+                                (0..32)
+                                    .filter(|i| p.affinity & (1u64 << i) != 0)
+                                    .map(|i| i.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
                             let threads = r.processes.iter().filter(|t| t.tgid == p.tgid).count();
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
@@ -1132,6 +1174,30 @@ impl Vfs {
         Ok(None)
     }
     pub(super) fn pseudo_children(&self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+        if let Some(tail) = path.strip_prefix(b"/sys/devices/system/cpu/cpu") {
+            let parts: Vec<_> = tail.split(|c| *c == b'/').collect();
+            if std::str::from_utf8(parts[0])
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| n < self.pseudo.borrow().runtime.cpu_count.max(1))
+            {
+                return Ok(if parts.len() == 1 {
+                    vec![b"online".to_vec(), b"topology".to_vec()]
+                } else if parts.len() == 2 && parts[1] == b"topology" {
+                    [
+                        "core_id",
+                        "physical_package_id",
+                        "thread_siblings_list",
+                        "thread_siblings",
+                    ]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect()
+                } else {
+                    Vec::new()
+                });
+            }
+        }
         if !self.pseudo.borrow().enabled {
             return Ok(Vec::new());
         }
@@ -1185,7 +1251,19 @@ impl Vfs {
                 b"dev".to_vec(),
             ],
             b"/sys/class" => vec![b"net".to_vec(), b"block".to_vec()],
-            b"/sys/devices" => vec![b"virtual".to_vec()],
+            b"/sys/devices" => vec![b"virtual".to_vec(), b"system".to_vec()],
+            b"/sys/devices/system" => vec![b"cpu".to_vec()],
+            b"/sys/devices/system/cpu" => {
+                let mut names: Vec<_> = ["online", "offline", "possible", "present"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect();
+                names.extend(
+                    (0..self.pseudo.borrow().runtime.cpu_count.max(1))
+                        .map(|i| format!("cpu{i}").into_bytes()),
+                );
+                names
+            }
             b"/sys/devices/virtual" => vec![b"net".to_vec(), b"block".to_vec()],
             b"/sys/dev" => vec![b"block".to_vec()],
             b"/dev/block" | b"/sys/dev/block" => vec![b"253:0".to_vec(), b"253:1".to_vec()],

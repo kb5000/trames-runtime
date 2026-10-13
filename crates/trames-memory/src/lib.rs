@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod backing;
+mod cpu_memory;
 mod native_access;
+pub mod parallel;
 mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
+pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::Transfer;
 pub use reservations::MAX_RESERVATIONS;
 use std::{
@@ -22,6 +25,11 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
 pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 static NEXT_SPACE: AtomicU64 = AtomicU64::new(1);
+static NEXT_BACKING: AtomicU64 = AtomicU64::new(1);
+/// Opaque identity shared by aliases of one backing page, never a host pointer.
+pub fn new_backing_identity() -> u64 {
+    NEXT_BACKING.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -95,6 +103,8 @@ struct Page {
     instruction_revision: u64,
     backing: Option<Backed>,
     mapping: u64,
+    data_revision: u64,
+    parallel_dirty: bool,
 }
 
 const TRANSLATION_SLOTS: usize = 256;
@@ -126,6 +136,8 @@ pub struct Memory {
     identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
     has_backings: bool,
+    parallel_cache: Option<parallel::SnapshotCache>,
+    parallel_dirty: Vec<usize>,
 }
 impl Clone for Memory {
     fn clone(&self) -> Self {
@@ -136,7 +148,17 @@ impl Clone for Memory {
         Self {
             pages: self.pages.clone(),
             reservations: self.reservations.clone(),
-            frames: self.frames.clone(),
+            frames: self
+                .frames
+                .iter()
+                .map(|page| {
+                    page.as_ref().map(|page| {
+                        let mut page = page.clone();
+                        page.parallel_dirty = false;
+                        page
+                    })
+                })
+                .collect(),
             free_frames: self.free_frames.clone(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit: self.limit,
@@ -145,6 +167,8 @@ impl Clone for Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: self.has_backings,
+            parallel_cache: None,
+            parallel_dirty: Vec::new(),
         }
     }
 }
@@ -157,7 +181,8 @@ impl Default for Memory {
 
 impl Memory {
     /// CLONE_VM shares mappings, protections, bytes and the decoder revision.
-    /// The inner address space remains private; no RefCell guard crosses an API call.
+    /// The inner address space remains private. A local CPU slice may borrow it
+    /// once; no guard crosses a scheduler turn or native/host callback.
     pub fn share(&mut self) -> Self {
         if self.shared.is_none() {
             let owned = std::mem::replace(self, Self::new(self.limit));
@@ -191,6 +216,8 @@ impl Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: false,
+            parallel_cache: None,
+            parallel_dirty: Vec::new(),
         }
     }
     pub fn mapped_bytes(&self) -> usize {
@@ -250,6 +277,8 @@ impl Memory {
             instruction_revision: self.code_revision,
             backing: None,
             mapping: self.code_revision,
+            data_revision: 0,
+            parallel_dirty: false,
         };
         if let Some(&frame) = self.pages.get(&base) {
             self.frames[frame] = Some(page);
@@ -696,6 +725,7 @@ impl Memory {
                 page.instruction_revision = self.code_revision.wrapping_add(1);
                 self.advance_code_revision();
             }
+            self.note_parallel_write(frame);
             return Ok(());
         }
         self.check(address, input.len(), Access::Write)?;
@@ -714,6 +744,7 @@ impl Memory {
                 page.instruction_revision = self.code_revision.wrapping_add(1);
             }
             page.write_bytes(offset, &input[..len])?;
+            self.note_parallel_write(frame);
             address += len as u64;
             input = &input[len..];
         }
@@ -796,6 +827,7 @@ impl Memory {
             page.instruction_revision = self.code_revision.wrapping_add(1);
             self.advance_code_revision();
         }
+        self.note_parallel_write(frame);
         Ok(())
     }
 

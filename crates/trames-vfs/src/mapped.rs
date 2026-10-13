@@ -4,6 +4,7 @@ use super::*;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, PAGE_SIZE};
 pub(super) struct FilePage {
+    identity: u64,
     bytes: RefCell<Box<[u8; PAGE_SIZE as usize]>>,
     dirty: Cell<bool>,
     writers: Cell<u32>,
@@ -40,6 +41,7 @@ impl MappedData {
         let mut bytes = Box::new([0; PAGE_SIZE as usize]);
         bytes[..data.len()].copy_from_slice(&data);
         let page = Rc::new(FilePage {
+            identity: trames_memory::new_backing_identity(),
             bytes: RefCell::new(bytes),
             dirty: Cell::new(false),
             writers: Cell::new(0),
@@ -71,6 +73,7 @@ impl MappedData {
                             .copy_from_slice(&bytes[inside as usize..inside as usize + available]);
                     }
                     let page = Rc::new(FilePage {
+                        identity: trames_memory::new_backing_identity(),
                         bytes: RefCell::new(data),
                         dirty: Cell::new(false),
                         writers: Cell::new(0),
@@ -187,6 +190,9 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn parallel_key(&self) -> Option<(u64, u64)> {
+        Some((self.page.identity, 0))
+    }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
         let n = self.node.borrow();
         let Content::File(data) = &n.content else {
@@ -315,6 +321,68 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn parallel_readonly_alias_dirty_fragments_private_refresh_and_live_eof() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.open_at(-100, b"/parallel-mapped", 0x42, 0o600).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let mut memory = Memory::default();
+        mapped(&v, &mut memory, fd, 0x1000, PAGE_SIZE, true, Permissions::R);
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x5000,
+            PAGE_SIZE,
+            true,
+            Permissions::RW,
+        );
+        let mut child = memory.clone();
+        let mut registry = Registry::default();
+        let reader = memory.parallel_view(&mut registry).unwrap();
+        let mut writer = child.parallel_view(&mut registry).unwrap();
+        writer.write_array(0x5008, 42u64.to_le_bytes()).unwrap();
+        assert_eq!(reader.read_u64(0x1008).unwrap(), 42);
+        drop((reader, writer));
+        memory.commit_parallel().unwrap();
+        child.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x1008).unwrap(), 42);
+        v.seek(fd, 0, 0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(v.read(fd, 16).unwrap()[8..16].try_into().unwrap()),
+            42
+        );
+        // An undetached private snapshot must refresh after fd writes and must
+        // still check EOF; it cannot become an authoritative detached file copy.
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x9000,
+            PAGE_SIZE,
+            false,
+            Permissions::RX,
+        );
+        let reader = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(reader.read_u64(0x9008).unwrap(), 42);
+        let old_global = reader.instruction_identity();
+        let old_page = reader.instruction_page_identity(0x9000).unwrap();
+        drop(reader);
+        v.seek(fd, 8, 0).unwrap();
+        v.write(fd, &99u64.to_le_bytes()).unwrap();
+        let reader = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(reader.read_u64(0x9008).unwrap(), 99);
+        assert_ne!(reader.instruction_identity(), old_global);
+        assert_ne!(reader.instruction_page_identity(0x9000).unwrap(), old_page);
+        drop(reader);
+        v.truncate_fd(fd, 0).unwrap();
+        let reader = memory.parallel_view(&mut registry).unwrap();
+        assert!(matches!(
+            reader.read_u64(0x9008),
+            Err(MemoryError::Bus(0x9008))
+        ));
+    }
     fn mapped(v: &Vfs, m: &mut Memory, fd: u32, at: u64, len: u64, shared: bool, p: Permissions) {
         m.map_backed(
             at,

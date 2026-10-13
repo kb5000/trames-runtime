@@ -1,0 +1,783 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! CPU-only views between quiescent kernel checkpoints. Rc backings, mappings,
+//! COW and native slice borrows stay on the coordinator. No unsafe Send/Sync.
+use super::*;
+use std::sync::{Mutex, Weak};
+
+#[derive(Default)]
+pub struct Registry {
+    shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
+    code_epoch: Arc<AtomicU64>,
+}
+struct Bytes {
+    bytes: Box<[u8; PAGE_SIZE as usize]>,
+    version: u64,
+    reservations: [u64; 256],
+}
+struct ConcurrentPage {
+    identity: u64,
+    constant: Option<Arc<[u8; PAGE_SIZE as usize]>>,
+    bytes: Mutex<Option<Bytes>>,
+    dirty: AtomicU64,
+    version: AtomicU64,
+    executable: std::sync::atomic::AtomicBool,
+    code_epoch: Arc<AtomicU64>,
+}
+impl ConcurrentPage {
+    fn new(bytes: [u8; PAGE_SIZE as usize], constant: bool, code_epoch: Arc<AtomicU64>) -> Self {
+        Self {
+            identity: new_backing_identity(),
+            constant: constant.then(|| Arc::new(bytes)),
+            bytes: Mutex::new((!constant).then(|| Bytes {
+                bytes: Box::new(bytes),
+                version: 0,
+                reservations: [0; 256],
+            })),
+            dirty: AtomicU64::new(0),
+            version: AtomicU64::new(0),
+            executable: std::sync::atomic::AtomicBool::new(false),
+            code_epoch,
+        }
+    }
+    fn changed(&self, state: &mut Bytes, offset: usize, len: usize) {
+        state.version = state.version.wrapping_add(1);
+        for slot in offset / 16..=(offset + len - 1) / 16 {
+            state.reservations[slot] = state.version;
+        }
+        self.version.store(state.version, Ordering::Release);
+        // One bit per 64-byte fragment. No unrelated clean bytes are written
+        // back over an alias; full-page snapshots would lose concurrent edits.
+        let first = offset / 64;
+        let last = (offset + len - 1) / 64;
+        let mask = (u64::MAX >> (63 - (last - first))) << first;
+        self.dirty.fetch_or(mask, Ordering::Relaxed);
+        if self.executable.load(Ordering::Relaxed) {
+            self.code_epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn refresh(&self, bytes: &[u8; PAGE_SIZE as usize]) {
+        if self.constant.is_some() {
+            return;
+        }
+        let mut guard = self.bytes.lock().unwrap();
+        let s = guard.as_mut().expect("mutable page");
+        {
+            // A coordinator ABA write invalidates reservations even if bytes match.
+            s.bytes.copy_from_slice(bytes);
+            s.version = s.version.wrapping_add(1);
+            let version = s.version;
+            s.reservations.fill(version);
+            self.version.store(s.version, Ordering::Release);
+            if self.executable.load(Ordering::Relaxed) {
+                self.code_epoch.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+}
+struct Frame {
+    base: u64,
+    root_frame: usize,
+    permissions: Permissions,
+    code_revision: u64,
+    data_revision: AtomicU64,
+    backing_version: AtomicU64,
+    error: Option<MemoryError>,
+    bytes: Arc<ConcurrentPage>,
+}
+struct Snapshot {
+    dynamic_code: bool,
+    positions: Vec<Option<usize>>,
+    backing_revision: u64,
+    identity: u64,
+    code_revision: u64,
+    pages: BTreeMap<u64, usize>,
+    frames: Vec<Frame>,
+    reservations: BTreeMap<u64, u64>,
+    code_epoch: Arc<AtomicU64>,
+}
+pub(super) struct SnapshotCache {
+    snapshot: Arc<Snapshot>,
+    source_revision: u64,
+    source_backing_revision: u64,
+}
+/// Send, with worker-local translations; never Sync and never retains Rc data.
+pub struct View {
+    snapshot: Arc<Snapshot>,
+    translations: [Cell<Translation>; TRANSLATION_SLOTS],
+}
+impl View {
+    fn new(snapshot: Arc<Snapshot>) -> Self {
+        Self {
+            snapshot,
+            translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
+        }
+    }
+    fn frame(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {
+        let base = address & !(PAGE_SIZE - 1);
+        let slot = (base / PAGE_SIZE) as usize & (TRANSLATION_SLOTS - 1);
+        let cached = self.translations[slot].get();
+        let index = if cached.base == base {
+            cached.frame
+        } else {
+            let Some(&index) = self.snapshot.pages.get(&base) else {
+                if self
+                    .snapshot
+                    .reservations
+                    .range(..=address)
+                    .next_back()
+                    .is_some_and(|(_, end)| address < *end)
+                {
+                    return Err(MemoryError::Permission { address, access });
+                }
+                return Err(MemoryError::Unmapped(address));
+            };
+            self.translations[slot].set(Translation { base, frame: index });
+            index
+        };
+        let frame = &self.snapshot.frames[index];
+        if !frame.permissions.allows(access) {
+            return Err(MemoryError::Permission { address, access });
+        }
+        if let Some(error) = &frame.error {
+            return Err(match error {
+                MemoryError::Bus(_) => MemoryError::Bus(address),
+                other => other.clone(),
+            });
+        }
+        Ok(frame)
+    }
+    fn reached(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+    ) -> Result<(&Frame, usize), MemoryError> {
+        Memory::end(address, len as u64)?;
+        let offset = (address % PAGE_SIZE) as usize;
+        if len > PAGE_SIZE as usize - offset {
+            return Err(MemoryError::InvalidRange);
+        }
+        Ok((self.frame(address, access)?, offset))
+    }
+}
+impl CpuMemory for View {
+    fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        Memory::end(address, len as u64)?;
+        if len == 0 {
+            return Ok(());
+        }
+        for at in (address & !(PAGE_SIZE - 1)..address + len as u64).step_by(PAGE_SIZE as usize) {
+            self.frame(at.max(address), access)?;
+        }
+        Ok(())
+    }
+    fn check_translation(&self, address: u64) -> Result<(), MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        Memory::end(address, 1)?;
+        if self
+            .snapshot
+            .pages
+            .contains_key(&(address & !(PAGE_SIZE - 1)))
+            || self
+                .snapshot
+                .reservations
+                .range(..=address)
+                .next_back()
+                .is_some_and(|(_, end)| address < *end)
+        {
+            Ok(())
+        } else {
+            Err(MemoryError::Unmapped(address))
+        }
+    }
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
+        let mut address = address & 0x00ffffffffffffff;
+        self.check(address, out.len(), Access::Read)?;
+        let mut done = 0;
+        while done < out.len() {
+            let frame = self.frame(address, Access::Read)?;
+            let offset = (address % PAGE_SIZE) as usize;
+            let len = (out.len() - done).min(PAGE_SIZE as usize - offset);
+            if let Some(bytes) = &frame.bytes.constant {
+                out[done..done + len].copy_from_slice(&bytes[offset..offset + len]);
+            } else {
+                out[done..done + len].copy_from_slice(
+                    &frame
+                        .bytes
+                        .bytes
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("mutable page")
+                        .bytes[offset..offset + len],
+                );
+            }
+            done += len;
+            address += len as u64;
+        }
+        Ok(())
+    }
+    fn write(&mut self, address: u64, input: &[u8]) -> Result<(), MemoryError> {
+        let mut address = address & 0x00ffffffffffffff;
+        self.check(address, input.len(), Access::Write)?;
+        let mut done = 0;
+        while done < input.len() {
+            let frame = self.frame(address, Access::Write)?;
+            let offset = (address % PAGE_SIZE) as usize;
+            let len = (input.len() - done).min(PAGE_SIZE as usize - offset);
+            let mut guard = frame.bytes.bytes.lock().unwrap();
+            let state = guard.as_mut().expect("writable page");
+            state.bytes[offset..offset + len].copy_from_slice(&input[done..done + len]);
+            frame.bytes.changed(state, offset, len);
+            address += len as u64;
+            done += len;
+        }
+        Ok(())
+    }
+    fn fetch_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        if !address.is_multiple_of(4) {
+            return Err(MemoryError::Alignment(address));
+        }
+        let (frame, offset) = self.reached(address, 4, Access::Execute)?;
+        let mut bytes = [0; 4];
+        if let Some(data) = &frame.bytes.constant {
+            bytes.copy_from_slice(&data[offset..offset + 4]);
+        } else {
+            bytes.copy_from_slice(
+                &frame
+                    .bytes
+                    .bytes
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("mutable page")
+                    .bytes[offset..offset + 4],
+            );
+        }
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn instruction_identity(&self) -> (u64, u64, u64) {
+        (
+            self.snapshot.identity,
+            self.snapshot.code_revision,
+            (if self.snapshot.dynamic_code {
+                self.snapshot.code_epoch.load(Ordering::Acquire)
+            } else {
+                0
+            })
+            .wrapping_add(self.snapshot.backing_revision),
+        )
+    }
+    fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64, u64), MemoryError> {
+        if !address.is_multiple_of(4) {
+            return Err(MemoryError::Alignment(address));
+        }
+        let (frame, _) = self.reached(address, 4, Access::Execute)?;
+        Ok((
+            self.snapshot.identity,
+            frame.bytes.identity,
+            frame.bytes.version.load(Ordering::Acquire),
+        ))
+    }
+    fn atomic_update<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        update: impl FnOnce(&mut [u8]) -> (T, bool),
+    ) -> Result<T, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        let (frame, offset) = self.reached(address, len, Access::Write)?;
+        if len == 0 || len > 16 {
+            return Err(MemoryError::InvalidRange);
+        }
+        if !frame.permissions.read {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Read,
+            });
+        }
+        let mut guard = frame.bytes.bytes.lock().unwrap();
+        let state = guard.as_mut().expect("writable page");
+        let (value, write) = update(&mut state.bytes[offset..offset + len]);
+        if write {
+            frame.bytes.changed(state, offset, len)
+        }
+        Ok(value)
+    }
+    fn exclusive_read(&self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
+        if let Some(bytes) = &frame.bytes.constant {
+            out.copy_from_slice(&bytes[offset..offset + out.len()]);
+            return Ok((frame.bytes.identity as u128) << 64);
+        }
+        let guard = frame.bytes.bytes.lock().unwrap();
+        let s = guard.as_ref().expect("mutable page");
+        out.copy_from_slice(&s.bytes[offset..offset + out.len()]);
+        Ok((frame.bytes.identity as u128) << 64 | s.reservations[offset / 16] as u128)
+    }
+    fn exclusive_write(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        token: Option<u128>,
+    ) -> Result<bool, MemoryError> {
+        if token.is_none() {
+            return Ok(false);
+        }
+        let address = address & 0x00ffffffffffffff;
+        let (frame, offset) = self.reached(address, bytes.len(), Access::Write)?;
+        let mut guard = frame.bytes.bytes.lock().unwrap();
+        let state = guard.as_mut().expect("writable page");
+        if token
+            != Some((frame.bytes.identity as u128) << 64 | state.reservations[offset / 16] as u128)
+        {
+            return Ok(false);
+        }
+        state.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        frame.bytes.changed(state, offset, bytes.len());
+        Ok(true)
+    }
+    fn fence(&self, order: Ordering) {
+        std::sync::atomic::fence(order)
+    }
+}
+impl Memory {
+    #[inline]
+    pub(super) fn note_parallel_write(&mut self, frame: usize) {
+        if self.parallel_cache.is_some() {
+            let page = self.frames[frame].as_mut().expect("written page");
+            if !page.parallel_dirty {
+                page.data_revision = page.data_revision.wrapping_add(1);
+                page.parallel_dirty = true;
+                self.parallel_dirty.push(frame);
+            }
+        }
+    }
+    /// Shared futexes identify the backing page, including aliases at different
+    /// virtual addresses and after fork. Private/anonymous addresses use mm+VA.
+    pub fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        if let Some(shared) = &self.shared {
+            return shared.borrow().shared_futex_key(address);
+        }
+        let page = self.page_for_access(address, 4, Access::Read)?;
+        Ok(page
+            .backing
+            .as_ref()
+            .filter(|b| b.shared)
+            .and_then(|b| b.object.parallel_key())
+            .map(|(identity, offset)| (identity, offset, address % PAGE_SIZE)))
+    }
+    /// Freeze mapping metadata while retaining coherent shared bytes. The host
+    /// must join every view user before kernel/native operations or commit.
+    pub fn parallel_view(&mut self, registry: &mut Registry) -> Option<View> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().parallel_view(registry);
+        }
+        let backing_revision = backing::backing_revision();
+        if let Some(c) = &self.parallel_cache {
+            if c.source_revision == self.revision && c.source_backing_revision == backing_revision {
+                return Some(View::new(c.snapshot.clone()));
+            }
+        }
+        // Data-only coordinator writes reuse the immutable mapping table and
+        // refresh just dirty frames. No Arc/map rebuild or full page-table walk
+        // for each libc call. Executable/mapping/EOF changes take the slow path.
+        if self.parallel_cache.as_ref().is_some_and(|c| {
+            c.snapshot.code_revision == self.code_revision
+                && c.source_backing_revision == backing_revision
+        }) {
+            let mut cache = self.parallel_cache.take().expect("checked cache");
+            let dirty = std::mem::take(&mut self.parallel_dirty);
+            for &index in &dirty {
+                self.frames[index]
+                    .as_mut()
+                    .expect("same mapped frame")
+                    .parallel_dirty = false;
+            }
+            for index in dirty {
+                let page = self.frames[index].as_mut().expect("same mapped frame");
+                let frame = &cache.snapshot.frames
+                    [cache.snapshot.positions[index].expect("same mapped frame")];
+                let mut data = [0; PAGE_SIZE as usize];
+                page.read_bytes(0, &mut data).ok()?;
+                frame.bytes.refresh(&data);
+                frame
+                    .data_revision
+                    .store(page.data_revision, Ordering::Relaxed);
+                frame.backing_version.store(
+                    page.backing.as_ref().map_or(0, |b| b.object.version()),
+                    Ordering::Relaxed,
+                );
+            }
+            cache.source_revision = self.revision;
+            let view = View::new(cache.snapshot.clone());
+            self.parallel_cache = Some(cache);
+            return Some(view);
+        }
+        // Unknown mutable backings retain the existing serial path.
+        if self.frames.iter().flatten().any(|p| {
+            p.backing
+                .as_ref()
+                .is_some_and(|b| b.object.parallel_key().is_none())
+        }) {
+            return None;
+        }
+        registry.shared.retain(|_, page| page.strong_count() != 0);
+        let old = self.parallel_cache.take();
+        let mut frames = Vec::with_capacity(self.pages.len());
+        let mut positions = vec![None; self.frames.len()];
+        let mut pages = BTreeMap::new();
+        for (&base, &root_frame) in &self.pages {
+            let page = self.frames[root_frame].as_ref().expect("mapped frame");
+            let error = page.check_backing(base).err();
+            let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
+            let previous = old
+                .as_ref()
+                .and_then(|c| c.snapshot.pages.get(&base).map(|&i| &c.snapshot.frames[i]))
+                .filter(|f| {
+                    f.root_frame == root_frame
+                        && f.code_revision == page.instruction_revision
+                        && f.permissions == page.permissions
+                });
+            let key = page
+                .backing
+                .as_ref()
+                .filter(|b| b.shared)
+                .and_then(|b| b.object.parallel_key());
+            let same = previous.filter(|f| {
+                f.data_revision.load(Ordering::Relaxed) == page.data_revision
+                    && f.backing_version.load(Ordering::Relaxed) == backing_version
+                    && f.error == error
+            });
+            let bytes = if let Some(frame) = same {
+                frame.bytes.clone()
+            } else {
+                let mut data = [0; PAGE_SIZE as usize];
+                if error.is_none() {
+                    page.read_bytes(0, &mut data).ok()?;
+                }
+                if let Some(key) = key {
+                    if let Some(bytes) = registry.shared.get(&key).and_then(Weak::upgrade) {
+                        bytes.refresh(&data);
+                        bytes
+                    } else {
+                        let bytes = Arc::new(ConcurrentPage::new(
+                            data,
+                            false,
+                            registry.code_epoch.clone(),
+                        ));
+                        registry.shared.insert(key, Arc::downgrade(&bytes));
+                        bytes
+                    }
+                } else if let Some(frame) = previous.filter(|f| f.bytes.constant.is_none()) {
+                    frame.bytes.refresh(&data);
+                    frame.bytes.clone()
+                } else {
+                    Arc::new(ConcurrentPage::new(
+                        data,
+                        !page.permissions.write,
+                        registry.code_epoch.clone(),
+                    ))
+                }
+            };
+            if page.permissions.execute {
+                bytes.executable.store(true, Ordering::Relaxed);
+            }
+            pages.insert(base, frames.len());
+            positions[root_frame] = Some(frames.len());
+            frames.push(Frame {
+                base,
+                root_frame,
+                permissions: page.permissions,
+                code_revision: page.instruction_revision,
+                data_revision: AtomicU64::new(page.data_revision),
+                backing_version: AtomicU64::new(backing_version),
+                error,
+                bytes,
+            });
+        }
+        let snapshot = Arc::new(Snapshot {
+            dynamic_code: frames
+                .iter()
+                .any(|frame| frame.permissions.execute && frame.bytes.constant.is_none()),
+            positions,
+            backing_revision,
+            identity: self.identity,
+            code_revision: self.code_revision,
+            pages,
+            frames,
+            reservations: self.reservations.clone(),
+            code_epoch: registry.code_epoch.clone(),
+        });
+        self.parallel_cache = Some(SnapshotCache {
+            snapshot: snapshot.clone(),
+            source_revision: self.revision,
+            source_backing_revision: backing_revision,
+        });
+        for index in self.parallel_dirty.drain(..) {
+            if let Some(page) = self.frames[index].as_mut() {
+                page.parallel_dirty = false;
+            }
+        }
+        Some(View::new(snapshot))
+    }
+    /// Joined CPUs publish changed fragments through the normal COW/backing/code
+    /// hooks before any syscall, signal frame or native operation can observe them.
+    pub fn commit_parallel(&mut self) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().commit_parallel();
+        }
+        let Some(mut cache) = self.parallel_cache.take() else {
+            return Ok(());
+        };
+        let result = (|| {
+            for frame in &cache.snapshot.frames {
+                if !frame.permissions.write {
+                    continue;
+                }
+                let dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
+                if dirty == 0 {
+                    continue;
+                }
+                let guard = frame.bytes.bytes.lock().unwrap();
+                let bytes = guard.as_ref().expect("dirty writable page");
+                for i in 0..64 {
+                    if dirty & (1u64 << i) != 0 {
+                        self.write(
+                            frame.base + i * 64,
+                            &bytes.bytes[i as usize * 64..i as usize * 64 + 64],
+                        )?;
+                    }
+                }
+                let page = self.frames[frame.root_frame]
+                    .as_ref()
+                    .expect("committed page");
+                frame
+                    .data_revision
+                    .store(page.data_revision, Ordering::Relaxed);
+                frame.backing_version.store(
+                    page.backing.as_ref().map_or(0, |b| b.object.version()),
+                    Ordering::Relaxed,
+                );
+            }
+            Ok(())
+        })();
+        // Frame generations are rebuilt after kernel writes. Keep data-only
+        // worker rounds cheap when there was no coordinator mutation.
+        cache.source_revision = self.revision;
+        // Retain the captured backing epoch: writes through another mapping
+        // may require refreshing an undetached private file view next round.
+        if cache.snapshot.code_revision != self.code_revision {
+            cache.source_revision = self.revision.wrapping_sub(1);
+        }
+        self.parallel_cache = Some(cache);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    #[test]
+    fn immutable_code_ignores_unrelated_live_code_epochs() {
+        let mut immutable = Memory::default();
+        immutable.map(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let mut mutable = Memory::default();
+        mutable
+            .map(
+                0x1000,
+                PAGE_SIZE,
+                Permissions {
+                    execute: true,
+                    ..Permissions::RW
+                },
+            )
+            .unwrap();
+        let mut registry = Registry::default();
+        let a = immutable.parallel_view(&mut registry).unwrap();
+        let mut b = mutable.parallel_view(&mut registry).unwrap();
+        assert!(!a.snapshot.dynamic_code);
+        assert!(b.snapshot.dynamic_code);
+        let before = a.instruction_identity();
+        let mutable_before = b.instruction_identity();
+        b.write_array(0x1000, 0xd503201fu32.to_le_bytes()).unwrap();
+        assert_eq!(a.instruction_identity(), before);
+        assert_ne!(b.instruction_identity(), mutable_before);
+    }
+    #[test]
+    fn racing_rmw_and_shared_vm_publish_every_increment() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut sibling = memory.share();
+        let mut registry = Registry::default();
+        let start = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let mut view = sibling.parallel_view(&mut registry).unwrap();
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..10000 {
+                    view.atomic_update(0x1000, 8, |data| {
+                        let n = u64::from_le_bytes(data.try_into().unwrap());
+                        data.copy_from_slice(&(n + 1).to_le_bytes());
+                        ((), true)
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x1000).unwrap(), 40000);
+        assert_eq!(sibling.read_u64(0x1000).unwrap(), 40000);
+    }
+    #[test]
+    fn exclusives_detect_aba_but_allow_an_unrelated_granule() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
+        let mut b = memory.parallel_view(&mut registry).unwrap();
+        let mut old = [0; 8];
+        let token = a.exclusive_read(0x1000, &mut old).unwrap();
+        b.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
+        b.write_array(0x1000, 0u64.to_le_bytes()).unwrap();
+        assert!(!a
+            .exclusive_write(0x1000, &2u64.to_le_bytes(), Some(token))
+            .unwrap());
+        let token = a.exclusive_read(0x1000, &mut old).unwrap();
+        b.write_array(0x1020, 3u64.to_le_bytes()).unwrap();
+        assert!(a
+            .exclusive_write(0x1000, &2u64.to_le_bytes(), Some(token))
+            .unwrap());
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x1000).unwrap(), 2);
+        assert_eq!(memory.read_u64(0x1020).unwrap(), 3);
+    }
+    #[test]
+    fn coordinator_aba_and_native_stores_invalidate_a_worker_reservation() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let a = memory.parallel_view(&mut registry).unwrap();
+        let mut old = [0; 8];
+        let token = a.exclusive_read(0x1000, &mut old).unwrap();
+        drop(a);
+        memory.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
+        memory.write_array(0x1000, 0u64.to_le_bytes()).unwrap();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
+        assert!(!a
+            .exclusive_write(0x1000, &2u64.to_le_bytes(), Some(token))
+            .unwrap());
+        let token = a.exclusive_read(0x1000, &mut old).unwrap();
+        drop(a);
+        memory.fill_with(0x1000, 8, |bytes| bytes.fill(0)).unwrap();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
+        assert!(!a
+            .exclusive_write(0x1000, &2u64.to_le_bytes(), Some(token))
+            .unwrap());
+    }
+    #[test]
+    fn remapping_changes_reservation_identity_and_cross_page_faults_have_no_effect() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        let mut registry = Registry::default();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
+        let mut bytes = [0; 8];
+        let token = a.exclusive_read(0x1000, &mut bytes).unwrap();
+        assert!(matches!(
+            a.write(0x1fff, &[1, 2]),
+            Err(MemoryError::Permission { .. })
+        ));
+        assert_eq!(a.read_array::<1>(0x1fff).unwrap(), [0]);
+        drop(a);
+        memory.unmap(0x1000, PAGE_SIZE).unwrap();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
+        assert!(!a
+            .exclusive_write(0x1000, &1u64.to_le_bytes(), Some(token))
+            .unwrap());
+    }
+    #[test]
+    fn shared_backing_aliases_are_one_transaction_domain_and_fork_cow_stays_private() {
+        let mut parent = Memory::default();
+        parent
+            .map_shared_anonymous(0x1000, PAGE_SIZE, Permissions::RW, false)
+            .unwrap();
+        parent.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut child = parent.clone();
+        let mut registry = Registry::default();
+        let mut p = parent.parallel_view(&mut registry).unwrap();
+        let mut c = child.parallel_view(&mut registry).unwrap();
+        p.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
+        c.atomic_update(0x1000, 8, |b| {
+            let v = u64::from_le_bytes(b.try_into().unwrap());
+            b.copy_from_slice(&(v + 1).to_le_bytes());
+            ((), true)
+        })
+        .unwrap();
+        p.write_array(0x2000, 3u64.to_le_bytes()).unwrap();
+        c.write_array(0x2000, 4u64.to_le_bytes()).unwrap();
+        drop((p, c));
+        parent.commit_parallel().unwrap();
+        child.commit_parallel().unwrap();
+        assert_eq!(parent.read_u64(0x1000).unwrap(), 2);
+        assert_eq!(child.read_u64(0x1000).unwrap(), 2);
+        assert_eq!(parent.read_u64(0x2000).unwrap(), 3);
+        assert_eq!(child.read_u64(0x2000).unwrap(), 4);
+    }
+    #[test]
+    fn acquire_release_publication_and_page_code_tokens_reach_peers() {
+        let mut memory = Memory::default();
+        memory
+            .map(
+                0x1000,
+                PAGE_SIZE,
+                Permissions {
+                    execute: true,
+                    ..Permissions::RW
+                },
+            )
+            .unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let mut writer = memory.parallel_view(&mut registry).unwrap();
+        let reader = memory.parallel_view(&mut registry).unwrap();
+        let before = reader.instruction_identity();
+        let page_before = reader.instruction_page_identity(0x1000).unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let gate = started.clone();
+        let thread = std::thread::spawn(move || {
+            gate.wait();
+            writer
+                .write_array(0x1000, 0xd503201fu32.to_le_bytes())
+                .unwrap();
+            writer.fence(Ordering::Release);
+            writer.write_array(0x2000, 1u64.to_le_bytes()).unwrap();
+        });
+        started.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while reader.read_u64(0x2000).unwrap() == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        reader.fence(Ordering::Acquire);
+        assert_eq!(reader.fetch_u32(0x1000).unwrap(), 0xd503201f);
+        assert_ne!(reader.instruction_identity(), before);
+        assert_ne!(
+            reader.instruction_page_identity(0x1000).unwrap(),
+            page_before
+        );
+        thread.join().unwrap();
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.fetch_u32(0x1000).unwrap(), 0xd503201f);
+    }
+}
