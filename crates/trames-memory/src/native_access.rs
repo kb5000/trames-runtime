@@ -64,6 +64,20 @@ impl Memory {
         {
             return Ok((operation(&page.bytes[offset..offset + len]), true));
         }
+        let mut operation = Some(operation);
+        let mut result = None;
+        if page
+            .backing
+            .as_ref()
+            .expect("live backing")
+            .object
+            .with_read(offset, len, &mut |bytes| {
+                result = Some(operation.take().expect("one callback")(bytes));
+            })?
+        {
+            return Ok((result.expect("resident callback"), true));
+        }
+        let operation = operation.expect("unavailable borrow has no effects");
         let mut snapshot = [0; PAGE_SIZE as usize];
         page.read_bytes(offset, &mut snapshot[..len])?;
         Ok((operation(&snapshot[..len]), false))
@@ -116,6 +130,20 @@ impl Memory {
         self.mark_native_write(frame);
         let page = self.frames[frame].as_mut().expect("checked page");
         if page.backing.as_ref().is_some_and(|b| b.shared) {
+            let mut operation = Some(operation);
+            let mut result = None;
+            if page
+                .backing
+                .as_ref()
+                .expect("shared backing")
+                .object
+                .with_write(offset, len, &mut |bytes| {
+                    result = Some(operation.take().expect("one callback")(bytes));
+                })?
+            {
+                return Ok((result.expect("resident callback"), true));
+            }
+            let operation = operation.expect("unavailable borrow has no effects");
             let mut bytes = [0; PAGE_SIZE as usize];
             page.read_bytes(offset, &mut bytes[..len])?;
             let result = operation(&mut bytes[..len]);
@@ -216,7 +244,8 @@ impl Memory {
                         .as_ref()
                         .expect("page")
                         .backing
-                        .is_some()
+                        .as_ref()
+                        .is_some_and(|b| b.shared || !b.private_copy)
                 })
         });
         if backed {
@@ -296,6 +325,48 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_shared_borrows_preserve_alias_fork_code_and_parallel_visibility() {
+        use crate::{parallel::Registry, CpuMemory};
+        let mut m = Memory::default();
+        m.map_shared_anonymous(
+            0x1000,
+            PAGE_SIZE,
+            Permissions {
+                read: true,
+                write: true,
+                execute: true,
+            },
+            false,
+        )
+        .unwrap();
+        let object = m.frames[m.pages[&0x1000]]
+            .as_ref()
+            .unwrap()
+            .backing
+            .as_ref()
+            .unwrap()
+            .object
+            .clone();
+        m.map_backed(0x3000, vec![object], true, Permissions::RW, false)
+            .unwrap();
+        let child = m.clone();
+        let token = m.instruction_page_identity(0x1000).unwrap();
+        assert!(m.with_write_chunk(0x3000, 16, |b| b.fill(42)).unwrap().1);
+        assert_ne!(token, m.instruction_page_identity(0x1000).unwrap());
+        assert_eq!(
+            child.with_read_chunk(0x1000, 16, |b| b.to_vec()).unwrap(),
+            (vec![42; 16], true)
+        );
+        let mut registry = Registry::default();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<16>(0x1000).unwrap(), [42; 16]);
+        drop(view);
+        assert!(m.with_write_chunk(0x1000, 16, |b| b.fill(17)).unwrap().1);
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<16>(0x3000).unwrap(), [17; 16]);
+    }
 
     #[test]
     fn scoped_borrows_reach_real_pages_and_preserve_cow_shared_vm_and_code_tokens() {
@@ -398,7 +469,7 @@ mod tests {
         let initial: Vec<_> = (0..4096).map(|i| (i * 73) as u8).collect();
         memory.write(0x1000, &initial).unwrap();
         assert!(
-            !memory
+            memory
                 .with_read_chunk(0x3000, 4096, |bytes| assert_eq!(bytes, initial))
                 .unwrap()
                 .1
@@ -407,7 +478,8 @@ mod tests {
             .copy_with(0x3001, 0x1000, 4095, |d, s| d.copy_from_slice(s))
             .unwrap();
         assert_eq!(stats.buffered_read, 4095);
-        assert_eq!(stats.buffered_write, 4095);
+        assert_eq!(stats.direct_write, 4095);
+        assert_eq!(stats.buffered_write, 0);
         let mut expected = initial.clone();
         expected[1..].copy_from_slice(&initial[..4095]);
         let mut actual = vec![0; 4096];

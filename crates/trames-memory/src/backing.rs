@@ -18,6 +18,26 @@ pub trait PageBacking {
     fn check(&self, address: u64) -> Result<(), MemoryError>;
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
+    /// Invoke once on a coherent resident fragment, or return false without
+    /// invoking. Implementations retain the backing borrow for the callback.
+    /// Called only at a joined coordinator checkpoint; no Rc reaches workers.
+    fn with_read(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _f: &mut dyn FnMut(&[u8]),
+    ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+    /// As above, with write/version/dirty hooks before exposing mutable bytes.
+    fn with_write(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _f: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
     fn sync(&self) -> Result<(), MemoryError>;
     fn sync_key(&self) -> Option<u64> {
         None
@@ -308,6 +328,27 @@ impl PageBacking for AnonymousPage {
         self.revision.set(self.revision.get().wrapping_add(1));
         backing_changed();
         Ok(())
+    }
+    fn with_read(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]),
+    ) -> Result<bool, MemoryError> {
+        f(&self.bytes.borrow()[offset..offset + len]);
+        Ok(true)
+    }
+    fn with_write(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<bool, MemoryError> {
+        let mut bytes = self.bytes.borrow_mut();
+        self.revision.set(self.revision.get().wrapping_add(1));
+        backing_changed();
+        f(&mut bytes[offset..offset + len]);
+        Ok(true)
     }
     fn sync(&self) -> Result<(), MemoryError> {
         Ok(())

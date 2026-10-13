@@ -220,6 +220,34 @@ impl PageBacking for FileMapping {
         trames_memory::backing_changed();
         Ok(())
     }
+    fn with_read(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&[u8]),
+    ) -> std::result::Result<bool, MemoryError> {
+        f(&self.page.bytes.borrow()[offset..offset + len]);
+        Ok(true)
+    }
+    fn with_write(
+        &self,
+        offset: usize,
+        len: usize,
+        f: &mut dyn FnMut(&mut [u8]),
+    ) -> std::result::Result<bool, MemoryError> {
+        if !self.writable {
+            return Err(MemoryError::BackingIo(13));
+        }
+        let mut bytes = self.page.bytes.borrow_mut();
+        self.page.dirty.set(true);
+        self.page
+            .version
+            .set(self.page.version.get().wrapping_add(1));
+        self.node.borrow_mut().times[1] = storage::Timestamp::now();
+        trames_memory::backing_changed();
+        f(&mut bytes[offset..offset + len]);
+        Ok(true)
+    }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
         let node = self.node.borrow();
         if let Content::File(FileData::Mapped(data)) = &node.content {
@@ -321,6 +349,36 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn direct_file_borrows_dirty_writeback_alias_tokens_and_live_eof() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(-100, b"/native-mapped", 0x42, 0o600).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        let mut m = Memory::default();
+        mapped(&v, &mut m, fd, 0x1000, PAGE_SIZE * 2, true, Permissions::RW);
+        mapped(&v, &mut m, fd, 0x5000, PAGE_SIZE * 2, true, Permissions::RX);
+        let token = m.instruction_page_identity(0x5000).unwrap();
+        assert_eq!(
+            m.fill_with(0x1ffe, 8, |b| b.fill(91)).unwrap().direct_write,
+            8
+        );
+        assert_eq!(
+            m.with_read_chunk(0x5ffe, 2, |b| b.to_vec()).unwrap(),
+            (vec![91; 2], true)
+        );
+        assert_ne!(token, m.instruction_page_identity(0x5000).unwrap());
+        m.sync_range(0x1000, PAGE_SIZE * 2).unwrap();
+        v.seek(fd, 4094, 0).unwrap();
+        assert_eq!(v.read(fd, 8).unwrap(), vec![91; 8]);
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        assert_eq!(
+            m.with_read_chunk(0x6000, 1, |b| b[0]),
+            Err(MemoryError::Bus(0x6000))
+        );
+        assert!(m.fill_with(0x1fff, 2, |b| b.fill(0)).is_err());
+        assert_eq!(m.read_array::<1>(0x1fff).unwrap(), [91]);
+    }
+
     #[test]
     fn parallel_readonly_alias_dirty_fragments_private_refresh_and_live_eof() {
         use trames_memory::{parallel::Registry, CpuMemory};
