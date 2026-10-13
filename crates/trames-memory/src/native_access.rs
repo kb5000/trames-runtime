@@ -36,6 +36,31 @@ impl Memory {
                         .is_none_or(|b| !b.shared && b.private_copy)
             }))
     }
+    /// Preflight output for a pure one-shot operation. Unlike callback state,
+    /// it need not be readable or private. Resident backing cannot fail with I/O
+    /// after preflight; custom/live I/O backings retain original fallback.
+    pub fn native_output_range(&self, address: u64, len: usize) -> Result<bool, MemoryError> {
+        let address = address & 0x00ffffffffffffff;
+        if let Some(shared) = &self.shared {
+            return shared.borrow().native_output_range(address, len);
+        }
+        self.check(address, len, Access::Write)?;
+        if len == 0 {
+            return Ok(true);
+        }
+        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
+            .step_by(PAGE_SIZE as usize)
+            .all(|base| {
+                let page = self.frames[self.pages[&base]]
+                    .as_ref()
+                    .expect("checked page");
+                page.backing.as_ref().is_none_or(|b| {
+                    (!b.shared && b.private_copy)
+                        || (b.object.native_resident() && (!b.shared || b.object.writable()))
+                })
+            }))
+    }
+
     /// Borrow one readable page fragment for the duration of a pure callback.
     /// Live backing objects use a bounded snapshot; private COW pages can borrow.
     /// The bool reports whether the supplied slice directly refers to guest bytes.
@@ -505,11 +530,13 @@ mod tests {
         memory.write(0x3000, &expected).unwrap();
         memory.read(0x3000, &mut actual).unwrap();
         assert_eq!(actual, expected);
-        let before = memory.revision();
+        // The public revision includes a global backing counter that unrelated
+        // parallel tests may advance. Check this address space's own writes.
+        let before = memory.revision;
         assert!(memory
             .copy_with(0x1000, 0x3fff, 2, |d, s| d.copy_from_slice(s))
             .is_err());
-        assert_eq!(memory.revision(), before);
+        assert_eq!(memory.revision, before);
         assert!(memory.fill_with(0x1fff, 2, |bytes| bytes.fill(0)).is_err());
         assert_eq!(memory.read_array::<1>(0x1fff).unwrap(), [expected[4095]]);
     }

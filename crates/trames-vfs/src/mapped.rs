@@ -190,6 +190,9 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn native_resident(&self) -> bool {
+        true
+    }
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((self.page.identity, 0))
     }

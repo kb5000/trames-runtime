@@ -18,6 +18,11 @@ pub trait PageBacking {
     fn check(&self, address: u64) -> Result<(), MemoryError>;
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
+    /// Resident operations cannot perform fallible backing I/O after complete
+    /// permission/EOF preflight. External backings must explicitly opt in.
+    fn native_resident(&self) -> bool {
+        false
+    }
     /// Invoke once on a coherent resident fragment, or return false without
     /// invoking. Implementations retain the backing borrow for the callback.
     /// Called only at a joined coordinator checkpoint; no Rc reaches workers.
@@ -313,6 +318,9 @@ impl AnonymousPage {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn native_resident(&self) -> bool {
+        true
+    }
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((self.identity, 0))
     }

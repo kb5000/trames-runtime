@@ -632,3 +632,33 @@ fn explicit_reset_refuses_live_stores_and_clears_unsupported_metadata() {
     let v = dir.open();
     assert_eq!(v.stat_at(AT_FDCWD, b"/data"), Err(Errno(2)));
 }
+
+#[test]
+fn direct_native_mapped_writes_survive_disk_sync_unmap_and_reopen() {
+    use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/native-disk", 0x42, 0o600).unwrap();
+    v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+    let objects = v.mapping_pages(fd, 0, PAGE_SIZE * 2, true, true).unwrap();
+    let mut m = Memory::default();
+    m.map_backed(0x1000, objects, true, Permissions::RW, false)
+        .unwrap();
+    assert!(m.native_output_range(0x1ffe, 8).unwrap());
+    assert!(!m.native_writable_range(0x1ffe, 8).unwrap());
+    assert_eq!(
+        m.fill_with(0x1ffe, 8, |bytes| bytes.fill(91))
+            .unwrap()
+            .direct_write,
+        8
+    );
+    m.sync_range(0x1000, PAGE_SIZE * 2).unwrap();
+    m.unmap(0x1000, PAGE_SIZE * 2).unwrap();
+    v.close(fd).unwrap();
+    drop(m);
+    drop(v);
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/native-disk", 0, 0).unwrap();
+    v.seek(fd, 4094, 0).unwrap();
+    assert_eq!(v.read(fd, 8).unwrap(), vec![91; 8]);
+}
