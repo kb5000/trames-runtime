@@ -6,6 +6,7 @@ mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use native_access::Transfer;
+pub use reservations::MAX_RESERVATIONS;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Anonymous inaccessible ranges: virtual ownership without page allocations.
 use super::*;
-const MAX_RESERVATIONS: usize = 65_536;
+pub const MAX_RESERVATIONS: usize = 65_536;
 
 impl Memory {
     pub fn virtual_bytes(&self) -> u64 {

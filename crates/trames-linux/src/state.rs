@@ -1241,7 +1241,7 @@ impl Linux {
             222 => self.mmap(a, memory),
             215 => {
                 let len = Self::page_length(a[1])?;
-                memory.unmap(a[0], len).map_err(|_| Errno(22))?;
+                memory.unmap(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
             }
             226 => {
@@ -1277,6 +1277,31 @@ impl Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn munmap_metadata_exhaustion_returns_enomem_and_retains_the_range() {
+        let mut linux = Linux::new(0);
+        let mut m = Memory::new(0);
+        let mut out = CapturedOutput::default();
+        for i in 0..trames_memory::MAX_RESERVATIONS as u64 {
+            m.reserve(0x10000 + i * 4 * PAGE_SIZE, 3 * PAGE_SIZE, false)
+                .unwrap();
+        }
+        assert_eq!(
+            linux.syscall(215, [0x11000, PAGE_SIZE, 0, 0, 0, 0], &mut m, &mut out),
+            Err(Errno(12))
+        );
+        assert!(m.is_reserved(0x10000, 3 * PAGE_SIZE));
+        assert_eq!(m.mapped_bytes(), 0);
+        assert_eq!(
+            linux.syscall(215, [0x11001, PAGE_SIZE, 0, 0, 0, 0], &mut m, &mut out),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            linux.syscall(215, [0x10000, 3 * PAGE_SIZE, 0, 0, 0, 0], &mut m, &mut out),
+            Ok(0)
+        );
+        assert!(m.is_free(0x10000, 3 * PAGE_SIZE));
+    }
     use crate::CapturedOutput;
     fn memory() -> Memory {
         let mut m = Memory::default();
