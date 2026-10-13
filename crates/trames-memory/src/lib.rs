@@ -2,6 +2,7 @@
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod backing;
 mod native_access;
+mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use native_access::Transfer;
@@ -36,6 +37,11 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    pub const NONE: Self = Self {
+        read: false,
+        write: false,
+        execute: false,
+    };
     pub const RW: Self = Self {
         read: true,
         write: true,
@@ -108,6 +114,8 @@ pub struct Memory {
     // interpreter. The translation cache owns no bytes, so it cannot trigger
     // false COW or retain an old allocation after a write.
     pages: BTreeMap<u64, usize>,
+    // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
+    reservations: BTreeMap<u64, u64>,
     frames: Vec<Option<Page>>,
     free_frames: Vec<usize>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -126,6 +134,7 @@ impl Clone for Memory {
         }
         Self {
             pages: self.pages.clone(),
+            reservations: self.reservations.clone(),
             frames: self.frames.clone(),
             free_frames: self.free_frames.clone(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -171,6 +180,7 @@ impl Memory {
     pub fn new(limit: usize) -> Self {
         Self {
             pages: BTreeMap::new(),
+            reservations: BTreeMap::new(),
             frames: Vec::new(),
             free_frames: Vec::new(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -205,6 +215,12 @@ impl Memory {
             }
             regions.push((address, address + PAGE_SIZE, page.permissions));
         }
+        regions.extend(
+            self.reservations
+                .iter()
+                .map(|(&start, &end)| (start, end, Permissions::NONE)),
+        );
+        regions.sort_unstable_by_key(|region| region.0);
         regions
     }
 
@@ -214,6 +230,7 @@ impl Memory {
         }
     }
 
+    #[inline]
     fn frame(&self, base: u64) -> Option<usize> {
         let slot = ((base / PAGE_SIZE) as usize) & (TRANSLATION_SLOTS - 1);
         let entry = self.translations[slot].get();
@@ -254,6 +271,11 @@ impl Memory {
         self.pages
             .last_key_value()
             .map_or(0, |(&address, _)| address + PAGE_SIZE)
+            .max(
+                self.reservations
+                    .last_key_value()
+                    .map_or(0, |(_, &end)| end),
+            )
     }
     pub fn revision(&self) -> u64 {
         if let Some(shared) = &self.shared {
@@ -321,24 +343,42 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().is_free(address, len);
         }
-        Self::mapping_end(address, len)
-            .is_ok_and(|end| self.pages.range(address..end).next().is_none())
+        Self::mapping_end(address, len).is_ok_and(|end| {
+            self.pages.range(address..end).next().is_none()
+                && !self.reservation_overlaps(address, end)
+        })
     }
     pub fn find_free(&self, start: u64, len: u64) -> Option<u64> {
         if let Some(shared) = &self.shared {
             return shared.borrow().find_free(start, len);
         }
         let mut candidate = start.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-        Self::mapping_end(candidate, len).ok()?;
-        for (&base, _) in self.pages.range(candidate..) {
-            if base >= candidate.checked_add(len)? {
+        if let Some(stop) = self.reserved_end(candidate) {
+            candidate = stop;
+        }
+        let mut pages = self
+            .pages
+            .range(candidate..)
+            .map(|(&a, _)| (a, a + PAGE_SIZE))
+            .peekable();
+        let mut reserved = self
+            .reservations
+            .range(candidate..)
+            .map(|(&a, &b)| (a, b))
+            .peekable();
+        loop {
+            let next = match (pages.peek(), reserved.peek()) {
+                (Some(a), Some(b)) if a.0 < b.0 => pages.next(),
+                (_, Some(_)) => reserved.next(),
+                (Some(_), None) => pages.next(),
+                (None, None) => return Self::mapping_end(candidate, len).ok().map(|_| candidate),
+            };
+            let (base, stop) = next.expect("occupied range");
+            if base >= Self::mapping_end(candidate, len).ok()? {
                 return Some(candidate);
             }
-            if base >= candidate {
-                candidate = base + PAGE_SIZE;
-            }
+            candidate = candidate.max(stop);
         }
-        Self::mapping_end(candidate, len).ok().map(|_| candidate)
     }
     /// Atomic anonymous MAP_FIXED: account for replaced pages before changing data.
     pub fn map_fixed(
@@ -361,6 +401,7 @@ impl Memory {
         {
             return Err(MemoryError::Limit);
         }
+        self.remove_reservations(address, end)?;
         self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             self.insert_page(base, permissions);
@@ -376,6 +417,7 @@ impl Memory {
             return shared.borrow_mut().unmap(address, len);
         }
         let end = Self::mapping_end(address, len)?;
+        self.remove_reservations(address, end)?;
         let keys: Vec<_> = self
             .pages
             .range(address..end)
@@ -459,6 +501,9 @@ impl Memory {
         if let Some((&base, _)) = self.pages.range(address..end).next() {
             return Err(MemoryError::Overlap(base));
         }
+        if self.reservation_overlaps(address, end) {
+            return Err(MemoryError::Overlap(address));
+        }
         self.advance_code_revision();
         for base in (address..end).step_by(PAGE_SIZE as usize) {
             self.insert_page(base, permissions);
@@ -478,11 +523,16 @@ impl Memory {
             return shared.borrow_mut().protect(address, len, permissions);
         }
         let end = Self::mapping_end(address, len)?;
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            if !self.pages.contains_key(&base) {
-                return Err(MemoryError::Unmapped(base));
-            }
-            let p = self.frames[self.pages[&base]].as_ref().expect("page");
+        self.check_mapped_range(address, end)?;
+        let committed = self.pages.range(address..end).count() as u64 * PAGE_SIZE;
+        let commit = permissions != Permissions::NONE;
+        if commit
+            && (end - address - committed) > self.limit.saturating_sub(self.mapped_bytes()) as u64
+        {
+            return Err(MemoryError::Limit);
+        }
+        for (&base, &frame) in self.pages.range(address..end) {
+            let p = self.frames[frame].as_ref().expect("page");
             if permissions.write
                 && p.backing
                     .as_ref()
@@ -494,9 +544,18 @@ impl Memory {
                 });
             }
         }
+        if commit {
+            self.remove_reservations(address, end)?;
+        }
         self.advance_code_revision();
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            let frame = self.pages[&base];
+        if commit {
+            for base in (address..end).step_by(PAGE_SIZE as usize) {
+                if !self.pages.contains_key(&base) {
+                    self.insert_page(base, permissions);
+                }
+            }
+        }
+        for (_, &frame) in self.pages.range(address..end) {
             let page = self.frames[frame].as_mut().expect("validated page");
             page.permissions = permissions;
             page.instruction_revision = self.code_revision;
@@ -513,7 +572,9 @@ impl Memory {
             return shared.borrow().check_translation(address);
         }
         Self::end(address, 1)?;
-        if self.pages.contains_key(&(address & !(PAGE_SIZE - 1))) {
+        if self.pages.contains_key(&(address & !(PAGE_SIZE - 1)))
+            || self.reserved_end(address).is_some()
+        {
             Ok(())
         } else {
             Err(MemoryError::Unmapped(address))
@@ -538,7 +599,7 @@ impl Memory {
             let fault_address = base.max(address);
             let frame = self
                 .frame(base)
-                .ok_or(MemoryError::Unmapped(fault_address))?;
+                .ok_or_else(|| self.missing_page(fault_address, access))?;
             let page = self.frames[frame].as_ref().expect("mapped frame");
             if !page.permissions.allows(access) {
                 return Err(MemoryError::Permission {
@@ -568,6 +629,7 @@ impl Memory {
     }
 
     // Callers handle shared memory and ensure the range fits within one page.
+    #[inline]
     fn page_for_access(
         &self,
         address: u64,
@@ -577,7 +639,7 @@ impl Memory {
         Self::end(address, len as u64)?;
         let frame = self
             .frame(address & !(PAGE_SIZE - 1))
-            .ok_or(MemoryError::Unmapped(address))?;
+            .ok_or_else(|| self.missing_page(address, access))?;
         let page = self.frames[frame].as_ref().expect("mapped frame");
         if !page.permissions.allows(access) {
             return Err(MemoryError::Permission { address, access });
@@ -618,7 +680,7 @@ impl Memory {
             Self::end(address, input.len() as u64)?;
             let frame = self
                 .frame(address & !(PAGE_SIZE - 1))
-                .ok_or(MemoryError::Unmapped(address))?;
+                .ok_or_else(|| self.missing_page(address, Access::Write))?;
             let page = self.frames[frame].as_mut().expect("mapped frame");
             if !page.permissions.write {
                 return Err(MemoryError::Permission {
@@ -718,7 +780,7 @@ impl Memory {
         Self::end(address, N as u64)?;
         let frame = self
             .frame(address & !(PAGE_SIZE - 1))
-            .ok_or(MemoryError::Unmapped(address))?;
+            .ok_or_else(|| self.missing_page(address, Access::Write))?;
         let page = self.frames[frame].as_mut().expect("mapped frame");
         if !page.permissions.write {
             return Err(MemoryError::Permission {

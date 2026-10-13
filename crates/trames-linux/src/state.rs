@@ -393,7 +393,8 @@ impl Linux {
     }
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
-        if len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+        let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
+        if !reservation && len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
             return Err(Errno(12));
         }
         let flags = a[3];
@@ -438,6 +439,10 @@ impl Linux {
             memory
                 .map_backed(address, objects, shared, permissions, flags & 0x10 != 0)
                 .map_err(Self::memory_errno)?;
+        } else if reservation {
+            memory
+                .reserve(address, len, flags & 0x10 != 0)
+                .map_err(Self::memory_errno)?;
         } else if shared {
             memory
                 .map_shared_anonymous(address, len, permissions, flags & 0x10 != 0)
@@ -462,7 +467,9 @@ impl Linux {
         if a[3] & !3 != 0 || a[3] & 2 != 0 && a[3] & 1 == 0 {
             return Err(Errno(22));
         }
-        if new_len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+        if !memory.is_reserved(a[0], old_len)
+            && new_len > trames_memory::DEFAULT_MEMORY_LIMIT as u64
+        {
             return Err(Errno(12));
         }
         let fixed = a[3] & 2 != 0;
@@ -1224,7 +1231,9 @@ impl Linux {
                 if a[2] as u32 == 4 {
                     memory.discard(a[0], len).map_err(Self::memory_errno)?;
                 } else {
-                    memory.resident(a[0], len).map_err(Self::memory_errno)?;
+                    memory
+                        .validate_mapped(a[0], len)
+                        .map_err(Self::memory_errno)?;
                 }
                 Ok(0)
             }
@@ -1389,6 +1398,42 @@ mod tests {
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn stdio_nonblocking_ioctl_preserves_alias_flags_and_fault_atomicity() {
+        let mut linux = Linux::new(0x3000);
+        let mut m = memory();
+        let mut out = CapturedOutput::default();
+        let alias = linux.vfs.dup(1, 3, true).unwrap();
+        m.write(0x1000, &1u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            linux.syscall(29, [1, 0x5421, 0x1000, 0, 0, 0], &mut m, &mut out),
+            Ok(0)
+        );
+        assert_ne!(linux.vfs.flags(alias).unwrap() & O_NONBLOCK, 0);
+        assert_ne!(linux.vfs.flags(alias).unwrap() & trames_vfs::O_CLOEXEC, 0);
+        assert_eq!(
+            linux.syscall(
+                29,
+                [alias as u64, 0x5421, u64::MAX, 0, 0, 0],
+                &mut m,
+                &mut out
+            ),
+            Err(Errno(14))
+        );
+        assert_ne!(linux.vfs.flags(1).unwrap() & O_NONBLOCK, 0);
+        m.write(0x1000, &0u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            linux.syscall(
+                29,
+                [alias as u64, 0x5421, 0x1000, 0, 0, 0],
+                &mut m,
+                &mut out
+            ),
+            Ok(0)
+        );
+        assert_eq!(linux.vfs.flags(1).unwrap() & O_NONBLOCK, 0);
+    }
+
     #[test]
     fn invalid_read_buffer_does_not_consume_file_or_stdin() {
         let mut linux = Linux::new(0x3000);

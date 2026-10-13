@@ -5,7 +5,7 @@ use nix::{
     errno::Errno as HostErrno,
     poll::{poll, PollFd, PollFlags, PollTimeout},
 };
-use socket2::{Domain, Protocol, SockAddr, SockRef, Socket as RawNativeSocket, Type};
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket as RawNativeSocket, TcpKeepalive, Type};
 use std::{
     cell::Cell,
     io::{self, Read},
@@ -606,6 +606,27 @@ impl Socket {
                 }
             }
             (6, 1) if self.kind == 1 => self.native.control().set_tcp_nodelay(value != 0),
+            (6, 4..=6) if self.kind == 1 => {
+                if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
+                    return Err(NetError(22));
+                }
+                let parameters = match name {
+                    4 => TcpKeepalive::new().with_time(Duration::from_secs(value as u64)),
+                    5 => TcpKeepalive::new().with_interval(Duration::from_secs(value as u64)),
+                    _ => TcpKeepalive::new().with_retries(value as u32),
+                };
+                let socket = self.native.control();
+                let enabled = socket.keepalive().map_err(from_io)?;
+                let changed = socket.set_tcp_keepalive(&parameters);
+                // socket2 enables SO_KEEPALIVE; Linux's individual TCP options
+                // preserve it, including when the parameter operation fails.
+                let restored = if enabled {
+                    Ok(())
+                } else {
+                    socket.set_keepalive(false)
+                };
+                changed.and(restored)
+            }
             (41, 26) if self.family == 10 => self.native.control().set_only_v6(value != 0),
             (1, 20 | 21) => return Err(NetError(95)), // guest timeout state is not implemented
             _ => return Err(NetError(92)),
@@ -653,6 +674,23 @@ impl Socket {
             (6, 1) if self.kind == 1 => Ok(i32::from(
                 self.native.control().tcp_nodelay().map_err(from_io)?,
             )),
+            (6, 4) if self.kind == 1 => Ok(self
+                .native
+                .control()
+                .tcp_keepalive_time()
+                .map_err(from_io)?
+                .as_secs() as i32),
+            (6, 5) if self.kind == 1 => Ok(self
+                .native
+                .control()
+                .tcp_keepalive_interval()
+                .map_err(from_io)?
+                .as_secs() as i32),
+            (6, 6) if self.kind == 1 => Ok(self
+                .native
+                .control()
+                .tcp_keepalive_retries()
+                .map_err(from_io)? as i32),
             (41, 26) if self.family == 10 => {
                 Ok(i32::from(self.native.control().only_v6().map_err(from_io)?))
             }

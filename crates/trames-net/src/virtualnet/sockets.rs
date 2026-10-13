@@ -358,6 +358,9 @@ impl Socket {
             reuse: state.reuse,
             nodelay: state.nodelay,
             keepalive: state.keepalive,
+            keep_idle: state.keep_idle,
+            keep_interval: state.keep_interval,
+            keep_count: state.keep_count,
             backlog: 1,
             icmp_pending: None,
             hop_limit: state.hop_limit,
@@ -429,7 +432,9 @@ impl Socket {
         let mut state = self.state.borrow_mut();
         s.set_nagle_enabled(!state.nodelay);
         if state.keepalive {
-            s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
+            s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                state.keep_idle as u64,
+            )));
         }
         state.handles.push(n.sockets.add(s));
         state.bound = Some(bound);
@@ -772,6 +777,19 @@ impl Socket {
                 }
             }
             (6, 1) if self.kind == 1 => state.nodelay = value != 0,
+            (6, 4..=6) if self.kind == 1 => {
+                if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
+                    return Err(NetError(22));
+                }
+                match name {
+                    4 => state.keep_idle = value as u32,
+                    // smoltcp uses a single idle/probe interval. These two
+                    // Linux tuning values are retained for ABI compatibility;
+                    // they do not replace its retransmission/expiry policy.
+                    5 => state.keep_interval = value as u32,
+                    _ => state.keep_count = value as u32,
+                }
+            }
             (41, 26) if self.family == 10 => {
                 if matches!(self.kind, 3 | 4) && value == 0 {
                     return Err(NetError(95));
@@ -793,7 +811,7 @@ impl Socket {
                 s.set_keep_alive(
                     state
                         .keepalive
-                        .then_some(smoltcp::time::Duration::from_secs(30)),
+                        .then_some(smoltcp::time::Duration::from_secs(state.keep_idle as u64)),
                 );
             }
         }
@@ -834,6 +852,9 @@ impl Socket {
             (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
             (1, 7 | 8) => Ok(BUFFER as i32),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
+            (6, 4) if self.kind == 1 => Ok(state.keep_idle as i32),
+            (6, 5) if self.kind == 1 => Ok(state.keep_interval as i32),
+            (6, 6) if self.kind == 1 => Ok(state.keep_count as i32),
             (41, 26) if self.family == 10 => Ok(i32::from(state.v6_only)),
             _ => Err(NetError(92)),
         }

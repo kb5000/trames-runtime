@@ -1073,11 +1073,9 @@ impl Vfs {
     pub fn set_status_flags(&mut self, fd: u32, flags: u32) -> Result<()> {
         let d = self.descriptor(fd)?;
         let mut o = d.open.borrow_mut();
-        if matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
-            && flags & O_NONBLOCK != 0
-        {
-            return Err(Errno(38));
-        }
+        // Embedding input is polled and output can report WouldBlock. Keep
+        // O_NONBLOCK on these open descriptions just like guest pipes; the
+        // scheduler already retries EAGAIN only for blocking descriptors.
         const CHANGEABLE: u32 = 0x400 | O_NONBLOCK;
         if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | 0x101000) != 0 {
             return Err(Errno(22));

@@ -93,7 +93,7 @@ impl Memory {
         Self::end(address, len as u64)?;
         let frame = self
             .frame(address & !(PAGE_SIZE - 1))
-            .ok_or(MemoryError::Unmapped(address))?;
+            .ok_or_else(|| self.missing_page(address, Access::Write))?;
         let page = self.frames[frame].as_ref().expect("mapped frame");
         if !page.permissions.write {
             return Err(MemoryError::Permission {

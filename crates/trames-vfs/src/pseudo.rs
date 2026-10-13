@@ -232,6 +232,7 @@ pub struct ProcessInfo {
     pub executable: Vec<u8>,
     pub cwd: Vec<u8>,
     pub mapped_bytes: usize,
+    pub virtual_bytes: u64,
     pub maps: Vec<u8>,
     pub user_ticks: u64,
     pub start_ticks: u64,
@@ -879,7 +880,7 @@ impl Vfs {
                         b"mountinfo" => mountinfo().to_vec(),
                         b"statm" => format!(
                             "{} {} 0 0 0 0 0\n",
-                            p.mapped_bytes / 4096,
+                            p.virtual_bytes / 4096,
                             p.mapped_bytes / 4096
                         )
                         .into_bytes(),
@@ -907,7 +908,7 @@ impl Vfs {
                                 .count()
                                 .to_string();
                             fields[19] = p.start_ticks.to_string();
-                            fields[20] = p.mapped_bytes.to_string();
+                            fields[20] = p.virtual_bytes.to_string();
                             fields[21] = (p.mapped_bytes / 4096).to_string();
                             fields[22] = u64::MAX.to_string();
                             format!("{} ({name}) {}\n", p.pid, fields.join(" ")).into_bytes()
@@ -919,7 +920,7 @@ impl Vfs {
                                 .replace('\n', "_");
                             let threads = r.processes.iter().filter(|t| t.tgid == p.tgid).count();
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
-                                c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.mapped_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
+                                c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => {
                             let (soft, hard) = p.file_size_limits.unwrap_or((u64::MAX, u64::MAX));

@@ -28,12 +28,16 @@ pub(super) struct Backed {
     pub private_copy: bool,
 }
 impl Page {
+    #[inline]
     pub(super) fn check_backing(&self, address: u64) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
             b.object.check(address)?;
         }
         Ok(())
     }
+    // Fixed-size interpreter callers should compile resident copies to host
+    // loads/stores. Live backing and COW checks still run on every access.
+    #[inline]
     pub(super) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
             if b.shared || !b.private_copy {
@@ -43,6 +47,7 @@ impl Page {
         out.copy_from_slice(&self.bytes[offset..offset + out.len()]);
         Ok(())
     }
+    #[inline]
     pub(super) fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if let Some(b) = &mut self.backing {
             if b.shared {
@@ -111,18 +116,10 @@ impl Memory {
             return shared.borrow().sync_range(address, len);
         }
         let end = Self::mapping_end(address, len)?;
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            if !self.pages.contains_key(&base) {
-                return Err(MemoryError::Unmapped(base));
-            }
-        }
+        self.check_mapped_range(address, end)?;
         let mut synced = std::collections::BTreeSet::new();
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            if let Some(b) = &self.frames[self.pages[&base]]
-                .as_ref()
-                .expect("page")
-                .backing
-            {
+        for (_, &frame) in self.pages.range(address..end) {
+            if let Some(b) = &self.frames[frame].as_ref().expect("page").backing {
                 if b.shared && b.object.sync_key().is_none_or(|key| synced.insert(key)) {
                     b.object.sync()?;
                 }
@@ -135,16 +132,14 @@ impl Memory {
             return shared.borrow().resident(address, len);
         }
         let end = Self::mapping_end(address, len)?;
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            if !self.pages.contains_key(&base) {
-                return Err(MemoryError::Unmapped(base));
-            }
-        }
+        self.check_mapped_range(address, end)?;
         Ok((address..end)
             .step_by(PAGE_SIZE as usize)
             .map(|base| {
-                let page = self.frames[self.pages[&base]].as_ref().expect("page");
-                u8::from(page.check_backing(base).is_ok())
+                self.pages.get(&base).map_or(0, |&frame| {
+                    let page = self.frames[frame].as_ref().expect("page");
+                    u8::from(page.check_backing(base).is_ok())
+                })
             })
             .collect()) // Existing valid page objects are eagerly resident.
     }
@@ -153,14 +148,10 @@ impl Memory {
             return shared.borrow_mut().discard(address, len);
         }
         let end = Self::mapping_end(address, len)?;
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            if !self.pages.contains_key(&base) {
-                return Err(MemoryError::Unmapped(base));
-            }
-        }
+        self.check_mapped_range(address, end)?;
         self.advance_code_revision();
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            let page = self.frames[self.pages[&base]].as_mut().expect("page");
+        for (_, &frame) in self.pages.range(address..end) {
+            let page = self.frames[frame].as_mut().expect("page");
             if page.backing.as_ref().is_some_and(|b| b.shared) {
                 continue;
             }
@@ -193,6 +184,19 @@ impl Memory {
         if old != new && new < old_end && old < new_end {
             return Err(MemoryError::InvalidRange);
         }
+        if self.is_reserved(old, old_len) {
+            // Both splits and the final insertion must fit before either
+            // source or destination changes. Conservative near the metadata cap.
+            self.check_reservation_split(0, 0, 4)?;
+            if old == new && new_len > old_len && !self.is_free(old_end, new_len - old_len) {
+                return Err(MemoryError::Overlap(old_end));
+            }
+            if old != new && !fixed && !self.is_free(new, new_len) {
+                return Err(MemoryError::Overlap(new));
+            }
+            self.unmap(old, old_len)?;
+            return self.reserve(new, new_len, fixed);
+        }
         let mut pages = Vec::new();
         for base in (old..old_end).step_by(PAGE_SIZE as usize) {
             pages.push(
@@ -222,6 +226,9 @@ impl Memory {
         };
         if old != new && !fixed && !self.is_free(new, new_len) {
             return Err(MemoryError::Overlap(new));
+        }
+        if fixed && old != new {
+            self.check_reservation_split(new, new_end, 0)?;
         }
         if (self.mapped_bytes() as u64)
             .saturating_sub(old_len + if old == new { 0 } else { replaced })
