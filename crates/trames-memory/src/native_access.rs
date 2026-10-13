@@ -90,10 +90,18 @@ impl Memory {
         if len > PAGE_SIZE as usize - offset {
             return Err(MemoryError::InvalidRange);
         }
-        self.check(address, len, Access::Write)?;
+        Self::end(address, len as u64)?;
         let frame = self
             .frame(address & !(PAGE_SIZE - 1))
-            .expect("checked frame");
+            .ok_or(MemoryError::Unmapped(address))?;
+        let page = self.frames[frame].as_ref().expect("mapped frame");
+        if !page.permissions.write {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Write,
+            });
+        }
+        page.check_backing(address)?;
         // Materialize MAP_PRIVATE before borrowing it. check_backing above still
         // enforces live EOF/SIGBUS even after a private copy has been made.
         let page = self.frames[frame].as_mut().expect("checked page");
@@ -146,6 +154,18 @@ impl Memory {
         let address = address & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().fill_with(address, len, fill);
+        }
+        if len == 0 {
+            return Ok(Transfer::default());
+        }
+        let offset = (address % PAGE_SIZE) as usize;
+        if len <= PAGE_SIZE as usize - offset {
+            let (_, direct) = self.with_write_chunk(address, len, fill)?;
+            return Ok(Transfer {
+                direct_write: if direct { len as u64 } else { 0 },
+                buffered_write: if direct { 0 } else { len as u64 },
+                ..Transfer::default()
+            });
         }
         self.check(address, len, Access::Write)?;
         let mut stats = Transfer::default();
@@ -402,6 +422,14 @@ mod tests {
                 .unwrap(),
             (7, true)
         );
+        // Live alias bytes change between calls; a resident private copy stays
+        // detached, while backed C-string reads still observe each current NUL.
+        memory.write(0x3000, b"live\0").unwrap();
+        assert_eq!(memory.read_c_string(0x1000, 4096).unwrap(), b"live");
+        memory.write(0x3000, b"new\0").unwrap();
+        assert_eq!(memory.read_c_string(0x1000, 4096).unwrap(), b"new");
+        assert_eq!(memory.read_c_string(0x5000, 1), Err(MemoryError::Limit));
+        memory.write(0x3000, &expected).unwrap();
         memory.read(0x3000, &mut actual).unwrap();
         assert_eq!(actual, expected);
         let before = memory.revision();

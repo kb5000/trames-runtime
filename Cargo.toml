@@ -13,7 +13,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/kb5000/trames"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
 
 [profile.release]
 overflow-checks = true

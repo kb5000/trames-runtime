@@ -405,15 +405,16 @@ impl Memory {
                 .ok_or(MemoryError::InvalidRange)?;
             let offset = (current & (PAGE_SIZE - 1)) as usize;
             let length = (limit - bytes.len()).min(PAGE_SIZE as usize - offset);
-            let page = self.page_for_access(current, length, Access::Read)?;
-            let mut bytes_part = vec![0; length];
-            page.read_bytes(offset, &mut bytes_part)?;
-            let part = &bytes_part;
-            if let Some(end) = part.iter().position(|&byte| byte == 0) {
-                bytes.extend_from_slice(&part[..end]);
+            // Borrow resident bytes directly. Live backings retain the scoped
+            // snapshot and EOF checks; only the returned owned string allocates.
+            let (terminated, _) = self.with_read_chunk(current, length, |part| {
+                let end = part.iter().position(|&byte| byte == 0);
+                bytes.extend_from_slice(&part[..end.unwrap_or(part.len())]);
+                end.is_some()
+            })?;
+            if terminated {
                 return Ok(bytes);
             }
-            bytes.extend_from_slice(part);
         }
         Err(MemoryError::Limit)
     }
@@ -1010,6 +1011,39 @@ mod tests {
         assert_eq!(m.read_c_string(0x1ffe, 1), Err(MemoryError::Limit));
         m.write(0x1fff, &[1]).unwrap();
         assert!(m.read_c_string(0x1ffe, 4).is_err());
+    }
+    #[test]
+    fn borrowed_c_strings_keep_page_boundaries_tags_and_shared_vm_permissions() {
+        let mut m = Memory::default();
+        m.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        m.write(0x1ffe, b"ab\xff\0").unwrap();
+        assert_eq!(
+            m.read_c_string(0xab00_0000_0000_1ffe, 4).unwrap(),
+            b"ab\xff"
+        );
+        assert_eq!(m.read_c_string(0x1ffe, 3), Err(MemoryError::Limit));
+        let mut thread = m.share();
+        thread.write(0x2fff, &[0]).unwrap();
+        assert_eq!(m.read_c_string(0x2fff, 65536).unwrap(), b"");
+        thread
+            .protect(
+                0x2000,
+                PAGE_SIZE,
+                Permissions {
+                    read: false,
+                    write: true,
+                    execute: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            m.read_c_string(0x2000, 1),
+            Err(MemoryError::Permission {
+                address: 0x2000,
+                access: Access::Read
+            })
+        );
+        assert_eq!(m.read_c_string(u64::MAX, 0), Err(MemoryError::Limit));
     }
 
     #[test]
