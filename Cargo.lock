@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "trames-accel"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "sha2",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "trames-bridge"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "trames-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde_json",
  "trames-core",
@@ -432,11 +432,11 @@ dependencies = [
 
 [[package]]
 name = "trames-compute"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "trames-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "trames-accel",
  "trames-cpu",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "trames-cpu"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom",
  "trames-compute",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "trames-distro"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "flate2",
  "sha2",
@@ -470,14 +470,14 @@ dependencies = [
 
 [[package]]
 name = "trames-elf"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "trames-memory",
 ]
 
 [[package]]
 name = "trames-ffi"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "trames-linux"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom",
  "trames-cpu",
@@ -501,15 +501,15 @@ dependencies = [
 
 [[package]]
 name = "trames-memory"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "trames-native"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "trames-net"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom",
  "nix",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "trames-vfs"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom",
  "trames-bridge",
