@@ -8,7 +8,7 @@ mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use cpu_memory::{CpuMemory, CpuSlice};
-pub use native_access::Transfer;
+pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use std::{
     cell::{Cell, RefCell},

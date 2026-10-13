@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! CPU-only views between quiescent kernel checkpoints. Rc backings, mappings,
-//! COW and native slice borrows stay on the coordinator. No unsafe Send/Sync.
+//! CPU/native views between quiescent kernel checkpoints. Scoped page guards
+//! stay on workers; Rc backings, mappings and persistence stay coordinated.
+//! No unsafe Send/Sync.
+mod native;
 use super::*;
 use std::sync::{Mutex, Weak};
 
@@ -13,6 +15,17 @@ struct Bytes {
     bytes: Box<[u8; PAGE_SIZE as usize]>,
     version: u64,
     reservations: [u64; 256],
+    reservation_base: u64,
+    reservation_written: [u64; 4],
+}
+impl Bytes {
+    fn reservation(&self, slot: usize) -> u64 {
+        if self.reservation_written[slot / 64] & (1u64 << (slot % 64)) != 0 {
+            self.reservations[slot]
+        } else {
+            self.reservation_base
+        }
+    }
 }
 struct ConcurrentPage {
     identity: u64,
@@ -32,6 +45,8 @@ impl ConcurrentPage {
                 bytes: Box::new(bytes),
                 version: 0,
                 reservations: [0; 256],
+                reservation_base: 0,
+                reservation_written: [0; 4],
             })),
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
@@ -41,8 +56,17 @@ impl ConcurrentPage {
     }
     fn changed(&self, state: &mut Bytes, offset: usize, len: usize) {
         state.version = state.version.wrapping_add(1);
-        for slot in offset / 16..=(offset + len - 1) / 16 {
-            state.reservations[slot] = state.version;
+        if offset == 0 && len == PAGE_SIZE as usize {
+            // One epoch invalidates every granule without another 2 KiB store
+            // per 4 KiB copy/fill. Explicit bits preserve partial updates and
+            // counter wrap; no numeric max(version, base) assumption is made.
+            state.reservation_base = state.version;
+            state.reservation_written = [0; 4];
+        } else {
+            for slot in offset / 16..=(offset + len - 1) / 16 {
+                state.reservations[slot] = state.version;
+                state.reservation_written[slot / 64] |= 1u64 << (slot % 64);
+            }
         }
         self.version.store(state.version, Ordering::Release);
         // One bit per 64-byte fragment. No unrelated clean bytes are written
@@ -65,8 +89,8 @@ impl ConcurrentPage {
             // A coordinator ABA write invalidates reservations even if bytes match.
             s.bytes.copy_from_slice(bytes);
             s.version = s.version.wrapping_add(1);
-            let version = s.version;
-            s.reservations.fill(version);
+            s.reservation_base = s.version;
+            s.reservation_written = [0; 4];
             self.version.store(s.version, Ordering::Release);
             if self.executable.load(Ordering::Relaxed) {
                 self.code_epoch.fetch_add(1, Ordering::Release);
@@ -81,10 +105,14 @@ struct Frame {
     code_revision: u64,
     data_revision: AtomicU64,
     backing_version: AtomicU64,
+    native_retryable: std::sync::atomic::AtomicBool,
+    native_one_shot: std::sync::atomic::AtomicBool,
+    native_live_private: std::sync::atomic::AtomicBool,
     error: Option<MemoryError>,
     bytes: Arc<ConcurrentPage>,
 }
 struct Snapshot {
+    has_aliases: bool,
     dynamic_code: bool,
     positions: Vec<Option<usize>>,
     backing_revision: u64,
@@ -104,6 +132,13 @@ pub(super) struct SnapshotCache {
 pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
+}
+/// Clone a worker-local view over the same frozen address space, with its own
+/// translation cells. This is a shared-VM view, not a process fork.
+impl Clone for View {
+    fn clone(&self) -> Self {
+        Self::new(self.snapshot.clone())
+    }
 }
 impl View {
     fn new(snapshot: Arc<Snapshot>) -> Self {
@@ -315,7 +350,7 @@ impl CpuMemory for View {
         let guard = frame.bytes.bytes.lock().unwrap();
         let s = guard.as_ref().expect("mutable page");
         out.copy_from_slice(&s.bytes[offset..offset + out.len()]);
-        Ok((frame.bytes.identity as u128) << 64 | s.reservations[offset / 16] as u128)
+        Ok((frame.bytes.identity as u128) << 64 | s.reservation(offset / 16) as u128)
     }
     fn exclusive_write(
         &mut self,
@@ -331,7 +366,7 @@ impl CpuMemory for View {
         let mut guard = frame.bytes.bytes.lock().unwrap();
         let state = guard.as_mut().expect("writable page");
         if token
-            != Some((frame.bytes.identity as u128) << 64 | state.reservations[offset / 16] as u128)
+            != Some((frame.bytes.identity as u128) << 64 | state.reservation(offset / 16) as u128)
         {
             return Ok(false);
         }
@@ -371,10 +406,20 @@ impl Memory {
             .map(|(identity, offset)| (identity, offset, address % PAGE_SIZE)))
     }
     /// Freeze mapping metadata while retaining coherent shared bytes. The host
-    /// must join every view user before kernel/native operations or commit.
+    /// must join every view user before kernel operations or backing commit.
     pub fn parallel_view(&mut self, registry: &mut Registry) -> Option<View> {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().parallel_view(registry);
+        }
+        // A resumed runtime can construct a new coordinator registry. Cached
+        // shared pages must join that registry's alias/code domain, not silently
+        // retain an earlier one while fork peers allocate duplicate snapshots.
+        if self
+            .parallel_cache
+            .as_ref()
+            .is_some_and(|c| !Arc::ptr_eq(&c.snapshot.code_epoch, &registry.code_epoch))
+        {
+            self.parallel_cache = None;
         }
         let backing_revision = backing::backing_revision();
         if let Some(c) = &self.parallel_cache {
@@ -404,6 +449,18 @@ impl Memory {
                 let mut data = [0; PAGE_SIZE as usize];
                 page.read_bytes(0, &mut data).ok()?;
                 frame.bytes.refresh(&data);
+                frame
+                    .native_retryable
+                    .store(page.native_retryable(), Ordering::Relaxed);
+                frame
+                    .native_one_shot
+                    .store(page.native_one_shot(), Ordering::Relaxed);
+                frame.native_live_private.store(
+                    page.backing
+                        .as_ref()
+                        .is_some_and(|b| !b.shared && !b.private_copy),
+                    Ordering::Relaxed,
+                );
                 frame
                     .data_revision
                     .store(page.data_revision, Ordering::Relaxed);
@@ -495,11 +552,24 @@ impl Memory {
                 code_revision: page.instruction_revision,
                 data_revision: AtomicU64::new(page.data_revision),
                 backing_version: AtomicU64::new(backing_version),
+                native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
+                native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
+                native_live_private: std::sync::atomic::AtomicBool::new(
+                    page.backing
+                        .as_ref()
+                        .is_some_and(|b| !b.shared && !b.private_copy),
+                ),
                 error,
                 bytes,
             });
         }
         let snapshot = Arc::new(Snapshot {
+            has_aliases: {
+                let mut identities = std::collections::BTreeSet::new();
+                frames
+                    .iter()
+                    .any(|frame| !identities.insert(frame.bytes.identity))
+            },
             dynamic_code: frames
                 .iter()
                 .any(|frame| frame.permissions.execute && frame.bytes.constant.is_none()),
@@ -555,6 +625,18 @@ impl Memory {
                 let page = self.frames[frame.root_frame]
                     .as_ref()
                     .expect("committed page");
+                frame
+                    .native_retryable
+                    .store(page.native_retryable(), Ordering::Relaxed);
+                frame
+                    .native_one_shot
+                    .store(page.native_one_shot(), Ordering::Relaxed);
+                frame.native_live_private.store(
+                    page.backing
+                        .as_ref()
+                        .is_some_and(|b| !b.shared && !b.private_copy),
+                    Ordering::Relaxed,
+                );
                 frame
                     .data_revision
                     .store(page.data_revision, Ordering::Relaxed);

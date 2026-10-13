@@ -11,6 +11,126 @@ pub struct Transfer {
     pub buffered_write: u64,
 }
 
+/// A checkpoint request has no guest write effects; worker callers may safely
+/// retry against coordinator memory after all views are joined.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeAccessError {
+    Memory(MemoryError),
+    Checkpoint,
+}
+impl From<MemoryError> for NativeAccessError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+/// Checked pure-native transport for coordinator memory and worker snapshots.
+/// Borrows are callback-scoped; callers never retain guards or host pointers.
+pub trait NativeMemory: CpuMemory {
+    fn native_writable_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError>;
+    fn native_output_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError>;
+    fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError>;
+    fn native_read_array<const N: usize>(
+        &self,
+        address: u64,
+    ) -> Result<[u8; N], NativeAccessError> {
+        let mut bytes = [0; N];
+        self.native_read(address, &mut bytes)?;
+        Ok(bytes)
+    }
+    fn with_read_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), NativeAccessError>;
+    /// Pair reads must handle physical aliases without recursively locking them.
+    fn with_read_pair<T>(
+        &self,
+        left: u64,
+        right: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8], &[u8]) -> T,
+    ) -> Result<(T, bool, bool), NativeAccessError>;
+    fn fill_with(
+        &mut self,
+        address: u64,
+        len: usize,
+        fill: impl FnMut(&mut [u8]),
+    ) -> Result<Transfer, NativeAccessError>;
+    fn copy_with(
+        &mut self,
+        destination: u64,
+        source: u64,
+        len: usize,
+        copy: impl FnMut(&mut [u8], &[u8]),
+    ) -> Result<Transfer, NativeAccessError>;
+}
+impl NativeMemory for Memory {
+    fn native_writable_range(&self, a: u64, n: usize) -> Result<bool, NativeAccessError> {
+        Memory::native_writable_range(self, a, n).map_err(Into::into)
+    }
+    fn native_output_range(&self, a: u64, n: usize) -> Result<bool, NativeAccessError> {
+        Memory::native_output_range(self, a, n).map_err(Into::into)
+    }
+    fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError> {
+        self.read(address, out).map_err(Into::into)
+    }
+    fn with_read_chunk<T>(
+        &self,
+        a: u64,
+        n: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), NativeAccessError> {
+        Memory::with_read_chunk(self, a, n, f).map_err(Into::into)
+    }
+    fn with_read_pair<T>(
+        &self,
+        a: u64,
+        b: u64,
+        n: usize,
+        f: impl FnOnce(&[u8], &[u8]) -> T,
+    ) -> Result<(T, bool, bool), NativeAccessError> {
+        let (right, ld) = self.with_read_chunk(a, n, |left| {
+            self.with_read_chunk(b, n, |right| f(left, right))
+        })?;
+        let (value, rd) = right?;
+        Ok((value, ld, rd))
+    }
+    fn fill_with(
+        &mut self,
+        a: u64,
+        n: usize,
+        f: impl FnMut(&mut [u8]),
+    ) -> Result<Transfer, NativeAccessError> {
+        Memory::fill_with(self, a, n, f).map_err(Into::into)
+    }
+    fn copy_with(
+        &mut self,
+        d: u64,
+        s: u64,
+        n: usize,
+        f: impl FnMut(&mut [u8], &[u8]),
+    ) -> Result<Transfer, NativeAccessError> {
+        Memory::copy_with(self, d, s, n, f).map_err(Into::into)
+    }
+}
+impl Page {
+    pub(super) fn native_retryable(&self) -> bool {
+        self.permissions.write
+            && self
+                .backing
+                .as_ref()
+                .is_none_or(|b| !b.shared && b.private_copy)
+    }
+    pub(super) fn native_one_shot(&self) -> bool {
+        self.backing.as_ref().is_none_or(|b| {
+            (!b.shared && b.private_copy)
+                || (b.object.native_resident() && (!b.shared || b.object.writable()))
+        })
+    }
+}
+
 impl Memory {
     /// Whether a checked readable range can also be written without live backing
     /// I/O. Used for operations whose guest-owned continuation must remain safe
@@ -30,10 +150,7 @@ impl Memory {
                 let p = self.frames[self.pages[&base]]
                     .as_ref()
                     .expect("checked page");
-                p.permissions.write
-                    && p.backing
-                        .as_ref()
-                        .is_none_or(|b| !b.shared && b.private_copy)
+                p.native_retryable()
             }))
     }
     /// Preflight output for a pure one-shot operation. Unlike callback state,
@@ -54,10 +171,7 @@ impl Memory {
                 let page = self.frames[self.pages[&base]]
                     .as_ref()
                     .expect("checked page");
-                page.backing.as_ref().is_none_or(|b| {
-                    (!b.shared && b.private_copy)
-                        || (b.object.native_resident() && (!b.shared || b.object.writable()))
-                })
+                page.native_one_shot()
             }))
     }
 
