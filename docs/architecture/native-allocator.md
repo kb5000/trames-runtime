@@ -143,9 +143,12 @@ slot. The allocator is not restarted. The first implementation held the lock
 through framing and regressed the four-CPU allocation workload; that diagnostic
 led to restoring the original unlock boundary.
 
-Scalar stores initially form a bounded journal (at most 16 operations), with
-read-after-write forwarding. All destinations are checked before publication.
-No whole-context snapshot is copied back. Native per-call caching covers only
+Scalar stores initially form a bounded native C journal (at most 16 operations),
+with read-after-write forwarding. Publication transfers its initialized prefix
+once, at the first CAS or after the native body returns; individual staged
+stores no longer call Rust. The unused journal slots use `MaybeUninit`, and the
+private producer count exposes only completely initialized records. All destinations are checked before publication.
+No whole-context snapshot is copied back. Native per-call value caching covers only
 nonvolatile mem/control fields stable under the original lock or live-slot
 lifetime, and every staged store invalidates that cache. Volatile availability
 and freed masks always read current guest bytes. Free's first CAS publishes original
@@ -179,8 +182,22 @@ faults take precedence over that request, and no output is exposed on failure.
 The allocator journal still preflights all output before its first mutation:
 this protects original-code fallback and is not a second memory permission
 policy. Scoped host pointers and region guards never survive a guest callback.
-Per-field C/Rust callbacks, original allocator locking and cold-path fallback
-remain costs to address; sharing the access model alone is not a speed claim.
+Coordinator `Memory` can lend owned anonymous/resident-private page bytes after
+the same CPU translation, permission and backing validation. A four-slot native
+address cache reuses that page conversion for subsequent in-page scalar reads;
+loads still read current bytes, with unaligned-safe copies and staged-write
+forwarding. The containing synchronous call owns the allocation: no Arc clone,
+whole-page data snapshot, new lock or per-field Rust callback is required. C
+invalidates all descriptors before CAS/publication, and none survives execute.
+Real COW and executable/dirty/reservation updates remain CPU writes. Live/shared,
+custom/reentrant and cross-page inputs retain checked scalar transport.
+
+Mutable parallel worker pages do not expose unguarded C pointers. Their original
+CPU scalar/atomic accesses continue under the common region protocol. Native
+journaling still eliminates individual store callbacks, and publishing a batch
+writes each scalar separately; it does not acquire a function-wide lock or turn
+a thread-unsafe function into a thread-safe one. Original allocator locking,
+entry/return transitions and cold-path fallback remain costs to address.
 
 Malformed/extreme metadata must not invoke host C undefined behavior. Checked
 class indexes, input sizes, signed-offset bounds and framing stride admission
@@ -191,7 +208,10 @@ code invalidation and dirty commit hooks.
 
 Metrics distinguish allocator_calls, allocator_slot_reservations,
 allocator_allocations (native framing completions), allocator_frees and
-allocator_free_resumes. The existing bulk byte counters describe the earlier
+allocator_free_resumes. Additional counters record allocator_load_callbacks,
+allocator_page_callbacks, allocator_direct_loads and allocator_journal_writes.
+They include attempts/fallbacks and merge worker-local counts; journal writes
+are staged records, not individually committed stores. The existing bulk byte counters describe the earlier
 copy/scan/parser transports, not these scalar metadata accesses.
 
 ## Next implementation batches

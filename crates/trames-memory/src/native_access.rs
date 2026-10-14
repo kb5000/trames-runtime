@@ -25,8 +25,21 @@ impl From<MemoryError> for NativeAccessError {
 }
 
 /// Checked pure-native transport for coordinator memory and worker snapshots.
-/// Borrows are callback-scoped; callers never retain guards or host pointers.
+/// Mutable borrows are callback-scoped. Optional coordinator page borrows reuse
+/// owned bytes only until publication; no guard survives a guest callback.
 pub trait NativeMemory: CpuMemory {
+    /// The mapping and eligible page contents cannot change externally during
+    /// this synchronous coordinator call. Never true for parallel worker views.
+    fn native_read_pages_enabled(&self) -> bool {
+        false
+    }
+    fn native_read_page(
+        &self,
+        _address: u64,
+        _len: usize,
+    ) -> Result<Option<&[u8; PAGE_SIZE as usize]>, NativeAccessError> {
+        Ok(None)
+    }
     fn native_writable_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError>;
     fn native_output_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError>;
     fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError>;
@@ -67,6 +80,37 @@ pub trait NativeMemory: CpuMemory {
     ) -> Result<Transfer, NativeAccessError>;
 }
 impl NativeMemory for Memory {
+    fn native_read_pages_enabled(&self) -> bool {
+        self.shared.is_none() && self.cpu_borrow_safe
+    }
+    fn native_read_page(
+        &self,
+        address: u64,
+        len: usize,
+    ) -> Result<Option<&[u8; PAGE_SIZE as usize]>, NativeAccessError> {
+        let address = address & 0x00ffffffffffffff;
+        if self.shared.is_some() {
+            // cpu_slice lends safe shared VMs directly; a standalone access
+            // cannot return a slice through a temporary RefCell guard.
+            return Ok(None);
+        }
+        let offset = (address % PAGE_SIZE) as usize;
+        if len == 0 || len > PAGE_SIZE as usize - offset || !self.cpu_borrow_safe {
+            return Ok(None);
+        }
+        // Reuse the exact CPU translation, permission and backing check. A
+        // live/shared provider must retain its ordinary transport; only owned
+        // anonymous bytes or resident private copies can be borrowed here.
+        let page = self.page_for_access(address, len, Access::Read)?;
+        if page
+            .backing
+            .as_ref()
+            .is_some_and(|b| b.shared || !b.private_copy || !b.object.native_resident())
+        {
+            return Ok(None);
+        }
+        Ok(Some(&page.bytes))
+    }
     #[inline]
     fn native_writable_range(&self, a: u64, n: usize) -> Result<bool, NativeAccessError> {
         Memory::native_writable_range(self, a, n).map_err(Into::into)
@@ -451,6 +495,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_borrows_reuse_owned_bytes_and_preserve_cpu_faults_without_false_cow() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x1008, 42u64.to_le_bytes()).unwrap();
+        let page = memory
+            .native_read_page(0xab00_0000_0000_1008, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&page[8..16], &42u64.to_le_bytes());
+        let original = page.as_ptr();
+        assert_eq!(
+            Arc::strong_count(&memory.frames[0].as_ref().unwrap().bytes),
+            1
+        );
+        assert!(memory.native_read_page(0x1ffc, 8).unwrap().is_none());
+        memory.write_array(0x1008, 99u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            memory
+                .native_read_page(0x1008, 8)
+                .unwrap()
+                .unwrap()
+                .as_ptr(),
+            original
+        );
+        assert_eq!(memory.read_u64(0x1008).unwrap(), 99);
+        memory
+            .protect(0x1000, PAGE_SIZE, Permissions::NONE)
+            .unwrap();
+        assert!(matches!(
+            memory.native_read_page(0x1008, 8),
+            Err(NativeAccessError::Memory(MemoryError::Permission {
+                address: 0x1008,
+                access: Access::Read
+            }))
+        ));
+        memory.unmap(0x1000, PAGE_SIZE).unwrap();
+        assert!(matches!(
+            memory.native_read_page(0x1008, 8),
+            Err(NativeAccessError::Memory(MemoryError::Unmapped(0x1008)))
+        ));
+        assert!(!Memory::default()
+            .parallel_view(&mut parallel::Registry::default())
+            .unwrap()
+            .native_read_pages_enabled());
+    }
+
+    #[test]
     fn direct_shared_borrows_preserve_alias_fork_code_and_parallel_visibility() {
         use crate::{parallel::Registry, CpuMemory};
         let mut m = Memory::default();
@@ -475,6 +566,8 @@ mod tests {
             .clone();
         m.map_backed(0x3000, vec![object], true, Permissions::RW, false)
             .unwrap();
+        assert!(m.native_read_page(0x1000, 8).unwrap().is_none());
+        assert!(m.native_read_page(0x3000, 8).unwrap().is_none());
         let child = m.clone();
         let token = m.instruction_page_identity(0x1000).unwrap();
         assert!(m.with_write_chunk(0x3000, 16, |b| b.fill(42)).unwrap().1);
