@@ -60,11 +60,20 @@ CPU accesses validate once; checked native control reads share the transport
 helper. Coordinator Memory also combines copy admission with range validation,
 reducing repeated BTreeMap lookups in the single-CPU direct path.
 Built-in anonymous/VFS backings explicitly promise their CPU check/read/write/
-version methods cannot re-enter Memory. CLONE_VM then borrows the local address
-space once per CPU slice, dropping that borrow before every returned event.
+version and scoped native-span methods cannot re-enter Memory. CLONE_VM then
+borrows the local address space once per CPU slice or native entry, dropping
+that borrow before every returned event or guest callback.
 Custom backings default to individual access borrows; a reentrant readonly
 provider test verifies their existing behavior. Admission is conservatively
 latched on mapping changes, with no per-instruction page-table scan.
+
+CPU and native worker scalar reads now enter the same checked implementation.
+A single-page native read resolves the frame once, retaining the CPU permission,
+EOF and region-access behavior; only live private backing adds native checkpoint
+admission. Cross-page validation finishes before bytes are exposed, and CPU
+faults take precedence over checkpoint deferral. Original-source allocator
+loads/stores use the same fixed-width 1/2/4/8-byte operand interfaces. Fallback
+output preflight remains a publication rule, separate from memory permissions.
 
 [Validation and one alternating before/after batch](../validation/region-memory.md)
 include disjoint held borrows, overlapping masks/unwind, atomic pairs, aliases,
