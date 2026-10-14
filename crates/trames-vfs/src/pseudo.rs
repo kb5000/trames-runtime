@@ -239,6 +239,7 @@ pub struct ProcessInfo {
     pub user_ticks: u64,
     pub start_ticks: u64,
     pub terminal: bool,
+    pub terminal_number: u32,
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
@@ -317,7 +318,7 @@ pub(super) enum Device {
     Full,
     Random,
     Urandom,
-    Pts,
+    Pts(u32),
     Ptmx,
     Bridge,
     Vda,
@@ -331,7 +332,7 @@ impl Device {
             Self::Full => 0x107,
             Self::Random => 0x108,
             Self::Urandom => 0x109,
-            Self::Pts => 0x8800,
+            Self::Pts(id) => 0x8800 + id as u64,
             Self::Ptmx => 0x502,
             Self::Bridge => 0xf000,
             Self::Vda => 0xfd00,
@@ -344,7 +345,7 @@ impl Device {
             Self::Zero | Self::Full => {}
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
             Self::Kmsg => return Err(Errno(29)),
-            Self::Pts => return Err(Errno(11)),
+            Self::Pts(_) => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
             Self::Bridge => return Err(Errno(19)),
             Self::Vda | Self::Vda1 => return Err(Errno(95)),
@@ -355,7 +356,7 @@ impl Device {
         match self {
             Self::Full if !data.is_empty() => Err(Errno(28)),
             Self::Kmsg => Err(Errno(29)),
-            Self::Pts => Err(Errno(11)),
+            Self::Pts(_) => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
             Self::Bridge => Err(Errno(19)),
             Self::Vda | Self::Vda1 => Err(Errno(95)),
@@ -449,6 +450,14 @@ impl Vfs {
                             p.extend_from_slice(b" (deleted)");
                             p
                         }),
+                    FdKind::Terminal if o.pty.is_some() => {
+                        let end = o.pty.as_ref().expect("PTY");
+                        if end.master {
+                            b"/dev/ptmx".to_vec()
+                        } else {
+                            format!("/dev/pts/{}", end.pair.id).into_bytes()
+                        }
+                    }
                     FdKind::Terminal => node
                         .as_ref()
                         .and_then(|n| self.path_of(n).ok())
@@ -626,6 +635,7 @@ impl Vfs {
             kernel_log: None,
             anonymous: None,
             local: None,
+            pty: original.pty.clone(),
         };
         drop(original);
         let fd = self.available(0)?;
@@ -764,6 +774,19 @@ impl Vfs {
         let regular = |value: Vec<u8>| Some((file(value), 0o100444));
         let link = |value: Vec<u8>| Some((Content::Symlink(value), 0o120777));
         let info = self.network_info();
+        if let Some(tail) = path.strip_prefix(b"/dev/pts/") {
+            if let Some(id) = std::str::from_utf8(tail)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if id == 0 && self.embedding_terminal.get()
+                    || self.pty_by_id(id).is_some_and(|p| p.master_alive.get())
+                {
+                    return Ok(Some((Content::Device(Device::Pts(id)), 0o20620)));
+                }
+                return Ok(None);
+            }
+        }
         if let Some(tail) = path.strip_prefix(b"/sys/devices/system/cpu/cpu") {
             let parts: Vec<_> = tail.split(|c| *c == b'/').collect();
             if let Some(cpu) = std::str::from_utf8(parts[0])
@@ -795,6 +818,7 @@ impl Vfs {
             b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
             b"/proc/sys/kernel" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
+            b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
             b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
             b"/sys/devices/system/cpu/offline"=>return Ok(regular(b"\n".to_vec())),
             b"/proc/self" => return Ok(link(own.map_or(self.pid, |p| p.tgid).to_string().into_bytes())),
@@ -822,7 +846,6 @@ impl Vfs {
                     b"/dev/random" => Device::Random, b"/dev/urandom" => Device::Urandom, _ => Device::Ptmx };
                 return Ok(Some((Content::Device(d), 0o20666)));
             }
-            b"/dev/pts/0" if own.is_some_and(|p| p.terminal) => return Ok(Some((Content::Device(Device::Pts), 0o20620))),
             b"/proc/uptime" => return Ok(regular(format!("{:.2} {:.2}\n", r.uptime.as_secs_f64(), r.idle.as_secs_f64()).into_bytes())),
             b"/proc/meminfo" => {
                 let total = r.memory_limit as u64 / 1024;
@@ -926,7 +949,7 @@ impl Vfs {
                             fields[2] = p.group.to_string();
                             fields[3] = p.session.to_string();
                             fields[4] = if p.terminal {
-                                "34816".into()
+                                (34816 + p.terminal_number).to_string()
                             } else {
                                 "0".into()
                             };
@@ -1355,8 +1378,16 @@ impl Vfs {
                     .map(|p| p.pid.to_string().into_bytes()),
             );
         }
-        if path == b"/dev/pts" && r.processes.iter().any(|p| p.pid == self.pid && p.terminal) {
-            names.push(b"0".to_vec());
+        if path == b"/dev/pts" {
+            if self.embedding_terminal.get() {
+                names.push(b"0".to_vec());
+            }
+            names.extend(
+                self.live_ptys()
+                    .iter()
+                    .filter(|p| p.master_alive.get())
+                    .map(|p| p.id.to_string().into_bytes()),
+            );
         }
         if let Some(rest) = path.strip_prefix(b"/proc/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();

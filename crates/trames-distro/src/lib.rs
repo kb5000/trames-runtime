@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pinned distribution verification and checked import into the private VFS.
+mod timezone;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     io::{self, Read},
 };
+pub use timezone::synchronize_timezone;
 use trames_vfs::{Errno, Vfs, AT_FDCWD, MAX_PATH};
 pub const ALPINE_VERSION: &str = "3.22.6";
 pub const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.6-aarch64.tar.gz";

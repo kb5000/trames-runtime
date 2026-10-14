@@ -13,6 +13,9 @@ pub use locks::RecordLock;
 mod namespace;
 mod network;
 mod pseudo;
+mod pty;
+pub mod terminal;
+pub use pty::{Pty, PtyEnd};
 mod storage;
 #[cfg(test)]
 mod storage_tests;
@@ -140,6 +143,7 @@ struct OpenDescription {
     kernel_log: Option<Rc<RefCell<kernel_log::KernelLog>>>,
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
+    pty: Option<Rc<PtyEnd>>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -194,6 +198,10 @@ pub struct Vfs {
     file_size_signal: Cell<bool>,
     next_open: Rc<Cell<u64>>,
     proc_accessed: Cell<bool>,
+    ptys: Rc<RefCell<BTreeMap<u32, Weak<Pty>>>>,
+    embedding_terminal: Rc<Cell<bool>>,
+    pub controlling_terminal: Option<u32>,
+    controlling_pair: Option<Rc<Pty>>,
     bridge: Option<trames_bridge::Broker>,
 }
 impl Default for Vfs {
@@ -217,6 +225,10 @@ impl Default for Vfs {
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             kernel_log: Rc::new(RefCell::new(kernel_log::KernelLog::default())),
             pid: 1,
+            ptys: Rc::default(),
+            embedding_terminal: Rc::default(),
+            controlling_terminal: None,
+            controlling_pair: None,
             lock_owner: 1,
             file_size_limit: u64::MAX,
             file_size_signal: Cell::new(false),
@@ -252,6 +264,7 @@ impl Default for Vfs {
                         kernel_log: None,
                         anonymous: None,
                         local: None,
+                        pty: None,
                     })),
                     cloexec: false,
                 },
@@ -309,6 +322,9 @@ impl Vfs {
         Self::poll_open(&d.open.borrow(), events)
     }
     fn poll_open(o: &OpenDescription, events: u16) -> u16 {
+        if let Some(end) = &o.pty {
+            return end.pair.poll(end.master, events);
+        }
         if let Some(log) = &o.kernel_log {
             return log.borrow().poll(o.position, events);
         }
@@ -350,6 +366,8 @@ impl Vfs {
         ready
     }
     pub fn enable_terminal(&mut self) -> Result<()> {
+        self.embedding_terminal.set(true);
+        self.controlling_terminal = Some(0);
         if self.node(b"/dev/tty").is_err() {
             self.insert(b"/dev/tty".to_vec(), Content::Terminal, 0o20666)?;
         }
@@ -370,6 +388,7 @@ impl Vfs {
                         kernel_log: None,
                         anonymous: None,
                         local: None,
+                        pty: None,
                     })),
                     cloexec: false,
                 },
@@ -882,9 +901,6 @@ impl Vfs {
             )?;
         }
         let node = self.node(&p)?;
-        if matches!(node.borrow().content, Content::Device(pseudo::Device::Ptmx)) {
-            return Err(Errno(95));
-        }
         {
             let mut n = node.borrow_mut();
             if matches!(n.content, Content::Symlink(_)) {
@@ -930,6 +946,28 @@ impl Vfs {
         let kernel_log = matches!(node.borrow().content, Content::Device(pseudo::Device::Kmsg))
             .then(|| self.kernel_log.clone());
         let position = kernel_log.as_ref().map_or(0, |log| log.borrow().oldest());
+        let pty = match node.borrow().content {
+            Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty()?),
+            Content::Device(pseudo::Device::Pts(id)) if id != 0 => {
+                let pair = self.pty_by_id(id).ok_or(Errno(5))?;
+                if pair.locked.get() || !pair.master_alive.get() {
+                    return Err(Errno(5));
+                }
+                Some(PtyEnd::new(pair, false))
+            }
+            Content::Terminal => match self.controlling_terminal {
+                None => return Err(Errno(6)),
+                Some(0) => None,
+                Some(id) => {
+                    let pair = self.pty_by_id(id).ok_or(Errno(6))?;
+                    if !pair.master_alive.get() {
+                        return Err(Errno(6));
+                    }
+                    Some(PtyEnd::new(pair, false))
+                }
+            },
+            _ => None,
+        };
         let pipe = if let Content::Fifo(pipe) = &node.borrow().content {
             let read = flags & 3 != 1;
             let write = flags & 3 != 0;
@@ -951,10 +989,11 @@ impl Vfs {
                 open: Rc::new(RefCell::new(OpenDescription {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
-                    kind: if matches!(
-                        node.borrow().content,
-                        Content::Terminal | Content::Device(pseudo::Device::Pts)
-                    ) {
+                    kind: if pty.is_some()
+                        || matches!(
+                            node.borrow().content,
+                            Content::Terminal | Content::Device(pseudo::Device::Pts(_))
+                        ) {
                         FdKind::Terminal
                     } else {
                         FdKind::Node(p)
@@ -968,6 +1007,7 @@ impl Vfs {
                     kernel_log,
                     anonymous: None,
                     local: None,
+                    pty,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -1117,6 +1157,7 @@ impl Vfs {
                         kernel_log: None,
                         anonymous: None,
                         local: None,
+                        pty: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -1398,6 +1439,9 @@ impl Vfs {
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.kind == FdKind::Terminal {
+            return Err(Errno(29));
+        }
         if o.bridge.is_some() {
             return Err(Errno(29));
         }

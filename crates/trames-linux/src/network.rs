@@ -470,6 +470,11 @@ impl Linux {
         a: [u64; 6],
         memory: &mut Memory,
     ) -> Result<u64> {
+        let nonblocking = if self.vfs.flags(a[0] as u32)? & trames_vfs::O_NONBLOCK != 0 {
+            0x40
+        } else {
+            0
+        };
         match number {
             204 | 205 => {
                 let output = AddressOutput::prepare(memory, a[1], a[2], 2)?.ok_or(Errno(14))?;
@@ -490,7 +495,7 @@ impl Linux {
                 let count = a[2].min(super::MAX_WRITE as u64) as usize;
                 Self::check(memory, a[1], count, Access::Write)?;
                 let output = AddressOutput::prepare(memory, a[4], a[5], 2)?;
-                let received = socket.recv(count, a[3] as u32)?;
+                let received = socket.recv(count, a[3] as u32 | nonblocking)?;
                 memory.write(a[1], &received.data).map_err(|_| Errno(14))?;
                 if let Some(output) = output {
                     output.write_bytes(memory, if socket.kind() == 1 { &[] } else { &[1, 0] })?;
@@ -566,7 +571,7 @@ impl Linux {
                     if receive { Access::Write } else { Access::Read },
                 )?;
                 if receive {
-                    let received = socket.recv(vectors.size, a[2] as u32)?;
+                    let received = socket.recv(vectors.size, a[2] as u32 | nonblocking)?;
                     vectors.write(memory, &received.data)?;
                     if let Some(output) = output {
                         output

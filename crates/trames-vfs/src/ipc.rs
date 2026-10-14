@@ -72,7 +72,12 @@ impl LocalSocket {
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
-        if flags & !(2 | 0x20 | 0x40 | 0x40000000) != 0 {
+        if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x40000000) != 0 {
+            return Err(Errno(95));
+        }
+        if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
+            // Larger blocking records need a scheduler continuation that
+            // consumes partial data; never wait forever on a bounded queue.
             return Err(Errno(95));
         }
         let mut channel = self.channel.borrow_mut();
@@ -116,6 +121,12 @@ impl LocalSocket {
             }
         }
         if flags & 2 == 0 {
+            // MSG_WAITALL waits for the requested stream bytes unless EOF or
+            // nonblocking mode permits a short read. Do not consume a prefix
+            // before a blocked syscall is retried by the guest scheduler.
+            if flags & 0x100 != 0 && flags & 0x40 == 0 && !eof && data.len() < count {
+                return Err(Errno(11));
+            }
             let mut remaining = data.len();
             while remaining != 0 {
                 let packet = queue.front_mut().expect("stream bytes");
@@ -217,11 +228,38 @@ impl Vfs {
                         kernel_log: None,
                         anonymous: None,
                         local: Some(local),
+                        pty: None,
                     })),
                     cloexec: kind & O_CLOEXEC != 0,
                 },
             );
         }
         Ok([free[0], free[1]])
+    }
+}
+
+#[cfg(test)]
+mod waitall_tests {
+    use super::*;
+    #[test]
+    fn fragmented_waitall_preserves_prefix_and_nonblocking_and_eof_return_short_reads() {
+        let mut v = Vfs::default();
+        let [a, b] = v.socketpair(1, 1, 0).unwrap();
+        let receiver = v.local_socket(a).unwrap().unwrap();
+        v.write(b, b"abc").unwrap();
+        assert!(matches!(receiver.recv(8, 0x100), Err(Errno(11))));
+        assert_eq!(receiver.recv(8, 2).unwrap().data, b"abc");
+        v.write(b, b"defgh").unwrap();
+        assert_eq!(receiver.recv(8, 0x100).unwrap().data, b"abcdefgh");
+        v.write(b, b"xy").unwrap();
+        assert_eq!(receiver.recv(8, 0x100 | 0x40).unwrap().data, b"xy");
+        v.write(b, b"end").unwrap();
+        v.close(b).unwrap();
+        assert_eq!(receiver.recv(8, 0x100).unwrap().data, b"end");
+        assert!(receiver.recv(8, 0x100).unwrap().data.is_empty());
+        assert!(matches!(
+            receiver.recv(PIPE_CAPACITY + 1, 0x100),
+            Err(Errno(95))
+        ));
     }
 }

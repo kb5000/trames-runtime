@@ -69,6 +69,7 @@ impl Vfs {
                     kernel_log: None,
                     anonymous: None,
                     local: None,
+                    pty: None,
                 })),
                 cloexec: flags & 1 != 0,
             },
