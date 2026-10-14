@@ -6,6 +6,16 @@ does not invent a race error or deterministic global ordering. Synchronized
 programs retain ARM atomic/exclusive/acquire/release/fence constraints. One cached
 CPU interpreter remains, with no JIT or extra execution backend.
 
+Owner clarification, 2026-10-14: native conversion preserves each original
+function's thread-safety contract. A non-thread-safe guest function is not owed
+an algorithm/global lock, deterministic winner or invented race error. Existing
+guest locks and CPU atomic/memory-order requirements remain. Audited unsafe is
+permitted; suspected host undefined behavior needs a concrete impact analysis,
+including compiler transformations and effects on other host/guest state. A
+contained, supported low-level implementation may be used, but observing one
+successful run does not establish containment. Persistent working instructions
+are in [AGENTS.md](../../AGENTS.md).
+
 ## Scoped ownership
 
 `parallel/page.rs` owns a stable Box of per-byte UnsafeCells and an atomic held
