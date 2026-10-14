@@ -10,3 +10,4 @@ apps/ios/build/
 *.xcuserstate
 
 /apps/ios/Trames/GuestMusl/
+/apps/ios/Trames/GuestVulkan/
