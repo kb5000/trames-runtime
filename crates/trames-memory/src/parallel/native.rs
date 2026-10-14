@@ -2,28 +2,46 @@
 //! Pure native access to resident worker pages; no backing objects cross threads.
 use super::*;
 
+#[derive(Clone, Copy)]
+enum Gate {
+    Read,
+    Write,
+    Output,
+    Retryable,
+}
 impl View {
+    #[inline]
     fn native_range(
         &self,
         address: u64,
         len: usize,
         access: Access,
-        write: bool,
-    ) -> Result<(), NativeAccessError> {
+        gate: Gate,
+    ) -> Result<bool, NativeAccessError> {
         let address = address & 0x00ffffffffffffff;
-        self.check(address, len, access)?;
+        Memory::end(address, len as u64)?;
         if len == 0 {
-            return Ok(());
+            return Ok(true);
         }
+        let mut defer = false;
+        let mut eligible = true;
         for base in (address & !(PAGE_SIZE - 1)..address + len as u64).step_by(PAGE_SIZE as usize) {
-            let frame = self.frame(base, access)?;
-            if frame.native_live_private.load(Ordering::Relaxed)
-                || (write && !frame.native_one_shot.load(Ordering::Relaxed))
-            {
-                return Err(NativeAccessError::Checkpoint);
+            // Validate all permissions/EOF before returning a typed defer, with
+            // the exact first fault address, in one mapping traversal.
+            let frame = self.frame(base.max(address), access)?;
+            defer |= frame.native_live_private.load(Ordering::Relaxed);
+            match gate {
+                Gate::Write => defer |= !frame.native_one_shot.load(Ordering::Relaxed),
+                Gate::Output => eligible &= frame.native_one_shot.load(Ordering::Relaxed),
+                Gate::Retryable => eligible &= frame.native_retryable.load(Ordering::Relaxed),
+                Gate::Read => {}
             }
         }
-        Ok(())
+        if defer {
+            Err(NativeAccessError::Checkpoint)
+        } else {
+            Ok(eligible)
+        }
     }
     fn write_chunk<T>(
         &self,
@@ -32,49 +50,30 @@ impl View {
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<T, MemoryError> {
         let (frame, offset) = self.reached(address, len, Access::Write)?;
-        let mut guard = frame.bytes.bytes.lock().unwrap();
-        let state = guard.as_mut().expect("writable page");
+        let mut guard = frame
+            .bytes
+            .bytes
+            .as_ref()
+            .expect("writable page")
+            .lock(offset, len);
         // Invalidate reservations/code before exposing a mutable slice, including
         // an internal panic. Dirty-fragment commit uses the existing CPU hooks.
-        frame.bytes.changed(state, offset, len);
-        Ok(operation(&mut state.bytes[offset..offset + len]))
+        frame.bytes.changed(&mut guard, offset, len);
+        Ok(operation(guard.write(offset, len)))
     }
 }
 
 impl NativeMemory for View {
     fn native_writable_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError> {
-        let address = address & 0x00ffffffffffffff;
-        self.native_range(address, len, Access::Read, false)?;
-        if len == 0 {
-            return Ok(true);
-        }
-        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
-            .step_by(PAGE_SIZE as usize)
-            .all(|base| {
-                self.frame(base, Access::Read)
-                    .expect("checked page")
-                    .native_retryable
-                    .load(Ordering::Relaxed)
-            }))
+        self.native_range(address, len, Access::Read, Gate::Retryable)
     }
     fn native_output_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError> {
-        let address = address & 0x00ffffffffffffff;
-        self.native_range(address, len, Access::Write, false)?;
-        if len == 0 {
-            return Ok(true);
-        }
-        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
-            .step_by(PAGE_SIZE as usize)
-            .all(|base| {
-                self.frame(base, Access::Write)
-                    .expect("checked page")
-                    .native_one_shot
-                    .load(Ordering::Relaxed)
-            }))
+        self.native_range(address, len, Access::Write, Gate::Output)
     }
     fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError> {
-        self.native_range(address, out.len(), Access::Read, false)?;
-        self.read(address, out).map_err(Into::into)
+        self.native_range(address, out.len(), Access::Read, Gate::Read)?;
+        self.copy_read(address & 0x00ffffffffffffff, out)
+            .map_err(Into::into)
     }
     fn with_read_chunk<T>(
         &self,
@@ -93,8 +92,13 @@ impl NativeMemory for View {
         let result = if let Some(bytes) = &frame.bytes.constant {
             operation(&bytes[offset..offset + len])
         } else {
-            let guard = frame.bytes.bytes.lock().unwrap();
-            operation(&guard.as_ref().expect("mutable page").bytes[offset..offset + len])
+            let guard = frame
+                .bytes
+                .bytes
+                .as_ref()
+                .expect("mutable page")
+                .lock(offset, len);
+            operation(guard.read(offset, len))
         };
         Ok((result, true))
     }
@@ -120,34 +124,30 @@ impl NativeMemory for View {
         let result = match (&a.constant, &b.constant) {
             (Some(a), Some(b)) => operation(&a[ai..ai + len], &b[bi..bi + len]),
             (Some(a), None) => {
-                let bg = b.bytes.lock().unwrap();
-                operation(&a[ai..ai + len], &bg.as_ref().unwrap().bytes[bi..bi + len])
+                let bg = b.bytes.as_ref().unwrap().lock(bi, len);
+                operation(&a[ai..ai + len], bg.read(bi, len))
             }
             (None, Some(b)) => {
-                let ag = a.bytes.lock().unwrap();
-                operation(&ag.as_ref().unwrap().bytes[ai..ai + len], &b[bi..bi + len])
+                let ag = a.bytes.as_ref().unwrap().lock(ai, len);
+                operation(ag.read(ai, len), &b[bi..bi + len])
             }
             (None, None) if Arc::ptr_eq(a, b) => {
-                let guard = a.bytes.lock().unwrap();
-                let bytes = &guard.as_ref().unwrap().bytes;
-                operation(&bytes[ai..ai + len], &bytes[bi..bi + len])
+                let guard = a.bytes.as_ref().unwrap().lock_pair(ai, bi, len);
+                operation(guard.read(ai, len), guard.read(bi, len))
             }
             (None, None) => {
                 // Physical identity order applies equally to aliases and opposite
                 // direction comparisons; no AB/BA lock inversion is possible.
                 let (ag, bg) = if a.identity < b.identity {
-                    let ag = a.bytes.lock().unwrap();
-                    let bg = b.bytes.lock().unwrap();
+                    let ag = a.bytes.as_ref().unwrap().lock(ai, len);
+                    let bg = b.bytes.as_ref().unwrap().lock(bi, len);
                     (ag, bg)
                 } else {
-                    let bg = b.bytes.lock().unwrap();
-                    let ag = a.bytes.lock().unwrap();
+                    let bg = b.bytes.as_ref().unwrap().lock(bi, len);
+                    let ag = a.bytes.as_ref().unwrap().lock(ai, len);
                     (ag, bg)
                 };
-                operation(
-                    &ag.as_ref().unwrap().bytes[ai..ai + len],
-                    &bg.as_ref().unwrap().bytes[bi..bi + len],
-                )
+                operation(ag.read(ai, len), bg.read(bi, len))
             }
         };
         Ok((result, true, true))
@@ -159,7 +159,7 @@ impl NativeMemory for View {
         mut fill: impl FnMut(&mut [u8]),
     ) -> Result<Transfer, NativeAccessError> {
         let address = address & 0x00ffffffffffffff;
-        self.native_range(address, len, Access::Write, true)?;
+        self.native_range(address, len, Access::Write, Gate::Write)?;
         let mut offset = 0;
         while offset < len {
             let at = address + offset as u64;
@@ -181,8 +181,8 @@ impl NativeMemory for View {
     ) -> Result<Transfer, NativeAccessError> {
         let destination = destination & 0x00ffffffffffffff;
         let source = source & 0x00ffffffffffffff;
-        self.native_range(source, len, Access::Read, false)?;
-        self.native_range(destination, len, Access::Write, true)?;
+        self.native_range(source, len, Access::Read, Gate::Read)?;
+        self.native_range(destination, len, Access::Write, Gate::Write)?;
         if len == 0 {
             return Ok(Transfer::default());
         }
@@ -246,28 +246,27 @@ impl NativeMemory for View {
             let dst = &df.bytes;
             let src = &sf.bytes;
             if Arc::ptr_eq(dst, src) {
-                let mut guard = dst.bytes.lock().unwrap();
-                let state = guard.as_mut().expect("writable page");
-                dst.changed(state, di, count);
-                state.bytes.copy_within(si..si + count, di);
+                let mut guard = dst
+                    .bytes
+                    .as_ref()
+                    .expect("writable page")
+                    .lock_pair(si, di, count);
+                dst.changed(&mut guard, di, count);
+                guard.copy_within(si, di, count);
             } else if let Some(bytes) = &src.constant {
                 self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
             } else {
                 let (mut dg, sg) = if dst.identity < src.identity {
-                    let dg = dst.bytes.lock().unwrap();
-                    let sg = src.bytes.lock().unwrap();
+                    let dg = dst.bytes.as_ref().unwrap().lock(di, count);
+                    let sg = src.bytes.as_ref().unwrap().lock(si, count);
                     (dg, sg)
                 } else {
-                    let sg = src.bytes.lock().unwrap();
-                    let dg = dst.bytes.lock().unwrap();
+                    let sg = src.bytes.as_ref().unwrap().lock(si, count);
+                    let dg = dst.bytes.as_ref().unwrap().lock(di, count);
                     (dg, sg)
                 };
-                let state = dg.as_mut().expect("writable page");
-                dst.changed(state, di, count);
-                copy(
-                    &mut state.bytes[di..di + count],
-                    &sg.as_ref().unwrap().bytes[si..si + count],
-                );
+                dst.changed(&mut dg, di, count);
+                copy(dg.write(di, count), sg.read(si, count));
             }
             remaining -= count;
         }
@@ -284,6 +283,61 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn independent_atomic_pairs_share_one_page_without_torn_reads() {
+        use std::sync::{atomic::AtomicUsize, Arc, Barrier};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        for rank in 0..4 {
+            memory
+                .write(0x1000 + rank * 64 + 8, &u64::MAX.to_le_bytes())
+                .unwrap();
+        }
+        let view = memory.parallel_view(&mut Registry::default()).unwrap();
+        let barrier = Arc::new(Barrier::new(5));
+        let active = Arc::new(AtomicUsize::new(4));
+        let mut joins = Vec::new();
+        for rank in 0..4 {
+            let mut worker = view.clone();
+            let barrier = barrier.clone();
+            let active = active.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..2000 {
+                    worker
+                        .atomic_update(0x1000 + rank * 64, 16, |bytes| {
+                            let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                            assert_eq!(u64::from_le_bytes(bytes[8..].try_into().unwrap()), !value);
+                            let value = value + 1;
+                            bytes[..8].copy_from_slice(&value.to_le_bytes());
+                            bytes[8..].copy_from_slice(&(!value).to_le_bytes());
+                            ((), true)
+                        })
+                        .unwrap();
+                }
+                active.fetch_sub(1, Ordering::Release);
+            }));
+        }
+        barrier.wait();
+        while active.load(Ordering::Acquire) != 0 {
+            for rank in 0..4 {
+                let bytes = view.read_array::<16>(0x1000 + rank * 64).unwrap();
+                assert_eq!(
+                    u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                    !u64::from_le_bytes(bytes[..8].try_into().unwrap())
+                );
+            }
+        }
+        for join in joins {
+            join.join().unwrap();
+        }
+        drop(view);
+        memory.commit_parallel().unwrap();
+        for rank in 0..4 {
+            assert_eq!(memory.read_u64(0x1000 + rank * 64).unwrap(), 2000);
+        }
+    }
 
     #[test]
     fn a_new_coordinator_registry_rejoins_cached_fork_shared_aliases() {
@@ -498,14 +552,20 @@ mod tests {
         let old = view.exclusive_read(0x1000, &mut bytes).unwrap();
         view.fill_with(0x1000, 4096, |b| b.fill(7)).unwrap();
         assert!(!view.exclusive_write(0x1000, &[9; 8], Some(old)).unwrap());
+        for offset in [16, 32, 48] {
+            let token = view.exclusive_read(0x1000 + offset, &mut bytes).unwrap();
+            view.fill_with(0x1000, 8, |b| b.fill(6)).unwrap();
+            assert!(view
+                .exclusive_write(0x1000 + offset, &[5; 8], Some(token))
+                .unwrap());
+        }
         let first = view.exclusive_read(0x1000, &mut bytes).unwrap();
         view.fill_with(0x1100, 8, |b| b.fill(8)).unwrap();
         assert!(view.exclusive_write(0x1000, &[9; 8], Some(first)).unwrap());
         {
             let frame = view.frame(0x1000, Access::Write).unwrap();
-            let mut g = frame.bytes.bytes.lock().unwrap();
-            let s = g.as_mut().unwrap();
-            s.version = u64::MAX - 1;
+            let _guard = frame.bytes.bytes.as_ref().unwrap().lock(0, 4096);
+            frame.bytes.version.store(u64::MAX - 1, Ordering::Relaxed);
         }
         view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();
         let old = view.exclusive_read(0x1000, &mut bytes).unwrap();

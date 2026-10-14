@@ -10,6 +10,12 @@ pub(super) fn backing_revision() -> u64 {
     BACKING_REVISION.load(Ordering::Relaxed)
 }
 pub trait PageBacking {
+    /// CPU check/read/write/version methods never re-enter their containing
+    /// Memory or invoke an arbitrary host callback. Allows one local VM borrow
+    /// per interpreter slice; external/custom backings conservatively opt out.
+    fn cpu_borrow_safe(&self) -> bool {
+        false
+    }
     /// Stable backing-page identity for quiescent parallel snapshots. External
     /// shared backings must opt in; no thread ever receives this Rc object.
     fn parallel_key(&self) -> Option<(u64, u64)> {
@@ -122,6 +128,7 @@ impl Memory {
                 access: Access::Write,
             });
         }
+        let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
         if fixed {
             self.map_fixed(address, len, permissions)?;
         } else {
@@ -139,6 +146,7 @@ impl Memory {
             });
         }
         self.has_backings = true;
+        self.cpu_borrow_safe &= cpu_safe;
         Ok(())
     }
     pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {
@@ -294,6 +302,11 @@ impl Memory {
             self.unmap(new, new_len)?;
         }
         self.map_fixed(new, new_len, permissions)?;
+        self.cpu_borrow_safe &= pages.iter().all(|p| {
+            p.backing
+                .as_ref()
+                .is_none_or(|b| b.object.cpu_borrow_safe())
+        });
         for (i, mut page) in pages.into_iter().take(count).enumerate() {
             page.instruction_revision = self.code_revision;
             let frame = self.pages[&(new + i as u64 * PAGE_SIZE)];
@@ -318,6 +331,9 @@ impl AnonymousPage {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn cpu_borrow_safe(&self) -> bool {
+        true
+    }
     fn native_resident(&self) -> bool {
         true
     }

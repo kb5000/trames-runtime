@@ -67,15 +67,19 @@ pub trait NativeMemory: CpuMemory {
     ) -> Result<Transfer, NativeAccessError>;
 }
 impl NativeMemory for Memory {
+    #[inline]
     fn native_writable_range(&self, a: u64, n: usize) -> Result<bool, NativeAccessError> {
         Memory::native_writable_range(self, a, n).map_err(Into::into)
     }
+    #[inline]
     fn native_output_range(&self, a: u64, n: usize) -> Result<bool, NativeAccessError> {
         Memory::native_output_range(self, a, n).map_err(Into::into)
     }
+    #[inline]
     fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError> {
         self.read(address, out).map_err(Into::into)
     }
+    #[inline]
     fn with_read_chunk<T>(
         &self,
         a: u64,
@@ -84,6 +88,7 @@ impl NativeMemory for Memory {
     ) -> Result<(T, bool), NativeAccessError> {
         Memory::with_read_chunk(self, a, n, f).map_err(Into::into)
     }
+    #[inline]
     fn with_read_pair<T>(
         &self,
         a: u64,
@@ -97,6 +102,7 @@ impl NativeMemory for Memory {
         let (value, rd) = right?;
         Ok((value, ld, rd))
     }
+    #[inline]
     fn fill_with(
         &mut self,
         a: u64,
@@ -105,6 +111,7 @@ impl NativeMemory for Memory {
     ) -> Result<Transfer, NativeAccessError> {
         Memory::fill_with(self, a, n, f).map_err(Into::into)
     }
+    #[inline]
     fn copy_with(
         &mut self,
         d: u64,
@@ -140,18 +147,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().native_writable_range(address, len);
         }
-        self.check(address, len, Access::Read)?;
-        if len == 0 {
-            return Ok(true);
-        }
-        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
-            .step_by(PAGE_SIZE as usize)
-            .all(|base| {
-                let p = self.frames[self.pages[&base]]
-                    .as_ref()
-                    .expect("checked page");
-                p.native_retryable()
-            }))
+        self.checked_pages(address, len, Access::Read, Page::native_retryable)
     }
     /// Preflight output for a pure one-shot operation. Unlike callback state,
     /// it need not be readable or private. Resident backing cannot fail with I/O
@@ -161,18 +157,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().native_output_range(address, len);
         }
-        self.check(address, len, Access::Write)?;
-        if len == 0 {
-            return Ok(true);
-        }
-        Ok((address & !(PAGE_SIZE - 1)..address + len as u64)
-            .step_by(PAGE_SIZE as usize)
-            .all(|base| {
-                let page = self.frames[self.pages[&base]]
-                    .as_ref()
-                    .expect("checked page");
-                page.native_one_shot()
-            }))
+        self.checked_pages(address, len, Access::Write, Page::native_one_shot)
     }
 
     /// Borrow one readable page fragment for the duration of a pure callback.
@@ -369,25 +354,18 @@ impl Memory {
                 .borrow_mut()
                 .copy_with(destination, source, len, copy);
         }
-        self.check(source, len, Access::Read)?;
-        self.check(destination, len, Access::Write)?;
+        let direct = |page: &Page| {
+            page.backing
+                .as_ref()
+                .is_none_or(|b| !b.shared && b.private_copy)
+        };
+        let source_direct = self.checked_pages(source, len, Access::Read, direct)?;
+        let destination_direct = self.checked_pages(destination, len, Access::Write, direct)?;
         let mut stats = Transfer::default();
         if len == 0 {
             return Ok(stats);
         }
-        let backed = [source, destination].into_iter().any(|start| {
-            (start & !(PAGE_SIZE - 1)..start + len as u64)
-                .step_by(PAGE_SIZE as usize)
-                .any(|base| {
-                    self.frames[self.pages[&base]]
-                        .as_ref()
-                        .expect("page")
-                        .backing
-                        .as_ref()
-                        .is_some_and(|b| b.shared || !b.private_copy)
-                })
-        });
-        if backed {
+        if !source_direct || !destination_direct {
             let mut input = vec![0; len];
             self.read(source, &mut input)?;
             stats.buffered_read = len as u64;

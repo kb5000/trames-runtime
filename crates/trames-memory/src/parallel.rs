@@ -1,36 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! CPU/native views between quiescent kernel checkpoints. Scoped page guards
 //! stay on workers; Rc backings, mappings and persistence stay coordinated.
-//! No unsafe Send/Sync.
+//! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
 mod native;
+mod page;
 use super::*;
-use std::sync::{Mutex, Weak};
+use std::sync::Weak;
 
 #[derive(Default)]
 pub struct Registry {
     shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
     code_epoch: Arc<AtomicU64>,
 }
-struct Bytes {
-    bytes: Box<[u8; PAGE_SIZE as usize]>,
-    version: u64,
-    reservations: [u64; 256],
-    reservation_base: u64,
-    reservation_written: [u64; 4],
-}
-impl Bytes {
-    fn reservation(&self, slot: usize) -> u64 {
-        if self.reservation_written[slot / 64] & (1u64 << (slot % 64)) != 0 {
-            self.reservations[slot]
-        } else {
-            self.reservation_base
-        }
-    }
-}
 struct ConcurrentPage {
     identity: u64,
     constant: Option<Arc<[u8; PAGE_SIZE as usize]>>,
-    bytes: Mutex<Option<Bytes>>,
+    bytes: Option<page::MutablePage>,
     dirty: AtomicU64,
     version: AtomicU64,
     executable: std::sync::atomic::AtomicBool,
@@ -41,40 +26,29 @@ impl ConcurrentPage {
         Self {
             identity: new_backing_identity(),
             constant: constant.then(|| Arc::new(bytes)),
-            bytes: Mutex::new((!constant).then(|| Bytes {
-                bytes: Box::new(bytes),
-                version: 0,
-                reservations: [0; 256],
-                reservation_base: 0,
-                reservation_written: [0; 4],
-            })),
+            bytes: (!constant).then(|| page::MutablePage::new(bytes)),
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
             executable: std::sync::atomic::AtomicBool::new(false),
             code_epoch,
         }
     }
-    fn changed(&self, state: &mut Bytes, offset: usize, len: usize) {
-        state.version = state.version.wrapping_add(1);
-        if offset == 0 && len == PAGE_SIZE as usize {
-            // One epoch invalidates every granule without another 2 KiB store
-            // per 4 KiB copy/fill. Explicit bits preserve partial updates and
-            // counter wrap; no numeric max(version, base) assumption is made.
-            state.reservation_base = state.version;
-            state.reservation_written = [0; 4];
-        } else {
-            for slot in offset / 16..=(offset + len - 1) / 16 {
-                state.reservations[slot] = state.version;
-                state.reservation_written[slot / 64] |= 1u64 << (slot % 64);
-            }
+    fn changed(&self, state: &mut page::Guard<'_>, offset: usize, len: usize) {
+        if len == 0 {
+            return;
         }
-        self.version.store(state.version, Ordering::Release);
+        let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
+        state.invalidate(offset, len, version);
         // One bit per 64-byte fragment. No unrelated clean bytes are written
         // back over an alias; full-page snapshots would lose concurrent edits.
         let first = offset / 64;
         let last = (offset + len - 1) / 64;
         let mask = (u64::MAX >> (63 - (last - first))) << first;
-        self.dirty.fetch_or(mask, Ordering::Relaxed);
+        // Only the joined coordinator clears dirty bits. Once this region is
+        // dirty in an epoch, another RMW per store/copy adds no information.
+        if self.dirty.load(Ordering::Relaxed) & mask != mask {
+            self.dirty.fetch_or(mask, Ordering::Relaxed);
+        }
         if self.executable.load(Ordering::Relaxed) {
             self.code_epoch.fetch_add(1, Ordering::Release);
         }
@@ -83,15 +57,16 @@ impl ConcurrentPage {
         if self.constant.is_some() {
             return;
         }
-        let mut guard = self.bytes.lock().unwrap();
-        let s = guard.as_mut().expect("mutable page");
+        let mut guard = self
+            .bytes
+            .as_ref()
+            .expect("mutable page")
+            .lock(0, PAGE_SIZE as usize);
         {
             // A coordinator ABA write invalidates reservations even if bytes match.
-            s.bytes.copy_from_slice(bytes);
-            s.version = s.version.wrapping_add(1);
-            s.reservation_base = s.version;
-            s.reservation_written = [0; 4];
-            self.version.store(s.version, Ordering::Release);
+            guard.write(0, PAGE_SIZE as usize).copy_from_slice(bytes);
+            let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
+            guard.invalidate(0, PAGE_SIZE as usize, version);
             if self.executable.load(Ordering::Relaxed) {
                 self.code_epoch.fetch_add(1, Ordering::Release);
             }
@@ -194,6 +169,42 @@ impl View {
         }
         Ok((self.frame(address, access)?, offset))
     }
+    fn read_fragment(&self, frame: &Frame, offset: usize, out: &mut [u8]) {
+        if let Some(bytes) = &frame.bytes.constant {
+            out.copy_from_slice(&bytes[offset..offset + out.len()]);
+        } else {
+            let guard = frame
+                .bytes
+                .bytes
+                .as_ref()
+                .expect("mutable page")
+                .lock(offset, out.len());
+            out.copy_from_slice(guard.read(offset, out.len()));
+        }
+    }
+    /// Mapping/EOF validation is complete before this private transport helper.
+    fn copy_read(&self, mut address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
+        let mut done = 0;
+        while done < out.len() {
+            let frame = self.frame(address, Access::Read)?;
+            let offset = (address % PAGE_SIZE) as usize;
+            let len = (out.len() - done).min(PAGE_SIZE as usize - offset);
+            self.read_fragment(frame, offset, &mut out[done..done + len]);
+            done += len;
+            address += len as u64;
+        }
+        Ok(())
+    }
+    fn write_fragment(&self, frame: &Frame, offset: usize, input: &[u8]) {
+        let mut guard = frame
+            .bytes
+            .bytes
+            .as_ref()
+            .expect("writable page")
+            .lock(offset, input.len());
+        guard.write(offset, input.len()).copy_from_slice(input);
+        frame.bytes.changed(&mut guard, offset, input.len());
+    }
 }
 impl CpuMemory for View {
     fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
@@ -227,44 +238,37 @@ impl CpuMemory for View {
         }
     }
     fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
-        let mut address = address & 0x00ffffffffffffff;
-        self.check(address, out.len(), Access::Read)?;
-        let mut done = 0;
-        while done < out.len() {
-            let frame = self.frame(address, Access::Read)?;
-            let offset = (address % PAGE_SIZE) as usize;
-            let len = (out.len() - done).min(PAGE_SIZE as usize - offset);
-            if let Some(bytes) = &frame.bytes.constant {
-                out[done..done + len].copy_from_slice(&bytes[offset..offset + len]);
-            } else {
-                out[done..done + len].copy_from_slice(
-                    &frame
-                        .bytes
-                        .bytes
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .expect("mutable page")
-                        .bytes[offset..offset + len],
-                );
-            }
-            done += len;
-            address += len as u64;
+        let address = address & 0x00ffffffffffffff;
+        if out.is_empty() {
+            Memory::end(address, 0)?;
+            return Ok(());
         }
-        Ok(())
+        if out.len() <= (PAGE_SIZE - address % PAGE_SIZE) as usize {
+            let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
+            self.read_fragment(frame, offset, out);
+            return Ok(());
+        }
+        self.check(address, out.len(), Access::Read)?;
+        self.copy_read(address, out)
     }
     fn write(&mut self, address: u64, input: &[u8]) -> Result<(), MemoryError> {
         let mut address = address & 0x00ffffffffffffff;
+        if input.is_empty() {
+            Memory::end(address, 0)?;
+            return Ok(());
+        }
+        if input.len() <= (PAGE_SIZE - address % PAGE_SIZE) as usize {
+            let (frame, offset) = self.reached(address, input.len(), Access::Write)?;
+            self.write_fragment(frame, offset, input);
+            return Ok(());
+        }
         self.check(address, input.len(), Access::Write)?;
         let mut done = 0;
         while done < input.len() {
             let frame = self.frame(address, Access::Write)?;
             let offset = (address % PAGE_SIZE) as usize;
             let len = (input.len() - done).min(PAGE_SIZE as usize - offset);
-            let mut guard = frame.bytes.bytes.lock().unwrap();
-            let state = guard.as_mut().expect("writable page");
-            state.bytes[offset..offset + len].copy_from_slice(&input[done..done + len]);
-            frame.bytes.changed(state, offset, len);
+            self.write_fragment(frame, offset, &input[done..done + len]);
             address += len as u64;
             done += len;
         }
@@ -279,16 +283,13 @@ impl CpuMemory for View {
         if let Some(data) = &frame.bytes.constant {
             bytes.copy_from_slice(&data[offset..offset + 4]);
         } else {
-            bytes.copy_from_slice(
-                &frame
-                    .bytes
-                    .bytes
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .expect("mutable page")
-                    .bytes[offset..offset + 4],
-            );
+            let guard = frame
+                .bytes
+                .bytes
+                .as_ref()
+                .expect("mutable page")
+                .lock(offset, 4);
+            bytes.copy_from_slice(guard.read(offset, 4));
         }
         Ok(u32::from_le_bytes(bytes))
     }
@@ -332,11 +333,15 @@ impl CpuMemory for View {
                 access: Access::Read,
             });
         }
-        let mut guard = frame.bytes.bytes.lock().unwrap();
-        let state = guard.as_mut().expect("writable page");
-        let (value, write) = update(&mut state.bytes[offset..offset + len]);
+        let mut guard = frame
+            .bytes
+            .bytes
+            .as_ref()
+            .expect("writable page")
+            .lock(offset, len);
+        let (value, write) = update(guard.write(offset, len));
         if write {
-            frame.bytes.changed(state, offset, len)
+            frame.bytes.changed(&mut guard, offset, len)
         }
         Ok(value)
     }
@@ -347,10 +352,14 @@ impl CpuMemory for View {
             out.copy_from_slice(&bytes[offset..offset + out.len()]);
             return Ok((frame.bytes.identity as u128) << 64);
         }
-        let guard = frame.bytes.bytes.lock().unwrap();
-        let s = guard.as_ref().expect("mutable page");
-        out.copy_from_slice(&s.bytes[offset..offset + out.len()]);
-        Ok((frame.bytes.identity as u128) << 64 | s.reservation(offset / 16) as u128)
+        let guard = frame
+            .bytes
+            .bytes
+            .as_ref()
+            .expect("mutable page")
+            .lock(offset, out.len());
+        out.copy_from_slice(guard.read(offset, out.len()));
+        Ok((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
     }
     fn exclusive_write(
         &mut self,
@@ -363,15 +372,19 @@ impl CpuMemory for View {
         }
         let address = address & 0x00ffffffffffffff;
         let (frame, offset) = self.reached(address, bytes.len(), Access::Write)?;
-        let mut guard = frame.bytes.bytes.lock().unwrap();
-        let state = guard.as_mut().expect("writable page");
+        let mut guard = frame
+            .bytes
+            .bytes
+            .as_ref()
+            .expect("writable page")
+            .lock(offset, bytes.len());
         if token
-            != Some((frame.bytes.identity as u128) << 64 | state.reservation(offset / 16) as u128)
+            != Some((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
         {
             return Ok(false);
         }
-        state.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
-        frame.bytes.changed(state, offset, bytes.len());
+        guard.write(offset, bytes.len()).copy_from_slice(bytes);
+        frame.bytes.changed(&mut guard, offset, bytes.len());
         Ok(true)
     }
     fn fence(&self, order: Ordering) {
@@ -608,18 +621,29 @@ impl Memory {
                 if !frame.permissions.write {
                     continue;
                 }
-                let dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
+                let mut dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
                 if dirty == 0 {
                     continue;
                 }
-                let guard = frame.bytes.bytes.lock().unwrap();
-                let bytes = guard.as_ref().expect("dirty writable page");
-                for i in 0..64 {
-                    if dirty & (1u64 << i) != 0 {
-                        self.write(
-                            frame.base + i * 64,
-                            &bytes.bytes[i as usize * 64..i as usize * 64 + 64],
-                        )?;
+                let guard = frame
+                    .bytes
+                    .bytes
+                    .as_ref()
+                    .expect("dirty writable page")
+                    .lock(0, PAGE_SIZE as usize);
+                while dirty != 0 {
+                    let first = dirty.trailing_zeros() as usize;
+                    let count = (dirty >> first).trailing_ones() as usize;
+                    self.write(
+                        frame.base + (first * 64) as u64,
+                        guard.read(first * 64, count * 64),
+                    )?;
+                    // Coalesce adjacent dirty fragments without writing through
+                    // a clean hole or overwriting another backing alias's bytes.
+                    if count == 64 {
+                        dirty = 0;
+                    } else {
+                        dirty &= !(((1u64 << count) - 1) << first);
                     }
                 }
                 let page = self.frames[frame.root_frame]
@@ -664,6 +688,89 @@ impl Memory {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn commit_coalesces_dirty_runs_and_preserves_clean_backing_alias_holes() {
+        struct Backing {
+            bytes: RefCell<[u8; 4096]>,
+            writes: RefCell<Vec<(usize, usize)>>,
+            version: Cell<u64>,
+            identity: u64,
+        }
+        impl PageBacking for Backing {
+            fn parallel_key(&self) -> Option<(u64, u64)> {
+                Some((self.identity, 0))
+            }
+            fn check(&self, _: u64) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+                out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+                Ok(())
+            }
+            fn write(&self, offset: usize, input: &[u8]) -> Result<(), MemoryError> {
+                self.bytes.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
+                self.writes.borrow_mut().push((offset, input.len()));
+                self.version.set(self.version.get().wrapping_add(1));
+                backing_changed();
+                Ok(())
+            }
+            fn native_resident(&self) -> bool {
+                true
+            }
+            fn sync(&self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn version(&self) -> u64 {
+                self.version.get()
+            }
+            fn writable(&self) -> bool {
+                true
+            }
+            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+                Err(MemoryError::InvalidRange)
+            }
+        }
+        let object = Rc::new(Backing {
+            bytes: RefCell::new([0; 4096]),
+            writes: RefCell::new(Vec::new()),
+            version: Cell::new(0),
+            identity: new_backing_identity(),
+        });
+        let mut memory = Memory::default();
+        memory
+            .map_backed(0x1000, vec![object.clone()], true, Permissions::RW, false)
+            .unwrap();
+        memory
+            .map_backed(0x3000, vec![object.clone()], true, Permissions::RW, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(*object.writes.borrow(), [(0, 4096)]);
+        object.writes.borrow_mut().clear();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.fill_with(0x3000, 64, |b| b.fill(7)).unwrap();
+        view.fill_with(0x3080, 64, |b| b.fill(8)).unwrap();
+        drop(view);
+        // An independent backing alias can change a clean hole. Commit must
+        // retain it instead of publishing the old snapshot's whole page.
+        object.write(64, &[9; 64]).unwrap();
+        object.writes.borrow_mut().clear();
+        memory.commit_parallel().unwrap();
+        assert_eq!(*object.writes.borrow(), [(0, 64), (128, 64)]);
+        assert_eq!(memory.read_array::<64>(0x1000).unwrap(), [7; 64]);
+        assert_eq!(memory.read_array::<64>(0x1040).unwrap(), [9; 64]);
+        assert_eq!(memory.read_array::<64>(0x1080).unwrap(), [8; 64]);
+        object.writes.borrow_mut().clear();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.fill_with(0x1000, 128, |b| b.fill(2)).unwrap();
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(*object.writes.borrow(), [(0, 128)]);
+    }
     #[test]
     fn immutable_code_ignores_unrelated_live_code_epochs() {
         let mut immutable = Memory::default();

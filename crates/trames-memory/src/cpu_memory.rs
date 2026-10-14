@@ -81,7 +81,7 @@ impl CpuMemory for Memory {
         if self
             .shared
             .as_ref()
-            .is_some_and(|m| !m.borrow().has_backings)
+            .is_some_and(|m| m.borrow().cpu_borrow_safe)
         {
             CpuSlice::Shared(self.shared.as_ref().expect("shared space").borrow_mut())
         } else {
@@ -157,5 +157,75 @@ impl CpuMemory for Memory {
         }
         self.write(a, b)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PageBacking, Permissions, PAGE_SIZE};
+    use std::{
+        cell::RefCell,
+        rc::{Rc, Weak},
+    };
+
+    #[test]
+    fn trusted_backings_borrow_once_and_unknown_read_callbacks_can_reenter() {
+        let mut memory = Memory::default();
+        memory
+            .map_shared_anonymous(0x1000, PAGE_SIZE, Permissions::RW, false)
+            .unwrap();
+        let mut peer = memory.share();
+        {
+            let mut slice = peer.cpu_slice();
+            assert!(matches!(slice, CpuSlice::Shared(_)));
+            slice.write(0x1000, &[7; 8]).unwrap();
+            assert_eq!(slice.read_array::<8>(0x1000).unwrap(), [7; 8]);
+        }
+        // Slice scope is finished before any coordinator or native callback.
+        memory.write(0x1000, &[8; 8]).unwrap();
+
+        struct Reentrant {
+            owner: Weak<RefCell<Memory>>,
+        }
+        impl PageBacking for Reentrant {
+            fn check(&self, _: u64) -> Result<(), MemoryError> {
+                assert!(
+                    self.owner.upgrade().unwrap().borrow().mapped_bytes() >= PAGE_SIZE as usize
+                );
+                Ok(())
+            }
+            fn read(&self, _: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+                assert!(
+                    self.owner.upgrade().unwrap().borrow().mapped_bytes() >= PAGE_SIZE as usize
+                );
+                out.fill(9);
+                Ok(())
+            }
+            fn write(&self, _: usize, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::BackingIo(13))
+            }
+            fn sync(&self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn version(&self) -> u64 {
+                0
+            }
+            fn writable(&self) -> bool {
+                false
+            }
+            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+                Err(MemoryError::InvalidRange)
+            }
+        }
+        let object = Rc::new(Reentrant {
+            owner: Rc::downgrade(memory.shared.as_ref().unwrap()),
+        });
+        memory
+            .map_backed(0x3000, vec![object], false, Permissions::R, false)
+            .unwrap();
+        let slice = peer.cpu_slice();
+        assert!(matches!(slice, CpuSlice::Direct(_)));
+        assert_eq!(slice.read_array::<8>(0x3000).unwrap(), [9; 8]);
     }
 }

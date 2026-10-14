@@ -136,6 +136,7 @@ pub struct Memory {
     identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
     has_backings: bool,
+    cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
     parallel_dirty: Vec<usize>,
 }
@@ -167,6 +168,7 @@ impl Clone for Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: self.has_backings,
+            cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
             parallel_dirty: Vec::new(),
         }
@@ -216,6 +218,7 @@ impl Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: false,
+            cpu_borrow_safe: true,
             parallel_cache: None,
             parallel_dirty: Vec::new(),
         }
@@ -620,11 +623,25 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().check(address, len, access);
         }
+        self.checked_pages(address, len, access, |_| true)
+            .map(|_| ())
+    }
+
+    /// Validate every page once, retaining the first precise fault, while
+    /// collecting native admission facts. The caller handles tagged/shared VMs.
+    fn checked_pages(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+        mut eligible: impl FnMut(&Page) -> bool,
+    ) -> Result<bool, MemoryError> {
         if len == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let end = Self::end(address, len as u64)?;
         let first = address & !(PAGE_SIZE - 1);
+        let mut allowed = true;
         for base in (first..end).step_by(PAGE_SIZE as usize) {
             let fault_address = base.max(address);
             let frame = self
@@ -638,8 +655,9 @@ impl Memory {
                 });
             }
             page.check_backing(fault_address)?;
+            allowed &= eligible(page);
         }
-        Ok(())
+        Ok(allowed)
     }
 
     fn copy_read(&self, mut address: u64, mut out: &mut [u8]) -> Result<(), MemoryError> {

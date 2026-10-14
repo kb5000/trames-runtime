@@ -190,6 +190,11 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn cpu_borrow_safe(&self) -> bool {
+        // These CPU methods inspect resident file bytes/metadata only; they
+        // cannot call the containing VM or a user-provided callback.
+        true
+    }
     fn native_resident(&self) -> bool {
         true
     }
