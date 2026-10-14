@@ -10,9 +10,11 @@ pub(super) fn backing_revision() -> u64 {
     BACKING_REVISION.load(Ordering::Relaxed)
 }
 pub trait PageBacking {
-    /// CPU check/read/write/version methods never re-enter their containing
-    /// Memory or invoke an arbitrary host callback. Allows one local VM borrow
-    /// per interpreter slice; external/custom backings conservatively opt out.
+    /// Check/read/write/version and scoped native-span methods never re-enter
+    /// their containing Memory or invoke an arbitrary host callback. Allows one
+    /// local VM borrow per interpreter slice or native call; external/custom
+    /// backings conservatively opt out. Span methods may invoke only the supplied
+    /// memory operation, which cannot yield to guest code while bytes are borrowed.
     fn cpu_borrow_safe(&self) -> bool {
         false
     }

@@ -122,6 +122,7 @@ impl View {
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
     }
+    #[inline]
     fn frame(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {
         let base = address & !(PAGE_SIZE - 1);
         let slot = (base / PAGE_SIZE) as usize & (TRANSLATION_SLOTS - 1);
@@ -156,6 +157,7 @@ impl View {
         }
         Ok(frame)
     }
+    #[inline]
     fn reached(
         &self,
         address: u64,
@@ -169,6 +171,7 @@ impl View {
         }
         Ok((self.frame(address, access)?, offset))
     }
+    #[inline]
     fn read_fragment(&self, frame: &Frame, offset: usize, out: &mut [u8]) {
         if let Some(bytes) = &frame.bytes.constant {
             out.copy_from_slice(&bytes[offset..offset + out.len()]);
@@ -193,6 +196,46 @@ impl View {
             done += len;
             address += len as u64;
         }
+        Ok(())
+    }
+    /// The CPU and native transport share page translation, permissions and
+    /// byte access. Native callers add only their backing-checkpoint admission.
+    /// The single-page path reaches the frame once; cross-page reads validate
+    /// every frame before exposing any bytes to either caller.
+    #[inline]
+    fn read_checked<E: From<MemoryError>>(
+        &self,
+        address: u64,
+        out: &mut [u8],
+        admit: impl Fn(&Frame) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let address = address & 0x00ffffffffffffff;
+        if out.is_empty() {
+            Memory::end(address, 0)?;
+            return Ok(());
+        }
+        if out.len() <= (PAGE_SIZE - address % PAGE_SIZE) as usize {
+            let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
+            admit(frame)?;
+            self.read_fragment(frame, offset, out);
+            return Ok(());
+        }
+        Memory::end(address, out.len() as u64)?;
+        let mut admission_error = None;
+        for at in
+            (address & !(PAGE_SIZE - 1)..address + out.len() as u64).step_by(PAGE_SIZE as usize)
+        {
+            // An earlier live-backing checkpoint must not hide a later CPU
+            // permission/EOF fault. Admission is reported after CPU validation.
+            let result = admit(self.frame(at.max(address), Access::Read)?);
+            if admission_error.is_none() {
+                admission_error = result.err();
+            }
+        }
+        if let Some(error) = admission_error {
+            return Err(error);
+        }
+        self.copy_read(address, out)?;
         Ok(())
     }
     fn write_fragment(&self, frame: &Frame, offset: usize, input: &[u8]) {
@@ -237,19 +280,15 @@ impl CpuMemory for View {
             Err(MemoryError::Unmapped(address))
         }
     }
+    #[inline]
     fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
-        let address = address & 0x00ffffffffffffff;
-        if out.is_empty() {
-            Memory::end(address, 0)?;
-            return Ok(());
-        }
-        if out.len() <= (PAGE_SIZE - address % PAGE_SIZE) as usize {
-            let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
-            self.read_fragment(frame, offset, out);
-            return Ok(());
-        }
-        self.check(address, out.len(), Access::Read)?;
-        self.copy_read(address, out)
+        self.read_checked(address, out, |_| Ok(()))
+    }
+    #[inline]
+    fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
+        let mut bytes = [0; N];
+        self.read(address, &mut bytes)?;
+        Ok(bytes)
     }
     fn write(&mut self, address: u64, input: &[u8]) -> Result<(), MemoryError> {
         let mut address = address & 0x00ffffffffffffff;

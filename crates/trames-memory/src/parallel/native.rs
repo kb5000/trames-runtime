@@ -70,10 +70,24 @@ impl NativeMemory for View {
     fn native_output_range(&self, address: u64, len: usize) -> Result<bool, NativeAccessError> {
         self.native_range(address, len, Access::Write, Gate::Output)
     }
+    #[inline]
     fn native_read(&self, address: u64, out: &mut [u8]) -> Result<(), NativeAccessError> {
-        self.native_range(address, out.len(), Access::Read, Gate::Read)?;
-        self.copy_read(address & 0x00ffffffffffffff, out)
-            .map_err(Into::into)
+        self.read_checked(address, out, |frame| {
+            if frame.native_live_private.load(Ordering::Relaxed) {
+                Err(NativeAccessError::Checkpoint)
+            } else {
+                Ok(())
+            }
+        })
+    }
+    #[inline]
+    fn native_read_array<const N: usize>(
+        &self,
+        address: u64,
+    ) -> Result<[u8; N], NativeAccessError> {
+        let mut bytes = [0; N];
+        self.native_read(address, &mut bytes)?;
+        Ok(bytes)
     }
     fn with_read_chunk<T>(
         &self,
@@ -285,6 +299,65 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn native_and_cpu_scalar_reads_share_permissions_tags_and_cross_page_faults() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        let input: Vec<_> = (0..PAGE_SIZE as usize * 2).map(|i| i as u8).collect();
+        memory.write(0x1000, &input).unwrap();
+        memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        memory
+            .map(
+                0x3000,
+                PAGE_SIZE,
+                Permissions {
+                    read: false,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        let view = memory.parallel_view(&mut Registry::default()).unwrap();
+        fn compare<const N: usize>(view: &View, address: u64) {
+            let expected = view
+                .read_array::<N>(address)
+                .map_err(NativeAccessError::from);
+            assert_eq!(view.native_read_array::<N>(address), expected);
+            let mut bytes = [0x55; N];
+            let result = view.native_read(address, &mut bytes);
+            match expected {
+                Ok(value) => {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(bytes, value);
+                }
+                Err(error) => {
+                    assert_eq!(result, Err(error));
+                    assert_eq!(bytes, [0x55; N]);
+                }
+            }
+        }
+        for address in [
+            0xffc,
+            0x1001,
+            0x1ff9,
+            0x1fff,
+            0x2ffc,
+            0x3000,
+            0x3fff,
+            0x4000,
+            ADDRESS_LIMIT - 4,
+            ADDRESS_LIMIT,
+        ] {
+            for tagged in [address, address | 0xab00_0000_0000_0000] {
+                compare::<1>(&view, tagged);
+                compare::<2>(&view, tagged);
+                compare::<4>(&view, tagged);
+                compare::<8>(&view, tagged);
+                compare::<16>(&view, tagged);
+            }
+        }
+    }
+
+    #[test]
     fn independent_atomic_pairs_share_one_page_without_torn_reads() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
         let mut memory = Memory::default();
@@ -433,6 +506,17 @@ mod tests {
             view.native_output_range(0x5000, 4096),
             Err(NativeAccessError::Checkpoint)
         );
+        assert_eq!(
+            view.native_read_array::<8>(0x5000),
+            Err(NativeAccessError::Checkpoint)
+        );
+        assert_eq!(view.read_array::<8>(0x5000).unwrap(), initial[..8]);
+        let mut untouched = [0x55; 16];
+        assert_eq!(
+            view.native_read(0x5ff8, &mut untouched),
+            Err(NativeAccessError::Memory(MemoryError::Unmapped(0x6000)))
+        );
+        assert_eq!(untouched, [0x55; 16]);
         assert_eq!(
             view.native_writable_range(0x5000, 4096),
             Err(NativeAccessError::Checkpoint)

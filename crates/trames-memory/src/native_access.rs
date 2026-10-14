@@ -80,6 +80,13 @@ impl NativeMemory for Memory {
         self.read(address, out).map_err(Into::into)
     }
     #[inline]
+    fn native_read_array<const N: usize>(
+        &self,
+        address: u64,
+    ) -> Result<[u8; N], NativeAccessError> {
+        self.read_array(address).map_err(Into::into)
+    }
+    #[inline]
     fn with_read_chunk<T>(
         &self,
         a: u64,

@@ -157,6 +157,31 @@ header invalidation. After 64 failed CAS attempts the same slow boundary bounds
 native work. Both worker View and joined Memory use the same transport; no
 allocator-specific global stop or page lock is added.
 
+### Shared interpreter/native memory access
+
+Native scalar accesses use the interpreter's fixed-width load/store interfaces
+and its translation cache, permission/EOF checks, COW and publication hooks.
+Worker CPU and native reads enter the same `View::read_checked` implementation.
+An in-page scalar read resolves and validates one frame, then reads its bytes
+under the ordinary CPU region guard. It no longer runs a separate native range
+walk followed by a second frame lookup. Constant-width 1/2/4/8-byte allocator
+operands preserve fixed-size host copies rather than variable-length transport.
+
+Native entry uses `cpu_slice`, as an interpreter slice does, borrowing a local
+CLONE_VM address space once when its backings permit it. Custom/reentrant
+backings retain the original per-access borrow path. The borrow ends when the
+native call returns, before any guest callback or mapping/scheduler checkpoint.
+No additional page permissions or allocator-specific lock are introduced.
+
+Native admission remains separate from CPU access validation. Live private
+backing can request a coordinator checkpoint; cross-page CPU permission/EOF
+faults take precedence over that request, and no output is exposed on failure.
+The allocator journal still preflights all output before its first mutation:
+this protects original-code fallback and is not a second memory permission
+policy. Scoped host pointers and region guards never survive a guest callback.
+Per-field C/Rust callbacks, original allocator locking and cold-path fallback
+remain costs to address; sharing the access model alone is not a speed claim.
+
 Malformed/extreme metadata must not invoke host C undefined behavior. Checked
 class indexes, input sizes, signed-offset bounds and framing stride admission
 select original code before effects. C callback failures use ordinary checked
