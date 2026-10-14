@@ -64,6 +64,27 @@ reservation and executable invalidation hooks remain on the original paths.
 Dirty publication skips the RMW when all touched regions are already marked in
 the joined epoch. Only a quiescent coordinator clears those bits.
 
+Worker writes also mark a sparse page bitmap indexed by stable root-frame IDs.
+Commit scans one bitmap word per 64 frame slots, then visits only marked pages;
+virtual mapping order and recycled frame indices do not change publication.
+CPU stores, atomic/exclusive writes, native fill and both copy paths use the same
+marker. Bitmap storage follows the cached mapping domain across backing-epoch
+refreshes, including earlier views retaining the same physical pages. Mapping
+changes require joined workers and create a new bitmap. Worker completion/join
+publishes bytes and relaxed bitmap marks before the coordinator clears them.
+The original physical 64-byte dirty mask still coalesces runs and handles aliases;
+failed backing writes retain outstanding fragments and frame bits for retry.
+
+The coordinator commits each selected shared VM once per round, before processing
+any returned syscall, signal or exit. Fork address spaces remain distinct, even
+when they share file-backed physical pages. CPU dispatch placeholders and newly
+forked CPUs allocate no decode-slot table until the first nonzero interpreter slice;
+moving a warm CPU to a worker keeps its existing cache. Guest instruction budgets,
+kernel checkpoint triggers and original musl synchronization remain unchanged.
+
+[Checkpoint measurements and validation](../validation/checkpoint-cost.md) record
+the fixed-work comparison for default and experimental allocator routing.
+
 Native permission/backing/admission checks collect facts in one traversal while
 retaining the first fault address and full validation before effects. Single-page
 CPU accesses validate once; checked native control reads share the transport

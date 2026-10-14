@@ -95,6 +95,9 @@ struct Snapshot {
     code_revision: u64,
     pages: BTreeMap<u64, usize>,
     frames: Vec<Frame>,
+    // One bit per virtual frame, independent of the physical dirty fragments.
+    // Workers mark reached frames; only the joined coordinator clears bits.
+    dirty_pages: Arc<[AtomicU64]>,
     reservations: BTreeMap<u64, u64>,
     code_epoch: Arc<AtomicU64>,
 }
@@ -185,6 +188,17 @@ impl View {
             out.copy_from_slice(guard.read(offset, out.len()));
         }
     }
+    #[inline]
+    fn changed(&self, frame: &Frame, state: &mut page::Guard<'_>, offset: usize, len: usize) {
+        frame.bytes.changed(state, offset, len);
+        if len != 0 {
+            let word = &self.snapshot.dirty_pages[frame.root_frame / 64];
+            let bit = 1 << (frame.root_frame % 64);
+            if word.load(Ordering::Relaxed) & bit == 0 {
+                word.fetch_or(bit, Ordering::Relaxed);
+            }
+        }
+    }
     /// Mapping/EOF validation is complete before this private transport helper.
     fn copy_read(&self, mut address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
         let mut done = 0;
@@ -246,7 +260,7 @@ impl View {
             .expect("writable page")
             .lock(offset, input.len());
         guard.write(offset, input.len()).copy_from_slice(input);
-        frame.bytes.changed(&mut guard, offset, input.len());
+        self.changed(frame, &mut guard, offset, input.len());
     }
 }
 impl CpuMemory for View {
@@ -380,7 +394,7 @@ impl CpuMemory for View {
             .lock(offset, len);
         let (value, write) = update(guard.write(offset, len));
         if write {
-            frame.bytes.changed(&mut guard, offset, len)
+            self.changed(frame, &mut guard, offset, len)
         }
         Ok(value)
     }
@@ -423,7 +437,7 @@ impl CpuMemory for View {
             return Ok(false);
         }
         guard.write(offset, bytes.len()).copy_from_slice(bytes);
-        frame.bytes.changed(&mut guard, offset, bytes.len());
+        self.changed(frame, &mut guard, offset, bytes.len());
         Ok(true)
     }
     fn fence(&self, order: Ordering) {
@@ -630,6 +644,20 @@ impl Memory {
             identity: self.identity,
             code_revision: self.code_revision,
             pages,
+            // Backing-epoch refreshes can retain the same ConcurrentPages in
+            // earlier views. Keep their publication tracker in that domain too.
+            // Mapping changes require joined workers and get a fresh tracker.
+            dirty_pages: old
+                .as_ref()
+                .filter(|c| c.snapshot.code_revision == self.code_revision)
+                .map_or_else(
+                    || {
+                        (0..self.frames.len().div_ceil(64))
+                            .map(|_| AtomicU64::new(0))
+                            .collect()
+                    },
+                    |c| c.snapshot.dirty_pages.clone(),
+                ),
             frames,
             reservations: self.reservations.clone(),
             code_epoch: registry.code_epoch.clone(),
@@ -656,57 +684,70 @@ impl Memory {
             return Ok(());
         };
         let result = (|| {
-            for frame in &cache.snapshot.frames {
-                if !frame.permissions.write {
-                    continue;
-                }
-                let mut dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
-                if dirty == 0 {
-                    continue;
-                }
-                let guard = frame
-                    .bytes
-                    .bytes
-                    .as_ref()
-                    .expect("dirty writable page")
-                    .lock(0, PAGE_SIZE as usize);
-                while dirty != 0 {
-                    let first = dirty.trailing_zeros() as usize;
-                    let count = (dirty >> first).trailing_ones() as usize;
-                    self.write(
-                        frame.base + (first * 64) as u64,
-                        guard.read(first * 64, count * 64),
-                    )?;
-                    // Coalesce adjacent dirty fragments without writing through
-                    // a clean hole or overwriting another backing alias's bytes.
-                    if count == 64 {
-                        dirty = 0;
-                    } else {
-                        dirty &= !(((1u64 << count) - 1) << first);
+            for (word_index, word) in cache.snapshot.dirty_pages.iter().enumerate() {
+                // Workers are joined; no concurrent publication can be lost.
+                let mut pending = word.load(Ordering::Relaxed);
+                while pending != 0 {
+                    let bit = pending.trailing_zeros() as usize;
+                    let index = cache.snapshot.positions[word_index * 64 + bit]
+                        .expect("dirty mapped frame");
+                    let frame = &cache.snapshot.frames[index];
+                    debug_assert!(frame.permissions.write);
+                    let mut dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
+                    if dirty == 0 {
+                        pending &= pending - 1;
+                        word.store(pending, Ordering::Relaxed);
+                        continue;
                     }
-                }
-                let page = self.frames[frame.root_frame]
-                    .as_ref()
-                    .expect("committed page");
-                frame
-                    .native_retryable
-                    .store(page.native_retryable(), Ordering::Relaxed);
-                frame
-                    .native_one_shot
-                    .store(page.native_one_shot(), Ordering::Relaxed);
-                frame.native_live_private.store(
-                    page.backing
+                    let guard = frame
+                        .bytes
+                        .bytes
                         .as_ref()
-                        .is_some_and(|b| !b.shared && !b.private_copy),
-                    Ordering::Relaxed,
-                );
-                frame
-                    .data_revision
-                    .store(page.data_revision, Ordering::Relaxed);
-                frame.backing_version.store(
-                    page.backing.as_ref().map_or(0, |b| b.object.version()),
-                    Ordering::Relaxed,
-                );
+                        .expect("dirty writable page")
+                        .lock(0, PAGE_SIZE as usize);
+                    while dirty != 0 {
+                        let first = dirty.trailing_zeros() as usize;
+                        let count = (dirty >> first).trailing_ones() as usize;
+                        if let Err(error) = self.write(
+                            frame.base + (first * 64) as u64,
+                            guard.read(first * 64, count * 64),
+                        ) {
+                            frame.bytes.dirty.fetch_or(dirty, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                        // Coalesce adjacent dirty fragments without writing through
+                        // a clean hole or overwriting another backing alias's bytes.
+                        if count == 64 {
+                            dirty = 0;
+                        } else {
+                            dirty &= !(((1u64 << count) - 1) << first);
+                        }
+                    }
+                    let page = self.frames[frame.root_frame]
+                        .as_ref()
+                        .expect("committed page");
+                    frame
+                        .native_retryable
+                        .store(page.native_retryable(), Ordering::Relaxed);
+                    frame
+                        .native_one_shot
+                        .store(page.native_one_shot(), Ordering::Relaxed);
+                    frame.native_live_private.store(
+                        page.backing
+                            .as_ref()
+                            .is_some_and(|b| !b.shared && !b.private_copy),
+                        Ordering::Relaxed,
+                    );
+                    frame
+                        .data_revision
+                        .store(page.data_revision, Ordering::Relaxed);
+                    frame.backing_version.store(
+                        page.backing.as_ref().map_or(0, |b| b.object.version()),
+                        Ordering::Relaxed,
+                    );
+                    pending &= pending - 1;
+                    word.store(pending, Ordering::Relaxed);
+                }
             }
             Ok(())
         })();
@@ -729,12 +770,63 @@ mod tests {
     use std::sync::Barrier;
 
     #[test]
+    fn sparse_publication_survives_frame_reuse_and_repeated_worker_epochs() {
+        let mut memory = Memory::default();
+        memory
+            .map(0x1000, PAGE_SIZE * 257, Permissions::RW)
+            .unwrap();
+        // Reuse a low root-frame index for a high virtual address; publication
+        // must not confuse virtual table order with stable frame indices.
+        memory.unmap(0x2000, PAGE_SIZE).unwrap();
+        memory.map(0x400000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let addresses = [0x1000, 0x41000, 0x81000, 0x101000, 0x400000];
+        for epoch in 1..=3u64 {
+            let view = memory.parallel_view(&mut registry).unwrap();
+            let mut threads = Vec::new();
+            for address in addresses {
+                let mut view = view.clone();
+                threads.push(std::thread::spawn(move || {
+                    view.write_array(address, epoch.to_le_bytes()).unwrap();
+                }));
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            drop(view);
+            memory.commit_parallel().unwrap();
+            memory.commit_parallel().unwrap();
+            for address in addresses {
+                assert_eq!(memory.read_u64(address).unwrap(), epoch);
+            }
+            assert_eq!(memory.read_u64(0x5000).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_views_publish_after_an_unrelated_backing_epoch_refresh() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let mut earlier = memory.parallel_view(&mut registry).unwrap();
+        backing_changed();
+        let mut later = memory.parallel_view(&mut registry).unwrap();
+        earlier.write_array(0x1000, 7u64.to_le_bytes()).unwrap();
+        later.write_array(0x2000, 9u64.to_le_bytes()).unwrap();
+        drop((earlier, later));
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x1000).unwrap(), 7);
+        assert_eq!(memory.read_u64(0x2000).unwrap(), 9);
+    }
+
+    #[test]
     fn commit_coalesces_dirty_runs_and_preserves_clean_backing_alias_holes() {
         struct Backing {
             bytes: RefCell<[u8; 4096]>,
             writes: RefCell<Vec<(usize, usize)>>,
             version: Cell<u64>,
             identity: u64,
+            fail_once: Cell<bool>,
         }
         impl PageBacking for Backing {
             fn parallel_key(&self) -> Option<(u64, u64)> {
@@ -748,6 +840,9 @@ mod tests {
                 Ok(())
             }
             fn write(&self, offset: usize, input: &[u8]) -> Result<(), MemoryError> {
+                if self.fail_once.replace(false) {
+                    return Err(MemoryError::BackingIo(5));
+                }
                 self.bytes.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
                 self.writes.borrow_mut().push((offset, input.len()));
                 self.version.set(self.version.get().wrapping_add(1));
@@ -775,6 +870,7 @@ mod tests {
             writes: RefCell::new(Vec::new()),
             version: Cell::new(0),
             identity: new_backing_identity(),
+            fail_once: Cell::new(false),
         });
         let mut memory = Memory::default();
         memory
@@ -809,6 +905,14 @@ mod tests {
         drop(view);
         memory.commit_parallel().unwrap();
         assert_eq!(*object.writes.borrow(), [(0, 128)]);
+        // A transient persistence failure must keep uncommitted fragments.
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.write_array(0x3020, 42u64.to_le_bytes()).unwrap();
+        drop(view);
+        object.fail_once.set(true);
+        assert_eq!(memory.commit_parallel(), Err(MemoryError::BackingIo(5)));
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x1020).unwrap(), 42);
     }
     #[test]
     fn immutable_code_ignores_unrelated_live_code_epochs() {

@@ -58,7 +58,7 @@ impl View {
             .lock(offset, len);
         // Invalidate reservations/code before exposing a mutable slice, including
         // an internal panic. Dirty-fragment commit uses the existing CPU hooks.
-        frame.bytes.changed(&mut guard, offset, len);
+        self.changed(frame, &mut guard, offset, len);
         Ok(operation(guard.write(offset, len)))
     }
 }
@@ -265,7 +265,7 @@ impl NativeMemory for View {
                     .as_ref()
                     .expect("writable page")
                     .lock_pair(si, di, count);
-                dst.changed(&mut guard, di, count);
+                self.changed(df, &mut guard, di, count);
                 guard.copy_within(si, di, count);
             } else if let Some(bytes) = &src.constant {
                 self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
@@ -279,7 +279,7 @@ impl NativeMemory for View {
                     let dg = dst.bytes.as_ref().unwrap().lock(di, count);
                     (dg, sg)
                 };
-                dst.changed(&mut dg, di, count);
+                self.changed(df, &mut dg, di, count);
                 copy(dg.write(di, count), sg.read(si, count));
             }
             remaining -= count;
