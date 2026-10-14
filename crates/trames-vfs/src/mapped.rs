@@ -310,6 +310,9 @@ impl Vfs {
         writable: bool,
     ) -> Result<Vec<Rc<dyn PageBacking>>> {
         let o = self.descriptor(fd)?.open.borrow();
+        if o.flags & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         if o.flags & 3 == 1 {
             return Err(Errno(13));
         }

@@ -186,6 +186,13 @@ impl Vfs {
         self.chmod_node(node, mode)
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
+        if self.flags(fd)? & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        self.chmod_fd_at(fd, mode)
+    }
+    /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
+    pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
         let n = self
             .descriptor(fd)?
             .open
@@ -193,6 +200,9 @@ impl Vfs {
             .node
             .clone()
             .ok_or(Errno(22))?;
+        if matches!(n.borrow().content, Content::Symlink(_)) {
+            return Err(Errno(95));
+        }
         self.chmod_node(n, mode)
     }
     pub fn set_times(

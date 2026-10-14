@@ -58,7 +58,7 @@ impl Linux {
                     if a[0] as i32 == -100 {
                         self.vfs.chmod_at(-100, b".", a[2] as u32)?;
                     } else {
-                        self.vfs.chmod_fd(a[0] as u32, a[2] as u32)?;
+                        self.vfs.chmod_fd_at(a[0] as u32, a[2] as u32)?;
                     }
                 } else {
                     self.vfs

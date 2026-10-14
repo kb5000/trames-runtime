@@ -12,6 +12,7 @@ pub struct Linux {
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable_path: Vec<u8>,
+    pub executable_file: Option<std::rc::Rc<trames_vfs::ExecutableFile>>,
     pub command_name: Vec<u8>,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
@@ -45,6 +46,7 @@ impl Linux {
             arguments: Vec::new(),
             environment: Vec::new(),
             executable_path: Vec::new(),
+            executable_file: None,
             command_name: Vec::new(),
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
@@ -669,7 +671,8 @@ impl Linux {
                 }
                 let path = Self::path(memory, a[1])?;
                 if path.is_empty() && a[4] & 0x1000 != 0 {
-                    self.vfs.chown_fd(a[0] as u32, a[2] as u32, a[3] as u32)?;
+                    self.vfs
+                        .chown_fd_at(a[0] as u32, a[2] as u32, a[3] as u32)?;
                 } else {
                     self.vfs.chown_at(
                         a[0] as i32,
@@ -833,6 +836,9 @@ impl Linux {
             }
             25 => {
                 let flags = self.vfs.flags(a[0] as u32)?;
+                if flags & trames_vfs::O_PATH != 0 && !matches!(a[1], 0..=3 | 1030) {
+                    return Err(Errno(9));
+                }
                 match a[1] {
                     1033 => Ok(self.vfs.seals(a[0] as u32, Some(a[2] as u32))? as u64),
                     1034 => Ok(self.vfs.seals(a[0] as u32, None)? as u64),
@@ -896,6 +902,9 @@ impl Linux {
                 }
             }
             29 => {
+                if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
+                    return Err(Errno(9));
+                }
                 if a[1] as u32 == 0x5421 {
                     let flags = self.vfs.flags(a[0] as u32)? & (3 | 0x400 | O_NONBLOCK);
                     let mut value = [0; 4];

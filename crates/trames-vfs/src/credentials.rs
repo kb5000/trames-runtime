@@ -72,8 +72,11 @@ impl Credentials {
 }
 impl Vfs {
     pub fn apply_exec_credentials(&mut self, path: &[u8]) -> Result<()> {
-        let n = self.node(&self.resolve(AT_FDCWD, path)?)?;
-        let n = n.borrow();
+        let file = self.executable_file_at(AT_FDCWD, path, 0)?;
+        self.apply_exec_file_credentials(&file)
+    }
+    pub fn apply_exec_file_credentials(&mut self, file: &ExecutableFile) -> Result<()> {
+        let n = file.node.borrow();
         if n.mode & 0o4000 != 0 {
             self.credentials.euid = n.uid;
             self.credentials.fsuid = n.uid;
@@ -182,6 +185,13 @@ impl Vfs {
         self.chown_node(node, uid, gid)
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
+        if self.flags(fd)? & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        self.chown_fd_at(fd, uid, gid)
+    }
+    /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
+    pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         let node = self
             .descriptor(fd)?
             .open

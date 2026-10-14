@@ -2,6 +2,8 @@
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 mod credentials;
 mod events;
+mod executable;
+pub use executable::ExecutableFile;
 mod ipc;
 mod kernel_log;
 mod locks;
@@ -43,6 +45,7 @@ pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_LARGEFILE: u32 = 0x20000;
 pub const O_CLOEXEC: u32 = 0x80000;
 pub const O_NONBLOCK: u32 = 0x800;
+pub const O_PATH: u32 = 0x200000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Errno(pub u32);
 impl fmt::Display for Errno {
@@ -171,6 +174,8 @@ struct Node {
     times: [storage::Timestamp; 3],
     seals: Option<u32>,
 }
+type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>);
+type ResolvedEntry = (Vec<u8>, Option<ResolvedInode>);
 type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
@@ -531,6 +536,16 @@ impl Vfs {
         self.proc_accessed.replace(false)
     }
     pub fn resolve_final(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Vec<u8>> {
+        self.resolve_entry(dirfd, path, follow_final, false)
+            .map(|entry| entry.0)
+    }
+    fn resolve_entry(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow_final: bool,
+        retain_magic: bool,
+    ) -> Result<ResolvedEntry> {
         if path.is_empty() {
             return Err(Errno(2));
         }
@@ -586,6 +601,18 @@ impl Vfs {
                 return Err(Errno(36));
             }
             if !parts.is_empty() || follow_final || trailing {
+                if retain_magic {
+                    if let Some((node, label)) = self.proc_magic_node_normalized(&current)? {
+                        if parts.is_empty() && !trailing {
+                            return Ok((current, Some((node, label))));
+                        }
+                        if !matches!(node.borrow().content, Content::Directory) {
+                            return Err(Errno(20));
+                        }
+                        current = self.path_of(&node)?;
+                        continue;
+                    }
+                }
                 if let Ok(node) = self.node(&current) {
                     if let Content::Symlink(target) = &node.borrow().content {
                         links += 1;
@@ -620,7 +647,7 @@ impl Vfs {
                 return Err(Errno(20));
             }
         }
-        Ok(current)
+        Ok((current, None))
     }
     pub fn symlink_at(&mut self, target: &[u8], dirfd: i32, path: &[u8]) -> Result<()> {
         if target.is_empty() {
@@ -754,16 +781,7 @@ impl Vfs {
         Ok(())
     }
     pub fn executable(&self, path: &[u8]) -> Result<Vec<u8>> {
-        let p = self.resolve(AT_FDCWD, path)?;
-        let node = self.node(&p)?;
-        let n = node.borrow();
-        if !self.allowed(&n, 1) {
-            return Err(Errno(13));
-        }
-        match &n.content {
-            Content::File(b) => Self::executable_data(b),
-            _ => Err(Errno(13)),
-        }
+        self.executable_file_at(AT_FDCWD, path, 0)?.bytes()
     }
     pub fn mkdir_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
         if path.len() >= MAX_PATH {
@@ -862,7 +880,13 @@ impl Vfs {
             | O_NOFOLLOW
             | O_LARGEFILE
             | O_CLOEXEC
+            | O_PATH
             | 0x101000;
+        let flags = if flags & O_PATH != 0 {
+            flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        } else {
+            flags
+        };
         if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
             return Err(Errno(22));
         }
@@ -903,7 +927,7 @@ impl Vfs {
         let node = self.node(&p)?;
         {
             let mut n = node.borrow_mut();
-            if matches!(n.content, Content::Symlink(_)) {
+            if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
                 return Err(Errno(40));
             }
             if matches!(n.content, Content::Directory) && flags & 3 != 0 {
@@ -913,6 +937,7 @@ impl Vfs {
                 return Err(Errno(20));
             }
             if existed
+                && flags & O_PATH == 0
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
                     || (flags & 3 != 0 && !self.allowed(&n, 2)))
             {
@@ -929,10 +954,11 @@ impl Vfs {
         if flags & 0x200 != 0 {
             self.checkpoint()?;
         }
-        let bridge = if matches!(
-            node.borrow().content,
-            Content::Device(pseudo::Device::Bridge)
-        ) {
+        let bridge = if flags & O_PATH == 0
+            && matches!(
+                node.borrow().content,
+                Content::Device(pseudo::Device::Bridge)
+            ) {
             Some(
                 self.bridge
                     .as_ref()
@@ -943,32 +969,39 @@ impl Vfs {
         } else {
             None
         };
-        let kernel_log = matches!(node.borrow().content, Content::Device(pseudo::Device::Kmsg))
-            .then(|| self.kernel_log.clone());
+        let kernel_log = (flags & O_PATH == 0
+            && matches!(node.borrow().content, Content::Device(pseudo::Device::Kmsg)))
+        .then(|| self.kernel_log.clone());
         let position = kernel_log.as_ref().map_or(0, |log| log.borrow().oldest());
-        let pty = match node.borrow().content {
-            Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty()?),
-            Content::Device(pseudo::Device::Pts(id)) if id != 0 => {
-                let pair = self.pty_by_id(id).ok_or(Errno(5))?;
-                if pair.locked.get() || !pair.master_alive.get() {
-                    return Err(Errno(5));
-                }
-                Some(PtyEnd::new(pair, false))
-            }
-            Content::Terminal => match self.controlling_terminal {
-                None => return Err(Errno(6)),
-                Some(0) => None,
-                Some(id) => {
-                    let pair = self.pty_by_id(id).ok_or(Errno(6))?;
-                    if !pair.master_alive.get() {
-                        return Err(Errno(6));
+        let pty = if flags & O_PATH != 0 {
+            None
+        } else {
+            match node.borrow().content {
+                Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty()?),
+                Content::Device(pseudo::Device::Pts(id)) if id != 0 => {
+                    let pair = self.pty_by_id(id).ok_or(Errno(5))?;
+                    if pair.locked.get() || !pair.master_alive.get() {
+                        return Err(Errno(5));
                     }
                     Some(PtyEnd::new(pair, false))
                 }
-            },
-            _ => None,
+                Content::Terminal => match self.controlling_terminal {
+                    None => return Err(Errno(6)),
+                    Some(0) => None,
+                    Some(id) => {
+                        let pair = self.pty_by_id(id).ok_or(Errno(6))?;
+                        if !pair.master_alive.get() {
+                            return Err(Errno(6));
+                        }
+                        Some(PtyEnd::new(pair, false))
+                    }
+                },
+                _ => None,
+            }
         };
-        let pipe = if let Content::Fifo(pipe) = &node.borrow().content {
+        let pipe = if flags & O_PATH != 0 {
+            None
+        } else if let Content::Fifo(pipe) = &node.borrow().content {
             let read = flags & 3 != 1;
             let write = flags & 3 != 0;
             if write && !read && flags & O_NONBLOCK != 0 && pipe.borrow().readers == 0 {
@@ -989,11 +1022,13 @@ impl Vfs {
                 open: Rc::new(RefCell::new(OpenDescription {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
-                    kind: if pty.is_some()
-                        || matches!(
-                            node.borrow().content,
-                            Content::Terminal | Content::Device(pseudo::Device::Pts(_))
-                        ) {
+                    kind: if flags & O_PATH == 0
+                        && (pty.is_some()
+                            || matches!(
+                                node.borrow().content,
+                                Content::Terminal | Content::Device(pseudo::Device::Pts(_))
+                            ))
+                    {
                         FdKind::Terminal
                     } else {
                         FdKind::Node(p)
@@ -1168,7 +1203,7 @@ impl Vfs {
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
         let mut o = self.descriptor(fd)?.open.borrow_mut();
-        if o.flags & 3 == 1 {
+        if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
         }
         if let Some(log) = o.kernel_log.clone() {
@@ -1364,7 +1399,7 @@ impl Vfs {
         if o.bridge.is_some() || o.kernel_log.is_some() {
             return Err(Errno(29));
         }
-        if o.flags & 3 == 1 {
+        if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
         }
         let n = o.node.as_ref().ok_or(Errno(29))?.borrow();
@@ -1387,6 +1422,9 @@ impl Vfs {
         self.file_write(fd, bytes, Some(offset))
     }
     pub fn truncate_fd(&mut self, fd: u32, length: u64) -> Result<()> {
+        if self.flags(fd)? & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         let available = self.capacity().available_bytes;
         let memfd_available = self.memfd_available();
         let o = self.descriptor(fd)?.open.borrow();
@@ -1439,6 +1477,9 @@ impl Vfs {
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
+        if o.flags & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         if o.kind == FdKind::Terminal {
             return Err(Errno(29));
         }

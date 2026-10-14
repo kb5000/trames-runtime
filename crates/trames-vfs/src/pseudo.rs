@@ -232,6 +232,7 @@ pub struct ProcessInfo {
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable: Vec<u8>,
+    pub executable_file: Option<Weak<ExecutableFile>>,
     pub cwd: Vec<u8>,
     pub mapped_bytes: usize,
     pub virtual_bytes: u64,
@@ -531,6 +532,33 @@ impl Vfs {
             };
             actual = format!("/proc/{}/fd/{fd}", self.pid).into_bytes();
         }
+        if let Some(open) = self.proc_fd_description_normalized(&actual)? {
+            return Ok(Some(open));
+        }
+        let Some((node, label)) = self.proc_exe_node_normalized(&actual)? else {
+            return Ok(None);
+        };
+        let owner = (node.borrow().uid, node.borrow().gid);
+        Ok(Some(Rc::new(RefCell::new(OpenDescription {
+            id: self.open_id(),
+            owner,
+            kind: FdKind::Node(label),
+            flags: 0,
+            position: 0,
+            node: Some(node),
+            pipe: None,
+            socket: None,
+            bridge: None,
+            kernel_log: None,
+            anonymous: None,
+            local: None,
+            pty: None,
+        }))))
+    }
+    fn proc_fd_description_normalized(
+        &self,
+        actual: &[u8],
+    ) -> Result<Option<Rc<RefCell<OpenDescription>>>> {
         let Some(rest) = actual.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
@@ -584,6 +612,48 @@ impl Vfs {
         };
         Ok(Some(open))
     }
+    pub(super) fn proc_magic_node_normalized(&self, path: &[u8]) -> Result<Option<ResolvedInode>> {
+        if let Some(open) = self.proc_fd_description_normalized(path)? {
+            let o = open.borrow();
+            let node = o.node.clone().ok_or(Errno(13))?;
+            let label = match &o.kind {
+                FdKind::Node(label) => label.clone(),
+                _ => path.to_vec(),
+            };
+            return Ok(Some((node, label)));
+        }
+        self.proc_exe_node_normalized(path)
+    }
+    fn proc_exe_node_normalized(&self, path: &[u8]) -> Result<Option<ResolvedInode>> {
+        let Some(rest) = path.strip_prefix(b"/proc/") else {
+            return Ok(None);
+        };
+        let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+        let (group, pid) = match parts.as_slice() {
+            [pid, b"exe"] => (None, *pid),
+            [group, b"task", pid, b"exe"] => (Some(*group), *pid),
+            _ => return Ok(None),
+        };
+        let parse = |s: &[u8]| {
+            std::str::from_utf8(s)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        };
+        let pseudo = self.pseudo.borrow();
+        let process = pseudo
+            .runtime
+            .processes
+            .iter()
+            .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
+            .ok_or(Errno(2))?;
+        if self.credentials.fsuid != 0 && self.credentials.fsuid != process.credentials.euid {
+            return Err(Errno(13));
+        }
+        let Some(file) = process.executable_file.as_ref().and_then(Weak::upgrade) else {
+            return Ok(None);
+        };
+        Ok(Some((file.node.clone(), file.label.clone())))
+    }
     pub(super) fn open_proc_fd(
         &mut self,
         dirfd: i32,
@@ -611,7 +681,9 @@ impl Vfs {
         {
             return Err(Errno(20));
         }
-        if let Some(node) = &original.node {
+        if flags & O_PATH != 0 {
+            // O_PATH references the inode without admitting data reads/writes.
+        } else if let Some(node) = &original.node {
             let n = node.borrow();
             if (flags & 3 != 1 && !self.allowed(&n, 4)) || (flags & 3 != 0 && !self.allowed(&n, 2))
             {
@@ -925,7 +997,8 @@ impl Vfs {
                         b"fd" | b"fdinfo" | b"net" => return Ok(directory()),
                         b"cwd" => return Ok(link(p.cwd.clone())),
                         b"root" => return Ok(link(b"/".to_vec())),
-                        b"exe" => return Ok(link(p.executable.clone())),
+                        b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
+                        b"exe" => return Ok(None),
                         b"comm" => comm(p),
                         b"cmdline" => nul_list(&p.arguments),
                         b"environ" => nul_list(&p.environment),

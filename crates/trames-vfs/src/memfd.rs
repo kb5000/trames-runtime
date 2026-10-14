@@ -52,7 +52,6 @@ impl Vfs {
         drop(fs);
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);
-        target.extend_from_slice(b" (deleted)");
         self.fds.insert(
             fd,
             Descriptor {
