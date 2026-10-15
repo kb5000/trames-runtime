@@ -229,6 +229,7 @@ pub struct ProcessInfo {
     pub state: char,
     pub credentials: Credentials,
     pub namespaces: NamespaceSnapshot,
+    pub namespace_ids: [Vec<u32>; 4],
     pub command: Vec<u8>,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
@@ -270,7 +271,7 @@ pub struct RuntimeInfo {
 pub(super) struct PseudoFs {
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
-    pub(super) nodes: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
+    pub(super) nodes: BTreeMap<(u64, Vec<u8>), Rc<RefCell<Node>>>,
     next_inode: u64,
 }
 impl PseudoFs {
@@ -278,10 +279,16 @@ impl PseudoFs {
         self.nodes
             .iter()
             .find(|(_, n)| Rc::ptr_eq(n, node))
-            .map(|(p, _)| p.clone())
+            .map(|((_, p), _)| p.clone())
     }
-    fn cache(&mut self, path: &[u8], content: Content, mode: u32) -> Result<Rc<RefCell<Node>>> {
-        if let Some(node) = self.nodes.get(path) {
+    fn cache(
+        &mut self,
+        ns: u64,
+        path: &[u8],
+        content: Content,
+        mode: u32,
+    ) -> Result<Rc<RefCell<Node>>> {
+        if let Some(node) = self.nodes.get(&(ns, path.to_vec())) {
             node.borrow_mut().content = content;
             return Ok(node.clone());
         }
@@ -309,7 +316,7 @@ impl PseudoFs {
             times: [storage::Timestamp::default(); 3],
             seals: None,
         }));
-        self.nodes.insert(path.to_vec(), node.clone());
+        self.nodes.insert((ns, path.to_vec()), node.clone());
         Ok(node)
     }
 }
@@ -391,7 +398,20 @@ impl Vfs {
             p.namespaces = self.namespace_snapshot();
         }
         let mut pseudo = self.pseudo.borrow_mut();
-        pseudo.nodes.retain(|path, _| {
+        pseudo.nodes.retain(|(ns, path), _| {
+            if !self.pid_ns.namespace_alive(*ns) {
+                return false;
+            }
+            let local = |p: &ProcessInfo, id| {
+                if *ns == 0 {
+                    id
+                } else {
+                    p.namespaces
+                        .pid
+                        .upgrade()
+                        .map_or(0, |n| PidNamespace(n).local_in(*ns, id))
+                }
+            };
             let parts: Vec<_> = path.split(|b| *b == b'/').collect();
             if !(parts.len() > 2
                 && parts[1] == b"proc"
@@ -402,7 +422,11 @@ impl Vfs {
             let pid = std::str::from_utf8(parts[2])
                 .ok()
                 .and_then(|p| p.parse::<u32>().ok());
-            if !runtime.processes.iter().any(|p| Some(p.pid) == pid) {
+            if !runtime
+                .processes
+                .iter()
+                .any(|p| Some(local(p, p.pid)) == pid)
+            {
                 return false;
             }
             if parts.len() > 4 && parts[3] == b"task" {
@@ -412,7 +436,7 @@ impl Vfs {
                 return runtime
                     .processes
                     .iter()
-                    .any(|p| Some(p.pid) == tid && Some(p.tgid) == pid);
+                    .any(|p| Some(local(p, p.pid)) == tid && Some(local(p, p.tgid)) == pid);
             }
             true
         });
@@ -549,11 +573,8 @@ impl Vfs {
             } else {
                 2
             };
-            actual = self.resolve_final(
-                AT_FDCWD,
-                format!("/proc/{}/fd/{fd}", self.pid).as_bytes(),
-                false,
-            )?;
+            actual =
+                self.resolve_final(AT_FDCWD, format!("/proc/self/fd/{fd}").as_bytes(), false)?;
         }
         if let Some(ns) = self.namespace_for_path(&actual)? {
             return Ok(Some(self.namespace_description(ns)));
@@ -594,7 +615,7 @@ impl Vfs {
     }
     fn proc_fd_description_normalized(
         &self,
-        actual: &[u8],
+        actual: &ResolvedPath,
     ) -> Result<Option<Rc<RefCell<OpenDescription>>>> {
         let Some(rest) = actual.strip_prefix(b"/proc/") else {
             return Ok(None);
@@ -610,9 +631,7 @@ impl Vfs {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok());
             if !self
-                .pseudo
-                .borrow()
-                .runtime
+                .proc_runtime(actual, &self.pseudo.borrow().runtime)
                 .processes
                 .iter()
                 .any(|p| Some(p.pid) == tid && Some(p.tgid) == group)
@@ -631,8 +650,8 @@ impl Vfs {
             .and_then(|s| s.parse::<u32>().ok());
         let open = {
             let pseudo = self.pseudo.borrow();
-            let process = pseudo
-                .runtime
+            let runtime = self.proc_runtime(actual, &pseudo.runtime);
+            let process = runtime
                 .processes
                 .iter()
                 .find(|p| Some(p.pid) == pid)
@@ -649,7 +668,10 @@ impl Vfs {
         };
         Ok(Some(open))
     }
-    pub(super) fn proc_magic_node_normalized(&self, path: &[u8]) -> Result<Option<ResolvedInode>> {
+    pub(super) fn proc_magic_node_normalized(
+        &self,
+        path: &ResolvedPath,
+    ) -> Result<Option<ResolvedInode>> {
         if let Some(open) = self.proc_fd_description_normalized(path)? {
             let o = open.borrow();
             let node = o.node.clone().ok_or(Errno(13))?;
@@ -661,7 +683,7 @@ impl Vfs {
         }
         self.proc_exe_node_normalized(path)
     }
-    fn proc_exe_node_normalized(&self, path: &[u8]) -> Result<Option<ResolvedInode>> {
+    fn proc_exe_node_normalized(&self, path: &ResolvedPath) -> Result<Option<ResolvedInode>> {
         let Some(rest) = path.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
@@ -677,8 +699,8 @@ impl Vfs {
                 .and_then(|s| s.parse::<u32>().ok())
         };
         let pseudo = self.pseudo.borrow();
-        let process = pseudo
-            .runtime
+        let runtime = self.proc_runtime(path, &pseudo.runtime);
+        let process = runtime
             .processes
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
@@ -812,15 +834,23 @@ impl Vfs {
         Ok(out)
     }
     pub(super) fn refresh_pseudo_fd(&self, fd: u32) -> Result<()> {
-        let kind = self.descriptor(fd)?.open.borrow().kind.clone();
-        if let FdKind::Node(path) = kind {
-            if self.pseudo_readonly(&path) {
+        let o = self.descriptor(fd)?.open.borrow();
+        if let FdKind::Node(key) = &o.kind {
+            let path = ResolvedPath {
+                key: key.clone(),
+                mount: o.mount.clone(),
+            };
+            if self.uses_pseudo(&path) && self.pseudo_readonly(&path) {
                 self.pseudo_node(&path)?;
             }
         }
         Ok(())
     }
-    pub(super) fn pseudo_node(&self, path: &[u8]) -> Result<Option<Rc<RefCell<Node>>>> {
+    pub(super) fn pseudo_node<P: PathArg + ?Sized>(
+        &self,
+        at: &P,
+    ) -> Result<Option<Rc<RefCell<Node>>>> {
+        let path = at.key();
         if ![b"/proc".as_slice(), b"/sys", b"/dev"].iter().any(|base| {
             path == *base
                 || path
@@ -832,9 +862,18 @@ impl Vfs {
         if !self.pseudo.borrow().enabled {
             return Ok(None);
         }
-        let content = self.pseudo_content(path)?;
+        let content = self.pseudo_content(at)?;
         if let Some((content, mode)) = content {
-            let node = self.pseudo.borrow_mut().cache(path, content, mode)?;
+            let node = self.pseudo.borrow_mut().cache(
+                if path.starts_with(b"/proc") && self.proc_namespace(at).is_nested() {
+                    self.proc_namespace(at).id()
+                } else {
+                    0
+                },
+                path,
+                content,
+                mode,
+            )?;
             if let Some(rest) = path.strip_prefix(b"/proc/") {
                 let pid = rest
                     .split(|b| *b == b'/')
@@ -842,9 +881,7 @@ impl Vfs {
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .and_then(|s| s.parse::<u32>().ok());
                 if let Some(p) = self
-                    .pseudo
-                    .borrow()
-                    .runtime
+                    .proc_runtime(at, &self.pseudo.borrow().runtime)
                     .processes
                     .iter()
                     .find(|p| Some(p.pid) == pid)
@@ -870,10 +907,12 @@ impl Vfs {
         }
         Ok(None)
     }
-    fn pseudo_content(&self, path: &[u8]) -> Result<Option<(Content, u32)>> {
+    fn pseudo_content<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<(Content, u32)>> {
+        let path = at.key();
         let pseudo = self.pseudo.borrow();
-        let r = &pseudo.runtime;
-        let own = r.processes.iter().find(|p| p.pid == self.pid);
+        let r = self.proc_runtime(at, &pseudo.runtime);
+        let current = self.proc_namespace(at).local(self.pid);
+        let own = r.processes.iter().find(|p| p.pid == current);
         let directory = || Some((Content::Directory, 0o40555));
         let regular = |value: Vec<u8>| Some((file(value), 0o100444));
         let link = |value: Vec<u8>| Some((Content::Symlink(value), 0o120777));
@@ -925,8 +964,8 @@ impl Vfs {
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
             b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
             b"/sys/devices/system/cpu/offline"=>return Ok(regular(b"\n".to_vec())),
-            b"/proc/self" => return Ok(link(own.map_or(self.pid, |p| p.tgid).to_string().into_bytes())),
-            b"/proc/thread-self" => return Ok(link(format!("{}/task/{}", own.map_or(self.pid, |p| p.tgid), self.pid).into_bytes())),
+            b"/proc/self" => return Ok(link(own.map_or(current, |p| p.tgid).to_string().into_bytes())),
+            b"/proc/thread-self" => return Ok(link(format!("{}/task/{}", own.map_or(current, |p| p.tgid), current).into_bytes())),
             b"/proc/mounts" => return Ok(link(b"self/mounts".to_vec())),
             b"/proc/net" => return Ok(link(b"self/net".to_vec())),
             b"/dev/fd" => return Ok(link(b"/proc/self/fd".to_vec())),
@@ -1024,7 +1063,10 @@ impl Vfs {
                     return Ok(directory());
                 }
                 let key = parts[i];
-                if parts.len() == i + 2 && key == b"ns" && matches!(parts[i + 1], b"uts" | b"mnt") {
+                if parts.len() == i + 2
+                    && key == b"ns"
+                    && matches!(parts[i + 1], b"uts" | b"mnt" | b"pid" | b"pid_for_children")
+                {
                     return Ok(
                         linux_namespace::snapshot_label(&p.namespaces, parts[i + 1]).and_then(link)
                     );
@@ -1094,6 +1136,21 @@ impl Vfs {
                                     .join(",")
                             );
                             let threads = r.processes.iter().filter(|t| t.tgid == p.tgid).count();
+                            let mut name = name;
+                            for (key, ids) in ["NStgid", "NSpid", "NSpgid", "NSsid"]
+                                .iter()
+                                .zip(&p.namespace_ids)
+                            {
+                                if !ids.is_empty() {
+                                    name.push_str(&format!(
+                                        "\n{key}:\t{}",
+                                        ids.iter()
+                                            .map(u32::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join("\t")
+                                    ));
+                                }
+                            }
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
@@ -1315,7 +1372,8 @@ impl Vfs {
         }
         Ok(None)
     }
-    pub(super) fn pseudo_children(&self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+    pub(super) fn pseudo_children<P: PathArg + ?Sized>(&self, at: &P) -> Result<Vec<Vec<u8>>> {
+        let path = at.key();
         if let Some(tail) = path.strip_prefix(b"/sys/devices/system/cpu/cpu") {
             let parts: Vec<_> = tail.split(|c| *c == b'/').collect();
             if std::str::from_utf8(parts[0])
@@ -1488,7 +1546,7 @@ impl Vfs {
             _ => Vec::new(),
         };
         let pseudo = self.pseudo.borrow();
-        let r = &pseudo.runtime;
+        let r = self.proc_runtime(at, &pseudo.runtime);
         if path == b"/proc" {
             names.extend(
                 r.processes
@@ -1572,6 +1630,8 @@ impl Vfs {
                         && linux_namespace::snapshot_label(&p.namespaces, b"uts").is_some()
                     {
                         names.push(b"uts".to_vec());
+                        names.push(b"pid".to_vec());
+                        names.push(b"pid_for_children".to_vec());
                         if p.namespaces.mount.strong_count() != 0 {
                             names.push(b"mnt".to_vec());
                         }

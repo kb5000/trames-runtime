@@ -914,7 +914,9 @@ impl Linux {
                                     })
                                     .to_le_bytes(),
                                 );
-                                bytes[24..28].copy_from_slice(&conflict.owner.to_le_bytes());
+                                bytes[24..28].copy_from_slice(
+                                    &self.vfs.visible_pid(conflict.owner).to_le_bytes(),
+                                );
                             } else {
                                 bytes[..2].copy_from_slice(&2u16.to_le_bytes());
                             }

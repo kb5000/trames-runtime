@@ -52,6 +52,7 @@ pub(super) struct Mount {
     pub root: Rc<RefCell<Node>>,
     pub root_key: Vec<u8>,
     pub kind: Kind,
+    pub pid_namespace: Option<PidNamespace>,
     pub flags: Cell<u64>,
     pub writers: Cell<usize>,
     pub parent: RefCell<Option<Attachment>>,
@@ -218,6 +219,7 @@ impl Vfs {
             root,
             root_key: b"/".to_vec(),
             kind: Kind::Root,
+            pid_namespace: None,
             flags: Cell::new(MS_RELATIME),
             writers: Cell::new(0),
             parent: RefCell::new(None),
@@ -237,6 +239,7 @@ impl Vfs {
                 root: node.clone(),
                 root_key: path.to_vec(),
                 kind,
+                pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
                 flags: Cell::new(flags),
                 writers: Cell::new(0),
                 parent: RefCell::new(Some(Attachment {
@@ -397,6 +400,7 @@ impl Vfs {
                     root: m.root.clone(),
                     root_key: m.root_key.clone(),
                     kind: m.kind,
+                    pid_namespace: m.pid_namespace.clone(),
                     flags: Cell::new(m.flags.get()),
                     writers: Cell::new(0),
                     parent: RefCell::new(None),
@@ -636,12 +640,20 @@ impl Vfs {
         if ns.0.borrow().mounts.len() + additions.len() + 1 > MAX_MOUNTS {
             return Err(Errno(28));
         }
+        let proc_ns = if flags & 4096 != 0 {
+            self.resolve(AT_FDCWD, source.ok_or(Errno(22))?)?
+                .mount
+                .and_then(|m| m.pid_namespace.clone())
+        } else {
+            (mount_kind == Kind::Proc).then(|| self.pid_ns.clone())
+        };
         let root = Rc::new(Mount {
             id: new_mount_id()?,
             fs,
             root,
             root_key,
             kind: mount_kind,
+            pid_namespace: proc_ns,
             flags: Cell::new(attrs),
             writers: Cell::new(0),
             parent: RefCell::new(Some(Attachment {
@@ -839,7 +851,7 @@ impl Vfs {
         {
             return Ok(Vec::new());
         }
-        self.pseudo_children(&path.key)
+        self.pseudo_children(path)
     }
 }
 fn new_mount_id() -> Result<u64> {
@@ -856,6 +868,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         root: m.root.clone(),
         root_key: m.root_key.clone(),
         kind: m.kind,
+        pid_namespace: m.pid_namespace.clone(),
         flags: Cell::new(m.flags.get()),
         writers: Cell::new(0),
         parent: RefCell::new(None),

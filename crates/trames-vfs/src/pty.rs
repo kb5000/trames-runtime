@@ -141,7 +141,7 @@ impl Vfs {
         });
         self.ptys.borrow_mut().insert(id, Rc::downgrade(&pair));
         let path = format!("/dev/pts/{id}").into_bytes();
-        self.pseudo.borrow_mut().nodes.remove(&path);
+        self.pseudo.borrow_mut().nodes.remove(&(0, path.clone()));
         let node = self.node(&path)?;
         node.borrow_mut().uid = self.credentials.fsuid;
         node.borrow_mut().gid = 5; // Linux's tty group; grantpt/chown may change it.

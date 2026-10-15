@@ -16,6 +16,8 @@ mod syscall_names;
 pub use ipc::{LocalReceived, LocalSocket};
 pub use locks::RecordLock;
 mod linux_namespace;
+mod pid_namespace;
+pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
 mod namespace;
 pub use linux_namespace::{NamespaceSnapshot, UtsNamespace, CLONE_NEWUTS};
 mod network;
@@ -202,6 +204,8 @@ pub struct Vfs {
     cwd_node: Option<Rc<RefCell<Node>>>,
     root_node: Option<Rc<RefCell<Node>>>,
     uts: UtsNamespace,
+    pid_ns: PidNamespace,
+    pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
     mount_registry: Rc<RefCell<Vec<Weak<Mount>>>>,
     detached_mounts: Rc<RefCell<Vec<Vec<Rc<Mount>>>>>,
@@ -225,6 +229,7 @@ pub struct Vfs {
 }
 impl Default for Vfs {
     fn default() -> Self {
+        let pid_ns = PidNamespace::default();
         let mut v = Self {
             network: trames_net::Network::default(),
             fs: Rc::new(RefCell::new(Filesystem {
@@ -241,6 +246,8 @@ impl Default for Vfs {
             cwd_node: None,
             root_node: None,
             uts: UtsNamespace::default(),
+            pid_ns: pid_ns.clone(),
+            pid_children: pid_ns,
             mounts: None,
             mount_registry: Rc::default(),
             detached_mounts: Rc::default(),
@@ -503,7 +510,7 @@ impl Vfs {
             if key == b"/proc" || key.starts_with(b"/proc/") {
                 self.proc_accessed.set(true);
             }
-            if let Some(node) = self.pseudo_node(key)? {
+            if let Some(node) = self.pseudo_node(path)? {
                 return Ok(node);
             }
         }
@@ -1636,7 +1643,7 @@ impl Vfs {
                         .nodes
                         .iter()
                         .find(|(_, n)| n.borrow().inode == node.inode)
-                        .map(|(p, _)| p.clone())
+                        .map(|((_, p), _)| p.clone())
                 });
             if let Some(path) = path {
                 let mut prefix = path.clone();

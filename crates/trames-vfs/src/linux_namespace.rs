@@ -58,24 +58,28 @@ impl UtsNamespace {
 pub(super) enum NamespaceHandle {
     Uts(UtsNamespace),
     Mount(MountNamespace),
+    Pid(PidNamespace),
 }
 impl NamespaceHandle {
     pub fn id(&self) -> u64 {
         match self {
             Self::Uts(n) => n.id(),
             Self::Mount(n) => n.id(),
+            Self::Pid(n) => n.id(),
         }
     }
     pub fn kind(&self) -> u64 {
         match self {
             Self::Uts(_) => CLONE_NEWUTS,
             Self::Mount(_) => CLONE_NEWNS,
+            Self::Pid(_) => CLONE_NEWPID,
         }
     }
     pub fn label(&self) -> Vec<u8> {
         match self {
             Self::Uts(n) => n.label(),
             Self::Mount(n) => format!("mnt:[{}]", n.id()).into_bytes(),
+            Self::Pid(n) => n.label(),
         }
     }
 }
@@ -83,6 +87,8 @@ impl NamespaceHandle {
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
     uts: Weak<Uts>,
+    pub(super) pid: Weak<pid_namespace::PidSpace>,
+    pub(super) pid_children: Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
     pub(super) root: Option<(Weak<Mount>, Weak<RefCell<Node>>)>,
 }
@@ -91,6 +97,8 @@ impl Vfs {
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
         NamespaceSnapshot {
             uts: Rc::downgrade(&self.uts.0),
+            pid: Rc::downgrade(&self.pid_ns.0),
+            pid_children: Rc::downgrade(&self.pid_children.0),
             mount: self
                 .mounts
                 .as_ref()
@@ -139,6 +147,12 @@ impl Vfs {
         }
         match ns {
             NamespaceHandle::Uts(ns) => self.uts = ns,
+            NamespaceHandle::Pid(ns) => {
+                if !self.pid_ns.contains(&ns) {
+                    return Err(Errno(22));
+                }
+                self.pid_children = ns;
+            }
             NamespaceHandle::Mount(ns) => {
                 let root = ns.0.borrow().root.clone();
                 self.mounts = Some(ns);
@@ -159,14 +173,21 @@ impl Vfs {
             .as_ref()
             .map(NamespaceHandle::kind))
     }
-    pub(super) fn namespace_for_path(&self, path: &[u8]) -> Result<Option<NamespaceHandle>> {
+    pub(super) fn namespace_for_path(
+        &self,
+        path: &ResolvedPath,
+    ) -> Result<Option<NamespaceHandle>> {
         let Some(rest) = path.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
         let (group, pid, kind) = match parts.as_slice() {
-            [pid, b"ns", kind @ (b"uts" | b"mnt")] => (None, *pid, *kind),
-            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt")] => (Some(*group), *pid, *kind),
+            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children")] => {
+                (None, *pid, *kind)
+            }
+            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children")] => {
+                (Some(*group), *pid, *kind)
+            }
             _ => return Ok(None),
         };
         let parse = |p: &[u8]| {
@@ -178,8 +199,8 @@ impl Vfs {
         if !pseudo.enabled {
             return Ok(None);
         }
-        let process = pseudo
-            .runtime
+        let runtime = self.proc_runtime(path, &pseudo.runtime);
+        let process = runtime
             .processes
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
@@ -190,6 +211,15 @@ impl Vfs {
         Ok(Some(match kind {
             b"uts" => NamespaceHandle::Uts(UtsNamespace(
                 process.namespaces.uts.upgrade().ok_or(Errno(2))?,
+            )),
+            b"pid" | b"pid_for_children" => NamespaceHandle::Pid(PidNamespace(
+                if kind == b"pid" {
+                    &process.namespaces.pid
+                } else {
+                    &process.namespaces.pid_children
+                }
+                .upgrade()
+                .ok_or(Errno(2))?,
             )),
             _ => NamespaceHandle::Mount(MountNamespace(
                 process.namespaces.mount.upgrade().ok_or(Errno(2))?,
@@ -240,6 +270,14 @@ impl Vfs {
 pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Option<Vec<u8>> {
     match kind {
         b"uts" => snapshot.uts.upgrade().map(|ns| UtsNamespace(ns).label()),
+        b"pid" => snapshot.pid.upgrade().map(|ns| PidNamespace(ns).label()),
+        b"pid_for_children" => snapshot
+            .pid_children
+            .upgrade()
+            .filter(|ns| {
+                PidNamespace(ns.clone()).init() != 1 || !PidNamespace(ns.clone()).is_nested()
+            })
+            .map(|ns| PidNamespace(ns).label()),
         b"mnt" => snapshot
             .mount
             .upgrade()
