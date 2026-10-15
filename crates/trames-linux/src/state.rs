@@ -562,6 +562,7 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            280 => self.bpf_syscall(a, memory),
             5..=16 => self.xattr_syscall(number, a, memory),
             51 => {
                 let path = Self::path(memory, a[0])?;

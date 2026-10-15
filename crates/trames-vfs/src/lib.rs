@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
+mod bpf;
 pub mod capabilities;
 mod cgroup;
 mod credentials;
@@ -24,7 +25,9 @@ mod namespace;
 mod xattr;
 pub use linux_namespace::{NamespaceSnapshot, UtsNamespace, CLONE_NEWUTS};
 mod network;
+mod oom;
 mod pseudo;
+pub use oom::OomTask;
 mod pty;
 pub mod terminal;
 pub use pty::{Pty, PtyEnd};
@@ -81,6 +84,7 @@ pub enum FdKind {
 }
 struct Pipe {
     inode: u64,
+    metadata: Option<Rc<RefCell<Node>>>,
     bytes: VecDeque<u8>,
     readers: u32,
     writers: u32,
@@ -99,6 +103,7 @@ impl Pipe {
     fn new(inode: u64) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             inode,
+            metadata: None,
             bytes: VecDeque::new(),
             readers: 0,
             writers: 0,
@@ -186,7 +191,15 @@ struct OpenDescription {
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
+    oom: Option<Weak<OomTask>>,
     mount: Option<Rc<Mount>>,
+}
+impl OpenDescription {
+    fn metadata_node(&self) -> Option<Rc<RefCell<Node>>> {
+        self.node
+            .clone()
+            .or_else(|| self.pipe.as_ref()?.pipe.borrow().metadata.clone())
+    }
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -340,6 +353,7 @@ impl Default for Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        oom: None,
                         mount: None,
                     })),
                     cloexec: false,
@@ -383,7 +397,12 @@ impl Vfs {
     }
     fn check_parent_write(&self, path: &ResolvedPath) -> Result<()> {
         path.writable()?;
-        if Self::cgroup_mount(path) || path.mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
+        if Self::cgroup_mount(path)
+            || path
+                .mount
+                .as_ref()
+                .is_some_and(|m| m.devpts.is_some() || m.kind == mounts::Kind::Mqueue)
+        {
             return Err(Errno(1));
         }
         if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
@@ -472,6 +491,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        oom: None,
                         mount: None,
                     })),
                     cloexec: false,
@@ -1068,6 +1088,7 @@ impl Vfs {
                 if !self.credentials.has_cap(capabilities::MKNOD) {
                     return Err(Errno(1));
                 }
+                self.cgroup_device(type_, device as u32 as u64, 1)?;
                 // Linux's syscall ABI accepts an unsigned 32-bit new_encode_dev.
                 pseudo::Device::node(device as u32, type_ == 0o60000)
             }
@@ -1206,7 +1227,9 @@ impl Vfs {
         if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
             p.writable()?;
         }
-        if self.uses_pseudo(&p)
+        let oom = self.oom_for_path(&p);
+        if oom.is_none()
+            && self.uses_pseudo(&p)
             && self.pseudo_readonly(&p)
             && (flags & 3 != 0 || flags & 0x240 != 0)
         {
@@ -1234,6 +1257,7 @@ impl Vfs {
         let node = self.node(&p)?;
         {
             let mut n = node.borrow_mut();
+            self.check_device_open(&n, flags)?;
             if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
                 return Err(Errno(6));
             }
@@ -1264,7 +1288,7 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
-            if flags & 0x200 != 0 && !Self::cgroup_mount(&p) {
+            if flags & 0x200 != 0 && !Self::cgroup_mount(&p) && oom.is_none() {
                 if let Content::File(b) = &mut n.content {
                     b.truncate(0)?;
                     n.times[1] = storage::Timestamp::now();
@@ -1362,6 +1386,7 @@ impl Vfs {
                     local: None,
                     pty,
                     namespace: None,
+                    oom,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -1489,6 +1514,20 @@ impl Vfs {
             return Err(Errno(24));
         }
         let p = Pipe::new(self.open_id());
+        let inode = p.borrow().inode;
+        p.borrow_mut().metadata = Some(Rc::new(RefCell::new(Node {
+            device: 6,
+            content: Content::Null,
+            mode: 0o10600,
+            uid: self.credentials.fsuid,
+            gid: self.credentials.fsgid,
+            volatile: false,
+            inode,
+            links: 1,
+            times: [storage::Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
+            seals: None,
+        })));
         let read = PipeEnd::new(p.clone(), true, false, false);
         let write = PipeEnd::new(p, false, true, false);
         for (fd, end, kind, access) in [
@@ -1513,6 +1552,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        oom: None,
                         mount: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
@@ -1526,6 +1566,10 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(data) = Self::oom_read(&o, o.position, count)? {
+            o.position += data.len() as u64;
+            return Ok(data);
         }
         if let Some(data) = self.cgroup_read(&o, o.position, count)? {
             o.position += data.len() as u64;
@@ -1665,6 +1709,10 @@ impl Vfs {
         if o.flags & 3 == 0 {
             return Err(Errno(9));
         }
+        if let Some(count) = self.oom_write(&o, bytes)? {
+            // proc oom_score_adj_write ignores and does not advance f_pos.
+            return Ok(count);
+        }
         if let Some(count) = self.cgroup_write(&o, bytes)? {
             if offset.is_none() {
                 o.position = o.position.saturating_add(count as u64);
@@ -1754,6 +1802,9 @@ impl Vfs {
         }
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(data) = Self::oom_read(&o, offset, count)? {
+            return Ok(data);
         }
         if let Some(data) = self.cgroup_read(&o, offset, count)? {
             return Ok(data);
@@ -1858,14 +1909,18 @@ impl Vfs {
             o.position = position;
             return Ok(0);
         }
-        let length = match &n.content {
-            Content::File(b) => b.len(),
-            Content::Directory => 0,
-            Content::Socket(_) => return Err(Errno(6)),
-            Content::Symlink(_) => return Err(Errno(40)),
-            Content::Null => return Ok(0),
-            Content::Device(_) => return Ok(0),
-            Content::Terminal | Content::Fifo(_) => return Err(Errno(29)),
+        let length = if o.oom.is_some() {
+            0
+        } else {
+            match &n.content {
+                Content::File(b) => b.len(),
+                Content::Directory => 0,
+                Content::Socket(_) => return Err(Errno(6)),
+                Content::Symlink(_) => return Err(Errno(40)),
+                Content::Null => return Ok(0),
+                Content::Device(_) => return Ok(0),
+                Content::Terminal | Content::Fifo(_) => return Err(Errno(29)),
+            }
         };
         let base = match whence {
             0 => 0,
@@ -1993,7 +2048,7 @@ impl Vfs {
         self.stat_open(&d.open.borrow())
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
-        if let Some(n) = &o.node {
+        if let Some(n) = o.metadata_node() {
             return self.stat_node(&n.borrow(), o.mount.as_ref());
         }
         if matches!(o.kind, FdKind::Terminal) {

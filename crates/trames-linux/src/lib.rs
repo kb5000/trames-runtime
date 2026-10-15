@@ -3,6 +3,7 @@
 use std::io;
 use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
+mod bpf;
 mod file_calls;
 mod network;
 mod state;

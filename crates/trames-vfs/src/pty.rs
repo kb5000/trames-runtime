@@ -232,6 +232,7 @@ impl Vfs {
         if !self.allowed(&node.borrow(), 6) {
             return Err(Errno(13));
         }
+        self.check_device_open(&node.borrow(), flags)?;
         self.fds.insert(
             fd,
             Descriptor {
@@ -249,6 +250,7 @@ impl Vfs {
                     anonymous: None,
                     local: None,
                     namespace: None,
+                    oom: None,
                     mount: end.pair.mount.clone(),
                     pty: Some(PtyEnd::new(end.pair.clone(), false)),
                 })),

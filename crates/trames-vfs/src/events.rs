@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Bpf(Rc<bpf::Program>),
     Signal {
         mask: u64,
     },
@@ -43,6 +44,7 @@ impl Watch {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Bpf(_) => b"anon_inode:bpf-prog",
             Self::Signal { .. } => b"anon_inode:[signalfd]",
             Self::Event { .. } => b"anon_inode:[eventfd]",
             Self::Timer { .. } => b"anon_inode:[timerfd]",
@@ -81,6 +83,7 @@ impl Anonymous {
     }
     pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
         match self {
+            Self::Bpf(_) => 0,
             Self::Signal { mask } => {
                 if mask & pending != 0 {
                     events & 1
@@ -142,7 +145,7 @@ impl Anonymous {
                 }
                 std::mem::take(pending)
             }
-            Self::Signal { .. } | Self::Epoll { .. } => return Err(Errno(22)),
+            Self::Bpf(_) | Self::Signal { .. } | Self::Epoll { .. } => return Err(Errno(22)),
         };
         Ok(value.to_le_bytes().to_vec())
     }
@@ -189,7 +192,7 @@ impl Vfs {
             _ => None,
         })
     }
-    fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
+    pub(super) fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
         let fd = self.available(0)?;
         self.fds.insert(
             fd,
@@ -209,6 +212,7 @@ impl Vfs {
                     local: None,
                     pty: None,
                     namespace: None,
+                    oom: None,
                     mount: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
@@ -331,6 +335,9 @@ impl Vfs {
             && !matches!(t.anonymous, Some(Anonymous::Event { .. }))
         {
             return Err(Errno(95));
+        }
+        if matches!(t.anonymous, Some(Anonymous::Bpf(_))) {
+            return Err(Errno(1));
         }
         if matches!(t.anonymous, Some(Anonymous::Epoll { .. })) {
             return Err(Errno(95));

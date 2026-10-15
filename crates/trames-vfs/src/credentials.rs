@@ -280,7 +280,13 @@ impl Vfs {
                 && bits & 2 == 0
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
-    fn chown_node(&self, node: Rc<RefCell<Node>>, uid: u32, gid: u32) -> Result<()> {
+    fn chown_node(
+        &self,
+        node: Rc<RefCell<Node>>,
+        uid: u32,
+        gid: u32,
+        persistent: bool,
+    ) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
@@ -303,7 +309,11 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(error) = self.checkpoint() {
+        if let Err(error) = if persistent {
+            self.checkpoint()
+        } else {
+            Ok(())
+        } {
             let mut n = node.borrow_mut();
             (n.uid, n.gid, n.mode, n.times[2]) = old;
             return Err(error);
@@ -320,7 +330,7 @@ impl Vfs {
     ) -> Result<()> {
         let (path, node) = self.metadata_target(dirfd, path, !nofollow)?;
         path.writable()?;
-        self.chown_node(node, uid, gid)
+        self.chown_node(node, uid, gid, true)
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -331,13 +341,8 @@ impl Vfs {
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         self.fd_writable(fd)?;
-        let node = self
-            .descriptor(fd)?
-            .open
-            .borrow()
-            .node
-            .clone()
-            .ok_or(Errno(22))?;
-        self.chown_node(node, uid, gid)
+        let open = self.descriptor(fd)?.open.borrow();
+        let node = open.metadata_node().ok_or(Errno(22))?;
+        self.chown_node(node, uid, gid, open.node.is_some())
     }
 }

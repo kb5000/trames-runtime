@@ -150,7 +150,7 @@ impl Vfs {
         }
         Ok(())
     }
-    fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32) -> Result<()> {
+    fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32, persistent: bool) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {
@@ -164,7 +164,11 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(e) = self.checkpoint() {
+        if let Err(e) = if persistent {
+            self.checkpoint()
+        } else {
+            Ok(())
+        } {
             let mut n = node.borrow_mut();
             n.mode = old_mode;
             n.times[2] = old_time;
@@ -175,7 +179,7 @@ impl Vfs {
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
         let (path, node) = self.metadata_target(dirfd, path, true)?;
         path.writable()?;
-        self.chmod_node(node, mode)
+        self.chmod_node(node, mode, true)
     }
     pub fn chmod_at_flags(
         &mut self,
@@ -189,7 +193,7 @@ impl Vfs {
         if matches!(node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
-        self.chmod_node(node, mode)
+        self.chmod_node(node, mode, true)
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -200,17 +204,12 @@ impl Vfs {
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
         self.fd_writable(fd)?;
-        let n = self
-            .descriptor(fd)?
-            .open
-            .borrow()
-            .node
-            .clone()
-            .ok_or(Errno(22))?;
+        let open = self.descriptor(fd)?.open.borrow();
+        let n = open.metadata_node().ok_or(Errno(22))?;
         if matches!(n.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
-        self.chmod_node(n, mode)
+        self.chmod_node(n, mode, open.node.is_some())
     }
     pub fn set_times(
         &mut self,

@@ -344,9 +344,10 @@ impl Vfs {
         if shared && writable && o.flags & 3 != 2 {
             return Err(Errno(13));
         }
-        if o.mount
-            .as_ref()
-            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
+        if o.oom.is_some()
+            || o.mount
+                .as_ref()
+                .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
         {
             return Err(Errno(19));
         }

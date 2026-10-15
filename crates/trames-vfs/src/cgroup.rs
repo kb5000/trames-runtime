@@ -24,8 +24,14 @@ const FILES: &[(&str, u32)] = &[
     ("cgroup.stat", 0o444),
     ("cgroup.freeze", 0o644),
     ("cgroup.kill", 0o200),
+    // crun opens io.max even for an empty OCI blockIO object. Expose the
+    // empty/unlimited view, but reject all writes: no IO controller is
+    // advertised and no throttling request can silently succeed.
+    ("io.max", 0o644),
 ];
 struct Group {
+    device_programs: Vec<Rc<bpf::Program>>,
+    device_attach_flags: u32,
     path: Vec<u8>,
     parent: Option<u64>,
     freeze: bool,
@@ -40,6 +46,7 @@ struct Dying {
     ancestors: Vec<u64>,
 }
 pub(super) struct Cgroups {
+    pub bpf: bpf::Registry,
     pub fs: Rc<RefCell<Filesystem>>,
     groups: BTreeMap<u64, Group>,
     tasks: BTreeMap<u32, (u32, u64)>, // global TID -> (global TGID, group inode)
@@ -60,6 +67,7 @@ fn child_path(path: &[u8], name: &[u8]) -> Vec<u8> {
 impl Default for Cgroups {
     fn default() -> Self {
         let mut out = Self {
+            bpf: bpf::Registry::default(),
             fs: Rc::new(RefCell::new(Filesystem {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -112,7 +120,7 @@ impl Cgroups {
             if parent.is_none()
                 && matches!(
                     *name,
-                    "cgroup.type" | "cgroup.events" | "cgroup.freeze" | "cgroup.kill"
+                    "cgroup.type" | "cgroup.events" | "cgroup.freeze" | "cgroup.kill" | "io.max"
                 )
             {
                 continue;
@@ -122,6 +130,8 @@ impl Cgroups {
         self.groups.insert(
             id,
             Group {
+                device_programs: Vec::new(),
+                device_attach_flags: 0,
                 path,
                 parent,
                 freeze: false,
@@ -202,6 +212,165 @@ impl Cgroups {
     }
 }
 impl Vfs {
+    fn bpf_group(&self, fd: u32) -> Result<u64> {
+        let open = self.descriptor(fd)?.open.borrow();
+        if !open
+            .mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
+        {
+            return Err(Errno(9));
+        }
+        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
+        if !matches!(node.content, Content::Directory) {
+            return Err(Errno(22));
+        }
+        if node.links == 0 || !self.cgroups.borrow().groups.contains_key(&node.inode) {
+            return Err(Errno(19));
+        }
+        Ok(node.inode)
+    }
+    pub fn bpf_attach_device(
+        &self,
+        target: u32,
+        program: u32,
+        flags: u32,
+        replace: u32,
+    ) -> Result<()> {
+        self.bpf_authorized()?;
+        if flags & !6 != 0 || flags == 4 {
+            return Err(Errno(22));
+        }
+        let id = self.bpf_group(target)?;
+        let program = self.bpf_program(program)?;
+        let replace = if flags & 4 != 0 {
+            Some(self.bpf_program(replace)?)
+        } else {
+            None
+        };
+        let mut cg = self.cgroups.borrow_mut();
+        // ALLOW_OVERRIDE is not supported. A single ancestor attachment keeps
+        // the hierarchy closed to descendant attachment, as on Linux.
+        if cg.ancestors(id).iter().skip(1).any(|a| {
+            !cg.groups[a].device_programs.is_empty() && cg.groups[a].device_attach_flags == 0
+        }) {
+            return Err(Errno(1));
+        }
+        if flags == 0
+            && cg.groups.iter().any(|(other, g)| {
+                *other != id
+                    && below(&g.path, &cg.groups[&id].path)
+                    && !g.device_programs.is_empty()
+            })
+        {
+            return Err(Errno(1));
+        }
+        let group = cg.groups.get_mut(&id).unwrap();
+        if !group.device_programs.is_empty() && group.device_attach_flags != flags & 2 {
+            return Err(Errno(22));
+        }
+        if group.device_programs.iter().any(|p| p.id == program.id) {
+            return Err(Errno(17));
+        }
+        if let Some(old) = replace {
+            let slot = group
+                .device_programs
+                .iter_mut()
+                .find(|p| p.id == old.id)
+                .ok_or(Errno(2))?;
+            *slot = program;
+        } else if flags == 0 {
+            group.device_programs = vec![program];
+        } else {
+            if group.device_programs.len() >= 16 {
+                return Err(Errno(7));
+            }
+            group.device_programs.push(program);
+        }
+        group.device_attach_flags = flags & 2;
+        Ok(())
+    }
+    pub fn bpf_detach_device(&self, target: u32, program: u32) -> Result<()> {
+        self.bpf_authorized()?;
+        let id = self.bpf_group(target)?;
+        let program = self.bpf_program(program)?;
+        let mut cg = self.cgroups.borrow_mut();
+        let group = cg.groups.get_mut(&id).unwrap();
+        let index = group
+            .device_programs
+            .iter()
+            .position(|p| p.id == program.id)
+            .ok_or(Errno(2))?;
+        group.device_programs.remove(index);
+        if group.device_programs.is_empty() {
+            group.device_attach_flags = 0;
+        }
+        Ok(())
+    }
+    pub fn bpf_query_device(&self, target: u32, effective: bool) -> Result<(u32, Vec<u32>)> {
+        self.bpf_authorized()?;
+        let id = self.bpf_group(target)?;
+        let cg = self.cgroups.borrow();
+        let groups = if effective {
+            cg.ancestors(id)
+        } else {
+            vec![id]
+        };
+        Ok((
+            if effective {
+                0
+            } else {
+                cg.groups[&id].device_attach_flags
+            },
+            groups
+                .iter()
+                .flat_map(|g| cg.groups[g].device_programs.iter().map(|p| p.id))
+                .collect(),
+        ))
+    }
+    pub(super) fn cgroup_device(&self, mode: u32, rdev: u64, access: u32) -> Result<()> {
+        let kind = match mode & 0o170000 {
+            0o20000 => 2,
+            0o60000 => 1,
+            _ => return Ok(()),
+        };
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xfffff000);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & 0xffffff00);
+        let cg = self.cgroups.borrow();
+        let mut id = Some(cg.tasks.get(&self.pid).map_or(ROOT, |(_, g)| *g));
+        while let Some(current) = id {
+            let group = &cg.groups[&current];
+            if group
+                .device_programs
+                .iter()
+                .any(|p| !p.allows([kind | (access << 16), major as u32, minor as u32]))
+            {
+                return Err(Errno(1));
+            }
+            id = group.parent;
+        }
+        Ok(())
+    }
+    pub(super) fn check_device_open(&self, node: &Node, flags: u32) -> Result<()> {
+        if flags & O_PATH != 0 {
+            return Ok(());
+        }
+        let rdev = match node.content {
+            Content::Null => 0x103,
+            Content::Terminal => 0x500,
+            Content::Device(d) => d.rdev(),
+            _ => return Ok(()),
+        };
+        self.cgroup_device(
+            node.mode,
+            rdev,
+            match flags & 3 {
+                0 => 2,
+                1 => 4,
+                _ => 6,
+            },
+        )
+    }
     /// Called before clone commits IDs/TID stores. All workers have joined;
     /// the following membership insertion cannot race another charge.
     pub fn cgroup_can_fork(&self, pid: u32) -> Result<()> {
@@ -374,6 +543,7 @@ impl Vfs {
         let cg = self.cgroups.borrow();
         let path = &cg.groups.get(&id).ok_or(Errno(19))?.path;
         let text = match name.as_slice() {
+            b"io.max" => String::new(),
             b"cgroup.procs" | b"cgroup.threads" => {
                 let ids: BTreeSet<_> = cg
                     .tasks
@@ -454,6 +624,7 @@ impl Vfs {
         }
         let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?.trim();
         match name.as_slice() {
+            b"io.max" => return Err(Errno(95)),
             b"cgroup.freeze" => {
                 let freeze = match text {
                     "0" => false,

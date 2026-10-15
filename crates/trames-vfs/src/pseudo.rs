@@ -48,6 +48,33 @@ mod tests {
         out
     }
     #[test]
+    fn device_directory_enumerates_only_available_embedding_devices() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        for attached in [false, true] {
+            if attached {
+                v.attach_bridge(trames_bridge::Broker::default());
+            }
+            let fd = v.open_at(AT_FDCWD, b"/dev", O_DIRECTORY, 0).unwrap();
+            let entries = v.getdents(fd, 4096).unwrap();
+            let mut at = 0;
+            let mut found = false;
+            while at < entries.len() {
+                let length =
+                    u16::from_le_bytes(entries[at + 16..at + 18].try_into().unwrap()) as usize;
+                let name = entries[at + 19..at + length]
+                    .split(|b| *b == 0)
+                    .next()
+                    .unwrap();
+                v.stat_at_flags(fd as i32, name, true).unwrap();
+                found |= name == b"trames-bridge";
+                at += length;
+            }
+            assert_eq!(found, attached);
+            v.close(fd).unwrap();
+        }
+    }
+    #[test]
     fn logical_block_identity_agrees_across_mounts_stat_and_sysfs() {
         let mut v = Vfs::default();
         let capacity = v.capacity();
@@ -249,6 +276,7 @@ pub struct ProcessInfo {
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
+    pub oom: Weak<OomTask>,
     pub pending: u64,
     pub shared_pending: u64,
     pub blocked: u64,
@@ -273,6 +301,9 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    // One empty POSIX queue filesystem for the current guest IPC scope.
+    // mq_* calls remain unsupported; ordinary VFS operations cannot invent queues.
+    pub(super) mqueue: Option<Rc<RefCell<Filesystem>>>,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) nodes: BTreeMap<(u64, Vec<u8>), Rc<RefCell<Node>>>,
@@ -647,6 +678,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: None,
+            oom: None,
             mount,
         }))))
     }
@@ -785,6 +817,7 @@ impl Vfs {
             // O_PATH references the inode without admitting data reads/writes.
         } else if let Some(node) = &original.node {
             let n = node.borrow();
+            self.check_device_open(&n, flags)?;
             if (flags & 3 != 1 && !self.allowed(&n, 4)) || (flags & 3 != 0 && !self.allowed(&n, 2))
             {
                 return Err(Errno(13));
@@ -824,6 +857,7 @@ impl Vfs {
             local: None,
             pty: original.pty.clone(),
             namespace: original.namespace.clone(),
+            oom: original.oom.clone(),
             mount: original.mount.clone(),
         };
         drop(original);
@@ -835,6 +869,7 @@ impl Vfs {
             },
         );
         if flags & 0x200 != 0
+            && self.descriptor(fd)?.open.borrow().oom.is_none()
             && self
                 .descriptor(fd)?
                 .open
@@ -881,6 +916,9 @@ impl Vfs {
     }
     pub(super) fn refresh_pseudo_fd(&self, fd: u32) -> Result<()> {
         let o = self.descriptor(fd)?.open.borrow();
+        if o.oom.is_some() {
+            return Ok(());
+        }
         if let FdKind::Node(key) = &o.kind {
             let path = ResolvedPath {
                 key: key.clone(),
@@ -921,11 +959,16 @@ impl Vfs {
                 mode,
             )?;
             if let Some(rest) = path.strip_prefix(b"/proc/") {
-                let pid = rest
-                    .split(|b| *b == b'/')
-                    .next()
-                    .and_then(|s| std::str::from_utf8(s).ok())
-                    .and_then(|s| s.parse::<u32>().ok());
+                let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+                // Raw clone threads can have distinct credentials. Task paths
+                // belong to the selected TID, not always the group leader.
+                let pid = if parts.get(1) == Some(&b"task".as_slice()) {
+                    parts.get(2)
+                } else {
+                    parts.first()
+                }
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(|s| s.parse::<u32>().ok());
                 if let Some(p) = self
                     .proc_runtime(at, &self.pseudo.borrow().runtime)
                     .processes
@@ -1048,7 +1091,7 @@ impl Vfs {
             b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
             b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\tcgroup2\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;
@@ -1128,6 +1171,7 @@ impl Vfs {
                         b"root" => return Ok(link(b"/".to_vec())),
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
+                        b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
                         b"comm" => comm(p),
                         b"cgroup" => [
                             b"0::".as_slice(),
@@ -1501,21 +1545,8 @@ impl Vfs {
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/dev" => [
-                "zero",
-                "full",
-                "random",
-                "urandom",
-                "kmsg",
-                "ptmx",
-                "pts",
-                "fd",
-                "stdin",
-                "stdout",
-                "trames-bridge",
-                "stderr",
-                "vda",
-                "vda1",
-                "block",
+                "zero", "full", "random", "urandom", "kmsg", "ptmx", "pts", "fd", "stdin",
+                "stdout", "stderr", "vda", "vda1", "block",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())
@@ -1624,6 +1655,9 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
+        if path == b"/dev" && self.bridge.is_some() {
+            names.push(b"trames-bridge".to_vec());
+        }
         let pseudo = self.pseudo.borrow();
         let r = self.proc_runtime(at, &pseudo.runtime);
         if path == b"/proc" {
@@ -1681,6 +1715,7 @@ impl Vfs {
                             "stat",
                             "status",
                             "statm",
+                            "oom_score_adj",
                             "cgroup",
                             "cmdline",
                             "environ",

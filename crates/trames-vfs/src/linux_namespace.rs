@@ -270,6 +270,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: Some(ns),
+            oom: None,
             mount: None,
         }))
     }

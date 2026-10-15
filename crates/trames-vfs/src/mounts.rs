@@ -11,6 +11,7 @@ pub(super) const MS_NODEV: u64 = 4;
 pub(super) const MS_NOEXEC: u64 = 8;
 pub(super) const MS_RELATIME: u64 = 1 << 21;
 const MAX_MOUNTS: usize = 128;
+const MAX_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(16);
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
 
@@ -23,6 +24,7 @@ pub(super) enum Kind {
     Devpts,
     Cgroup,
     Nsfs,
+    Mqueue,
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -234,7 +236,7 @@ impl Vfs {
         let enabled = self.pseudo.borrow().enabled;
         self.pseudo.borrow_mut().enabled = true;
         for (id, path, kind, flags) in [
-            (2, b"/proc".as_slice(), Kind::Proc, 15),
+            (2, b"/proc".as_slice(), Kind::Proc, 14),
             (3, b"/sys".as_slice(), Kind::Sysfs, 15),
             (4, b"/dev/pts".as_slice(), Kind::Devpts, 10),
         ] {
@@ -475,7 +477,7 @@ impl Vfs {
             return false;
         }
         match path.mount().map(|m| m.kind) {
-            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs) => false,
+            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue) => false,
             Some(Kind::Root) => {
                 let p = path.key();
                 !p.starts_with(b"/proc/")
@@ -552,7 +554,15 @@ impl Vfs {
         } else {
             flags
         };
-        let flags = flags & !0x8000; // MS_SILENT only suppresses kernel mount diagnostics.
+        // MS_SILENT only suppresses kernel mount diagnostics.
+        let flags = flags & !0x8000;
+        // Strict atime is the absence of relatime in the selected VFS model.
+        // Linux gives MS_STRICTATIME precedence when both are supplied.
+        let flags = if flags & (1 << 24) != 0 {
+            flags & !((1 << 24) | MS_RELATIME)
+        } else {
+            flags
+        };
         let target = self.mount_location(target, true)?;
         let target_node = self.node(&target)?;
         let parent = target.mount.as_ref().ok_or(Errno(22))?.clone();
@@ -587,7 +597,7 @@ impl Vfs {
             if !self.is_mount_root(&target) {
                 return Err(Errno(22));
             }
-            if matches!(parent.kind, Kind::Proc | Kind::Sysfs) && flags & MS_RDONLY == 0 {
+            if parent.kind == Kind::Sysfs && flags & MS_RDONLY == 0 {
                 return Err(Errno(30));
             }
             if flags & MS_RDONLY != 0 && parent.writers.get() != 0 {
@@ -687,8 +697,24 @@ impl Vfs {
                 return Err(Errno(20));
             }
             match kind.ok_or(Errno(22))? {
-                b"tmpfs" => {
-                    let (limit, nodes, mode) = tmpfs_options(data.unwrap_or_default())?;
+                b"mqueue" if self.pseudo.borrow().mqueue.is_some() => {
+                    if data.is_some_and(|d| !d.is_empty()) {
+                        return Err(Errno(95));
+                    }
+                    let fs = self.pseudo.borrow().mqueue.as_ref().unwrap().clone();
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Mqueue, flags & ATTRS)
+                }
+                b"tmpfs" | b"mqueue" => {
+                    let mqueue = kind == Some(b"mqueue");
+                    let (limit, nodes, mode) = if mqueue {
+                        if data.is_some_and(|d| !d.is_empty()) {
+                            return Err(Errno(95));
+                        }
+                        (0, 1, 0o1777)
+                    } else {
+                        tmpfs_options(data.unwrap_or_default())?
+                    };
                     let id = new_mount_id()?;
                     let inode = id << 32;
                     let root = Rc::new(RefCell::new(Node {
@@ -717,7 +743,16 @@ impl Vfs {
                         disk: None,
                         volume: None,
                     }));
-                    (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
+                    if mqueue {
+                        self.pseudo.borrow_mut().mqueue = Some(fs.clone());
+                    }
+                    (
+                        fs,
+                        root,
+                        b"/".to_vec(),
+                        if mqueue { Kind::Mqueue } else { Kind::Tmpfs },
+                        flags & ATTRS,
+                    )
                 }
                 b"cgroup2" => {
                     if data.is_some_and(|d| !d.is_empty()) {
@@ -749,7 +784,7 @@ impl Vfs {
                         node,
                         key.to_vec(),
                         k,
-                        (flags & ATTRS) | if k == Kind::Devpts { 0 } else { MS_RDONLY },
+                        (flags & ATTRS) | if k == Kind::Sysfs { MS_RDONLY } else { 0 },
                     )
                 }
                 _ => return Err(Errno(19)),
@@ -1030,7 +1065,7 @@ fn tmpfs_options(data: &[u8]) -> Result<(u64, usize, u32)> {
                     .map_err(|_| Errno(22))?
                     .checked_mul(scale)
                     .ok_or(Errno(22))?;
-                if size == 0 || size > MAX_FILE_BYTES as u64 {
+                if size == 0 || size > MAX_TMPFS_BYTES {
                     return Err(Errno(28));
                 }
             }
@@ -1070,6 +1105,7 @@ impl Mount {
             Kind::Devpts => "devpts",
             Kind::Cgroup => "cgroup2",
             Kind::Nsfs => "nsfs",
+            Kind::Mqueue => "mqueue",
         }
     }
     fn options(&self) -> String {
@@ -1183,6 +1219,7 @@ impl Vfs {
             Kind::Devpts => 0x1cd1,
             Kind::Cgroup => 0x63677270,
             Kind::Nsfs => 0x6e736673,
+            Kind::Mqueue => 0x19800202,
         };
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
         if matches!(m.kind, Kind::Root | Kind::Tmpfs) {
@@ -1555,6 +1592,66 @@ mod boundary_tests {
         assert!(text.contains(" /a / "));
         assert!(text.contains(" /space\\040here "));
         assert!(!text.contains(" /proc "));
+    }
+    #[test]
+    fn docker_tmpfs_size_is_lazy_and_strictatime_overrides_relatime() {
+        let mut v = vfs();
+        v.mount(
+            None,
+            b"/a",
+            Some(b"tmpfs"),
+            MS_RELATIME,
+            Some(b"size=65536k,mode=755"),
+        )
+        .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/a/f", 0x42, 0o600).unwrap();
+        v.write(fd, b"x").unwrap();
+        let open = v.descriptor(fd).unwrap().open.clone();
+        let mount = open.borrow().mount.clone().unwrap();
+        let capacity = Vfs::filesystem_capacity(&mount.fs.borrow());
+        assert_eq!(capacity.budget_bytes, MAX_TMPFS_BYTES);
+        assert_eq!(capacity.used_bytes, 1);
+        let node = open.borrow().node.clone().unwrap();
+        let future = storage::Timestamp {
+            seconds: storage::Timestamp::now().seconds + 100000,
+            nanos: 0,
+        };
+        node.borrow_mut().times[0] = future;
+        v.seek(fd, 0, 0).unwrap();
+        assert_eq!(v.read(fd, 1).unwrap(), b"x");
+        assert_eq!(node.borrow().times[0], future);
+        v.mount(None, b"/a", None, 32 | MS_RELATIME | (1 << 24), None)
+            .unwrap();
+        assert_eq!(mount.flags.get() & MS_RELATIME, 0);
+        v.seek(fd, 0, 0).unwrap();
+        v.read(fd, 1).unwrap();
+        assert!(node.borrow().times[0].seconds < future.seconds);
+    }
+    #[test]
+    fn empty_mqueue_mounts_share_identity_without_creatable_regular_files() {
+        let mut v = vfs();
+        v.mount(None, b"/a", Some(b"mqueue"), 14, None).unwrap();
+        v.mount(None, b"/b", Some(b"mqueue"), 14, None).unwrap();
+        assert_eq!(
+            &v.stat_at(AT_FDCWD, b"/a").unwrap()[..16],
+            &v.stat_at(AT_FDCWD, b"/b").unwrap()[..16]
+        );
+        let fd = v.open_at(AT_FDCWD, b"/a", O_DIRECTORY, 0).unwrap();
+        let open = v.descriptor(fd).unwrap().open.borrow();
+        let fs = v.mount_statfs(open.mount.as_ref());
+        assert_eq!(u64::from_le_bytes(fs[..8].try_into().unwrap()), 0x19800202);
+        drop(open);
+        assert_eq!(v.open_at(AT_FDCWD, b"/a/queue", 0x42, 0o600), Err(Errno(1)));
+        assert_eq!(v.mkdir_at(AT_FDCWD, b"/b/dir", 0o700), Err(Errno(1)));
+        assert_eq!(v.mknod_at(AT_FDCWD, b"/b/fifo", 0o10600, 0), Err(Errno(1)));
+        v.mount(None, b"/b", None, 32 | MS_RDONLY, None).unwrap();
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/b/queue", 0x42, 0o600),
+            Err(Errno(30))
+        );
+        v.umount(b"/a", 2).unwrap();
+        assert!(v.stat_fd(fd).is_ok());
+        assert!(v.stat_at(AT_FDCWD, b"/b").is_ok());
     }
 }
 
