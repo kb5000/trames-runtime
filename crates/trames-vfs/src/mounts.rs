@@ -506,6 +506,15 @@ impl Vfs {
 }
 
 impl Vfs {
+    // A proc FD magic link is a retained mount/inode capability. Its display
+    // label may have been renamed or replaced and must not select the target.
+    fn mount_location(&self, path: &[u8], follow: bool) -> Result<ResolvedPath> {
+        let (path, magic) = self.resolve_entry(AT_FDCWD, path, follow, true)?;
+        match magic {
+            Some((node, _, mount)) => self.location(&node, &mount),
+            None => Ok(path),
+        }
+    }
     /// Mounts belong entirely to the guest. No host mount or pathname is used.
     pub fn mount(
         &mut self,
@@ -529,7 +538,7 @@ impl Vfs {
             flags
         };
         let flags = flags & !0x8000; // MS_SILENT only suppresses kernel mount diagnostics.
-        let target = self.resolve(AT_FDCWD, target)?;
+        let target = self.mount_location(target, true)?;
         let target_node = self.node(&target)?;
         let parent = target.mount.as_ref().ok_or(Errno(22))?.clone();
         if self
@@ -572,7 +581,7 @@ impl Vfs {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         let mut additions = Vec::new();
         let (fs, root, root_key, mount_kind, attrs) = if flags & BIND != 0 {
-            let source = self.resolve(AT_FDCWD, source.ok_or(Errno(22))?)?;
+            let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let node = self.node(&source)?;
             if matches!(node.borrow().content, Content::Directory)
                 != matches!(target_node.borrow().content, Content::Directory)
@@ -671,7 +680,7 @@ impl Vfs {
             return Err(Errno(28));
         }
         let proc_ns = if flags & 4096 != 0 {
-            self.resolve(AT_FDCWD, source.ok_or(Errno(22))?)?
+            self.mount_location(source.ok_or(Errno(22))?, true)?
                 .mount
                 .and_then(|m| m.pid_namespace.clone())
         } else {
@@ -694,7 +703,7 @@ impl Vfs {
         });
         let mut copies = BTreeMap::new();
         if !additions.is_empty() {
-            let source = self.resolve(AT_FDCWD, source.ok_or(Errno(22))?)?;
+            let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             copies.insert(source.mount.as_ref().ok_or(Errno(22))?.id, root.clone());
             for m in &additions {
                 copies.insert(m.id, copy_mount(m)?);
@@ -722,7 +731,7 @@ impl Vfs {
         if flags & !(2 | 8) != 0 {
             return Err(Errno(22));
         }
-        let target = self.resolve_final(AT_FDCWD, target, flags & 8 == 0)?;
+        let target = self.mount_location(target, flags & 8 == 0)?;
         let mount = target.mount.as_ref().ok_or(Errno(22))?;
         if !self.is_mount_root(&target) {
             return Err(Errno(22));

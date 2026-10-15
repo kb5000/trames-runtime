@@ -360,12 +360,15 @@ impl Vfs {
         Ok(())
     }
     pub fn poll(&self, fd: u32, events: u16) -> u16 {
+        self.poll_signals(fd, events, 0)
+    }
+    pub fn poll_signals(&self, fd: u32, events: u16, pending: u64) -> u16 {
         let Ok(d) = self.descriptor(fd) else {
             return 32;
         };
-        Self::poll_open(&d.open.borrow(), events)
+        Self::poll_open(&d.open.borrow(), events, pending)
     }
-    fn poll_open(o: &OpenDescription, events: u16) -> u16 {
+    fn poll_open(o: &OpenDescription, events: u16, pending: u64) -> u16 {
         if let Some(end) = &o.pty {
             return end.pair.poll(end.master, events);
         }
@@ -379,7 +382,7 @@ impl Vfs {
             return local.poll(events);
         }
         if let Some(anonymous) = &o.anonymous {
-            return anonymous.poll(events);
+            return anonymous.poll(events, pending);
         }
         if let Some(bridge) = &o.bridge {
             return bridge.poll(events);
@@ -1793,6 +1796,9 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & O_PATH != 0 {
             return Err(Errno(9));
+        }
+        if matches!(o.anonymous, Some(events::Anonymous::Signal { .. })) {
+            return Ok(o.position);
         }
         if o.kind == FdKind::Terminal {
             return Err(Errno(29));

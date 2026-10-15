@@ -12,6 +12,7 @@ pub struct FdInfo {
     pub inode: u64,
     pub mount_id: u64,
     pub socket: Option<trames_net::SocketInfo>,
+    pub signal_mask: Option<u64>,
     open: Weak<RefCell<OpenDescription>>,
 }
 
@@ -249,6 +250,7 @@ pub struct ProcessInfo {
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
     pub pending: u64,
+    pub shared_pending: u64,
     pub blocked: u64,
     pub ignored: u64,
     pub caught: u64,
@@ -538,6 +540,10 @@ impl Vfs {
                     }
                 };
                 FdInfo {
+                    signal_mask: match o.anonymous {
+                        Some(events::Anonymous::Signal { mask }) => Some(mask),
+                        _ => None,
+                    },
                     fd,
                     target,
                     position: o.position,
@@ -1194,8 +1200,8 @@ impl Vfs {
                                     ));
                                 }
                             }
-                            format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t0000000000000000\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
-                                c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.blocked,p.ignored,p.caught).into_bytes()
+                            format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
+                                c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => {
                             let (soft, hard) = p.file_size_limits.unwrap_or((u64::MAX, u64::MAX));
@@ -1224,8 +1230,14 @@ impl Vfs {
                     }
                     return Ok(regular(
                         format!(
-                            "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n",
-                            fd.position, fd.flags, fd.mount_id, fd.inode
+                            "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n{}",
+                            fd.position,
+                            fd.flags,
+                            fd.mount_id,
+                            fd.inode,
+                            fd.signal_mask
+                                .map(|mask| format!("sigmask:\t{mask:016x}\n"))
+                                .unwrap_or_default()
                         )
                         .into_bytes(),
                     ));

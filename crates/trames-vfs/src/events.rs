@@ -4,6 +4,9 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Signal {
+        mask: u64,
+    },
     Event {
         count: u64,
         semaphore: bool,
@@ -29,6 +32,7 @@ pub(super) struct Watch {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Signal { .. } => b"anon_inode:[signalfd]",
             Self::Event { .. } => b"anon_inode:[eventfd]",
             Self::Timer { .. } => b"anon_inode:[timerfd]",
             Self::Epoll { .. } => b"anon_inode:[eventpoll]",
@@ -64,8 +68,15 @@ impl Anonymous {
             }
         }
     }
-    pub(super) fn poll(&self, events: u16) -> u16 {
+    pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
         match self {
+            Self::Signal { mask } => {
+                if mask & pending != 0 {
+                    events & 1
+                } else {
+                    0
+                }
+            }
             Self::Event { count, .. } => {
                 (if *count > 0 { events & 1 } else { 0 })
                     | (if *count < u64::MAX - 1 { events & 4 } else { 0 })
@@ -82,9 +93,9 @@ impl Anonymous {
             Self::Epoll { watches, .. } => {
                 if watches.values().any(|w| {
                     w.armed
-                        && w.open
-                            .upgrade()
-                            .is_some_and(|o| Vfs::poll_open(&o.borrow(), w.events as u16) != 0)
+                        && w.open.upgrade().is_some_and(|o| {
+                            Vfs::poll_open(&o.borrow(), w.events as u16, pending) != 0
+                        })
                 }) {
                     events & 1
                 } else {
@@ -113,7 +124,7 @@ impl Anonymous {
                 }
                 std::mem::take(pending)
             }
-            Self::Epoll { .. } => return Err(Errno(22)),
+            Self::Signal { .. } | Self::Epoll { .. } => return Err(Errno(22)),
         };
         Ok(value.to_le_bytes().to_vec())
     }
@@ -136,6 +147,29 @@ impl Anonymous {
     }
 }
 impl Vfs {
+    /// The descriptor holds only its mask. Signals belong to the reading task,
+    /// never to the descriptor's creator or the host process.
+    pub fn signalfd(&mut self, fd: i32, mask: u64, flags: u32) -> Result<u32> {
+        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+            return Err(Errno(22));
+        }
+        let mask = mask & !((1 << 8) | (1 << 18));
+        if fd == -1 {
+            return self.anonymous(flags, Anonymous::Signal { mask });
+        }
+        let mut open = self.descriptor(fd as u32)?.open.borrow_mut();
+        let Some(Anonymous::Signal { mask: current }) = open.anonymous.as_mut() else {
+            return Err(Errno(22));
+        };
+        *current = mask;
+        Ok(fd as u32)
+    }
+    pub fn signalfd_mask(&self, fd: u32) -> Result<Option<u64>> {
+        Ok(match self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Signal { mask }) => Some(mask),
+            _ => None,
+        })
+    }
     fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
         let fd = self.available(0)?;
         self.fds.insert(
@@ -321,6 +355,15 @@ impl Vfs {
         &self,
         fd: u32,
         max: usize,
+        special: impl FnMut(&FdKind, u16) -> Result<Option<u16>>,
+    ) -> Result<Vec<(u32, u64)>> {
+        self.epoll_wait_signals(fd, max, 0, special)
+    }
+    pub fn epoll_wait_signals(
+        &self,
+        fd: u32,
+        max: usize,
+        pending: u64,
         mut special: impl FnMut(&FdKind, u16) -> Result<Option<u16>>,
     ) -> Result<Vec<(u32, u64)>> {
         let mut e = self.descriptor(fd)?.open.borrow_mut();
@@ -345,7 +388,7 @@ impl Vfs {
             let ready = if let Some(ready) = special(&o.kind, requested)? {
                 ready
             } else {
-                Self::poll_open(&o, requested)
+                Self::poll_open(&o, requested, pending)
             };
             if ready != 0 {
                 result.push((ready as u32, watch.data));
