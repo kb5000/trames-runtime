@@ -21,6 +21,7 @@ pub(super) enum Kind {
     Proc,
     Sysfs,
     Devpts,
+    Cgroup,
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -249,6 +250,24 @@ impl Vfs {
                 })),
             }));
         }
+        let point = self.pseudo_node(b"/sys/fs/cgroup")?.ok_or(Errno(2))?;
+        let fs = self.cgroups.borrow().fs.clone();
+        let cgroup_root = fs.borrow().paths[b"/".as_slice()].clone();
+        mounts.push(Rc::new(Mount {
+            id: 5,
+            fs,
+            root: cgroup_root,
+            root_key: b"/".to_vec(),
+            kind: Kind::Cgroup,
+            pid_namespace: None,
+            flags: Cell::new(14),
+            writers: Cell::new(0),
+            parent: RefCell::new(Some(Attachment {
+                parent: mounts[2].clone(),
+                node: point,
+                fallback: b"/sys/fs/cgroup".to_vec(),
+            })),
+        }));
         self.pseudo.borrow_mut().enabled = enabled;
         self.cwd_mount = Some(root.clone());
         self.root_mount = Some(root.clone());
@@ -308,7 +327,10 @@ impl Vfs {
                     .filter_map(Weak::upgrade)
                     .find(|m| {
                         (self.pseudo.borrow().enabled
-                            || !matches!(m.kind, Kind::Proc | Kind::Sysfs | Kind::Devpts))
+                            || !matches!(
+                                m.kind,
+                                Kind::Proc | Kind::Sysfs | Kind::Devpts | Kind::Cgroup
+                            ))
                             && m.parent.borrow().as_ref().is_some_and(|a| {
                                 Rc::ptr_eq(&a.parent, current) && a.key() == path.key
                             })
@@ -439,7 +461,7 @@ impl Vfs {
 impl Vfs {
     pub(super) fn uses_pseudo<P: PathArg + ?Sized>(&self, path: &P) -> bool {
         match path.mount().map(|m| m.kind) {
-            Some(Kind::Tmpfs) => false,
+            Some(Kind::Tmpfs | Kind::Cgroup) => false,
             Some(Kind::Root) => {
                 let p = path.key();
                 !p.starts_with(b"/proc/")
@@ -615,6 +637,14 @@ impl Vfs {
                         volume: None,
                     }));
                     (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
+                }
+                b"cgroup2" => {
+                    if data.is_some_and(|d| !d.is_empty()) {
+                        return Err(Errno(95));
+                    }
+                    let fs = self.cgroups.borrow().fs.clone();
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Cgroup, flags & ATTRS)
                 }
                 b"proc" | b"sysfs" | b"devpts" => {
                     if data.is_some_and(|d| !d.is_empty()) {
@@ -942,6 +972,7 @@ impl Mount {
             Kind::Proc => "proc",
             Kind::Sysfs => "sysfs",
             Kind::Devpts => "devpts",
+            Kind::Cgroup => "cgroup2",
         }
     }
     fn options(&self) -> String {
@@ -1053,6 +1084,7 @@ impl Vfs {
             Kind::Proc => 0x9fa0,
             Kind::Sysfs => 0x62656572,
             Kind::Devpts => 0x1cd1,
+            Kind::Cgroup => 0x63677270,
         };
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
         if matches!(m.kind, Kind::Root | Kind::Tmpfs) {

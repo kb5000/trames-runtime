@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 pub mod capabilities;
+mod cgroup;
 mod credentials;
 mod events;
 mod executable;
@@ -216,6 +217,8 @@ pub struct Vfs {
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     kernel_log: Rc<RefCell<kernel_log::KernelLog>>,
+    cgroups: Rc<RefCell<cgroup::Cgroups>>,
+    dumpable: Rc<Cell<bool>>,
     pid: u32,
     lock_owner: u32,
     file_size_limit: u64,
@@ -258,6 +261,8 @@ impl Default for Vfs {
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             kernel_log: Rc::new(RefCell::new(kernel_log::KernelLog::default())),
+            cgroups: Rc::default(),
+            dumpable: Rc::new(Cell::new(true)),
             pid: 1,
             ptys: Rc::default(),
             embedding_terminal: Rc::default(),
@@ -343,6 +348,9 @@ impl Vfs {
     }
     fn check_parent_write(&self, path: &ResolvedPath) -> Result<()> {
         path.writable()?;
+        if Self::cgroup_mount(path) {
+            return Err(Errno(1));
+        }
         if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
             return Err(Errno(30));
         }
@@ -507,6 +515,12 @@ impl Vfs {
     }
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<Rc<RefCell<Node>>> {
         let key = path.key();
+        if path
+            .mount()
+            .is_some_and(|m| m.kind == mounts::Kind::Cgroup && m.root.borrow().links == 0)
+        {
+            return Err(Errno(19));
+        }
         if self.uses_pseudo(path) {
             if key == b"/proc" || key.starts_with(b"/proc/") {
                 self.proc_accessed.set(true);
@@ -677,8 +691,14 @@ impl Vfs {
                         continue;
                     }
                 }
-                if let Ok(node) = self.node(&current) {
+                let node = match self.node(&current) {
+                    Ok(node) => Some(node),
+                    Err(Errno(2)) => None,
+                    Err(e) => return Err(e),
+                };
+                if let Some(node) = node {
                     if let Content::Symlink(target) = &node.borrow().content {
+                        self.check_proc_inspection(&current, true)?;
                         links += 1;
                         if links > 40 {
                             return Err(Errno(40));
@@ -729,6 +749,7 @@ impl Vfs {
     }
     pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
         let dest = self.resolve_final(dirfd, path, false)?;
+        self.check_proc_inspection(&dest, true)?;
         let node = self.node(&dest)?;
         let n = node.borrow();
         match &n.content {
@@ -874,6 +895,9 @@ impl Vfs {
         if self.node(&p).is_ok() {
             return Err(Errno(17));
         }
+        if Self::cgroup_mount(&p) {
+            return self.cgroup_mkdir(&p, mode);
+        }
         self.check_parent_write(&p)?;
         self.insert(
             p,
@@ -909,6 +933,13 @@ impl Vfs {
         let is_dir = matches!(node.borrow().content, Content::Directory);
         if directory != is_dir {
             return Err(Errno(if is_dir { 21 } else { 20 }));
+        }
+        if Self::cgroup_mount(&p) {
+            return if directory {
+                self.cgroup_rmdir(&p)
+            } else {
+                Err(Errno(1))
+            };
         }
         self.check_parent_write(&p)?;
         let filesystem = p.filesystem(self);
@@ -983,6 +1014,9 @@ impl Vfs {
         }
         let fd = self.available(0)?;
         let p = self.resolve_final(dirfd, path, flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0)?;
+        if flags & O_PATH == 0 {
+            self.check_proc_inspection(&p, false)?;
+        }
         if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
             p.writable()?;
         }
@@ -992,7 +1026,11 @@ impl Vfs {
         {
             return Err(Errno(30));
         }
-        let existed = self.node(&p).is_ok();
+        let existed = match self.node(&p) {
+            Ok(_) => true,
+            Err(Errno(2)) => false,
+            Err(e) => return Err(e),
+        };
         if existed && flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
         }
@@ -1037,7 +1075,7 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
-            if flags & 0x200 != 0 {
+            if flags & 0x200 != 0 && !Self::cgroup_mount(&p) {
                 if let Content::File(b) = &mut n.content {
                     b.truncate(0)?;
                     n.times[1] = storage::Timestamp::now();
@@ -1304,6 +1342,10 @@ impl Vfs {
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
         }
+        if let Some(data) = self.cgroup_read(&o, o.position, count)? {
+            o.position += data.len() as u64;
+            return Ok(data);
+        }
         if let Some(log) = o.kernel_log.clone() {
             return log.borrow().kmsg_read(&mut o.position, count);
         }
@@ -1426,6 +1468,12 @@ impl Vfs {
         if o.flags & 3 == 0 {
             return Err(Errno(9));
         }
+        if let Some(count) = self.cgroup_write(&o, bytes)? {
+            if offset.is_none() {
+                o.position = o.position.saturating_add(count as u64);
+            }
+            return Ok(count);
+        }
         let node = o.node.clone().ok_or(Errno(29))?;
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
@@ -1508,6 +1556,9 @@ impl Vfs {
         }
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(data) = self.cgroup_read(&o, offset, count)? {
+            return Ok(data);
         }
         let mut n = o.node.as_ref().ok_or(Errno(29))?.borrow_mut();
         let result = match &n.content {

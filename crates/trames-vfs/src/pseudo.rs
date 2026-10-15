@@ -231,6 +231,8 @@ pub struct ProcessInfo {
     pub namespaces: NamespaceSnapshot,
     pub namespace_ids: [Vec<u32>; 4],
     pub command: Vec<u8>,
+    pub cgroup: Vec<u8>,
+    pub nondumpable: bool,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable: Vec<u8>,
@@ -656,9 +658,7 @@ impl Vfs {
                 .iter()
                 .find(|p| Some(p.pid) == pid)
                 .ok_or(Errno(2))?;
-            if !self.credentials.has_cap(capabilities::SYS_PTRACE)
-                && self.credentials.fsuid != process.credentials.euid
-            {
+            if !self.may_inspect(actual, &runtime, process) {
                 return Err(Errno(13));
             }
             process
@@ -707,9 +707,7 @@ impl Vfs {
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
             .ok_or(Errno(2))?;
-        if !self.credentials.has_cap(capabilities::SYS_PTRACE)
-            && self.credentials.fsuid != process.credentials.euid
-        {
+        if !self.may_inspect(path, &runtime, process) {
             return Err(Errno(13));
         }
         let Some(file) = process.executable_file.as_ref().and_then(Weak::upgrade) else {
@@ -891,12 +889,9 @@ impl Vfs {
                     .find(|p| Some(p.pid) == pid)
                 {
                     let mut n = node.borrow_mut();
-                    n.uid = p.credentials.euid;
-                    n.gid = p.credentials.egid;
-                    if rest.ends_with(b"/environ")
-                        || rest.ends_with(b"/auxv")
-                        || rest.ends_with(b"/maps")
-                    {
+                    n.uid = if p.nondumpable { 0 } else { p.credentials.euid };
+                    n.gid = if p.nondumpable { 0 } else { p.credentials.egid };
+                    if rest.ends_with(b"/environ") || rest.ends_with(b"/auxv") {
                         n.mode = 0o100400;
                     }
                     if rest.ends_with(b"/fd") || rest.ends_with(b"/fdinfo") {
@@ -958,7 +953,7 @@ impl Vfs {
             }
         }
         match path {
-            b"/proc" | b"/sys" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
+            b"/proc" | b"/sys" | b"/sys/fs" | b"/sys/fs/cgroup" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
             b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
@@ -1006,7 +1001,8 @@ impl Vfs {
             b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),
             b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\n".to_vec())),
+            b"/proc/cgroups" => return Ok(regular(b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\tcgroup2\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;
@@ -1084,6 +1080,12 @@ impl Vfs {
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
                         b"comm" => comm(p),
+                        b"cgroup" => [
+                            b"0::".as_slice(),
+                            if p.cgroup.is_empty() { b"/" } else { &p.cgroup },
+                            b"\n",
+                        ]
+                        .concat(),
                         b"cmdline" => nul_list(&p.arguments),
                         b"environ" => nul_list(&p.environment),
                         b"auxv" => p.auxiliary.clone(),
@@ -1431,6 +1433,7 @@ impl Vfs {
                 "cpuinfo",
                 "version",
                 "filesystems",
+                "cgroups",
                 "stat",
                 "loadavg",
                 "sys",
@@ -1462,7 +1465,9 @@ impl Vfs {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
+            b"/sys/fs" => vec![b"cgroup".to_vec()],
             b"/sys" => vec![
+                b"fs".to_vec(),
                 b"class".to_vec(),
                 b"devices".to_vec(),
                 b"block".to_vec(),
@@ -1621,6 +1626,7 @@ impl Vfs {
                             "stat",
                             "status",
                             "statm",
+                            "cgroup",
                             "cmdline",
                             "environ",
                             "comm",

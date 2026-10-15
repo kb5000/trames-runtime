@@ -344,6 +344,12 @@ impl Vfs {
         if shared && writable && o.flags & 3 != 2 {
             return Err(Errno(13));
         }
+        if o.mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
+        {
+            return Err(Errno(19));
+        }
         let node = o.node.clone().ok_or(Errno(19))?;
         let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());
         if shared && writable && readonly {

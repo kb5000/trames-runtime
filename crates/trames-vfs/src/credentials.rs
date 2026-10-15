@@ -84,12 +84,101 @@ impl Credentials {
     }
 }
 impl Vfs {
+    /// Metadata lookup remains public; dereferencing sensitive links and opening
+    /// protected data use the ptrace-style check, as procfs does on Linux.
+    pub(super) fn check_proc_inspection(&self, at: &ResolvedPath, link: bool) -> Result<()> {
+        if !self.uses_pseudo(at) {
+            return Ok(());
+        }
+        let Some(rest) = at.strip_prefix(b"/proc/") else {
+            return Ok(());
+        };
+        let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+        let parse = |s: &[u8]| {
+            std::str::from_utf8(s)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        };
+        let (pid, group, key) = match parts.as_slice() {
+            [group, b"task", pid, key, ..] => (parse(pid), parse(group), *key),
+            [pid, key, ..] => (parse(pid), None, *key),
+            _ => return Ok(()),
+        };
+        let protected = if link {
+            matches!(key, b"cwd" | b"root" | b"exe" | b"fd" | b"ns")
+        } else {
+            matches!(key, b"maps" | b"environ" | b"auxv" | b"fdinfo")
+        };
+        if protected {
+            let pseudo = self.pseudo.borrow();
+            let runtime = self.proc_runtime(at, &pseudo.runtime);
+            if let Some(target) = runtime
+                .processes
+                .iter()
+                .find(|p| Some(p.pid) == pid && group.is_none_or(|g| p.tgid == g))
+            {
+                if !self.may_inspect(at, &runtime, target) {
+                    return Err(Errno(13));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn dumpable(&self) -> u64 {
+        u64::from(self.dumpable.get())
+    }
+    pub fn set_dumpable(&self, value: u64) -> Result<()> {
+        if value > 1 {
+            return Err(Errno(22));
+        }
+        self.dumpable.set(value != 0);
+        Ok(())
+    }
+    pub fn unshare_dumpable(&mut self) {
+        self.dumpable = Rc::new(Cell::new(self.dumpable.get()));
+    }
+    pub fn fs_identity(&self) -> [u32; 4] {
+        let c = &self.credentials;
+        [c.euid, c.egid, c.fsuid, c.fsgid]
+    }
+    pub fn reset_dumpable_after_ids(&self, old: [u32; 4]) {
+        if self.fs_identity() != old {
+            self.dumpable.set(false);
+        }
+    }
+    /// Selected ptrace READ_FSCREDS policy for sensitive proc objects.
+    /// Same thread group and CAP_SYS_PTRACE bypass the ordinary ID/dump checks.
+    pub(super) fn may_inspect<P: PathArg + ?Sized>(
+        &self,
+        at: &P,
+        runtime: &RuntimeInfo,
+        target: &ProcessInfo,
+    ) -> bool {
+        let own = self.proc_namespace(at).local(self.pid);
+        if runtime
+            .processes
+            .iter()
+            .any(|p| p.pid == own && p.tgid == target.tgid)
+            || self.credentials.has_cap(capabilities::SYS_PTRACE)
+        {
+            return true;
+        }
+        let c = &self.credentials;
+        let t = &target.credentials;
+        !target.nondumpable
+            && [t.uid, t.euid, t.suid].iter().all(|id| *id == c.fsuid)
+            && [t.gid, t.egid, t.sgid].iter().all(|id| *id == c.fsgid)
+            && t.caps.permitted & !c.caps.effective == 0
+    }
+
     pub fn apply_exec_credentials(&mut self, path: &[u8]) -> Result<()> {
         let file = self.executable_file_at(AT_FDCWD, path, 0)?;
         self.apply_exec_file_credentials(&file)
     }
     pub fn apply_exec_file_credentials(&mut self, file: &ExecutableFile) -> Result<()> {
         let n = file.node.borrow();
+        let readable = self.allowed(&n, 4);
+        let old_permitted = self.credentials.caps.permitted;
         let nosuid = file
             .mount
             .as_ref()
@@ -111,6 +200,12 @@ impl Vfs {
             c.euid = c.uid;
             c.egid = c.gid;
         }
+        self.dumpable = Rc::new(Cell::new(
+            readable
+                && c.uid == c.euid
+                && c.gid == c.egid
+                && c.caps.permitted & !old_permitted == 0,
+        ));
         c.fsuid = c.euid;
         c.fsgid = c.egid;
         self.credentials.suid = self.credentials.euid;

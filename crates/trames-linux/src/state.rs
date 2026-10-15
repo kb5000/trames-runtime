@@ -527,7 +527,11 @@ impl Linux {
             }
             return SyscallOutcome::Exit(a[0] as u8);
         }
+        let old_ids = matches!(number, 143..=147 | 149 | 151 | 152).then(|| self.vfs.fs_identity());
         let result = self.syscall(number, a, memory, io);
+        if let Some(old) = old_ids {
+            self.vfs.reset_dumpable_after_ids(old);
+        }
         let raw = match result {
             Ok(value) => value,
             Err(e) => errno(e.0 as u64),

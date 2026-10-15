@@ -205,9 +205,7 @@ impl Vfs {
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
             .ok_or(Errno(2))?;
-        if !self.credentials.has_cap(capabilities::SYS_PTRACE)
-            && self.credentials.fsuid != process.credentials.euid
-        {
+        if !self.may_inspect(path, &runtime, process) {
             return Err(Errno(13));
         }
         Ok(Some(match kind {
