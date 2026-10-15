@@ -597,6 +597,30 @@ impl Vfs {
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<ResolvedPath> {
         self.resolve_final(dirfd, path, true)
     }
+    fn check_resolve_mount(from: &ResolvedPath, to: &ResolvedPath, policy: u64) -> Result<()> {
+        if policy & 1 != 0 && from.mount.as_ref().map(|m| m.id) != to.mount.as_ref().map(|m| m.id) {
+            return Err(Errno(18));
+        }
+        Ok(())
+    }
+    fn is_proc_magic_link(&self, at: &ResolvedPath) -> bool {
+        if !self.uses_pseudo(at) {
+            return false;
+        }
+        let Some(rest) = at.strip_prefix(b"/proc/") else {
+            return false;
+        };
+        let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+        let tail = match parts.as_slice() {
+            [_, b"task", _, tail @ ..] => tail,
+            [_, tail @ ..] => tail,
+            _ => return false,
+        };
+        matches!(tail, [b"cwd" | b"root" | b"exe"] | [b"fd" | b"ns", _])
+            && self
+                .node(at)
+                .is_ok_and(|n| matches!(n.borrow().content, Content::Symlink(_)))
+    }
     /// Observe the actual traversal, including cwd/dirfd, symlinks and failed
     /// lookups of newly created process directories. A textual prefix check
     /// would miss aliases such as /dev/fd and links into another process's proc.
@@ -614,6 +638,20 @@ impl Vfs {
         self.resolve_entry(dirfd, path, follow_final, false)
             .map(|entry| entry.0)
     }
+    fn metadata_target(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<(ResolvedPath, Rc<RefCell<Node>>)> {
+        let (path, magic) = self.resolve_entry(dirfd, path, follow, true)?;
+        if let Some((node, label, mount)) = magic {
+            Ok((ResolvedPath { key: label, mount }, node))
+        } else {
+            let node = self.node(&path)?;
+            Ok((path, node))
+        }
+    }
     fn resolve_entry(
         &self,
         dirfd: i32,
@@ -621,18 +659,44 @@ impl Vfs {
         follow_final: bool,
         retain_magic: bool,
     ) -> Result<ResolvedEntry> {
+        self.resolve_entry_policy(dirfd, path, follow_final, retain_magic, 0)
+    }
+    fn resolve_entry_policy(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow_final: bool,
+        retain_magic: bool,
+        policy: u64,
+    ) -> Result<ResolvedEntry> {
         if path.is_empty() {
             return Err(Errno(2));
         }
         if path.len() >= MAX_PATH || path.contains(&0) {
             return Err(Errno(36));
         }
-        let root = self.root_location()?;
+        let scoped = policy & (8 | 16) != 0;
+        let boundary = if scoped {
+            Some(self.base(dirfd)?)
+        } else {
+            None
+        };
+        if policy & 8 != 0 && path[0] == b'/' {
+            return Err(Errno(18));
+        }
+        let root = if policy & 16 != 0 {
+            boundary.clone().unwrap()
+        } else {
+            self.root_location()?
+        };
         let mut current = if path[0] == b'/' {
             self.follow_mounts(root.clone())?
         } else {
             self.base(dirfd)?
         };
+        if path[0] == b'/' {
+            Self::check_resolve_mount(&root, &current, policy)?;
+        }
         let mut parts: VecDeque<Vec<u8>> = path
             .split(|&b| b == b'/')
             .filter(|p| !p.is_empty())
@@ -654,7 +718,15 @@ impl Vfs {
                 continue;
             }
             if part == b".." {
-                current = self.parent_location(&current)?;
+                if boundary.as_ref() == Some(&current) {
+                    if policy & 8 != 0 {
+                        return Err(Errno(18));
+                    }
+                    continue;
+                }
+                let parent = self.parent_location(&current)?;
+                Self::check_resolve_mount(&current, &parent, policy)?;
+                current = parent;
                 continue;
             }
             if part.len() > 255 {
@@ -669,7 +741,11 @@ impl Vfs {
                 return Err(Errno(36));
             }
             current = self.follow_mounts(current)?;
+            Self::check_resolve_mount(&parent, &current, policy)?;
             if !parts.is_empty() || follow_final || trailing {
+                if policy & (2 | 4 | 8 | 16) != 0 && self.is_proc_magic_link(&current) {
+                    return Err(Errno(40));
+                }
                 // An nsfs magic link names a kernel object, not a pathname such
                 // as "uts:[123]". Leave the canonical endpoint for open/stat.
                 if parts.is_empty()
@@ -677,10 +753,21 @@ impl Vfs {
                     && self.uses_pseudo(&current)
                     && self.namespace_for_path(&current)?.is_some()
                 {
+                    if policy & 1 != 0 {
+                        return Err(Errno(18));
+                    }
                     return Ok((current, None));
                 }
                 if self.uses_pseudo(&current) && (retain_magic || !parts.is_empty()) {
                     if let Some((node, label, mount)) = self.proc_magic_node_normalized(&current)? {
+                        Self::check_resolve_mount(
+                            &current,
+                            &ResolvedPath {
+                                key: label.clone(),
+                                mount: mount.clone(),
+                            },
+                            policy,
+                        )?;
                         if parts.is_empty() && !trailing {
                             return Ok((current, Some((node, label, mount))));
                         }
@@ -698,6 +785,15 @@ impl Vfs {
                 };
                 if let Some(node) = node {
                     if let Content::Symlink(target) = &node.borrow().content {
+                        if policy & 4 != 0 {
+                            return Err(Errno(40));
+                        }
+                        if policy & 8 != 0 && target.starts_with(b"/") {
+                            return Err(Errno(18));
+                        }
+                        if target.starts_with(b"/") {
+                            Self::check_resolve_mount(&current, &root, policy)?;
+                        }
                         self.check_proc_inspection(&current, true)?;
                         links += 1;
                         if links > 40 {
@@ -853,7 +949,14 @@ impl Vfs {
         if self.node(dest).is_ok() {
             return Err(Errno(17));
         }
-        if !matches!(source.borrow().content, Content::File(_)) {
+        // Synthesized endpoints have a separate inode allocation/lifetime and
+        // cannot be inserted into the persistent filesystem's inode table.
+        if source.borrow().volatile
+            || !matches!(
+                source.borrow().content,
+                Content::File(_) | Content::Null | Content::Terminal | Content::Device(_)
+            )
+        {
             return Err(Errno(1));
         }
         if filesystem.borrow().paths.len() >= filesystem.borrow().limits.nodes {
@@ -907,18 +1010,26 @@ impl Vfs {
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
         let type_ = mode & 0o170000;
-        if device != 0 || !matches!(type_, 0 | 0o100000 | 0o10000) {
-            return Err(Errno(95));
+        if !matches!(type_, 0 | 0o100000 | 0o10000 | 0o20000 | 0o60000) {
+            return Err(Errno(if type_ == 0o140000 { 95 } else { 22 }));
         }
         let p = self.resolve_final(dirfd, path, false)?;
-        if self.node(&p).is_ok() {
-            return Err(Errno(17));
+        match self.node(&p) {
+            Ok(_) => return Err(Errno(17)),
+            Err(Errno(2)) => {}
+            Err(e) => return Err(e),
         }
         self.check_parent_write(&p)?;
-        let content = if type_ == 0o10000 {
-            Content::Fifo(Pipe::new(self.open_id()))
-        } else {
-            Content::File(self.empty_data_at(&p)?)
+        let content = match type_ {
+            0o20000 | 0o60000 => {
+                if !self.credentials.has_cap(capabilities::MKNOD) {
+                    return Err(Errno(1));
+                }
+                // Linux's syscall ABI accepts an unsigned 32-bit new_encode_dev.
+                pseudo::Device::node(device as u32, type_ == 0o60000)
+            }
+            0o10000 => Content::Fifo(Pipe::new(self.open_id())),
+            _ => Content::File(self.empty_data_at(&p)?),
         };
         let type_ = if type_ == 0 { 0o100000 } else { type_ };
         self.insert(p, content, type_ | (mode & 0o7777 & !self.umask))
@@ -977,6 +1088,23 @@ impl Vfs {
             .ok_or(Errno(24))
     }
     pub fn open_at(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<u32> {
+        self.open_at_resolve(dirfd, path, flags, mode, 0)
+    }
+    pub fn open_at_resolve(
+        &mut self,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        policy: u64,
+    ) -> Result<u32> {
+        if policy & !63 != 0 || policy & 24 == 24 {
+            return Err(Errno(22));
+        }
+        // No host-I/O-free lookup guarantee exists for the disk-backed namespace.
+        if policy & 32 != 0 {
+            return Err(Errno(11));
+        }
         const ALLOWED: u32 = 3
             | 0x40
             | 0x80
@@ -1006,14 +1134,29 @@ impl Vfs {
             while plain.len() > 1 && plain.last() == Some(&b'/') {
                 plain = &plain[..plain.len() - 1];
             }
-            self.resolve_final(dirfd, plain, true)?;
+            self.resolve_entry_policy(dirfd, plain, true, false, policy)?;
             return Err(Errno(21));
         }
-        if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
-            return Ok(fd);
+        if policy == 0 {
+            if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
+                return Ok(fd);
+            }
         }
         let fd = self.available(0)?;
-        let p = self.resolve_final(dirfd, path, flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0)?;
+        let (p, _) = self.resolve_entry_policy(
+            dirfd,
+            path,
+            flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0,
+            policy != 0,
+            policy,
+        )?;
+        // Only NO_XDEV alone can follow a final magic link. Validate the entire
+        // traversal first; syscall execution serializes namespace mutations.
+        if policy == 1 {
+            if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
+                return Ok(fd);
+            }
+        }
         if flags & O_PATH == 0 {
             self.check_proc_inspection(&p, false)?;
         }
@@ -1085,6 +1228,14 @@ impl Vfs {
         }
         if flags & 0x200 != 0 {
             self.checkpoint()?;
+        }
+        if flags & O_PATH == 0
+            && matches!(
+                node.borrow().content,
+                Content::Device(pseudo::Device::Unregistered(_))
+            )
+        {
+            return Err(Errno(6));
         }
         let bridge = if flags & O_PATH == 0
             && matches!(
@@ -1897,19 +2048,7 @@ impl Vfs {
                 continue;
             }
             let n = node.borrow();
-            children.insert(
-                name.to_vec(),
-                (
-                    n.inode,
-                    match n.content {
-                        Content::Directory => 4,
-                        Content::File(_) => 8,
-                        Content::Symlink(_) => 10,
-                        Content::Fifo(_) => 1,
-                        Content::Null | Content::Terminal | Content::Device(_) => 2,
-                    },
-                ),
-            );
+            children.insert(name.to_vec(), (n.inode, ((n.mode & 0o170000) >> 12) as u8));
         }
         drop(fs);
         for name in self.mounted_pseudo_children(&p)? {
@@ -1917,12 +2056,7 @@ impl Vfs {
             child.extend_from_slice(&name);
             let n = self.node(&child)?;
             let n = n.borrow();
-            let kind = match n.content {
-                Content::Directory => 4,
-                Content::Symlink(_) => 10,
-                Content::File(_) => 8,
-                _ => 2,
-            };
+            let kind = ((n.mode & 0o170000) >> 12) as u8;
             children.insert(name, (n.inode, kind));
         }
         let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];

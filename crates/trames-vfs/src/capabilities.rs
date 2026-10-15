@@ -18,6 +18,7 @@ pub const SYS_PTRACE: u32 = 19;
 pub const SYS_ADMIN: u32 = 21;
 pub const SYS_NICE: u32 = 23;
 pub const SYS_RESOURCE: u32 = 24;
+pub const MKNOD: u32 = 27;
 pub const SYSLOG: u32 = 34;
 pub const LAST: u32 = 40;
 pub const ALL: u64 = (1 << (LAST + 1)) - 1;

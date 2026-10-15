@@ -785,7 +785,6 @@ impl Vfs {
         let current_root = self.root_location()?;
         if !self.is_mount_root(&new)
             || !Rc::ptr_eq(&new_mount, &old_mount)
-            || old.key == new.key
             || !below(&old.key, &new.key)
             || !self.is_mount_root(&current_root)
         {

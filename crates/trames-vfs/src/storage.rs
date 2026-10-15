@@ -455,7 +455,13 @@ impl Filesystem {
                     Content::Terminal => 3,
                     Content::Symlink(_) => 4,
                     Content::Fifo(_) => 5,
-                    Content::Device(_) => return Err(Errno(95)),
+                    Content::Device(_) => {
+                        if n.mode & 0o170000 == 0o60000 {
+                            7
+                        } else {
+                            6
+                        }
+                    }
                 },
                 0,
                 0,
@@ -469,6 +475,11 @@ impl Filesystem {
             if let Content::Symlink(target) = &n.content {
                 out.extend((target.len() as u32).to_le_bytes());
                 out.extend(target);
+            } else if let Content::Device(device) = n.content {
+                // Tags 6/7 extend v3 with a fixed-width guest device number;
+                // no host path or live driver state is persisted.
+                out.extend(4u32.to_le_bytes());
+                out.extend((device.rdev() as u32).to_le_bytes());
             } else {
                 out.extend(0u32.to_le_bytes());
             }
@@ -561,8 +572,12 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             return Err(Errno(22));
         }
         let target = d.take(size)?.to_vec();
-        if (kind[0] == 4) == target.is_empty() || target.contains(&0) {
-            return Err(Errno(22));
+        match kind[0] {
+            4 if target.is_empty() || target.contains(&0) => return Err(Errno(22)),
+            6 | 7 if target.len() != 4 => return Err(Errno(22)),
+            4 | 6 | 7 => {}
+            _ if !target.is_empty() => return Err(Errno(22)),
+            _ => {}
         }
         let (content, type_) = match kind[0] {
             0 => (Content::Directory, 0o40000),
@@ -571,6 +586,13 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             3 => (Content::Terminal, 0o20000),
             4 => (Content::Symlink(target), 0o120000),
             5 => (Content::Fifo(Pipe::new(ino)), 0o10000),
+            6 | 7 => (
+                pseudo::Device::node(
+                    u32::from_le_bytes(target.try_into().map_err(|_| Errno(22))?),
+                    kind[0] == 7,
+                ),
+                if kind[0] == 7 { 0o60000 } else { 0o20000 },
+            ),
             _ => return Err(Errno(22)),
         };
         if mode & !0o7777 != type_ {

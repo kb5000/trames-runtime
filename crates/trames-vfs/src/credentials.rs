@@ -318,9 +318,8 @@ impl Vfs {
         gid: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let path = self.resolve_final(dirfd, path, !nofollow)?;
+        let (path, node) = self.metadata_target(dirfd, path, !nofollow)?;
         path.writable()?;
-        let node = self.node(&path)?;
         self.chown_node(node, uid, gid)
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {

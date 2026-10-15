@@ -324,6 +324,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Unregistered(u32),
     Kmsg,
     Zero,
     Full,
@@ -336,8 +337,28 @@ pub(super) enum Device {
     Vda1,
 }
 impl Device {
+    /// Resolve guest device numbers only. Never open a host device node.
+    pub(super) fn node(rdev: u32, block: bool) -> Content {
+        if block {
+            return Content::Device(Self::Unregistered(rdev));
+        }
+        match rdev {
+            0x103 => Content::Null,
+            0x500 => Content::Terminal,
+            value => Content::Device(match value {
+                0x105 => Self::Zero,
+                0x107 => Self::Full,
+                0x108 => Self::Random,
+                0x109 => Self::Urandom,
+                0x10b => Self::Kmsg,
+                0x502 => Self::Ptmx,
+                _ => Self::Unregistered(value),
+            }),
+        }
+    }
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::Unregistered(rdev) => rdev as u64,
             Self::Kmsg => 0x10b,
             Self::Zero => 0x105,
             Self::Full => 0x107,
@@ -353,6 +374,7 @@ impl Device {
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
+            Self::Unregistered(_) => return Err(Errno(6)),
             Self::Zero | Self::Full => {}
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
             Self::Kmsg => return Err(Errno(29)),
@@ -365,7 +387,8 @@ impl Device {
     }
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
-            Self::Full if !data.is_empty() => Err(Errno(28)),
+            Self::Unregistered(_) => Err(Errno(6)),
+            Self::Full => Err(Errno(28)),
             Self::Kmsg => Err(Errno(29)),
             Self::Pts(_) => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),

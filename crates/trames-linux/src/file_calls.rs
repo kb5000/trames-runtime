@@ -89,14 +89,24 @@ impl Linux {
                 {
                     return Err(Errno(22));
                 }
-                if resolve != 0 {
-                    return Err(Errno(95));
-                } // Never silently ignore a path-containment requirement.
+                if flags & trames_vfs::O_PATH as u64 != 0
+                    && flags
+                        & !((trames_vfs::O_PATH
+                            | trames_vfs::O_NOFOLLOW
+                            | trames_vfs::O_DIRECTORY
+                            | trames_vfs::O_CLOEXEC) as u64)
+                        != 0
+                {
+                    return Err(Errno(22));
+                }
                 let path = Self::path(memory, a[1])?;
-                Ok(self
-                    .vfs
-                    .open_at(a[0] as i32, &path, flags as u32, mode as u32)?
-                    as u64)
+                Ok(self.vfs.open_at_resolve(
+                    a[0] as i32,
+                    &path,
+                    flags as u32,
+                    mode as u32,
+                    resolve,
+                )? as u64)
             }
             286 | 287 => {
                 if a[5] & !6 != 0 {
@@ -224,7 +234,7 @@ mod tests {
                 &mut memory,
                 &mut io
             ),
-            Err(Errno(95))
+            Err(Errno(18))
         );
         assert_eq!(l.vfs.stat_at(-100, b"/file"), Err(Errno(2)));
         memory.write(0x1110, &0u64.to_le_bytes()).unwrap();

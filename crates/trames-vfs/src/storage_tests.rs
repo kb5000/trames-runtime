@@ -30,6 +30,122 @@ fn size(stat: [u8; 128]) -> u64 {
     u64::from_le_bytes(stat[48..56].try_into().unwrap())
 }
 #[test]
+fn device_nodes_persist_numbers_links_and_driver_behavior() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let initial = v.capacity();
+    let devices = [
+        ("null", 0x103),
+        ("zero", 0x105),
+        ("full", 0x107),
+        ("random", 0x108),
+        ("urandom", 0x109),
+        ("tty", 0x500),
+        ("ptmx", 0x502),
+        ("unknown", 0xffffffff),
+    ];
+    for (name, number) in devices {
+        v.mknod_at(AT_FDCWD, format!("/{name}").as_bytes(), 0o20640, number)
+            .unwrap();
+    }
+    v.mknod_at(AT_FDCWD, b"/block", 0o60600, 0x103).unwrap();
+    v.link_at(AT_FDCWD, b"/zero", AT_FDCWD, b"/alias").unwrap();
+    v.rename_at(AT_FDCWD, b"/zero", AT_FDCWD, b"/renamed", 0)
+        .unwrap();
+    v.chown_at(AT_FDCWD, b"/renamed", 123, 456, true).unwrap();
+    let before = v.stat_at(AT_FDCWD, b"/renamed").unwrap();
+    assert_eq!(v.capacity().used_bytes, initial.used_bytes);
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    let after = v.stat_at(AT_FDCWD, b"/alias").unwrap();
+    assert_eq!(&before[..48], &after[..48]);
+    assert_eq!(u64::from_le_bytes(after[32..40].try_into().unwrap()), 0x105);
+    let fd = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
+    v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+    v.unlink_at(AT_FDCWD, b"/renamed", false).unwrap();
+    assert_eq!(v.read(fd, 17).unwrap(), vec![0; 17]);
+    assert_eq!(v.write(fd, b"discarded").unwrap(), 9);
+    assert_eq!(v.seek(fd, 9, 0).unwrap(), 0);
+    let null = v.open_at(AT_FDCWD, b"/null", 2, 0).unwrap();
+    assert!(v.read(null, 17).unwrap().is_empty());
+    assert_eq!(v.write(null, b"discarded").unwrap(), 9);
+    let full = v.open_at(AT_FDCWD, b"/full", 2, 0).unwrap();
+    assert_eq!(v.read(full, 17).unwrap(), vec![0; 17]);
+    assert_eq!(v.write(full, b"x"), Err(Errno(28)));
+    for name in [b"/random".as_slice(), b"/urandom"] {
+        let fd = v.open_at(AT_FDCWD, name, 0, 0).unwrap();
+        assert_eq!(v.read(fd, 17).unwrap().len(), 17);
+    }
+    for name in [b"/unknown".as_slice(), b"/block"] {
+        assert_eq!(v.open_at(AT_FDCWD, name, 0, 0), Err(Errno(6)));
+        let fd = v.open_at(AT_FDCWD, name, O_PATH, 0).unwrap();
+        assert_eq!(v.stat_fd(fd).unwrap(), v.stat_at(AT_FDCWD, name).unwrap());
+    }
+    assert_eq!(fs::read_dir(dir.0.join("objects")).unwrap().count(), 0);
+}
+#[test]
+fn device_creation_failure_rolls_back_and_unprivileged_cannot_create() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let before = v.capacity();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v.mknod_at(AT_FDCWD, b"/failed", 0o20666, 0x105).is_err());
+    assert_eq!(v.stat_at(AT_FDCWD, b"/failed"), Err(Errno(2)));
+    assert_eq!(v.capacity().nodes_used, before.nodes_used);
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    v.set_runtime_info(1, RuntimeInfo::default());
+    assert_eq!(
+        v.link_at(AT_FDCWD, b"/dev/zero", AT_FDCWD, b"/pseudo-alias"),
+        Err(Errno(1))
+    );
+    assert_eq!(v.stat_at(AT_FDCWD, b"/pseudo-alias"), Err(Errno(2)));
+    v.credentials.caps.effective &= !(1 << capabilities::MKNOD);
+    assert_eq!(
+        v.mknod_at(AT_FDCWD, b"/denied", 0o20666, 0x103),
+        Err(Errno(1))
+    );
+    assert_eq!(
+        v.mknod_at(AT_FDCWD, b"/block", 0o60666, 0xfd01),
+        Err(Errno(1))
+    );
+    // dev is ignored for regular files/FIFOs, which do not require MKNOD.
+    v.mknod_at(AT_FDCWD, b"/regular", 0o100600, u64::MAX)
+        .unwrap();
+    v.mknod_at(AT_FDCWD, b"/fifo", 0o10600, u64::MAX).unwrap();
+}
+#[test]
+fn corrupt_device_payloads_are_rejected_before_storage_recovery() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mknod_at(AT_FDCWD, b"/zero", 0o20666, 0x105).unwrap();
+    v.import_file(b"/keep", b"keep".to_vec()).unwrap();
+    drop(v);
+    let manifest = dir.0.join("manifest");
+    let original = fs::read(&manifest).unwrap();
+    let mut offset = 40;
+    while original[offset + 20] != 6 {
+        let size = u32::from_le_bytes(original[offset + 72..offset + 76].try_into().unwrap());
+        offset += 76 + size as usize;
+    }
+    let orphan = dir.0.join("objects/ffffffffffffffff.dat");
+    fs::write(&orphan, b"retain until manifest validates").unwrap();
+    for field in [20, 21, 72] {
+        let mut data = original.clone();
+        data[offset + field] ^= 1; // wrong type, reserved byte, or payload length
+        let end = data.len() - 8;
+        let hash = storage::checksum(&data[..end]).to_le_bytes();
+        data[end..].copy_from_slice(&hash);
+        fs::write(&manifest, &data).unwrap();
+        assert_eq!(
+            Vfs::open_disk(&dir.0, DiskOptions::default()).err(),
+            Some(Errno(22))
+        );
+        assert!(orphan.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), data);
+    }
+}
+#[test]
 fn fifo_inode_persists_but_live_channel_does_not() {
     let dir = Temp::new();
     let mut v = dir.open();
