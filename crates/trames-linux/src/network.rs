@@ -463,7 +463,7 @@ impl Linux {
         }
     }
     fn local_network_syscall(
-        &self,
+        &mut self,
         socket: &trames_vfs::LocalSocket,
         number: u64,
         a: [u64; 6],
@@ -540,22 +540,20 @@ impl Linux {
                     Self::check(memory, a[1], 56, Access::Write)?;
                 }
                 let name = u64_at(memory, a[1])?;
+                let control = u64_at(memory, a[1] + 32)?;
                 let control_size = u64_at(memory, a[1] + 40)?;
-                if !receive && control_size != 0 {
-                    return Err(Errno(95));
-                }
                 if !receive && name != 0 {
                     return Err(Errno(106));
                 }
-                if receive && control_size != 0 {
+                if control_size != 0 {
                     if control_size > super::MAX_WRITE as u64 {
                         return Err(Errno(22));
                     }
                     Self::check(
                         memory,
-                        u64_at(memory, a[1] + 32)?,
+                        control,
                         control_size as usize,
-                        Access::Write,
+                        if receive { Access::Write } else { Access::Read },
                     )?;
                 }
                 let output = if receive {
@@ -572,6 +570,25 @@ impl Linux {
                 if receive {
                     let received = socket.recv(vectors.size, a[2] as u32 | nonblocking)?;
                     vectors.write(memory, &received.data)?;
+                    let capacity = control_size.saturating_sub(16) as usize / 4;
+                    let (fds, truncated) =
+                        self.vfs
+                            .receive_rights(received.rights, capacity, a[2] & 0x40000000 != 0);
+                    let control_count = if fds.is_empty() {
+                        0
+                    } else {
+                        let size = 16 + fds.len() * 4;
+                        let space = ((size + 7) & !7).min(control_size as usize);
+                        let mut bytes = vec![0; space];
+                        bytes[..8].copy_from_slice(&(size as u64).to_le_bytes());
+                        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+                        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+                        for (i, fd) in fds.iter().enumerate() {
+                            bytes[16 + i * 4..20 + i * 4].copy_from_slice(&fd.to_le_bytes());
+                        }
+                        memory.write(control, &bytes).map_err(|_| Errno(14))?;
+                        space
+                    };
                     if let Some(output) = output {
                         output
                             .write_bytes(memory, if socket.kind() == 1 { &[] } else { &[1, 0] })?;
@@ -581,12 +598,14 @@ impl Linux {
                             .map_err(|_| Errno(14))?;
                     }
                     memory
-                        .write(a[1] + 40, &0u64.to_le_bytes())
+                        .write(a[1] + 40, &(control_count as u64).to_le_bytes())
                         .map_err(|_| Errno(14))?;
                     memory
                         .write(
                             a[1] + 48,
-                            &(if received.truncated { MSG_TRUNC } else { 0 }).to_le_bytes(),
+                            &((if received.truncated { MSG_TRUNC } else { 0 })
+                                | if truncated { 8 } else { 0 })
+                            .to_le_bytes(),
                         )
                         .map_err(|_| Errno(14))?;
                     Ok(if a[2] & MSG_TRUNC as u64 != 0 {
@@ -595,7 +614,35 @@ impl Linux {
                         received.data.len()
                     } as u64)
                 } else {
-                    Ok(socket.send(&vectors.read(memory)?, a[2] as u32)? as u64)
+                    let mut fds = Vec::new();
+                    let mut offset = 0;
+                    while control_size - offset >= 16 {
+                        let length = u64_at(memory, control + offset)?;
+                        if length < 16 || length > control_size - offset {
+                            return Err(Errno(22));
+                        }
+                        let level = u32_at(memory, control + offset + 8)?;
+                        let kind = u32_at(memory, control + offset + 12)?;
+                        if level != 1 || kind != 1 {
+                            return Err(Errno(95));
+                        }
+                        for i in 0..(length - 16) / 4 {
+                            fds.push(u32_at(memory, control + offset + 16 + i * 4)?);
+                        }
+                        if fds.len() > 253 {
+                            return Err(Errno(22));
+                        }
+                        let next = (length + 7) & !7;
+                        if next > control_size - offset {
+                            break;
+                        }
+                        offset += next;
+                    }
+                    if control_size != 0 && control_size < 16 {
+                        return Err(Errno(22));
+                    }
+                    let rights = self.vfs.send_rights(&fds)?;
+                    Ok(socket.send_rights(&vectors.read(memory)?, a[2] as u32, rights)? as u64)
                 }
             }
             _ => Err(Errno(95)),

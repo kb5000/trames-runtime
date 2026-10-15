@@ -54,6 +54,7 @@ pub(super) struct Mount {
     pub root_key: Vec<u8>,
     pub kind: Kind,
     pub pid_namespace: Option<PidNamespace>,
+    pub devpts: Option<Rc<pty::Devpts>>,
     pub flags: Cell<u64>,
     pub writers: Cell<usize>,
     pub parent: RefCell<Option<Attachment>>,
@@ -221,6 +222,7 @@ impl Vfs {
             root_key: b"/".to_vec(),
             kind: Kind::Root,
             pid_namespace: None,
+            devpts: None,
             flags: Cell::new(MS_RELATIME),
             writers: Cell::new(0),
             parent: RefCell::new(None),
@@ -241,6 +243,7 @@ impl Vfs {
                 root_key: path.to_vec(),
                 kind,
                 pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
+                devpts: None,
                 flags: Cell::new(flags),
                 writers: Cell::new(0),
                 parent: RefCell::new(Some(Attachment {
@@ -260,6 +263,7 @@ impl Vfs {
             root_key: b"/".to_vec(),
             kind: Kind::Cgroup,
             pid_namespace: None,
+            devpts: None,
             flags: Cell::new(14),
             writers: Cell::new(0),
             parent: RefCell::new(Some(Attachment {
@@ -423,6 +427,7 @@ impl Vfs {
                     root_key: m.root_key.clone(),
                     kind: m.kind,
                     pid_namespace: m.pid_namespace.clone(),
+                    devpts: m.devpts.clone(),
                     flags: Cell::new(m.flags.get()),
                     writers: Cell::new(0),
                     parent: RefCell::new(None),
@@ -460,6 +465,9 @@ impl Vfs {
 
 impl Vfs {
     pub(super) fn uses_pseudo<P: PathArg + ?Sized>(&self, path: &P) -> bool {
+        if path.mount().is_some_and(|m| m.devpts.is_some()) {
+            return false;
+        }
         match path.mount().map(|m| m.kind) {
             Some(Kind::Tmpfs | Kind::Cgroup) => false,
             Some(Kind::Root) => {
@@ -557,6 +565,9 @@ impl Vfs {
             return Ok(());
         }
         if flags & REMOUNT != 0 {
+            if parent.devpts.is_some() && data.is_some_and(|d| !d.is_empty()) {
+                return Err(Errno(95));
+            }
             if flags & !(REMOUNT | BIND | ATTRS) != 0 {
                 return Err(Errno(95));
             }
@@ -580,6 +591,7 @@ impl Vfs {
         }
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         let mut additions = Vec::new();
+        let mut devpts = None;
         let (fs, root, root_key, mount_kind, attrs) = if flags & BIND != 0 {
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let node = self.node(&source)?;
@@ -589,6 +601,7 @@ impl Vfs {
                 return Err(Errno(20));
             }
             let m = source.mount.as_ref().ok_or(Errno(22))?;
+            devpts = m.devpts.clone();
             if flags & REC != 0 {
                 for child in &ns.0.borrow().mounts {
                     if Rc::ptr_eq(child, m) {
@@ -655,14 +668,21 @@ impl Vfs {
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Cgroup, flags & ATTRS)
                 }
-                b"proc" | b"sysfs" | b"devpts" => {
+                b"devpts" => {
+                    let pts = pty::Devpts::new(new_mount_id()?, data.unwrap_or_default())?;
+                    let fs = pts.fs.clone();
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    devpts = Some(Rc::new(pts));
+                    (fs, root, b"/".to_vec(), Kind::Devpts, flags & ATTRS)
+                }
+                b"proc" | b"sysfs" => {
                     if data.is_some_and(|d| !d.is_empty()) {
                         return Err(Errno(95));
                     }
                     let (key, k) = match kind.unwrap() {
                         b"proc" => (b"/proc".as_slice(), Kind::Proc),
                         b"sysfs" => (b"/sys".as_slice(), Kind::Sysfs),
-                        _ => (b"/dev/pts".as_slice(), Kind::Devpts),
+                        _ => unreachable!(),
                     };
                     let node = self.pseudo_node(key)?.ok_or(Errno(19))?;
                     (
@@ -693,6 +713,7 @@ impl Vfs {
             root_key,
             kind: mount_kind,
             pid_namespace: proc_ns,
+            devpts,
             flags: Cell::new(attrs),
             writers: Cell::new(0),
             parent: RefCell::new(Some(Attachment {
@@ -883,6 +904,9 @@ impl Vfs {
         ))
     }
     pub(super) fn mounted_pseudo_children(&self, path: &ResolvedPath) -> Result<Vec<Vec<u8>>> {
+        if path.mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
+            return Ok(Vec::new());
+        }
         if !self.uses_pseudo(path)
             || path.mount.as_ref().is_some_and(|m| m.kind == Kind::Root)
                 && matches!(path.key.as_slice(), b"/proc" | b"/sys" | b"/dev/pts")
@@ -907,6 +931,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         root_key: m.root_key.clone(),
         kind: m.kind,
         pid_namespace: m.pid_namespace.clone(),
+        devpts: m.devpts.clone(),
         flags: Cell::new(m.flags.get()),
         writers: Cell::new(0),
         parent: RefCell::new(None),

@@ -28,6 +28,16 @@ pub(super) struct Watch {
     events: u32,
     data: u64,
     armed: bool,
+    last_ready: Cell<u16>,
+    last_epoch: Cell<[u64; 2]>,
+}
+impl Watch {
+    fn ready(&self, ready: u16, epoch: [u64; 2]) -> bool {
+        self.events & 0x80000000 == 0
+            || ready & !self.last_ready.get() != 0
+            || ready & 3 != 0 && epoch[0] != self.last_epoch.get()[0]
+            || ready & 4 != 0 && epoch[1] != self.last_epoch.get()[1]
+    }
 }
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
@@ -94,7 +104,9 @@ impl Anonymous {
                 if watches.values().any(|w| {
                     w.armed
                         && w.open.upgrade().is_some_and(|o| {
-                            Vfs::poll_open(&o.borrow(), w.events as u16, pending) != 0
+                            let o = o.borrow();
+                            let ready = Vfs::poll_open(&o, w.events as u16, pending);
+                            ready != 0 && w.ready(ready, Vfs::poll_epoch(&o))
                         })
                 }) {
                     events & 1
@@ -296,6 +308,11 @@ impl Vfs {
             return Err(Errno(22));
         }
         let t = target.borrow();
+        // PTY and embedding-terminal wakeups have explicit queue generations.
+        // Other ET sources need their own wakeup tracking before advertising it.
+        if op != 2 && events & 0x80000000 != 0 && !matches!(t.kind, FdKind::Terminal) {
+            return Err(Errno(95));
+        }
         if matches!(t.anonymous, Some(Anonymous::Epoll { .. })) {
             return Err(Errno(95));
         }
@@ -324,7 +341,7 @@ impl Vfs {
         if !matches!(op, 1..=3) {
             return Err(Errno(22));
         }
-        if op != 2 && events & !0x4000201f != 0 {
+        if op != 2 && events & !0xc000201f != 0 {
             return Err(Errno(95));
         }
         match op {
@@ -345,6 +362,8 @@ impl Vfs {
                         events,
                         data,
                         armed: true,
+                        last_ready: Cell::new(0),
+                        last_epoch: Cell::new([0; 2]),
                     },
                 );
                 Ok(())
@@ -355,16 +374,23 @@ impl Vfs {
         &self,
         fd: u32,
         max: usize,
-        special: impl FnMut(&FdKind, u16) -> Result<Option<u16>>,
+        mut special: impl FnMut(&FdKind, u16) -> Result<Option<u16>>,
     ) -> Result<Vec<(u32, u64)>> {
-        self.epoll_wait_signals(fd, max, 0, special)
+        self.epoll_wait_signals(fd, max, 0, |kind, events| {
+            special(kind, events).map(|r| r.map(|r| (r, [0; 2])))
+        })
+    }
+    fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+        o.pty
+            .as_ref()
+            .map_or([0; 2], |end| end.pair.poll_epoch(end.master))
     }
     pub fn epoll_wait_signals(
         &self,
         fd: u32,
         max: usize,
         pending: u64,
-        mut special: impl FnMut(&FdKind, u16) -> Result<Option<u16>>,
+        mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
     ) -> Result<Vec<(u32, u64)>> {
         let mut e = self.descriptor(fd)?.open.borrow_mut();
         let Some(Anonymous::Epoll { watches, cursor }) = e.anonymous.as_mut() else {
@@ -385,17 +411,28 @@ impl Vfs {
             };
             let o = open.borrow();
             let requested = (watch.events & 0xffff) as u16;
-            let ready = if let Some(ready) = special(&o.kind, requested)? {
-                ready
+            let override_ready = if o.pty.is_none() {
+                special(&o.kind, requested)?
             } else {
-                Self::poll_open(&o, requested, pending)
+                None
             };
-            if ready != 0 {
+            let (ready, epoch) = override_ready.unwrap_or_else(|| {
+                (
+                    Self::poll_open(&o, requested, pending),
+                    Self::poll_epoch(&o),
+                )
+            });
+            if ready != 0 && watch.ready(ready, epoch) {
+                watch.last_ready.set(ready);
+                watch.last_epoch.set(epoch);
                 result.push((ready as u32, watch.data));
                 selected.push(key);
                 if result.len() == max {
                     break;
                 }
+            } else if ready == 0 {
+                watch.last_ready.set(0);
+                watch.last_epoch.set(epoch);
             }
         }
         for key in selected {

@@ -2,8 +2,19 @@
 //! Bounded AF_UNIX pairs, shared by dup/fork and confined to the guest runtime.
 use super::*;
 
+#[derive(Clone, Default)]
+pub struct LocalRights(Vec<Rc<RefCell<OpenDescription>>>);
+impl LocalRights {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+struct Packet {
+    data: Vec<u8>,
+    rights: LocalRights,
+}
 struct Channel {
-    queues: [VecDeque<Vec<u8>>; 2],
+    queues: [VecDeque<Packet>; 2],
     ends: [Weak<LocalSocket>; 2],
 }
 pub struct LocalSocket {
@@ -17,6 +28,7 @@ pub struct LocalReceived {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
+    pub rights: LocalRights,
 }
 impl LocalSocket {
     pub fn kind(&self) -> u32 {
@@ -36,6 +48,9 @@ impl LocalSocket {
         Ok(())
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
+        self.send_rights(bytes, flags, LocalRights::default())
+    }
+    pub fn send_rights(&self, bytes: &[u8], flags: u32, rights: LocalRights) -> Result<usize> {
         if flags & !(0x40 | 0x4000) != 0 {
             return Err(Errno(95));
         }
@@ -49,8 +64,11 @@ impl LocalSocket {
         if peer.read_closed.get() {
             return Err(Errno(32));
         }
+        if self.kind == 1 && bytes.is_empty() {
+            return Ok(0);
+        }
         let queue = &mut channel.queues[1 - self.side];
-        let used: usize = queue.iter().map(Vec::len).sum();
+        let used: usize = queue.iter().map(|p| p.data.len()).sum();
         if self.kind != 1 && bytes.len() > PIPE_CAPACITY {
             return Err(Errno(90));
         }
@@ -61,13 +79,23 @@ impl LocalSocket {
             return Err(Errno(11));
         }
         let count = room.min(bytes.len());
-        if self.kind == 1 && count != 0 && !queue.is_empty() {
+        let merge = self.kind == 1
+            && rights.is_empty()
+            && queue.back().is_some_and(|p| p.rights.is_empty());
+        if !merge && queue.len() >= 128 {
+            return Err(Errno(11));
+        }
+        if merge && count != 0 {
             queue
                 .back_mut()
                 .expect("stream queue")
+                .data
                 .extend_from_slice(&bytes[..count]);
         } else if count != 0 || self.kind != 1 {
-            queue.push_back(bytes[..count].to_vec());
+            queue.push_back(Packet {
+                data: bytes[..count].to_vec(),
+                rights,
+            });
         }
         Ok(count)
     }
@@ -94,6 +122,7 @@ impl LocalSocket {
                 data: Vec::new(),
                 length: 0,
                 truncated: false,
+                rights: LocalRights::default(),
             });
         }
         if queue.is_empty() {
@@ -101,8 +130,9 @@ impl LocalSocket {
         }
         if self.kind != 1 {
             let packet = queue.front().expect("packet");
-            let length = packet.len();
-            let data = packet[..count.min(length)].to_vec();
+            let length = packet.data.len();
+            let data = packet.data[..count.min(length)].to_vec();
+            let rights = packet.rights.clone();
             if flags & 2 == 0 {
                 queue.pop_front();
             }
@@ -110,12 +140,18 @@ impl LocalSocket {
                 data,
                 length,
                 truncated: count < length,
+                rights,
             });
         }
         let mut data = Vec::new();
+        let mut rights = LocalRights::default();
         for packet in queue.iter() {
-            let n = (count - data.len()).min(packet.len());
-            data.extend_from_slice(&packet[..n]);
+            let n = (count - data.len()).min(packet.data.len());
+            data.extend_from_slice(&packet.data[..n]);
+            if !packet.rights.is_empty() {
+                rights = packet.rights.clone();
+                break;
+            }
             if data.len() == count {
                 break;
             }
@@ -124,16 +160,22 @@ impl LocalSocket {
             // MSG_WAITALL waits for the requested stream bytes unless EOF or
             // nonblocking mode permits a short read. Do not consume a prefix
             // before a blocked syscall is retried by the guest scheduler.
-            if flags & 0x100 != 0 && flags & 0x40 == 0 && !eof && data.len() < count {
+            if flags & 0x100 != 0
+                && flags & 0x40 == 0
+                && !eof
+                && data.len() < count
+                && rights.is_empty()
+            {
                 return Err(Errno(11));
             }
             let mut remaining = data.len();
             while remaining != 0 {
                 let packet = queue.front_mut().expect("stream bytes");
-                let n = remaining.min(packet.len());
-                packet.drain(..n);
+                let n = remaining.min(packet.data.len());
+                packet.data.drain(..n);
+                packet.rights = LocalRights::default();
                 remaining -= n;
-                if packet.is_empty() {
+                if packet.data.is_empty() {
                     queue.pop_front();
                 }
             }
@@ -143,6 +185,7 @@ impl LocalSocket {
             data,
             length,
             truncated: false,
+            rights,
         })
     }
     pub fn poll(&self, events: u16) -> u16 {
@@ -151,12 +194,15 @@ impl LocalSocket {
         let eof = self.read_closed.get() || peer.as_ref().is_none_or(|s| s.write_closed.get());
         let queue = &channel.queues[self.side];
         let send_queue = &channel.queues[1 - self.side];
-        let room = PIPE_CAPACITY - send_queue.iter().map(Vec::len).sum::<usize>();
+        let room = PIPE_CAPACITY - send_queue.iter().map(|p| p.data.len()).sum::<usize>();
         (if !queue.is_empty() || (eof && self.kind != 2) {
             events & 1
         } else {
             0
-        }) | (if room != 0 && (self.kind == 1 || send_queue.len() < 128) {
+        }) | (if room != 0
+            && (send_queue.len() < 128
+                || self.kind == 1 && send_queue.back().is_some_and(|p| p.rights.is_empty()))
+        {
             events & 4
         } else {
             0
@@ -171,7 +217,45 @@ impl LocalSocket {
         })
     }
 }
+impl Drop for LocalSocket {
+    fn drop(&mut self) {
+        // Rights queued for a closed receiver must release their open files.
+        self.channel.borrow_mut().queues[self.side].clear();
+    }
+}
 impl Vfs {
+    pub fn send_rights(&self, fds: &[u32]) -> Result<LocalRights> {
+        if fds.len() > 253 {
+            return Err(Errno(22));
+        }
+        let mut rights = Vec::new();
+        for fd in fds {
+            let open = &self.descriptor(*fd)?.open;
+            // UNIX-socket transfer needs an in-flight graph garbage collector.
+            // Reject it explicitly until cycles can be reclaimed correctly.
+            if open.borrow().local.is_some() {
+                return Err(Errno(95));
+            }
+            rights.push(open.clone());
+        }
+        Ok(LocalRights(rights))
+    }
+    pub fn receive_rights(
+        &mut self,
+        rights: LocalRights,
+        capacity: usize,
+        cloexec: bool,
+    ) -> (Vec<u32>, bool) {
+        let free: Vec<_> = (0..MAX_FDS)
+            .filter(|fd| !self.fds.contains_key(fd))
+            .take(capacity.min(rights.0.len()))
+            .collect();
+        let truncated = free.len() < rights.0.len();
+        for (&fd, open) in free.iter().zip(rights.0) {
+            self.fds.insert(fd, Descriptor { open, cloexec });
+        }
+        (free, truncated)
+    }
     pub fn local_socket(&self, fd: u32) -> Result<Option<Rc<LocalSocket>>> {
         Ok(self.descriptor(fd)?.open.borrow().local.clone())
     }

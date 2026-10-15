@@ -285,7 +285,7 @@ impl PseudoFs {
             .find(|(_, n)| Rc::ptr_eq(n, node))
             .map(|((_, p), _)| p.clone())
     }
-    fn cache(
+    pub(super) fn cache(
         &mut self,
         ns: u64,
         path: &[u8],
@@ -332,7 +332,7 @@ pub(super) enum Device {
     Full,
     Random,
     Urandom,
-    Pts(u32),
+    Pts(u32, u32), // scheduler identity, devpts-local slave number
     Ptmx,
     Bridge,
     Vda,
@@ -366,7 +366,7 @@ impl Device {
             Self::Full => 0x107,
             Self::Random => 0x108,
             Self::Urandom => 0x109,
-            Self::Pts(id) => 0x8800 + id as u64,
+            Self::Pts(_, number) => ((136 + number / 256) as u64) << 8 | (number % 256) as u64,
             Self::Ptmx => 0x502,
             Self::Bridge => 0xf000,
             Self::Vda => 0xfd00,
@@ -380,7 +380,7 @@ impl Device {
             Self::Zero | Self::Full => {}
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
             Self::Kmsg => return Err(Errno(29)),
-            Self::Pts(_) => return Err(Errno(11)),
+            Self::Pts(_, _) => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
             Self::Bridge => return Err(Errno(19)),
             Self::Vda | Self::Vda1 => return Err(Errno(95)),
@@ -392,7 +392,7 @@ impl Device {
             Self::Unregistered(_) => Err(Errno(6)),
             Self::Full => Err(Errno(28)),
             Self::Kmsg => Err(Errno(29)),
-            Self::Pts(_) => Err(Errno(11)),
+            Self::Pts(_, _) => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
             Self::Bridge => Err(Errno(19)),
             Self::Vda | Self::Vda1 => Err(Errno(95)),
@@ -517,7 +517,7 @@ impl Vfs {
                             if end.master {
                                 b"/dev/ptmx".to_vec()
                             } else {
-                                format!("/dev/pts/{}", end.pair.id).into_bytes()
+                                format!("/dev/pts/{}", end.pair.number).into_bytes()
                             }
                         }
                         FdKind::Terminal => node
@@ -951,9 +951,11 @@ impl Vfs {
                 .and_then(|s| s.parse::<u32>().ok())
             {
                 if id == 0 && self.embedding_terminal.get()
-                    || self.pty_by_id(id).is_some_and(|p| p.master_alive.get())
+                    || self
+                        .pty_by_id(id)
+                        .is_some_and(|p| !p.private() && p.master_alive.get())
                 {
-                    return Ok(Some((Content::Device(Device::Pts(id)), 0o20620)));
+                    return Ok(Some((Content::Device(Device::Pts(id, id)), 0o20620)));
                 }
                 return Ok(None);
             }
@@ -1030,7 +1032,7 @@ impl Vfs {
             b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),
             b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
-            b"/proc/cgroups" => return Ok(regular(b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n".to_vec())),
+            b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
             b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\tcgroup2\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
@@ -1621,7 +1623,7 @@ impl Vfs {
             names.extend(
                 self.live_ptys()
                     .iter()
-                    .filter(|p| p.master_alive.get())
+                    .filter(|p| !p.private() && p.master_alive.get())
                     .map(|p| p.id.to_string().into_bytes()),
             );
         }

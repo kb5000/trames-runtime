@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Guest-wide cgroup v2 domain hierarchy, without resource controllers.
+//! Guest-wide cgroup v2 domains, freezer and hierarchical pids controller.
 //! Scheduler-owned metadata, independent of disk storage and mount namespaces.
 use super::*;
 use std::collections::BTreeSet;
@@ -7,6 +7,13 @@ use std::collections::BTreeSet;
 const ROOT: u64 = 5 << 32;
 const MAX_GROUPS: usize = 128;
 const MAX_DEPTH: usize = 32;
+const PIDS_FILES: &[(&str, u32)] = &[
+    ("pids.current", 0o444),
+    ("pids.max", 0o644),
+    ("pids.peak", 0o444),
+    ("pids.events", 0o444),
+    ("pids.events.local", 0o444),
+];
 const FILES: &[(&str, u32)] = &[
     ("cgroup.procs", 0o644),
     ("cgroup.threads", 0o444),
@@ -15,10 +22,18 @@ const FILES: &[(&str, u32)] = &[
     ("cgroup.type", 0o444),
     ("cgroup.events", 0o444),
     ("cgroup.stat", 0o444),
+    ("cgroup.freeze", 0o644),
+    ("cgroup.kill", 0o200),
 ];
 struct Group {
     path: Vec<u8>,
     parent: Option<u64>,
+    freeze: bool,
+    subtree_pids: bool,
+    pids_max: Option<u64>,
+    pids_peak: u64,
+    pids_events: u64,
+    pids_events_local: u64,
 }
 struct Dying {
     nodes: Vec<Weak<RefCell<Node>>>,
@@ -29,6 +44,7 @@ pub(super) struct Cgroups {
     groups: BTreeMap<u64, Group>,
     tasks: BTreeMap<u32, (u32, u64)>, // global TID -> (global TGID, group inode)
     dying: Vec<Dying>,
+    kill: BTreeSet<u32>,
 }
 fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || root == b"/" || path.starts_with(root) && path.get(root.len()) == Some(&b'/')
@@ -57,6 +73,7 @@ impl Default for Cgroups {
             groups: BTreeMap::new(),
             tasks: BTreeMap::from([(1, (1, ROOT))]),
             dying: Vec::new(),
+            kill: BTreeSet::new(),
         };
         out.add_group(b"/".to_vec(), None, 0o755);
         out
@@ -90,13 +107,81 @@ impl Cgroups {
     fn add_group(&mut self, path: Vec<u8>, parent: Option<u64>, mode: u32) {
         let id = self.add_node(path.clone(), true, mode);
         for (name, mode) in FILES {
-            // Linux omits type/events on the root cgroup.
-            if parent.is_none() && matches!(*name, "cgroup.type" | "cgroup.events") {
+            // These controls apply only below the root cgroup.
+            if parent.is_none()
+                && matches!(
+                    *name,
+                    "cgroup.type" | "cgroup.events" | "cgroup.freeze" | "cgroup.kill"
+                )
+            {
                 continue;
             }
             self.add_node(child_path(&path, name.as_bytes()), false, *mode);
         }
-        self.groups.insert(id, Group { path, parent });
+        self.groups.insert(
+            id,
+            Group {
+                path,
+                parent,
+                freeze: false,
+                subtree_pids: false,
+                pids_max: None,
+                pids_peak: 0,
+                pids_events: 0,
+                pids_events_local: 0,
+            },
+        );
+        if self.pids_enabled(id) {
+            self.install_pids(id, true);
+        }
+    }
+    fn pids_enabled(&self, id: u64) -> bool {
+        self.groups[&id]
+            .parent
+            .is_some_and(|parent| self.groups[&parent].subtree_pids)
+    }
+    fn current(&self, id: u64) -> u64 {
+        self.tasks
+            .values()
+            .filter(|(_, group)| below(&self.groups[group].path, &self.groups[&id].path))
+            .count() as u64
+    }
+    fn update_peak(&mut self, id: u64) {
+        for group in self.ancestors(id) {
+            let count = self.current(group);
+            if self.pids_enabled(group) {
+                let entry = self.groups.get_mut(&group).expect("ancestor");
+                entry.pids_peak = entry.pids_peak.max(count);
+            }
+        }
+    }
+    fn install_pids(&mut self, id: u64, enable: bool) {
+        for (name, mode) in PIDS_FILES {
+            let path = child_path(&self.groups[&id].path, name.as_bytes());
+            if enable {
+                self.add_node(path, false, *mode);
+            } else if let Some(node) = self.fs.borrow_mut().paths.remove(&path) {
+                node.borrow_mut().links = 0;
+            }
+        }
+        let current = self.current(id);
+        let group = self.groups.get_mut(&id).expect("group");
+        group.pids_max = None;
+        group.pids_peak = current;
+        group.pids_events = 0;
+        group.pids_events_local = 0;
+    }
+    fn frozen(&self, mut id: u64) -> bool {
+        loop {
+            let group = &self.groups[&id];
+            if group.freeze {
+                return true;
+            }
+            let Some(parent) = group.parent else {
+                return false;
+            };
+            id = parent;
+        }
     }
     fn ancestors(&self, mut id: u64) -> Vec<u64> {
         let mut out = vec![id];
@@ -116,6 +201,50 @@ impl Cgroups {
     }
 }
 impl Vfs {
+    /// Called before clone commits IDs/TID stores. All workers have joined;
+    /// the following membership insertion cannot race another charge.
+    pub fn cgroup_can_fork(&self, pid: u32) -> Result<()> {
+        let mut cg = self.cgroups.borrow_mut();
+        let id = cg.tasks.get(&pid).map_or(ROOT, |(_, group)| *group);
+        for group in cg.ancestors(id) {
+            if !cg.pids_enabled(group) {
+                continue;
+            }
+            let count = cg.current(group) + 1;
+            if cg.groups[&group]
+                .pids_max
+                .is_some_and(|limit| count > limit)
+            {
+                cg.groups.get_mut(&group).expect("group").pids_events_local += 1;
+                for ancestor in cg.ancestors(group) {
+                    if cg.pids_enabled(ancestor) {
+                        cg.groups.get_mut(&ancestor).expect("ancestor").pids_events += 1;
+                    }
+                }
+                return Err(Errno(11));
+            }
+            let entry = cg.groups.get_mut(&group).expect("group");
+            entry.pids_peak = entry.pids_peak.max(count);
+        }
+        Ok(())
+    }
+    pub(super) fn cgroup_subsystems(&self) -> Vec<u8> {
+        format!(
+            "#subsys_name\thierarchy\tnum_cgroups\tenabled\npids\t0\t{}\t1\n",
+            self.cgroups.borrow().groups.len()
+        )
+        .into_bytes()
+    }
+    /// Evaluated only at joined scheduler boundaries, never on CPU workers.
+    /// Freeze does not overwrite signal stops or the task's blocked syscall.
+    pub fn cgroup_frozen(&self, pid: u32) -> bool {
+        let cg = self.cgroups.borrow();
+        cg.tasks.get(&pid).is_some_and(|(_, id)| cg.frozen(*id))
+    }
+    /// The write snapshots the entire subtree before any task can move/fork.
+    pub fn take_cgroup_kills(&self) -> BTreeSet<u32> {
+        std::mem::take(&mut self.cgroups.borrow_mut().kill)
+    }
     pub(super) fn cgroup_mount(path: &ResolvedPath) -> bool {
         path.mount
             .as_ref()
@@ -187,6 +316,7 @@ impl Vfs {
         let mut cg = self.cgroups.borrow_mut();
         let group = cg.tasks.get(&parent).map_or(ROOT, |(_, g)| *g);
         cg.tasks.insert(child, (tgid, group));
+        cg.update_peak(group);
     }
     pub fn cgroup_exit(&self, pid: u32) {
         self.cgroups.borrow_mut().tasks.remove(&pid);
@@ -255,15 +385,38 @@ impl Vfs {
                     .collect();
                 ids.iter().map(|id| format!("{id}\n")).collect::<String>()
             }
-            b"cgroup.controllers" | b"cgroup.subtree_control" => "\n".to_owned(),
+            b"cgroup.controllers" => if id == ROOT || cg.pids_enabled(id) {
+                "pids\n"
+            } else {
+                "\n"
+            }
+            .to_owned(),
+            b"cgroup.subtree_control" => if cg.groups[&id].subtree_pids {
+                "pids\n"
+            } else {
+                "\n"
+            }
+            .to_owned(),
+            b"pids.current" => format!("{}\n", cg.current(id)),
+            b"pids.peak" => format!("{}\n", cg.groups[&id].pids_peak),
+            b"pids.max" => cg.groups[&id]
+                .pids_max
+                .map_or_else(|| "max\n".to_owned(), |n| format!("{n}\n")),
+            b"pids.events" => format!("max {}\n", cg.groups[&id].pids_events),
+            b"pids.events.local" => format!("max {}\n", cg.groups[&id].pids_events_local),
             b"cgroup.type" => "domain\n".to_owned(),
             b"cgroup.events" => {
                 let populated = cg
                     .tasks
                     .values()
                     .any(|(_, g)| below(&cg.groups[g].path, path));
-                format!("populated {}\nfrozen 0\n", u8::from(populated))
+                format!(
+                    "populated {}\nfrozen {}\n",
+                    u8::from(populated),
+                    u8::from(cg.frozen(id))
+                )
             }
+            b"cgroup.freeze" => format!("{}\n", u8::from(cg.groups[&id].freeze)),
             b"cgroup.stat" => {
                 let descendants = cg
                     .groups
@@ -300,10 +453,93 @@ impl Vfs {
         }
         let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?.trim();
         match name.as_slice() {
-            b"cgroup.subtree_control" => {
-                if !text.is_empty() {
-                    return Err(Errno(95));
+            b"cgroup.freeze" => {
+                let freeze = match text {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(Errno(22)),
+                };
+                self.cgroups
+                    .borrow_mut()
+                    .groups
+                    .get_mut(&id)
+                    .ok_or(Errno(19))?
+                    .freeze = freeze;
+            }
+            b"cgroup.kill" => {
+                if text != "1" {
+                    return Err(Errno(22));
                 }
+                let mut cg = self.cgroups.borrow_mut();
+                let path = &cg.groups[&id].path;
+                let targets: Vec<_> = cg
+                    .tasks
+                    .iter()
+                    .filter(|(_, (_, group))| below(&cg.groups[group].path, path))
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                cg.kill.extend(targets);
+            }
+            b"cgroup.subtree_control" => {
+                let mut cg = self.cgroups.borrow_mut();
+                let mut enable = cg.groups[&id].subtree_pids;
+                for token in text.split_whitespace() {
+                    enable = match token {
+                        "+pids" => true,
+                        "-pids" => false,
+                        _ => return Err(Errno(95)),
+                    };
+                }
+                if enable == cg.groups[&id].subtree_pids {
+                    return Ok(Some(bytes.len()));
+                }
+                if enable && id != ROOT && !cg.pids_enabled(id) {
+                    return Err(Errno(2));
+                }
+                let children: Vec<_> = cg
+                    .groups
+                    .iter()
+                    .filter(|(_, g)| g.parent == Some(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                if !enable && children.iter().any(|id| cg.groups[id].subtree_pids)
+                    || enable && id != ROOT && cg.tasks.values().any(|(_, group)| *group == id)
+                {
+                    return Err(Errno(16));
+                }
+                cg.groups.get_mut(&id).expect("group").subtree_pids = enable;
+                for child in children {
+                    cg.install_pids(child, enable);
+                }
+            }
+            b"pids.max" => {
+                let limit = if text == "max" {
+                    None
+                } else {
+                    let value = text.strip_prefix('+').unwrap_or(text);
+                    let (value, radix) = if let Some(value) = value
+                        .strip_prefix("0x")
+                        .or_else(|| value.strip_prefix("0X"))
+                    {
+                        (value, 16)
+                    } else if value.len() > 1 && value.starts_with('0') {
+                        (&value[1..], 8)
+                    } else {
+                        (value, 10)
+                    };
+                    Some(
+                        u64::from_str_radix(value, radix)
+                            .ok()
+                            .filter(|n| *n <= 4194304)
+                            .ok_or(Errno(22))?,
+                    )
+                };
+                self.cgroups
+                    .borrow_mut()
+                    .groups
+                    .get_mut(&id)
+                    .ok_or(Errno(19))?
+                    .pids_max = limit;
             }
             b"cgroup.procs" => {
                 if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -316,12 +552,16 @@ impl Vfs {
                     self.global_pid(local)?
                 };
                 let mut cg = self.cgroups.borrow_mut();
+                if id != ROOT && cg.groups[&id].subtree_pids {
+                    return Err(Errno(16));
+                }
                 let (tgid, _) = *cg.tasks.get(&target).ok_or(Errno(3))?;
                 for (process, group) in cg.tasks.values_mut() {
                     if *process == tgid {
                         *group = id;
                     }
                 }
+                cg.update_peak(id);
             }
             b"cgroup.threads" | b"cgroup.type" => return Err(Errno(95)),
             _ => return Err(Errno(13)),

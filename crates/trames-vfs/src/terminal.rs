@@ -15,6 +15,10 @@ pub struct Terminal {
     pub eof: bool,
     pub output_queue: VecDeque<u8>,
     pub flow_stopped: bool,
+    pub input_epoch: u64,
+    pub input_space_epoch: u64,
+    pub output_epoch: u64,
+    pub output_space_epoch: u64,
 }
 impl Default for Terminal {
     fn default() -> Self {
@@ -41,6 +45,10 @@ impl Default for Terminal {
             eof: false,
             output_queue: VecDeque::new(),
             flow_stopped: false,
+            input_epoch: 0,
+            input_space_epoch: 0,
+            output_epoch: 0,
+            output_space_epoch: 0,
         }
     }
 }
@@ -51,6 +59,9 @@ impl Terminal {
     }
     pub fn drain_output(&mut self, maximum: usize) -> Vec<u8> {
         let take = maximum.min(self.output_queue.len());
+        if take != 0 {
+            self.output_space_epoch = self.output_space_epoch.wrapping_add(1);
+        }
         self.output_queue.drain(..take).collect()
     }
     pub fn input_capacity(&self) -> usize {
@@ -60,6 +71,7 @@ impl Terminal {
         !self.packets.is_empty() || self.eof
     }
     pub fn flush_input(&mut self) {
+        self.input_space_epoch = self.input_space_epoch.wrapping_add(1);
         self.edit.clear();
         self.packets.clear();
         self.queued_charge = 0;
@@ -77,6 +89,9 @@ impl Terminal {
         if !bytes.is_empty() && count == 0 {
             Err(Errno(11))
         } else {
+            if count != 0 {
+                self.output_epoch = self.output_epoch.wrapping_add(1);
+            }
             Ok(count)
         }
     }
@@ -92,6 +107,7 @@ impl Terminal {
     }
     /// Input is bounded to 64 KiB; returns terminal-generated signals for the foreground group.
     pub fn input(&mut self, bytes: &[u8]) -> Vec<u32> {
+        let before = (self.packets.len(), self.queued_charge);
         let mut signals = Vec::new();
         for &raw in bytes {
             if self.input_capacity() == 0 {
@@ -180,6 +196,9 @@ impl Terminal {
                 self.queued_charge += 1;
             }
         }
+        if before != (self.packets.len(), self.queued_charge) {
+            self.input_epoch = self.input_epoch.wrapping_add(1);
+        }
         signals
     }
     pub fn read(&mut self, count: usize) -> Result<Vec<u8>, Errno> {
@@ -203,6 +222,7 @@ impl Terminal {
             };
         };
         let take = count.min(p.len());
+        self.input_space_epoch = self.input_space_epoch.wrapping_add(1);
         let bytes = p.drain(..take).collect();
         self.queued_charge -= take.max(1);
         if p.is_empty() {

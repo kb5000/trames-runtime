@@ -15,7 +15,7 @@ mod mounts;
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
-pub use ipc::{LocalReceived, LocalSocket};
+pub use ipc::{LocalReceived, LocalRights, LocalSocket};
 pub use locks::RecordLock;
 mod linux_namespace;
 mod pid_namespace;
@@ -348,7 +348,7 @@ impl Vfs {
     }
     fn check_parent_write(&self, path: &ResolvedPath) -> Result<()> {
         path.writable()?;
-        if Self::cgroup_mount(path) {
+        if Self::cgroup_mount(path) || path.mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
             return Err(Errno(1));
         }
         if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
@@ -1263,8 +1263,8 @@ impl Vfs {
             None
         } else {
             match node.borrow().content {
-                Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty()?),
-                Content::Device(pseudo::Device::Pts(id)) if id != 0 => {
+                Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty(&p)?),
+                Content::Device(pseudo::Device::Pts(id, _)) if id != 0 => {
                     let pair = self.pty_by_id(id).ok_or(Errno(5))?;
                     if pair.locked.get() || !pair.master_alive.get() {
                         return Err(Errno(5));
@@ -1312,7 +1312,7 @@ impl Vfs {
                         && (pty.is_some()
                             || matches!(
                                 node.borrow().content,
-                                Content::Terminal | Content::Device(pseudo::Device::Pts(_))
+                                Content::Terminal | Content::Device(pseudo::Device::Pts(_, _))
                             ))
                     {
                         FdKind::Terminal
