@@ -21,6 +21,7 @@ mod linux_namespace;
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
 mod namespace;
+mod xattr;
 pub use linux_namespace::{NamespaceSnapshot, UtsNamespace, CLONE_NEWUTS};
 mod network;
 mod pseudo;
@@ -47,6 +48,8 @@ pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
 pub const MAX_FDS: u32 = 256;
+/// Scheduler task budget, also reported by procfs and RLIMIT_NPROC.
+pub const MAX_TASKS: usize = 256;
 pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
 pub const O_DIRECTORY: u32 = 0x4000;
@@ -83,6 +86,7 @@ struct Pipe {
     writers: u32,
     read_epoch: u64,
     write_epoch: u64,
+    io_epoch: [u64; 2],
 }
 struct PipeEnd {
     pipe: Rc<RefCell<Pipe>>,
@@ -100,10 +104,27 @@ impl Pipe {
             writers: 0,
             read_epoch: 0,
             write_epoch: 0,
+            io_epoch: [0; 2],
         }))
     }
 }
 impl PipeEnd {
+    fn open(pipe: &Rc<RefCell<Pipe>>, flags: u32) -> Result<Option<Rc<Self>>> {
+        if flags & O_PATH != 0 {
+            return Ok(None);
+        }
+        let read = flags & 3 != 1;
+        let write = flags & 3 != 0;
+        if write && !read && flags & O_NONBLOCK != 0 && pipe.borrow().readers == 0 {
+            return Err(Errno(6));
+        }
+        Ok(Some(Self::new(
+            pipe.clone(),
+            read,
+            write,
+            flags & O_NONBLOCK == 0,
+        )))
+    }
     fn new(pipe: Rc<RefCell<Pipe>>, read: bool, write: bool, block: bool) -> Rc<Self> {
         let mut p = pipe.borrow_mut();
         let initial_write_epoch = p.write_epoch.wrapping_sub(u64::from(p.writers != 0));
@@ -117,10 +138,12 @@ impl PipeEnd {
         if read {
             p.readers += 1;
             p.read_epoch = p.read_epoch.wrapping_add(1);
+            p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
         }
         if write {
             p.writers += 1;
             p.write_epoch = p.write_epoch.wrapping_add(1);
+            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
         }
         drop(p);
         Rc::new(Self {
@@ -137,6 +160,12 @@ impl Drop for PipeEnd {
         let mut p = self.pipe.borrow_mut();
         p.readers -= u32::from(self.read);
         p.writers -= u32::from(self.write);
+        if self.read {
+            p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
+        }
+        if self.write {
+            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
+        }
         if p.readers == 0 && p.writers == 0 {
             p.bytes.clear();
         }
@@ -172,6 +201,7 @@ enum Content {
     Terminal,
     Device(pseudo::Device),
     Fifo(Rc<RefCell<Pipe>>),
+    Socket(Weak<LocalSocket>),
 }
 struct Node {
     device: u64,
@@ -184,6 +214,7 @@ struct Node {
     links: u32,
     times: [storage::Timestamp; 3],
     seals: Option<u32>,
+    xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
@@ -201,11 +232,13 @@ struct Filesystem {
 #[derive(Clone)]
 pub struct Vfs {
     network: trames_net::Network,
+    local_namespace: Rc<RefCell<ipc::LocalNamespace>>,
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
     cwd_node: Option<Rc<RefCell<Node>>>,
     root_node: Option<Rc<RefCell<Node>>>,
     uts: UtsNamespace,
+    root_network: Rc<linux_namespace::RootNetwork>,
     pid_ns: PidNamespace,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
@@ -236,6 +269,7 @@ impl Default for Vfs {
         let pid_ns = PidNamespace::default();
         let mut v = Self {
             network: trames_net::Network::default(),
+            local_namespace: Rc::default(),
             fs: Rc::new(RefCell::new(Filesystem {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -250,6 +284,7 @@ impl Default for Vfs {
             cwd_node: None,
             root_node: None,
             uts: UtsNamespace::default(),
+            root_network: Rc::default(),
             pid_ns: pid_ns.clone(),
             pid_children: pid_ns,
             mounts: None,
@@ -501,6 +536,7 @@ impl Vfs {
             inode,
             links: 1,
             times: [storage::Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
             seals: None,
         }));
         fs.inodes.push(Rc::downgrade(&node));
@@ -957,7 +993,11 @@ impl Vfs {
         if source.borrow().volatile
             || !matches!(
                 source.borrow().content,
-                Content::File(_) | Content::Null | Content::Terminal | Content::Device(_)
+                Content::File(_)
+                    | Content::Null
+                    | Content::Terminal
+                    | Content::Device(_)
+                    | Content::Socket(_)
             )
         {
             return Err(Errno(1));
@@ -1194,6 +1234,9 @@ impl Vfs {
         let node = self.node(&p)?;
         {
             let mut n = node.borrow_mut();
+            if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
+                return Err(Errno(6));
+            }
             if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
                 return Err(Errno(40));
             }
@@ -1285,20 +1328,8 @@ impl Vfs {
                 _ => None,
             }
         };
-        let pipe = if flags & O_PATH != 0 {
-            None
-        } else if let Content::Fifo(pipe) = &node.borrow().content {
-            let read = flags & 3 != 1;
-            let write = flags & 3 != 0;
-            if write && !read && flags & O_NONBLOCK != 0 && pipe.borrow().readers == 0 {
-                return Err(Errno(6));
-            }
-            Some(PipeEnd::new(
-                pipe.clone(),
-                read,
-                write,
-                flags & O_NONBLOCK == 0,
-            ))
+        let pipe = if let Content::Fifo(pipe) = &node.borrow().content {
+            PipeEnd::open(pipe, flags)?
         } else {
             None
         };
@@ -1533,6 +1564,9 @@ impl Vfs {
                 return Err(Errno(11));
             }
             let n = count.min(p.bytes.len());
+            if n != 0 {
+                p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
+            }
             return Ok(p.bytes.drain(..n).collect());
         }
         let node = o.node.clone().ok_or(Errno(9))?;
@@ -1546,6 +1580,7 @@ impl Vfs {
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
+            Content::Socket(_) => Err(Errno(6)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
             Content::Fifo(_) => Err(Errno(29)),
@@ -1582,7 +1617,14 @@ impl Vfs {
             return bridge.write(bytes).map_err(Errno);
         }
         if let Some(socket) = &o.socket {
-            return socket.send(bytes, 0, None).map_err(|e| Errno(e.0));
+            return socket
+                .send_bytes_authorized(
+                    bytes,
+                    0,
+                    None,
+                    self.credentials.has_cap(capabilities::NET_ADMIN),
+                )
+                .map_err(|e| Errno(e.0));
         }
         if let Some(end) = &o.pipe {
             if !end.write {
@@ -1601,6 +1643,7 @@ impl Vfs {
             }
             let n = room.min(bytes.len());
             p.bytes.extend(&bytes[..n]);
+            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
             return Ok(n);
         }
         drop(o);
@@ -1639,6 +1682,7 @@ impl Vfs {
             Content::Device(device) => device.write(bytes),
             Content::Fifo(_) => Err(Errno(29)),
             Content::Directory => Err(Errno(21)),
+            Content::Socket(_) => Err(Errno(6)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal => Err(Errno(11)),
             Content::File(b) => {
@@ -1720,6 +1764,7 @@ impl Vfs {
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
+            Content::Socket(_) => Err(Errno(6)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal | Content::Fifo(_) => Err(Errno(29)),
         };
@@ -1816,6 +1861,7 @@ impl Vfs {
         let length = match &n.content {
             Content::File(b) => b.len(),
             Content::Directory => 0,
+            Content::Socket(_) => return Err(Errno(6)),
             Content::Symlink(_) => return Err(Errno(40)),
             Content::Null => return Ok(0),
             Content::Device(_) => return Ok(0),
@@ -1991,6 +2037,7 @@ impl Vfs {
                 gid: o.owner.1,
                 volatile: false,
                 times: [storage::Timestamp::default(); 3],
+                xattrs: BTreeMap::new(),
                 seals: None,
             },
             None,

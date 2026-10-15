@@ -562,6 +562,7 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            5..=16 => self.xattr_syscall(number, a, memory),
             51 => {
                 let path = Self::path(memory, a[0])?;
                 self.vfs.chroot(&path)?;
@@ -771,7 +772,8 @@ impl Linux {
                         })
                     }))
                 };
-                self.vfs.set_times(a[0] as i32, path.as_deref(), times)?;
+                self.vfs
+                    .set_times_flags(a[0] as i32, path.as_deref(), times, a[3] as u32)?;
                 Ok(0)
             }
             23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),

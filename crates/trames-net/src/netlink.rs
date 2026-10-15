@@ -24,6 +24,7 @@ pub(super) struct Socket {
     port: Cell<u32>,
     connected: Cell<bool>,
     replies: RefCell<VecDeque<Vec<u8>>>,
+    read_epoch: Cell<u64>,
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
     strict: Cell<bool>,
@@ -84,6 +85,7 @@ impl Socket {
             port: Cell::new(0),
             connected: Cell::new(false),
             replies: RefCell::new(VecDeque::new()),
+            read_epoch: Cell::new(0),
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
             strict: Cell::new(false),
@@ -145,6 +147,15 @@ impl Socket {
         flags: u32,
         destination: Option<&[u8]>,
     ) -> Result<usize> {
+        self.send_bytes_authorized(bytes, flags, destination, false)
+    }
+    pub fn send_bytes_authorized(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+    ) -> Result<usize> {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(NetError(95));
         }
@@ -184,7 +195,7 @@ impl Socket {
         self.autobind()?;
         let mut replies = Vec::new();
         for request in requests {
-            let generated = self.request(request)?;
+            let generated = self.request(request, net_admin)?;
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
             }
@@ -198,10 +209,13 @@ impl Socket {
         {
             return Err(NetError(105));
         }
+        if !replies.is_empty() {
+            self.read_epoch.set(self.read_epoch.get().wrapping_add(1));
+        }
         queued.extend(replies);
         Ok(bytes.len())
     }
-    fn request(&self, request: &[u8]) -> Result<Vec<Vec<u8>>> {
+    fn request(&self, request: &[u8], net_admin: bool) -> Result<Vec<Vec<u8>>> {
         let kind = u16::from_le_bytes(request[4..6].try_into().unwrap());
         let flags = u16::from_le_bytes(request[6..8].try_into().unwrap());
         let sequence = u32::from_le_bytes(request[8..12].try_into().unwrap());
@@ -213,13 +227,62 @@ impl Socket {
             .into_iter()
             .filter(|i| *i == 1 || self.info.is_some());
         match kind {
+            16 | 17 | 20 | 21 | 24 | 25 => {
+                // The direct root network has an always-up loopback. Accept
+                // only the exact idempotent LinkSetUp request; never pretend
+                // that down, rename, MTU, address or route changes took effect.
+                let already_up = kind == 16
+                    && request.len() == 32
+                    && flags & !5 == 0
+                    && request[16..20] == [0; 4]
+                    && request[20..24] == 1u32.to_le_bytes()
+                    && request[24..28] == 1u32.to_le_bytes()
+                    && request[28..32] == 1u32.to_le_bytes();
+                let errno: i32 = if !net_admin {
+                    -1
+                } else if already_up {
+                    0
+                } else {
+                    -95
+                };
+                if errno != 0 || flags & 4 != 0 {
+                    let mut data = errno.to_le_bytes().to_vec();
+                    data.extend_from_slice(&request[..16]);
+                    out.push(message(2, 0, sequence, self.port.get(), &data));
+                }
+                return Ok(out);
+            }
             18 if request.len() >= 17 => {
+                let mut name = None;
+                let mut at = 32;
+                while at < request.len() {
+                    if request.len() - at < 4 {
+                        return Err(NetError(22));
+                    }
+                    let len = u16::from_le_bytes(request[at..at + 2].try_into().unwrap()) as usize;
+                    let kind =
+                        u16::from_le_bytes(request[at + 2..at + 4].try_into().unwrap()) & 0x3fff;
+                    if len < 4 || len > request.len() - at {
+                        return Err(NetError(22));
+                    }
+                    if kind == 3 {
+                        let value = &request[at + 4..at + len];
+                        let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+                        name = Some(&value[..end]);
+                    }
+                    at += (len + 3) & !3;
+                }
                 let index = if request.len() >= 24 {
                     u32::from_le_bytes(request[20..24].try_into().unwrap())
                 } else {
                     0
                 };
-                for i in interfaces.filter(|i| dump || index == 0 || *i == index) {
+                for i in interfaces.filter(|i| {
+                    dump || (index == 0 || *i == index)
+                        && name.is_none_or(|name| {
+                            name == if *i == 1 { b"lo".as_slice() } else { b"eth0" }
+                        })
+                }) {
                     let lo = i == 1;
                     let mut data = vec![0; 16];
                     data[2..4].copy_from_slice(&(if lo { 772u16 } else { 65534 }).to_le_bytes());
@@ -432,6 +495,9 @@ impl Socket {
         }
         Ok(result)
     }
+    pub fn poll_epoch(&self) -> [u64; 2] {
+        [self.read_epoch.get(), 0]
+    }
     pub fn poll(&self, events: u16) -> Result<u16> {
         Ok((if self.replies.borrow().is_empty() {
             0
@@ -471,6 +537,39 @@ impl Drop for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loopback_up_requires_authority_and_never_accepts_real_interface_changes() {
+        let s = Socket::new(Rc::new(Namespace::default()), None, 3, 0).unwrap();
+        let mut data = vec![0; 16];
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data[12..16].copy_from_slice(&1u32.to_le_bytes());
+        for (admin, index, up, expected) in [
+            (false, 1, 1, -1i32),
+            (true, 1, 1, 0),
+            (true, 1, 0, -95),
+            (true, 2, 1, -95),
+        ] {
+            data[4..8].copy_from_slice(&u32::to_le_bytes(index));
+            data[8..12].copy_from_slice(&u32::to_le_bytes(up));
+            let request = message(16, 5, 42, 0, &data);
+            s.send_bytes_authorized(&request, 0, None, admin).unwrap();
+            let reply = s.recv(4096, 0).unwrap();
+            assert_eq!(
+                i32::from_le_bytes(reply.data[16..20].try_into().unwrap()),
+                expected
+            );
+        }
+        data.fill(0);
+        attr(&mut data, 3, b"absent\0");
+        s.send_bytes(&message(18, 1, 43, 0, &data), 0, None)
+            .unwrap();
+        let reply = s.recv(4096, 0).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(reply.data[16..20].try_into().unwrap()),
+            -19
+        );
+    }
     #[test]
     fn malformed_multi_request_has_no_reply_and_dump_preserves_sequence_and_peek() {
         let s = Socket::new(Rc::new(Namespace::default()), None, 3, 0).unwrap();

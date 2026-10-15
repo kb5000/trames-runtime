@@ -10,6 +10,7 @@ pub(super) enum Anonymous {
     Event {
         count: u64,
         semaphore: bool,
+        epoch: [u64; 2],
     },
     Timer {
         clock: u32,
@@ -122,12 +123,17 @@ impl Anonymous {
         }
         self.tick();
         let value = match self {
-            Self::Event { count, semaphore } => {
+            Self::Event {
+                count,
+                semaphore,
+                epoch,
+            } => {
                 if *count == 0 {
                     return Err(Errno(11));
                 }
                 let value = if *semaphore { 1 } else { *count };
                 *count -= value;
+                epoch[1] = epoch[1].wrapping_add(1);
                 value
             }
             Self::Timer { pending, .. } => {
@@ -141,7 +147,7 @@ impl Anonymous {
         Ok(value.to_le_bytes().to_vec())
     }
     pub(super) fn write(&mut self, bytes: &[u8]) -> Result<usize> {
-        let Self::Event { count, .. } = self else {
+        let Self::Event { count, epoch, .. } = self else {
             return Err(Errno(22));
         };
         if bytes.len() < 8 {
@@ -155,6 +161,7 @@ impl Anonymous {
             .checked_add(value)
             .filter(|n| *n < u64::MAX)
             .ok_or(Errno(11))?;
+        epoch[0] = epoch[0].wrapping_add(1);
         Ok(8)
     }
 }
@@ -218,6 +225,7 @@ impl Vfs {
             Anonymous::Event {
                 count: initial as u64,
                 semaphore: flags & 1 != 0,
+                epoch: [0; 2],
             },
         )
     }
@@ -308,16 +316,24 @@ impl Vfs {
             return Err(Errno(22));
         }
         let t = target.borrow();
-        // PTY and embedding-terminal wakeups have explicit queue generations.
-        // Other ET sources need their own wakeup tracking before advertising it.
-        if op != 2 && events & 0x80000000 != 0 && !matches!(t.kind, FdKind::Terminal) {
+        if t.namespace.is_some()
+            || matches!(t.kind, FdKind::Node(_)) && t.bridge.is_none() && t.pipe.is_none()
+        {
+            return Err(Errno(1));
+        }
+        // Accept ET only for sources with explicit wakeup generations.
+        if op != 2
+            && events & 0x80000000 != 0
+            && !matches!(t.kind, FdKind::Terminal)
+            && t.local.is_none()
+            && t.pipe.is_none()
+            && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
+            && !matches!(t.anonymous, Some(Anonymous::Event { .. }))
+        {
             return Err(Errno(95));
         }
         if matches!(t.anonymous, Some(Anonymous::Epoll { .. })) {
             return Err(Errno(95));
-        }
-        if t.namespace.is_some() || matches!(t.kind, FdKind::Node(_)) && t.bridge.is_none() {
-            return Err(Errno(1));
         }
         let key = (target_number, t.id);
         // The caller's descriptor number distinguishes separate dup registrations.
@@ -381,6 +397,18 @@ impl Vfs {
         })
     }
     fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+        if let Some(epoch) = o.socket.as_ref().and_then(|s| s.poll_epoch()) {
+            return epoch;
+        }
+        if let Some(end) = &o.pipe {
+            return end.pipe.borrow().io_epoch;
+        }
+        if let Some(local) = &o.local {
+            return local.poll_epoch();
+        }
+        if let Some(Anonymous::Event { epoch, .. }) = &o.anonymous {
+            return *epoch;
+        }
         o.pty
             .as_ref()
             .map_or([0; 2], |end| end.pair.poll_epoch(end.master))
@@ -471,7 +499,7 @@ mod tests {
         let mut v = Vfs::default();
         let fd = v.eventfd(1, 0).unwrap();
         let ep = v.epoll_create(O_CLOEXEC).unwrap();
-        assert_eq!(v.epoll_ctl(ep, 1, fd, 0x80000001, 42), Err(Errno(95)));
+        assert_eq!(v.epoll_ctl(ep, 1, fd, 0x10000001, 42), Err(Errno(95)));
         assert_eq!(v.epoll_ctl(ep, 1, ep, 1, 42), Err(Errno(22)));
         assert_eq!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(), vec![]);
         v.epoll_ctl(ep, 1, fd, 1, 42).unwrap();

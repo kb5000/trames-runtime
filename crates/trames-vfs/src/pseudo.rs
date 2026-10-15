@@ -318,6 +318,7 @@ impl PseudoFs {
             inode: (1u64 << 63) + self.next_inode,
             links: 1,
             times: [storage::Timestamp::default(); 3],
+            xattrs: BTreeMap::new(),
             seals: None,
         }));
         self.nodes.insert((ns, path.to_vec()), node.clone());
@@ -589,6 +590,11 @@ impl Vfs {
             return Ok(None);
         }
         let link_path = self.resolve_final(dirfd, path, false)?;
+        if let Some(ns) = link_path.mount.as_ref().and_then(|m| m.namespace.clone()) {
+            let description = self.namespace_description(ns);
+            description.borrow_mut().mount = link_path.mount;
+            return Ok(Some(description));
+        }
         if !self.uses_pseudo(&link_path) {
             return Ok(None);
         }
@@ -793,6 +799,16 @@ impl Vfs {
                 m.writable()?;
             }
         }
+        let fd = self.available(0)?;
+        let pipe = if let Some(node) = &original.node {
+            if let Content::Fifo(pipe) = &node.borrow().content {
+                PipeEnd::open(pipe, flags)?
+            } else {
+                original.pipe.clone()
+            }
+        } else {
+            original.pipe.clone()
+        };
         let descriptor = OpenDescription {
             id: self.open_id(),
             owner: original.owner,
@@ -800,7 +816,7 @@ impl Vfs {
             flags: flags & !O_CLOEXEC,
             position: 0,
             node: original.node.clone(),
-            pipe: original.pipe.clone(),
+            pipe,
             socket: None,
             bridge: original.bridge.clone(),
             kernel_log: None,
@@ -811,7 +827,6 @@ impl Vfs {
             mount: original.mount.clone(),
         };
         drop(original);
-        let fd = self.available(0)?;
         self.fds.insert(
             fd,
             Descriptor {
@@ -1054,9 +1069,9 @@ impl Vfs {
             b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(regular(n)); },
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
-            b"/proc/sys/kernel/threads-max" => return Ok(regular(b"32\n".to_vec())),
-            b"/proc/sys/fs/file-max" => return Ok(regular(b"8192\n".to_vec())),
-            b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t8192\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>()).into_bytes())),
+            b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{MAX_TASKS}\n").into_bytes())),
+            b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", MAX_TASKS * MAX_FDS as usize).into_bytes())),
+            b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), MAX_TASKS * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_forward" => return Ok(regular(b"0\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
@@ -1097,7 +1112,10 @@ impl Vfs {
                 let key = parts[i];
                 if parts.len() == i + 2
                     && key == b"ns"
-                    && matches!(parts[i + 1], b"uts" | b"mnt" | b"pid" | b"pid_for_children")
+                    && matches!(
+                        parts[i + 1],
+                        b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net"
+                    )
                 {
                     return Ok(
                         linux_namespace::snapshot_label(&p.namespaces, parts[i + 1]).and_then(link)
@@ -1214,7 +1232,7 @@ impl Vfs {
                                     v.to_string()
                                 }
                             };
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             32                   32                   processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {MAX_TASKS:<20} {MAX_TASKS:<20} processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };
@@ -1694,6 +1712,7 @@ impl Vfs {
                         names.push(b"uts".to_vec());
                         names.push(b"pid".to_vec());
                         names.push(b"pid_for_children".to_vec());
+                        names.push(b"net".to_vec());
                         if p.namespaces.mount.strong_count() != 0 {
                             names.push(b"mnt".to_vec());
                         }

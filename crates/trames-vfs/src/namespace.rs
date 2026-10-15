@@ -218,6 +218,18 @@ impl Vfs {
         path: Option<&[u8]>,
         times: Option<[[i64; 2]; 2]>,
     ) -> Result<()> {
+        self.set_times_flags(dirfd, path, times, 0)
+    }
+    pub fn set_times_flags(
+        &mut self,
+        dirfd: i32,
+        path: Option<&[u8]>,
+        times: Option<[[i64; 2]; 2]>,
+        flags: u32,
+    ) -> Result<()> {
+        if flags & !0x100 != 0 || path.is_none() && flags != 0 {
+            return Err(Errno(22));
+        }
         let now = storage::Timestamp::now();
         let mut values = [Some(now); 2];
         if let Some(times) = times {
@@ -238,7 +250,7 @@ impl Vfs {
         }
         let node = match path {
             Some(p) => {
-                let p = self.resolve(dirfd, p)?;
+                let p = self.resolve_final(dirfd, p, flags & 0x100 == 0)?;
                 p.writable()?;
                 self.node(&p)?
             }

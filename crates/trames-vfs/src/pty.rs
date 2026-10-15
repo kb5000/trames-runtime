@@ -344,6 +344,7 @@ impl Devpts {
             volatile: true,
             links: 1,
             times: [storage::Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
             seals: None,
         }));
         fs.next_inode += 1;

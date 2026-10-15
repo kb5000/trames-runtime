@@ -22,6 +22,7 @@ pub(super) enum Kind {
     Sysfs,
     Devpts,
     Cgroup,
+    Nsfs,
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -53,6 +54,7 @@ pub(super) struct Mount {
     pub root: Rc<RefCell<Node>>,
     pub root_key: Vec<u8>,
     pub kind: Kind,
+    pub namespace: Option<linux_namespace::NamespaceHandle>,
     pub pid_namespace: Option<PidNamespace>,
     pub devpts: Option<Rc<pty::Devpts>>,
     pub flags: Cell<u64>,
@@ -221,6 +223,7 @@ impl Vfs {
             root,
             root_key: b"/".to_vec(),
             kind: Kind::Root,
+            namespace: None,
             pid_namespace: None,
             devpts: None,
             flags: Cell::new(MS_RELATIME),
@@ -242,6 +245,7 @@ impl Vfs {
                 root: node.clone(),
                 root_key: path.to_vec(),
                 kind,
+                namespace: None,
                 pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
                 devpts: None,
                 flags: Cell::new(flags),
@@ -262,6 +266,7 @@ impl Vfs {
             root: cgroup_root,
             root_key: b"/".to_vec(),
             kind: Kind::Cgroup,
+            namespace: None,
             pid_namespace: None,
             devpts: None,
             flags: Cell::new(14),
@@ -426,6 +431,7 @@ impl Vfs {
                     root: m.root.clone(),
                     root_key: m.root_key.clone(),
                     kind: m.kind,
+                    namespace: m.namespace.clone(),
                     pid_namespace: m.pid_namespace.clone(),
                     devpts: m.devpts.clone(),
                     flags: Cell::new(m.flags.get()),
@@ -469,7 +475,7 @@ impl Vfs {
             return false;
         }
         match path.mount().map(|m| m.kind) {
-            Some(Kind::Tmpfs | Kind::Cgroup) => false,
+            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs) => false,
             Some(Kind::Root) => {
                 let p = path.key();
                 !p.starts_with(b"/proc/")
@@ -536,6 +542,7 @@ impl Vfs {
         const REC: u64 = 16384;
         const REMOUNT: u64 = 32;
         const PRIVATE: u64 = 1 << 18;
+        const SLAVE: u64 = 1 << 19;
         const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
@@ -556,12 +563,18 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        if flags & PRIVATE != 0 {
-            if flags & !(PRIVATE | REC) != 0 {
+        if flags & (PRIVATE | SLAVE) != 0 {
+            let propagation = flags & !REC;
+            if !matches!(propagation, PRIVATE | SLAVE) {
                 return Err(Errno(22));
             }
-            // All current mounts are private; shared/slave propagation is not
-            // accepted until actual cross-namespace propagation exists.
+            if !self.is_mount_root(&target) {
+                return Err(Errno(22));
+            }
+            // Linux leaves a private mount private when requested to become
+            // slave: it has no shared peer/master to follow. Every mount in
+            // this runtime is private. MS_SHARED still requires actual event
+            // propagation and remains unsupported.
             return Ok(());
         }
         if flags & REMOUNT != 0 {
@@ -592,7 +605,52 @@ impl Vfs {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         let mut additions = Vec::new();
         let mut devpts = None;
-        let (fs, root, root_key, mount_kind, attrs) = if flags & BIND != 0 {
+        let mut namespace = None;
+        if flags & BIND != 0 {
+            if let Some(open) = self.proc_fd_description(AT_FDCWD, source.ok_or(Errno(22))?)? {
+                namespace = open.borrow().namespace.clone();
+            }
+        }
+        // Binding a mount namespace into a mount table requires namespace
+        // cycle collection. Keep that unsupported rather than leak Rc cycles.
+        if matches!(namespace, Some(linux_namespace::NamespaceHandle::Mount(_))) {
+            return Err(Errno(95));
+        }
+        let (fs, root, root_key, mount_kind, attrs) = if let Some(handle) = &namespace {
+            if matches!(target_node.borrow().content, Content::Directory) {
+                return Err(Errno(20));
+            }
+            let root = Rc::new(RefCell::new(Node {
+                device: 17,
+                inode: handle.id(),
+                content: Content::Null,
+                mode: 0o100444,
+                uid: 0,
+                gid: 0,
+                volatile: true,
+                links: 1,
+                times: [storage::Timestamp::default(); 3],
+                xattrs: BTreeMap::new(),
+                seals: None,
+            }));
+            let fs = Rc::new(RefCell::new(Filesystem {
+                paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
+                inodes: vec![Rc::downgrade(&root)],
+                next_inode: handle.id() + 1,
+                flock: BTreeMap::new(),
+                record_locks: BTreeMap::new(),
+                limits: StorageLimits::memory(),
+                disk: None,
+                volume: None,
+            }));
+            (
+                fs,
+                root,
+                b"/".to_vec(),
+                Kind::Nsfs,
+                MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            )
+        } else if flags & BIND != 0 {
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let node = self.node(&source)?;
             if matches!(node.borrow().content, Content::Directory)
@@ -643,6 +701,7 @@ impl Vfs {
                         inode,
                         links: 1,
                         times: [storage::Timestamp::now(); 3],
+                        xattrs: BTreeMap::new(),
                         seals: None,
                     }));
                     let fs = Rc::new(RefCell::new(Filesystem {
@@ -699,7 +758,9 @@ impl Vfs {
         if ns.0.borrow().mounts.len() + additions.len() + 1 > MAX_MOUNTS {
             return Err(Errno(28));
         }
-        let proc_ns = if flags & 4096 != 0 {
+        let proc_ns = if namespace.is_some() {
+            None
+        } else if flags & 4096 != 0 {
             self.mount_location(source.ok_or(Errno(22))?, true)?
                 .mount
                 .and_then(|m| m.pid_namespace.clone())
@@ -712,6 +773,7 @@ impl Vfs {
             root,
             root_key,
             kind: mount_kind,
+            namespace,
             pid_namespace: proc_ns,
             devpts,
             flags: Cell::new(attrs),
@@ -930,6 +992,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         root: m.root.clone(),
         root_key: m.root_key.clone(),
         kind: m.kind,
+        namespace: m.namespace.clone(),
         pid_namespace: m.pid_namespace.clone(),
         devpts: m.devpts.clone(),
         flags: Cell::new(m.flags.get()),
@@ -1006,6 +1069,7 @@ impl Mount {
             Kind::Sysfs => "sysfs",
             Kind::Devpts => "devpts",
             Kind::Cgroup => "cgroup2",
+            Kind::Nsfs => "nsfs",
         }
     }
     fn options(&self) -> String {
@@ -1118,6 +1182,7 @@ impl Vfs {
             Kind::Sysfs => 0x62656572,
             Kind::Devpts => 0x1cd1,
             Kind::Cgroup => 0x63677270,
+            Kind::Nsfs => 0x6e736673,
         };
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
         if matches!(m.kind, Kind::Root | Kind::Tmpfs) {

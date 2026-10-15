@@ -46,6 +46,7 @@ impl Vfs {
             inode,
             links: 0,
             times: [storage::Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
             seals: Some(if flags & 2 != 0 { 0 } else { 1 }),
         }));
         fs.inodes.push(Rc::downgrade(&node));

@@ -38,6 +38,9 @@ impl Vfs {
         self.network.finish();
     }
     pub fn socket(&mut self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
+        if family == 1 {
+            return self.local_create(kind, protocol);
+        }
         if matches!(family, 2 | 10)
             && kind & 0xf == 3
             && !self.credentials.has_cap(capabilities::NET_RAW)

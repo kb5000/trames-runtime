@@ -4,8 +4,18 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
 const MAX_NAMESPACES: usize = 128;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(0xf000_0000);
+
+/// The single network owned by one guest kernel. New network namespaces are
+/// deliberately unavailable until sockets and routing can be isolated too.
+pub(super) struct RootNetwork(u64);
+impl Default for RootNetwork {
+    fn default() -> Self {
+        Self(NEXT_INODE.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 struct Uts {
     inode: u64,
@@ -59,6 +69,7 @@ pub(super) enum NamespaceHandle {
     Uts(UtsNamespace),
     Mount(MountNamespace),
     Pid(PidNamespace),
+    Net(Rc<RootNetwork>),
 }
 impl NamespaceHandle {
     pub fn id(&self) -> u64 {
@@ -66,6 +77,7 @@ impl NamespaceHandle {
             Self::Uts(n) => n.id(),
             Self::Mount(n) => n.id(),
             Self::Pid(n) => n.id(),
+            Self::Net(n) => n.0,
         }
     }
     pub fn kind(&self) -> u64 {
@@ -73,6 +85,7 @@ impl NamespaceHandle {
             Self::Uts(_) => CLONE_NEWUTS,
             Self::Mount(_) => CLONE_NEWNS,
             Self::Pid(_) => CLONE_NEWPID,
+            Self::Net(_) => CLONE_NEWNET,
         }
     }
     pub fn label(&self) -> Vec<u8> {
@@ -80,6 +93,7 @@ impl NamespaceHandle {
             Self::Uts(n) => n.label(),
             Self::Mount(n) => format!("mnt:[{}]", n.id()).into_bytes(),
             Self::Pid(n) => n.label(),
+            Self::Net(n) => format!("net:[{}]", n.0).into_bytes(),
         }
     }
 }
@@ -87,6 +101,7 @@ impl NamespaceHandle {
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
     uts: Weak<Uts>,
+    net: Weak<RootNetwork>,
     pub(super) pid: Weak<pid_namespace::PidSpace>,
     pub(super) pid_children: Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
@@ -97,6 +112,7 @@ impl Vfs {
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
         NamespaceSnapshot {
             uts: Rc::downgrade(&self.uts.0),
+            net: Rc::downgrade(&self.root_network),
             pid: Rc::downgrade(&self.pid_ns.0),
             pid_children: Rc::downgrade(&self.pid_children.0),
             mount: self
@@ -146,6 +162,11 @@ impl Vfs {
             return Err(Errno(1));
         }
         match ns {
+            NamespaceHandle::Net(ns) => {
+                if !Rc::ptr_eq(&ns, &self.root_network) {
+                    return Err(Errno(95));
+                }
+            }
             NamespaceHandle::Uts(ns) => self.uts = ns,
             NamespaceHandle::Pid(ns) => {
                 if !self.pid_ns.contains(&ns) {
@@ -177,15 +198,18 @@ impl Vfs {
         &self,
         path: &ResolvedPath,
     ) -> Result<Option<NamespaceHandle>> {
+        if let Some(ns) = path.mount.as_ref().and_then(|m| m.namespace.clone()) {
+            return Ok(Some(ns));
+        }
         let Some(rest) = path.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
         let (group, pid, kind) = match parts.as_slice() {
-            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children")] => {
+            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net")] => {
                 (None, *pid, *kind)
             }
-            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children")] => {
+            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net")] => {
                 (Some(*group), *pid, *kind)
             }
             _ => return Ok(None),
@@ -209,6 +233,7 @@ impl Vfs {
             return Err(Errno(13));
         }
         Ok(Some(match kind {
+            b"net" => NamespaceHandle::Net(process.namespaces.net.upgrade().ok_or(Errno(2))?),
             b"uts" => NamespaceHandle::Uts(UtsNamespace(
                 process.namespaces.uts.upgrade().ok_or(Errno(2))?,
             )),
@@ -269,6 +294,10 @@ impl Vfs {
 
 pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Option<Vec<u8>> {
     match kind {
+        b"net" => snapshot
+            .net
+            .upgrade()
+            .map(|ns| NamespaceHandle::Net(ns).label()),
         b"uts" => snapshot.uts.upgrade().map(|ns| UtsNamespace(ns).label()),
         b"pid" => snapshot.pid.upgrade().map(|ns| PidNamespace(ns).label()),
         b"pid_for_children" => snapshot
@@ -302,6 +331,33 @@ mod tests {
                 ..RuntimeInfo::default()
             },
         );
+    }
+    #[test]
+    fn root_network_handle_binds_pins_and_reenters_without_creating_isolation() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let fd = v.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
+        let before = v.stat_fd(fd).unwrap();
+        assert_eq!(v.namespace_type(fd), Ok(Some(CLONE_NEWNET)));
+        v.import_file(b"/network", vec![]).unwrap();
+        v.mount(Some(b"/proc/self/ns/net"), b"/network", None, 4096, None)
+            .unwrap();
+        let bound = v.open_at(AT_FDCWD, b"/network", 0, 0).unwrap();
+        assert_eq!(v.stat_fd(bound).unwrap(), before);
+        assert_eq!(v.stat_at(AT_FDCWD, b"/network").unwrap(), before);
+        assert_eq!(
+            u64::from_le_bytes(v.statfs_at(b"/network").unwrap()[..8].try_into().unwrap()),
+            0x6e736673
+        );
+        assert_eq!(v.read(bound, 1), Err(Errno(22)));
+        assert_eq!(v.setns(bound, CLONE_NEWUTS), Err(Errno(22)));
+        v.unshare_mounts().unwrap();
+        v.umount(b"/network", 2).unwrap();
+        v.close(fd).unwrap();
+        v.setns(bound, CLONE_NEWNET).unwrap();
+        assert_eq!(v.namespace_type(bound), Ok(Some(CLONE_NEWNET)));
+        v.credentials = Credentials::user(1000, 1000);
+        assert_eq!(v.setns(bound, CLONE_NEWNET), Err(Errno(1)));
     }
     #[test]
     fn namespace_fd_pins_identity_across_unshare_and_setns() {

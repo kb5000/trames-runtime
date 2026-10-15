@@ -98,6 +98,7 @@ impl Cgroups {
             inode,
             links: 1,
             times: [storage::Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
             seals: None,
         }));
         fs.inodes.push(Rc::downgrade(&node));

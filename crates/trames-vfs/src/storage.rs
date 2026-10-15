@@ -15,7 +15,9 @@ pub const DEFAULT_DISK_NODES: usize = 131_072;
 pub const MAX_DISK_NODES: usize = 262_144;
 pub const MAX_TRANSFER: usize = 1024 * 1024;
 const MAX_MANIFEST: u64 = 128 * 1024 * 1024;
-const MAX_EXECUTABLE: u64 = 64 * 1024 * 1024;
+// Large Go executables (including the unmodified Docker daemon) exceed 64 MiB.
+// This is an input-buffer bound; mapped guest memory retains its own quota.
+const MAX_EXECUTABLE: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageLimits {
@@ -435,7 +437,7 @@ impl Filesystem {
             nodes.insert(n.borrow().inode, n.clone());
         }
         let mut out = b"TRAMESFS".to_vec();
-        out.extend(3u32.to_le_bytes());
+        out.extend(4u32.to_le_bytes());
         out.extend(self.limits.file_bytes.to_le_bytes());
         out.extend((self.limits.nodes as u32).to_le_bytes());
         out.extend(self.next_inode.to_le_bytes());
@@ -455,6 +457,7 @@ impl Filesystem {
                     Content::Terminal => 3,
                     Content::Symlink(_) => 4,
                     Content::Fifo(_) => 5,
+                    Content::Socket(_) => 8,
                     Content::Device(_) => {
                         if n.mode & 0o170000 == 0o60000 {
                             7
@@ -482,6 +485,25 @@ impl Filesystem {
                 out.extend((device.rdev() as u32).to_le_bytes());
             } else {
                 out.extend(0u32.to_le_bytes());
+            }
+        }
+        // Version 4 adds an inode-keyed attribute table after the v3 nodes.
+        let mut attrs = BTreeMap::new();
+        for n in self.paths.values() {
+            let n = n.borrow();
+            if !n.xattrs.is_empty() {
+                attrs.insert(n.inode, n.xattrs.clone());
+            }
+        }
+        out.extend((attrs.len() as u32).to_le_bytes());
+        for (ino, entries) in attrs {
+            out.extend(ino.to_le_bytes());
+            out.extend((entries.len() as u32).to_le_bytes());
+            for (name, value) in entries {
+                out.extend((name.len() as u32).to_le_bytes());
+                out.extend((value.len() as u32).to_le_bytes());
+                out.extend(name);
+                out.extend(value);
             }
         }
         for (path, n) in &self.paths {
@@ -535,7 +557,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         return Err(Errno(22));
     }
     let version = d.u32()?;
-    if version != 3 {
+    if !matches!(version, 3 | 4) {
         return Err(Errno(22));
     }
     let limits = StorageLimits {
@@ -586,6 +608,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             3 => (Content::Terminal, 0o20000),
             4 => (Content::Symlink(target), 0o120000),
             5 => (Content::Fifo(Pipe::new(ino)), 0o10000),
+            8 => (Content::Socket(Weak::new()), 0o140000),
             6 | 7 => (
                 pseudo::Device::node(
                     u32::from_le_bytes(target.try_into().map_err(|_| Errno(22))?),
@@ -616,9 +639,54 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 inode: ino,
                 links: 0,
                 times,
+                xattrs: BTreeMap::new(),
                 seals: None,
             })),
         );
+    }
+    if version == 4 {
+        let count = d.u32()? as usize;
+        if count > nodes.len() {
+            return Err(Errno(22));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0;
+        for _ in 0..count {
+            let ino = d.u64()?;
+            if !seen.insert(ino) {
+                return Err(Errno(22));
+            }
+            let node = nodes.get(&ino).ok_or(Errno(22))?;
+            let mut n = node.borrow_mut();
+            if !matches!(n.content, Content::File(_) | Content::Directory) {
+                return Err(Errno(22));
+            }
+            let entries = d.u32()?;
+            if entries == 0 || entries > 128 {
+                return Err(Errno(22));
+            }
+            for _ in 0..entries {
+                let len = d.u32()? as usize;
+                let size = d.u32()? as usize;
+                if len > 255 || size > 65536 {
+                    return Err(Errno(22));
+                }
+                let name = d.take(len)?.to_vec();
+                let value = d.take(size)?.to_vec();
+                if !name.starts_with(b"user.")
+                    || name.len() <= 5
+                    || name.contains(&0)
+                    || n.xattrs.insert(name, value).is_some()
+                {
+                    return Err(Errno(22));
+                }
+            }
+            let size = super::xattr::xattr_size(&n.xattrs);
+            total += size;
+            if size > 65536 || total > super::xattr::XATTR_BUDGET {
+                return Err(Errno(22));
+            }
+        }
     }
     let mut paths = BTreeMap::new();
     for _ in 0..path_count {
@@ -757,6 +825,7 @@ impl Vfs {
             inode,
             links,
             times: [Timestamp::now(); 3],
+            xattrs: BTreeMap::new(),
             seals: None,
         }));
         for n in fs.paths.values_mut() {

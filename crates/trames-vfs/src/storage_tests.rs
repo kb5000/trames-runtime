@@ -6,6 +6,128 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[test]
+fn inode_attributes_persist_share_hardlinks_and_rollback_failed_commits() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/attrs", b"payload".to_vec()).unwrap();
+    v.link_at(AT_FDCWD, b"/attrs", AT_FDCWD, b"/alias").unwrap();
+    v.set_xattr(
+        AT_FDCWD,
+        Some(b"/attrs"),
+        true,
+        b"user.key",
+        Some(b"a\0b"),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/alias"), true, b"user.key")
+            .unwrap(),
+        b"a\0b"
+    );
+    let before = v.stat_at(AT_FDCWD, b"/attrs").unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v
+        .set_xattr(
+            AT_FDCWD,
+            Some(b"/attrs"),
+            true,
+            b"user.key",
+            Some(b"replacement"),
+            2
+        )
+        .is_err());
+    assert_eq!(v.stat_at(AT_FDCWD, b"/attrs").unwrap(), before);
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/alias"), true, b"user.key")
+            .unwrap(),
+        b"a\0b"
+    );
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/alias"), true, b"user.key")
+            .unwrap(),
+        b"a\0b"
+    );
+    let fd = v.open_at(AT_FDCWD, b"/attrs", 0, 0).unwrap();
+    v.unlink_at(AT_FDCWD, b"/attrs", false).unwrap();
+    v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+    assert_eq!(
+        v.get_xattr(fd as i32, None, true, b"user.key").unwrap(),
+        b"a\0b"
+    );
+    v.close(fd).unwrap();
+}
+
+#[test]
+fn inode_attributes_bound_metadata_and_reject_unimplemented_security_policy() {
+    let mut v = Vfs::default();
+    let value = vec![9; 65000];
+    for i in 0..17 {
+        let path = format!("/attrs-{i}");
+        v.import_file(path.as_bytes(), vec![]).unwrap();
+        let result = v.set_xattr(
+            AT_FDCWD,
+            Some(path.as_bytes()),
+            true,
+            b"user.key",
+            Some(&value),
+            0,
+        );
+        assert_eq!(result, if i == 16 { Err(Errno(28)) } else { Ok(()) });
+    }
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/attrs-16"), true, b"user.key"),
+        Err(Errno(61))
+    );
+    assert_eq!(
+        v.set_xattr(
+            AT_FDCWD,
+            Some(b"/attrs-0"),
+            true,
+            b"user.large",
+            Some(&vec![0; 65536]),
+            0
+        ),
+        Err(Errno(28))
+    );
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/attrs-0"), true, b"user.key")
+            .unwrap(),
+        value
+    );
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/attrs-0"), true, b"security.capability"),
+        Err(Errno(61))
+    );
+    assert_eq!(
+        v.set_xattr(
+            AT_FDCWD,
+            Some(b"/attrs-0"),
+            true,
+            b"security.capability",
+            Some(&[0; 20]),
+            0
+        ),
+        Err(Errno(95))
+    );
+    v.set_xattr(AT_FDCWD, Some(b"/attrs-0"), true, b"user.key", None, 0)
+        .unwrap();
+    v.set_xattr(
+        AT_FDCWD,
+        Some(b"/attrs-16"),
+        true,
+        b"user.key",
+        Some(&value),
+        0,
+    )
+    .unwrap();
+}
+
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -715,7 +837,7 @@ fn flock_is_shared_by_dup_fork_and_released_by_last_close() {
 
 #[test]
 fn unsupported_manifest_versions_are_rejected_without_deleting_data() {
-    for version in [1u32, 2, 4] {
+    for version in [1u32, 2, 5] {
         let dir = Temp::new();
         let mut v = dir.open();
         v.import_file(b"/data", b"retained".to_vec()).unwrap();
@@ -733,6 +855,50 @@ fn unsupported_manifest_versions_are_rejected_without_deleting_data() {
         assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), data);
         assert_eq!(fs::read_dir(dir.0.join("objects")).unwrap().count(), 1);
     }
+}
+#[test]
+fn version_three_manifest_reopens_without_attributes_and_upgrades_on_write() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"retained".to_vec()).unwrap();
+    drop(v);
+    let mut bytes = fs::read(dir.0.join("manifest")).unwrap();
+    let count = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+    let mut at = 40;
+    for _ in 0..count {
+        let size = u32::from_le_bytes(bytes[at + 72..at + 76].try_into().unwrap()) as usize;
+        at += 76 + size;
+    }
+    assert_eq!(&bytes[at..at + 4], &[0; 4]);
+    bytes.drain(at..at + 4); // v3 has no attribute table
+    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+    let end = bytes.len() - 8;
+    let hash = storage::checksum(&bytes[..end]).to_le_bytes();
+    bytes[end..].copy_from_slice(&hash);
+    fs::write(dir.0.join("manifest"), bytes).unwrap();
+    let mut v = dir.open();
+    assert!(v
+        .list_xattrs(AT_FDCWD, Some(b"/data"), true)
+        .unwrap()
+        .is_empty());
+    v.set_xattr(
+        AT_FDCWD,
+        Some(b"/data"),
+        true,
+        b"user.upgrade",
+        Some(b"yes"),
+        0,
+    )
+    .unwrap();
+    drop(v);
+    let bytes = fs::read(dir.0.join("manifest")).unwrap();
+    assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+    assert_eq!(
+        dir.open()
+            .get_xattr(AT_FDCWD, Some(b"/data"), true, b"user.upgrade")
+            .unwrap(),
+        b"yes"
+    );
 }
 #[test]
 fn explicit_reset_refuses_live_stores_and_clears_unsupported_metadata() {
@@ -777,4 +943,38 @@ fn direct_native_mapped_writes_survive_disk_sync_unmap_and_reopen() {
     let fd = v.open_at(AT_FDCWD, b"/native-disk", 0, 0).unwrap();
     v.seek(fd, 4094, 0).unwrap();
     assert_eq!(v.read(fd, 8).unwrap(), vec![91; 8]);
+}
+
+#[test]
+fn named_socket_inodes_reopen_as_stale_endpoints() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let fd = v.socket(1, 1, 0).unwrap();
+    let socket = v.local_socket(fd).unwrap().unwrap();
+    v.local_bind(&socket, b"\x01\x00/socket\0").unwrap();
+    socket.listen(1).unwrap();
+    v.link_at(AT_FDCWD, b"/socket", AT_FDCWD, b"/alias")
+        .unwrap();
+    v.sync().unwrap();
+    drop(socket);
+    drop(v);
+    let mut v = dir.open();
+    let stat = v.stat_at(AT_FDCWD, b"/alias").unwrap();
+    assert_eq!(
+        u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o170000,
+        0o140000
+    );
+    let fd = v.socket(1, 1, 0).unwrap();
+    let socket = v.local_socket(fd).unwrap().unwrap();
+    assert_eq!(
+        v.local_connect(&socket, b"\x01\x00/alias\0"),
+        Err(Errno(111))
+    );
+    assert_eq!(v.local_bind(&socket, b"\x01\x00/alias\0"), Err(Errno(98)));
+    v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+    v.local_bind(&socket, b"\x01\x00/alias\0").unwrap();
+    assert_eq!(
+        v.local_connect(&socket, b"\x01\x00/socket\0"),
+        Err(Errno(111))
+    );
 }

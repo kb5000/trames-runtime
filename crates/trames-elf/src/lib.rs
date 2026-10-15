@@ -5,7 +5,8 @@ use trames_memory::{Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
 
 const EH_SIZE: usize = 64;
 const PH_SIZE: usize = 56;
-pub const MAX_ELF_SIZE: usize = 64 * 1024 * 1024;
+/// Bounded input for large unmodified Go executables, including dockerd.
+pub const MAX_ELF_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ElfError {

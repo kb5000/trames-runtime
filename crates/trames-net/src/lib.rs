@@ -103,6 +103,12 @@ macro_rules! delegate {
     }
 }
 impl Socket {
+    pub fn poll_epoch(&self) -> Option<[u64; 2]> {
+        match &self.0 {
+            SocketBackend::Netlink(s) => Some(s.poll_epoch()),
+            _ => None,
+        }
+    }
     pub fn info(&self) -> Option<SocketInfo> {
         match &self.0 {
             SocketBackend::Virtual(s) => Some(s.info()),
@@ -176,8 +182,17 @@ impl Socket {
         flags: u32,
         destination: Option<&[u8]>,
     ) -> Result<usize> {
+        self.send_bytes_authorized(bytes, flags, destination, false)
+    }
+    pub fn send_bytes_authorized(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+    ) -> Result<usize> {
         if let SocketBackend::Netlink(s) = &self.0 {
-            s.send_bytes(bytes, flags, destination)
+            s.send_bytes_authorized(bytes, flags, destination, net_admin)
         } else {
             self.send(bytes, flags, destination.map(decode_address).transpose()?)
         }

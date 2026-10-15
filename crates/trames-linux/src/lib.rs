@@ -6,6 +6,7 @@ use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod file_calls;
 mod network;
 mod state;
+mod xattr;
 pub use state::Linux;
 
 pub fn fill_entropy(bytes: &mut [u8]) -> Result<(), trames_vfs::Errno> {
