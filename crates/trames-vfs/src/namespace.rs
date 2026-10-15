@@ -45,7 +45,7 @@ impl Vfs {
         let source = self.resolve_final(oldfd, old, false)?;
         let dest = self.resolve_final(newfd, new, false)?;
         self.check_parent_write(&dest)?;
-        self.import_alias(&source, &dest, false)
+        self.link_resolved(&source, &dest, false)
     }
     /// Rename a file or subtree with one manifest replacement. Only NOREPLACE is
     /// supported in addition to the ordinary overwrite semantics.
@@ -62,9 +62,13 @@ impl Vfs {
         }
         let source = self.resolve_final(oldfd, old, false)?;
         let dest = self.resolve_final(newfd, new, false)?;
-        if source == b"/" || dest == b"/" {
+        if self.is_mount_root(&source) || self.is_mount_root(&dest) {
             return Err(Errno(16));
         }
+        if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
+            return Err(Errno(18));
+        }
+        let filesystem = source.filesystem(self);
         let src = self.node(&source)?;
         self.check_parent_write(&source)?;
         self.check_parent_write(&dest)?;
@@ -93,8 +97,7 @@ impl Vfs {
             if target_dir {
                 let mut dest_prefix = dest.clone();
                 dest_prefix.push(b'/');
-                if self
-                    .fs
+                if filesystem
                     .borrow()
                     .paths
                     .keys()
@@ -104,10 +107,10 @@ impl Vfs {
                 }
             }
         }
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = filesystem.borrow_mut();
         let mut replacements = Vec::new();
         for (path, n) in &fs.paths {
-            if *path == source || (is_dir && path.starts_with(&prefix)) {
+            if *path == source.key || (is_dir && path.starts_with(&prefix)) {
                 let mut new_path = dest.clone();
                 new_path.extend_from_slice(&path[source.len()..]);
                 if new_path.len() >= MAX_PATH {
@@ -119,13 +122,13 @@ impl Vfs {
         let old_paths = fs.paths.clone();
         if let Some(n) = &target {
             n.borrow_mut().links -= 1;
-            fs.paths.remove(&dest);
+            fs.paths.remove(&dest.key);
         }
         for (path, _, _) in &replacements {
             fs.paths.remove(path);
         }
         for (_, path, n) in replacements {
-            fs.paths.insert(path, n);
+            fs.paths.insert(path.key, n);
         }
         let old_time = src.borrow().times[2];
         src.borrow_mut().times[2] = storage::Timestamp::now();
@@ -170,7 +173,9 @@ impl Vfs {
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
-        self.chmod_node(self.node(&self.resolve(dirfd, path)?)?, mode)
+        let path = self.resolve(dirfd, path)?;
+        path.writable()?;
+        self.chmod_node(self.node(&path)?, mode)
     }
     pub fn chmod_at_flags(
         &mut self,
@@ -179,7 +184,9 @@ impl Vfs {
         mode: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let node = self.node(&self.resolve_final(dirfd, path, !nofollow)?)?;
+        let path = self.resolve_final(dirfd, path, !nofollow)?;
+        path.writable()?;
+        let node = self.node(&path)?;
         if matches!(node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
@@ -193,6 +200,7 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
+        self.fd_writable(fd)?;
         let n = self
             .descriptor(fd)?
             .open
@@ -226,8 +234,15 @@ impl Vfs {
                 };
             }
         }
+        if path.is_none() {
+            self.fd_writable(dirfd as u32)?;
+        }
         let node = match path {
-            Some(p) => self.node(&self.resolve(dirfd, p)?)?,
+            Some(p) => {
+                let p = self.resolve(dirfd, p)?;
+                p.writable()?;
+                self.node(&p)?
+            }
             None => self
                 .descriptor(dirfd as u32)?
                 .open

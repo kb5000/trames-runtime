@@ -384,15 +384,12 @@ fn comm(p: &ProcessInfo) -> Vec<u8> {
     name.push(b'\n');
     name
 }
-fn mounts() -> &'static [u8] {
-    b"/dev/vda1 / rootfs rw,relatime 0 0\nproc /proc proc ro,nosuid,nodev,noexec 0 0\nsysfs /sys sysfs ro,nosuid,nodev,noexec 0 0\ndevpts /dev/pts devpts rw,nosuid,noexec 0 0\n"
-}
-fn mountinfo() -> &'static [u8] {
-    b"1 1 253:1 / / rw,relatime - rootfs /dev/vda1 rw\n2 1 0:2 / /proc ro,nosuid,nodev,noexec - proc proc ro\n3 1 0:3 / /sys ro,nosuid,nodev,noexec - sysfs sysfs ro\n4 1 0:4 / /dev/pts rw,nosuid,noexec - devpts devpts rw\n"
-}
 impl Vfs {
-    pub fn set_runtime_info(&mut self, pid: u32, runtime: RuntimeInfo) {
+    pub fn set_runtime_info(&mut self, pid: u32, mut runtime: RuntimeInfo) {
         self.pid = pid;
+        if let Some(p) = runtime.processes.iter_mut().find(|p| p.pid == pid) {
+            p.namespaces = self.namespace_snapshot();
+        }
         let mut pseudo = self.pseudo.borrow_mut();
         pseudo.nodes.retain(|path, _| {
             let parts: Vec<_> = path.split(|b| *b == b'/').collect();
@@ -442,7 +439,7 @@ impl Vfs {
                     || {
                         o.namespace.as_ref().map_or_else(
                             || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
-                            UtsNamespace::id,
+                            linux_namespace::NamespaceHandle::id,
                         )
                     },
                     |n| n.borrow().inode,
@@ -454,7 +451,11 @@ impl Vfs {
                         FdKind::Node(path) => o
                             .node
                             .as_ref()
-                            .and_then(|n| self.path_of(n).ok())
+                            .and_then(|n| {
+                                self.location(n, &o.mount)
+                                    .map(|p| self.path_visible(&p).unwrap_or(p.key))
+                                    .ok()
+                            })
                             .unwrap_or_else(|| {
                                 let mut p = path.clone();
                                 p.extend_from_slice(b" (deleted)");
@@ -493,15 +494,15 @@ impl Vfs {
                     position: o.position,
                     flags: o.flags | if d.cloexec { O_CLOEXEC } else { 0 },
                     inode,
-                    mount_id: node.as_ref().map_or(
-                        if o.namespace.is_some() { 17 } else { 1 },
-                        |n| {
-                            if n.borrow().device == 0xfd01 {
-                                1
-                            } else {
-                                n.borrow().device
-                            }
+                    mount_id: o.mount.as_ref().map_or(
+                        if o.namespace.is_some() {
+                            17
+                        } else if matches!(o.kind, FdKind::Terminal) {
+                            4
+                        } else {
+                            1
                         },
+                        |m| m.id,
                     ),
                     socket: o.socket.as_ref().and_then(|s| s.info()),
                     open: Rc::downgrade(&d.open),
@@ -533,6 +534,9 @@ impl Vfs {
             return Ok(None);
         }
         let link_path = self.resolve_final(dirfd, path, false)?;
+        if !self.uses_pseudo(&link_path) {
+            return Ok(None);
+        }
         let mut actual = link_path;
         if matches!(
             actual.as_slice(),
@@ -545,7 +549,11 @@ impl Vfs {
             } else {
                 2
             };
-            actual = format!("/proc/{}/fd/{fd}", self.pid).into_bytes();
+            actual = self.resolve_final(
+                AT_FDCWD,
+                format!("/proc/{}/fd/{fd}", self.pid).as_bytes(),
+                false,
+            )?;
         }
         if let Some(ns) = self.namespace_for_path(&actual)? {
             return Ok(Some(self.namespace_description(ns)));
@@ -562,7 +570,7 @@ impl Vfs {
                 return Ok(Some(self.namespace_description(ns)));
             }
         }
-        let Some((node, label)) = self.proc_exe_node_normalized(&actual)? else {
+        let Some((node, label, mount)) = self.proc_exe_node_normalized(&actual)? else {
             return Ok(None);
         };
         let owner = (node.borrow().uid, node.borrow().gid);
@@ -581,6 +589,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: None,
+            mount,
         }))))
     }
     fn proc_fd_description_normalized(
@@ -648,7 +657,7 @@ impl Vfs {
                 FdKind::Node(label) => label.clone(),
                 _ => path.to_vec(),
             };
-            return Ok(Some((node, label)));
+            return Ok(Some((node, label, o.mount.clone())));
         }
         self.proc_exe_node_normalized(path)
     }
@@ -680,7 +689,11 @@ impl Vfs {
         let Some(file) = process.executable_file.as_ref().and_then(Weak::upgrade) else {
             return Ok(None);
         };
-        Ok(Some((file.node.clone(), file.label.clone())))
+        Ok(Some((
+            file.node.clone(),
+            file.label.clone(),
+            file.mount.clone(),
+        )))
     }
     pub(super) fn open_proc_fd(
         &mut self,
@@ -722,6 +735,11 @@ impl Vfs {
         {
             return Err(Errno(13));
         }
+        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
+            if let Some(m) = &original.mount {
+                m.writable()?;
+            }
+        }
         let descriptor = OpenDescription {
             id: self.open_id(),
             owner: original.owner,
@@ -737,6 +755,7 @@ impl Vfs {
             local: None,
             pty: original.pty.clone(),
             namespace: original.namespace.clone(),
+            mount: original.mount.clone(),
         };
         drop(original);
         let fd = self.available(0)?;
@@ -763,41 +782,14 @@ impl Vfs {
         }
         Ok(Some(fd))
     }
-    fn statfs_for_path(&self, path: &[u8]) -> [u8; 120] {
-        let (magic, id, flags) = if path == b"/proc" || path.starts_with(b"/proc/") {
-            (0x9fa0u64, 2u64, 15u64)
-        } else if path == b"/sys" || path.starts_with(b"/sys/") {
-            (0x62656572, 3, 15)
-        } else if path == b"/dev/pts" || path.starts_with(b"/dev/pts/") {
-            (0x1cd1, 4, 10)
-        } else {
-            return self.storage_stat();
-        };
-        let mut out = [0; 120];
-        for (offset, value) in [
-            (0, magic),
-            (8, 4096),
-            (56, id),
-            (64, 255),
-            (72, 4096),
-            (80, flags),
-        ] {
-            out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        out
-    }
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
         let path = self.resolve(AT_FDCWD, path)?;
         self.node(&path)?;
-        Ok(self.statfs_for_path(&path))
+        Ok(self.mount_statfs(path.mount.as_ref()))
     }
     pub fn statfs_fd(&self, fd: u32) -> Result<[u8; 120]> {
         let o = self.descriptor(fd)?.open.borrow();
-        let mut out = if let FdKind::Node(path) = &o.kind {
-            self.statfs_for_path(path)
-        } else {
-            self.storage_stat()
-        };
+        let mut out = self.mount_statfs(o.mount.as_ref());
         if o.namespace.is_some()
             || o.socket.is_some()
             || o.local.is_some()
@@ -1032,8 +1024,10 @@ impl Vfs {
                     return Ok(directory());
                 }
                 let key = parts[i];
-                if parts.len() == i + 2 && key == b"ns" && parts[i + 1] == b"uts" {
-                    return Ok(linux_namespace::snapshot_label(&p.namespaces).and_then(link));
+                if parts.len() == i + 2 && key == b"ns" && matches!(parts[i + 1], b"uts" | b"mnt") {
+                    return Ok(
+                        linux_namespace::snapshot_label(&p.namespaces, parts[i + 1]).and_then(link)
+                    );
                 }
                 if parts.len() == i + 1 {
                     let value = match key {
@@ -1047,8 +1041,8 @@ impl Vfs {
                         b"environ" => nul_list(&p.environment),
                         b"auxv" => p.auxiliary.clone(),
                         b"maps" => p.maps.clone(),
-                        b"mounts" => mounts().to_vec(),
-                        b"mountinfo" => mountinfo().to_vec(),
+                        b"mounts" => mounts::table_text(&p.namespaces, false),
+                        b"mountinfo" => mounts::table_text(&p.namespaces, true),
                         b"statm" => format!(
                             "{} {} 0 0 0 0 0\n",
                             p.virtual_bytes / 4096,
@@ -1575,9 +1569,12 @@ impl Vfs {
                 }
                 if parts.len() == depth + 1 {
                     if parts[depth] == b"ns"
-                        && linux_namespace::snapshot_label(&p.namespaces).is_some()
+                        && linux_namespace::snapshot_label(&p.namespaces, b"uts").is_some()
                     {
                         names.push(b"uts".to_vec());
+                        if p.namespaces.mount.strong_count() != 0 {
+                            names.push(b"mnt".to_vec());
+                        }
                     }
                     if matches!(parts[depth], b"fd" | b"fdinfo") {
                         names.extend(p.fds.iter().map(|f| f.fd.to_string().into_bytes()));

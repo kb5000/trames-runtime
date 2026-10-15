@@ -786,6 +786,7 @@ impl Vfs {
             fs.limits = StorageLimits::disk();
         }
         v.cwd_node = Some(v.node(b"/")?);
+        v.initialize_mounts()?;
         if let Some(limits) = options.limits {
             v.set_storage_limits(limits)?;
         }
@@ -831,8 +832,18 @@ impl Vfs {
         Ok(())
     }
     pub fn capacity(&self) -> StorageCapacity {
-        let used = self.allocated_bytes();
-        let fs = self.fs.borrow();
+        Self::filesystem_capacity(&self.fs.borrow())
+    }
+    pub(super) fn filesystem_capacity(fs: &Filesystem) -> StorageCapacity {
+        let used = fs
+            .inodes
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|n| match &n.borrow().content {
+                Content::File(b) if n.borrow().seals.is_none() => b.len(),
+                _ => 0,
+            })
+            .sum::<u64>();
         let mut budget = fs.limits.file_bytes;
         let mut available = budget.saturating_sub(used);
         if let Some((volume, at_used)) = fs.volume {
@@ -872,7 +883,9 @@ impl Vfs {
         Ok(())
     }
     pub(super) fn empty_data(&self) -> Result<FileData> {
-        let mut fs = self.fs.borrow_mut();
+        Self::filesystem_empty_data(&mut self.fs.borrow_mut())
+    }
+    pub(super) fn filesystem_empty_data(fs: &mut Filesystem) -> Result<FileData> {
         if let Some(d) = &fs.disk {
             let next = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
             let data = d.create(fs.next_inode)?;

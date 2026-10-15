@@ -230,6 +230,7 @@ impl Vfs {
                         local: Some(local),
                         pty: None,
                         namespace: None,
+                        mount: None,
                     })),
                     cloexec: kind & O_CLOEXEC != 0,
                 },

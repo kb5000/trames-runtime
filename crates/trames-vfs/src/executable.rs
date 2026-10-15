@@ -5,6 +5,7 @@ use super::*;
 pub struct ExecutableFile {
     pub(super) node: Rc<RefCell<Node>>,
     pub(super) label: Vec<u8>,
+    pub(super) mount: Option<Rc<Mount>>,
 }
 
 impl Vfs {
@@ -20,7 +21,7 @@ impl Vfs {
         if flags & !0x1100 != 0 {
             return Err(Errno(22));
         }
-        let (node, label) = if path.is_empty() {
+        let (node, label, mount) = if path.is_empty() {
             if flags & 0x1000 == 0 {
                 return Err(Errno(2));
             }
@@ -33,30 +34,43 @@ impl Vfs {
                 FdKind::Node(path) => path.clone(),
                 _ => Vec::new(),
             };
-            (node, label)
+            (node, label, open.mount.clone())
         } else {
             let (resolved, magic) = self.resolve_entry(dirfd, path, flags & 0x100 == 0, true)?;
             match magic {
                 Some(file) => file,
-                None => (self.node(&resolved)?, resolved),
+                None => (
+                    self.node(&resolved)?,
+                    self.path_visible(&resolved)
+                        .unwrap_or_else(|_| resolved.key.clone()),
+                    resolved.mount,
+                ),
             }
         };
         let n = node.borrow();
         if matches!(n.content, Content::Symlink(_)) {
             return Err(Errno(40));
         }
+        if mount
+            .as_ref()
+            .is_some_and(|m| m.flags.get() & mounts::MS_NOEXEC != 0)
+        {
+            return Err(Errno(13));
+        }
         if !matches!(n.content, Content::File(_)) || !self.allowed(&n, 1) {
             return Err(Errno(13));
         }
         drop(n);
-        Ok(Rc::new(ExecutableFile { node, label }))
+        Ok(Rc::new(ExecutableFile { node, label, mount }))
     }
     pub fn executable_display(&self, file: &ExecutableFile) -> Vec<u8> {
-        self.path_of(&file.node).unwrap_or_else(|_| {
-            let mut label = file.label.clone();
-            label.extend_from_slice(b" (deleted)");
-            label
-        })
+        self.location(&file.node, &file.mount)
+            .map(|p| self.path_visible(&p).unwrap_or(p.key))
+            .unwrap_or_else(|_| {
+                let mut label = file.label.clone();
+                label.extend_from_slice(b" (deleted)");
+                label
+            })
     }
 }
 

@@ -57,6 +57,10 @@ pub trait PageBacking {
     }
     fn version(&self) -> u64;
     fn writable(&self) -> bool;
+    /// Maximum mapping permission, sampled by mmap/mprotect, never CPU loads.
+    fn executable(&self) -> bool {
+        true
+    }
     fn next_page(&self, pages: u64) -> Result<Rc<dyn PageBacking>, MemoryError>;
 }
 #[derive(Clone)]

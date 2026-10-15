@@ -566,6 +566,12 @@ impl Memory {
         }
         for (&base, &frame) in self.pages.range(address..end) {
             let p = self.frames[frame].as_ref().expect("page");
+            if permissions.execute && p.backing.as_ref().is_some_and(|b| !b.object.executable()) {
+                return Err(MemoryError::Permission {
+                    address: base,
+                    access: Access::Execute,
+                });
+            }
             if permissions.write
                 && p.backing
                     .as_ref()

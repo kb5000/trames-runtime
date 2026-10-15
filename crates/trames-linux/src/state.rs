@@ -346,7 +346,16 @@ impl Linux {
             out[offset..offset + 4].copy_from_slice(&(major as u32).to_le_bytes());
             out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
         }
-        let mount = if dev == 0xfd01 { 1 } else { dev };
+        let mount = if path.is_empty() && flags & 0x1000 != 0 {
+            if a[0] as i32 == -100 {
+                self.vfs.mount_id_at(-100, b".", false)?
+            } else {
+                self.vfs.mount_id_fd(a[0] as u32)?
+            }
+        } else {
+            self.vfs
+                .mount_id_at(a[0] as i32, &path, flags & 0x100 != 0)?
+        };
         out[144..152].copy_from_slice(&mount.to_le_bytes());
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
         Ok(0)
@@ -435,6 +444,9 @@ impl Linux {
             a[5].checked_add(len)
                 .filter(|n| *n <= i64::MAX as u64)
                 .ok_or(Errno(75))?;
+            if permissions.execute && !self.vfs.mapping_executable(a[4] as u32)? {
+                return Err(Errno(1));
+            }
             let objects =
                 self.vfs
                     .mapping_pages(a[4] as u32, a[5], len, shared, permissions.write)?;

@@ -77,11 +77,15 @@ impl Vfs {
     }
     pub fn apply_exec_file_credentials(&mut self, file: &ExecutableFile) -> Result<()> {
         let n = file.node.borrow();
-        if n.mode & 0o4000 != 0 {
+        let nosuid = file
+            .mount
+            .as_ref()
+            .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0);
+        if !nosuid && n.mode & 0o4000 != 0 {
             self.credentials.euid = n.uid;
             self.credentials.fsuid = n.uid;
         }
-        if n.mode & 0o2000 != 0 {
+        if !nosuid && n.mode & 0o2000 != 0 {
             self.credentials.egid = n.gid;
             self.credentials.fsgid = n.gid;
         }
@@ -105,20 +109,22 @@ impl Vfs {
             view.credentials.fsuid = self.credentials.uid;
             view.credentials.fsgid = self.credentials.gid;
         }
-        let node = view.node(&view.resolve_final(dirfd, path, !nofollow)?)?;
+        let path = view.resolve_final(dirfd, path, !nofollow)?;
+        if mode & 2 != 0 {
+            path.writable()?;
+        }
+        let node = view.node(&path)?;
         if view.allowed(&node.borrow(), mode) {
             Ok(())
         } else {
             Err(Errno(13))
         }
     }
-    pub(super) fn check_remove(&self, path: &[u8]) -> Result<()> {
-        let end = path
-            .iter()
-            .rposition(|b| *b == b'/')
-            .ok_or(Errno(22))?
-            .max(1);
-        let parent = self.node(&path[..end])?;
+    pub(super) fn check_remove(&self, path: &ResolvedPath) -> Result<()> {
+        if self.is_mount_root(path) {
+            return Err(Errno(16));
+        }
+        let parent = self.node(&path.parent())?;
         let p = parent.borrow();
         let uid = self.credentials.fsuid;
         if p.mode & 0o1000 != 0 && uid != 0 && uid != p.uid && uid != self.node(path)?.borrow().uid
@@ -181,7 +187,9 @@ impl Vfs {
         gid: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let node = self.node(&self.resolve_final(dirfd, path, !nofollow)?)?;
+        let path = self.resolve_final(dirfd, path, !nofollow)?;
+        path.writable()?;
+        let node = self.node(&path)?;
         self.chown_node(node, uid, gid)
     }
     pub fn chown_fd(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
@@ -192,6 +200,7 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
+        self.fd_writable(fd)?;
         let node = self
             .descriptor(fd)?
             .open

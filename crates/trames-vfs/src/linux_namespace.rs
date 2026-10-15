@@ -54,15 +54,53 @@ impl UtsNamespace {
     }
 }
 
+#[derive(Clone)]
+pub(super) enum NamespaceHandle {
+    Uts(UtsNamespace),
+    Mount(MountNamespace),
+}
+impl NamespaceHandle {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Uts(n) => n.id(),
+            Self::Mount(n) => n.id(),
+        }
+    }
+    pub fn kind(&self) -> u64 {
+        match self {
+            Self::Uts(_) => CLONE_NEWUTS,
+            Self::Mount(_) => CLONE_NEWNS,
+        }
+    }
+    pub fn label(&self) -> Vec<u8> {
+        match self {
+            Self::Uts(n) => n.label(),
+            Self::Mount(n) => format!("mnt:[{}]", n.id()).into_bytes(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
     uts: Weak<Uts>,
+    pub(super) mount: Weak<RefCell<mounts::Table>>,
+    pub(super) root: Option<(Weak<Mount>, Weak<RefCell<Node>>)>,
 }
 
 impl Vfs {
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
         NamespaceSnapshot {
             uts: Rc::downgrade(&self.uts.0),
+            mount: self
+                .mounts
+                .as_ref()
+                .map_or_else(Weak::new, |n| Rc::downgrade(&n.0)),
+            root: self.root_mount.as_ref().map(|m| {
+                (
+                    Rc::downgrade(m),
+                    Rc::downgrade(self.root_node.as_ref().unwrap_or(&m.root)),
+                )
+            }),
         }
     }
     pub fn unshare_uts(&mut self) -> Result<()> {
@@ -93,13 +131,23 @@ impl Vfs {
             .namespace
             .clone()
             .ok_or(Errno(22))?;
-        if kind != 0 && kind != CLONE_NEWUTS {
+        if kind != 0 && kind != ns.kind() {
             return Err(Errno(22));
         }
         if self.credentials.euid != 0 {
             return Err(Errno(1));
         }
-        self.uts = ns;
+        match ns {
+            NamespaceHandle::Uts(ns) => self.uts = ns,
+            NamespaceHandle::Mount(ns) => {
+                let root = ns.0.borrow().root.clone();
+                self.mounts = Some(ns);
+                self.root_node = Some(root.root.clone());
+                self.cwd_node = Some(root.root.clone());
+                self.root_mount = Some(root.clone());
+                self.cwd_mount = Some(root);
+            }
+        }
         Ok(())
     }
     pub fn namespace_type(&self, fd: u32) -> Result<Option<u64>> {
@@ -109,16 +157,16 @@ impl Vfs {
             .borrow()
             .namespace
             .as_ref()
-            .map(|_| CLONE_NEWUTS))
+            .map(NamespaceHandle::kind))
     }
-    pub(super) fn namespace_for_path(&self, path: &[u8]) -> Result<Option<UtsNamespace>> {
+    pub(super) fn namespace_for_path(&self, path: &[u8]) -> Result<Option<NamespaceHandle>> {
         let Some(rest) = path.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-        let (group, pid) = match parts.as_slice() {
-            [pid, b"ns", b"uts"] => (None, *pid),
-            [group, b"task", pid, b"ns", b"uts"] => (Some(*group), *pid),
+        let (group, pid, kind) = match parts.as_slice() {
+            [pid, b"ns", kind @ (b"uts" | b"mnt")] => (None, *pid, *kind),
+            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt")] => (Some(*group), *pid, *kind),
             _ => return Ok(None),
         };
         let parse = |p: &[u8]| {
@@ -139,11 +187,19 @@ impl Vfs {
         if self.credentials.fsuid != 0 && self.credentials.fsuid != process.credentials.euid {
             return Err(Errno(13));
         }
-        Ok(Some(UtsNamespace(
-            process.namespaces.uts.upgrade().ok_or(Errno(2))?,
-        )))
+        Ok(Some(match kind {
+            b"uts" => NamespaceHandle::Uts(UtsNamespace(
+                process.namespaces.uts.upgrade().ok_or(Errno(2))?,
+            )),
+            _ => NamespaceHandle::Mount(MountNamespace(
+                process.namespaces.mount.upgrade().ok_or(Errno(2))?,
+            )),
+        }))
     }
-    pub(super) fn namespace_description(&self, ns: UtsNamespace) -> Rc<RefCell<OpenDescription>> {
+    pub(super) fn namespace_description(
+        &self,
+        ns: NamespaceHandle,
+    ) -> Rc<RefCell<OpenDescription>> {
         Rc::new(RefCell::new(OpenDescription {
             id: ns.id(),
             owner: (0, 0),
@@ -159,6 +215,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: Some(ns),
+            mount: None,
         }))
     }
     /// Linux chroot changes only fs.root. Existing cwd/dirfds remain capabilities.
@@ -174,31 +231,21 @@ impl Vfs {
         if !self.allowed(&node.borrow(), 1) {
             return Err(Errno(13));
         }
+        self.root_mount = path.mount;
         self.root_node = Some(node);
         Ok(())
     }
-    pub(super) fn root_path(&self) -> Result<Vec<u8>> {
-        self.root_node
-            .as_ref()
-            .map_or_else(|| Ok(b"/".to_vec()), |n| self.path_of(n))
-    }
-    pub(super) fn visible_path(&self, path: &[u8]) -> Result<Vec<u8>> {
-        let root = self.root_path()?;
-        if root == b"/" {
-            return Ok(path.to_vec());
-        }
-        if path == root {
-            return Ok(b"/".to_vec());
-        }
-        match path.strip_prefix(root.as_slice()) {
-            Some(tail) if tail.first() == Some(&b'/') => Ok(tail.to_vec()),
-            _ => Err(Errno(2)),
-        }
-    }
 }
 
-pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot) -> Option<Vec<u8>> {
-    snapshot.uts.upgrade().map(|ns| UtsNamespace(ns).label())
+pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Option<Vec<u8>> {
+    match kind {
+        b"uts" => snapshot.uts.upgrade().map(|ns| UtsNamespace(ns).label()),
+        b"mnt" => snapshot
+            .mount
+            .upgrade()
+            .map(|ns| NamespaceHandle::Mount(MountNamespace(ns)).label()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

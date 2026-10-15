@@ -9,6 +9,9 @@ mod kernel_log;
 mod locks;
 mod mapped;
 mod memfd;
+mod mounts;
+use mounts::{Mount, PathArg};
+pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
 pub use ipc::{LocalReceived, LocalSocket};
 pub use locks::RecordLock;
@@ -149,7 +152,8 @@ struct OpenDescription {
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
-    namespace: Option<UtsNamespace>,
+    namespace: Option<linux_namespace::NamespaceHandle>,
+    mount: Option<Rc<Mount>>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -177,8 +181,8 @@ struct Node {
     times: [storage::Timestamp; 3],
     seals: Option<u32>,
 }
-type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>);
-type ResolvedEntry = (Vec<u8>, Option<ResolvedInode>);
+type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
+type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
 type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
@@ -198,6 +202,11 @@ pub struct Vfs {
     cwd_node: Option<Rc<RefCell<Node>>>,
     root_node: Option<Rc<RefCell<Node>>>,
     uts: UtsNamespace,
+    mounts: Option<MountNamespace>,
+    mount_registry: Rc<RefCell<Vec<Weak<Mount>>>>,
+    detached_mounts: Rc<RefCell<Vec<Vec<Rc<Mount>>>>>,
+    cwd_mount: Option<Rc<Mount>>,
+    root_mount: Option<Rc<Mount>>,
     pub umask: u32,
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
@@ -232,6 +241,11 @@ impl Default for Vfs {
             cwd_node: None,
             root_node: None,
             uts: UtsNamespace::default(),
+            mounts: None,
+            mount_registry: Rc::default(),
+            detached_mounts: Rc::default(),
+            cwd_mount: None,
+            root_mount: None,
             umask: 0o022,
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
@@ -278,11 +292,13 @@ impl Default for Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        mount: None,
                     })),
                     cloexec: false,
                 },
             );
         }
+        v.initialize_mounts().expect("initial mount namespace");
         v
     }
 }
@@ -309,22 +325,20 @@ impl Vfs {
     pub fn share_context_from(&mut self, other: &Self) {
         self.cwd_node.clone_from(&other.cwd_node);
         self.root_node.clone_from(&other.root_node);
+        self.cwd_mount.clone_from(&other.cwd_mount);
+        self.root_mount.clone_from(&other.root_mount);
         self.umask = other.umask;
     }
     pub fn import_executable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
         self.import_reader(path, &mut bytes.as_slice(), true)
             .map(|_| ())
     }
-    fn check_parent_write(&self, path: &[u8]) -> Result<()> {
-        if self.pseudo_readonly(path) {
+    fn check_parent_write(&self, path: &ResolvedPath) -> Result<()> {
+        path.writable()?;
+        if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
             return Err(Errno(30));
         }
-        let end = path
-            .iter()
-            .rposition(|&b| b == b'/')
-            .ok_or(Errno(22))?
-            .max(1);
-        if !self.allowed(&self.node(&path[..end])?.borrow(), 3) {
+        if !self.allowed(&self.node(&path.parent())?.borrow(), 3) {
             return Err(Errno(13));
         }
         Ok(())
@@ -404,6 +418,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        mount: None,
                     })),
                     cloexec: false,
                 },
@@ -411,13 +426,24 @@ impl Vfs {
         }
         Ok(())
     }
-    fn insert(&mut self, path: Vec<u8>, content: Content, mut mode: u32) -> Result<()> {
+    fn insert(
+        &mut self,
+        path: impl Into<ResolvedPath>,
+        content: Content,
+        mut mode: u32,
+    ) -> Result<()> {
+        let path = path.into();
+        let filesystem = path.filesystem(self);
         let parent = if path == b"/" {
             None
         } else {
-            path.iter()
-                .rposition(|b| *b == b'/')
-                .and_then(|i| self.node(&path[..i.max(1)]).ok())
+            path.iter().rposition(|b| *b == b'/').and_then(|i| {
+                self.node(&ResolvedPath {
+                    key: path[..i.max(1)].to_vec(),
+                    mount: path.mount.clone(),
+                })
+                .ok()
+            })
         };
         let inherited = parent.as_ref().and_then(|p| {
             let p = p.borrow();
@@ -426,7 +452,7 @@ impl Vfs {
         if inherited.is_some() && matches!(content, Content::Directory) {
             mode |= 0o2000;
         }
-        let mut fs = self.fs.borrow_mut();
+        let mut fs = filesystem.borrow_mut();
         fs.inodes.retain(|n| n.strong_count() != 0);
         if fs.inodes.len() >= fs.limits.nodes || fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
@@ -444,7 +470,10 @@ impl Vfs {
             data.sync(false)?;
         }
         let node = Rc::new(RefCell::new(Node {
-            device: 0xfd01,
+            device: path
+                .mount
+                .as_ref()
+                .map_or(0xfd01, |m| m.root.borrow().device),
             content,
             mode,
             uid: self.credentials.fsuid,
@@ -456,9 +485,9 @@ impl Vfs {
             seals: None,
         }));
         fs.inodes.push(Rc::downgrade(&node));
-        fs.paths.insert(path.clone(), node.clone());
+        fs.paths.insert(path.key.clone(), node.clone());
         if let Err(e) = fs.checkpoint() {
-            fs.paths.remove(&path);
+            fs.paths.remove(&path.key);
             fs.inodes.pop();
             fs.next_inode = old_next;
             return Err(e);
@@ -468,14 +497,23 @@ impl Vfs {
         }
         Ok(())
     }
-    fn node(&self, path: &[u8]) -> Result<Rc<RefCell<Node>>> {
-        if path == b"/proc" || path.starts_with(b"/proc/") {
-            self.proc_accessed.set(true);
+    fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<Rc<RefCell<Node>>> {
+        let key = path.key();
+        if self.uses_pseudo(path) {
+            if key == b"/proc" || key.starts_with(b"/proc/") {
+                self.proc_accessed.set(true);
+            }
+            if let Some(node) = self.pseudo_node(key)? {
+                return Ok(node);
+            }
         }
-        if let Some(node) = self.pseudo_node(path)? {
-            return Ok(node);
-        }
-        self.fs.borrow().paths.get(path).cloned().ok_or(Errno(2))
+        path.mount()
+            .map_or(&self.fs, |m| &m.fs)
+            .borrow()
+            .paths
+            .get(key)
+            .cloned()
+            .ok_or(Errno(2))
     }
     fn descriptor(&self, fd: u32) -> Result<&Descriptor> {
         let d = self.fds.get(&fd).ok_or(Errno(9))?;
@@ -502,7 +540,7 @@ impl Vfs {
             .sum()
     }
     pub fn cwd(&self) -> Result<Vec<u8>> {
-        self.visible_path(&self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?)?)
+        self.path_visible(&self.location(self.cwd_node.as_ref().ok_or(Errno(2))?, &self.cwd_mount)?)
     }
     fn path_of(&self, node: &Rc<RefCell<Node>>) -> Result<Vec<u8>> {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
@@ -519,22 +557,22 @@ impl Vfs {
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
         Ok(self.descriptor(fd)?.open.borrow().kind.clone())
     }
-    fn is_directory(&self, path: &[u8]) -> bool {
+    fn is_directory<P: PathArg + ?Sized>(&self, path: &P) -> bool {
         self.node(path)
             .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
     }
-    fn base(&self, dirfd: i32) -> Result<Vec<u8>> {
+    fn base(&self, dirfd: i32) -> Result<ResolvedPath> {
         if dirfd == AT_FDCWD {
-            return self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?);
+            return self.location(self.cwd_node.as_ref().ok_or(Errno(2))?, &self.cwd_mount);
         }
         let o = self.descriptor(dirfd as u32)?.open.borrow();
         let n = o.node.as_ref().ok_or(Errno(20))?;
         if !matches!(n.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        self.path_of(n)
+        self.location(n, &o.mount)
     }
-    pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
+    pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<ResolvedPath> {
         self.resolve_final(dirfd, path, true)
     }
     /// Observe the actual traversal, including cwd/dirfd, symlinks and failed
@@ -545,7 +583,12 @@ impl Vfs {
         let _ = self.resolve(dirfd, path);
         self.proc_accessed.replace(false)
     }
-    pub fn resolve_final(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Vec<u8>> {
+    pub fn resolve_final(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow_final: bool,
+    ) -> Result<ResolvedPath> {
         self.resolve_entry(dirfd, path, follow_final, false)
             .map(|entry| entry.0)
     }
@@ -562,9 +605,9 @@ impl Vfs {
         if path.len() >= MAX_PATH || path.contains(&0) {
             return Err(Errno(36));
         }
-        let root = self.root_path()?;
+        let root = self.root_location()?;
         let mut current = if path[0] == b'/' {
-            root.clone()
+            self.follow_mounts(root.clone())?
         } else {
             self.base(dirfd)?
         };
@@ -589,15 +632,7 @@ impl Vfs {
                 continue;
             }
             if part == b".." {
-                if current != root && current != b"/" {
-                    current.truncate(
-                        current
-                            .iter()
-                            .rposition(|&b| b == b'/')
-                            .expect("absolute")
-                            .max(1),
-                    );
-                }
+                current = self.parent_location(&current)?;
                 continue;
             }
             if part.len() > 255 {
@@ -611,21 +646,26 @@ impl Vfs {
             if current.len() >= MAX_PATH {
                 return Err(Errno(36));
             }
+            current = self.follow_mounts(current)?;
             if !parts.is_empty() || follow_final || trailing {
                 // An nsfs magic link names a kernel object, not a pathname such
                 // as "uts:[123]". Leave the canonical endpoint for open/stat.
-                if parts.is_empty() && !trailing && self.namespace_for_path(&current)?.is_some() {
+                if parts.is_empty()
+                    && !trailing
+                    && self.uses_pseudo(&current)
+                    && self.namespace_for_path(&current)?.is_some()
+                {
                     return Ok((current, None));
                 }
-                if retain_magic {
-                    if let Some((node, label)) = self.proc_magic_node_normalized(&current)? {
+                if self.uses_pseudo(&current) && (retain_magic || !parts.is_empty()) {
+                    if let Some((node, label, mount)) = self.proc_magic_node_normalized(&current)? {
                         if parts.is_empty() && !trailing {
-                            return Ok((current, Some((node, label))));
+                            return Ok((current, Some((node, label, mount))));
                         }
                         if !matches!(node.borrow().content, Content::Directory) {
                             return Err(Errno(20));
                         }
-                        current = self.path_of(&node)?;
+                        current = self.location(&node, &mount)?;
                         continue;
                     }
                 }
@@ -766,15 +806,28 @@ impl Vfs {
     }
     /// Explicit embedding API: install an executable/hard link, without duplicating file data.
     pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
-        let source = self.node(existing)?;
+        let source = self.resolve_final(AT_FDCWD, existing, false)?;
         let dest = self.resolve_final(AT_FDCWD, alias, false)?;
-        if self.node(&dest).is_ok() {
+        self.link_resolved(&source, &dest, executable)
+    }
+    fn link_resolved(
+        &mut self,
+        source: &ResolvedPath,
+        dest: &ResolvedPath,
+        executable: bool,
+    ) -> Result<()> {
+        if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
+            return Err(Errno(18));
+        }
+        let filesystem = dest.filesystem(self);
+        let source = self.node(source)?;
+        if self.node(dest).is_ok() {
             return Err(Errno(17));
         }
         if !matches!(source.borrow().content, Content::File(_)) {
             return Err(Errno(1));
         }
-        if self.fs.borrow().paths.len() >= self.fs.borrow().limits.nodes {
+        if filesystem.borrow().paths.len() >= filesystem.borrow().limits.nodes {
             return Err(Errno(28));
         }
         let old_mode = source.borrow().mode;
@@ -785,10 +838,10 @@ impl Vfs {
                 n.mode |= 0o111;
             }
         }
-        let mut fs = self.fs.borrow_mut();
-        fs.paths.insert(dest.clone(), source.clone());
+        let mut fs = filesystem.borrow_mut();
+        fs.paths.insert(dest.key.clone(), source.clone());
         if let Err(e) = fs.checkpoint() {
-            fs.paths.remove(&dest);
+            fs.paths.remove(&dest.key);
             let mut n = source.borrow_mut();
             n.links -= 1;
             n.mode = old_mode;
@@ -833,14 +886,14 @@ impl Vfs {
         let content = if type_ == 0o10000 {
             Content::Fifo(Pipe::new(self.open_id()))
         } else {
-            Content::File(self.empty_data()?)
+            Content::File(self.empty_data_at(&p)?)
         };
         let type_ = if type_ == 0 { 0o100000 } else { type_ };
         self.insert(p, content, type_ | (mode & 0o7777 & !self.umask))
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
         let p = self.resolve_final(dirfd, path, false)?;
-        if p == b"/" {
+        if self.is_mount_root(&p) {
             return Err(Errno(16));
         }
         let node = self.node(&p)?;
@@ -850,11 +903,11 @@ impl Vfs {
             return Err(Errno(if is_dir { 21 } else { 20 }));
         }
         self.check_parent_write(&p)?;
+        let filesystem = p.filesystem(self);
         if is_dir {
             let mut prefix = p.clone();
             prefix.push(b'/');
-            if self
-                .fs
+            if filesystem
                 .borrow()
                 .paths
                 .keys()
@@ -864,11 +917,11 @@ impl Vfs {
             }
         }
         node.borrow_mut().links -= 1;
-        let mut fs = self.fs.borrow_mut();
-        fs.paths.remove(&p);
+        let mut fs = filesystem.borrow_mut();
+        fs.paths.remove(&p.key);
         if let Err(e) = fs.checkpoint() {
             node.borrow_mut().links += 1;
-            fs.paths.insert(p, node);
+            fs.paths.insert(p.key, node);
             return Err(e);
         }
         let mut n = node.borrow_mut();
@@ -922,7 +975,13 @@ impl Vfs {
         }
         let fd = self.available(0)?;
         let p = self.resolve_final(dirfd, path, flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0)?;
-        if self.pseudo_readonly(&p) && (flags & 3 != 0 || flags & 0x240 != 0) {
+        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
+            p.writable()?;
+        }
+        if self.uses_pseudo(&p)
+            && self.pseudo_readonly(&p)
+            && (flags & 3 != 0 || flags & 0x240 != 0)
+        {
             return Err(Errno(30));
         }
         let existed = self.node(&p).is_ok();
@@ -936,7 +995,7 @@ impl Vfs {
             self.check_parent_write(&p)?;
             self.insert(
                 p.clone(),
-                Content::File(self.empty_data()?),
+                Content::File(self.empty_data_at(&p)?),
                 0o100000 | (mode & 0o7777 & !self.umask),
             )?;
         }
@@ -956,6 +1015,17 @@ impl Vfs {
                 && flags & O_PATH == 0
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
                     || (flags & 3 != 0 && !self.allowed(&n, 2)))
+            {
+                return Err(Errno(13));
+            }
+            if flags & O_PATH == 0
+                && p.mount
+                    .as_ref()
+                    .is_some_and(|m| m.flags.get() & mounts::MS_NODEV != 0)
+                && matches!(
+                    n.content,
+                    Content::Device(_) | Content::Null | Content::Terminal
+                )
             {
                 return Err(Errno(13));
             }
@@ -1047,11 +1117,12 @@ impl Vfs {
                     {
                         FdKind::Terminal
                     } else {
-                        FdKind::Node(p)
+                        FdKind::Node(p.key.clone())
                     },
                     flags: flags & !O_CLOEXEC,
                     position,
                     node: Some(node),
+                    mount: p.mount,
                     pipe,
                     socket: None,
                     bridge,
@@ -1211,6 +1282,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        mount: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -1275,7 +1347,7 @@ impl Vfs {
             Content::Fifo(_) => Err(Errno(29)),
         };
         if result.is_ok() {
-            n.times[0] = storage::Timestamp::now();
+            mounts::accessed(&mut n, o.mount.as_ref());
         }
         result
     }
@@ -1339,7 +1411,8 @@ impl Vfs {
         self.file_size_signal.replace(false)
     }
     fn file_write(&mut self, fd: u32, bytes: &[u8], offset: Option<u64>) -> Result<usize> {
-        let available = self.capacity().available_bytes;
+        self.fd_writable(fd)?;
+        let available = self.fd_available_bytes(fd)?;
         let memfd_available = self.memfd_available();
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & 3 == 0 {
@@ -1426,15 +1499,19 @@ impl Vfs {
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
         }
-        let n = o.node.as_ref().ok_or(Errno(29))?.borrow();
-        match &n.content {
+        let mut n = o.node.as_ref().ok_or(Errno(29))?.borrow_mut();
+        let result = match &n.content {
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
             Content::Directory => Err(Errno(21)),
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal | Content::Fifo(_) => Err(Errno(29)),
+        };
+        if count != 0 && result.is_ok() {
+            mounts::accessed(&mut n, o.mount.as_ref());
         }
+        result
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
         if self.bridge_fd(fd) || self.descriptor(fd)?.open.borrow().kernel_log.is_some() {
@@ -1449,7 +1526,8 @@ impl Vfs {
         if self.flags(fd)? & O_PATH != 0 {
             return Err(Errno(9));
         }
-        let available = self.capacity().available_bytes;
+        self.fd_writable(fd)?;
+        let available = self.fd_available_bytes(fd)?;
         let memfd_available = self.memfd_available();
         let o = self.descriptor(fd)?.open.borrow();
         if o.flags & 3 == 0 {
@@ -1538,7 +1616,7 @@ impl Vfs {
         o.position = new as u64;
         Ok(new as u64)
     }
-    fn stat_node(&self, node: &Node) -> Result<[u8; 128]> {
+    fn stat_node(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
         let mut out = [0; 128];
         out[..8].copy_from_slice(&node.device.to_le_bytes());
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
@@ -1546,7 +1624,7 @@ impl Vfs {
         let mut links = node.links;
         if links != 0 && matches!(node.content, Content::Directory) {
             // Persistent links count path owners; stat counts . and children's .. too.
-            let fs = self.fs.borrow();
+            let fs = mount.map_or(&self.fs, |m| &m.fs).borrow();
             let path = fs
                 .paths
                 .iter()
@@ -1578,7 +1656,11 @@ impl Vfs {
                         directories.insert(name.to_vec());
                     }
                 }
-                for name in self.pseudo_children(&path)? {
+                let at = ResolvedPath {
+                    key: path.clone(),
+                    mount: mount.cloned(),
+                };
+                for name in self.mounted_pseudo_children(&at)? {
                     let mut child = prefix.clone();
                     child.extend_from_slice(&name);
                     if self
@@ -1639,7 +1721,7 @@ impl Vfs {
         }
         let p = self.resolve_final(dirfd, path, !nofollow)?;
         let n = self.node(&p)?;
-        let out = self.stat_node(&n.borrow());
+        let out = self.stat_node(&n.borrow(), p.mount.as_ref());
         out
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
@@ -1648,50 +1730,53 @@ impl Vfs {
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
         if let Some(n) = &o.node {
-            return self.stat_node(&n.borrow());
+            return self.stat_node(&n.borrow(), o.mount.as_ref());
         }
         if matches!(o.kind, FdKind::Terminal) {
             if let Ok(n) = self.node(b"/dev/pts/0") {
-                return self.stat_node(&n.borrow());
+                return self.stat_node(&n.borrow(), o.mount.as_ref());
             }
         }
-        self.stat_node(&Node {
-            device: if o.namespace.is_some() {
-                17
-            } else if o.anonymous.is_some() {
-                16
-            } else if o.socket.is_some() || o.local.is_some() {
-                5
-            } else if o.pipe.is_some() {
-                6
-            } else {
-                1
+        self.stat_node(
+            &Node {
+                device: if o.namespace.is_some() {
+                    17
+                } else if o.anonymous.is_some() {
+                    16
+                } else if o.socket.is_some() || o.local.is_some() {
+                    5
+                } else if o.pipe.is_some() {
+                    6
+                } else {
+                    1
+                },
+                content: Content::Null,
+                mode: if o.namespace.is_some() {
+                    0o100444
+                } else if o.anonymous.is_some() {
+                    0o600
+                } else if o.socket.is_some() || o.local.is_some() {
+                    0o140600
+                } else if o.pipe.is_some()
+                    || matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
+                {
+                    0o10600
+                } else {
+                    0o20666
+                },
+                inode: o.namespace.as_ref().map_or_else(
+                    || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+                    linux_namespace::NamespaceHandle::id,
+                ),
+                links: 1,
+                uid: o.owner.0,
+                gid: o.owner.1,
+                volatile: false,
+                times: [storage::Timestamp::default(); 3],
+                seals: None,
             },
-            content: Content::Null,
-            mode: if o.namespace.is_some() {
-                0o100444
-            } else if o.anonymous.is_some() {
-                0o600
-            } else if o.socket.is_some() || o.local.is_some() {
-                0o140600
-            } else if o.pipe.is_some()
-                || matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)
-            {
-                0o10600
-            } else {
-                0o20666
-            },
-            inode: o.namespace.as_ref().map_or_else(
-                || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
-                UtsNamespace::id,
-            ),
-            links: 1,
-            uid: o.owner.0,
-            gid: o.owner.1,
-            volatile: false,
-            times: [storage::Timestamp::default(); 3],
-            seals: None,
-        })
+            None,
+        )
     }
     pub fn chdir_fd(&mut self, fd: u32) -> Result<()> {
         let node = self
@@ -1707,6 +1792,8 @@ impl Vfs {
         if !self.allowed(&node.borrow(), 1) {
             return Err(Errno(13));
         }
+        let mount = self.descriptor(fd)?.open.borrow().mount.clone();
+        self.cwd_mount = mount;
         self.cwd_node = Some(node);
         Ok(())
     }
@@ -1719,6 +1806,7 @@ impl Vfs {
         if !self.allowed(&n.borrow(), 1) {
             return Err(Errno(13));
         }
+        self.cwd_mount = p.mount;
         self.cwd_node = Some(n);
         Ok(())
     }
@@ -1729,17 +1817,17 @@ impl Vfs {
         if !matches!(node.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        let p = self.path_of(node)?;
-        let fs = self.fs.borrow();
+        let p = self.location(node, &o.mount)?;
+        let filesystem = p.filesystem(self);
+        let fs = filesystem.borrow();
         let inode = node.borrow().inode;
-        let parent_end = p.iter().rposition(|&b| b == b'/').expect("absolute").max(1);
-        let parent = self.node(&p[..parent_end])?.borrow().inode;
+        let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
         let mut children = BTreeMap::new();
         let mut prefix = p.clone();
         if prefix != b"/" {
             prefix.push(b'/');
         }
-        for (path, node) in fs.paths.range(prefix.clone()..) {
+        for (path, node) in fs.paths.range(prefix.key.clone()..) {
             if !path.starts_with(&prefix) {
                 break;
             }
@@ -1763,7 +1851,7 @@ impl Vfs {
             );
         }
         drop(fs);
-        for name in self.pseudo_children(&p)? {
+        for name in self.mounted_pseudo_children(&p)? {
             let mut child = prefix.clone();
             child.extend_from_slice(&name);
             let n = self.node(&child)?;

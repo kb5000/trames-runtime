@@ -166,13 +166,21 @@ impl MappedData {
     }
 }
 struct FileMapping {
+    mount: Option<Rc<Mount>>,
     node: Rc<RefCell<Node>>,
     page: Rc<FilePage>,
     offset: u64,
     writable: bool,
+    executable: bool,
 }
 impl FileMapping {
-    fn create(node: Rc<RefCell<Node>>, offset: u64, writable: bool) -> Result<Rc<dyn PageBacking>> {
+    fn create(
+        node: Rc<RefCell<Node>>,
+        mount: Option<Rc<Mount>>,
+        offset: u64,
+        writable: bool,
+        executable: bool,
+    ) -> Result<Rc<dyn PageBacking>> {
         let page = if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
             data.page(offset)?
         } else {
@@ -180,12 +188,17 @@ impl FileMapping {
         };
         if writable {
             page.writers.set(page.writers.get() + 1);
+            if let Some(m) = &mount {
+                m.writers.set(m.writers.get() + 1);
+            }
         }
         Ok(Rc::new(Self {
+            mount,
             node,
             page,
             offset,
             writable,
+            executable,
         }))
     }
 }
@@ -270,6 +283,9 @@ impl PageBacking for FileMapping {
     fn version(&self) -> u64 {
         self.page.version.get()
     }
+    fn executable(&self) -> bool {
+        self.executable
+    }
     fn writable(&self) -> bool {
         self.writable
     }
@@ -282,14 +298,23 @@ impl PageBacking for FileMapping {
                     .ok_or(MemoryError::InvalidRange)?,
             )
             .ok_or(MemoryError::InvalidRange)?;
-        Self::create(self.node.clone(), offset, self.writable)
-            .map_err(|e| MemoryError::BackingIo(e.0))
+        Self::create(
+            self.node.clone(),
+            self.mount.clone(),
+            offset,
+            self.writable,
+            self.executable,
+        )
+        .map_err(|e| MemoryError::BackingIo(e.0))
     }
 }
 impl Drop for FileMapping {
     fn drop(&mut self) {
         if self.writable {
             self.page.writers.set(self.page.writers.get() - 1);
+            if let Some(m) = &self.mount {
+                m.writers.set(m.writers.get() - 1);
+            }
         }
         // Closing the descriptor/unlinking the path never invalidates this inode.
         if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
@@ -320,11 +345,16 @@ impl Vfs {
             return Err(Errno(13));
         }
         let node = o.node.clone().ok_or(Errno(19))?;
+        let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());
+        if shared && writable && readonly {
+            return Err(Errno(30));
+        }
         let sealed = node.borrow().seals.is_some_and(|s| s & 8 != 0);
         if shared && writable && sealed {
             return Err(Errno(1));
         }
-        let may_write = shared && o.flags & 3 == 2 && !sealed && !node.borrow().volatile;
+        let may_write =
+            !readonly && shared && o.flags & 3 == 2 && !sealed && !node.borrow().volatile;
         let mut n = node.borrow_mut();
         let Content::File(data) = &mut n.content else {
             return Err(Errno(19));
@@ -340,17 +370,26 @@ impl Vfs {
             unreachable!("mapped data")
         };
         drop(n);
+        let mount = o.mount.clone();
+        let executable = mount
+            .as_ref()
+            .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
         drop(o);
         let mut pages: Vec<Rc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
             if may_write {
                 page.writers.set(page.writers.get() + 1);
+                if let Some(m) = &mount {
+                    m.writers.set(m.writers.get() + 1);
+                }
             }
             pages.push(Rc::new(FileMapping {
+                mount: mount.clone(),
                 node: node.clone(),
                 page,
                 offset: offset + i as u64 * PAGE_SIZE,
                 writable: may_write,
+                executable,
             }));
         }
         Ok(pages)
