@@ -153,13 +153,13 @@ impl Vfs {
     fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
-        if self.credentials.fsuid != 0 && self.credentials.fsuid != n.uid {
+        if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {
             return Err(Errno(1));
         }
         let old_mode = n.mode;
         let old_time = n.times[2];
         n.mode = (n.mode & !0o7777) | (mode & 0o7777);
-        if self.credentials.fsuid != 0 && !self.credentials.in_group(n.gid) {
+        if !self.credentials.has_cap(capabilities::FSETID) && !self.credentials.in_group(n.gid) {
             n.mode &= !0o2000;
         }
         n.times[2] = storage::Timestamp::now();

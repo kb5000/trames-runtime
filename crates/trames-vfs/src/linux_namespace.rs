@@ -112,14 +112,14 @@ impl Vfs {
         }
     }
     pub fn unshare_uts(&mut self) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         self.uts = self.uts.copy()?;
         Ok(())
     }
     pub fn set_uts_name(&mut self, domain: bool, name: &[u8]) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         if name.len() > 64 {
@@ -142,7 +142,7 @@ impl Vfs {
         if kind != 0 && kind != ns.kind() {
             return Err(Errno(22));
         }
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         match ns {
@@ -205,7 +205,9 @@ impl Vfs {
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
             .ok_or(Errno(2))?;
-        if self.credentials.fsuid != 0 && self.credentials.fsuid != process.credentials.euid {
+        if !self.credentials.has_cap(capabilities::SYS_PTRACE)
+            && self.credentials.fsuid != process.credentials.euid
+        {
             return Err(Errno(13));
         }
         Ok(Some(match kind {
@@ -250,7 +252,7 @@ impl Vfs {
     }
     /// Linux chroot changes only fs.root. Existing cwd/dirfds remain capabilities.
     pub fn chroot(&mut self, path: &[u8]) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_CHROOT) {
             return Err(Errno(1));
         }
         let path = self.resolve(AT_FDCWD, path)?;

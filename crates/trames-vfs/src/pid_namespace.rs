@@ -176,7 +176,7 @@ impl Vfs {
         &self.pid_children
     }
     pub fn unshare_pid(&mut self) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         if self.pid_children.id() != self.pid_ns.id() {

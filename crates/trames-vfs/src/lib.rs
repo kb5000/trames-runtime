@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
+pub mod capabilities;
 mod credentials;
 mod events;
 mod executable;
@@ -1477,7 +1478,9 @@ impl Vfs {
             }
         };
         if result.is_ok_and(|n| n != 0) {
-            if self.credentials.fsuid != 0 && matches!(n.content, Content::File(_)) {
+            if !self.credentials.has_cap(capabilities::FSETID)
+                && matches!(n.content, Content::File(_))
+            {
                 n.mode &= !0o4000;
                 if n.mode & 0o10 != 0 {
                     n.mode &= !0o2000;
@@ -1566,7 +1569,7 @@ impl Vfs {
             return Err(Errno(28));
         }
         b.truncate(length)?;
-        if self.credentials.fsuid != 0 {
+        if !self.credentials.has_cap(capabilities::FSETID) {
             n.mode &= !0o4000;
             if n.mode & 0o10 != 0 {
                 n.mode &= !0o2000;

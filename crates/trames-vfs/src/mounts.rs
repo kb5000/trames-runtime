@@ -386,7 +386,7 @@ impl Vfs {
         Err(Errno(40))
     }
     pub fn unshare_mounts(&mut self) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let old = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
@@ -498,7 +498,7 @@ impl Vfs {
         const REMOUNT: u64 = 32;
         const PRIVATE: u64 = 1 << 18;
         const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let flags = if flags & 0xffff0000 == 0xc0ed0000 {
@@ -686,7 +686,7 @@ impl Vfs {
         Ok(())
     }
     pub fn umount(&mut self, target: &[u8], flags: u64) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         if flags & !(2 | 8) != 0 {
@@ -738,7 +738,7 @@ impl Vfs {
         Ok(())
     }
     pub fn pivot_root(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let new = self.resolve(AT_FDCWD, new_root)?;

@@ -656,7 +656,9 @@ impl Vfs {
                 .iter()
                 .find(|p| Some(p.pid) == pid)
                 .ok_or(Errno(2))?;
-            if self.credentials.fsuid != 0 && self.credentials.fsuid != process.credentials.euid {
+            if !self.credentials.has_cap(capabilities::SYS_PTRACE)
+                && self.credentials.fsuid != process.credentials.euid
+            {
                 return Err(Errno(13));
             }
             process
@@ -705,7 +707,9 @@ impl Vfs {
             .iter()
             .find(|p| Some(p.pid) == parse(pid) && group.is_none_or(|g| Some(p.tgid) == parse(g)))
             .ok_or(Errno(2))?;
-        if self.credentials.fsuid != 0 && self.credentials.fsuid != process.credentials.euid {
+        if !self.credentials.has_cap(capabilities::SYS_PTRACE)
+            && self.credentials.fsuid != process.credentials.euid
+        {
             return Err(Errno(13));
         }
         let Some(file) = process.executable_file.as_ref().and_then(Weak::upgrade) else {
@@ -1021,6 +1025,7 @@ impl Vfs {
             b"/proc/sys/kernel/version" => return Ok(regular(b"Trames userspace runtime\n".to_vec())),
             b"/proc/sys/kernel/hostname" => { let mut n = self.uts_name(false); n.push(b'\n'); return Ok(regular(n)); },
             b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(regular(n)); },
+            b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(b"32\n".to_vec())),
             b"/proc/sys/fs/file-max" => return Ok(regular(b"8192\n".to_vec())),
@@ -1137,6 +1142,19 @@ impl Vfs {
                             );
                             let threads = r.processes.iter().filter(|t| t.tgid == p.tgid).count();
                             let mut name = name;
+                            for (key, mask) in [
+                                ("CapInh", c.caps.inheritable),
+                                ("CapPrm", c.caps.permitted),
+                                ("CapEff", c.caps.effective),
+                                ("CapBnd", c.caps.bounding),
+                                ("CapAmb", c.caps.ambient),
+                            ] {
+                                name.push_str(&format!("\n{key}:\t{mask:016x}"));
+                            }
+                            name.push_str(&format!(
+                                "\nNoNewPrivs:\t{}",
+                                u32::from(c.caps.no_new_privs)
+                            ));
                             for (key, ids) in ["NStgid", "NSpid", "NSpgid", "NSsid"]
                                 .iter()
                                 .zip(&p.namespace_ids)
@@ -1526,6 +1544,7 @@ impl Vfs {
                 "hostname",
                 "domainname",
                 "pid_max",
+                "cap_last_cap",
                 "threads-max",
             ]
             .iter()

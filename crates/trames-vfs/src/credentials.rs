@@ -13,6 +13,7 @@ pub struct Credentials {
     pub fsuid: u32,
     pub fsgid: u32,
     pub groups: Vec<u32>,
+    pub caps: capabilities::Capabilities,
 }
 impl Credentials {
     pub fn user(uid: u32, gid: u32) -> Self {
@@ -26,7 +27,11 @@ impl Credentials {
             fsuid: uid,
             fsgid: gid,
             groups: Vec::new(),
+            caps: capabilities::Capabilities::for_uid(uid),
         }
+    }
+    pub fn has_cap(&self, cap: u32) -> bool {
+        self.caps.has(cap)
     }
     pub fn in_group(&self, gid: u32) -> bool {
         self.fsgid == gid || self.groups.contains(&gid)
@@ -37,10 +42,13 @@ impl Credentials {
         } else {
             [self.uid, self.euid, self.suid]
         };
-        if self.euid != 0
-            && values
-                .iter()
-                .any(|v| *v != u32::MAX && !current.contains(v))
+        if !self.has_cap(if group {
+            capabilities::SETGID
+        } else {
+            capabilities::SETUID
+        }) && values
+            .iter()
+            .any(|v| *v != u32::MAX && !current.contains(v))
         {
             return Err(Errno(1));
         }
@@ -54,6 +62,7 @@ impl Credentials {
             [self.gid, self.egid, self.sgid] = next;
             self.fsgid = self.egid;
         } else {
+            self.caps.uids_changed(current, next);
             [self.uid, self.euid, self.suid] = next;
             self.fsuid = self.euid;
         }
@@ -63,7 +72,11 @@ impl Credentials {
         if value == u32::MAX {
             return Err(Errno(22));
         }
-        if self.euid == 0 {
+        if self.has_cap(if group {
+            capabilities::SETGID
+        } else {
+            capabilities::SETUID
+        }) {
             self.set_res_ids(group, [value; 3])
         } else {
             self.set_res_ids(group, [u32::MAX, value, u32::MAX])
@@ -81,14 +94,25 @@ impl Vfs {
             .mount
             .as_ref()
             .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0);
-        if !nosuid && n.mode & 0o4000 != 0 {
+        if !nosuid && !self.credentials.caps.no_new_privs && n.mode & 0o4000 != 0 {
             self.credentials.euid = n.uid;
             self.credentials.fsuid = n.uid;
         }
-        if !nosuid && n.mode & 0o2000 != 0 {
+        if !nosuid && !self.credentials.caps.no_new_privs && n.mode & 0o2010 == 0o2010 {
             self.credentials.egid = n.gid;
             self.credentials.fsgid = n.gid;
         }
+        let c = &mut self.credentials;
+        c.caps
+            .exec(c.uid, c.euid, c.uid != c.euid || c.gid != c.egid);
+        // NNP also prevents a pre-existing effective-ID mismatch from
+        // surviving exec. Capability computation uses the pre-downgrade IDs.
+        if c.caps.no_new_privs && (c.uid != c.euid || c.gid != c.egid) {
+            c.euid = c.uid;
+            c.egid = c.gid;
+        }
+        c.fsuid = c.euid;
+        c.fsgid = c.egid;
         self.credentials.suid = self.credentials.euid;
         self.credentials.sgid = self.credentials.egid;
         Ok(())
@@ -108,6 +132,13 @@ impl Vfs {
         if !effective {
             view.credentials.fsuid = self.credentials.uid;
             view.credentials.fsgid = self.credentials.gid;
+            if self.credentials.caps.securebits & capabilities::NO_SETUID_FIXUP == 0 {
+                view.credentials.caps.effective = if self.credentials.uid == 0 {
+                    self.credentials.caps.permitted
+                } else {
+                    0
+                };
+            }
         }
         let path = view.resolve_final(dirfd, path, !nofollow)?;
         if mode & 2 != 0 {
@@ -127,7 +158,10 @@ impl Vfs {
         let parent = self.node(&path.parent())?;
         let p = parent.borrow();
         let uid = self.credentials.fsuid;
-        if p.mode & 0o1000 != 0 && uid != 0 && uid != p.uid && uid != self.node(path)?.borrow().uid
+        if p.mode & 0o1000 != 0
+            && !self.credentials.has_cap(capabilities::FOWNER)
+            && uid != p.uid
+            && uid != self.node(path)?.borrow().uid
         {
             return Err(Errno(1));
         }
@@ -135,11 +169,6 @@ impl Vfs {
     }
     pub(super) fn allowed(&self, node: &Node, bits: u32) -> bool {
         let c = &self.credentials;
-        if c.fsuid == 0 {
-            return bits & 1 == 0
-                || matches!(node.content, Content::Directory)
-                || node.mode & 0o111 != 0;
-        }
         let shift = if c.fsuid == node.uid {
             6
         } else if c.in_group(node.gid) {
@@ -148,12 +177,19 @@ impl Vfs {
             0
         };
         (node.mode >> shift) & bits == bits
+            || c.has_cap(capabilities::DAC_OVERRIDE)
+                && (bits & 1 == 0
+                    || matches!(node.content, Content::Directory)
+                    || node.mode & 0o111 != 0)
+            || c.has_cap(capabilities::DAC_READ_SEARCH)
+                && bits & 2 == 0
+                && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
     fn chown_node(&self, node: Rc<RefCell<Node>>, uid: u32, gid: u32) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
-        if c.fsuid != 0
+        if !c.has_cap(capabilities::CHOWN)
             && (c.fsuid != n.uid
                 || (uid != u32::MAX && uid != n.uid)
                 || (gid != u32::MAX && gid != n.gid && !c.in_group(gid)))

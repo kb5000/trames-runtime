@@ -195,12 +195,12 @@ impl Vfs {
             ),
         );
     }
-    /// syscall 116 klogctl: reading and clearing require virtual root.
+    /// syscall 116 klogctl: reading and clearing require guest CAP_SYSLOG.
     pub fn syslog(&self, action: u32, count: usize) -> Result<Vec<u8>> {
         if action > 10 {
             return Err(Errno(22));
         }
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYSLOG) {
             return Err(Errno(1));
         }
         let mut log = self.kernel_log.borrow_mut();
@@ -221,7 +221,7 @@ impl Vfs {
         }
     }
     pub fn syslog_size(&self, action: u32) -> Result<u64> {
-        if self.credentials.euid != 0 {
+        if !self.credentials.has_cap(capabilities::SYSLOG) {
             return Err(Errno(1));
         }
         match action {

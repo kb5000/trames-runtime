@@ -2,6 +2,7 @@
 use super::{errno, io_errno, GuestOutput, OutputFd, SyscallOutcome, MAX_WRITE};
 use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
+use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH, O_NONBLOCK};
 
 type Result<T> = std::result::Result<T, Errno>;
@@ -1181,10 +1182,16 @@ impl Linux {
                 } else {
                     [c.uid, c.euid, c.suid, old]
                 };
-                if c.euid == 0 || ids.contains(&(a[0] as u32)) {
+                if c.has_cap(if group {
+                    capabilities::SETGID
+                } else {
+                    capabilities::SETUID
+                }) || ids.contains(&(a[0] as u32))
+                {
                     if group {
                         c.fsgid = a[0] as u32;
                     } else {
+                        c.caps.fsuid_changed(c.fsuid, a[0] as u32);
                         c.fsuid = a[0] as u32;
                     }
                 }
@@ -1211,7 +1218,7 @@ impl Linux {
                     }
                     Ok(groups.len() as u64)
                 } else {
-                    if self.vfs.credentials.euid != 0 {
+                    if !self.vfs.credentials.has_cap(capabilities::SETGID) {
                         return Err(Errno(1));
                     }
                     Self::check(memory, a[1], count * 4, Access::Read)?;
