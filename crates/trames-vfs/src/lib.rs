@@ -12,7 +12,9 @@ mod memfd;
 mod syscall_names;
 pub use ipc::{LocalReceived, LocalSocket};
 pub use locks::RecordLock;
+mod linux_namespace;
 mod namespace;
+pub use linux_namespace::{NamespaceSnapshot, UtsNamespace, CLONE_NEWUTS};
 mod network;
 mod pseudo;
 mod pty;
@@ -147,6 +149,7 @@ struct OpenDescription {
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
+    namespace: Option<UtsNamespace>,
 }
 #[derive(Clone)]
 struct Descriptor {
@@ -193,6 +196,8 @@ pub struct Vfs {
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
     cwd_node: Option<Rc<RefCell<Node>>>,
+    root_node: Option<Rc<RefCell<Node>>>,
+    uts: UtsNamespace,
     pub umask: u32,
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
@@ -225,6 +230,8 @@ impl Default for Vfs {
             })),
             fds: BTreeMap::new(),
             cwd_node: None,
+            root_node: None,
+            uts: UtsNamespace::default(),
             umask: 0o022,
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
@@ -270,6 +277,7 @@ impl Default for Vfs {
                         anonymous: None,
                         local: None,
                         pty: None,
+                        namespace: None,
                     })),
                     cloexec: false,
                 },
@@ -300,6 +308,7 @@ impl Vfs {
     }
     pub fn share_context_from(&mut self, other: &Self) {
         self.cwd_node.clone_from(&other.cwd_node);
+        self.root_node.clone_from(&other.root_node);
         self.umask = other.umask;
     }
     pub fn import_executable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
@@ -394,6 +403,7 @@ impl Vfs {
                         anonymous: None,
                         local: None,
                         pty: None,
+                        namespace: None,
                     })),
                     cloexec: false,
                 },
@@ -492,7 +502,7 @@ impl Vfs {
             .sum()
     }
     pub fn cwd(&self) -> Result<Vec<u8>> {
-        self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?)
+        self.visible_path(&self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?)?)
     }
     fn path_of(&self, node: &Rc<RefCell<Node>>) -> Result<Vec<u8>> {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
@@ -515,7 +525,7 @@ impl Vfs {
     }
     fn base(&self, dirfd: i32) -> Result<Vec<u8>> {
         if dirfd == AT_FDCWD {
-            return self.cwd();
+            return self.path_of(self.cwd_node.as_ref().ok_or(Errno(2))?);
         }
         let o = self.descriptor(dirfd as u32)?.open.borrow();
         let n = o.node.as_ref().ok_or(Errno(20))?;
@@ -552,8 +562,9 @@ impl Vfs {
         if path.len() >= MAX_PATH || path.contains(&0) {
             return Err(Errno(36));
         }
+        let root = self.root_path()?;
         let mut current = if path[0] == b'/' {
-            b"/".to_vec()
+            root.clone()
         } else {
             self.base(dirfd)?
         };
@@ -578,7 +589,7 @@ impl Vfs {
                 continue;
             }
             if part == b".." {
-                if current != b"/" {
+                if current != root && current != b"/" {
                     current.truncate(
                         current
                             .iter()
@@ -601,6 +612,11 @@ impl Vfs {
                 return Err(Errno(36));
             }
             if !parts.is_empty() || follow_final || trailing {
+                // An nsfs magic link names a kernel object, not a pathname such
+                // as "uts:[123]". Leave the canonical endpoint for open/stat.
+                if parts.is_empty() && !trailing && self.namespace_for_path(&current)?.is_some() {
+                    return Ok((current, None));
+                }
                 if retain_magic {
                     if let Some((node, label)) = self.proc_magic_node_normalized(&current)? {
                         if parts.is_empty() && !trailing {
@@ -620,7 +636,7 @@ impl Vfs {
                             return Err(Errno(40));
                         }
                         current = if target.starts_with(b"/") {
-                            b"/".to_vec()
+                            root.clone()
                         } else {
                             parent
                         };
@@ -1043,6 +1059,7 @@ impl Vfs {
                     anonymous: None,
                     local: None,
                     pty,
+                    namespace: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -1193,6 +1210,7 @@ impl Vfs {
                         anonymous: None,
                         local: None,
                         pty: None,
+                        namespace: None,
                     })),
                     cloexec: flags & O_CLOEXEC != 0,
                 },
@@ -1211,6 +1229,9 @@ impl Vfs {
         }
         if let Some(local) = &o.local {
             return local.recv(count, 0).map(|r| r.data);
+        }
+        if o.namespace.is_some() {
+            return Err(Errno(22));
         }
         if let Some(anonymous) = &mut o.anonymous {
             return anonymous.read(count);
@@ -1274,6 +1295,9 @@ impl Vfs {
         }
         if let Some(local) = &o.local {
             return local.send(bytes, 0);
+        }
+        if o.namespace.is_some() {
+            return Err(Errno(22));
         }
         if let Some(anonymous) = &mut o.anonymous {
             return anonymous.write(bytes);
@@ -1632,7 +1656,9 @@ impl Vfs {
             }
         }
         self.stat_node(&Node {
-            device: if o.anonymous.is_some() {
+            device: if o.namespace.is_some() {
+                17
+            } else if o.anonymous.is_some() {
                 16
             } else if o.socket.is_some() || o.local.is_some() {
                 5
@@ -1642,7 +1668,9 @@ impl Vfs {
                 1
             },
             content: Content::Null,
-            mode: if o.anonymous.is_some() {
+            mode: if o.namespace.is_some() {
+                0o100444
+            } else if o.anonymous.is_some() {
                 0o600
             } else if o.socket.is_some() || o.local.is_some() {
                 0o140600
@@ -1653,7 +1681,10 @@ impl Vfs {
             } else {
                 0o20666
             },
-            inode: o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+            inode: o.namespace.as_ref().map_or_else(
+                || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+                UtsNamespace::id,
+            ),
             links: 1,
             uid: o.owner.0,
             gid: o.owner.1,

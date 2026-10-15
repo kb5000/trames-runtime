@@ -211,11 +211,10 @@ impl Linux {
                     .copy_from_slice(&(if loopback { 0x49u16 } else { 0xc1u16 }).to_le_bytes()),
                 0x8915 | 0x891b => {
                     let ip = if request == 0x891b {
-                        std::net::Ipv4Addr::new(
-                            255,
-                            if loopback { 0 } else { 255 },
-                            if loopback { 0 } else { 255 },
-                            0,
+                        std::net::Ipv4Addr::from(
+                            u32::MAX
+                                .checked_shl(32 - if loopback { 8 } else { info.prefix4 as u32 })
+                                .unwrap_or(0),
                         )
                     } else if loopback {
                         std::net::Ipv4Addr::LOCALHOST

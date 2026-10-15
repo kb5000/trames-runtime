@@ -229,6 +229,7 @@ impl Vfs {
                         anonymous: None,
                         local: Some(local),
                         pty: None,
+                        namespace: None,
                     })),
                     cloexec: kind & O_CLOEXEC != 0,
                 },

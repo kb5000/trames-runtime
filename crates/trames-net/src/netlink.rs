@@ -253,6 +253,9 @@ impl Socket {
                             (2, false) => IpAddr::V4(self.info.unwrap().ipv4),
                             _ => IpAddr::V6(self.info.unwrap().ipv6),
                         };
+                        if address.is_unspecified() {
+                            continue;
+                        }
                         let mut data = vec![
                             af,
                             if lo {
@@ -262,9 +265,9 @@ impl Socket {
                                     128
                                 }
                             } else if af == 2 {
-                                24
+                                self.info.unwrap().prefix4
                             } else {
-                                64
+                                self.info.unwrap().prefix6
                             },
                             0x80,
                             if lo { 254 } else { 0 },
@@ -288,21 +291,28 @@ impl Socket {
                         continue;
                     }
                     if let Some(n) = self.info {
+                        if (af == 2 && n.ipv4.is_unspecified())
+                            || (af == 10 && n.ipv6.is_unspecified())
+                        {
+                            continue;
+                        }
                         let mut data = vec![af, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
                         attr(&mut data, 4, &2u32.to_le_bytes());
-                        attr(
-                            &mut data,
-                            5,
-                            &if af == 2 {
-                                n.gateway4.octets().to_vec()
-                            } else {
-                                n.gateway6.octets().to_vec()
-                            },
-                        );
+                        if n.id != 0 {
+                            attr(
+                                &mut data,
+                                5,
+                                &if af == 2 {
+                                    n.gateway4.octets().to_vec()
+                                } else {
+                                    n.gateway6.octets().to_vec()
+                                },
+                            );
+                        }
                         out.push(message(24, 2, sequence, self.port.get(), &data));
                         let mut data = vec![
                             af,
-                            if af == 2 { 24 } else { 64 },
+                            if af == 2 { n.prefix4 } else { n.prefix6 },
                             0,
                             0,
                             254,
@@ -319,9 +329,15 @@ impl Socket {
                             &mut data,
                             1,
                             &if af == 2 {
-                                vec![10, 0, 0, 0]
+                                (u32::from(n.ipv4)
+                                    & (u32::MAX.checked_shl(32 - n.prefix4 as u32).unwrap_or(0)))
+                                .to_be_bytes()
+                                .to_vec()
                             } else {
-                                Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0).octets().to_vec()
+                                (u128::from(n.ipv6)
+                                    & (u128::MAX.checked_shl(128 - n.prefix6 as u32).unwrap_or(0)))
+                                .to_be_bytes()
+                                .to_vec()
                             },
                         );
                         attr(

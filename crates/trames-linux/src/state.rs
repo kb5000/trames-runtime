@@ -545,6 +545,20 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            51 => {
+                let path = Self::path(memory, a[0])?;
+                self.vfs.chroot(&path)?;
+                Ok(0)
+            }
+            161 | 162 => {
+                if a[1] > 64 {
+                    return Err(Errno(22));
+                }
+                let mut name = vec![0; a[1] as usize];
+                memory.read(a[0], &mut name).map_err(|_| Errno(14))?;
+                self.vfs.set_uts_name(number == 162, &name)?;
+                Ok(0)
+            }
             71 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
                 self.file_syscall(number, a, memory, io)
             }
@@ -919,6 +933,11 @@ impl Linux {
                         },
                     )?;
                     Ok(0)
+                } else if let Some(kind) = self.vfs.namespace_type(a[0] as u32)? {
+                    match a[1] as u32 {
+                        0xb703 => Ok(kind),
+                        _ => Err(Errno(25)),
+                    }
                 } else if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
                     self.network_ioctl(a, memory)
                 } else {
@@ -1025,14 +1044,16 @@ impl Linux {
             }
             160 => {
                 Self::check(memory, a[0], 390, Access::Write)?;
+                let hostname = self.vfs.uts_name(false);
+                let domainname = self.vfs.uts_name(true);
                 let mut fields = [0; 390];
                 for (i, text) in [
                     b"Linux".as_slice(),
-                    b"trames",
+                    hostname.as_slice(),
                     b"6.0.0-trames",
                     b"#1 Trames compatibility runtime",
                     b"aarch64",
-                    b"(none)",
+                    domainname.as_slice(),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1420,10 +1441,7 @@ mod tests {
         linux.vfs.write(fd, b"durable length and data").unwrap();
         let mut memory = memory();
         let mut io = CapturedOutput::default();
-        assert_eq!(
-            linux.syscall(162, [0; 6], &mut memory, &mut io),
-            Err(Errno(38))
-        );
+        assert_eq!(linux.syscall(162, [0; 6], &mut memory, &mut io), Ok(0));
         assert_eq!(linux.syscall(81, [0; 6], &mut memory, &mut io), Ok(0));
         drop(linux);
         let mut reopened = Vfs::open_disk(&directory, trames_vfs::DiskOptions::default()).unwrap();

@@ -155,6 +155,7 @@ impl Vfs {
                     anonymous: Some(anonymous),
                     local: None,
                     pty: None,
+                    namespace: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },
@@ -263,7 +264,7 @@ impl Vfs {
         if matches!(t.anonymous, Some(Anonymous::Epoll { .. })) {
             return Err(Errno(95));
         }
-        if matches!(t.kind, FdKind::Node(_)) && t.bridge.is_none() {
+        if t.namespace.is_some() || matches!(t.kind, FdKind::Node(_)) && t.bridge.is_none() {
             return Err(Errno(1));
         }
         let key = (target_number, t.id);

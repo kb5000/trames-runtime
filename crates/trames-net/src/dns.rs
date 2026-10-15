@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded DNS wire service, backed by the supported host system resolver.
-use super::*;
+use std::net::IpAddr;
 use std::{
     net::ToSocketAddrs,
     sync::{mpsc, Arc, Mutex},
 };
 #[derive(Clone)]
-pub(super) struct Question {
+pub(crate) struct Question {
     pub packet: Vec<u8>,
     pub name: String,
     pub kind: u16,
 }
-pub(super) struct Resolver {
+pub(crate) struct Resolver {
     jobs: Option<mpsc::SyncSender<(u64, String, u16)>>,
     results: mpsc::Receiver<(u64, Vec<IpAddr>, u8)>,
     next: u64,
@@ -72,7 +72,7 @@ impl Resolver {
         self.results.try_recv().ok()
     }
 }
-pub(super) fn parse(packet: &[u8]) -> std::result::Result<Question, u8> {
+pub(crate) fn parse(packet: &[u8]) -> std::result::Result<Question, u8> {
     if packet.len() < 12 || packet.len() > 4096 {
         return Err(1);
     }
@@ -123,7 +123,7 @@ pub(super) fn parse(packet: &[u8]) -> std::result::Result<Question, u8> {
         kind,
     })
 }
-pub(super) fn answer(q: &[u8], addresses: &[IpAddr], code: u8, limit: usize) -> Vec<u8> {
+pub(crate) fn answer(q: &[u8], addresses: &[IpAddr], code: u8, limit: usize) -> Vec<u8> {
     let question = parse(q).ok();
     let mut out = if let Some(q) = &question {
         q.packet.clone()

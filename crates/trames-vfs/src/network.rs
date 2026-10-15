@@ -70,6 +70,7 @@ impl Vfs {
                     anonymous: None,
                     local: None,
                     pty: None,
+                    namespace: None,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
             },

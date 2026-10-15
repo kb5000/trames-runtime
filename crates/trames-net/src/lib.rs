@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Checked sockets with native and isolated userspace packet-stack backends.
+mod direct_dns;
+mod dns;
+mod interfaces;
 mod native;
 mod netlink;
 mod virtualnet;
@@ -55,13 +58,13 @@ impl Network {
     }
     pub fn info(&self) -> Option<NetworkInfo> {
         match &self.0 {
-            Backend::Native(_) => None,
+            Backend::Native(n) => n.info(),
             Backend::Virtual(n) => Some(n.info()),
         }
     }
     pub fn links(&self) -> Option<[LinkStats; 2]> {
         match &self.0 {
-            Backend::Native(_) => None,
+            Backend::Native(n) => Some(n.links()),
             Backend::Virtual(n) => Some(n.links()),
         }
     }
@@ -108,6 +111,9 @@ impl Socket {
         }
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if let SocketBackend::Native(s) = &self.0 {
+            return s.set_option_bytes(level, name, value);
+        }
         if let SocketBackend::Virtual(s) = &self.0 {
             return s.set_option_bytes(level, name, value);
         }
@@ -122,6 +128,8 @@ impl Socket {
     }
     pub fn ancillary_hop(&self) -> Option<(u32, u32, u8)> {
         if let SocketBackend::Virtual(s) = &self.0 {
+            s.ancillary_hop()
+        } else if let SocketBackend::Native(s) = &self.0 {
             s.ancillary_hop()
         } else {
             None

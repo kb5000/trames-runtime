@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! A bounded IP fabric. Only the trusted gateway opens native sockets.
-mod dns;
+use crate::dns;
 mod gateway;
 mod packet;
 mod sockets;
@@ -33,6 +33,8 @@ pub struct NetworkInfo {
     pub gateway4: Ipv4Addr,
     pub gateway6: Ipv6Addr,
     pub mtu: u32,
+    pub prefix4: u8,
+    pub prefix6: u8,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetworkStats {
@@ -263,6 +265,8 @@ impl Fabric {
             gateway4: v4(1),
             gateway6: v6(1),
             mtu: packet::MTU as u32,
+            prefix4: 24,
+            prefix6: 64,
         };
         let mut node = make_node(id, i.now())?;
         let ns = Rc::new(Namespace {

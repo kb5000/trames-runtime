@@ -228,6 +228,7 @@ pub struct ProcessInfo {
     pub session: u32,
     pub state: char,
     pub credentials: Credentials,
+    pub namespaces: NamespaceSnapshot,
     pub command: Vec<u8>,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
@@ -267,8 +268,8 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
-    enabled: bool,
-    runtime: RuntimeInfo,
+    pub(super) enabled: bool,
+    pub(super) runtime: RuntimeInfo,
     pub(super) nodes: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
     next_inode: u64,
 }
@@ -438,41 +439,52 @@ impl Vfs {
                     }
                 });
                 let inode = node.as_ref().map_or_else(
-                    || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+                    || {
+                        o.namespace.as_ref().map_or_else(
+                            || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+                            UtsNamespace::id,
+                        )
+                    },
                     |n| n.borrow().inode,
                 );
-                let target = match &o.kind {
-                    FdKind::Node(path) => o
-                        .node
-                        .as_ref()
-                        .and_then(|n| self.path_of(n).ok())
-                        .unwrap_or_else(|| {
-                            let mut p = path.clone();
-                            p.extend_from_slice(b" (deleted)");
-                            p
-                        }),
-                    FdKind::Terminal if o.pty.is_some() => {
-                        let end = o.pty.as_ref().expect("PTY");
-                        if end.master {
-                            b"/dev/ptmx".to_vec()
-                        } else {
-                            format!("/dev/pts/{}", end.pair.id).into_bytes()
+                let target = if let Some(ns) = &o.namespace {
+                    ns.label()
+                } else {
+                    match &o.kind {
+                        FdKind::Node(path) => o
+                            .node
+                            .as_ref()
+                            .and_then(|n| self.path_of(n).ok())
+                            .unwrap_or_else(|| {
+                                let mut p = path.clone();
+                                p.extend_from_slice(b" (deleted)");
+                                p
+                            }),
+                        FdKind::Terminal if o.pty.is_some() => {
+                            let end = o.pty.as_ref().expect("PTY");
+                            if end.master {
+                                b"/dev/ptmx".to_vec()
+                            } else {
+                                format!("/dev/pts/{}", end.pair.id).into_bytes()
+                            }
                         }
-                    }
-                    FdKind::Terminal => node
-                        .as_ref()
-                        .and_then(|n| self.path_of(n).ok())
-                        .unwrap_or_else(|| b"/dev/pts/0".to_vec()),
-                    FdKind::Anonymous => o
-                        .anonymous
-                        .as_ref()
-                        .expect("anonymous description")
-                        .name()
-                        .to_vec(),
-                    FdKind::Socket => format!("socket:[{inode}]").into_bytes(),
-                    FdKind::PipeRead | FdKind::PipeWrite => format!("pipe:[{inode}]").into_bytes(),
-                    FdKind::Stdin | FdKind::Stdout | FdKind::Stderr => {
-                        format!("pipe:[{inode}]").into_bytes()
+                        FdKind::Terminal => node
+                            .as_ref()
+                            .and_then(|n| self.path_of(n).ok())
+                            .unwrap_or_else(|| b"/dev/pts/0".to_vec()),
+                        FdKind::Anonymous => o
+                            .anonymous
+                            .as_ref()
+                            .expect("anonymous description")
+                            .name()
+                            .to_vec(),
+                        FdKind::Socket => format!("socket:[{inode}]").into_bytes(),
+                        FdKind::PipeRead | FdKind::PipeWrite => {
+                            format!("pipe:[{inode}]").into_bytes()
+                        }
+                        FdKind::Stdin | FdKind::Stdout | FdKind::Stderr => {
+                            format!("pipe:[{inode}]").into_bytes()
+                        }
                     }
                 };
                 FdInfo {
@@ -481,13 +493,16 @@ impl Vfs {
                     position: o.position,
                     flags: o.flags | if d.cloexec { O_CLOEXEC } else { 0 },
                     inode,
-                    mount_id: node.as_ref().map_or(1, |n| {
-                        if n.borrow().device == 0xfd01 {
-                            1
-                        } else {
-                            n.borrow().device
-                        }
-                    }),
+                    mount_id: node.as_ref().map_or(
+                        if o.namespace.is_some() { 17 } else { 1 },
+                        |n| {
+                            if n.borrow().device == 0xfd01 {
+                                1
+                            } else {
+                                n.borrow().device
+                            }
+                        },
+                    ),
                     socket: o.socket.as_ref().and_then(|s| s.info()),
                     open: Rc::downgrade(&d.open),
                 }
@@ -532,8 +547,20 @@ impl Vfs {
             };
             actual = format!("/proc/{}/fd/{fd}", self.pid).into_bytes();
         }
+        if let Some(ns) = self.namespace_for_path(&actual)? {
+            return Ok(Some(self.namespace_description(ns)));
+        }
         if let Some(open) = self.proc_fd_description_normalized(&actual)? {
             return Ok(Some(open));
+        }
+        if self
+            .node(&actual)
+            .is_ok_and(|n| matches!(n.borrow().content, Content::Symlink(_)))
+        {
+            let resolved = self.resolve_final(dirfd, path, true)?;
+            if let Some(ns) = self.namespace_for_path(&resolved)? {
+                return Ok(Some(self.namespace_description(ns)));
+            }
         }
         let Some((node, label)) = self.proc_exe_node_normalized(&actual)? else {
             return Ok(None);
@@ -553,6 +580,7 @@ impl Vfs {
             anonymous: None,
             local: None,
             pty: None,
+            namespace: None,
         }))))
     }
     fn proc_fd_description_normalized(
@@ -708,6 +736,7 @@ impl Vfs {
             anonymous: None,
             local: None,
             pty: original.pty.clone(),
+            namespace: original.namespace.clone(),
         };
         drop(original);
         let fd = self.available(0)?;
@@ -769,13 +798,16 @@ impl Vfs {
         } else {
             self.storage_stat()
         };
-        if o.socket.is_some()
+        if o.namespace.is_some()
+            || o.socket.is_some()
             || o.local.is_some()
             || (o.pipe.is_some() && o.node.is_none())
             || o.anonymous.is_some()
         {
             out.fill(0);
-            let magic = if o.anonymous.is_some() {
+            let magic = if o.namespace.is_some() {
+                0x6e736673u64
+            } else if o.anonymous.is_some() {
                 0x09041934u64
             } else if o.socket.is_some() || o.local.is_some() {
                 0x534f434bu64
@@ -797,6 +829,14 @@ impl Vfs {
         Ok(())
     }
     pub(super) fn pseudo_node(&self, path: &[u8]) -> Result<Option<Rc<RefCell<Node>>>> {
+        if ![b"/proc".as_slice(), b"/sys", b"/dev"].iter().any(|base| {
+            path == *base
+                || path
+                    .strip_prefix(*base)
+                    .is_some_and(|tail| tail.starts_with(b"/"))
+        }) {
+            return Ok(None);
+        }
         if !self.pseudo.borrow().enabled {
             return Ok(None);
         }
@@ -948,8 +988,8 @@ impl Vfs {
             b"/proc/sys/kernel/ostype" => return Ok(regular(b"Linux\n".to_vec())),
             b"/proc/sys/kernel/osrelease" => return Ok(regular(b"6.0.0-trames\n".to_vec())),
             b"/proc/sys/kernel/version" => return Ok(regular(b"Trames userspace runtime\n".to_vec())),
-            b"/proc/sys/kernel/hostname" => return Ok(regular(b"trames\n".to_vec())),
-            b"/proc/sys/kernel/domainname" => return Ok(regular(b"(none)\n".to_vec())),
+            b"/proc/sys/kernel/hostname" => { let mut n = self.uts_name(false); n.push(b'\n'); return Ok(regular(n)); },
+            b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(regular(n)); },
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(b"32\n".to_vec())),
             b"/proc/sys/fs/file-max" => return Ok(regular(b"8192\n".to_vec())),
@@ -992,9 +1032,12 @@ impl Vfs {
                     return Ok(directory());
                 }
                 let key = parts[i];
+                if parts.len() == i + 2 && key == b"ns" && parts[i + 1] == b"uts" {
+                    return Ok(linux_namespace::snapshot_label(&p.namespaces).and_then(link));
+                }
                 if parts.len() == i + 1 {
                     let value = match key {
-                        b"fd" | b"fdinfo" | b"net" => return Ok(directory()),
+                        b"fd" | b"fdinfo" | b"net" | b"ns" => return Ok(directory()),
                         b"cwd" => return Ok(link(p.cwd.clone())),
                         b"root" => return Ok(link(b"/".to_vec())),
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
@@ -1172,17 +1215,26 @@ impl Vfs {
                             regular(data.into_bytes())
                         }
                         b"route" => regular(if let Some(n) = info {
-                            format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0\neth0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n", u32::from_le_bytes(n.gateway4.octets())).into_bytes()
+                            if n.id == 0 {
+                                let mask = u32::MAX.checked_shl(32 - n.prefix4 as u32).unwrap_or(0);
+                                format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\neth0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\neth0\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0\n", (u32::from(n.ipv4) & mask).to_le(), mask.to_le()).into_bytes()
+                            } else {
+                                format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0\neth0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n", u32::from_le_bytes(n.gateway4.octets())).into_bytes()
+                            }
                         } else {
                             b"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n".to_vec()
                         }),
                         b"if_inet6" => regular(
                             format!(
                                 "00000000000000000000000000000001 01 80 10 80 lo\n{}",
-                                info.map_or(String::new(), |n| format!(
-                                    "{:032x} 02 40 00 80 eth0\n",
-                                    u128::from_be_bytes(n.ipv6.octets())
-                                ))
+                                info.filter(|n| !n.ipv6.is_unspecified()).map_or(
+                                    String::new(),
+                                    |n| format!(
+                                        "{:032x} 02 {:02x} 00 80 eth0\n",
+                                        u128::from_be_bytes(n.ipv6.octets()),
+                                        n.prefix6
+                                    )
+                                )
                             )
                             .into_bytes(),
                         ),
@@ -1508,6 +1560,7 @@ impl Vfs {
                             "exe",
                             "mounts",
                             "mountinfo",
+                            "ns",
                             "limits",
                             "fd",
                             "fdinfo",
@@ -1521,6 +1574,11 @@ impl Vfs {
                     }
                 }
                 if parts.len() == depth + 1 {
+                    if parts[depth] == b"ns"
+                        && linux_namespace::snapshot_label(&p.namespaces).is_some()
+                    {
+                        names.push(b"uts".to_vec());
+                    }
                     if matches!(parts[depth], b"fd" | b"fdinfo") {
                         names.extend(p.fds.iter().map(|f| f.fd.to_string().into_bytes()));
                     }

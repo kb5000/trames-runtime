@@ -69,6 +69,7 @@ impl Vfs {
                     anonymous: None,
                     local: None,
                     pty: None,
+                    namespace: None,
                 })),
                 cloexec: flags & 1 != 0,
             },
