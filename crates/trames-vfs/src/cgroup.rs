@@ -93,6 +93,7 @@ impl Cgroups {
         let inode = fs.next_inode;
         fs.next_inode += 1;
         let node = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             device: 5,
             content: if directory {
                 Content::Directory

@@ -149,6 +149,7 @@ impl Vfs {
             n.times = old_times;
             return Err(e);
         }
+        inotify::notify(&node, inotify::ATTRIB, None);
         Ok(())
     }
 }

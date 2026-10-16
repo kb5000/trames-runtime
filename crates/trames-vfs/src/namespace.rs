@@ -140,14 +140,32 @@ impl Vfs {
             }
             return Err(e);
         }
+        drop(fs);
         if let Some(n) = &target {
+            self.notification_link(&dest, n, false);
+            inotify::notify(n, inotify::ATTRIB, None);
             let mut n = n.borrow_mut();
             if n.links == 0 {
+                if matches!(n.content, Content::Directory) {
+                    n.notifications.destroy(true);
+                }
                 if let Content::File(b) = &mut n.content {
                     b.orphan(true);
                 }
             }
         }
+        let cookie = (self.open_id() as u32).max(1);
+        self.notification_entry(&source, inotify::MOVED_FROM, cookie, is_dir);
+        self.notification_entry(&dest, inotify::MOVED_TO, cookie, is_dir);
+        if let (Some((old_parent, old_name)), Some((new_parent, new_name))) = (
+            self.notification_parent(&source),
+            self.notification_parent(&dest),
+        ) {
+            inotify::move_link(&src, &old_parent, &old_name, &new_parent, &new_name);
+        }
+        src.borrow_mut()
+            .notifications
+            .send(inotify::MOVE_SELF, 0, b"", false);
         Ok(())
     }
     fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32, persistent: bool) -> Result<()> {
@@ -174,6 +192,7 @@ impl Vfs {
             n.times[2] = old_time;
             return Err(e);
         }
+        inotify::notify(&node, inotify::ATTRIB, None);
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
@@ -278,6 +297,7 @@ impl Vfs {
             node.borrow_mut().times = old;
             return Err(e);
         }
+        inotify::notify(&node, inotify::ATTRIB, None);
         Ok(())
     }
 }

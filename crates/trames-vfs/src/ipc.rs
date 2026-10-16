@@ -419,6 +419,7 @@ impl Vfs {
                     bridge: None,
                     kernel_log: None,
                     anonymous: None,
+                    notification: None,
                     local: Some(local),
                     pty: None,
                     namespace: None,

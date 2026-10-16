@@ -37,6 +37,7 @@ impl Vfs {
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             device: 16,
             content: Content::File(storage::FileData::Memory(Vec::new())),
             mode: 0o100777,
@@ -68,6 +69,7 @@ impl Vfs {
                     bridge: None,
                     kernel_log: None,
                     anonymous: None,
+                    notification: None,
                     local: None,
                     pty: None,
                     namespace: None,

@@ -7,6 +7,7 @@ mod credentials;
 mod events;
 mod executable;
 pub use executable::ExecutableFile;
+mod inotify;
 mod ipc;
 mod kernel_log;
 mod locks;
@@ -188,11 +189,17 @@ struct OpenDescription {
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
     kernel_log: Option<Rc<RefCell<kernel_log::KernelLog>>>,
     anonymous: Option<events::Anonymous>,
+    notification: Option<inotify::Close>,
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<Weak<OomTask>>,
     mount: Option<Rc<Mount>>,
+}
+impl Drop for OpenDescription {
+    fn drop(&mut self) {
+        drop(self.notification.take());
+    }
 }
 impl OpenDescription {
     fn metadata_node(&self) -> Option<Rc<RefCell<Node>>> {
@@ -217,6 +224,7 @@ enum Content {
     Socket(Weak<LocalSocket>),
 }
 struct Node {
+    notifications: inotify::Marks,
     device: u64,
     content: Content,
     mode: u32,
@@ -350,6 +358,7 @@ impl Default for Vfs {
                         bridge: None,
                         kernel_log: None,
                         anonymous: None,
+                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
@@ -488,6 +497,7 @@ impl Vfs {
                         bridge: None,
                         kernel_log: None,
                         anonymous: None,
+                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
@@ -544,6 +554,7 @@ impl Vfs {
             data.sync(false)?;
         }
         let node = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             device: path
                 .mount
                 .as_ref()
@@ -570,6 +581,14 @@ impl Vfs {
         if let Content::File(data) = &mut node.borrow_mut().content {
             data.orphan(false);
         }
+        drop(fs);
+        self.notification_link(&path, &node, true);
+        self.notification_entry(
+            &path,
+            inotify::CREATE,
+            0,
+            matches!(node.borrow().content, Content::Directory),
+        );
         Ok(())
     }
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<Rc<RefCell<Node>>> {
@@ -1042,6 +1061,10 @@ impl Vfs {
             n.mode = old_mode;
             return Err(e);
         }
+        drop(fs);
+        self.notification_link(dest, &source, true);
+        self.notification_entry(dest, inotify::CREATE, 0, false);
+        inotify::notify(&source, inotify::ATTRIB, None);
         Ok(())
     }
     pub fn executable(&self, path: &[u8]) -> Result<Vec<u8>> {
@@ -1135,11 +1158,18 @@ impl Vfs {
         fs.paths.remove(&p.key);
         if let Err(e) = fs.checkpoint() {
             node.borrow_mut().links += 1;
-            fs.paths.insert(p.key, node);
+            fs.paths.insert(p.key.clone(), node.clone());
             return Err(e);
         }
+        drop(fs);
+        self.notification_entry(&p, inotify::DELETE, 0, is_dir);
+        self.notification_link(&p, &node, false);
+        inotify::notify(&node, inotify::ATTRIB, None);
         let mut n = node.borrow_mut();
         if n.links == 0 {
+            if is_dir {
+                n.notifications.destroy(true);
+            }
             if let Content::File(data) = &mut n.content {
                 data.orphan(true);
             }
@@ -1298,6 +1328,9 @@ impl Vfs {
         }
         if flags & 0x200 != 0 {
             self.checkpoint()?;
+            if matches!(node.borrow().content, Content::File(_)) {
+                inotify::notify(&node, inotify::MODIFY, None);
+            }
         }
         if flags & O_PATH == 0
             && matches!(
@@ -1357,6 +1390,7 @@ impl Vfs {
         } else {
             None
         };
+        let notification = self.notification_open(&p, &node, flags);
         self.fds.insert(
             fd,
             Descriptor {
@@ -1383,6 +1417,7 @@ impl Vfs {
                     bridge,
                     kernel_log,
                     anonymous: None,
+                    notification,
                     local: None,
                     pty,
                     namespace: None,
@@ -1516,6 +1551,7 @@ impl Vfs {
         let p = Pipe::new(self.open_id());
         let inode = p.borrow().inode;
         p.borrow_mut().metadata = Some(Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             device: 6,
             content: Content::Null,
             mode: 0o10600,
@@ -1549,6 +1585,7 @@ impl Vfs {
                         bridge: None,
                         kernel_log: None,
                         anonymous: None,
+                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
@@ -1631,6 +1668,16 @@ impl Vfs {
         };
         if result.is_ok() {
             mounts::accessed(&mut n, o.mount.as_ref());
+        }
+        drop(n);
+        if result.as_ref().is_ok_and(|b| !b.is_empty())
+            && !(node.borrow().seals.is_some() && o.notification.is_none())
+        {
+            inotify::notify(
+                &node,
+                inotify::ACCESS,
+                o.notification.as_ref().and_then(|c| c.link.as_ref()),
+            );
         }
         result
     }
@@ -1785,6 +1832,15 @@ impl Vfs {
         }
         let synchronous = o.flags & 0x1000 != 0;
         drop(n);
+        if result.is_ok_and(|n| n != 0)
+            && !(node.borrow().seals.is_some() && o.notification.is_none())
+        {
+            inotify::notify(
+                &node,
+                inotify::MODIFY,
+                o.notification.as_ref().and_then(|c| c.link.as_ref()),
+            );
+        }
         drop(o);
         if result.is_ok() && synchronous {
             self.sync_fd(fd, false)?;
@@ -1809,7 +1865,8 @@ impl Vfs {
         if let Some(data) = self.cgroup_read(&o, offset, count)? {
             return Ok(data);
         }
-        let mut n = o.node.as_ref().ok_or(Errno(29))?.borrow_mut();
+        let node = o.node.as_ref().ok_or(Errno(29))?;
+        let mut n = node.borrow_mut();
         let result = match &n.content {
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
@@ -1821,6 +1878,16 @@ impl Vfs {
         };
         if count != 0 && result.is_ok() {
             mounts::accessed(&mut n, o.mount.as_ref());
+        }
+        drop(n);
+        if result.as_ref().is_ok_and(|b| !b.is_empty())
+            && !(node.borrow().seals.is_some() && o.notification.is_none())
+        {
+            inotify::notify(
+                node,
+                inotify::ACCESS,
+                o.notification.as_ref().and_then(|c| c.link.as_ref()),
+            );
         }
         result
     }
@@ -1844,8 +1911,8 @@ impl Vfs {
         if o.flags & 3 == 0 {
             return Err(Errno(22));
         }
-        let node = o.node.as_ref().ok_or(Errno(22))?;
-        self.pseudo_immutable(node)?;
+        let node = o.node.clone().ok_or(Errno(22))?;
+        self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let seals = n.seals;
         let Content::File(b) = &mut n.content else {
@@ -1879,8 +1946,13 @@ impl Vfs {
         n.times[1] = storage::Timestamp::now();
         n.times[2] = n.times[1];
         drop(n);
-        drop(o);
-        self.checkpoint()
+        self.checkpoint()?;
+        inotify::notify(
+            &node,
+            inotify::MODIFY,
+            o.notification.as_ref().and_then(|c| c.link.as_ref()),
+        );
+        Ok(())
     }
     pub fn truncate_at(&mut self, path: &[u8], length: u64) -> Result<()> {
         let fd = self.open_at(AT_FDCWD, path, 1, 0)?;
@@ -2058,6 +2130,7 @@ impl Vfs {
         }
         self.stat_node(
             &Node {
+                notifications: inotify::Marks::default(),
                 device: if o.namespace.is_some() {
                     17
                 } else if o.anonymous.is_some() {

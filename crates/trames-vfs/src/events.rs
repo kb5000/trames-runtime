@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
     Bpf(Rc<bpf::Program>),
+    Inotify(Rc<RefCell<inotify::Instance>>),
     Signal {
         mask: u64,
     },
@@ -45,6 +46,7 @@ impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
             Self::Bpf(_) => b"anon_inode:bpf-prog",
+            Self::Inotify(_) => b"anon_inode:inotify",
             Self::Signal { .. } => b"anon_inode:[signalfd]",
             Self::Event { .. } => b"anon_inode:[eventfd]",
             Self::Timer { .. } => b"anon_inode:[timerfd]",
@@ -84,6 +86,13 @@ impl Anonymous {
     pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
         match self {
             Self::Bpf(_) => 0,
+            Self::Inotify(i) => {
+                if i.borrow().available() != 0 {
+                    events & 1
+                } else {
+                    0
+                }
+            }
             Self::Signal { mask } => {
                 if mask & pending != 0 {
                     events & 1
@@ -121,6 +130,9 @@ impl Anonymous {
         }
     }
     pub(super) fn read(&mut self, count: usize) -> Result<Vec<u8>> {
+        if let Self::Inotify(i) = self {
+            return i.borrow_mut().read(count);
+        }
         if count < 8 {
             return Err(Errno(22));
         }
@@ -145,7 +157,9 @@ impl Anonymous {
                 }
                 std::mem::take(pending)
             }
-            Self::Bpf(_) | Self::Signal { .. } | Self::Epoll { .. } => return Err(Errno(22)),
+            Self::Bpf(_) | Self::Signal { .. } | Self::Epoll { .. } | Self::Inotify(_) => {
+                return Err(Errno(22))
+            }
         };
         Ok(value.to_le_bytes().to_vec())
     }
@@ -194,6 +208,11 @@ impl Vfs {
     }
     pub(super) fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
         let fd = self.available(0)?;
+        let access = if matches!(anonymous, Anonymous::Inotify(_)) {
+            0
+        } else {
+            2
+        };
         self.fds.insert(
             fd,
             Descriptor {
@@ -201,7 +220,7 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (0, 0),
                     kind: FdKind::Anonymous,
-                    flags: 2 | (flags & O_NONBLOCK),
+                    flags: access | (flags & O_NONBLOCK),
                     position: 0,
                     node: None,
                     pipe: None,
@@ -209,6 +228,7 @@ impl Vfs {
                     bridge: None,
                     kernel_log: None,
                     anonymous: Some(anonymous),
+                    notification: None,
                     local: None,
                     pty: None,
                     namespace: None,
@@ -332,7 +352,10 @@ impl Vfs {
             && t.local.is_none()
             && t.pipe.is_none()
             && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
-            && !matches!(t.anonymous, Some(Anonymous::Event { .. }))
+            && !matches!(
+                t.anonymous,
+                Some(Anonymous::Event { .. } | Anonymous::Inotify(_))
+            )
         {
             return Err(Errno(95));
         }
@@ -412,6 +435,9 @@ impl Vfs {
         }
         if let Some(local) = &o.local {
             return local.poll_epoch();
+        }
+        if let Some(Anonymous::Inotify(i)) = &o.anonymous {
+            return [i.borrow().epoch, 0];
         }
         if let Some(Anonymous::Event { epoch, .. }) = &o.anonymous {
             return *epoch;

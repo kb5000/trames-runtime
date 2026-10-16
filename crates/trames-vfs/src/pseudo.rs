@@ -332,6 +332,7 @@ impl PseudoFs {
         }
         self.next_inode = self.next_inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             content,
             mode,
             uid: 0,
@@ -675,6 +676,7 @@ impl Vfs {
             bridge: None,
             kernel_log: None,
             anonymous: None,
+            notification: None,
             local: None,
             pty: None,
             namespace: None,
@@ -842,6 +844,10 @@ impl Vfs {
         } else {
             original.pipe.clone()
         };
+        let notification = original
+            .node
+            .as_ref()
+            .and_then(|node| inotify::Close::reopen(node, flags, original.notification.as_ref()));
         let descriptor = OpenDescription {
             id: self.open_id(),
             owner: original.owner,
@@ -854,6 +860,7 @@ impl Vfs {
             bridge: original.bridge.clone(),
             kernel_log: None,
             anonymous: None,
+            notification,
             local: None,
             pty: original.pty.clone(),
             namespace: original.namespace.clone(),

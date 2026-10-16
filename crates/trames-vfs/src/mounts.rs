@@ -631,6 +631,7 @@ impl Vfs {
                 return Err(Errno(20));
             }
             let root = Rc::new(RefCell::new(Node {
+                notifications: inotify::Marks::default(),
                 device: 17,
                 inode: handle.id(),
                 content: Content::Null,
@@ -718,6 +719,7 @@ impl Vfs {
                     let id = new_mount_id()?;
                     let inode = id << 32;
                     let root = Rc::new(RefCell::new(Node {
+                        notifications: inotify::Marks::default(),
                         device: id,
                         content: Content::Directory,
                         mode: 0o40000 | mode,

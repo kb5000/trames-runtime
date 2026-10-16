@@ -978,3 +978,30 @@ fn named_socket_inodes_reopen_as_stale_endpoints() {
         Err(Errno(111))
     );
 }
+
+#[test]
+fn reopened_inode_watches_keep_parent_identity_and_failed_transactions_are_silent() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/watched", 0o700).unwrap();
+    v.import_file(b"/watched/file", b"data".to_vec()).unwrap();
+    drop(v);
+    let mut v = dir.open();
+    let fd = v.inotify_init(O_NONBLOCK).unwrap();
+    let wd = v
+        .inotify_add(fd, b"/watched", inotify::ACCESS | inotify::CREATE)
+        .unwrap();
+    let file = v.open_at(AT_FDCWD, b"/watched/file", 0, 0).unwrap();
+    assert_eq!(v.read(file, 4).unwrap(), b"data");
+    let bytes = v.read(fd, 128).unwrap();
+    assert_eq!(i32::from_le_bytes(bytes[..4].try_into().unwrap()), wd);
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        inotify::ACCESS
+    );
+    assert_eq!(&bytes[16..21], b"file\0");
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v.mkdir_at(AT_FDCWD, b"/watched/failed", 0o700).is_err());
+    assert_eq!(v.read(fd, 128), Err(Errno(11)));
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+}

@@ -629,6 +629,15 @@ impl Linux {
                     .epoll_ctl(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
                 Ok(0)
             }
+            26 => Ok(self.vfs.inotify_init(a[0] as u32)? as u64),
+            27 => {
+                let path = Self::path(memory, a[1])?;
+                Ok(self.vfs.inotify_add(a[0] as u32, &path, a[2] as u32)? as u64)
+            }
+            28 => {
+                self.vfs.inotify_remove(a[0] as u32, a[1] as i32)?;
+                Ok(0)
+            }
             32 => {
                 self.vfs.flock(a[0] as u32, a[1] as u32)?;
                 Ok(0)
@@ -938,6 +947,14 @@ impl Linux {
             29 => {
                 if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
                     return Err(Errno(9));
+                }
+                if a[1] as u32 == 0x541b {
+                    if let Some(bytes) = self.vfs.inotify_available(a[0] as u32)? {
+                        memory
+                            .write(a[2], &(bytes as u32).to_le_bytes())
+                            .map_err(|_| Errno(14))?;
+                        return Ok(0);
+                    }
                 }
                 if a[1] as u32 == 0x5421 {
                     let flags = self.vfs.flags(a[0] as u32)? & (3 | 0x400 | O_NONBLOCK);

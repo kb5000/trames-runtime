@@ -318,6 +318,7 @@ impl Vfs {
             (n.uid, n.gid, n.mode, n.times[2]) = old;
             return Err(error);
         }
+        inotify::notify(&node, inotify::ATTRIB, None);
         Ok(())
     }
     pub fn chown_at(

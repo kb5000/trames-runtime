@@ -248,6 +248,7 @@ impl Vfs {
                     bridge: None,
                     kernel_log: None,
                     anonymous: None,
+                    notification: None,
                     local: None,
                     namespace: None,
                     oom: None,
@@ -337,6 +338,7 @@ impl Devpts {
     ) -> Rc<RefCell<Node>> {
         let mut fs = self.fs.borrow_mut();
         let node = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             inode: fs.next_inode,
             device: self.device,
             content,

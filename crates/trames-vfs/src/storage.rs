@@ -630,6 +630,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         nodes.insert(
             ino,
             Rc::new(RefCell::new(Node {
+                notifications: inotify::Marks::default(),
                 device: 0xfd01,
                 content,
                 mode,
@@ -741,6 +742,18 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         return Err(Errno(22));
     }
     disk.recover(&nodes)?;
+    for (path, node) in &paths {
+        if path == b"/" {
+            continue;
+        }
+        let at = path
+            .iter()
+            .rposition(|&b| b == b'/')
+            .expect("absolute path");
+        if let Some(parent) = paths.get(&path[..at.max(1)]) {
+            inotify::link(node, parent, &path[at + 1..]);
+        }
+    }
     Ok(Filesystem {
         flock: BTreeMap::new(),
         record_locks: BTreeMap::new(),
@@ -816,6 +829,7 @@ impl Vfs {
         }
         let links = old.borrow().links;
         let new = Rc::new(RefCell::new(Node {
+            notifications: inotify::Marks::default(),
             device: 0xfd01,
             content: Content::File(data),
             mode: 0o100755,
