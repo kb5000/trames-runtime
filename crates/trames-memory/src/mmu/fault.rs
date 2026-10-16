@@ -109,15 +109,63 @@ extern "C" fn handle(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             default.sa_sigaction = libc::SIG_DFL;
             libc::sigemptyset(&mut default.sa_mask);
             libc::sigaction(signal, &default, std::ptr::null_mut());
+            // A forwarding dispatcher may have blocked this signal. Unblock
+            // before redelivery so Darwin/Linux cannot return with it pending.
+            libc::sigaddset(&mut default.sa_mask, signal);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &default.sa_mask, std::ptr::null_mut());
             libc::raise(signal);
-        } else if old.sa_flags & libc::SA_SIGINFO != 0 {
-            let callback: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
-                std::mem::transmute(old.sa_sigaction);
-            callback(signal, info, context);
         } else {
-            let callback: extern "C" fn(i32) = std::mem::transmute(old.sa_sigaction);
-            callback(signal);
+            // Interposed signal dispatchers (including TSan) may invoke us with
+            // their own mask. Establish the previous handler's POSIX mask from
+            // the interrupted context, then restore our caller's mask on return.
+            let mut saved: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut saved);
+            let original = if context.is_null() {
+                &raw const saved
+            } else {
+                context_mask(context)
+            };
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            let maximum = if cfg!(target_vendor = "apple") {
+                31
+            } else {
+                64
+            };
+            for number in 1..=maximum {
+                if libc::sigismember(original, number) == 1
+                    || libc::sigismember(&old.sa_mask, number) == 1
+                {
+                    libc::sigaddset(&mut mask, number);
+                }
+            }
+            if old.sa_flags & libc::SA_NODEFER == 0 {
+                libc::sigaddset(&mut mask, signal);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+            if old.sa_flags & libc::SA_SIGINFO != 0 {
+                let callback: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
+                    std::mem::transmute(old.sa_sigaction);
+                callback(signal, info, context);
+            } else {
+                let callback: extern "C" fn(i32) = std::mem::transmute(old.sa_sigaction);
+                callback(signal);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut());
         }
+    }
+}
+
+unsafe fn context_mask(context: *mut libc::c_void) -> *const libc::sigset_t {
+    #[cfg(target_os = "linux")]
+    // SAFETY: same kernel-provided ucontext as context_pc; passing its address
+    // avoids reading unused platform sigset padding as initialized Rust values.
+    unsafe {
+        &raw const (*context.cast::<libc::ucontext_t>()).uc_sigmask
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        &raw const (*context.cast::<DarwinContext>()).mask
     }
 }
 

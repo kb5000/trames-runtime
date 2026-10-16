@@ -203,7 +203,7 @@ impl Frozen {
             (window, hint.bias)
         };
         let offset = (address - window.base) as usize;
-        let state = window.flags[offset / window.granule].load(Ordering::Relaxed);
+        let state = window.flags[offset >> window.shift].load(Ordering::Relaxed);
         if state & ELIGIBLE == 0 || (write && state & CODE != 0) {
             return None;
         }

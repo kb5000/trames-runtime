@@ -166,6 +166,8 @@ fn unrelated_host_faults_keep_default_or_preexisting_signal_behavior() {
     }
     assert_eq!(probe("default").signal(), Some(libc::SIGSEGV));
     assert!(probe("chain").success());
+    let mask = probe("mask");
+    assert!(mask.success(), "{mask:?}");
     assert_eq!(probe("reset").signal(), Some(libc::SIGSEGV));
 }
 #[test]
@@ -174,17 +176,19 @@ fn signal_probe_child() {
         return;
     };
     static SEEN: AtomicUsize = AtomicUsize::new(0);
+    static CHECK_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     extern "C" fn previous(_: i32) {
         // SAFETY: sigprocmask/sigismember are async-signal-safe. Record masks
         // without assertions, formatting, allocation or panic in the callback.
         unsafe {
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask);
-            if libc::sigismember(&mask, libc::SIGUSR1) == 1
-                && libc::sigismember(&mask, libc::SIGSEGV) == 0
-            {
-                SEEN.fetch_add(1, Ordering::Relaxed);
+            if CHECK_MASK.load(Ordering::Relaxed) {
+                let correct = libc::sigismember(&mask, libc::SIGUSR1) == 1
+                    && libc::sigismember(&mask, libc::SIGSEGV) == 0;
+                libc::_exit(if correct { 0 } else { 1 });
             }
+            SEEN.fetch_add(1, Ordering::Relaxed);
         }
     }
     // SAFETY: isolated subprocess; the expected crash cannot affect the runner.
@@ -198,7 +202,8 @@ fn signal_probe_child() {
         );
         let mut action: libc::sigaction = std::mem::zeroed();
         libc::sigemptyset(&mut action.sa_mask);
-        if mode == "chain" || mode == "reset" {
+        CHECK_MASK.store(mode == "mask", Ordering::Relaxed);
+        if mode == "chain" || mode == "reset" || mode == "mask" {
             action.sa_sigaction = previous as *const () as usize;
             libc::sigaddset(&mut action.sa_mask, libc::SIGUSR1);
             action.sa_flags = libc::SA_NODEFER
@@ -223,7 +228,9 @@ fn signal_probe_child() {
             bytes.as_mut_ptr()
         ));
         assert_eq!(SEEN.load(Ordering::Relaxed), 0);
-        if mode == "default" {
+        if mode == "default" || mode == "mask" {
+            // A synchronous hardware fault preserves the OS handler mask even
+            // under TSan, whose deferred user-signal dispatcher changes masks.
             access::access::<8>(false, std::ptr::null_mut(), bytes.as_mut_ptr());
             panic!("non-arena fault was incorrectly swallowed");
         } else {
@@ -236,7 +243,10 @@ fn signal_probe_child() {
             ));
             if mode == "reset" {
                 libc::raise(libc::SIGSEGV);
-                panic!("one-shot handler was not reset");
+                panic!(
+                    "one-shot handler returned; callback count={}",
+                    SEEN.load(Ordering::Relaxed)
+                );
             }
         }
     }

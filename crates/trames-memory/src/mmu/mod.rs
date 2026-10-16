@@ -98,6 +98,7 @@ pub(crate) struct Window {
     frames: Box<[AtomicUsize]>,
     initialized: Box<[AtomicBool]>,
     granule: usize,
+    shift: u32,
 }
 impl Window {
     fn new(base: u64, granule: usize) -> Option<Self> {
@@ -105,6 +106,7 @@ impl Window {
             base,
             mapping: Arc::new(host::Mapping::new()?),
             granule,
+            shift: granule.trailing_zeros(),
             flags: (0..WINDOW / granule).map(|_| AtomicU8::new(0)).collect(),
             frames: (0..WINDOW / P)
                 .map(|_| AtomicUsize::new(usize::MAX))
@@ -256,7 +258,7 @@ impl Arena {
     #[inline]
     fn ready(&self, address: u64) -> bool {
         self.reached(address).is_some_and(|window| {
-            window.flags[(address - window.base) as usize / window.granule].load(Ordering::Relaxed)
+            window.flags[(address - window.base) as usize >> window.shift].load(Ordering::Relaxed)
                 & ELIGIBLE
                 != 0
         })
@@ -279,7 +281,7 @@ impl Arena {
             return None;
         }
         let offset = (address - window.base) as usize;
-        if window.flags[offset / window.granule].load(Ordering::Relaxed) & ELIGIBLE == 0 {
+        if window.flags[offset >> window.shift].load(Ordering::Relaxed) & ELIGIBLE == 0 {
             return None;
         }
         let mut bytes = [0; N];
@@ -321,7 +323,7 @@ impl Arena {
             return None;
         }
         let offset = (address - window.base) as usize;
-        let state = window.flags[offset / window.granule].load(Ordering::Relaxed);
+        let state = window.flags[offset >> window.shift].load(Ordering::Relaxed);
         if state & (ELIGIBLE | CODE) != ELIGIBLE {
             return None;
         }
