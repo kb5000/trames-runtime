@@ -2,7 +2,7 @@
 //! Host-owned shared storage. Mappings retain physical storage while logical
 //! truncate/EOF remains a guest file property. No host pathname reaches guests.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io,
     os::{
@@ -11,7 +11,7 @@ use std::{
     },
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, Weak,
     },
 };
@@ -20,8 +20,25 @@ pub const MAX_SHARED_BYTES: usize = 128 * 1024 * 1024;
 const MAP_BLOCK: usize = 65536;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 type Key = (u64, u64);
-fn registry() -> &'static Mutex<BTreeMap<Key, Weak<Inner>>> {
-    static FILES: OnceLock<Mutex<BTreeMap<Key, Weak<Inner>>>> = OnceLock::new();
+struct Entry {
+    owner: Weak<Inner>,
+    transfers: VecDeque<Weak<Transfer>>,
+}
+struct Transfer {
+    _file: SharedFile,
+    claimed: AtomicBool,
+}
+/// Keeps the original inode, logical EOF and budget through an in-flight FD.
+/// The receiving service retains this until import acknowledgement or disconnect.
+#[derive(Clone)]
+pub struct ExportLease(Arc<Transfer>);
+impl ExportLease {
+    pub fn claimed(&self) -> bool {
+        self.0.claimed.load(Ordering::Acquire)
+    }
+}
+fn registry() -> &'static Mutex<BTreeMap<Key, Entry>> {
+    static FILES: OnceLock<Mutex<BTreeMap<Key, Entry>>> = OnceLock::new();
     FILES.get_or_init(Mutex::default)
 }
 fn invalid() -> io::Error {
@@ -146,10 +163,21 @@ impl SharedFile {
         }
         let key = (stat.dev(), stat.ino());
         let mut registry = registry().lock().map_err(lock_error)?;
-        if let Some(owner) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(Self(owner));
+        if let Some(entry) = registry.get_mut(&key) {
+            if let Some(owner) = entry.owner.upgrade() {
+                // One acknowledgement per delivered FD, even when the same inode
+                // is exported several times or across independent connections.
+                while let Some(weak) = entry.transfers.pop_front() {
+                    if let Some(lease) = weak.upgrade() {
+                        if !lease.claimed.swap(true, Ordering::AcqRel) {
+                            break;
+                        }
+                    }
+                }
+                return Ok(Self(owner));
+            }
         }
-        registry.retain(|_, owner| owner.strong_count() != 0);
+        registry.retain(|_, entry| entry.owner.strong_count() != 0);
         let size = stat.len() as usize;
         let capacity = round(size, host_page())?;
         budget.reserve(capacity)?;
@@ -163,7 +191,13 @@ impl SharedFile {
             resize: Mutex::default(),
             mappings: Mutex::default(),
         });
-        registry.insert(key, Arc::downgrade(&owner));
+        registry.insert(
+            key,
+            Entry {
+                owner: Arc::downgrade(&owner),
+                transfers: VecDeque::new(),
+            },
+        );
         Ok(Self(owner))
     }
     /// Import an FD delivered by the native bridge. Known inodes recover their
@@ -173,6 +207,18 @@ impl SharedFile {
     }
     pub fn duplicate_fd(&self) -> io::Result<OwnedFd> {
         self.0.file.as_fd().try_clone_to_owned()
+    }
+    pub fn export(&self) -> io::Result<(OwnedFd, ExportLease)> {
+        let fd = self.duplicate_fd()?;
+        let lease = Arc::new(Transfer {
+            _file: self.clone(),
+            claimed: AtomicBool::new(false),
+        });
+        let mut registry = registry().lock().map_err(lock_error)?;
+        let entry = registry.get_mut(&self.key()).ok_or_else(invalid)?;
+        entry.transfers.retain(|weak| weak.strong_count() != 0);
+        entry.transfers.push_back(Arc::downgrade(&lease));
+        Ok((fd, ExportLease(lease)))
     }
     pub fn key(&self) -> Key {
         self.0.key
@@ -361,6 +407,31 @@ impl Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn in_flight_fds_preserve_logical_eof_and_budget_before_receiver_import() {
+        let budget = SharedBudget::new(host_page());
+        let file = SharedFile::anonymous_in(budget.clone()).unwrap();
+        file.write_at(0, b"abc").unwrap();
+        let (cancelled_fd, cancelled) = file.export().unwrap();
+        let (fd, lease) = file.export().unwrap();
+        drop(cancelled_fd);
+        drop(cancelled);
+        drop(file);
+        assert_eq!(budget.available(), 0);
+        let native = SharedFile::import(fd).unwrap();
+        assert!(lease.claimed());
+        assert_eq!(native.len(), 3);
+        assert_eq!(native.read_at(0, 8).unwrap(), b"abc");
+        drop(lease);
+        assert_eq!(budget.available(), 0);
+        // Import recovers the same managed inode, including its resize ownership.
+        native.set_len(4).unwrap();
+        let mapping = native.map(0, 4).unwrap();
+        drop(native);
+        assert_eq!(budget.available(), 0);
+        drop(mapping);
+        assert_eq!(budget.available(), host_page());
+    }
     #[test]
     fn fd_import_and_independent_mappings_share_the_original_inode_bytes() {
         let file = SharedFile::anonymous().unwrap();

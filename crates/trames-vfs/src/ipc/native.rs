@@ -10,6 +10,8 @@ struct Outgoing {
     bytes: Vec<u8>,
     fds: Vec<OwnedFd>,
     done: usize,
+    leases: Vec<trames_shared::ExportLease>,
+    registered: bool,
 }
 struct Incoming {
     bytes: Vec<u8>,
@@ -23,6 +25,7 @@ struct Connection {
     owner: (u32, u32),
     outgoing: Option<Outgoing>,
     incoming: Option<Incoming>,
+    exports: Vec<trames_shared::ExportLease>,
 }
 pub(crate) struct Services {
     server: Server,
@@ -59,6 +62,7 @@ impl Services {
                             owner: (uid, gid),
                             outgoing: None,
                             incoming: None,
+                            exports: Vec::new(),
                         });
                         progress = true;
                     }
@@ -67,7 +71,7 @@ impl Services {
             }
         }
         self.connections
-            .retain_mut(|connection| match connection.pump(vfs) {
+            .retain_mut(|connection| match connection.pump(vfs, &self.server) {
                 Ok(changed) => {
                     progress |= changed;
                     true
@@ -89,17 +93,21 @@ impl Services {
     }
 }
 impl Connection {
-    fn pump(&mut self, vfs: &Vfs) -> Result<bool> {
+    fn pump(&mut self, vfs: &Vfs, server: &Server) -> Result<bool> {
         let mut progress = false;
+        self.exports.retain(|lease| !lease.claimed());
         for _ in 0..16 {
             if self.outgoing.is_none() {
+                if self.exports.len() >= 64 {
+                    break;
+                }
                 match self.local.recv(MAX_BYTES_OUT, 0x40) {
                     Ok(packet) if packet.data.is_empty() => return Err(Errno(32)),
                     Ok(packet) => {
                         if packet.rights.0.len() > MAX_FDS_OUT {
                             return Err(Errno(90));
                         }
-                        let fds = packet
+                        let exported = packet
                             .rights
                             .0
                             .iter()
@@ -114,14 +122,17 @@ impl Connection {
                                 };
                                 data.shared_file()
                                     .ok_or(Errno(95))?
-                                    .duplicate_fd()
+                                    .export()
                                     .map_err(io_errno)
                             })
                             .collect::<Result<Vec<_>>>()?;
+                        let (fds, leases) = exported.into_iter().unzip();
                         self.outgoing = Some(Outgoing {
                             bytes: packet.data,
                             fds,
                             done: 0,
+                            leases,
+                            registered: false,
                         });
                     }
                     Err(Errno(11)) => break,
@@ -129,6 +140,16 @@ impl Connection {
                 }
             }
             let packet = self.outgoing.as_mut().unwrap();
+            if !packet.registered {
+                if !packet.leases.is_empty() {
+                    match server.retain_exports(self.token, packet.leases.clone()) {
+                        Ok(()) => self.exports.append(&mut packet.leases),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(io_errno(e)),
+                    }
+                }
+                packet.registered = true;
+            }
             match self
                 .native
                 .send_msg(&packet.bytes[packet.done..], &packet.fds)

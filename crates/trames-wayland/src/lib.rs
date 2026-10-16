@@ -30,6 +30,8 @@ impl ClientData for ClientIdentity {}
 pub struct Compositor {
     display: Display<State>,
     state: State,
+    clients: std::collections::BTreeMap<u64, wayland_server::Client>,
+    exports: Vec<(u64, trames_shared::ExportLease)>,
 }
 struct State {
     next: u64,
@@ -59,7 +61,12 @@ impl Compositor {
         State::globals(&display.handle());
         let mut state = State::default();
         state.initialize_input()?;
-        Ok(Self { display, state })
+        Ok(Self {
+            display,
+            state,
+            clients: Default::default(),
+            exports: Vec::new(),
+        })
     }
     pub fn windows(&self) -> Vec<WindowSnapshot> {
         scene::snapshot(&self.state.surfaces)
@@ -142,15 +149,33 @@ impl Compositor {
         }
     }
     pub fn connect(&mut self, stream: UnixStream, identity: ClientIdentity) -> io::Result<()> {
-        self.display
+        let client = self
+            .display
             .handle()
             .insert_client(stream, Arc::new(identity))?;
+        self.clients.insert(identity.connection, client);
         Ok(())
+    }
+    pub(crate) fn retain_exports(
+        &mut self,
+        connection: u64,
+        leases: Vec<trames_shared::ExportLease>,
+    ) {
+        if self.clients.contains_key(&connection) {
+            self.exports
+                .extend(leases.into_iter().map(|lease| (connection, lease)));
+        }
     }
     /// Nonblocking protocol progress. Native event-loop integration owns polling.
     pub fn dispatch(&mut self) -> io::Result<usize> {
         let count = self.display.dispatch_clients(&mut self.state)?;
         self.display.flush_clients()?;
+        let handle = self.display.handle().backend_handle();
+        self.clients
+            .retain(|_, client| handle.get_client_data(client.id()).is_ok());
+        self.exports.retain(|(connection, lease)| {
+            self.clients.contains_key(connection) && !lease.claimed()
+        });
         Ok(count)
     }
 }
@@ -159,6 +184,26 @@ impl Compositor {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    #[test]
+    fn disconnected_clients_cancel_unconsumed_shared_fd_transfers() {
+        let server = Server::new().unwrap();
+        let (connection, socket) = server.connect(1, 0, 0).unwrap();
+        let budget = trames_shared::SharedBudget::new(65536);
+        let file = trames_shared::SharedFile::anonymous_in(budget.clone()).unwrap();
+        file.set_len(65536).unwrap();
+        let (fd, lease) = file.export().unwrap();
+        drop(file);
+        drop(fd);
+        server.retain_exports(connection, vec![lease]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(budget.available(), 0);
+        drop(socket);
+        let began = std::time::Instant::now();
+        while budget.available() != 65536 {
+            assert!(began.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     #[test]
     fn standard_display_sync_replies_and_preserves_connection_identity() {
         let mut compositor = Compositor::new().unwrap();

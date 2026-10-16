@@ -39,6 +39,7 @@ enum Command {
     Input(InputEvent),
     Text(TextEdit),
     Gpu(u64, Arc<dyn GpuImage>),
+    Exports(u64, Vec<trames_shared::ExportLease>),
     Stop,
 }
 struct Control {
@@ -146,6 +147,13 @@ impl Server {
     pub fn edit_text(&self, edit: TextEdit) -> io::Result<()> {
         self.0.send(Command::Text(edit))
     }
+    pub fn retain_exports(
+        &self,
+        connection: u64,
+        leases: Vec<trames_shared::ExportLease>,
+    ) -> io::Result<()> {
+        self.0.send(Command::Exports(connection, leases))
+    }
     pub fn present_gpu(&self, surface: u64, image: Arc<dyn GpuImage>) -> io::Result<()> {
         self.0.send(Command::Gpu(surface, image))
     }
@@ -180,6 +188,9 @@ fn run(
                 Command::Input(event) => compositor.state.input(event),
                 Command::Text(edit) => compositor.state.text_edit(edit),
                 Command::Gpu(id, image) => compositor.state.enqueue_gpu(id, image),
+                Command::Exports(connection, leases) => {
+                    compositor.retain_exports(connection, leases)
+                }
                 Command::Stop => stopped = true,
             }
         }
