@@ -543,6 +543,7 @@ dependencies = [
  "trames-net",
  "trames-vfs",
  "trames-vulkan",
+ "trames-wayland",
 ]
 
 [[package]]

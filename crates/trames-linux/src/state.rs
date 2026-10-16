@@ -696,6 +696,10 @@ impl Linux {
                 self.vfs.truncate_fd(a[0] as u32, a[1])?;
                 Ok(0)
             }
+            47 => {
+                self.vfs.allocate_fd(a[0] as u32, a[1], a[2], a[3])?;
+                Ok(0)
+            }
             52 => {
                 self.vfs.chmod_fd(a[0] as u32, a[1] as u32)?;
                 Ok(0)

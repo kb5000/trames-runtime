@@ -160,7 +160,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                     init.post_error(id, 5u32, "incomplete popup positioner");
                     return;
                 }
-                if !state.surfaces.contains_key(&parent.0) || parent.0 == key.0 {
+                if !state.surfaces.contains_key(&parent.0) || state.is_descendant(parent.0, key.0) {
                     init.post_error(id, 3u32, "invalid popup parent");
                     return;
                 }

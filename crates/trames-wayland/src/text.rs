@@ -25,6 +25,7 @@ pub struct TextContext {
 }
 #[derive(Clone, Debug, Default)]
 pub struct TextEdit {
+    pub serial: u32,
     pub context: u64,
     pub epoch: u64,
     pub preedit: Option<(String, i32, i32)>,
@@ -50,6 +51,7 @@ struct Object {
     connection: u64,
     surface: Option<u64>,
     entered: bool,
+    ready: bool,
     enabled: bool,
     pending_enabled: Option<bool>,
     serial: u32,
@@ -87,6 +89,7 @@ impl State {
                     }
                 }
                 o.entered = false;
+                o.ready = false;
                 o.enabled = false;
                 o.pending_enabled = None;
             }
@@ -127,7 +130,7 @@ impl State {
             .objects
             .iter()
             .rev()
-            .find(|(_, o)| o.entered && o.enabled && o.surface == self.seat.focus)?;
+            .find(|(_, o)| o.entered && o.ready && o.enabled && o.surface == self.seat.focus)?;
         let surface = o.surface?;
         let mut window = surface;
         for _ in 0..256 {
@@ -138,6 +141,20 @@ impl State {
                 break;
             }
         }
+        let mut caret = o.state.caret;
+        if let Some(origin) = crate::scene::snapshot(&self.surfaces)
+            .iter()
+            .find(|w| w.id == window)
+            .and_then(|w| {
+                w.scene
+                    .iter()
+                    .find(|s| s.surface == surface)
+                    .map(|s| (s.x, s.y))
+            })
+        {
+            caret[0] = caret[0].saturating_add(origin.0);
+            caret[1] = caret[1].saturating_add(origin.1);
+        }
         Some(TextContext {
             id,
             epoch: o.epoch,
@@ -147,7 +164,7 @@ impl State {
             text: o.state.text.clone(),
             cursor: o.state.cursor,
             anchor: o.state.anchor,
-            caret: o.state.caret,
+            caret,
             hint: o.state.hint,
             purpose: o.state.purpose,
         })
@@ -169,14 +186,12 @@ impl State {
         {
             return;
         }
-        if edit.delete_before > context.cursor
-            || edit.delete_after > context.text.len() as u32 - context.cursor
-        {
-            return;
-        }
-        let before = (context.cursor - edit.delete_before) as usize;
-        let after = (context.cursor + edit.delete_after) as usize;
-        if !context.text.is_char_boundary(before) || !context.text.is_char_boundary(after) {
+        // Delete lengths refer to UIKit's current local document, which can
+        // include previous input events not yet acknowledged by the client.
+        // Rechecking against an older surrounding-text snapshot drops legitimate
+        // rapid edits. Preserve the originating client serial on the wire; the
+        // client applies its own reset/serial rules, as on a native compositor.
+        if edit.delete_before > 4096 || edit.delete_after > 4096 {
             return;
         }
         if let Some((s, start, end)) = &edit.preedit {
@@ -201,7 +216,7 @@ impl State {
                 if let Some((s, start, end)) = edit.preedit {
                     r.preedit_string(Some(s), start, end);
                 }
-                r.done(o.serial);
+                r.done(edit.serial);
             }
             Protocol::V1(r) => {
                 if edit.delete_before != 0 || edit.delete_after != 0 {
@@ -212,10 +227,10 @@ impl State {
                 }
                 if let Some((s, start, _)) = edit.preedit {
                     r.preedit_cursor(start);
-                    r.preedit_string(o.serial, s, String::new());
+                    r.preedit_string(edit.serial, s, String::new());
                 }
                 if let Some(s) = edit.commit {
-                    r.commit_string(o.serial, s);
+                    r.commit_string(edit.serial, s);
                 }
             }
         }
@@ -227,6 +242,7 @@ impl State {
             connection,
             surface: None,
             entered: false,
+            ready: false,
             enabled: false,
             pending_enabled: None,
             serial: 0,
@@ -384,6 +400,7 @@ impl Dispatch<t3::ZwpTextInputV3, TextKey> for State {
                     o.epoch = state.text.epoch;
                 }
                 o.state = o.pending.clone();
+                o.ready = o.entered && o.enabled;
             }
             t3::Request::Destroy => {
                 state.text.objects.remove(&key.0);
@@ -427,6 +444,7 @@ impl Dispatch<t1::ZwpTextInputV1, TextKey> for State {
                 }
                 o.surface = id;
                 o.enabled = true;
+                o.ready = false;
                 state.text.epoch = state.text.epoch.wrapping_add(1);
                 o.epoch = state.text.epoch;
                 if id == state.seat.focus {
@@ -440,6 +458,7 @@ impl Dispatch<t1::ZwpTextInputV1, TextKey> for State {
                     r.leave();
                 }
                 o.entered = false;
+                o.ready = false;
                 o.enabled = false;
             }
             t1::Request::SetSurroundingText {
@@ -465,6 +484,7 @@ impl Dispatch<t1::ZwpTextInputV1, TextKey> for State {
             t1::Request::CommitState { serial } => {
                 o.serial = serial;
                 o.state = o.pending.clone();
+                o.ready = o.entered && o.enabled;
             }
             t1::Request::ShowInputPanel => r.input_panel_state(1),
             t1::Request::HideInputPanel => r.input_panel_state(0),

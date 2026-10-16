@@ -94,6 +94,24 @@ impl Server {
     pub fn connect(&self, pid: u32, uid: u32, gid: u32) -> io::Result<(u64, UnixStream)> {
         let (guest, server) = UnixStream::pair()?;
         guest.set_nonblocking(true)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let enabled = 1i32;
+            // SAFETY: a live owned Unix socket and a scoped i32 option value.
+            // C client peers on Darwin use SO_NOSIGPIPE instead of MSG_NOSIGNAL.
+            if unsafe {
+                libc::setsockopt(
+                    guest.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&enabled as *const i32).cast(),
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let connection = self.0.next.fetch_add(1, Ordering::Relaxed);
         self.0.send(Command::Connect(
             server,

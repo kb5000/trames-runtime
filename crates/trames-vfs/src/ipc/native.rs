@@ -72,7 +72,18 @@ impl Services {
                     progress |= changed;
                     true
                 }
-                Err(_) => false,
+                Err(e) => {
+                    if e.0 != 32 {
+                        vfs.log(
+                            4,
+                            &format!(
+                                "wayland bridge connection={} errno={}",
+                                connection.token, e.0
+                            ),
+                        );
+                    }
+                    false
+                }
             });
         progress
     }
@@ -236,7 +247,10 @@ impl Vfs {
         services.is_some_and(|services| services.borrow_mut().pump(self))
     }
     pub fn has_native_services(&self) -> bool {
-        self.native_services.borrow().is_some()
+        self.native_services
+            .borrow()
+            .as_ref()
+            .is_some_and(|services| !services.borrow().connections.is_empty())
     }
     /// Resolve an authenticated Wayland connection from a live guest descriptor.
     pub fn wayland_connection(&self, fd: u32) -> Result<(Server, u64)> {

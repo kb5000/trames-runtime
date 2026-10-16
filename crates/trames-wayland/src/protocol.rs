@@ -21,6 +21,7 @@ impl State {
         crate::shell::globals(handle);
         crate::input::globals(handle);
         crate::text::globals(handle);
+        crate::subsurface::globals(handle);
     }
     pub fn id(&mut self) -> u64 {
         let id = self.next;
@@ -34,6 +35,23 @@ impl State {
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn commit(&mut self, id: u64) {
+        let synchronized = self.effectively_synchronized(id);
+        let Some(s) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        let pending = s.take_pending();
+        if synchronized {
+            if let Some(cached) = &mut s.cached {
+                cached.merge(pending);
+            } else {
+                s.cached = Some(pending);
+            }
+            return;
+        }
+        self.apply_commit(id, pending);
+        self.apply_children(id);
+    }
+    pub(crate) fn apply_commit(&mut self, id: u64, pending: CachedCommit) {
         let needs_configure = self
             .surfaces
             .get(&id)
@@ -44,30 +62,46 @@ impl State {
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
         };
-        if let Some(attachment) = s.pending_buffer.take() {
+        if let Some(attachment) = pending.buffer {
             if attachment.is_some() && s.xdg.is_some() && !s.acknowledged {
                 if let Some(xdg) = &s.xdg {
                     xdg.post_error(3u32, "buffer committed before configure acknowledgement");
                 }
                 return;
             }
-            s.current = attachment.and_then(BufferLease::acquire);
+            s.current = attachment;
         }
-        s.scale = s.pending_scale;
-        if let Some(geometry) = s.pending_geometry.take() {
+        s.scale = pending.scale;
+        s.transform = pending.transform;
+        if let Some(input) = pending.input {
+            s.input = input;
+        }
+        if let Some((x, y)) = pending.offset {
+            s.offset = (s.offset.0.saturating_add(x), s.offset.1.saturating_add(y));
+        }
+        if let Some(geometry) = pending.geometry {
             s.geometry = Some(geometry);
         }
         if let Some(buffer) = &s.current {
-            s.size = s.geometry.map(|(_, _, w, h)| (w, h)).unwrap_or((
-                buffer.pixels.width / s.scale as u32,
-                buffer.pixels.height / s.scale as u32,
-            ));
+            let (w, h) = if s.transform & 1 != 0 {
+                (buffer.pixels.height, buffer.pixels.width)
+            } else {
+                (buffer.pixels.width, buffer.pixels.height)
+            };
+            if !w.is_multiple_of(s.scale as u32) || !h.is_multiple_of(s.scale as u32) {
+                s.resource
+                    .post_error(2u32, "buffer dimensions must be a multiple of scale");
+                return;
+            }
+            s.size = s
+                .geometry
+                .map(|(_, _, w, h)| (w, h))
+                .unwrap_or((w / s.scale as u32, h / s.scale as u32));
         }
         self.revision = self.revision.wrapping_add(1);
         s.revision = self.revision;
-        if !s.pending_callbacks.is_empty() {
-            s.callbacks
-                .push_back((s.revision, std::mem::take(&mut s.pending_callbacks)));
+        if !pending.callbacks.is_empty() {
+            s.callbacks.push_back((s.revision, pending.callbacks));
         }
     }
 }
@@ -110,31 +144,48 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
                 state.changed();
             }
             wl_compositor::Request::CreateRegion { id } => {
-                init.init(id, ());
+                init.init(id, Mutex::new(Region::default()));
             }
             _ => r.post_error(0u32, "unsupported compositor request"),
         }
     }
 }
-impl Dispatch<wl_region::WlRegion, ()> for State {
+impl Dispatch<wl_region::WlRegion, Mutex<Region>> for State {
     fn request(
         _: &mut Self,
         _: &Client,
         r: &wl_region::WlRegion,
         request: wl_region::Request,
-        _: &(),
+        data: &Mutex<Region>,
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wl_region::Request::Destroy => {}
-            wl_region::Request::Add { width, height, .. }
-            | wl_region::Request::Subtract { width, height, .. } => {
-                if width < 0 || height < 0 {
-                    r.post_error(0u32, "negative region extent");
-                }
+        let (x, y, width, height, add) = match request {
+            wl_region::Request::Destroy => return,
+            wl_region::Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => (x, y, width, height, true),
+            wl_region::Request::Subtract {
+                x,
+                y,
+                width,
+                height,
+            } => (x, y, width, height, false),
+            _ => return,
+        };
+        if width < 0 || height < 0 {
+            r.post_error(0u32, "negative region extent");
+            return;
+        }
+        if let Ok(mut region) = data.lock() {
+            if region.0.len() >= 1024 {
+                r.post_error(0u32, "region operation limit reached");
+                return;
             }
-            _ => r.post_error(0u32, "unsupported region request"),
+            region.0.push((x, y, width, height, add));
         }
     }
 }
@@ -154,10 +205,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
         match request {
             wl_surface::Request::Destroy => {}
             wl_surface::Request::Attach { buffer, x, y } => {
-                if x != 0 || y != 0 {
-                    r.post_error(0u32, "nonzero attach offset is unsupported");
-                    return;
-                }
+                s.pending_offset = Some((x, y));
                 s.pending_buffer = Some(buffer);
             }
             wl_surface::Request::Damage { width, height, .. }
@@ -169,6 +217,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
             wl_surface::Request::Frame { callback } => {
                 if s.pending_callbacks.len()
                     + s.callbacks.iter().map(|(_, c)| c.len()).sum::<usize>()
+                    + s.cached.as_ref().map_or(0, |c| c.callbacks.len())
                     >= 256
                 {
                     init.post_error(callback, 0u32, "frame callback limit reached");
@@ -185,12 +234,20 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
                 }
             }
             wl_surface::Request::SetBufferTransform { transform } => {
-                if transform != WEnum::Value(wl_output::Transform::Normal) {
-                    r.post_error(1u32, "buffer transform not yet supported");
+                let raw: u32 = transform.into();
+                if raw > 7 {
+                    r.post_error(1u32, "invalid buffer transform");
+                } else {
+                    s.pending_transform = raw;
                 }
             }
-            wl_surface::Request::SetOpaqueRegion { .. }
-            | wl_surface::Request::SetInputRegion { .. } => {}
+            wl_surface::Request::SetInputRegion { region } => {
+                s.pending_input = Some(region.and_then(|r| {
+                    r.data::<Mutex<Region>>()
+                        .and_then(|v| v.lock().ok().map(|v| v.clone()))
+                }));
+            }
+            wl_surface::Request::SetOpaqueRegion { .. } => {}
             _ => r.post_error(0u32, "unsupported surface request"),
         }
     }

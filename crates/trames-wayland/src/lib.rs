@@ -11,6 +11,7 @@ mod server;
 pub use server::{Server, Snapshot, SurfaceInfo};
 mod protocol;
 mod shell;
+mod subsurface;
 pub use scene::{BufferLease, ShmBuffer, SurfaceImage, WindowMode, WindowSnapshot};
 
 /// Guest identity is attached by the VM bridge, never inferred from the host UID.

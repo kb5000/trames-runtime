@@ -36,6 +36,7 @@ pub struct SurfaceImage {
     pub x: i32,
     pub y: i32,
     pub scale: i32,
+    pub transform: u32,
     pub buffer: Arc<BufferLease>,
 }
 /// Host buffer capability. It contains no guest pointer, FD number or VM borrow.
@@ -81,6 +82,57 @@ impl Drop for BufferLease {
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceKey(pub u64);
+pub(crate) struct Subsurface {
+    pub synchronized: bool,
+    pub below: bool,
+    pub pending_position: Option<(i32, i32)>,
+    pub pending_stack: Option<(u64, bool)>,
+}
+pub(crate) struct CachedCommit {
+    pub buffer: Option<Option<Arc<BufferLease>>>,
+    pub callbacks: Vec<WlCallback>,
+    pub scale: i32,
+    pub geometry: Option<(i32, i32, u32, u32)>,
+    pub offset: Option<(i32, i32)>,
+    pub transform: u32,
+    pub input: Option<Option<Region>>,
+}
+impl CachedCommit {
+    pub fn merge(&mut self, mut next: Self) {
+        if next.buffer.is_some() {
+            self.buffer = next.buffer;
+        }
+        self.callbacks.append(&mut next.callbacks);
+        self.scale = next.scale;
+        self.transform = next.transform;
+        if let Some((x, y)) = next.offset {
+            let (a, b) = self.offset.unwrap_or_default();
+            self.offset = Some((a.saturating_add(x), b.saturating_add(y)));
+        }
+        if next.input.is_some() {
+            self.input = next.input;
+        }
+        if next.geometry.is_some() {
+            self.geometry = next.geometry;
+        }
+    }
+}
+#[derive(Clone, Default)]
+pub(crate) struct Region(pub Vec<(i32, i32, i32, i32, bool)>);
+impl Region {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        self.0
+            .iter()
+            .rev()
+            .find(|&&(rx, ry, w, h, _)| {
+                x >= f64::from(rx)
+                    && y >= f64::from(ry)
+                    && x < f64::from(rx) + f64::from(w)
+                    && y < f64::from(ry) + f64::from(h)
+            })
+            .is_some_and(|r| r.4)
+    }
+}
 pub(crate) struct Surface {
     pub resource: WlSurface,
     pub connection: u64,
@@ -89,6 +141,8 @@ pub(crate) struct Surface {
     pub popup: Option<XdgPopup>,
     pub parent: Option<(u64, i32, i32)>,
     pub children: Vec<u64>,
+    pub sub: Option<Subsurface>,
+    pub cached: Option<CachedCommit>,
     pub title: String,
     pub app_id: String,
     pub size: (u32, u32),
@@ -107,8 +161,28 @@ pub(crate) struct Surface {
     pub geometry: Option<(i32, i32, u32, u32)>,
     pub pending_geometry: Option<(i32, i32, u32, u32)>,
     pub revision: u64,
+    pub offset: (i32, i32),
+    pub pending_offset: Option<(i32, i32)>,
+    pub transform: u32,
+    pub pending_transform: u32,
+    pub input: Option<Region>,
+    pub pending_input: Option<Option<Region>>,
 }
 impl Surface {
+    pub fn take_pending(&mut self) -> CachedCommit {
+        CachedCommit {
+            buffer: self
+                .pending_buffer
+                .take()
+                .map(|b| b.and_then(BufferLease::acquire)),
+            callbacks: std::mem::take(&mut self.pending_callbacks),
+            scale: self.pending_scale,
+            geometry: self.pending_geometry.take(),
+            offset: self.pending_offset.take(),
+            transform: self.pending_transform,
+            input: self.pending_input.take(),
+        }
+    }
     pub fn new(resource: WlSurface, connection: u64) -> Self {
         Self {
             resource,
@@ -118,6 +192,8 @@ impl Surface {
             popup: None,
             parent: None,
             children: Vec::new(),
+            sub: None,
+            cached: None,
             title: String::new(),
             app_id: String::new(),
             size: (640, 480),
@@ -136,6 +212,12 @@ impl Surface {
             geometry: None,
             pending_geometry: None,
             revision: 0,
+            offset: (0, 0),
+            pending_offset: None,
+            transform: 0,
+            pending_transform: 0,
+            input: None,
+            pending_input: None,
         }
     }
 }
@@ -148,24 +230,41 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
         out: &mut Vec<SurfaceImage>,
     ) {
         let Some(s) = surfaces.get(&id) else { return };
-        if let Some(buffer) = &s.current {
-            out.push(SurfaceImage {
-                surface: id,
-                x,
-                y,
-                scale: s.scale,
-                buffer: buffer.clone(),
-            });
-        }
-        for &child in &s.children {
-            if let Some((_, cx, cy)) = surfaces.get(&child).and_then(|s| s.parent) {
-                images(
-                    surfaces,
-                    child,
-                    x.saturating_add(cx),
-                    y.saturating_add(cy),
-                    out,
-                );
+        // Subsurface stacking is relative to the parent and its siblings.
+        for below in [true, false] {
+            if !below {
+                if let Some(buffer) = &s.current {
+                    out.push(SurfaceImage {
+                        surface: id,
+                        x,
+                        y,
+                        scale: s.scale,
+                        transform: s.transform,
+                        buffer: buffer.clone(),
+                    });
+                }
+            }
+            for &child in &s.children {
+                if let Some(c) = surfaces.get(&child) {
+                    if c.sub.as_ref().is_some_and(|s| s.below) != below {
+                        continue;
+                    }
+                    if let Some((_, mut cx, mut cy)) = c.parent {
+                        if c.popup.is_some() {
+                            let (px, py, ..) = s.geometry.unwrap_or((0, 0, 0, 0));
+                            let (gx, gy, ..) = c.geometry.unwrap_or((0, 0, 0, 0));
+                            cx = cx.saturating_add(px).saturating_sub(gx);
+                            cy = cy.saturating_add(py).saturating_sub(gy);
+                        }
+                        images(
+                            surfaces,
+                            child,
+                            x.saturating_add(cx),
+                            y.saturating_add(cy),
+                            out,
+                        );
+                    }
+                }
             }
         }
     }
@@ -174,7 +273,14 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
         .filter(|(_, s)| s.top.is_some() && s.current.is_some())
         .map(|(&id, s)| {
             let mut scene = Vec::new();
-            images(surfaces, id, 0, 0, &mut scene);
+            let (gx, gy, ..) = s.geometry.unwrap_or((0, 0, 0, 0));
+            images(
+                surfaces,
+                id,
+                gx.saturating_neg(),
+                gy.saturating_neg(),
+                &mut scene,
+            );
             WindowSnapshot {
                 id,
                 connection: s.connection,

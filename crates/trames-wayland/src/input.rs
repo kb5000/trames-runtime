@@ -231,7 +231,7 @@ impl State {
                 if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
                     for k in &self.seat.keyboards {
                         if connection(k) == s.connection {
-                            k.modifiers(serial, modifiers, 0, 0, 0);
+                            k.modifiers(serial, modifiers & !2, 0, modifiers & 2, 0);
                             k.key(
                                 serial,
                                 time,
@@ -255,10 +255,20 @@ impl State {
             .find(|w| w.id == window && w.mode != WindowMode::Minimized)?;
         for image in window.scene.iter().rev() {
             let (lx, ly) = (x - f64::from(image.x), y - f64::from(image.y));
+            let pixels = &image.buffer.pixels;
+            let (width, height) = if image.transform & 1 != 0 {
+                (pixels.height, pixels.width)
+            } else {
+                (pixels.width, pixels.height)
+            };
             if lx >= 0.0
                 && ly >= 0.0
-                && lx < f64::from(image.buffer.pixels.width) / f64::from(image.scale)
-                && ly < f64::from(image.buffer.pixels.height) / f64::from(image.scale)
+                && lx < f64::from(width) / f64::from(image.scale)
+                && ly < f64::from(height) / f64::from(image.scale)
+                && self
+                    .surfaces
+                    .get(&image.surface)
+                    .is_some_and(|s| s.input.as_ref().is_none_or(|r| r.contains(lx, ly)))
             {
                 return Some((image.surface, lx, ly));
             }
@@ -319,7 +329,13 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                                 .flat_map(|v| v.to_ne_bytes())
                                 .collect(),
                         );
-                        k.modifiers(state.serial, state.seat.modifiers, 0, 0, 0);
+                        k.modifiers(
+                            state.serial,
+                            state.seat.modifiers & !2,
+                            0,
+                            state.seat.modifiers & 2,
+                            0,
+                        );
                     }
                 }
                 state.seat.keyboards.push(k);
