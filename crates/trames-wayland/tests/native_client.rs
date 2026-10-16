@@ -460,3 +460,124 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
     assert_eq!(phase, 6, "{log}");
     assert!(log.contains("repositioned=17"), "{log}");
 }
+
+#[test]
+#[ignore = "build original C text-input-v3 peer with scripts/test-wayland.sh"]
+fn original_c_text_v3_composition_utf8_serial_and_surrounding_ack() {
+    use std::io::Read;
+    use trames_wayland::{InputEvent, TextEdit};
+    let server = Server::new().unwrap();
+    let (_, socket) = server.connect(10, 1000, 1000).unwrap();
+    let fd = socket.as_raw_fd();
+    let mut command = Command::new(std::env::var("TRAMES_WAYLAND_TEXT_V3_CLIENT").unwrap());
+    command
+        .env("WAYLAND_SOCKET", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: retained child-only Unix descriptor; async-signal-safe CLOEXEC update.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(socket);
+    let mut stdout = child.stdout.take().unwrap();
+    // SAFETY: a uniquely owned diagnostic pipe; no other flags are in use.
+    unsafe {
+        assert!(libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) >= 0);
+    }
+    let began = Instant::now();
+    let mut focused = false;
+    let mut sent = false;
+    let mut closed = false;
+    let mut log = String::new();
+    loop {
+        let mut bytes = [0; 4096];
+        loop {
+            match stdout.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => log.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let scene = server.snapshot();
+        if let Some(w) = scene.windows.first() {
+            if !focused {
+                server
+                    .input(InputEvent::Focus { window: Some(w.id) })
+                    .unwrap();
+                focused = true;
+            }
+        }
+        if let Some(t) = scene.text {
+            assert_eq!(t.version, 3);
+            if !sent {
+                assert_eq!(
+                    (t.text.as_str(), t.cursor, t.anchor, t.serial),
+                    ("a🙂中", 8, 1, 1)
+                );
+                server
+                    .edit_text(TextEdit {
+                        context: t.id,
+                        epoch: t.epoch,
+                        serial: t.serial,
+                        preedit: Some(("ni".into(), 2, 2)),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                // v3 preedit/commit replaces the selection itself; there is no
+                // surrounding deletion for the selected seven UTF-8 bytes.
+                server
+                    .edit_text(TextEdit {
+                        context: t.id,
+                        epoch: t.epoch,
+                        serial: t.serial,
+                        preedit: Some((String::new(), 0, 0)),
+                        commit: Some("你好🙂".into()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                sent = true;
+            } else if t.text == "a你好🙂" && t.serial == 2 && !closed {
+                assert_eq!((t.cursor, t.anchor), (11, 11));
+                server.close(t.window).unwrap();
+                closed = true;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.success(),
+                "{log}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if began.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "v3 peer stalled: {log}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(sent && closed, "{log}");
+    assert!(
+        log.contains("v3-preedit:ni:2:2")
+            && log.contains("v3-commit:你好🙂")
+            && log.contains("v3-done:1"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("v3-delete:"),
+        "selected text must not also be deleted as surrounding bytes: {log}"
+    );
+}

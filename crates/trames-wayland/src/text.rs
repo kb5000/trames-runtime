@@ -11,6 +11,7 @@ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, 
 
 #[derive(Clone, Debug, Default)]
 pub struct TextContext {
+    pub version: u32,
     pub id: u64,
     pub epoch: u64,
     pub surface: u64,
@@ -156,6 +157,10 @@ impl State {
             caret[1] = caret[1].saturating_add(origin.1);
         }
         Some(TextContext {
+            version: match o.protocol {
+                Protocol::V1(_) => 1,
+                Protocol::V3(_) => 3,
+            },
             id,
             epoch: o.epoch,
             surface,
