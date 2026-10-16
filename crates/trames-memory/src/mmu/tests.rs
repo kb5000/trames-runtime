@@ -168,7 +168,17 @@ fn unrelated_host_faults_keep_default_or_preexisting_signal_behavior() {
     assert!(probe("chain").success());
     let mask = probe("mask");
     assert!(mask.success(), "{mask:?}");
-    assert_eq!(probe("reset").signal(), Some(libc::SIGSEGV));
+    let native = probe("native-reset");
+    assert!(
+        native.success() || native.signal() == Some(libc::SIGSEGV),
+        "native reset: {native:?}"
+    );
+    let wrapped = probe("reset");
+    assert_eq!(
+        (wrapped.code(), wrapped.signal()),
+        (native.code(), native.signal()),
+        "forwarded one-shot behavior must match this OS without Trames"
+    );
 }
 #[test]
 fn signal_probe_child() {
@@ -203,11 +213,11 @@ fn signal_probe_child() {
         let mut action: libc::sigaction = std::mem::zeroed();
         libc::sigemptyset(&mut action.sa_mask);
         CHECK_MASK.store(mode == "mask", Ordering::Relaxed);
-        if mode == "chain" || mode == "reset" || mode == "mask" {
+        if mode == "chain" || mode.ends_with("reset") || mode == "mask" {
             action.sa_sigaction = previous as *const () as usize;
             libc::sigaddset(&mut action.sa_mask, libc::SIGUSR1);
             action.sa_flags = libc::SA_NODEFER
-                | if mode == "reset" {
+                | if mode.ends_with("reset") {
                     libc::SA_RESETHAND
                 } else {
                     0
@@ -220,6 +230,15 @@ fn signal_probe_child() {
             libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()),
             0
         );
+        if mode == "native-reset" {
+            // Independent host oracle: some OSes clear unsupported reset flags
+            // for synchronous signals. Do not assume Linux behavior on Darwin.
+            libc::raise(libc::SIGSEGV);
+            assert_eq!(SEEN.load(Ordering::Relaxed), 1);
+            libc::raise(libc::SIGSEGV);
+            assert_eq!(SEEN.load(Ordering::Relaxed), 2);
+            return;
+        }
         let mapping = host::Mapping::new().expect("hardware mapping");
         let mut bytes = [0; 8];
         assert!(!access::access::<8>(
@@ -243,10 +262,7 @@ fn signal_probe_child() {
             ));
             if mode == "reset" {
                 libc::raise(libc::SIGSEGV);
-                panic!(
-                    "one-shot handler returned; callback count={}",
-                    SEEN.load(Ordering::Relaxed)
-                );
+                assert_eq!(SEEN.load(Ordering::Relaxed), 2);
             }
         }
     }
