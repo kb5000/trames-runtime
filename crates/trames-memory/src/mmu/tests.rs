@@ -137,7 +137,7 @@ fn worker_cpu_aliases_native_bytes_and_dirty_publication_share_one_region_protoc
 }
 
 #[test]
-fn unrelated_host_faults_keep_default_or_preexisting_signal_behavior() {
+fn unrelated_host_faults_preserve_queryable_host_signal_behavior() {
     fn probe(mode: &str) -> std::process::ExitStatus {
         let exe = std::env::current_exe().unwrap();
         let args = ["--exact", "mmu::tests::signal_probe_child"];
@@ -173,11 +173,13 @@ fn unrelated_host_faults_keep_default_or_preexisting_signal_behavior() {
         native.success() || native.signal() == Some(libc::SIGSEGV),
         "native reset: {native:?}"
     );
+    let queried = probe("roundtrip-reset");
+    assert!(queried.success() || queried.signal() == Some(libc::SIGSEGV));
     let wrapped = probe("reset");
     assert_eq!(
         (wrapped.code(), wrapped.signal()),
-        (native.code(), native.signal()),
-        "forwarded one-shot behavior must match this OS without Trames"
+        (queried.code(), queried.signal()),
+        "forwarding must preserve the configuration this OS query can recover"
     );
 }
 #[test]
@@ -230,9 +232,20 @@ fn signal_probe_child() {
             libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut()),
             0
         );
-        if mode == "native-reset" {
-            // Independent host oracle: some OSes clear unsupported reset flags
-            // for synchronous signals. Do not assume Linux behavior on Darwin.
+        if mode == "native-reset" || mode == "roundtrip-reset" {
+            if mode == "roundtrip-reset" {
+                // XNU's getter omits ps_sigreset/SA_RESETHAND. Independently
+                // measure that native query/restore boundary without our MMU.
+                let mut queried: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut queried),
+                    0
+                );
+                assert_eq!(
+                    libc::sigaction(libc::SIGSEGV, &queried, std::ptr::null_mut()),
+                    0
+                );
+            }
             libc::raise(libc::SIGSEGV);
             assert_eq!(SEEN.load(Ordering::Relaxed), 1);
             libc::raise(libc::SIGSEGV);
