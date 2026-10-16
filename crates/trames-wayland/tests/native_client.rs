@@ -439,6 +439,7 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
             phase = 6;
         }
         if let Some(status) = child.try_wait().unwrap() {
+            stdout.read_to_string(&mut log).unwrap();
             let output = child.wait_with_output().unwrap();
             assert!(
                 status.success(),
@@ -551,6 +552,7 @@ fn original_c_text_v3_composition_utf8_serial_and_surrounding_ack() {
             }
         }
         if let Some(status) = child.try_wait().unwrap() {
+            stdout.read_to_string(&mut log).unwrap();
             let output = child.wait_with_output().unwrap();
             assert!(
                 status.success(),
