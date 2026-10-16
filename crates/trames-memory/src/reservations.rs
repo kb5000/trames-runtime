@@ -74,6 +74,9 @@ impl Memory {
                 overlaps.push((a, b));
             }
         }
+        if !overlaps.is_empty() && self.parallel_cache.is_some() {
+            self.parallel_reservations_dirty = true;
+        }
         for (a, b) in overlaps {
             self.reservations.remove(&a);
             if a < start {
@@ -132,6 +135,9 @@ impl Memory {
             self.reservations.remove(&end);
         }
         self.reservations.insert(start, stop);
+        if self.parallel_cache.is_some() {
+            self.parallel_reservations_dirty = true;
+        }
         self.revision = self.revision.wrapping_add(1);
         self.advance_code_revision();
         Ok(())

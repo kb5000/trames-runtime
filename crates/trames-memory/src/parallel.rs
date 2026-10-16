@@ -4,6 +4,7 @@
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
 mod native;
 mod page;
+mod snapshot;
 use super::*;
 use std::sync::{Arc, Weak};
 
@@ -11,6 +12,19 @@ use std::sync::{Arc, Weak};
 pub struct Registry {
     shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
     code_epoch: Arc<AtomicU64>,
+    pub metrics: Metrics,
+}
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Metrics {
+    pub cache_hits: u64,
+    pub dirty_refreshes: u64,
+    pub full_rebuilds: u64,
+    pub full_rebuild_pages: u64,
+    pub backing_invalidations: u64,
+    pub code_invalidations: u64,
+    pub source_page_reads: u64,
+    pub incremental_updates: u64,
+    pub incremental_pages: u64,
 }
 struct ConcurrentPage {
     identity: u64,
@@ -86,9 +100,92 @@ struct Frame {
     error: Option<MemoryError>,
     bytes: Arc<ConcurrentPage>,
 }
+fn prepare_frame(
+    page: &Page,
+    base: u64,
+    root_frame: usize,
+    previous: Option<&Frame>,
+    registry: &mut Registry,
+) -> Option<Frame> {
+    let error = page.check_backing(base).err();
+    let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
+    let key = page
+        .backing
+        .as_ref()
+        .filter(|b| b.shared)
+        .and_then(|b| b.object.parallel_key());
+    let previous = previous.filter(|f| {
+        f.root_frame == root_frame
+            && f.code_revision == page.instruction_revision
+            && f.permissions == page.permissions
+    });
+    let same = previous.filter(|f| {
+        f.data_revision.load(Ordering::Relaxed) == page.data_revision
+            && f.backing_version.load(Ordering::Relaxed) == backing_version
+            && f.error == error
+    });
+    let bytes = if let Some(frame) = same {
+        frame.bytes.clone()
+    } else {
+        let mut data = [0; PAGE_SIZE as usize];
+        if error.is_none() {
+            registry.metrics.source_page_reads += 1;
+            page.read_bytes(0, &mut data).ok()?;
+        }
+        if let Some(key) = key {
+            if let Some(bytes) = registry.shared.get(&key).and_then(Weak::upgrade) {
+                bytes.refresh(&data);
+                bytes
+            } else {
+                let bytes = Arc::new(ConcurrentPage::new(
+                    data,
+                    false,
+                    registry.code_epoch.clone(),
+                ));
+                registry.shared.insert(key, Arc::downgrade(&bytes));
+                bytes
+            }
+        } else if let Some(frame) = previous.filter(|f| f.bytes.constant.is_none()) {
+            frame.bytes.refresh(&data);
+            frame.bytes.clone()
+        } else {
+            Arc::new(ConcurrentPage::new(
+                data,
+                !page.permissions.write,
+                registry.code_epoch.clone(),
+            ))
+        }
+    };
+    if page.permissions.execute {
+        bytes.executable.store(true, Ordering::Relaxed);
+    }
+
+    Some(Frame {
+        base,
+        root_frame,
+        permissions: page.permissions,
+        code_revision: page.instruction_revision,
+        data_revision: AtomicU64::new(page.data_revision),
+        backing_version: AtomicU64::new(backing_version),
+        native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
+        native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
+        native_live_private: std::sync::atomic::AtomicBool::new(
+            page.backing
+                .as_ref()
+                .is_some_and(|b| !b.shared && !b.private_copy),
+        ),
+        error,
+        bytes,
+    })
+}
+
 struct Snapshot {
     has_aliases: bool,
     dynamic_code: bool,
+    dynamic_code_pages: usize,
+    identities: BTreeMap<u64, usize>,
+    alias_count: usize,
+    backed_pages: BTreeSet<u64>,
     positions: Vec<Option<usize>>,
     backing_revision: u64,
     identity: u64,
@@ -502,6 +599,7 @@ impl Memory {
         let backing_revision = backing::backing_revision();
         if let Some(c) = &self.parallel_cache {
             if c.source_revision == self.revision && c.source_backing_revision == backing_revision {
+                registry.metrics.cache_hits += 1;
                 return Some(View::new(c.snapshot.clone()));
             }
         }
@@ -511,7 +609,11 @@ impl Memory {
         if self.parallel_cache.as_ref().is_some_and(|c| {
             c.snapshot.code_revision == self.code_revision
                 && c.source_backing_revision == backing_revision
+                && c.snapshot.identity == self.identity
+                && self.parallel_mappings.is_empty()
+                && !self.parallel_reservations_dirty
         }) {
+            registry.metrics.dirty_refreshes += 1;
             let mut cache = self.parallel_cache.take().expect("checked cache");
             let dirty = std::mem::take(&mut self.parallel_dirty);
             for &index in &dirty {
@@ -525,6 +627,7 @@ impl Memory {
                 let frame = &cache.snapshot.frames
                     [cache.snapshot.positions[index].expect("same mapped frame")];
                 let mut data = [0; PAGE_SIZE as usize];
+                registry.metrics.source_page_reads += 1;
                 page.read_bytes(0, &mut data).ok()?;
                 frame.bytes.refresh(&data);
                 frame
@@ -552,6 +655,12 @@ impl Memory {
             self.parallel_cache = Some(cache);
             return Some(view);
         }
+        if self.parallel_cache.as_ref().is_some_and(|cache| {
+            Arc::strong_count(&cache.snapshot) == 1
+                && Arc::strong_count(&cache.snapshot.dirty_pages) == 1
+        }) {
+            return self.update_parallel_snapshot(registry, backing_revision);
+        }
         // Unknown mutable backings retain the existing serial path.
         if self.frames.iter().flatten().any(|p| {
             p.backing
@@ -561,96 +670,49 @@ impl Memory {
             return None;
         }
         registry.shared.retain(|_, page| page.strong_count() != 0);
+        registry.metrics.full_rebuilds += 1;
+        registry.metrics.full_rebuild_pages += self.pages.len() as u64;
+        if let Some(cache) = &self.parallel_cache {
+            registry.metrics.backing_invalidations +=
+                u64::from(cache.source_backing_revision != backing_revision);
+            registry.metrics.code_invalidations +=
+                u64::from(cache.snapshot.code_revision != self.code_revision);
+        }
         let old = self.parallel_cache.take();
         let mut frames = Vec::with_capacity(self.pages.len());
         let mut positions = vec![None; self.frames.len()];
         let mut pages = BTreeMap::new();
+        let mut identities = BTreeMap::new();
+        let mut alias_count = 0usize;
+        let mut backed_pages = BTreeSet::new();
         for (&base, &root_frame) in &self.pages {
             let page = self.frames[root_frame].as_ref().expect("mapped frame");
-            let error = page.check_backing(base).err();
-            let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
             let previous = old
                 .as_ref()
-                .and_then(|c| c.snapshot.pages.get(&base).map(|&i| &c.snapshot.frames[i]))
-                .filter(|f| {
-                    f.root_frame == root_frame
-                        && f.code_revision == page.instruction_revision
-                        && f.permissions == page.permissions
-                });
-            let key = page
-                .backing
-                .as_ref()
-                .filter(|b| b.shared)
-                .and_then(|b| b.object.parallel_key());
-            let same = previous.filter(|f| {
-                f.data_revision.load(Ordering::Relaxed) == page.data_revision
-                    && f.backing_version.load(Ordering::Relaxed) == backing_version
-                    && f.error == error
-            });
-            let bytes = if let Some(frame) = same {
-                frame.bytes.clone()
-            } else {
-                let mut data = [0; PAGE_SIZE as usize];
-                if error.is_none() {
-                    page.read_bytes(0, &mut data).ok()?;
-                }
-                if let Some(key) = key {
-                    if let Some(bytes) = registry.shared.get(&key).and_then(Weak::upgrade) {
-                        bytes.refresh(&data);
-                        bytes
-                    } else {
-                        let bytes = Arc::new(ConcurrentPage::new(
-                            data,
-                            false,
-                            registry.code_epoch.clone(),
-                        ));
-                        registry.shared.insert(key, Arc::downgrade(&bytes));
-                        bytes
-                    }
-                } else if let Some(frame) = previous.filter(|f| f.bytes.constant.is_none()) {
-                    frame.bytes.refresh(&data);
-                    frame.bytes.clone()
-                } else {
-                    Arc::new(ConcurrentPage::new(
-                        data,
-                        !page.permissions.write,
-                        registry.code_epoch.clone(),
-                    ))
-                }
-            };
-            if page.permissions.execute {
-                bytes.executable.store(true, Ordering::Relaxed);
+                .and_then(|c| c.snapshot.pages.get(&base).map(|&i| &c.snapshot.frames[i]));
+            let frame = prepare_frame(page, base, root_frame, previous, registry)?;
+            let count = identities.entry(frame.bytes.identity).or_insert(0usize);
+            alias_count += usize::from(*count == 1);
+            *count += 1;
+            if page.backing.is_some() {
+                backed_pages.insert(base);
             }
             pages.insert(base, frames.len());
             positions[root_frame] = Some(frames.len());
-            frames.push(Frame {
-                base,
-                root_frame,
-                permissions: page.permissions,
-                code_revision: page.instruction_revision,
-                data_revision: AtomicU64::new(page.data_revision),
-                backing_version: AtomicU64::new(backing_version),
-                native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
-                native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
-                native_live_private: std::sync::atomic::AtomicBool::new(
-                    page.backing
-                        .as_ref()
-                        .is_some_and(|b| !b.shared && !b.private_copy),
-                ),
-                error,
-                bytes,
-            });
+            frames.push(frame);
         }
         let snapshot = Arc::new(Snapshot {
-            has_aliases: {
-                let mut identities = std::collections::BTreeSet::new();
-                frames
-                    .iter()
-                    .any(|frame| !identities.insert(frame.bytes.identity))
-            },
+            has_aliases: alias_count != 0,
             dynamic_code: frames
                 .iter()
                 .any(|frame| frame.permissions.execute && frame.bytes.constant.is_none()),
+            dynamic_code_pages: frames
+                .iter()
+                .filter(|frame| frame.permissions.execute && frame.bytes.constant.is_none())
+                .count(),
+            identities,
+            alias_count,
+            backed_pages,
             positions,
             backing_revision,
             identity: self.identity,
@@ -661,7 +723,12 @@ impl Memory {
             // Mapping changes require joined workers and get a fresh tracker.
             dirty_pages: old
                 .as_ref()
-                .filter(|c| c.snapshot.code_revision == self.code_revision)
+                .filter(|c| {
+                    c.snapshot.code_revision == self.code_revision
+                        && c.snapshot.identity == self.identity
+                        && self.parallel_mappings.is_empty()
+                        && !self.parallel_reservations_dirty
+                })
                 .map_or_else(
                     || {
                         (0..self.frames.len().div_ceil(64))
@@ -679,6 +746,8 @@ impl Memory {
             source_revision: self.revision,
             source_backing_revision: backing_revision,
         });
+        self.parallel_mappings.clear();
+        self.parallel_reservations_dirty = false;
         for index in self.parallel_dirty.drain(..) {
             if let Some(page) = self.frames[index].as_mut() {
                 page.parallel_dirty = false;
@@ -738,6 +807,9 @@ impl Memory {
                     let page = self.frames[frame.root_frame]
                         .as_ref()
                         .expect("committed page");
+                    if page.instruction_revision != frame.code_revision {
+                        self.parallel_mappings.insert(frame.base);
+                    }
                     frame
                         .native_retryable
                         .store(page.native_retryable(), Ordering::Relaxed);

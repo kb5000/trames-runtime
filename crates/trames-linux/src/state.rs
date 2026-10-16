@@ -406,7 +406,7 @@ impl Linux {
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
-        if !reservation && len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+        if !reservation && len > memory.limit() as u64 {
             return Err(Errno(12));
         }
         let flags = a[3];
@@ -482,9 +482,7 @@ impl Linux {
         if a[3] & !3 != 0 || a[3] & 2 != 0 && a[3] & 1 == 0 {
             return Err(Errno(22));
         }
-        if !memory.is_reserved(a[0], old_len)
-            && new_len > trames_memory::DEFAULT_MEMORY_LIMIT as u64
-        {
+        if !memory.is_reserved(a[0], old_len) && new_len > memory.limit() as u64 {
             return Err(Errno(12));
         }
         let fixed = a[3] & 2 != 0;
@@ -1267,7 +1265,7 @@ impl Linux {
                     };
                 }
                 let len = Self::page_length(a[1])?;
-                if len > trames_memory::DEFAULT_MEMORY_LIMIT as u64 {
+                if len > memory.limit() as u64 {
                     return Err(Errno(12));
                 }
                 let resident = memory.resident(a[0], len).map_err(Self::memory_errno)?;
@@ -1335,6 +1333,18 @@ impl Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mmap_uses_configured_budget_instead_of_the_legacy_half_gib_cap() {
+        let mut linux = Linux::new(0);
+        let mut memory = Memory::new(1024 * 1024 * 1024);
+        // Invalid flags must reach validation with a permitted large length;
+        // no host allocation is needed to detect an obsolete fixed quota.
+        let args = [0, 513 * 1024 * 1024, 3, 0, 0, 0];
+        assert_eq!(linux.mmap(args, &mut memory), Err(Errno(22)));
+        memory.set_limit(512 * 1024 * 1024).unwrap();
+        assert_eq!(linux.mmap(args, &mut memory), Err(Errno(12)));
+        assert_eq!(memory.mapped_bytes(), 0);
+    }
     #[test]
     fn munmap_metadata_exhaustion_returns_enomem_and_retains_the_range() {
         let mut linux = Linux::new(0);

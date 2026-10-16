@@ -12,7 +12,7 @@ pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -172,6 +172,8 @@ pub struct Memory {
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
     parallel_dirty: Vec<usize>,
+    parallel_mappings: BTreeSet<u64>,
+    parallel_reservations_dirty: bool,
 }
 impl Clone for Memory {
     fn clone(&self) -> Self {
@@ -204,6 +206,8 @@ impl Clone for Memory {
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
             parallel_dirty: Vec::new(),
+            parallel_mappings: BTreeSet::new(),
+            parallel_reservations_dirty: false,
         }
     }
 }
@@ -227,6 +231,11 @@ impl Memory {
             shared: self.shared.clone(),
             ..Self::new(self.limit)
         }
+    }
+    pub fn limit(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map_or(self.limit, |shared| shared.borrow().limit())
     }
     pub fn set_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
@@ -254,6 +263,8 @@ impl Memory {
             cpu_borrow_safe: true,
             parallel_cache: None,
             parallel_dirty: Vec::new(),
+            parallel_mappings: BTreeSet::new(),
+            parallel_reservations_dirty: false,
         }
     }
     pub fn mapped_bytes(&self) -> usize {
@@ -384,6 +395,9 @@ impl Memory {
     }
 
     fn insert_page(&mut self, base: u64, permissions: Permissions) {
+        if self.parallel_cache.is_some() {
+            self.parallel_mappings.insert(base);
+        }
         let page = Page {
             bytes: Rc::new([0; PAGE_SIZE as usize]),
             permissions,
@@ -567,6 +581,9 @@ impl Memory {
             .map(|(&base, _)| base)
             .collect();
         for base in keys {
+            if self.parallel_cache.is_some() {
+                self.parallel_mappings.insert(base);
+            }
             let frame = self.pages.remove(&base).expect("mapped frame");
             self.frames[frame] = None;
             self.free_frames.push(frame);
@@ -704,7 +721,10 @@ impl Memory {
                 }
             }
         }
-        for (_, &frame) in self.pages.range(address..end) {
+        for (&base, &frame) in self.pages.range(address..end) {
+            if self.parallel_cache.is_some() {
+                self.parallel_mappings.insert(base);
+            }
             let page = self.frames[frame].as_mut().expect("validated page");
             page.permissions = permissions;
             page.instruction_revision = self.code_revision;

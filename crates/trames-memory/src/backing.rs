@@ -194,10 +194,13 @@ impl Memory {
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
         self.advance_code_revision();
-        for (_, &frame) in self.pages.range(address..end) {
+        for (&base, &frame) in self.pages.range(address..end) {
             let page = self.frames[frame].as_mut().expect("page");
             if page.backing.as_ref().is_some_and(|b| b.shared) {
                 continue;
+            }
+            if self.parallel_cache.is_some() {
+                self.parallel_mappings.insert(base);
             }
             page.bytes = Rc::new([0; PAGE_SIZE as usize]);
             if let Some(b) = &mut page.backing {
