@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The interpreter's checked memory contract. Both views use the same CPU engine.
-use crate::{Access, Memory, MemoryError};
+use crate::{Access, DirectHint, Memory, MemoryError};
 use std::sync::atomic::Ordering;
 
 pub enum CpuSlice<'a, M> {
@@ -52,6 +52,29 @@ pub trait CpuMemory {
         bytes: [u8; N],
     ) -> Result<(), MemoryError> {
         self.write(address, &bytes)
+    }
+    /// Opaque generation-checked hint, valid only as an acceleration suggestion.
+    /// Mapping mutation, cross-memory reuse, and stale hints remain safe.
+    #[inline]
+    fn direct_hint(&self) -> DirectHint {
+        DirectHint::EMPTY
+    }
+    #[inline(always)]
+    fn read_array_hint<const N: usize>(
+        &self,
+        address: u64,
+        _hint: &mut DirectHint,
+    ) -> Result<[u8; N], MemoryError> {
+        self.read_array(address)
+    }
+    #[inline(always)]
+    fn write_array_hint<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+        _hint: &mut DirectHint,
+    ) -> Result<(), MemoryError> {
+        self.write_array(address, bytes)
     }
     fn read_u64(&self, address: u64) -> Result<u64, MemoryError> {
         Ok(u64::from_le_bytes(self.read_array(address)?))
@@ -123,6 +146,58 @@ impl CpuMemory for Memory {
     #[inline]
     fn write_array<const N: usize>(&mut self, a: u64, b: [u8; N]) -> Result<(), MemoryError> {
         Memory::write_array(self, a, b)
+    }
+    #[inline]
+    fn direct_hint(&self) -> DirectHint {
+        if self.shared.is_none() {
+            self.mmu.hint()
+        } else {
+            DirectHint::EMPTY
+        }
+    }
+    #[inline(always)]
+    fn read_array_hint<const N: usize>(
+        &self,
+        address: u64,
+        hint: &mut DirectHint,
+    ) -> Result<[u8; N], MemoryError> {
+        if self.shared.is_none() {
+            if let Some(bytes) = self.mmu.read_hint(address & 0x00ffffffffffffff, hint) {
+                return Ok(bytes);
+            }
+        }
+        let result = if self.shared.is_none() {
+            self.read_array_soft(address & 0x00ffffffffffffff)
+        } else {
+            self.read_array(address)
+        };
+        *hint = self.direct_hint();
+        result
+    }
+    #[inline(always)]
+    fn write_array_hint<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+        hint: &mut DirectHint,
+    ) -> Result<(), MemoryError> {
+        if self.shared.is_none() {
+            if let Some(frame) = self
+                .mmu
+                .write_hint(address & 0x00ffffffffffffff, bytes, hint)
+            {
+                self.revision = self.revision.wrapping_add(1);
+                self.note_parallel_write(frame);
+                return Ok(());
+            }
+        }
+        let result = if self.shared.is_none() {
+            self.write_array_soft(address & 0x00ffffffffffffff, bytes)
+        } else {
+            self.write_array(address, bytes)
+        };
+        *hint = self.direct_hint();
+        result
     }
     fn atomic_update<T>(
         &mut self,

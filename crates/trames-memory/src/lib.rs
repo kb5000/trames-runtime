@@ -2,12 +2,15 @@
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod backing;
 mod cpu_memory;
+mod mmu;
+use mmu::PageBytes;
 mod native_access;
 pub mod parallel;
 mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use cpu_memory::{CpuMemory, CpuSlice};
+pub use mmu::DirectHint;
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use std::{
@@ -99,7 +102,7 @@ struct Page {
     // workers get separate Arc<ConcurrentPage> bytes at joined checkpoints.
     // Rc preserves fork COW without an atomic refcount RMW on every CPU/native
     // store. Never send this allocation (or a borrowed slice) to a worker.
-    bytes: Rc<[u8; PAGE_SIZE as usize]>,
+    bytes: Rc<PageBytes>,
     permissions: Permissions,
     instruction_revision: u64,
     backing: Option<Backed>,
@@ -154,6 +157,7 @@ impl Translation {
 }
 
 pub struct Memory {
+    mmu: mmu::Arena,
     // Ordered mappings serve mmap and procfs; stable frame indices serve the
     // interpreter. The translation cache owns no bytes, so it cannot trigger
     // false COW or retain an old allocation after a write.
@@ -181,7 +185,9 @@ impl Clone for Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().clone();
         }
+        self.mmu.retire();
         Self {
+            mmu: mmu::Arena::default(),
             pages: self.pages.clone(),
             reservations: self.reservations.clone(),
             frames: self
@@ -249,6 +255,7 @@ impl Memory {
     }
     pub fn new(limit: usize) -> Self {
         Self {
+            mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
             frames: Vec::new(),
@@ -399,7 +406,10 @@ impl Memory {
             self.parallel_mappings.insert(base);
         }
         let page = Page {
-            bytes: Rc::new([0; PAGE_SIZE as usize]),
+            bytes: self
+                .mmu
+                .page(base)
+                .unwrap_or_else(|| Rc::new(PageBytes::new([0; PAGE_SIZE as usize]))),
             permissions,
             instruction_revision: self.code_revision,
             backing: None,
@@ -564,6 +574,7 @@ impl Memory {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.refresh_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }
@@ -590,6 +601,7 @@ impl Memory {
         }
         self.revision = self.revision.wrapping_add(1);
         self.advance_code_revision();
+        self.refresh_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }
@@ -669,6 +681,7 @@ impl Memory {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.refresh_mmu(address, len as u64);
         self.invalidate_translations();
         Ok(())
     }
@@ -730,6 +743,7 @@ impl Memory {
             page.instruction_revision = self.code_revision;
         }
         self.revision = self.revision.wrapping_add(1);
+        self.refresh_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }
@@ -859,6 +873,7 @@ impl Memory {
         if input.len() <= PAGE_SIZE as usize - offset {
             let entry = self.access_translation(address, input.len(), Access::Write)?;
             let frame = entry.frame;
+            self.prepare_mmu_write(address, input.len());
             let next_code_revision = self.code_revision.wrapping_add(1);
             let page = self.translated_page_mut(entry);
             if entry.tag & Translation::BACKED != 0 {
@@ -880,6 +895,7 @@ impl Memory {
         if !input.is_empty() {
             self.revision = self.revision.wrapping_add(1);
         }
+        self.prepare_mmu_write(address, input.len());
         let mut executable = false;
         while !input.is_empty() {
             let base = address & !(PAGE_SIZE - 1);
@@ -928,6 +944,20 @@ impl Memory {
         if N == 0 {
             return Ok([0; N]);
         }
+        if let Some(bytes) = self.mmu.read::<N>(address) {
+            return Ok(bytes);
+        }
+        self.read_array_soft(address)
+    }
+    /// Normalized, coordinator-owned fallback after one hardware attempt.
+    #[inline]
+    pub(crate) fn read_array_soft<const N: usize>(
+        &self,
+        address: u64,
+    ) -> Result<[u8; N], MemoryError> {
+        if N == 0 {
+            return Ok([0; N]);
+        }
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if N <= PAGE_SIZE as usize - offset {
             let page = self.page_for_access(address, N, Access::Read)?;
@@ -957,8 +987,29 @@ impl Memory {
         if N > PAGE_SIZE as usize - offset {
             return self.write(address, &bytes);
         }
+        if let Some(frame) = self.mmu.write(address, bytes) {
+            self.revision = self.revision.wrapping_add(1);
+            self.note_parallel_write(frame);
+            return Ok(());
+        }
+        self.write_array_soft(address, bytes)
+    }
+    #[inline]
+    pub(crate) fn write_array_soft<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+    ) -> Result<(), MemoryError> {
+        if N == 0 {
+            return Ok(());
+        }
+        let offset = (address & (PAGE_SIZE - 1)) as usize;
+        if N > PAGE_SIZE as usize - offset {
+            return self.write(address, &bytes);
+        }
         let entry = self.access_translation(address, N, Access::Write)?;
         let frame = entry.frame;
+        self.prepare_mmu_write(address, N);
         let next_code_revision = self.code_revision.wrapping_add(1);
         let page = self.translated_page_mut(entry);
         if entry.tag & Translation::BACKED != 0 {

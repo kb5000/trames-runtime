@@ -89,6 +89,7 @@ impl Memory {
             .iter()
             .filter_map(|&base| snapshot.remove_frame(base).map(|frame| (base, frame)))
             .collect();
+        let mmu_changed: Vec<_> = changed.iter().copied().collect();
         for base in changed {
             let Some(&root_frame) = self.pages.get(&base) else {
                 continue;
@@ -103,9 +104,17 @@ impl Memory {
                 // conservative serial behavior for custom backings.
                 return None;
             }
-            let frame = prepare_frame(page, base, root_frame, previous.get(&base), registry)?;
+            let frame = prepare_frame(
+                self.identity,
+                page,
+                base,
+                root_frame,
+                previous.get(&base),
+                registry,
+            )?;
             snapshot.insert_frame(frame, page.backing.is_some());
         }
+        snapshot.refresh_mmu(&mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
         snapshot.identity = self.identity;

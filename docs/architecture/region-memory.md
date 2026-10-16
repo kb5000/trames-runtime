@@ -18,7 +18,7 @@ are in [AGENTS.md](../../AGENTS.md).
 
 ## Scoped ownership
 
-Coordinator `Memory` pages use `Rc<[u8; 4096]>` for fork COW. `Memory` and its
+Coordinator `Memory` pages use `Rc<PageBytes>` (heap or mapped RAM) for fork COW. `Memory` and its
 backing objects are already local, non-`Send`/non-`Sync` objects. Ordinary CPU
 stores and native fragment writes therefore check local reference counts, without
 an atomic `Arc::make_mut` RMW for each store. Snapshot creation reads the bytes
@@ -27,7 +27,7 @@ slice crosses to a worker. Joined commit writes back through the same COW,
 backing, dirty and executable-invalidation hooks. Sharing a guest VM still uses
 the existing local borrow or concurrent view, rather than sharing the Rc itself.
 
-`parallel/page.rs` owns a stable Box of per-byte UnsafeCells and an atomic held
+`parallel/page.rs` owns stable heap or mapped byte storage and an atomic held
 mask: one bit for each 64-byte region in a 4 KiB page. A guard atomically acquires
 the complete mask it needs using acquire ordering; release clears only its own
 bits. Disjoint masks can coexist. Overlapping ordinary, atomic and native accesses
@@ -126,3 +126,11 @@ rights into one 16-byte entry. Hits reuse validated permission facts, with
 coordinator mapping/protection flushes and immutable worker snapshots. This
 changes translation work only: region guards, live backing faults, COW, native
 admission, dirty publication and ARM atomic ordering keep the model above.
+
+## Hardware-protected ordinary RAM
+
+[Hardware MMU mappings](hardware-mmu.md) share physical bytes between protected CPU
+aliases and RW native aliases. A per-view direct-mapped window cache and opaque
+base hint reduce translation work. Hardware-compatible groups use native scalar
+operands; special mappings and cross-page operations retain the checked software
+path. Region guards, COW, reservations and dirty/code publication are unchanged.

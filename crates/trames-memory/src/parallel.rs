@@ -2,6 +2,7 @@
 //! CPU/native views between quiescent kernel checkpoints. Scoped page guards
 //! stay on workers; Rc backings, mappings and persistence stay coordinated.
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
+mod hardware;
 mod native;
 mod page;
 mod snapshot;
@@ -10,6 +11,7 @@ use std::sync::{Arc, Weak};
 
 #[derive(Default)]
 pub struct Registry {
+    mmu: mmu::Pool,
     shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
     code_epoch: Arc<AtomicU64>,
     pub metrics: Metrics,
@@ -28,7 +30,7 @@ pub struct Metrics {
 }
 struct ConcurrentPage {
     identity: u64,
-    constant: Option<Arc<[u8; PAGE_SIZE as usize]>>,
+    constant: Option<Arc<PageBytes>>,
     bytes: Option<page::MutablePage>,
     dirty: AtomicU64,
     version: AtomicU64,
@@ -36,11 +38,35 @@ struct ConcurrentPage {
     code_epoch: Arc<AtomicU64>,
 }
 impl ConcurrentPage {
-    fn new(bytes: [u8; PAGE_SIZE as usize], constant: bool, code_epoch: Arc<AtomicU64>) -> Self {
+    fn new(
+        bytes: [u8; PAGE_SIZE as usize],
+        constant: bool,
+        code_epoch: Arc<AtomicU64>,
+        slot: Option<Arc<mmu::Slot>>,
+    ) -> Self {
+        let immutable = if constant {
+            Some(Arc::new(if let Some(slot) = &slot {
+                slot.initialize(&bytes);
+                PageBytes::from_slot(slot.clone())
+            } else {
+                PageBytes::new(bytes)
+            }))
+        } else {
+            None
+        };
+        let mutable = if constant {
+            None
+        } else {
+            Some(if let Some(slot) = slot {
+                page::MutablePage::new_mapped(bytes, slot)
+            } else {
+                page::MutablePage::new(bytes)
+            })
+        };
         Self {
             identity: new_backing_identity(),
-            constant: constant.then(|| Arc::new(bytes)),
-            bytes: (!constant).then(|| page::MutablePage::new(bytes)),
+            constant: immutable,
+            bytes: mutable,
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
             executable: std::sync::atomic::AtomicBool::new(false),
@@ -101,6 +127,7 @@ struct Frame {
     bytes: Arc<ConcurrentPage>,
 }
 fn prepare_frame(
+    space: u64,
     page: &Page,
     base: u64,
     root_frame: usize,
@@ -141,6 +168,7 @@ fn prepare_frame(
                     data,
                     false,
                     registry.code_epoch.clone(),
+                    None,
                 ));
                 registry.shared.insert(key, Arc::downgrade(&bytes));
                 bytes
@@ -153,6 +181,11 @@ fn prepare_frame(
                 data,
                 !page.permissions.write,
                 registry.code_epoch.clone(),
+                if page.backing.is_none() {
+                    registry.mmu.slot(space, base)
+                } else {
+                    None
+                },
             ))
         }
     };
@@ -180,6 +213,7 @@ fn prepare_frame(
 }
 
 struct Snapshot {
+    mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
     dynamic_code_pages: usize,
@@ -207,6 +241,7 @@ pub(super) struct SnapshotCache {
 pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
+    mmu_cache: mmu::Cache,
 }
 /// Clone a worker-local view over the same frozen address space, with its own
 /// translation cells. This is a shared-VM view, not a process fork.
@@ -219,6 +254,7 @@ impl View {
     fn new(snapshot: Arc<Snapshot>) -> Self {
         Self {
             snapshot,
+            mmu_cache: mmu::Cache::default(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
     }
@@ -409,9 +445,23 @@ impl CpuMemory for View {
     }
     #[inline]
     fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
+        if let Some(bytes) = self.mmu_read::<N>(address) {
+            return Ok(bytes);
+        }
         let mut bytes = [0; N];
         self.read(address, &mut bytes)?;
         Ok(bytes)
+    }
+    #[inline]
+    fn write_array<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+    ) -> Result<(), MemoryError> {
+        if self.mmu_write(address, bytes) {
+            return Ok(());
+        }
+        self.write(address, &bytes)
     }
     fn write(&mut self, address: u64, input: &[u8]) -> Result<(), MemoryError> {
         let mut address = address & 0x00ffffffffffffff;
@@ -477,6 +527,38 @@ impl CpuMemory for View {
             frame.bytes.identity,
             frame.bytes.version.load(Ordering::Acquire),
         ))
+    }
+    #[inline]
+    fn direct_hint(&self) -> DirectHint {
+        self.snapshot.mmu.hint(&self.mmu_cache)
+    }
+    #[inline(always)]
+    fn read_array_hint<const N: usize>(
+        &self,
+        address: u64,
+        hint: &mut DirectHint,
+    ) -> Result<[u8; N], MemoryError> {
+        if let Some(bytes) = self.mmu_read_hint(address, hint) {
+            return Ok(bytes);
+        }
+        let mut bytes = [0; N];
+        let result = self.read(address, &mut bytes).map(|()| bytes);
+        *hint = self.direct_hint();
+        result
+    }
+    #[inline(always)]
+    fn write_array_hint<const N: usize>(
+        &mut self,
+        address: u64,
+        bytes: [u8; N],
+        hint: &mut DirectHint,
+    ) -> Result<(), MemoryError> {
+        if self.mmu_write_hint(address, bytes, hint) {
+            return Ok(());
+        }
+        let result = self.write(address, &bytes);
+        *hint = self.direct_hint();
+        result
     }
     fn atomic_update<T>(
         &mut self,
@@ -670,6 +752,7 @@ impl Memory {
             return None;
         }
         registry.shared.retain(|_, page| page.strong_count() != 0);
+        registry.mmu.prune();
         registry.metrics.full_rebuilds += 1;
         registry.metrics.full_rebuild_pages += self.pages.len() as u64;
         if let Some(cache) = &self.parallel_cache {
@@ -690,7 +773,7 @@ impl Memory {
             let previous = old
                 .as_ref()
                 .and_then(|c| c.snapshot.pages.get(&base).map(|&i| &c.snapshot.frames[i]));
-            let frame = prepare_frame(page, base, root_frame, previous, registry)?;
+            let frame = prepare_frame(self.identity, page, base, root_frame, previous, registry)?;
             let count = identities.entry(frame.bytes.identity).or_insert(0usize);
             alias_count += usize::from(*count == 1);
             *count += 1;
@@ -701,7 +784,8 @@ impl Memory {
             positions[root_frame] = Some(frames.len());
             frames.push(frame);
         }
-        let snapshot = Arc::new(Snapshot {
+        let mut snapshot = Snapshot {
+            mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
             dynamic_code: frames
                 .iter()
@@ -740,7 +824,9 @@ impl Memory {
             frames,
             reservations: self.reservations.clone(),
             code_epoch: registry.code_epoch.clone(),
-        });
+        };
+        snapshot.refresh_mmu_all();
+        let snapshot = Arc::new(snapshot);
         self.parallel_cache = Some(SnapshotCache {
             snapshot: snapshot.clone(),
             source_revision: self.revision,

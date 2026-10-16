@@ -85,6 +85,11 @@ impl NativeMemory for View {
         &self,
         address: u64,
     ) -> Result<[u8; N], NativeAccessError> {
+        // Hardware views contain only ordinary anonymous pages, which cannot
+        // require native live-backing admission.
+        if let Some(bytes) = self.mmu_read::<N>(address) {
+            return Ok(bytes);
+        }
         let mut bytes = [0; N];
         self.native_read(address, &mut bytes)?;
         Ok(bytes)

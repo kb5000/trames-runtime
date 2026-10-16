@@ -11,8 +11,20 @@ const PAGE: usize = PAGE_SIZE as usize;
 
 /// Byte cells are never exposed without a matching, live range guard. The Box
 /// stays at one allocation for the lifetime of every guard and borrowed slice.
+enum Bytes {
+    Heap(Box<[UnsafeCell<u8>; PAGE]>),
+    Mapped(std::sync::Arc<crate::mmu::Slot>),
+}
+impl Bytes {
+    fn as_ptr(&self) -> *const UnsafeCell<u8> {
+        match self {
+            Self::Heap(bytes) => bytes.as_ptr(),
+            Self::Mapped(slot) => slot.pointer().cast(),
+        }
+    }
+}
 pub(super) struct MutablePage {
-    bytes: Box<[UnsafeCell<u8>; PAGE]>,
+    bytes: Bytes,
     held: AtomicU64,
     reservations: [UnsafeCell<[u64; 4]>; PAGE / REGION],
     reservation_overrides: [UnsafeCell<u8>; PAGE / REGION],
@@ -38,13 +50,26 @@ fn mask(offset: usize, len: usize) -> u64 {
 
 impl MutablePage {
     pub fn new(bytes: [u8; PAGE]) -> Self {
+        Self::with_storage(Bytes::Heap(Box::new(bytes.map(UnsafeCell::new))))
+    }
+    fn with_storage(bytes: Bytes) -> Self {
         Self {
-            bytes: Box::new(bytes.map(UnsafeCell::new)),
+            bytes,
             held: AtomicU64::new(0),
             reservations: std::array::from_fn(|_| UnsafeCell::new([0; 4])),
             reservation_overrides: std::array::from_fn(|_| UnsafeCell::new(0)),
             reservation_base: AtomicU64::new(0),
             reservation_written: AtomicU64::new(0),
+        }
+    }
+    pub(super) fn new_mapped(bytes: [u8; PAGE], slot: std::sync::Arc<crate::mmu::Slot>) -> Self {
+        slot.initialize(&bytes);
+        Self::with_storage(Bytes::Mapped(slot))
+    }
+    pub(super) fn physical(&self) -> Option<(&std::sync::Arc<crate::mmu::host::Mapping>, usize)> {
+        match &self.bytes {
+            Bytes::Mapped(slot) => Some((&slot.owner, slot.offset)),
+            _ => None,
         }
     }
     pub fn lock(&self, offset: usize, len: usize) -> Guard<'_> {

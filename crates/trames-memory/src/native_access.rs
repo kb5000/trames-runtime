@@ -298,11 +298,11 @@ impl Memory {
             if !b.shared && !b.private_copy {
                 let mut bytes = [0; PAGE_SIZE as usize];
                 b.object.read(0, &mut bytes)?;
-                page.bytes = Rc::new(bytes);
+                page.bytes = Rc::new(PageBytes::new(bytes));
                 b.private_copy = true;
             }
         }
-        self.mark_native_write(frame);
+        self.mark_native_write(frame, address & !(PAGE_SIZE - 1));
         let page = self.frames[frame].as_mut().expect("checked page");
         if page.backing.as_ref().is_some_and(|b| b.shared) {
             let mut operation = Some(operation);
@@ -331,7 +331,8 @@ impl Memory {
         ))
     }
 
-    fn mark_native_write(&mut self, frame: usize) {
+    fn mark_native_write(&mut self, frame: usize, base: u64) {
+        self.prepare_mmu_write(base, PAGE_SIZE as usize);
         self.note_parallel_write(frame);
         self.revision = self.revision.wrapping_add(1);
         if self.frames[frame]
@@ -457,7 +458,7 @@ impl Memory {
                 .frame(dst & !(PAGE_SIZE - 1))
                 .expect("checked destination");
             let sf = self.frame(src & !(PAGE_SIZE - 1)).expect("checked source");
-            self.mark_native_write(df);
+            self.mark_native_write(df, dst & !(PAGE_SIZE - 1));
             let di = (dst % PAGE_SIZE) as usize;
             let si = (src % PAGE_SIZE) as usize;
             if df == sf {

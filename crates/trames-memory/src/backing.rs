@@ -98,7 +98,7 @@ impl Page {
             if !b.private_copy {
                 let mut page = [0; PAGE_SIZE as usize];
                 b.object.read(0, &mut page)?;
-                self.bytes = Rc::new(page);
+                self.bytes = Rc::new(PageBytes::new(page));
                 b.private_copy = true;
             }
         }
@@ -140,7 +140,7 @@ impl Memory {
         } else {
             self.map(address, len, permissions)?;
         }
-        let zero = Rc::new([0; PAGE_SIZE as usize]);
+        let zero = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
         for (i, object) in objects.into_iter().enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
             let page = self.frames[frame].as_mut().expect("mapped page");
@@ -151,6 +151,7 @@ impl Memory {
                 private_copy: false,
             });
         }
+        self.refresh_mmu(address, len);
         self.has_backings = true;
         self.cpu_borrow_safe &= cpu_safe;
         Ok(())
@@ -202,12 +203,13 @@ impl Memory {
             if self.parallel_cache.is_some() {
                 self.parallel_mappings.insert(base);
             }
-            page.bytes = Rc::new([0; PAGE_SIZE as usize]);
+            page.bytes = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
             if let Some(b) = &mut page.backing {
                 b.private_copy = false;
             }
             page.instruction_revision = self.code_revision;
         }
+        self.refresh_mmu(address, len);
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
@@ -244,6 +246,7 @@ impl Memory {
             self.unmap(old, old_len)?;
             return self.reserve(new, new_len, fixed);
         }
+        self.mmu.retire();
         let mut pages = Vec::new();
         for base in (old..old_end).step_by(PAGE_SIZE as usize) {
             pages.push(
@@ -293,7 +296,7 @@ impl Memory {
             let original_count = pages.len();
             for i in original_count..count {
                 let mut page = last.clone();
-                page.bytes = Rc::new([0; PAGE_SIZE as usize]);
+                page.bytes = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
                 if let Some(b) = &mut page.backing {
                     b.object = last
                         .backing
@@ -321,6 +324,7 @@ impl Memory {
             let frame = self.pages[&(new + i as u64 * PAGE_SIZE)];
             self.frames[frame] = Some(page);
         }
+        self.refresh_mmu(new, new_len);
         Ok(())
     }
 }
