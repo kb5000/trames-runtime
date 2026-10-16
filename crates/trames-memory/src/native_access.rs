@@ -298,7 +298,7 @@ impl Memory {
             if !b.shared && !b.private_copy {
                 let mut bytes = [0; PAGE_SIZE as usize];
                 b.object.read(0, &mut bytes)?;
-                page.bytes = Arc::new(bytes);
+                page.bytes = Rc::new(bytes);
                 b.private_copy = true;
             }
         }
@@ -326,7 +326,7 @@ impl Memory {
             return Ok((result, false));
         }
         Ok((
-            operation(&mut Arc::make_mut(&mut page.bytes)[offset..offset + len]),
+            operation(&mut Rc::make_mut(&mut page.bytes)[offset..offset + len]),
             true,
         ))
     }
@@ -462,7 +462,7 @@ impl Memory {
             let si = (src % PAGE_SIZE) as usize;
             if df == sf {
                 let page = self.frames[df].as_mut().expect("page");
-                Arc::make_mut(&mut page.bytes).copy_within(si..si + count, di);
+                Rc::make_mut(&mut page.bytes).copy_within(si..si + count, di);
             } else {
                 let (d, s) = if df < sf {
                     let (left, right) = self.frames.split_at_mut(sf);
@@ -478,7 +478,7 @@ impl Memory {
                     )
                 };
                 copy(
-                    &mut Arc::make_mut(&mut d.bytes)[di..di + count],
+                    &mut Rc::make_mut(&mut d.bytes)[di..di + count],
                     &s.bytes[si..si + count],
                 );
             }
@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(&page[8..16], &42u64.to_le_bytes());
         let original = page.as_ptr();
         assert_eq!(
-            Arc::strong_count(&memory.frames[0].as_ref().unwrap().bytes),
+            Rc::strong_count(&memory.frames[0].as_ref().unwrap().bytes),
             1
         );
         assert!(memory.native_read_page(0x1ffc, 8).unwrap().is_none());

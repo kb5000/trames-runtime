@@ -5,7 +5,7 @@
 mod native;
 mod page;
 use super::*;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 #[derive(Default)]
 pub struct Registry {
@@ -1047,18 +1047,24 @@ mod tests {
         parent.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
         let mut child = parent.clone();
         let mut registry = Registry::default();
-        let mut p = parent.parallel_view(&mut registry).unwrap();
-        let mut c = child.parallel_view(&mut registry).unwrap();
-        p.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
-        c.atomic_update(0x1000, 8, |b| {
-            let v = u64::from_le_bytes(b.try_into().unwrap());
-            b.copy_from_slice(&(v + 1).to_le_bytes());
-            ((), true)
-        })
-        .unwrap();
-        p.write_array(0x2000, 3u64.to_le_bytes()).unwrap();
-        c.write_array(0x2000, 4u64.to_le_bytes()).unwrap();
-        drop((p, c));
+        let p = parent.parallel_view(&mut registry).unwrap();
+        let c = child.parallel_view(&mut registry).unwrap();
+        // Only the concurrent views cross host-thread boundaries. The parent
+        // and child retain coordinator-local COW pages until joined commit.
+        std::thread::scope(|scope| {
+            for (mut view, private_value) in [(p, 3u64), (c, 4u64)] {
+                scope.spawn(move || {
+                    view.atomic_update(0x1000, 8, |b| {
+                        let v = u64::from_le_bytes(b.try_into().unwrap());
+                        b.copy_from_slice(&(v + 1).to_le_bytes());
+                        ((), true)
+                    })
+                    .unwrap();
+                    view.write_array(0x2000, private_value.to_le_bytes())
+                        .unwrap();
+                });
+            }
+        });
         parent.commit_parallel().unwrap();
         child.commit_parallel().unwrap();
         assert_eq!(parent.read_u64(0x1000).unwrap(), 2);

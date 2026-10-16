@@ -98,11 +98,11 @@ impl Page {
             if !b.private_copy {
                 let mut page = [0; PAGE_SIZE as usize];
                 b.object.read(0, &mut page)?;
-                self.bytes = Arc::new(page);
+                self.bytes = Rc::new(page);
                 b.private_copy = true;
             }
         }
-        Arc::make_mut(&mut self.bytes)[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Rc::make_mut(&mut self.bytes)[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 }
@@ -140,7 +140,7 @@ impl Memory {
         } else {
             self.map(address, len, permissions)?;
         }
-        let zero = Arc::new([0; PAGE_SIZE as usize]);
+        let zero = Rc::new([0; PAGE_SIZE as usize]);
         for (i, object) in objects.into_iter().enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
             let page = self.frames[frame].as_mut().expect("mapped page");
@@ -199,7 +199,7 @@ impl Memory {
             if page.backing.as_ref().is_some_and(|b| b.shared) {
                 continue;
             }
-            page.bytes = Arc::new([0; PAGE_SIZE as usize]);
+            page.bytes = Rc::new([0; PAGE_SIZE as usize]);
             if let Some(b) = &mut page.backing {
                 b.private_copy = false;
             }
@@ -290,7 +290,7 @@ impl Memory {
             let original_count = pages.len();
             for i in original_count..count {
                 let mut page = last.clone();
-                page.bytes = Arc::new([0; PAGE_SIZE as usize]);
+                page.bytes = Rc::new([0; PAGE_SIZE as usize]);
                 if let Some(b) = &mut page.backing {
                     b.object = last
                         .backing

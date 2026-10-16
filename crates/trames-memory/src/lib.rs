@@ -15,10 +15,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     rc::Rc,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -98,7 +95,11 @@ impl std::error::Error for MemoryError {}
 
 #[derive(Clone)]
 struct Page {
-    bytes: Arc<[u8; PAGE_SIZE as usize]>,
+    // Coordinator-only COW storage. Memory/Backed are already !Send/!Sync;
+    // workers get separate Arc<ConcurrentPage> bytes at joined checkpoints.
+    // Rc preserves fork COW without an atomic refcount RMW on every CPU/native
+    // store. Never send this allocation (or a borrowed slice) to a worker.
+    bytes: Rc<[u8; PAGE_SIZE as usize]>,
     permissions: Permissions,
     instruction_revision: u64,
     backing: Option<Backed>,
@@ -275,7 +276,7 @@ impl Memory {
 
     fn insert_page(&mut self, base: u64, permissions: Permissions) {
         let page = Page {
-            bytes: Arc::new([0; PAGE_SIZE as usize]),
+            bytes: Rc::new([0; PAGE_SIZE as usize]),
             permissions,
             instruction_revision: self.code_revision,
             backing: None,
@@ -957,7 +958,7 @@ mod tests {
         memory.read(0, &mut bytes).unwrap();
         let frame = memory.pages[&0];
         assert_eq!(
-            Arc::strong_count(&memory.frames[frame].as_ref().unwrap().bytes),
+            Rc::strong_count(&memory.frames[frame].as_ref().unwrap().bytes),
             1
         );
         let mut child = memory.clone();

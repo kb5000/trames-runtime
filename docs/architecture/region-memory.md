@@ -18,6 +18,15 @@ are in [AGENTS.md](../../AGENTS.md).
 
 ## Scoped ownership
 
+Coordinator `Memory` pages use `Rc<[u8; 4096]>` for fork COW. `Memory` and its
+backing objects are already local, non-`Send`/non-`Sync` objects. Ordinary CPU
+stores and native fragment writes therefore check local reference counts, without
+an atomic `Arc::make_mut` RMW for each store. Snapshot creation reads the bytes
+into separate `Arc<ConcurrentPage>` allocations; no coordinator Rc or borrowed
+slice crosses to a worker. Joined commit writes back through the same COW,
+backing, dirty and executable-invalidation hooks. Sharing a guest VM still uses
+the existing local borrow or concurrent view, rather than sharing the Rc itself.
+
 `parallel/page.rs` owns a stable Box of per-byte UnsafeCells and an atomic held
 mask: one bit for each 64-byte region in a 4 KiB page. A guard atomically acquires
 the complete mask it needs using acquire ordering; release clears only its own
