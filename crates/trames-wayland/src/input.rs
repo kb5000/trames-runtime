@@ -44,6 +44,8 @@ pub(crate) struct Seat {
     pointer_position: (f64, f64),
     buttons: BTreeSet<u32>,
     grab: Option<u64>,
+    pub popups: Vec<u64>,
+    pub press_serial: Option<(u32, u64)>,
     pressed: BTreeSet<u32>,
     modifiers: u32,
     keymap: Option<trames_shared::SharedFile>,
@@ -104,7 +106,21 @@ impl State {
         self.seat.keyboards.retain(Resource::is_alive);
         self.seat.pointers.retain(Resource::is_alive);
         match event {
-            InputEvent::Focus { window } => self.focus_surface(window),
+            InputEvent::Focus { window } => {
+                self.dismiss_popups();
+                if window.is_none() {
+                    let buttons = self.seat.buttons.iter().copied().collect::<Vec<_>>();
+                    for button in buttons {
+                        self.input(InputEvent::Button {
+                            button,
+                            pressed: false,
+                            time: 0,
+                        });
+                    }
+                    self.seat.grab = None;
+                }
+                self.focus_surface(window);
+            }
             InputEvent::Pointer { window, x, y, time } => {
                 if !x.is_finite() || !y.is_finite() {
                     return;
@@ -175,6 +191,15 @@ impl State {
                     return;
                 }
                 if pressed {
+                    if self.seat.popups.last().is_some_and(|&popup| {
+                        self.seat
+                            .pointer
+                            .is_none_or(|target| !self.is_descendant(target, popup))
+                    }) {
+                        self.dismiss_popups();
+                        self.focus_surface(self.seat.pointer);
+                        return;
+                    }
                     if !self.seat.buttons.insert(button) {
                         return;
                     }
@@ -189,6 +214,11 @@ impl State {
                     self.seat.grab = None;
                 }
                 let serial = self.next_serial();
+                if let Some(id) = self.seat.pointer {
+                    if pressed {
+                        self.seat.press_serial = Some((serial, id));
+                    }
+                }
                 if let Some(s) = self.seat.pointer.and_then(|id| self.surfaces.get(&id)) {
                     for p in &self.seat.pointers {
                         if connection(p) == s.connection {
@@ -260,6 +290,11 @@ impl State {
                 }
                 self.seat.modifiers = modifiers;
                 let serial = self.next_serial();
+                if let Some(id) = self.seat.focus {
+                    if pressed {
+                        self.seat.press_serial = Some((serial, id));
+                    }
+                }
                 if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
                     for k in &self.seat.keyboards {
                         if connection(k) == s.connection {
@@ -428,8 +463,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 .data::<SurfaceKey>()
                 .and_then(|key| state.surfaces.get_mut(&key.0))
             {
-                if s.top.is_some() || s.parent.is_some() || s.xdg.is_some() {
+                if !matches!(
+                    s.role,
+                    crate::scene::Role::None | crate::scene::Role::Cursor
+                ) || s.top.is_some()
+                    || s.parent.is_some()
+                    || s.xdg.is_some()
+                {
                     r.post_error(0u32, "cursor surface already has a role");
+                } else {
+                    s.role = crate::scene::Role::Cursor;
                 }
             }
         }

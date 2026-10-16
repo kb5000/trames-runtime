@@ -105,6 +105,9 @@ impl State {
         if !pending.callbacks.is_empty() {
             s.callbacks.push_back((s.revision, pending.callbacks));
         }
+        if self.seat.popups.last() == Some(&id) {
+            self.focus_surface(Some(id));
+        }
     }
 }
 impl GlobalDispatch<wl_compositor::WlCompositor, ()> for State {
@@ -273,6 +276,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
                     }
                 }
             }
+            state.seat.popups.retain(|id| *id != key.0);
             state.changed();
         }
     }

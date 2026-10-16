@@ -30,6 +30,34 @@ pub struct WindowSnapshot {
     pub scene: Vec<SurfaceImage>,
     pub revision: u64,
 }
+impl WindowSnapshot {
+    /// Logical scene extent, including popups/CSD shadows outside root geometry.
+    /// The native UI intersects this with its actual workspace before allocating
+    /// a drawable. Wide arithmetic prevents hostile positions wrapping bounds.
+    pub fn bounds(&self) -> [i32; 4] {
+        let (mut x, mut y, mut r, mut b) =
+            (0i64, 0i64, i64::from(self.width), i64::from(self.height));
+        for image in &self.scene {
+            let (w, h) = image.buffer.dimensions();
+            let (w, h) = if image.transform & 1 != 0 {
+                (h, w)
+            } else {
+                (w, h)
+            };
+            let scale = i64::from(image.scale.max(1));
+            let (ix, iy) = (i64::from(image.x), i64::from(image.y));
+            x = x.min(ix);
+            y = y.min(iy);
+            r = r.max(ix + i64::from(w) / scale);
+            b = b.max(iy + i64::from(h) / scale);
+        }
+        let x = x.clamp(-4096, 4096);
+        let y = y.clamp(-4096, 4096);
+        let r = r.clamp(x + 1, 8192);
+        let b = b.clamp(y + 1, 8192);
+        [x as i32, y as i32, (r - x) as i32, (b - y) as i32]
+    }
+}
 #[derive(Clone)]
 pub struct SurfaceImage {
     pub surface: u64,
@@ -152,12 +180,23 @@ impl Region {
             .is_some_and(|r| r.4)
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    None,
+    Top,
+    Popup,
+    Subsurface,
+    Cursor,
+}
 pub(crate) struct Surface {
+    pub role: Role,
+    pub dismissed: bool,
     pub resource: WlSurface,
     pub connection: u64,
     pub xdg: Option<XdgSurface>,
     pub top: Option<XdgToplevel>,
     pub popup: Option<XdgPopup>,
+    pub reposition: Option<u32>,
     pub parent: Option<(u64, i32, i32)>,
     pub children: Vec<u64>,
     pub sub: Option<Subsurface>,
@@ -210,9 +249,12 @@ impl Surface {
         Self {
             resource,
             connection,
+            role: Role::None,
+            dismissed: false,
             xdg: None,
             top: None,
             popup: None,
+            reposition: None,
             parent: None,
             children: Vec::new(),
             sub: None,
@@ -257,6 +299,9 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
         out: &mut Vec<SurfaceImage>,
     ) {
         let Some(s) = surfaces.get(&id) else { return };
+        if s.dismissed {
+            return;
+        }
         // Subsurface stacking is relative to the parent and its siblings.
         for below in [true, false] {
             if !below {

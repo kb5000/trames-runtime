@@ -141,6 +141,7 @@ impl Dispatch<sc::WlSubcompositor, ()> for State {
                     return;
                 };
                 if parent_connection != Some(s.connection)
+                    || !matches!(s.role, Role::None | Role::Subsurface)
                     || s.xdg.is_some()
                     || s.sub.is_some()
                     || s.parent.is_some()
@@ -149,6 +150,7 @@ impl Dispatch<sc::WlSubcompositor, ()> for State {
                     return;
                 }
                 i.init(id, child);
+                s.role = Role::Subsurface;
                 s.parent = Some((parent.0, 0, 0));
                 s.sub = Some(Subsurface {
                     synchronized: true,

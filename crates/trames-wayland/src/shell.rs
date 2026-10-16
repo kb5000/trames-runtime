@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+use crate::popup::Positioner;
 use crate::scene::*;
 use wayland_protocols::xdg::shell::server::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
@@ -10,6 +11,20 @@ pub(crate) fn globals(handle: &DisplayHandle) {
     handle.create_global::<State, xdg_wm_base::XdgWmBase, _>(3, ());
 }
 impl State {
+    pub(crate) fn dismiss_popups(&mut self) {
+        let ids = std::mem::take(&mut self.seat.popups);
+        for id in ids.into_iter().rev() {
+            if let Some(s) = self.surfaces.get_mut(&id) {
+                if let Some(p) = &s.popup {
+                    p.popup_done();
+                }
+                s.dismissed = true;
+                s.current = None;
+                s.gpu_pending.clear();
+            }
+        }
+        self.changed();
+    }
     pub fn configure(&mut self, id: u64) {
         self.serial = self.serial.wrapping_add(1).max(1);
         let serial = self.serial;
@@ -26,6 +41,9 @@ impl State {
         if let Some(popup) = &s.popup {
             let (_, x, y) = s.parent.unwrap_or((0, 0, 0));
             popup.configure(x, y, s.size.0 as i32, s.size.1 as i32);
+            if let Some(token) = s.reposition.take() {
+                popup.repositioned(token);
+            }
         }
         if let Some(xdg) = &s.xdg {
             xdg.configure(serial);
@@ -69,7 +87,11 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
                     return;
                 };
-                if s.xdg.is_some() || s.parent.is_some() || s.current.is_some() {
+                if !matches!(s.role, Role::None | Role::Top | Role::Popup)
+                    || s.xdg.is_some()
+                    || s.parent.is_some()
+                    || s.current.is_some()
+                {
                     init.post_error(id, 0u32, "surface already has a role or buffer");
                     return;
                 }
@@ -107,10 +129,12 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
                     return;
                 };
-                if s.top.is_some() || s.popup.is_some() {
+                if !matches!(s.role, Role::None | Role::Top) || s.top.is_some() || s.popup.is_some()
+                {
                     init.post_error(id, 2u32, "surface already constructed");
                     return;
                 }
+                s.role = Role::Top;
                 s.top = Some(init.init(id, *key));
                 state.changed();
             }
@@ -156,7 +180,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 else {
                     return;
                 };
-                if pos.size.0 <= 0 || pos.size.1 <= 0 {
+                if !pos.complete() {
                     init.post_error(id, 5u32, "incomplete popup positioner");
                     return;
                 }
@@ -167,20 +191,18 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
                     return;
                 };
-                if s.top.is_some() || s.popup.is_some() {
+                if !matches!(s.role, Role::None | Role::Popup)
+                    || s.top.is_some()
+                    || s.popup.is_some()
+                {
                     init.post_error(id, 2u32, "surface already constructed");
                     return;
                 }
+                s.role = Role::Popup;
                 s.popup = Some(init.init(id, *key));
-                s.parent = Some((
-                    parent.0,
-                    pos.anchor.0.saturating_add(pos.offset.0),
-                    pos.anchor
-                        .1
-                        .saturating_add(pos.anchor.3)
-                        .saturating_add(pos.offset.1),
-                ));
-                s.size = (pos.size.0 as u32, pos.size.1 as u32);
+                let (x, y, w, h) = pos.geometry(state.viewport);
+                s.parent = Some((parent.0, x, y));
+                s.size = (w, h);
                 s.requested_size = s.size;
                 state
                     .surfaces
@@ -245,12 +267,6 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
         state.changed();
     }
 }
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Positioner {
-    size: (i32, i32),
-    anchor: (i32, i32, i32, i32),
-    offset: (i32, i32),
-}
 impl Dispatch<xdg_positioner::XdgPositioner, std::sync::Mutex<Positioner>> for State {
     fn request(
         _: &mut Self,
@@ -280,10 +296,33 @@ impl Dispatch<xdg_positioner::XdgPositioner, std::sync::Mutex<Positioner>> for S
                 if width <= 0 || height <= 0 {
                     r.post_error(0u32, "invalid anchor rectangle");
                 } else {
-                    p.anchor = (x, y, width, height);
+                    p.rect = (x, y, width, height);
                 }
             }
             xdg_positioner::Request::SetOffset { x, y } => p.offset = (x, y),
+            xdg_positioner::Request::SetAnchor { anchor } => {
+                if let wayland_server::WEnum::Value(value) = anchor {
+                    p.anchor = value as u32;
+                } else {
+                    r.post_error(0u32, "invalid anchor");
+                }
+            }
+            xdg_positioner::Request::SetGravity { gravity } => {
+                if let wayland_server::WEnum::Value(value) = gravity {
+                    p.gravity = value as u32;
+                } else {
+                    r.post_error(0u32, "invalid gravity");
+                }
+            }
+            xdg_positioner::Request::SetConstraintAdjustment {
+                constraint_adjustment,
+            } => {
+                if let wayland_server::WEnum::Value(value) = constraint_adjustment {
+                    p.constraints = value.bits();
+                } else {
+                    r.post_error(0u32, "invalid constraint adjustment");
+                }
+            }
             _ => {}
         }
     }
@@ -298,10 +337,65 @@ impl Dispatch<xdg_popup::XdgPopup, SurfaceKey> for State {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        if let xdg_popup::Request::Destroy = request {
-            if let Some(s) = state.surfaces.get_mut(&key.0) {
-                s.popup = None;
+        match request {
+            xdg_popup::Request::Destroy => {
+                if let Some(s) = state.surfaces.get_mut(&key.0) {
+                    s.popup = None;
+                    s.current = None;
+                }
+                state.seat.popups.retain(|id| *id != key.0);
+                state.changed();
             }
+            xdg_popup::Request::Grab { serial, .. } => {
+                let parent = state
+                    .surfaces
+                    .get(&key.0)
+                    .and_then(|s| s.parent)
+                    .map(|p| p.0);
+                let valid = state.seat.press_serial.is_some_and(|(issued, target)| {
+                    issued == serial && parent.is_some_and(|p| state.is_descendant(target, p))
+                }) && state
+                    .seat
+                    .popups
+                    .last()
+                    .is_none_or(|id| Some(*id) == parent)
+                    && state
+                        .surfaces
+                        .get(&key.0)
+                        .is_some_and(|s| s.current.is_none() && !s.dismissed)
+                    && !state.seat.popups.contains(&key.0);
+                if !valid {
+                    if let Some(p) = state.surfaces.get(&key.0).and_then(|s| s.popup.as_ref()) {
+                        p.post_error(0u32, "invalid popup implicit-grab serial or parent");
+                    }
+                    return;
+                }
+                state.seat.popups.push(key.0);
+            }
+            xdg_popup::Request::Reposition { positioner, token } => {
+                let Some(p) = positioner
+                    .data::<std::sync::Mutex<Positioner>>()
+                    .and_then(|p| p.lock().ok())
+                    .map(|p| *p)
+                else {
+                    return;
+                };
+                if !p.complete() {
+                    return;
+                }
+                let (x, y, w, h) = p.geometry(state.viewport);
+                if let Some(s) = state.surfaces.get_mut(&key.0) {
+                    if let Some((parent, ..)) = s.parent {
+                        s.parent = Some((parent, x, y));
+                    }
+                    s.size = (w, h);
+                    s.requested_size = s.size;
+                    s.reposition = Some(token);
+                }
+                state.configure(key.0);
+                state.changed();
+            }
+            _ => {}
         }
     }
 }

@@ -256,3 +256,207 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
     drop(last);
     assert!(dropped2.load(Ordering::Acquire));
 }
+
+#[test]
+#[ignore = "build original C scene peer with scripts/test-wayland.sh"]
+fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
+    use std::io::Read;
+    use trames_wayland::InputEvent;
+    let server = Server::new().unwrap();
+    let (_, socket) = server.connect(9, 1000, 1000).unwrap();
+    let fd = socket.as_raw_fd();
+    let mut cmd = Command::new(std::env::var("TRAMES_WAYLAND_SCENE_CLIENT").unwrap());
+    cmd.env("WAYLAND_SOCKET", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: child-only CLOEXEC update on the inherited retained Unix socket.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(socket);
+    let mut stdout = child.stdout.take().unwrap();
+    // SAFETY: a live uniquely-owned diagnostic pipe; only adds nonblocking I/O.
+    unsafe {
+        assert!(libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) >= 0);
+    }
+    let mut log = String::new();
+    let start = Instant::now();
+    let mut phase = 0;
+    let key = |value| {
+        for pressed in [true, false] {
+            server
+                .input(InputEvent::Key {
+                    key: value,
+                    pressed,
+                    modifiers: 0,
+                    time: 10,
+                })
+                .unwrap();
+        }
+    };
+    loop {
+        let mut bytes = [0; 4096];
+        loop {
+            match stdout.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => log.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let scene = server.snapshot();
+        if let Some(w) = scene.windows.first() {
+            let root = w.id;
+            if w.scene.len() == 3 {
+                let child_image = &w.scene[1];
+                let popup = &w.scene[2];
+                let color = |image: &trames_wayland::SurfaceImage| -> u32 {
+                    let mut value = 0;
+                    let pixels = image.buffer.shm().unwrap();
+                    // SAFETY: immutable client frame plus retained SHM lease.
+                    unsafe {
+                        pixels
+                            .mapping
+                            .with_read(0, 4, |p| value = u32::from_le_bytes(p.try_into().unwrap()));
+                    }
+                    value
+                };
+                if phase == 0 {
+                    assert_eq!((child_image.x, child_image.y), (20, 30));
+                    assert_eq!(color(child_image), 0xffcc0000);
+                    assert_eq!(
+                        (popup.x, popup.y, popup.buffer.dimensions()),
+                        (203, 115, (80, 60))
+                    );
+                    assert_eq!(w.bounds(), [-10, -10, 293, 185]);
+                    // The child's input region excludes its border. Once pressed
+                    // inside, its implicit grab keeps the release even outside.
+                    for (x, y) in [(21.0, 31.0), (25.0, 35.0)] {
+                        server
+                            .input(InputEvent::Pointer {
+                                window: root,
+                                x,
+                                y,
+                                time: 1,
+                            })
+                            .unwrap();
+                    }
+                    server
+                        .input(InputEvent::Button {
+                            button: 0x110,
+                            pressed: true,
+                            time: 2,
+                        })
+                        .unwrap();
+                    server
+                        .input(InputEvent::Pointer {
+                            window: root,
+                            x: 0.0,
+                            y: 0.0,
+                            time: 3,
+                        })
+                        .unwrap();
+                    server
+                        .input(InputEvent::Button {
+                            button: 0x110,
+                            pressed: false,
+                            time: 4,
+                        })
+                        .unwrap();
+                    server
+                        .input(InputEvent::Focus { window: Some(root) })
+                        .unwrap();
+                    key(30);
+                    phase = 1;
+                } else if phase == 1 && log.contains("staged") {
+                    assert_eq!((child_image.x, child_image.y), (20, 30));
+                    assert_eq!(color(child_image), 0xffcc0000);
+                    assert!(
+                        log.contains("pointer=root")
+                            && log.contains("pointer=child")
+                            && log.contains("motion=child -20,-30")
+                            && log.contains("button=child 0"),
+                        "{log}"
+                    );
+                    key(31);
+                    phase = 2;
+                } else if phase == 2 && log.contains("applied") {
+                    assert_eq!((child_image.x, child_image.y), (60, 40));
+                    assert_eq!(color(child_image), 0xff00cc00);
+                    key(32);
+                    phase = 3;
+                } else if phase == 3 && popup.buffer.dimensions() == (60, 40) {
+                    assert_eq!((popup.x, popup.y), (0, 0));
+                    key(33);
+                    phase = 4;
+                }
+            }
+        }
+        if phase == 4
+            && log.contains("grabbed")
+            && scene
+                .windows
+                .first()
+                .is_some_and(|w| w.scene.len() == 3 && w.scene[2].x == 110)
+        {
+            let root = scene.windows[0].id;
+            server
+                .input(InputEvent::Pointer {
+                    window: root,
+                    x: 1.0,
+                    y: 1.0,
+                    time: 20,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: true,
+                    time: 21,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: false,
+                    time: 22,
+                })
+                .unwrap();
+            phase = 5;
+        }
+        if phase == 5
+            && log.contains("popup-dismissed")
+            && scene.windows.first().is_some_and(|w| w.scene.len() == 2)
+        {
+            server.close(scene.windows[0].id).unwrap();
+            phase = 6;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.success(),
+                "{log}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "scene peer stalled phase={phase}: {log}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(phase, 6, "{log}");
+    assert!(log.contains("repositioned=17"), "{log}");
+}

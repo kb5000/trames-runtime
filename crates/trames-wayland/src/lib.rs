@@ -11,6 +11,7 @@ pub use input::InputEvent;
 pub use text::{TextContext, TextEdit};
 mod server;
 pub use server::{Server, Snapshot, SurfaceInfo};
+mod popup;
 mod protocol;
 mod shell;
 mod subsurface;
@@ -97,6 +98,15 @@ impl Compositor {
             s.mode = mode;
             self.state.configure(id);
             self.state.changed();
+        }
+        if mode == WindowMode::Minimized
+            && self
+                .state
+                .seat
+                .focus
+                .is_some_and(|focused| self.state.is_descendant(focused, id))
+        {
+            self.state.input(InputEvent::Focus { window: None });
         }
     }
     pub fn presented(&mut self, window: u64, revision: u64, milliseconds: u32) {
