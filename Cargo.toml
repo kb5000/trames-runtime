@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/trames-memory", "crates/trames-elf", "crates/trames-cpu", "crates/trames-vulkan",
+    "crates/trames-shared", "crates/trames-wayland", "crates/trames-memory", "crates/trames-elf", "crates/trames-cpu", "crates/trames-vulkan",
     "crates/trames-linux", "crates/trames-core", "crates/trames-cli", "crates/trames-vfs", "crates/trames-net", "crates/trames-distro", "crates/trames-ffi", "crates/trames-bridge", "crates/trames-accel", "crates/trames-compute", "crates/trames-native",
 ]
 
@@ -25,3 +25,6 @@ manual_checked_ops = "allow"
 [profile.release]
 overflow-checks = true
 lto = "thin"
+
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }

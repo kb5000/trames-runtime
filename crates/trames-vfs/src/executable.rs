@@ -115,7 +115,10 @@ mod tests {
         v.close(fd).unwrap();
         assert_eq!(file.bytes().unwrap(), b"payload");
         assert_eq!(v.executable_display(&file), b"/memfd:penguin (deleted)");
-        assert_eq!(v.memfd_available(), crate::memfd::MEMFD_BYTES - 7);
+        assert_eq!(
+            v.memfd_available(),
+            crate::memfd::MEMFD_BYTES - trames_shared::SharedFile::required_capacity(7).unwrap()
+        );
         drop(file);
         assert_eq!(v.memfd_available(), crate::memfd::MEMFD_BYTES);
     }

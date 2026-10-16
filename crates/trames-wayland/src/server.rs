@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! A native event loop independent of guest scheduling and UIKit's main thread.
+use crate::*;
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    os::fd::{AsFd, AsRawFd},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Mutex,
+    },
+    thread,
+};
+
+#[derive(Clone, Default)]
+pub struct Snapshot {
+    pub revision: u64,
+    pub text: Option<TextContext>,
+    pub windows: Vec<WindowSnapshot>,
+    /// Connection-scoped protocol IDs, never guest pointers or host layer IDs.
+    pub surfaces: BTreeMap<(u64, u32), SurfaceInfo>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceInfo {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale: i32,
+    pub configured: bool,
+}
+enum Command {
+    Connect(UnixStream, ClientIdentity),
+    Resize(u64, u32, u32),
+    Mode(u64, WindowMode),
+    Close(u64),
+    Presented(u64, u64, u32),
+    Input(InputEvent),
+    Text(TextEdit),
+    Stop,
+}
+struct Control {
+    sender: mpsc::SyncSender<Command>,
+    wake: UnixStream,
+    snapshot: Arc<Mutex<Snapshot>>,
+    next: AtomicU64,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+impl Control {
+    fn send(&self, command: Command) -> io::Result<()> {
+        self.sender.try_send(command).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
+            mpsc::TrySendError::Disconnected(_) => io::Error::from(io::ErrorKind::BrokenPipe),
+        })?;
+        match (&self.wake).write(&[1]) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+impl Drop for Control {
+    fn drop(&mut self) {
+        // Teardown is outside GPU/frame callbacks and holds no guest byte guard.
+        let _ = self.sender.send(Command::Stop);
+        let _ = (&self.wake).write(&[1]);
+        if let Some(worker) = self.worker.get_mut().ok().and_then(Option::take) {
+            let _ = worker.join();
+        }
+    }
+}
+#[derive(Clone)]
+pub struct Server(Arc<Control>);
+impl Server {
+    pub fn new() -> io::Result<Self> {
+        let compositor = Compositor::new()?;
+        let (wake, read) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        read.set_nonblocking(true)?;
+        let (sender, receiver) = mpsc::sync_channel(1024);
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let output = snapshot.clone();
+        let worker = thread::Builder::new()
+            .name("trames-wayland".into())
+            .spawn(move || run(compositor, read, receiver, output))?;
+        Ok(Self(Arc::new(Control {
+            sender,
+            wake,
+            snapshot,
+            next: AtomicU64::new(1),
+            worker: Mutex::new(Some(worker)),
+        })))
+    }
+    /// The guest VFS retains this socket; native peer credentials are not used.
+    pub fn connect(&self, pid: u32, uid: u32, gid: u32) -> io::Result<(u64, UnixStream)> {
+        let (guest, server) = UnixStream::pair()?;
+        guest.set_nonblocking(true)?;
+        let connection = self.0.next.fetch_add(1, Ordering::Relaxed);
+        self.0.send(Command::Connect(
+            server,
+            ClientIdentity {
+                connection,
+                pid,
+                uid,
+                gid,
+            },
+        ))?;
+        Ok((connection, guest))
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        self.0
+            .snapshot
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+    pub fn resize(&self, id: u64, w: u32, h: u32) -> io::Result<()> {
+        self.0.send(Command::Resize(id, w, h))
+    }
+    pub fn set_mode(&self, id: u64, mode: WindowMode) -> io::Result<()> {
+        self.0.send(Command::Mode(id, mode))
+    }
+    pub fn input(&self, event: InputEvent) -> io::Result<()> {
+        self.0.send(Command::Input(event))
+    }
+    pub fn edit_text(&self, edit: TextEdit) -> io::Result<()> {
+        self.0.send(Command::Text(edit))
+    }
+    pub fn close(&self, id: u64) -> io::Result<()> {
+        self.0.send(Command::Close(id))
+    }
+    pub fn presented(&self, window: u64, revision: u64, milliseconds: u32) -> io::Result<()> {
+        self.0
+            .send(Command::Presented(window, revision, milliseconds))
+    }
+}
+fn run(
+    mut compositor: Compositor,
+    mut wake: UnixStream,
+    receiver: mpsc::Receiver<Command>,
+    output: Arc<Mutex<Snapshot>>,
+) {
+    let mut stopped = false;
+    let mut published = u64::MAX;
+    while !stopped {
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                Command::Connect(stream, identity) => {
+                    let _ = compositor.connect(stream, identity);
+                }
+                Command::Resize(id, w, h) => {
+                    compositor.resize(id, w, h);
+                }
+                Command::Mode(id, mode) => compositor.set_mode(id, mode),
+                Command::Close(id) => compositor.close(id),
+                Command::Presented(id, revision, time) => compositor.presented(id, revision, time),
+                Command::Input(event) => compositor.state.input(event),
+                Command::Text(edit) => compositor.state.text_edit(edit),
+                Command::Stop => stopped = true,
+            }
+        }
+        if stopped {
+            break;
+        }
+        if compositor.dispatch().is_err() {
+            break;
+        }
+        if compositor.state.revision != published {
+            let surfaces = compositor
+                .state
+                .surfaces
+                .iter()
+                .map(|(&id, s)| {
+                    (
+                        (s.connection, s.resource.id().protocol_id()),
+                        SurfaceInfo {
+                            id,
+                            width: s.size.0,
+                            height: s.size.1,
+                            scale: s.scale,
+                            configured: s.acknowledged,
+                        },
+                    )
+                })
+                .collect();
+            let snapshot = Snapshot {
+                revision: compositor.state.revision,
+                windows: compositor.windows(),
+                text: compositor.state.text_context(),
+                surfaces,
+            };
+            published = snapshot.revision;
+            if let Ok(mut output) = output.lock() {
+                *output = snapshot;
+            }
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: compositor.display.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two live native descriptors and a fixed initialized array.
+        // The timeout also retries outbound flush after peer backpressure.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 16) };
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+        let mut bytes = [0; 256];
+        loop {
+            match wake.read(&mut bytes) {
+                Ok(0) => {
+                    stopped = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}

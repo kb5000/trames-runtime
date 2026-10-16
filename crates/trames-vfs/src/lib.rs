@@ -241,6 +241,7 @@ type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
 type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
+    shared_budget: trames_shared::SharedBudget,
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
     inodes: Vec<Weak<RefCell<Node>>>,
     next_inode: u64,
@@ -254,6 +255,7 @@ struct Filesystem {
 pub struct Vfs {
     network: trames_net::Network,
     local_namespace: Rc<RefCell<ipc::LocalNamespace>>,
+    native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
     cwd_node: Option<Rc<RefCell<Node>>>,
@@ -291,7 +293,9 @@ impl Default for Vfs {
         let mut v = Self {
             network: trames_net::Network::default(),
             local_namespace: Rc::default(),
+            native_services: Rc::default(),
             fs: Rc::new(RefCell::new(Filesystem {
+                shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: 1,
@@ -1808,7 +1812,7 @@ impl Vfs {
                 } else {
                     available
                 };
-                if end.saturating_sub(b.len()) > available {
+                if b.growth_charge(end) > available {
                     return Err(Errno(28));
                 }
                 let written = b.write_at(position, bytes)?;
@@ -1933,7 +1937,7 @@ impl Vfs {
         } else {
             available
         };
-        if length.saturating_sub(b.len()) > available {
+        if b.growth_charge(length) > available {
             return Err(Errno(28));
         }
         b.truncate(length)?;

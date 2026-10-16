@@ -5,10 +5,36 @@ use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, PAGE_SIZE};
 pub(super) struct FilePage {
     identity: u64,
-    bytes: RefCell<Box<[u8; PAGE_SIZE as usize]>>,
+    bytes: RefCell<PageStorage>,
     dirty: Cell<bool>,
     writers: Cell<u32>,
     version: Cell<u64>,
+}
+enum PageStorage {
+    Heap(Box<[u8; PAGE_SIZE as usize]>),
+    Shared(trames_shared::Mapping),
+}
+impl std::ops::Deref for PageStorage {
+    type Target = [u8; PAGE_SIZE as usize];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Heap(bytes) => bytes,
+            // SAFETY: map() proved a full guest page; the owning RefCell supplies
+            // scoped coordinator borrows. Native display holds raw GPU views,
+            // never Rust references; protocol ownership governs pixel reuse.
+            Self::Shared(map) => unsafe { &*map.pointer().cast() },
+        }
+    }
+}
+impl std::ops::DerefMut for PageStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Heap(bytes) => bytes,
+            // SAFETY: exclusive coordinator page borrow, same retained range.
+            // SharedFile never physically truncates a live mapping.
+            Self::Shared(map) => unsafe { &mut *map.pointer().cast() },
+        }
+    }
 }
 pub(super) struct MappedData {
     data: RefCell<Box<FileData>>,
@@ -33,13 +59,37 @@ impl MappedData {
     pub(super) fn orphan(&self, value: bool) {
         self.data.borrow_mut().orphan(value);
     }
+    pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
+        self.data.borrow().shared_file()
+    }
+    fn refresh_shared_pages(&self) {
+        let Some(file) = self.shared_file() else {
+            return;
+        };
+        for (&offset, page) in self.pages.borrow().iter() {
+            let Some(page) = page.upgrade() else { continue };
+            if matches!(*page.bytes.borrow(), PageStorage::Heap(_)) {
+                if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
+                    *page.bytes.borrow_mut() = PageStorage::Shared(map);
+                }
+            }
+        }
+    }
     fn page(&self, offset: u64) -> Result<Rc<FilePage>> {
         if let Some(p) = self.pages.borrow().get(&offset).and_then(Weak::upgrade) {
             return Ok(p);
         }
-        let data = self.data.borrow().read_at(offset, PAGE_SIZE as usize)?;
-        let mut bytes = Box::new([0; PAGE_SIZE as usize]);
-        bytes[..data.len()].copy_from_slice(&data);
+        let bytes = if let Some(map) = self
+            .shared_file()
+            .and_then(|file| file.map(offset as usize, PAGE_SIZE as usize).ok())
+        {
+            PageStorage::Shared(map)
+        } else {
+            let data = self.data.borrow().read_at(offset, PAGE_SIZE as usize)?;
+            let mut bytes = Box::new([0; PAGE_SIZE as usize]);
+            bytes[..data.len()].copy_from_slice(&data);
+            PageStorage::Heap(bytes)
+        };
         let page = Rc::new(FilePage {
             identity: trames_memory::new_backing_identity(),
             bytes: RefCell::new(bytes),
@@ -53,6 +103,12 @@ impl MappedData {
     }
     fn batch(&self, offset: u64, len: u64) -> Result<Vec<Rc<FilePage>>> {
         self.pages.borrow_mut().retain(|_, p| p.strong_count() != 0);
+        if self.shared_file().is_some() {
+            return (offset..offset + len)
+                .step_by(PAGE_SIZE as usize)
+                .map(|at| self.page(at))
+                .collect();
+        }
         let mut result = Vec::new();
         for batch in (0..len).step_by(storage::MAX_TRANSFER) {
             let size = (len - batch).min(storage::MAX_TRANSFER as u64);
@@ -74,7 +130,7 @@ impl MappedData {
                     }
                     let page = Rc::new(FilePage {
                         identity: trames_memory::new_backing_identity(),
-                        bytes: RefCell::new(data),
+                        bytes: RefCell::new(PageStorage::Heap(data)),
                         dirty: Cell::new(false),
                         writers: Cell::new(0),
                         version: Cell::new(0),
@@ -103,13 +159,16 @@ impl MappedData {
     }
     pub(super) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let count = self.data.borrow_mut().write_at(offset, bytes)?;
+        self.refresh_shared_pages();
         let end = offset + count as u64;
         for (&base, p) in self.pages.borrow().range((offset & !(PAGE_SIZE - 1))..end) {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                p.bytes.borrow_mut()[(start - base) as usize..(to - base) as usize]
-                    .copy_from_slice(&bytes[(start - offset) as usize..(to - offset) as usize]);
+                if matches!(*p.bytes.borrow(), PageStorage::Heap(_)) {
+                    p.bytes.borrow_mut()[(start - base) as usize..(to - base) as usize]
+                        .copy_from_slice(&bytes[(start - offset) as usize..(to - offset) as usize]);
+                }
                 p.version.set(p.version.get().wrapping_add(1));
             }
         }
@@ -118,6 +177,10 @@ impl MappedData {
     }
     fn flush(&self, offset: u64, page: &FilePage) -> Result<()> {
         if !page.dirty.get() {
+            return Ok(());
+        }
+        if matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
+            page.dirty.set(false);
             return Ok(());
         }
         let count = self.len().saturating_sub(offset).min(PAGE_SIZE) as usize;
@@ -151,12 +214,15 @@ impl MappedData {
     pub(super) fn truncate(&self, length: u64) -> Result<()> {
         self.sync(false)?;
         self.data.borrow_mut().truncate(length)?;
+        self.refresh_shared_pages();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
-                let mut content = page.bytes.borrow_mut();
-                content.fill(0);
-                content[..bytes.len()].copy_from_slice(&bytes);
+                if matches!(*page.bytes.borrow(), PageStorage::Heap(_)) {
+                    let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
+                    let mut content = page.bytes.borrow_mut();
+                    content.fill(0);
+                    content[..bytes.len()].copy_from_slice(&bytes);
+                }
                 page.version.set(page.version.get().wrapping_add(1));
                 page.dirty.set(false);
             }
@@ -407,6 +473,39 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn memfd_native_views_share_guest_pages_and_keep_physical_budget_until_last_lease() {
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"wayland-pool", 0).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        let file = v.shared_file(fd).unwrap();
+        let native = file.map(0, (PAGE_SIZE * 2) as usize).unwrap();
+        let mut m = Memory::default();
+        mapped(
+            &v,
+            &mut m,
+            fd,
+            0x40000,
+            PAGE_SIZE * 2,
+            true,
+            Permissions::RW,
+        );
+        m.write_array(0x41008, *b"pixels!!").unwrap();
+        // SAFETY: no guest CPU runs while this coordinator test reads the view.
+        unsafe {
+            native.with_read(4104, 8, |b| assert_eq!(b, b"pixels!!"));
+        }
+        file.write_at(8, b"native!!").unwrap();
+        assert_eq!(m.read_array::<8>(0x40008).unwrap(), *b"native!!");
+        let charged = crate::memfd::MEMFD_BYTES - file.capacity() as u64;
+        v.close(fd).unwrap();
+        drop(m);
+        drop(file);
+        assert_eq!(v.memfd_available(), charged);
+        drop(native);
+        assert_eq!(v.memfd_available(), crate::memfd::MEMFD_BYTES);
+    }
+
     #[test]
     fn direct_file_borrows_dirty_writeback_alias_tokens_and_live_eof() {
         let mut v = Vfs::default();

@@ -303,6 +303,7 @@ impl Devpts {
         }
         let out = Self {
             fs: Rc::new(RefCell::new(Filesystem {
+                shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: device << 32,

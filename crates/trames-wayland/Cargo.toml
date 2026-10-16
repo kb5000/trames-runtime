@@ -1,0 +1,16 @@
+[package]
+name = "trames-wayland"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trames-shared = { path = "../trames-shared" }
+wayland-server = "=0.31.14"
+wayland-backend = "=0.3.17"
+wayland-protocols = { version = "=0.32.13", features = ["server", "unstable", "staging"] }
+libc = "0.2"
+
+[lints]
+workspace = true

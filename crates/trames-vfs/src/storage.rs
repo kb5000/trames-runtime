@@ -110,6 +110,7 @@ impl Timestamp {
 
 pub(super) enum FileData {
     Memory(Vec<u8>),
+    Shared(trames_shared::SharedFile),
     Disk(DiskObject),
     Mapped(Box<mapped::MappedData>),
 }
@@ -164,7 +165,7 @@ impl FileData {
         }
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
-            Self::Memory(_) => None,
+            Self::Memory(_) | Self::Shared(_) => None,
             Self::Disk(d) => Some(d.inode),
         }
     }
@@ -175,7 +176,24 @@ impl FileData {
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => b.len() as u64,
+            Self::Shared(file) => file.len() as u64,
             Self::Disk(d) => d.length,
+        }
+    }
+    pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
+        match self {
+            Self::Shared(file) => Some(file.clone()),
+            Self::Mapped(data) => data.shared_file(),
+            _ => None,
+        }
+    }
+    pub(super) fn growth_charge(&self, length: u64) -> u64 {
+        if let Some(file) = self.shared_file() {
+            trames_shared::SharedFile::required_capacity(length)
+                .unwrap_or(u64::MAX)
+                .saturating_sub(file.capacity() as u64)
+        } else {
+            length.saturating_sub(self.len())
         }
     }
     pub fn read_at(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
@@ -191,6 +209,7 @@ impl FileData {
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
+            Self::Shared(file) => file.read_at(offset, count).map_err(host_errno),
             Self::Disk(d) => {
                 let mut file = d.open(false)?;
                 file.seek(SeekFrom::Start(offset)).map_err(host_errno)?;
@@ -207,6 +226,7 @@ impl FileData {
         }
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
+            Self::Shared(file) => file.write_at(offset, bytes).map_err(host_errno),
             Self::Memory(b) => {
                 let end = usize::try_from(offset)
                     .ok()
@@ -234,6 +254,9 @@ impl FileData {
         }
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
+            Self::Shared(file) => file
+                .set_len(usize::try_from(length).map_err(|_| Errno(27))?)
+                .map_err(host_errno)?,
             Self::Memory(b) => {
                 let n = usize::try_from(length).map_err(|_| Errno(27))?;
                 if n > b.len() {
@@ -755,6 +778,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         }
     }
     Ok(Filesystem {
+        shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
         flock: BTreeMap::new(),
         record_locks: BTreeMap::new(),
         paths,

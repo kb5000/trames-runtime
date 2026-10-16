@@ -1,0 +1,13 @@
+[package]
+name = "trames-shared"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "=1.1.5", features = ["net", "fs"] }
+
+[lints]
+workspace = true

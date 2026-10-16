@@ -645,6 +645,7 @@ impl Vfs {
                 seals: None,
             }));
             let fs = Rc::new(RefCell::new(Filesystem {
+                shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                 inodes: vec![Rc::downgrade(&root)],
                 next_inode: handle.id() + 1,
@@ -733,6 +734,9 @@ impl Vfs {
                         seals: None,
                     }));
                     let fs = Rc::new(RefCell::new(Filesystem {
+                        shared_budget: trames_shared::SharedBudget::new(
+                            memfd::MEMFD_BYTES as usize,
+                        ),
                         paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                         inodes: vec![Rc::downgrade(&root)],
                         next_inode: inode + 1,

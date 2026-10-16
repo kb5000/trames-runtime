@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded guest AF_UNIX endpoints. No guest pathname reaches host sockets.
 use super::*;
+mod native;
+pub(crate) use native::Services as NativeServices;
 
 #[derive(Clone, Default)]
-pub struct LocalRights(Vec<Rc<RefCell<OpenDescription>>>);
+pub struct LocalRights(pub(super) Vec<Rc<RefCell<OpenDescription>>>);
 impl LocalRights {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
