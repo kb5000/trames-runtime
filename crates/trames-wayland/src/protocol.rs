@@ -69,7 +69,8 @@ impl State {
                 }
                 return;
             }
-            s.current = attachment;
+            s.current = attachment.map(ImageBuffer::Shm);
+            s.gpu_pending.clear();
         }
         s.scale = pending.scale;
         s.transform = pending.transform;
@@ -83,10 +84,11 @@ impl State {
             s.geometry = Some(geometry);
         }
         if let Some(buffer) = &s.current {
+            let (bw, bh) = buffer.dimensions();
             let (w, h) = if s.transform & 1 != 0 {
-                (buffer.pixels.height, buffer.pixels.width)
+                (bh, bw)
             } else {
-                (buffer.pixels.width, buffer.pixels.height)
+                (bw, bh)
             };
             if !w.is_multiple_of(s.scale as u32) || !h.is_multiple_of(s.scale as u32) {
                 s.resource

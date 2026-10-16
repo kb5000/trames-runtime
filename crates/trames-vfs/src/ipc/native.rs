@@ -246,6 +246,12 @@ impl Vfs {
         let services = self.native_services.borrow().clone();
         services.is_some_and(|services| services.borrow_mut().pump(self))
     }
+    pub fn wayland_server(&self) -> Option<Server> {
+        self.native_services
+            .borrow()
+            .as_ref()
+            .map(|s| s.borrow().server.clone())
+    }
     pub fn has_native_services(&self) -> bool {
         self.native_services
             .borrow()

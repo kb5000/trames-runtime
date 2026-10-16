@@ -37,7 +37,26 @@ pub struct SurfaceImage {
     pub y: i32,
     pub scale: i32,
     pub transform: u32,
-    pub buffer: Arc<BufferLease>,
+    pub buffer: ImageBuffer,
+}
+#[derive(Clone)]
+pub enum ImageBuffer {
+    Shm(Arc<BufferLease>),
+    Gpu(Arc<dyn crate::GpuImage>),
+}
+impl ImageBuffer {
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Shm(b) => (b.pixels.width, b.pixels.height),
+            Self::Gpu(g) => g.dimensions(),
+        }
+    }
+    pub fn shm(&self) -> Option<&ShmBuffer> {
+        match self {
+            Self::Shm(b) => Some(&b.pixels),
+            Self::Gpu(_) => None,
+        }
+    }
 }
 /// Host buffer capability. It contains no guest pointer, FD number or VM borrow.
 pub struct ShmBuffer {
@@ -150,7 +169,11 @@ pub(crate) struct Surface {
     pub requested_size: (u32, u32),
     pub restore_size: (u32, u32),
     pub pending_buffer: Option<Option<WlBuffer>>,
-    pub current: Option<Arc<BufferLease>>,
+    pub current: Option<ImageBuffer>,
+    pub gpu_pending: VecDeque<Arc<dyn crate::GpuImage>>,
+    pub gpu_presented: bool,
+    pub gpu_owner: Arc<std::sync::atomic::AtomicU64>,
+    pub gpu_budget: crate::GpuBudget,
     pub pending_callbacks: Vec<WlCallback>,
     pub callbacks: VecDeque<(u64, Vec<WlCallback>)>,
     pub configured: bool,
@@ -198,10 +221,14 @@ impl Surface {
             app_id: String::new(),
             size: (640, 480),
             mode: WindowMode::Floating,
-            requested_size: (640, 480),
+            requested_size: (0, 0),
             restore_size: (640, 480),
             pending_buffer: None,
             current: None,
+            gpu_pending: VecDeque::new(),
+            gpu_presented: true,
+            gpu_owner: Arc::default(),
+            gpu_budget: Default::default(),
             pending_callbacks: Vec::new(),
             callbacks: VecDeque::new(),
             configured: false,

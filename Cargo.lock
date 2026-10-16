@@ -646,6 +646,7 @@ version = "0.16.0"
 dependencies = [
  "ash",
  "trames-memory",
+ "trames-wayland",
 ]
 
 [[package]]

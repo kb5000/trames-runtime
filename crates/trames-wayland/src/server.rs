@@ -20,13 +20,15 @@ pub struct Snapshot {
     /// Connection-scoped protocol IDs, never guest pointers or host layer IDs.
     pub surfaces: BTreeMap<(u64, u32), SurfaceInfo>,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SurfaceInfo {
     pub id: u64,
     pub width: u32,
     pub height: u32,
     pub scale: i32,
     pub configured: bool,
+    pub owner: Arc<AtomicU64>,
+    pub gpu_budget: GpuBudget,
 }
 enum Command {
     Connect(UnixStream, ClientIdentity),
@@ -36,6 +38,7 @@ enum Command {
     Presented(u64, u64, u32),
     Input(InputEvent),
     Text(TextEdit),
+    Gpu(u64, Arc<dyn GpuImage>),
     Stop,
 }
 struct Control {
@@ -143,6 +146,9 @@ impl Server {
     pub fn edit_text(&self, edit: TextEdit) -> io::Result<()> {
         self.0.send(Command::Text(edit))
     }
+    pub fn present_gpu(&self, surface: u64, image: Arc<dyn GpuImage>) -> io::Result<()> {
+        self.0.send(Command::Gpu(surface, image))
+    }
     pub fn close(&self, id: u64) -> io::Result<()> {
         self.0.send(Command::Close(id))
     }
@@ -173,6 +179,7 @@ fn run(
                 Command::Presented(id, revision, time) => compositor.presented(id, revision, time),
                 Command::Input(event) => compositor.state.input(event),
                 Command::Text(edit) => compositor.state.text_edit(edit),
+                Command::Gpu(id, image) => compositor.state.enqueue_gpu(id, image),
                 Command::Stop => stopped = true,
             }
         }
@@ -182,6 +189,7 @@ fn run(
         if compositor.dispatch().is_err() {
             break;
         }
+        compositor.state.poll_gpu();
         if compositor.state.revision != published {
             let surfaces = compositor
                 .state
@@ -196,6 +204,8 @@ fn run(
                             height: s.size.1,
                             scale: s.scale,
                             configured: s.acknowledged,
+                            owner: s.gpu_owner.clone(),
+                            gpu_budget: s.gpu_budget.clone(),
                         },
                     )
                 })

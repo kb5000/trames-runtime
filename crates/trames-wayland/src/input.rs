@@ -41,6 +41,9 @@ pub(crate) struct Seat {
     pointers: Vec<wl_pointer::WlPointer>,
     pub focus: Option<u64>,
     pointer: Option<u64>,
+    pointer_position: (f64, f64),
+    buttons: BTreeSet<u32>,
+    grab: Option<u64>,
     pressed: BTreeSet<u32>,
     modifiers: u32,
     keymap: Option<trames_shared::SharedFile>,
@@ -106,7 +109,24 @@ impl State {
                 if !x.is_finite() || !y.is_finite() {
                     return;
                 }
-                let hit = self.windows_hit(window, x, y);
+                let hit = self
+                    .seat
+                    .grab
+                    .and_then(|id| {
+                        let windows = crate::scene::snapshot(&self.surfaces);
+                        let image = windows
+                            .iter()
+                            .flat_map(|w| &w.scene)
+                            .find(|i| i.surface == id)?;
+                        Some((id, x - f64::from(image.x), y - f64::from(image.y)))
+                    })
+                    .or_else(|| {
+                        if self.seat.buttons.is_empty() {
+                            self.windows_hit(window, x, y)
+                        } else {
+                            None
+                        }
+                    });
                 let serial = self.next_serial();
                 let target = hit.map(|(id, _, _)| id);
                 if target != self.seat.pointer {
@@ -134,6 +154,7 @@ impl State {
                     }
                 }
                 if let Some((id, lx, ly)) = hit {
+                    self.seat.pointer_position = (lx, ly);
                     let s = &self.surfaces[&id];
                     for p in &self.seat.pointers {
                         if connection(p) == s.connection {
@@ -154,7 +175,18 @@ impl State {
                     return;
                 }
                 if pressed {
+                    if !self.seat.buttons.insert(button) {
+                        return;
+                    }
+                    if self.seat.buttons.len() == 1 {
+                        self.seat.grab = self.seat.pointer;
+                    }
                     self.focus_surface(self.seat.pointer);
+                } else if !self.seat.buttons.remove(&button) {
+                    return;
+                }
+                if self.seat.buttons.is_empty() {
+                    self.seat.grab = None;
                 }
                 let serial = self.next_serial();
                 if let Some(s) = self.seat.pointer.and_then(|id| self.surfaces.get(&id)) {
@@ -255,11 +287,11 @@ impl State {
             .find(|w| w.id == window && w.mode != WindowMode::Minimized)?;
         for image in window.scene.iter().rev() {
             let (lx, ly) = (x - f64::from(image.x), y - f64::from(image.y));
-            let pixels = &image.buffer.pixels;
+            let (bw, bh) = image.buffer.dimensions();
             let (width, height) = if image.transform & 1 != 0 {
-                (pixels.height, pixels.width)
+                (bh, bw)
             } else {
-                (pixels.width, pixels.height)
+                (bw, bh)
             };
             if lx >= 0.0
                 && ly >= 0.0
@@ -342,6 +374,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             }
             wl_seat::Request::GetPointer { id } => {
                 let p = init.init(id, ());
+                if let Some(s) = state.seat.pointer.and_then(|id| state.surfaces.get(&id)) {
+                    if connection(&p) == s.connection {
+                        let (x, y) = state.seat.pointer_position;
+                        p.enter(state.serial, &s.resource, x, y);
+                        if p.version() >= 5 {
+                            p.frame();
+                        }
+                    }
+                }
                 state.seat.pointers.push(p);
             }
             wl_seat::Request::GetTouch { id } => {

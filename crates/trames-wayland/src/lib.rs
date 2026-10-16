@@ -2,8 +2,10 @@
 //! Native, platform-independent Wayland compositor protocol and window state.
 use std::{io, os::unix::net::UnixStream, sync::Arc};
 use wayland_server::{backend::ClientData, Display, Resource};
+mod gpu;
 mod input;
 mod scene;
+pub use gpu::{GpuBudget, GpuImage, GpuPermit};
 mod text;
 pub use input::InputEvent;
 pub use text::{TextContext, TextEdit};
@@ -12,7 +14,7 @@ pub use server::{Server, Snapshot, SurfaceInfo};
 mod protocol;
 mod shell;
 mod subsurface;
-pub use scene::{BufferLease, ShmBuffer, SurfaceImage, WindowMode, WindowSnapshot};
+pub use scene::{BufferLease, ImageBuffer, ShmBuffer, SurfaceImage, WindowMode, WindowSnapshot};
 
 /// Guest identity is attached by the VM bridge, never inferred from the host UID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,9 @@ impl Compositor {
                 continue;
             };
             visit.extend_from_slice(&s.children);
+            if revision >= s.revision {
+                s.gpu_presented = true;
+            }
             while s
                 .callbacks
                 .front()
