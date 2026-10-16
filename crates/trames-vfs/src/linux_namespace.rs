@@ -41,7 +41,7 @@ impl UtsNamespace {
             return Err(Errno(28));
         }
         let inode = NEXT_INODE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Errno(28))?;
         live.set(live.get() + 1);
         Ok(Self(Rc::new(Uts {

@@ -118,3 +118,11 @@ output preflight remains a publication rule, separate from memory permissions.
 [Validation and one alternating before/after batch](../validation/region-memory.md)
 include disjoint held borrows, overlapping masks/unwind, atomic pairs, aliases,
 reservation wrap, complete musl and an ordinary same-page CPU workload.
+
+## Permission TLB
+
+[The permission-cached TLB](soft-tlb.md) packs virtual-page identity and access
+rights into one 16-byte entry. Hits reuse validated permission facts, with
+coordinator mapping/protection flushes and immutable worker snapshots. This
+changes translation work only: region guards, live backing faults, COW, native
+admission, dirty publication and ARM atomic ordering keep the model above.

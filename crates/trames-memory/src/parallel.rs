@@ -128,25 +128,31 @@ impl View {
     #[inline]
     fn frame(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {
         let base = address & !(PAGE_SIZE - 1);
-        let slot = (base / PAGE_SIZE) as usize & (TRANSLATION_SLOTS - 1);
-        let cached = self.translations[slot].get();
-        let index = if cached.base == base {
-            cached.frame
-        } else {
-            let Some(&index) = self.snapshot.pages.get(&base) else {
-                if self
-                    .snapshot
-                    .reservations
-                    .range(..=address)
-                    .next_back()
-                    .is_some_and(|(_, end)| address < *end)
-                {
-                    return Err(MemoryError::Permission { address, access });
-                }
-                return Err(MemoryError::Unmapped(address));
-            };
-            self.translations[slot].set(Translation { base, frame: index });
-            index
+        let cached = self.translations[Translation::slot(base)].get();
+        if cached.matches(base, Translation::access_bit(access)) {
+            // SAFETY: a view's snapshot owns an immutable frame slab and page
+            // table. Only successfully checked frames populate this view's
+            // private TLB. Snapshot refresh creates a new view with empty TLB.
+            debug_assert!(cached.frame < self.snapshot.frames.len());
+            return Ok(unsafe { self.snapshot.frames.get_unchecked(cached.frame) });
+        }
+        self.frame_slow(address, access)
+    }
+    #[cold]
+    #[inline(never)]
+    fn frame_slow(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {
+        let base = address & !(PAGE_SIZE - 1);
+        let Some(&index) = self.snapshot.pages.get(&base) else {
+            if self
+                .snapshot
+                .reservations
+                .range(..=address)
+                .next_back()
+                .is_some_and(|(_, end)| address < *end)
+            {
+                return Err(MemoryError::Permission { address, access });
+            }
+            return Err(MemoryError::Unmapped(address));
         };
         let frame = &self.snapshot.frames[index];
         if !frame.permissions.allows(access) {
@@ -158,6 +164,12 @@ impl View {
                 other => other.clone(),
             });
         }
+        self.translations[Translation::slot(base)].set(Translation::new(
+            base,
+            index,
+            frame.permissions,
+            false,
+        ));
         Ok(frame)
     }
     #[inline]

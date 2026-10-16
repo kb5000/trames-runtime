@@ -31,7 +31,7 @@ impl PidNamespace {
             return Err(Errno(28));
         }
         let inode = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Errno(28))?;
         let n = Self(Rc::new(PidSpace {
             inode,

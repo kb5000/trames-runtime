@@ -109,16 +109,48 @@ struct Page {
 }
 
 const TRANSLATION_SLOTS: usize = 256;
+/// A 16-byte software TLB entry. Low page-tag bits encode permissions so a
+/// single masked comparison validates both the virtual page and access kind.
+/// Entries hold slab indices, never byte pointers: COW/discard may replace Rc
+/// storage, and mapping edits may grow the slab. Mapping/protection mutations
+/// flush the local cache; worker views own immutable mapping snapshots.
 #[derive(Clone, Copy, Debug)]
 struct Translation {
-    base: u64,
+    tag: u64,
     frame: usize,
 }
 impl Translation {
-    const EMPTY: Self = Self {
-        base: u64::MAX,
-        frame: 0,
-    };
+    const VALID: u64 = 16;
+    const BACKED: u64 = 8;
+    const EMPTY: Self = Self { tag: 0, frame: 0 };
+    fn new(base: u64, frame: usize, permissions: Permissions, backed: bool) -> Self {
+        debug_assert!(base < ADDRESS_LIMIT && base.is_multiple_of(PAGE_SIZE));
+        Self {
+            tag: base
+                | Self::VALID
+                | u64::from(permissions.read)
+                | (u64::from(permissions.write) << 1)
+                | (u64::from(permissions.execute) << 2)
+                | if backed { Self::BACKED } else { 0 },
+            frame,
+        }
+    }
+    #[inline]
+    fn matches(self, base: u64, access_bit: u64) -> bool {
+        self.tag & (!(PAGE_SIZE - 1) | access_bit) == base | access_bit
+    }
+    #[inline]
+    fn access_bit(access: Access) -> u64 {
+        match access {
+            Access::Read => 1,
+            Access::Write => 2,
+            Access::Execute => 4,
+        }
+    }
+    #[inline]
+    fn slot(base: u64) -> usize {
+        (base / PAGE_SIZE) as usize & (TRANSLATION_SLOTS - 1)
+    }
 }
 
 pub struct Memory {
@@ -264,14 +296,91 @@ impl Memory {
 
     #[inline]
     fn frame(&self, base: u64) -> Option<usize> {
-        let slot = ((base / PAGE_SIZE) as usize) & (TRANSLATION_SLOTS - 1);
-        let entry = self.translations[slot].get();
-        if entry.base == base {
-            return Some(entry.frame);
+        self.translation(base).map(|entry| entry.frame)
+    }
+
+    #[inline]
+    fn translation(&self, base: u64) -> Option<Translation> {
+        let entry = self.translations[Translation::slot(base)].get();
+        if entry.matches(base, Translation::VALID) {
+            return Some(entry);
         }
+        self.fill_translation(base)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_translation(&self, base: u64) -> Option<Translation> {
         let frame = *self.pages.get(&base)?;
-        self.translations[slot].set(Translation { base, frame });
-        Some(frame)
+        let page = self.frames[frame].as_ref().expect("mapped frame");
+        let entry = Translation::new(base, frame, page.permissions, page.backing.is_some());
+        self.translations[Translation::slot(base)].set(entry);
+        Some(entry)
+    }
+
+    #[inline]
+    fn access_translation(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+    ) -> Result<Translation, MemoryError> {
+        let base = address & !(PAGE_SIZE - 1);
+        let entry = self.translations[Translation::slot(base)].get();
+        // A matching mapped page proves the 48-bit range. Callers normally
+        // already established the single-page bound, allowing LLVM to fold it.
+        if len <= (PAGE_SIZE - (address & (PAGE_SIZE - 1))) as usize
+            && entry.matches(base, Translation::access_bit(access))
+        {
+            return Ok(entry);
+        }
+        self.access_translation_slow(address, len, access)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn access_translation_slow(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+    ) -> Result<Translation, MemoryError> {
+        Self::end(address, len as u64)?;
+        let entry = self
+            .translation(address & !(PAGE_SIZE - 1))
+            .ok_or_else(|| self.missing_page(address, access))?;
+        if entry.tag & Translation::access_bit(access) == 0 {
+            return Err(MemoryError::Permission { address, access });
+        }
+        Ok(entry)
+    }
+
+    #[inline]
+    fn translated_page(&self, entry: Translation) -> &Page {
+        // SAFETY: entries are filled only from pages -> live slab slots. Every
+        // mapping mutation flushes translations before another access, and no
+        // callback/mutation occurs between translation and dereference. This
+        // local Memory is !Send/!Sync; no worker can edit its page table.
+        debug_assert!(self.frames.get(entry.frame).is_some_and(Option::is_some));
+        unsafe {
+            self.frames
+                .get_unchecked(entry.frame)
+                .as_ref()
+                .unwrap_unchecked()
+        }
+    }
+
+    #[inline]
+    fn translated_page_mut(&mut self, entry: Translation) -> &mut Page {
+        // SAFETY: same live-slot invariant as translated_page, with exclusive
+        // access to this coordinator Memory. The TLB owns no Rc or raw pointer.
+        debug_assert!(self.frames.get(entry.frame).is_some_and(Option::is_some));
+        unsafe {
+            self.frames
+                .get_unchecked_mut(entry.frame)
+                .as_mut()
+                .unwrap_unchecked()
+        }
     }
 
     fn insert_page(&mut self, base: u64, permissions: Permissions) {
@@ -691,15 +800,11 @@ impl Memory {
         len: usize,
         access: Access,
     ) -> Result<&Page, MemoryError> {
-        Self::end(address, len as u64)?;
-        let frame = self
-            .frame(address & !(PAGE_SIZE - 1))
-            .ok_or_else(|| self.missing_page(address, access))?;
-        let page = self.frames[frame].as_ref().expect("mapped frame");
-        if !page.permissions.allows(access) {
-            return Err(MemoryError::Permission { address, access });
+        let entry = self.access_translation(address, len, access)?;
+        let page = self.translated_page(entry);
+        if entry.tag & Translation::BACKED != 0 {
+            page.check_backing(address)?;
         }
-        page.check_backing(address)?;
         Ok(page)
     }
 
@@ -732,22 +837,20 @@ impl Memory {
         }
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if input.len() <= PAGE_SIZE as usize - offset {
-            Self::end(address, input.len() as u64)?;
-            let frame = self
-                .frame(address & !(PAGE_SIZE - 1))
-                .ok_or_else(|| self.missing_page(address, Access::Write))?;
-            let page = self.frames[frame].as_mut().expect("mapped frame");
-            if !page.permissions.write {
-                return Err(MemoryError::Permission {
-                    address,
-                    access: Access::Write,
-                });
+            let entry = self.access_translation(address, input.len(), Access::Write)?;
+            let frame = entry.frame;
+            let next_code_revision = self.code_revision.wrapping_add(1);
+            let page = self.translated_page_mut(entry);
+            if entry.tag & Translation::BACKED != 0 {
+                page.check_backing(address)?;
             }
-            page.check_backing(address)?;
             page.write_bytes(offset, input)?;
+            let executable = entry.tag & Translation::access_bit(Access::Execute) != 0;
+            if executable {
+                page.instruction_revision = next_code_revision;
+            }
             self.revision = self.revision.wrapping_add(1);
-            if page.permissions.execute {
-                page.instruction_revision = self.code_revision.wrapping_add(1);
+            if executable {
                 self.advance_code_revision();
             }
             self.note_parallel_write(frame);
@@ -834,22 +937,20 @@ impl Memory {
         if N > PAGE_SIZE as usize - offset {
             return self.write(address, &bytes);
         }
-        Self::end(address, N as u64)?;
-        let frame = self
-            .frame(address & !(PAGE_SIZE - 1))
-            .ok_or_else(|| self.missing_page(address, Access::Write))?;
-        let page = self.frames[frame].as_mut().expect("mapped frame");
-        if !page.permissions.write {
-            return Err(MemoryError::Permission {
-                address,
-                access: Access::Write,
-            });
+        let entry = self.access_translation(address, N, Access::Write)?;
+        let frame = entry.frame;
+        let next_code_revision = self.code_revision.wrapping_add(1);
+        let page = self.translated_page_mut(entry);
+        if entry.tag & Translation::BACKED != 0 {
+            page.check_backing(address)?;
         }
-        page.check_backing(address)?;
         page.write_bytes(offset, &bytes)?;
+        let executable = entry.tag & Translation::access_bit(Access::Execute) != 0;
+        if executable {
+            page.instruction_revision = next_code_revision;
+        }
         self.revision = self.revision.wrapping_add(1);
-        if page.permissions.execute {
-            page.instruction_revision = self.code_revision.wrapping_add(1);
+        if executable {
             self.advance_code_revision();
         }
         self.note_parallel_write(frame);

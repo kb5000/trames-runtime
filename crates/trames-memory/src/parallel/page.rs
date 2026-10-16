@@ -58,7 +58,7 @@ impl MutablePage {
         loop {
             if self
                 .held
-                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |held| {
+                .try_update(Ordering::Acquire, Ordering::Relaxed, |held| {
                     (held & mask == 0).then_some(held | mask)
                 })
                 .is_ok()

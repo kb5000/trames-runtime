@@ -198,19 +198,19 @@ impl Socket {
         }
     }
     delegate!(address_size() -> usize);
-    delegate!(bind(address:SocketAddr) -> Result<()>);
-    delegate!(listen(backlog:u32) -> Result<()>);
-    delegate!(connect(address:SocketAddr) -> Result<()>);
+    delegate!(bind(address: SocketAddr) -> Result<()>);
+    delegate!(listen(backlog: u32) -> Result<()>);
+    delegate!(connect(address: SocketAddr) -> Result<()>);
     delegate!(connect_complete() -> Result<bool>);
     delegate!(resume_connect() -> Result<bool>);
     delegate!(local_addr() -> Result<SocketAddr>);
     delegate!(peer_addr() -> Result<SocketAddr>);
-    delegate!(shutdown(how:u32) -> Result<()>);
-    delegate!(send(bytes:&[u8],flags:u32,address:Option<SocketAddr>) -> Result<usize>);
-    delegate!(recv(count:usize,flags:u32) -> Result<Received>);
-    delegate!(poll(events:u16) -> Result<u16>);
-    delegate!(set_option(level:u32,name:u32,value:i32) -> Result<()>);
-    delegate!(get_option(level:u32,name:u32) -> Result<i32>);
+    delegate!(shutdown(how: u32) -> Result<()>);
+    delegate!(send(bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize>);
+    delegate!(recv(count: usize, flags: u32) -> Result<Received>);
+    delegate!(poll(events: u16) -> Result<u16>);
+    delegate!(set_option(level: u32, name: u32, value: i32) -> Result<()>);
+    delegate!(get_option(level: u32, name: u32) -> Result<i32>);
     pub fn accept(&self) -> Result<(Rc<Self>, SocketAddr)> {
         let (backend, peer) = match &self.0 {
             SocketBackend::Netlink(_) => return Err(NetError(95)),

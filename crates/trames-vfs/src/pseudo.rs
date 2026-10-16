@@ -1026,7 +1026,7 @@ impl Vfs {
                 .filter(|n| *n < r.cpu_count.max(1))
             {
                 if parts.len() == 1
-                    || parts.as_slice().get(1) == Some(&b"topology".as_slice()) && parts.len() == 2
+                    || parts.get(1) == Some(&b"topology".as_slice()) && parts.len() == 2
                 {
                     return Ok(directory());
                 }

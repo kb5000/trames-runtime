@@ -8,12 +8,19 @@ members = [
 [workspace.package]
 version = "0.15.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.101"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/kb5000/trames"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Preserve established iterator/branch forms during the pinned nightly migration.
+# These advisory source-style lints do not diagnose correctness problems.
+[workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+needless_late_init = "allow"
+manual_checked_ops = "allow"
 
 [profile.release]
 overflow-checks = true

@@ -1015,7 +1015,7 @@ impl Vfs {
 }
 fn new_mount_id() -> Result<u64> {
     NEXT_MOUNT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             n.checked_add(1).filter(|n| *n < 0x1000_0000)
         })
         .map_err(|_| Errno(28))
