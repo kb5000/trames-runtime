@@ -152,6 +152,7 @@ impl Memory {
             });
         }
         self.refresh_mmu(address, len);
+        self.invalidate_translations();
         self.has_backings = true;
         self.cpu_borrow_safe &= cpu_safe;
         Ok(())
@@ -210,6 +211,7 @@ impl Memory {
             page.instruction_revision = self.code_revision;
         }
         self.refresh_mmu(address, len);
+        self.invalidate_translations();
         self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
@@ -246,6 +248,7 @@ impl Memory {
             self.unmap(old, old_len)?;
             return self.reserve(new, new_len, fixed);
         }
+        self.invalidate_translations();
         self.mmu.retire();
         let mut pages = Vec::new();
         for base in (old..old_end).step_by(PAGE_SIZE as usize) {
@@ -325,6 +328,7 @@ impl Memory {
             self.frames[frame] = Some(page);
         }
         self.refresh_mmu(new, new_len);
+        self.invalidate_translations();
         Ok(())
     }
 }

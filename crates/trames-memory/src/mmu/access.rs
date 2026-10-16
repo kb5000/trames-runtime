@@ -82,7 +82,7 @@ macro_rules! write_scalar { ($instruction:literal,$target:ident,$value:ident) =>
     ok!=0
 }}; }
 #[inline(always)]
-pub(super) unsafe fn access<const N: usize>(write: bool, target: *mut u8, bytes: *mut u8) -> bool {
+pub(crate) unsafe fn access<const N: usize>(write: bool, target: *mut u8, bytes: *mut u8) -> bool {
     if N == 16 {
         // SAFETY: caller provides a complete 16-byte host buffer and a target
         // wholly within one registered hardware page, with its lifetime guard.

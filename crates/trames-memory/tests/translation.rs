@@ -50,7 +50,7 @@ fn warming_one_access_does_not_grant_another_and_protect_revokes_permissions() {
 }
 
 #[test]
-fn resident_cow_discard_remap_and_frame_growth_never_retain_byte_pointers() {
+fn resident_cow_discard_remap_and_frame_growth_revoke_old_translations() {
     let mut parent = Memory::default();
     parent.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
     parent.write_array(0x1013, [7; 16]).unwrap();

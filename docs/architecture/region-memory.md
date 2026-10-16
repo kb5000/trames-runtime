@@ -130,7 +130,7 @@ admission, dirty publication and ARM atomic ordering keep the model above.
 ## Hardware-protected ordinary RAM
 
 [Hardware MMU mappings](hardware-mmu.md) share physical bytes between protected CPU
-aliases and RW native aliases. A per-view direct-mapped window cache and opaque
-base hint reduce translation work. Hardware-compatible groups use native scalar
+aliases and RW native aliases. A per-view single-level page TLB caches eligible
+CPU alias addresses, avoiding repeated sparse-window and group lookups. Hardware-compatible groups use native scalar
 operands; special mappings and cross-page operations retain the checked software
 path. Region guards, COW, reservations and dirty/code publication are unchanged.

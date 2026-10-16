@@ -10,7 +10,6 @@ mod reservations;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use cpu_memory::{CpuMemory, CpuSlice};
-pub use mmu::DirectHint;
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use std::{
@@ -112,21 +111,24 @@ struct Page {
 }
 
 const TRANSLATION_SLOTS: usize = 256;
-/// A 16-byte software TLB entry. Low page-tag bits encode permissions so a
-/// single masked comparison validates both the virtual page and access kind.
-/// Entries hold slab indices, never byte pointers: COW/discard may replace Rc
-/// storage, and mapping edits may grow the slab. Mapping/protection mutations
-/// flush the local cache; worker views own immutable mapping snapshots.
+/// Single-level direct-mapped page TLB: guest tag, stable frame ID, and an
+/// optional hardware-protected CPU page address. Local mapping/COW mutations
+/// invalidate entries before alias retirement; worker snapshots are immutable.
 #[derive(Clone, Copy, Debug)]
 struct Translation {
     tag: u64,
     frame: usize,
+    cpu: usize,
 }
 impl Translation {
     const VALID: u64 = 16;
     const BACKED: u64 = 8;
-    const EMPTY: Self = Self { tag: 0, frame: 0 };
-    fn new(base: u64, frame: usize, permissions: Permissions, backed: bool) -> Self {
+    const EMPTY: Self = Self {
+        tag: 0,
+        frame: 0,
+        cpu: 0,
+    };
+    fn new(base: u64, frame: usize, permissions: Permissions, backed: bool, cpu: usize) -> Self {
         debug_assert!(base < ADDRESS_LIMIT && base.is_multiple_of(PAGE_SIZE));
         Self {
             tag: base
@@ -136,6 +138,7 @@ impl Translation {
                 | (u64::from(permissions.execute) << 2)
                 | if backed { Self::BACKED } else { 0 },
             frame,
+            cpu,
         }
     }
     #[inline]
@@ -153,6 +156,40 @@ impl Translation {
     #[inline]
     fn slot(base: u64) -> usize {
         (base / PAGE_SIZE) as usize & (TRANSLATION_SLOTS - 1)
+    }
+    /// # Safety
+    /// This entry is from the caller's live TLB, and offset..offset+N is inside
+    /// its guest page. Worker callers hold the same physical byte-region guard.
+    #[inline(always)]
+    unsafe fn read<const N: usize>(self, offset: usize) -> Option<[u8; N]> {
+        let mut bytes = [0; N];
+        if self.cpu != 0
+            && unsafe {
+                mmu::access::access::<N>(
+                    false,
+                    self.cpu.wrapping_add(offset) as *mut u8,
+                    bytes.as_mut_ptr(),
+                )
+            }
+        {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+    /// # Safety
+    /// Same lifetime/range contract as read, with exclusive region ownership.
+    #[inline(always)]
+    unsafe fn write<const N: usize>(self, offset: usize, mut bytes: [u8; N]) -> bool {
+        self.cpu != 0
+            && self.tag & 4 == 0
+            && unsafe {
+                mmu::access::access::<N>(
+                    true,
+                    self.cpu.wrapping_add(offset) as *mut u8,
+                    bytes.as_mut_ptr(),
+                )
+            }
     }
 }
 
@@ -185,6 +222,7 @@ impl Clone for Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().clone();
         }
+        self.invalidate_translations();
         self.mmu.retire();
         Self {
             mmu: mmu::Arena::default(),
@@ -331,7 +369,13 @@ impl Memory {
     fn fill_translation(&self, base: u64) -> Option<Translation> {
         let frame = *self.pages.get(&base)?;
         let page = self.frames[frame].as_ref().expect("mapped frame");
-        let entry = Translation::new(base, frame, page.permissions, page.backing.is_some());
+        let entry = Translation::new(
+            base,
+            frame,
+            page.permissions,
+            page.backing.is_some(),
+            self.mmu.page_alias(base),
+        );
         self.translations[Translation::slot(base)].set(entry);
         Some(entry)
     }
@@ -391,7 +435,7 @@ impl Memory {
     #[inline]
     fn translated_page_mut(&mut self, entry: Translation) -> &mut Page {
         // SAFETY: same live-slot invariant as translated_page, with exclusive
-        // access to this coordinator Memory. The TLB owns no Rc or raw pointer.
+        // access to this coordinator Memory. The entry owns no byte allocation.
         debug_assert!(self.frames.get(entry.frame).is_some_and(Option::is_some));
         unsafe {
             self.frames
@@ -944,22 +988,21 @@ impl Memory {
         if N == 0 {
             return Ok([0; N]);
         }
-        if let Some(bytes) = self.mmu.read::<N>(address) {
-            return Ok(bytes);
-        }
-        self.read_array_soft(address)
-    }
-    /// Normalized, coordinator-owned fallback after one hardware attempt.
-    #[inline]
-    pub(crate) fn read_array_soft<const N: usize>(
-        &self,
-        address: u64,
-    ) -> Result<[u8; N], MemoryError> {
-        if N == 0 {
-            return Ok([0; N]);
-        }
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if N <= PAGE_SIZE as usize - offset {
+            let base = address & !(PAGE_SIZE - 1);
+            let entry = self.translation(base).ok_or_else(|| {
+                Self::end(address, N as u64)
+                    .err()
+                    .unwrap_or_else(|| self.missing_page(address, Access::Read))
+            })?;
+            if matches!(N, 1 | 2 | 4 | 8 | 16) {
+                // SAFETY: live owning TLB, page-contained operand, no callbacks
+                // or mutation before the guarded CPU load.
+                if let Some(bytes) = unsafe { entry.read::<N>(offset) } {
+                    return Ok(bytes);
+                }
+            }
             let page = self.page_for_access(address, N, Access::Read)?;
             let mut bytes = [0; N];
             page.read_bytes(offset, &mut bytes)?;
@@ -987,25 +1030,18 @@ impl Memory {
         if N > PAGE_SIZE as usize - offset {
             return self.write(address, &bytes);
         }
-        if let Some(frame) = self.mmu.write(address, bytes) {
+        let base = address & !(PAGE_SIZE - 1);
+        let entry = self.translation(base).ok_or_else(|| {
+            Self::end(address, N as u64)
+                .err()
+                .unwrap_or_else(|| self.missing_page(address, Access::Write))
+        })?;
+        // SAFETY: same owning-TLB/lifetime bound as read, exclusive coordinator
+        // access and one guest page. Failed protected stores have no effects.
+        if matches!(N, 1 | 2 | 4 | 8 | 16) && unsafe { entry.write(offset, bytes) } {
             self.revision = self.revision.wrapping_add(1);
-            self.note_parallel_write(frame);
+            self.note_parallel_write(entry.frame);
             return Ok(());
-        }
-        self.write_array_soft(address, bytes)
-    }
-    #[inline]
-    pub(crate) fn write_array_soft<const N: usize>(
-        &mut self,
-        address: u64,
-        bytes: [u8; N],
-    ) -> Result<(), MemoryError> {
-        if N == 0 {
-            return Ok(());
-        }
-        let offset = (address & (PAGE_SIZE - 1)) as usize;
-        if N > PAGE_SIZE as usize - offset {
-            return self.write(address, &bytes);
         }
         let entry = self.access_translation(address, N, Access::Write)?;
         let frame = entry.frame;

@@ -8,7 +8,6 @@ impl Snapshot {
         self.refresh_mmu(&addresses);
     }
     pub(super) fn refresh_mmu(&mut self, changed: &[u64]) {
-        self.mmu.invalidate_hints();
         let granule = self.mmu.granule();
         if granule == 0 {
             return;
@@ -52,70 +51,73 @@ impl Snapshot {
 }
 impl View {
     #[inline]
-    pub(crate) fn mmu_read<const N: usize>(&self, address: u64) -> Option<[u8; N]> {
-        self.mmu_read_hint(address, &mut self.snapshot.mmu.hint(&self.mmu_cache))
-    }
-    #[inline(always)]
-    pub(super) fn mmu_read_hint<const N: usize>(
+    pub(super) fn operand_translation(
         &self,
         address: u64,
-        hint: &mut DirectHint,
+        access: Access,
+    ) -> Result<Translation, MemoryError> {
+        let base = address & !(PAGE_SIZE - 1);
+        let entry = self.translations[Translation::slot(base)].get();
+        if entry.matches(base, Translation::VALID) {
+            return Ok(entry);
+        }
+        Memory::end(address, 1)?;
+        self.frame_slow(address, access)?;
+        Ok(self.translations[Translation::slot(base)].get())
+    }
+    #[inline(always)]
+    pub(super) fn mmu_read_entry<const N: usize>(
+        &self,
+        entry: Translation,
+        offset: usize,
     ) -> Option<[u8; N]> {
-        let address = address & 0x00ffffffffffffff;
-        let operand = self
-            .snapshot
-            .mmu
-            .operand_hint(&self.mmu_cache, address, N, false, hint)?;
-        let position = self.snapshot.positions[operand.frame]?;
-        let frame = &self.snapshot.frames[position];
+        if entry.cpu == 0 {
+            return None;
+        }
+        // SAFETY: only this immutable snapshot fills this view's TLB. The caller
+        // proves one-page bounds; no mapping can change during a view's lifetime.
+        let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
         let _guard = frame
             .bytes
             .bytes
             .as_ref()
-            .map(|bytes| bytes.lock(address as usize & 4095, N));
-        // SAFETY: mutable frames retain the exact region guard; constant frames
-        // cannot be mutated through any published view. CPU permissions are
-        // enforced by the hardware alias, not a second software permission test.
-        unsafe { operand.read() }
-    }
-    #[inline]
-    pub(super) fn mmu_write<const N: usize>(&self, address: u64, bytes: [u8; N]) -> bool {
-        self.mmu_write_hint(address, bytes, &mut self.snapshot.mmu.hint(&self.mmu_cache))
+            .map(|bytes| bytes.lock(offset, N));
+        // SAFETY: mutable physical bytes retain the exact same region guard;
+        // constant frames cannot be mutated through any published view.
+        unsafe { entry.read(offset) }
     }
     #[inline(always)]
-    pub(super) fn mmu_write_hint<const N: usize>(
+    pub(super) fn mmu_write_entry<const N: usize>(
         &self,
-        address: u64,
+        entry: Translation,
+        offset: usize,
         bytes: [u8; N],
-        hint: &mut DirectHint,
     ) -> bool {
-        let address = address & 0x00ffffffffffffff;
-        let Some(operand) = self
-            .snapshot
-            .mmu
-            .operand_hint(&self.mmu_cache, address, N, true, hint)
-        else {
+        if entry.cpu == 0 || entry.tag & 4 != 0 {
             return false;
-        };
-        let Some(position) = self.snapshot.positions[operand.frame] else {
-            return false;
-        };
-        let frame = &self.snapshot.frames[position];
-        let offset = address as usize & 4095;
-        // A read-only constant frame must fault without constructing a writable
-        // Rust reference. The fixed store instruction supplies that proof.
+        }
+        // SAFETY: same retained immutable snapshot and page-contained operand.
+        let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
         let Some(storage) = &frame.bytes.bytes else {
-            // SAFETY: a constant mapping has no hardware write permission.
-            debug_assert!(!unsafe { operand.write(bytes) });
             return false;
         };
         let mut guard = storage.lock(offset, N);
-        // SAFETY: the same guarded physical bytes back the hardware alias.
-        if unsafe { operand.write(bytes) } {
+        // SAFETY: same guarded physical bytes back the protected alias. A failed
+        // store leaves them unchanged and the checked path supplies the errno.
+        if unsafe { entry.write(offset, bytes) } {
             self.changed(frame, &mut guard, offset, N);
             true
         } else {
             false
         }
+    }
+    pub(crate) fn mmu_read<const N: usize>(&self, address: u64) -> Option<[u8; N]> {
+        let address = address & 0x00ffffffffffffff;
+        let offset = address as usize & (PAGE_SIZE as usize - 1);
+        if !matches!(N, 1 | 2 | 4 | 8 | 16) || N > PAGE_SIZE as usize - offset {
+            return None;
+        }
+        let entry = self.operand_translation(address, Access::Read).ok()?;
+        self.mmu_read_entry(entry, offset)
     }
 }

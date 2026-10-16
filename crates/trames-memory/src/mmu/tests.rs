@@ -282,45 +282,37 @@ fn signal_probe_child() {
 }
 
 #[test]
-fn cached_hints_reject_other_owners_and_retired_or_reused_windows() {
+fn cached_cpu_aliases_are_revoked_before_fork_remap_and_page_reuse() {
     let base = 0x40000;
     let mut first = Memory::default();
     first.map(base, 65536, Permissions::RW).unwrap();
     first.write_array(base, [11; 8]).unwrap();
-    let mut hint = first.direct_hint();
-    assert_ne!(hint, DirectHint::EMPTY);
+    assert_eq!(first.read_array::<8>(base), Ok([11; 8]));
+    assert_ne!(first.translation(base).unwrap().cpu, 0);
     let mut second = Memory::default();
     second.map(base, 65536, Permissions::RW).unwrap();
     second.write_array(base, [22; 8]).unwrap();
-    assert_eq!(second.read_array_hint::<8>(base, &mut hint), Ok([22; 8]));
-    assert_eq!(first.read_array_hint::<8>(base, &mut hint), Ok([11; 8]));
-    let child = first.clone(); // Retires all parent CPU windows.
-    first.write_array_hint(base, [33; 8], &mut hint).unwrap();
-    assert_eq!(child.read_array_hint::<8>(base, &mut hint), Ok([11; 8]));
+    assert_eq!(second.read_array::<8>(base), Ok([22; 8]));
+    let child = first.clone();
+    assert_eq!(first.translations[Translation::slot(base)].get().cpu, 0);
+    first.write_array(base, [33; 8]).unwrap();
+    assert_eq!(child.read_array::<8>(base), Ok([11; 8]));
     first.unmap(base, 65536).unwrap();
     first.map(base, 65536, Permissions::RW).unwrap();
-    assert_eq!(first.read_array_hint::<8>(base, &mut hint), Ok([0; 8]));
+    assert_eq!(first.read_array::<8>(base), Ok([0; 8]));
     first.protect(base, 65536, Permissions::R).unwrap();
-    assert!(first.write_array_hint(base, [44; 8], &mut hint).is_err());
-    assert_eq!(first.read_array_hint::<8>(base, &mut hint), Ok([0; 8]));
+    assert!(first.write_array(base, [44; 8]).is_err());
+    assert_eq!(first.read_array::<8>(base), Ok([0; 8]));
     first
         .remap(base, 65536, 0x7fffff000000, 65536, false)
         .unwrap();
-    assert!(first.read_array_hint::<8>(base, &mut hint).is_err());
-    assert_eq!(
-        first.read_array_hint::<8>(0xab007fffff000000, &mut hint),
-        Ok([0; 8])
-    );
-    let shared = first.share();
-    assert_eq!(
-        shared.read_array_hint::<8>(0x7fffff000000, &mut hint),
-        Ok([0; 8])
-    );
-    assert_eq!(hint, DirectHint::EMPTY);
+    assert!(first.read_array::<8>(base).is_err());
+    assert_eq!(first.read_array::<8>(0xab007fffff000000), Ok([0; 8]));
+    assert_eq!(first.share().read_array::<8>(0x7fffff000000), Ok([0; 8]));
 }
 
 #[test]
-fn direct_mapped_windows_and_worker_hints_keep_conflicting_addresses_separate() {
+fn direct_mapped_pages_keep_conflicts_and_retained_worker_snapshots_separate() {
     let mut memory = Memory::default();
     let bases: Vec<_> = (0..40).map(|i| 0x10000 + i * WINDOW as u64).collect();
     for (i, &base) in bases.iter().enumerate() {
@@ -329,34 +321,29 @@ fn direct_mapped_windows_and_worker_hints_keep_conflicting_addresses_separate() 
             .write_array(base, (i as u64 + 1).to_le_bytes())
             .unwrap();
     }
-    let mut hint = memory.direct_hint();
-    for &base in bases.iter().rev().cycle().take(160) {
-        assert_eq!(
-            memory.read_array_hint::<8>(base, &mut hint),
-            memory.read_array::<8>(base)
-        );
+    for _ in 0..4 {
+        for (i, &base) in bases.iter().enumerate().rev() {
+            assert_eq!(
+                memory.read_array::<8>(base),
+                Ok((i as u64 + 1).to_le_bytes())
+            );
+        }
     }
     let mut registry = parallel::Registry::default();
     let mut view = memory.parallel_view(&mut registry).unwrap();
     for (i, &base) in bases.iter().enumerate().rev() {
-        assert_eq!(
-            view.read_array_hint::<8>(base, &mut hint),
-            Ok((i as u64 + 1).to_le_bytes())
-        );
-        view.write_array_hint(base, (i as u64 + 42).to_le_bytes(), &mut hint)
+        assert_eq!(view.read_array::<8>(base), Ok((i as u64 + 1).to_le_bytes()));
+        view.write_array(base, (i as u64 + 42).to_le_bytes())
             .unwrap();
     }
-    let old_hint = hint;
+    let retained = view.clone();
     drop(view);
     memory.commit_parallel().unwrap();
     memory.protect(bases[39], 65536, Permissions::R).unwrap();
     let mut view = memory.parallel_view(&mut registry).unwrap();
-    assert!(view.write_array_hint(bases[39], [0; 8], &mut hint).is_err());
-    hint = old_hint;
-    assert_eq!(
-        memory.read_array_hint::<8>(bases[39], &mut hint),
-        Ok(81u64.to_le_bytes())
-    );
+    assert!(view.write_array(bases[39], [0; 8]).is_err());
+    assert_eq!(retained.read_array::<8>(bases[39]), Ok(81u64.to_le_bytes()));
+    assert_eq!(memory.read_array::<8>(bases[39]), Ok(81u64.to_le_bytes()));
 }
 
 #[test]
@@ -375,4 +362,33 @@ fn cached_missing_windows_are_invalidated_before_later_mapping_or_fork_write() {
     memory.write_array(base, [42; 8]).unwrap();
     assert_eq!(memory.mmu.read::<8>(base), Some([42; 8]));
     assert_eq!(child.read_array::<8>(base), Ok([0; 8]));
+}
+
+#[test]
+fn native_cow_promotion_invalidates_cached_neighbor_pages() {
+    let base = 0x40000;
+    let mut memory = Memory::default();
+    memory.map(base, 65536, Permissions::RW).unwrap();
+    memory.write_array(base, [11; 8]).unwrap();
+    memory.write_array(base + PAGE_SIZE, [22; 8]).unwrap();
+    let child = memory.clone();
+    // Warm software-only entries after retirement, before native promotion.
+    assert_eq!(memory.read_array::<8>(base), Ok([11; 8]));
+    assert_eq!(memory.read_array::<8>(base + PAGE_SIZE), Ok([22; 8]));
+    assert_eq!(memory.translation(base).unwrap().cpu, 0);
+    memory
+        .with_write_chunk(base, 8, |bytes| bytes.fill(33))
+        .unwrap();
+    memory
+        .with_write_chunk(base + PAGE_SIZE, 8, |bytes| bytes.fill(44))
+        .unwrap();
+    assert_eq!(memory.read_array::<8>(base), Ok([33; 8]));
+    assert_eq!(memory.read_array::<8>(base + PAGE_SIZE), Ok([44; 8]));
+    assert_ne!(memory.translation(base).unwrap().cpu, 0);
+    assert_ne!(memory.translation(base + PAGE_SIZE).unwrap().cpu, 0);
+    assert_eq!(child.read_array::<8>(base), Ok([11; 8]));
+    assert_eq!(child.read_array::<8>(base + PAGE_SIZE), Ok([22; 8]));
+    memory.discard(base, 65536).unwrap();
+    assert_eq!(memory.read_array::<8>(base), Ok([0; 8]));
+    assert_eq!(memory.read_array::<8>(base + PAGE_SIZE), Ok([0; 8]));
 }

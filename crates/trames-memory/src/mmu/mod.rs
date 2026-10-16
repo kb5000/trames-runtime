@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, non-executable hardware-protected views of ordinary guest RAM.
-mod access;
+pub(super) mod access;
 mod cache;
 pub(crate) use cache::Cache;
-pub use cache::DirectHint;
 mod fault;
 pub(crate) mod host;
 mod worker;
@@ -154,7 +153,6 @@ impl Window {
 pub(super) struct Arena {
     windows: RefCell<BTreeMap<u64, Rc<Window>>>,
     cache: Cache,
-    key: Cell<u64>,
     granule: usize,
 }
 impl Default for Arena {
@@ -162,7 +160,6 @@ impl Default for Arena {
         Self {
             windows: RefCell::new(BTreeMap::new()),
             cache: Cache::default(),
-            key: Cell::new(NEXT_SPACE.fetch_add(1, Ordering::Relaxed)),
             granule: host::page_size().unwrap_or(0),
         }
     }
@@ -214,7 +211,6 @@ impl Arena {
     /// Retired kernel aliases stay alive through their PageBytes. New mapping
     /// windows are populated lazily; fork does not eagerly copy guest RAM.
     pub fn retire(&self) {
-        self.key.set(NEXT_SPACE.fetch_add(1, Ordering::Relaxed));
         self.cache.clear();
         for window in self.windows.borrow().values() {
             for flag in &window.flags {
@@ -224,36 +220,17 @@ impl Arena {
         }
         self.windows.borrow_mut().clear();
     }
-    #[inline]
-    pub fn hint(&self) -> DirectHint {
-        self.cache.hint(self.key.get())
-    }
-    #[inline(always)]
-    pub fn read_hint<const N: usize>(
-        &self,
-        address: u64,
-        hint: &mut DirectHint,
-    ) -> Option<[u8; N]> {
-        if let Some((window, bias)) = hint.reached(self.key.get(), address) {
-            return Self::read_at(window, bias, address);
+    /// Cached only in the owning Memory's page TLB. Mapping edits and arena
+    /// retirement flush that TLB before any alias can be replaced or unmapped.
+    pub fn page_alias(&self, base: u64) -> usize {
+        let Some(window) = self.reached(base) else {
+            return 0;
+        };
+        let offset = (base - window.base) as usize;
+        if window.flags[offset >> window.shift].load(Ordering::Relaxed) & ELIGIBLE == 0 {
+            return 0;
         }
-        let result = self.read(address);
-        *hint = self.hint();
-        result
-    }
-    #[inline(always)]
-    pub fn write_hint<const N: usize>(
-        &self,
-        address: u64,
-        bytes: [u8; N],
-        hint: &mut DirectHint,
-    ) -> Option<usize> {
-        if let Some((window, bias)) = hint.reached(self.key.get(), address) {
-            return Self::write_at(window, bias, address, bytes);
-        }
-        let result = self.write(address, bytes);
-        *hint = self.hint();
-        result
+        window.mapping.cpu.as_ptr().wrapping_add(offset) as usize
     }
     #[inline]
     fn ready(&self, address: u64) -> bool {
@@ -264,6 +241,7 @@ impl Arena {
         })
     }
     #[inline]
+    #[cfg(test)]
     pub fn read<const N: usize>(&self, address: u64) -> Option<[u8; N]> {
         if !matches!(N, 1 | 2 | 4 | 8 | 16) || N > P - (address as usize & (P - 1)) {
             return None;
@@ -276,6 +254,7 @@ impl Arena {
         )
     }
     #[inline(always)]
+    #[cfg(test)]
     fn read_at<const N: usize>(window: &Window, bias: usize, address: u64) -> Option<[u8; N]> {
         if !matches!(N, 1 | 2 | 4 | 8 | 16) || N > P - (address as usize & (P - 1)) {
             return None;
@@ -300,6 +279,7 @@ impl Arena {
         }
     }
     #[inline]
+    #[cfg(test)]
     pub fn write<const N: usize>(&self, address: u64, bytes: [u8; N]) -> Option<usize> {
         if !matches!(N, 1 | 2 | 4 | 8 | 16) || N > P - (address as usize & (P - 1)) {
             return None;
@@ -313,6 +293,7 @@ impl Arena {
         )
     }
     #[inline(always)]
+    #[cfg(test)]
     fn write_at<const N: usize>(
         window: &Window,
         bias: usize,
@@ -345,18 +326,34 @@ impl Arena {
 
 impl Memory {
     pub(super) fn prepare_mmu_write(&mut self, address: u64, len: usize) {
-        if len <= P - (address as usize & (P - 1)) && self.mmu.ready(address) {
-            return;
+        if len <= P - (address as usize & (P - 1)) {
+            if self.mmu.ready(address) {
+                return;
+            }
+            // Backings always retain the software path (including live EOF
+            // checks after private COW). Rebuilding host groups on every file
+            // store can never make this page eligible.
+            let base = address & !(PAGE_SIZE - 1);
+            if self.frame(base).is_some_and(|frame| {
+                self.frames[frame]
+                    .as_ref()
+                    .is_some_and(|page| page.backing.is_some())
+            }) {
+                return;
+            }
         }
-        self.refresh_mmu(address, len as u64);
+        if self.refresh_mmu(address, len as u64) {
+            self.invalidate_translations();
+        }
     }
     /// Called only at quiescent mapping/COW boundaries. Hardware groups with
     /// holes, mixed permissions or backing I/O stay on the shared software path.
-    pub(super) fn refresh_mmu(&mut self, address: u64, len: u64) {
+    pub(super) fn refresh_mmu(&mut self, address: u64, len: u64) -> bool {
         let granule = self.mmu.granule;
         if granule == 0 || len == 0 {
-            return;
+            return false;
         }
+        let mut changed = false;
         let begin = address & !(granule as u64 - 1);
         let end = address
             .saturating_add(len)
@@ -402,6 +399,7 @@ impl Memory {
                         Rc::strong_count(&page.bytes) != 1
                             || !page.bytes.belongs(&window.mapping, first + index * P)
                     }) {
+                        changed = true;
                         // Capture the complete group before writing: remap may
                         // move overlapping ranges within an existing window.
                         let data: Vec<_> = frames
@@ -435,6 +433,7 @@ impl Memory {
                         | if permissions.execute { CODE } else { 0 };
                 }
                 if state != window.flags[group].load(Ordering::Relaxed) {
+                    changed = true;
                     match run {
                         Some((start, last, previous)) if last == group && previous == state => {
                             run = Some((start, group + 1, state))
@@ -455,5 +454,6 @@ impl Memory {
                 window.protect_run(start, last, state);
             }
         }
+        changed
     }
 }

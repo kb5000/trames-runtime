@@ -302,6 +302,7 @@ impl View {
             index,
             frame.permissions,
             false,
+            self.snapshot.mmu.page_alias(&self.mmu_cache, base),
         ));
         Ok(frame)
     }
@@ -445,8 +446,13 @@ impl CpuMemory for View {
     }
     #[inline]
     fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
-        if let Some(bytes) = self.mmu_read::<N>(address) {
-            return Ok(bytes);
+        let address = address & 0x00ffffffffffffff;
+        let offset = address as usize & (PAGE_SIZE as usize - 1);
+        if matches!(N, 1 | 2 | 4 | 8 | 16) && N <= PAGE_SIZE as usize - offset {
+            let entry = self.operand_translation(address, Access::Read)?;
+            if let Some(bytes) = self.mmu_read_entry::<N>(entry, offset) {
+                return Ok(bytes);
+            }
         }
         let mut bytes = [0; N];
         self.read(address, &mut bytes)?;
@@ -458,8 +464,13 @@ impl CpuMemory for View {
         address: u64,
         bytes: [u8; N],
     ) -> Result<(), MemoryError> {
-        if self.mmu_write(address, bytes) {
-            return Ok(());
+        let address = address & 0x00ffffffffffffff;
+        let offset = address as usize & (PAGE_SIZE as usize - 1);
+        if matches!(N, 1 | 2 | 4 | 8 | 16) && N <= PAGE_SIZE as usize - offset {
+            let entry = self.operand_translation(address, Access::Write)?;
+            if self.mmu_write_entry(entry, offset, bytes) {
+                return Ok(());
+            }
         }
         self.write(address, &bytes)
     }
@@ -527,38 +538,6 @@ impl CpuMemory for View {
             frame.bytes.identity,
             frame.bytes.version.load(Ordering::Acquire),
         ))
-    }
-    #[inline]
-    fn direct_hint(&self) -> DirectHint {
-        self.snapshot.mmu.hint(&self.mmu_cache)
-    }
-    #[inline(always)]
-    fn read_array_hint<const N: usize>(
-        &self,
-        address: u64,
-        hint: &mut DirectHint,
-    ) -> Result<[u8; N], MemoryError> {
-        if let Some(bytes) = self.mmu_read_hint(address, hint) {
-            return Ok(bytes);
-        }
-        let mut bytes = [0; N];
-        let result = self.read(address, &mut bytes).map(|()| bytes);
-        *hint = self.direct_hint();
-        result
-    }
-    #[inline(always)]
-    fn write_array_hint<const N: usize>(
-        &mut self,
-        address: u64,
-        bytes: [u8; N],
-        hint: &mut DirectHint,
-    ) -> Result<(), MemoryError> {
-        if self.mmu_write_hint(address, bytes, hint) {
-            return Ok(());
-        }
-        let result = self.write(address, &bytes);
-        *hint = self.direct_hint();
-        result
     }
     fn atomic_update<T>(
         &mut self,
