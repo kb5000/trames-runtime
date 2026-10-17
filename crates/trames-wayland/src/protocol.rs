@@ -53,6 +53,9 @@ impl State {
         self.apply_children(id);
     }
     pub(crate) fn apply_commit(&mut self, id: u64, pending: CachedCommit) {
+        if matches!(pending.buffer, Some(None)) {
+            self.surface_unmapped(id);
+        }
         let needs_configure = self
             .surfaces
             .get(&id)
@@ -263,6 +266,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
         _: &wl_surface::WlSurface,
         key: &SurfaceKey,
     ) {
+        state.surface_unmapped(key.0);
         if let Some(s) = state.surfaces.remove(&key.0) {
             if let Some((parent, ..)) = s.parent {
                 if let Some(p) = state.surfaces.get_mut(&parent) {

@@ -174,3 +174,163 @@ fn original_gtk3_seat_and_mousepad_open_without_gdk_errors() {
         let _ = std::fs::remove_dir_all(temp);
     }
 }
+
+#[test]
+#[ignore = "requires original system GTK3"]
+fn original_gtk_context_menu_copy_keeps_selection_and_keyboard_focus() {
+    #[derive(Clone, Default)]
+    struct Clipboard(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl trames_wayland::HostClipboard for Clipboard {
+        fn read(&self, _: std::os::fd::OwnedFd) -> io::Result<()> {
+            Ok(())
+        }
+        fn write(&self, mut pipe: trames_shared::NativePipe) -> io::Result<()> {
+            let values = self.0.clone();
+            thread::spawn(move || {
+                use std::io::Read;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut value = Vec::new();
+                let mut bytes = [0; 4096];
+                loop {
+                    match pipe.read(&mut bytes) {
+                        Ok(0) => {
+                            values
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8(value).unwrap());
+                            break;
+                        }
+                        Ok(n) => value.extend_from_slice(&bytes[..n]),
+                        Err(e)
+                            if e.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(1))
+                        }
+                        _ => break,
+                    }
+                }
+            });
+            Ok(())
+        }
+    }
+    let server = Server::new().unwrap();
+    let clipboard = Clipboard::default();
+    server
+        .attach_clipboard(std::sync::Arc::new(clipboard.clone()))
+        .unwrap();
+    let (_, socket) = server.connect(400, 1000, 1000).unwrap();
+    let fd = socket.as_raw_fd();
+    let marker = std::env::temp_dir().join(format!("trames-gtk-menu-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let runtime = marker.with_extension("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let mut command = Command::new("python3");
+    command
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/gtk-editing.py"),
+        )
+        .env("WAYLAND_SOCKET", fd.to_string())
+        .env("GDK_BACKEND", "wayland")
+        .env("GTK_IM_MODULE", "wayland")
+        .env("GSETTINGS_BACKEND", "memory")
+        .env("GTK_USE_PORTAL", "0")
+        .env("NO_AT_BRIDGE", "1")
+        .env("GTK_CSD", "0")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CACHE_HOME", &runtime)
+        .env("XDG_CONFIG_HOME", &runtime)
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .env("TRAMES_GTK_EDITING_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: child-only fcntl on the live inherited Wayland socket.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(socket);
+    let began = Instant::now();
+    let mut clicked = false;
+    let mut opened = false;
+    let mut activated = false;
+    let mut restored = false;
+    loop {
+        let scene = server.snapshot();
+        for window in &scene.windows {
+            server
+                .presented(
+                    window.id,
+                    scene.revision,
+                    began.elapsed().as_millis() as u32,
+                )
+                .unwrap();
+            if !clicked && !window.scene.is_empty() && began.elapsed() > Duration::from_millis(500)
+            {
+                server
+                    .input(trames_wayland::InputEvent::Focus {
+                        window: Some(window.id),
+                    })
+                    .unwrap();
+                clicked = true;
+            }
+            if clicked && !opened && scene.text.is_some() {
+                // GTK's standard Shift+F10 opens the same text context menu
+                // without depending on theme-specific CSD pixel positions.
+                for (key, modifiers) in [(30, 4), (68, 1)] {
+                    for pressed in [true, false] {
+                        server
+                            .input(trames_wayland::InputEvent::Key {
+                                key,
+                                pressed,
+                                modifiers: if pressed { modifiers } else { 0 },
+                                time: 2,
+                            })
+                            .unwrap();
+                    }
+                }
+                opened = true;
+            }
+            if !activated && marker.exists() && window.scene.len() > 1 {
+                for pressed in [true, false] {
+                    server
+                        .input(trames_wayland::InputEvent::Key {
+                            key: 46,
+                            pressed,
+                            modifiers: 0,
+                            time: 3,
+                        })
+                        .unwrap();
+                }
+                activated = true;
+            }
+            restored |= activated && scene.text.as_ref().is_some_and(|t| t.surface == window.id);
+        }
+        if !clipboard.0.lock().unwrap().is_empty() && restored {
+            break;
+        }
+        if child.try_wait().unwrap().is_some() || began.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "GTK menu copy failed: clicked={clicked}, windows={:?}, activated={activated}, restored={restored}, copied={:?}: {}",
+                scene.windows.iter().map(|w|(&w.title,w.scene.len())).collect::<Vec<_>>(),clipboard.0.lock().unwrap(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(&*clipboard.0.lock().unwrap(), &["menu clipboard 中文 🧪"]);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CRITICAL"));
+    let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_dir_all(runtime);
+}

@@ -46,6 +46,7 @@ pub(crate) struct Seat {
     grab: Option<u64>,
     pub popups: Vec<u64>,
     pub press_serial: Option<(u32, u64)>,
+    pub key_serial: Option<(u32, u64)>,
     pressed: BTreeSet<u32>,
     modifiers: u32,
     keymap: Option<trames_shared::SharedFile>,
@@ -60,6 +61,54 @@ pub(crate) fn globals(handle: &DisplayHandle) {
     handle.create_global::<State, wl_seat::WlSeat, _>(7, ());
 }
 impl State {
+    /// A menu can unmap before its activation sends set_selection. Restore the
+    /// nearest mapped parent while the old resource still exists, so keyboard,
+    /// text-input and data-device focus leave the popup together.
+    pub(crate) fn surface_unmapped(&mut self, id: u64) {
+        if self
+            .seat
+            .focus
+            .is_some_and(|focus| self.is_descendant(focus, id))
+        {
+            let mut parent = self.surfaces.get(&id).and_then(|s| s.parent).map(|p| p.0);
+            for _ in 0..256 {
+                let Some(surface) = parent.and_then(|p| self.surfaces.get(&p)) else {
+                    parent = None;
+                    break;
+                };
+                if surface.current.is_some() && !surface.dismissed && surface.resource.is_alive() {
+                    break;
+                }
+                parent = surface.parent.map(|p| p.0);
+            }
+            self.focus_surface(parent);
+        }
+        if self
+            .seat
+            .pointer
+            .is_some_and(|pointer| self.is_descendant(pointer, id))
+        {
+            let serial = self.next_serial();
+            if let Some(surface) = self.seat.pointer.and_then(|p| self.surfaces.get(&p)) {
+                for pointer in &self.seat.pointers {
+                    if pointer.is_alive() && connection(pointer) == surface.connection {
+                        pointer.leave(serial, &surface.resource);
+                        if pointer.version() >= 5 {
+                            pointer.frame();
+                        }
+                    }
+                }
+            }
+            self.seat.pointer = None;
+        }
+        if self
+            .seat
+            .grab
+            .is_some_and(|grab| self.is_descendant(grab, id))
+        {
+            self.seat.grab = None;
+        }
+    }
     pub(crate) fn next_serial(&mut self) -> u32 {
         self.serial = self.serial.wrapping_add(1).max(1);
         self.serial
@@ -292,6 +341,7 @@ impl State {
                 self.seat.modifiers = modifiers;
                 let serial = self.next_serial();
                 if let Some(id) = self.seat.focus {
+                    self.seat.key_serial = Some((serial, id));
                     if pressed {
                         self.seat.press_serial = Some((serial, id));
                     }
@@ -489,5 +539,83 @@ impl Dispatch<wl_touch::WlTouch, ()> for State {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{BufferData, BufferLease, ImageBuffer, ShmBuffer, Surface, SurfaceKey};
+    use std::sync::{Arc, Mutex, Weak};
+    use wayland_server::protocol::{wl_buffer, wl_surface};
+
+    #[test]
+    fn nested_popup_unmap_restores_mapped_ancestors_without_stealing_other_focus() {
+        let mut compositor = Compositor::new().unwrap();
+        let (_peer, socket) = UnixStream::pair().unwrap();
+        compositor
+            .connect(
+                socket,
+                ClientIdentity {
+                    connection: 1,
+                    pid: 1,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .unwrap();
+        let client = compositor.clients.get(&1).unwrap();
+        let handle = compositor.display.handle();
+        let file = trames_shared::SharedFile::anonymous().unwrap();
+        file.set_len(4).unwrap();
+        let pixels = Arc::new(ShmBuffer {
+            id: 1,
+            mapping: file.map(0, 4).unwrap(),
+            file,
+            width: 1,
+            height: 1,
+            stride: 4,
+            alpha: false,
+        });
+        let buffer = client
+            .create_resource::<wl_buffer::WlBuffer, _, State>(
+                &handle,
+                1,
+                BufferData {
+                    pixels,
+                    lease: Mutex::new(Weak::new()),
+                },
+            )
+            .unwrap();
+        let image = ImageBuffer::Shm(BufferLease::acquire(buffer).unwrap());
+        for (id, parent) in [(1, None), (2, Some(1)), (3, Some(2)), (4, None)] {
+            let resource = client
+                .create_resource::<wl_surface::WlSurface, _, State>(&handle, 4, SurfaceKey(id))
+                .unwrap();
+            let mut surface = Surface::new(resource, 1);
+            surface.parent = parent.map(|p| (p, 0, 0));
+            surface.current = Some(image.clone());
+            compositor.state.surfaces.insert(id, surface);
+        }
+        let state = &mut compositor.state;
+        state.focus_surface(Some(3));
+        state.seat.pointer = Some(3);
+        state.seat.grab = Some(3);
+        state.surface_unmapped(3);
+        assert_eq!(state.seat.focus, Some(2));
+        assert_eq!(state.seat.pointer, None);
+        assert_eq!(state.seat.grab, None);
+        state.surfaces.get_mut(&3).unwrap().current = None;
+        // wl_surface.attach(NULL) also releases popup focus before destruction.
+        state.focus_surface(Some(2));
+        state.surfaces.get_mut(&2).unwrap().pending_buffer = Some(None);
+        state.commit(2);
+        assert_eq!(state.seat.focus, Some(1));
+        state.focus_surface(Some(4));
+        state.surface_unmapped(2);
+        assert_eq!(state.seat.focus, Some(4));
+        state.focus_surface(Some(1));
+        state.surface_unmapped(1);
+        assert_eq!(state.seat.focus, None);
     }
 }

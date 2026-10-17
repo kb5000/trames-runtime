@@ -14,6 +14,7 @@ impl State {
     pub(crate) fn dismiss_popups(&mut self) {
         let ids = std::mem::take(&mut self.seat.popups);
         for id in ids.into_iter().rev() {
+            self.surface_unmapped(id);
             if let Some(s) = self.surfaces.get_mut(&id) {
                 if let Some(p) = &s.popup {
                     p.popup_done();
@@ -368,6 +369,7 @@ impl Dispatch<xdg_popup::XdgPopup, SurfaceKey> for State {
     ) {
         match request {
             xdg_popup::Request::Destroy => {
+                state.surface_unmapped(key.0);
                 if let Some(s) = state.surfaces.get_mut(&key.0) {
                     s.popup = None;
                     s.current = None;
@@ -381,13 +383,19 @@ impl Dispatch<xdg_popup::XdgPopup, SurfaceKey> for State {
                     .get(&key.0)
                     .and_then(|s| s.parent)
                     .map(|p| p.0);
-                let valid = state.seat.press_serial.is_some_and(|(issued, target)| {
-                    issued == serial && parent.is_some_and(|p| state.is_descendant(target, p))
-                }) && state
-                    .seat
-                    .popups
-                    .last()
-                    .is_none_or(|id| Some(*id) == parent)
+                // GTK keyboard menus can be opened from key release; pointer
+                // menus keep using the button-press implicit grab serial.
+                let valid = [state.seat.press_serial, state.seat.key_serial]
+                    .into_iter()
+                    .flatten()
+                    .any(|(issued, target)| {
+                        issued == serial && parent.is_some_and(|p| state.is_descendant(target, p))
+                    })
+                    && state
+                        .seat
+                        .popups
+                        .last()
+                        .is_none_or(|id| Some(*id) == parent)
                     && state
                         .surfaces
                         .get(&key.0)
