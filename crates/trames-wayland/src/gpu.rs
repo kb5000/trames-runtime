@@ -37,7 +37,10 @@ impl State {
             }
         }
     }
-    pub(crate) fn poll_gpu(&mut self) {
+    /// True only while an eligible producer fence is still pending. FIFO
+    /// backpressure waits for the UI wakeup and must not spin on a timer.
+    pub(crate) fn poll_gpu(&mut self) -> bool {
+        let mut waiting_for_gpu = false;
         for s in self.surfaces.values_mut() {
             if s.xdg.is_some() && !s.acknowledged {
                 continue;
@@ -52,7 +55,10 @@ impl State {
                 continue;
             }
             match image.ready() {
-                Ok(false) => continue,
+                Ok(false) => {
+                    waiting_for_gpu = true;
+                    continue;
+                }
                 Err(_) => {
                     s.gpu_pending.pop_front();
                     continue;
@@ -74,6 +80,7 @@ impl State {
             self.revision = self.revision.wrapping_add(1);
             s.revision = self.revision;
         }
+        waiting_for_gpu
     }
 }
 
