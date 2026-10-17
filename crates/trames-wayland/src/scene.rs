@@ -27,6 +27,9 @@ pub struct WindowSnapshot {
     pub width: u32,
     pub height: u32,
     pub mode: WindowMode,
+    pub parent: Option<u64>,
+    pub min_size: (u32, u32),
+    pub max_size: (u32, u32),
     pub scene: Vec<SurfaceImage>,
     pub revision: u64,
 }
@@ -206,6 +209,9 @@ pub(crate) struct Surface {
     pub size: (u32, u32),
     pub mode: WindowMode,
     pub requested_size: (u32, u32),
+    pub top_parent: Option<u64>,
+    pub min_size: (u32, u32),
+    pub max_size: (u32, u32),
     pub restore_size: (u32, u32),
     pub pending_buffer: Option<Option<WlBuffer>>,
     pub current: Option<ImageBuffer>,
@@ -264,6 +270,9 @@ impl Surface {
             size: (640, 480),
             mode: WindowMode::Floating,
             requested_size: (0, 0),
+            top_parent: None,
+            min_size: (0, 0),
+            max_size: (0, 0),
             restore_size: (640, 480),
             pending_buffer: None,
             current: None,
@@ -361,6 +370,9 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
                 width: s.size.0,
                 height: s.size.1,
                 mode: s.mode,
+                parent: s.top_parent,
+                min_size: s.min_size,
+                max_size: s.max_size,
                 revision: scene
                     .iter()
                     .filter_map(|image| surfaces.get(&image.surface))

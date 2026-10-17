@@ -7,7 +7,7 @@ impl Vfs {
     }
     /// Mode-zero allocation reserves the virtual inode's storage quota and
     /// extends logical EOF without changing existing bytes or the fd position.
-    /// Hole punching/KEEP_SIZE and host physical block reservation are separate.
+    /// KEEP_SIZE is supported for shared files; guest hole punching is separate.
     pub fn allocate_fd(&mut self, fd: u32, mode: u64, offset: u64, length: u64) -> Result<()> {
         if length == 0 || offset > i64::MAX as u64 || length > i64::MAX as u64 {
             return Err(Errno(22));
@@ -16,7 +16,7 @@ impl Vfs {
             .checked_add(length)
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(Errno(27))?;
-        let old = {
+        let (old, shared) = {
             let o = self.descriptor(fd)?.open.borrow();
             if o.flags & O_PATH != 0 || o.flags & 3 == 0 {
                 return Err(Errno(9));
@@ -28,12 +28,38 @@ impl Vfs {
             let Content::File(data) = &n.content else {
                 return Err(Errno(19));
             };
-            data.len()
+            (data.len(), data.shared_file())
         };
-        if mode != 0 {
+        if mode > 1 {
             return Err(Errno(95));
         }
-        self.truncate_fd(fd, old.max(end))
+        self.fd_writable(fd)?;
+        if let Some(file) = shared {
+            let n = self
+                .descriptor(fd)?
+                .open
+                .borrow()
+                .node
+                .clone()
+                .ok_or(Errno(19))?;
+            if n.borrow()
+                .seals
+                .is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old)
+            {
+                return Err(Errno(1));
+            }
+            if mode == 0 && end > self.file_size_limit {
+                return Err(Errno(27));
+            }
+            file.reserve_range(
+                usize::try_from(offset).map_err(|_| Errno(27))?,
+                usize::try_from(length).map_err(|_| Errno(27))?,
+            )
+            .map_err(storage::host_errno)?;
+        } else if mode != 0 {
+            return Err(Errno(95));
+        }
+        self.truncate_fd(fd, if mode == 0 { old.max(end) } else { old })
     }
     pub fn memfd_create(&mut self, name: &[u8], flags: u32) -> Result<u32> {
         if name.len() > 249 {
@@ -149,8 +175,28 @@ mod allocation_tests {
         assert_eq!(v.seek(fd, 0, 1).unwrap(), 8);
         assert_eq!(v.pread(fd, 4, 4096).unwrap(), [0; 4]);
         assert_eq!(v.allocate_fd(fd, 0, 0, 0), Err(Errno(22)));
-        assert_eq!(v.allocate_fd(fd, 1, 0, 1), Err(Errno(95)));
+        assert_eq!(v.allocate_fd(fd, 1, 0, 1), Ok(()));
+        assert_eq!(v.seek(fd, 0, 2).unwrap(), 8192);
         assert_eq!(v.allocate_fd(fd, 0, 0, MEMFD_BYTES + 1), Err(Errno(28)));
         assert_eq!(v.pread(fd, 8, 0).unwrap(), b"existing");
+    }
+    #[test]
+    fn foot_sparse_pool_probe_falls_back_without_charging_512_mib() {
+        let mut v = Vfs::default();
+        for _ in 0..4 {
+            let fd = v.memfd_create(b"foot-shm", 3).unwrap();
+            let before = v.memfd_available();
+            v.truncate_fd(fd, 512 * 1024 * 1024).unwrap();
+            assert_eq!(v.memfd_available(), before);
+            assert_eq!(v.allocate_fd(fd, 3, 0, 1), Err(Errno(95)));
+            v.truncate_fd(fd, 8192).unwrap();
+            let pages = v.mapping_pages(fd, 0, 8192, true, true).unwrap();
+            assert!(v.memfd_available() < before);
+            v.pwrite(fd, b"pixels", 4096).unwrap();
+            assert_eq!(v.pread(fd, 6, 4096).unwrap(), b"pixels");
+            v.close(fd).unwrap();
+            drop(pages);
+            assert_eq!(v.memfd_available(), before);
+        }
     }
 }

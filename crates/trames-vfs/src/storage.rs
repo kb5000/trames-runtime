@@ -157,6 +157,9 @@ impl FileData {
         if let Self::Disk(d) = self {
             return Ok(fs::symlink_metadata(&d.path).map_err(host_errno)?.blocks());
         }
+        if let Self::Shared(file) = self {
+            return Ok(file.allocated().div_ceil(512) as u64);
+        }
         Ok(self.len().div_ceil(512))
     }
     pub fn inode(&self) -> Option<u64> {
@@ -188,10 +191,10 @@ impl FileData {
         }
     }
     pub(super) fn growth_charge(&self, length: u64) -> u64 {
-        if let Some(file) = self.shared_file() {
-            trames_shared::SharedFile::required_capacity(length)
-                .unwrap_or(u64::MAX)
-                .saturating_sub(file.capacity() as u64)
+        if self.shared_file().is_some() {
+            // Sparse logical growth is free. SharedFile charges actual write /
+            // mapping ranges and explicit fallocate reservations atomically.
+            0
         } else {
             length.saturating_sub(self.len())
         }
@@ -1088,6 +1091,54 @@ impl Vfs {
         data.sync(false)?;
         self.import_data(path, data, executable)?;
         Ok(total)
+    }
+    /// Explicit host import replacement. Stage a complete inode before one
+    /// namespace rename; cancellation/short reads never truncate the old file.
+    pub fn import_reader_replace(&mut self, path: &[u8], reader: &mut impl Read) -> Result<u64> {
+        match self.import_plan(path) {
+            Ok(_) => return self.import_reader(path, reader, false),
+            Err(Errno(17)) => {}
+            Err(error) => return Err(error),
+        }
+        let old = self.node(path)?;
+        if !matches!(old.borrow().content, Content::File(_)) {
+            return Err(Errno(21));
+        }
+        let parent = &path[..path.iter().rposition(|b| *b == b'/').ok_or(Errno(22))?];
+        let mut temporary = parent.to_vec();
+        for attempt in 0..32 {
+            temporary.truncate(parent.len());
+            temporary.extend(
+                format!(
+                    "/.trames-import-{:x}-{attempt}",
+                    self.fs.borrow().next_inode
+                )
+                .as_bytes(),
+            );
+            if self.node(&temporary).is_err() {
+                break;
+            }
+            if attempt == 31 {
+                return Err(Errno(17));
+            }
+        }
+        let count = self.import_reader(&temporary, reader, false)?;
+        let result = (|| {
+            let staged = self.node(&temporary)?;
+            {
+                let mut staged = staged.borrow_mut();
+                let old = old.borrow();
+                staged.mode = old.mode;
+                staged.uid = old.uid;
+                staged.gid = old.gid;
+                staged.xattrs = old.xattrs.clone();
+            }
+            self.rename_at(AT_FDCWD, &temporary, AT_FDCWD, path, 0)
+        })();
+        if result.is_err() {
+            let _ = self.unlink_at(AT_FDCWD, &temporary, false);
+        }
+        result.map(|_| count)
     }
     /// Export through an authorized platform writer; no guest-to-host path mapping.
     pub fn export_writer(&self, path: &[u8], writer: &mut impl Write) -> Result<u64> {

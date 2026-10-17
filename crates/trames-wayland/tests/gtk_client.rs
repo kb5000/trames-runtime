@@ -101,9 +101,22 @@ fn original_gtk3_seat_and_mousepad_open_without_gdk_errors() {
         let mut rendered = false;
         let mut closed = false;
         let mut focused = false;
+        let mut resized_dialog = false;
+        let mut fixed_dialog = false;
         loop {
             let scene = server.snapshot();
             for window in &scene.windows {
+                if window.parent.is_some()
+                    && window.min_size.0 > 0
+                    && window.min_size == window.max_size
+                {
+                    if !resized_dialog {
+                        server.resize(window.id, 800, 600).unwrap();
+                        resized_dialog = true;
+                    } else if (window.width, window.height) == window.max_size {
+                        fixed_dialog = true;
+                    }
+                }
                 if !window.scene.is_empty() {
                     rendered = true;
                     if !focused {
@@ -141,6 +154,7 @@ fn original_gtk3_seat_and_mousepad_open_without_gdk_errors() {
                 );
                 if program == "python3" {
                     assert_eq!(&*clipboard.0.lock().unwrap(), &["guest 剪贴板 ✅"]);
+                    assert!(resized_dialog && fixed_dialog,"Original GTK fixed-size transient dialog must retain its client dimensions");
                 }
                 println!(
                     "{program}: original GTK seat, clipboard and SHM window passed; {}",

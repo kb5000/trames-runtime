@@ -7,6 +7,64 @@ use std::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[test]
+#[ignore = "emits the independent iOS File Provider manifest fixture"]
+fn emit_file_provider_manifest_fixture() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_reader(b"/root/readme.txt", &mut &b"rootfs fixture"[..], false)
+        .unwrap();
+    v.link_at(AT_FDCWD, b"/root/readme.txt", AT_FDCWD, b"/alias")
+        .unwrap();
+    v.symlink_at(b"/root/readme.txt", AT_FDCWD, b"/link")
+        .unwrap();
+    v.set_xattr(
+        AT_FDCWD,
+        Some(b"/alias"),
+        true,
+        b"user.test",
+        Some(b"metadata"),
+        0,
+    )
+    .unwrap();
+    v.sync().unwrap();
+    drop(v);
+    let path = std::env::var("TRAMES_PROVIDER_FIXTURE").expect("TRAMES_PROVIDER_FIXTURE");
+    let bytes = fs::read(dir.0.join("manifest")).unwrap();
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    fs::write(path, hex + "\n").unwrap();
+    // The fixture is produced and reopened by the production Rust format.
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/alias", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 32, 0).unwrap(), b"rootfs fixture");
+}
+#[test]
+fn repeated_host_import_is_atomic_preserves_open_inode_and_survives_cancel() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_reader(b"/upload", &mut &b"original"[..], true)
+        .unwrap();
+    let old = v.open_at(AT_FDCWD, b"/upload", 0, 0).unwrap();
+    struct Cancel;
+    impl std::io::Read for Cancel {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
+    }
+    assert_eq!(
+        v.import_reader_replace(b"/upload", &mut Cancel),
+        Err(Errno(4))
+    );
+    assert_eq!(v.executable(b"/upload").unwrap(), b"original");
+    v.import_reader_replace(b"/upload", &mut &b"replacement"[..])
+        .unwrap();
+    assert_eq!(v.executable(b"/upload").unwrap(), b"replacement");
+    assert_eq!(v.read(old, 32).unwrap(), b"original");
+    v.close(old).unwrap();
+    drop(v);
+    let reopened = dir.open();
+    assert_eq!(reopened.executable(b"/upload").unwrap(), b"replacement");
+}
+#[test]
 fn inode_attributes_persist_share_hardlinks_and_rollback_failed_commits() {
     let dir = Temp::new();
     let mut v = dir.open();

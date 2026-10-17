@@ -195,6 +195,7 @@ mod tests {
         let budget = trames_shared::SharedBudget::new(65536);
         let file = trames_shared::SharedFile::anonymous_in(budget.clone()).unwrap();
         file.set_len(65536).unwrap();
+        file.reserve_range(0, 65536).unwrap();
         let (fd, lease) = file.export().unwrap();
         drop(file);
         drop(fd);

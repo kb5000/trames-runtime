@@ -2,7 +2,7 @@
 //! Host-owned shared storage. Mappings retain physical storage while logical
 //! truncate/EOF remains a guest file property. No host pathname reaches guests.
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{File, OpenOptions},
     io,
     os::{
@@ -19,6 +19,8 @@ use std::{
 mod pipe;
 pub use pipe::NativePipe;
 pub const MAX_SHARED_BYTES: usize = 128 * 1024 * 1024;
+/// Sparse logical address space is distinct from the retained working-set quota.
+pub const MAX_SHARED_LENGTH: usize = 2 * 1024 * 1024 * 1024;
 const MAP_BLOCK: usize = 65536;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 type Key = (u64, u64);
@@ -108,6 +110,8 @@ struct Inner {
     key: Key,
     logical: AtomicUsize,
     capacity: AtomicUsize,
+    charged: Mutex<BTreeSet<usize>>,
+    allocated: AtomicUsize,
     owned: bool,
     budget: SharedBudget,
     resize: Mutex<()>,
@@ -115,7 +119,7 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.budget.release(*self.capacity.get_mut());
+        self.budget.release(*self.allocated.get_mut());
     }
 }
 /// Cloneable inode capability, not a guest descriptor or a borrowed byte slice.
@@ -160,7 +164,7 @@ impl SharedFile {
     }
     fn register(file: File, owned: bool, budget: SharedBudget) -> io::Result<Self> {
         let stat = file.metadata()?;
-        if !stat.is_file() || stat.len() > MAX_SHARED_BYTES as u64 {
+        if !stat.is_file() || stat.len() > MAX_SHARED_LENGTH as u64 {
             return Err(invalid());
         }
         let key = (stat.dev(), stat.ino());
@@ -182,12 +186,13 @@ impl SharedFile {
         registry.retain(|_, entry| entry.owner.strong_count() != 0);
         let size = stat.len() as usize;
         let capacity = round(size, host_page())?;
-        budget.reserve(capacity)?;
         let owner = Arc::new(Inner {
             file,
             key,
             logical: AtomicUsize::new(size),
             capacity: AtomicUsize::new(capacity),
+            charged: Mutex::default(),
+            allocated: AtomicUsize::new(0),
             owned,
             budget,
             resize: Mutex::default(),
@@ -240,35 +245,98 @@ impl SharedFile {
     pub fn capacity(&self) -> usize {
         self.0.capacity.load(Ordering::Acquire)
     }
+    pub fn allocated(&self) -> usize {
+        self.0.allocated.load(Ordering::Acquire)
+    }
+    /// Charge only ranges that are mapped, written or explicitly allocated.
+    /// Merely extending a sparse memfd does not instantiate its holes.
+    pub fn reserve_range(&self, offset: usize, length: usize) -> io::Result<()> {
+        let end = offset
+            .checked_add(length)
+            .filter(|n| *n <= MAX_SHARED_LENGTH)
+            .ok_or_else(invalid)?;
+        if length == 0 {
+            return Ok(());
+        }
+        let page = host_page();
+        let range = offset / page..round(end, page)? / page;
+        let mut charged = self.0.charged.lock().map_err(lock_error)?;
+        let extra = range.clone().filter(|p| !charged.contains(p)).count() * page;
+        self.0.budget.reserve(extra)?;
+        charged.extend(range);
+        self.0.allocated.fetch_add(extra, Ordering::Release);
+        Ok(())
+    }
     pub fn set_len(&self, length: usize) -> io::Result<()> {
-        if !self.0.owned || length > MAX_SHARED_BYTES {
+        if !self.0.owned || length > MAX_SHARED_LENGTH {
             return Err(invalid());
         }
         let _resize = self.0.resize.lock().map_err(lock_error)?;
         let old = self.len();
         let needed = round(length, host_page())?;
         if needed > self.capacity() {
-            let extra = needed - self.capacity();
-            self.0.budget.reserve(extra)?;
-            if let Err(error) = self.0.file.set_len(needed as u64) {
-                self.0.budget.release(extra);
-                return Err(error);
-            }
+            self.0.file.set_len(needed as u64)?;
             self.0.capacity.store(needed, Ordering::Release);
         }
         if length < old {
             // Never remove physical pages from under native/GPU leases. Zero
             // truncated bytes now, so a later grow cannot resurrect old data.
-            let zeros = [0; 16384];
-            let mut at = length;
-            while at < old {
-                let count = (old - at).min(zeros.len());
-                self.0.file.write_all_at(&zeros[..count], at as u64)?;
-                at += count;
-            }
+            self.clear_range(length, old - length)?;
         }
         self.0.logical.store(length, Ordering::Release);
         Ok(())
+    }
+    fn clear_range(&self, offset: usize, length: usize) -> io::Result<()> {
+        fn zeros(file: &File, mut start: usize, end: usize) -> io::Result<()> {
+            let zeros = [0; 16384];
+            while start < end {
+                let count = (end - start).min(zeros.len());
+                file.write_all_at(&zeros[..count], start as u64)?;
+                start += count;
+            }
+            Ok(())
+        }
+        let end = offset.checked_add(length).ok_or_else(invalid)?;
+        let first = round(offset, host_page())?.min(end);
+        let last = (end & !(host_page() - 1)).max(first);
+        zeros(&self.0.file, offset, first)?;
+        if last > first {
+            #[cfg(target_os = "linux")]
+            // SAFETY: retained regular inode and validated nonnegative range.
+            let punched = unsafe {
+                libc::fallocate(
+                    self.0.file.as_raw_fd(),
+                    3,
+                    first as libc::off_t,
+                    (last - first) as libc::off_t,
+                )
+            } == 0;
+            #[cfg(target_vendor = "apple")]
+            let punched = {
+                #[repr(C)]
+                struct Punch {
+                    flags: u32,
+                    reserved: u32,
+                    offset: i64,
+                    length: i64,
+                }
+                let mut punch = Punch {
+                    flags: 0,
+                    reserved: 0,
+                    offset: first as i64,
+                    length: (last - first) as i64,
+                };
+                // SAFETY: Darwin F_PUNCHHOLE (99), a live regular FD, public
+                // fpunchhole layout, and host-page-aligned retained extent.
+                (unsafe { libc::fcntl(self.0.file.as_raw_fd(), 99, &mut punch) }) == 0
+            };
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+            let punched = false;
+            if !punched {
+                zeros(&self.0.file, first, last)?;
+            }
+        }
+        zeros(&self.0.file, last, end)
     }
     pub fn read_at(&self, offset: u64, count: usize) -> io::Result<Vec<u8>> {
         let size = self
@@ -282,10 +350,11 @@ impl SharedFile {
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         let offset = usize::try_from(offset).map_err(|_| invalid())?;
         let end = offset.checked_add(bytes.len()).ok_or_else(invalid)?;
-        if end > self.len() {
-            self.set_len(end)?;
-        }
         if !bytes.is_empty() {
+            self.reserve_range(offset, bytes.len())?;
+            if end > self.len() {
+                self.set_len(end)?;
+            }
             self.0.file.write_all_at(bytes, offset as u64)?;
         }
         Ok(bytes.len())
@@ -297,6 +366,7 @@ impl SharedFile {
         if length == 0 || end > self.capacity() {
             return Err(invalid());
         }
+        self.reserve_range(offset, length)?;
         let start = offset & !(MAP_BLOCK - 1);
         let mapped_len = round(end - start, MAP_BLOCK)?.min(self.capacity() - start);
         let mut mappings = self.0.mappings.lock().map_err(lock_error)?;
@@ -479,7 +549,7 @@ mod tests {
     fn ranges_and_physical_budget_are_bounded() {
         let file = SharedFile::anonymous().unwrap();
         assert!(file.map(0, 1).is_err());
-        assert!(file.set_len(MAX_SHARED_BYTES + 1).is_err());
+        assert!(file.set_len(MAX_SHARED_LENGTH + 1).is_err());
         file.set_len(4096).unwrap();
         assert!(file.map(usize::MAX, 2).is_err());
         assert!(file.write_at(u64::MAX, b"x").is_err());
