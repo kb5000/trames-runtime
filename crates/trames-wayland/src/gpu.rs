@@ -14,6 +14,11 @@ pub unsafe trait GpuImage: Send + Sync {
     fn dimensions(&self) -> (u32, u32);
     fn metal_texture(&self) -> usize;
     fn ready(&self) -> io::Result<bool>;
+    /// Mailbox replaces queued frames; producer/UI leases still retain their
+    /// resources until native writes/reads complete. FIFO remains the default.
+    fn mailbox(&self) -> bool {
+        false
+    }
 }
 impl State {
     pub(crate) fn enqueue_gpu(&mut self, id: u64, image: Arc<dyn GpuImage>) {
@@ -22,8 +27,11 @@ impl State {
             return;
         }
         if let Some(s) = self.surfaces.get_mut(&id) {
-            // Per-surface FIFO, bounded across old/new producer pools. An
-            // occluded/minimized surface pauses consumption until shown again.
+            // Cancellation drops only the queue lease, never a producer/UI
+            // lease. Retain FIFO entries from a preceding swapchain generation.
+            if image.mailbox() {
+                s.gpu_pending.retain(|old| !old.mailbox());
+            }
             if s.gpu_pending.len() < 64 {
                 s.gpu_pending.push_back(image);
             }
@@ -34,12 +42,15 @@ impl State {
             if s.xdg.is_some() && !s.acknowledged {
                 continue;
             }
-            if matches!(s.current, Some(crate::scene::ImageBuffer::Gpu(_))) && !s.gpu_presented {
-                continue;
-            }
             let Some(image) = s.gpu_pending.front() else {
                 continue;
             };
+            if matches!(s.current, Some(crate::scene::ImageBuffer::Gpu(_)))
+                && !s.gpu_presented
+                && !image.mailbox()
+            {
+                continue;
+            }
             match image.ready() {
                 Ok(false) => continue,
                 Err(_) => {

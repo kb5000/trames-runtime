@@ -128,6 +128,7 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
     };
     struct Image {
         width: u32,
+        mailbox: bool,
         ready: Arc<AtomicBool>,
         dropped: Arc<AtomicBool>,
     }
@@ -147,6 +148,9 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
         }
         fn ready(&self) -> io::Result<bool> {
             Ok(self.ready.load(Ordering::Acquire))
+        }
+        fn mailbox(&self) -> bool {
+            self.mailbox
         }
     }
     let budget = trames_wayland::GpuBudget::default();
@@ -204,6 +208,7 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
             id,
             Arc::new(Image {
                 width: 111,
+                mailbox: false,
                 ready: ready.clone(),
                 dropped: dropped1.clone(),
             }),
@@ -214,6 +219,7 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
             id,
             Arc::new(Image {
                 width: 222,
+                mailbox: false,
                 ready: Arc::new(AtomicBool::new(true)),
                 dropped: dropped2.clone(),
             }),
@@ -241,6 +247,59 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
         assert!(start.elapsed() < Duration::from_secs(5));
         thread::yield_now();
     }
+    // A canceled mailbox frame retains its independent producer lease. A new
+    // ready mailbox frame may replace the current frame before UI presentation,
+    // while already acquired UI leases still keep the old image alive.
+    let canceled_drop = Arc::new(AtomicBool::new(false));
+    let producer: Arc<dyn trames_wayland::GpuImage> = Arc::new(Image {
+        width: 333,
+        mailbox: true,
+        ready: Arc::new(AtomicBool::new(false)),
+        dropped: canceled_drop.clone(),
+    });
+    server.present_gpu(id, producer.clone()).unwrap();
+    let mailbox_drop = Arc::new(AtomicBool::new(false));
+    server
+        .present_gpu(
+            id,
+            Arc::new(Image {
+                width: 444,
+                mailbox: true,
+                ready: Arc::new(AtomicBool::new(true)),
+                dropped: mailbox_drop.clone(),
+            }),
+        )
+        .unwrap();
+    let mailbox_ui = wait(&server, |s| {
+        s.windows[0].scene[0].buffer.dimensions() == (444, 64)
+    });
+    assert!(!canceled_drop.load(Ordering::Acquire));
+    drop(producer);
+    assert!(canceled_drop.load(Ordering::Acquire));
+    let newest_ready = Arc::new(AtomicBool::new(false));
+    server
+        .present_gpu(
+            id,
+            Arc::new(Image {
+                width: 555,
+                mailbox: true,
+                ready: newest_ready.clone(),
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        server.snapshot().windows[0].scene[0].buffer.dimensions(),
+        (444, 64)
+    );
+    newest_ready.store(true, Ordering::Release);
+    let newest = wait(&server, |s| {
+        s.windows[0].scene[0].buffer.dimensions() == (555, 64)
+    });
+    assert!(!mailbox_drop.load(Ordering::Acquire));
+    drop(mailbox_ui);
+    assert!(mailbox_drop.load(Ordering::Acquire));
     server.close(id).unwrap();
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
@@ -255,6 +314,7 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
     );
     drop(last);
     assert!(dropped2.load(Ordering::Acquire));
+    drop(newest);
 }
 
 #[test]
@@ -582,4 +642,60 @@ fn original_c_text_v3_composition_utf8_serial_and_surrounding_ack() {
         !log.contains("v3-delete:"),
         "selected text must not also be deleted as surrounding bytes: {log}"
     );
+}
+
+#[test]
+#[ignore = "build original C client with scripts/test-wayland.sh"]
+fn original_c_v1_widget_switching_has_balanced_exclusive_activation() {
+    use trames_wayland::InputEvent;
+    let server = Server::new().unwrap();
+    let (_, socket) = server.connect(11, 1000, 1000).unwrap();
+    let fd = socket.as_raw_fd();
+    let mut command = Command::new(std::env::var("TRAMES_WAYLAND_TEXT_V1_CLIENT").unwrap());
+    command
+        .env("WAYLAND_SOCKET", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: child-only async-signal-safe CLOEXEC change on a retained FD.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(socket);
+    let began = Instant::now();
+    let mut focused = false;
+    loop {
+        if !focused {
+            if let Some(window) = server.snapshot().windows.first() {
+                server
+                    .input(InputEvent::Focus {
+                        window: Some(window.id),
+                    })
+                    .unwrap();
+                focused = true;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("v1-multiwidget-ok"));
+            break;
+        }
+        if began.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            panic!("v1 activation peer stalled");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(focused);
 }

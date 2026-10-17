@@ -434,30 +434,57 @@ impl Dispatch<t1::ZwpTextInputV1, TextKey> for State {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        if let t1::Request::Activate { surface, .. } = &req {
+            let Some(connection) = state.text.objects.get(&key.0).map(|o| o.connection) else {
+                return;
+            };
+            if surface.client().is_none_or(|c| {
+                c.get_data::<ClientIdentity>()
+                    .is_none_or(|i| i.connection != connection)
+            }) {
+                r.post_error(0u32, "foreign text surface");
+                return;
+            }
+            let id = surface.data::<crate::scene::SurfaceKey>().map(|k| k.0);
+            // One seat has one active v1 text input. Clients such as Weston
+            // keep a separate object for each widget and rely on leave to
+            // deactivate the previous one. Re-activation is idempotent.
+            if state
+                .text
+                .objects
+                .get(&key.0)
+                .is_some_and(|o| o.enabled && o.surface == id)
+            {
+                return;
+            }
+            for o in state.text.objects.values_mut() {
+                if let Protocol::V1(old) = &o.protocol {
+                    if o.entered && old.is_alive() {
+                        old.leave();
+                    }
+                    o.entered = false;
+                }
+                o.enabled = false;
+                o.ready = false;
+                o.pending_enabled = None;
+            }
+            state.text.epoch = state.text.epoch.wrapping_add(1);
+            let o = state.text.objects.get_mut(&key.0).unwrap();
+            o.surface = id;
+            o.enabled = true;
+            o.epoch = state.text.epoch;
+            if id == state.seat.focus {
+                o.entered = true;
+                r.enter(surface);
+                r.modifiers_map(b"Shift\0Control\0Mod1\0Mod4\0".to_vec());
+            }
+            state.changed();
+            return;
+        }
         let Some(o) = state.text.objects.get_mut(&key.0) else {
             return;
         };
         match req {
-            t1::Request::Activate { surface, .. } => {
-                let id = surface.data::<crate::scene::SurfaceKey>().map(|k| k.0);
-                if surface.client().is_none_or(|c| {
-                    c.get_data::<ClientIdentity>()
-                        .is_none_or(|i| i.connection != o.connection)
-                }) {
-                    r.post_error(0u32, "foreign text surface");
-                    return;
-                }
-                o.surface = id;
-                o.enabled = true;
-                o.ready = false;
-                state.text.epoch = state.text.epoch.wrapping_add(1);
-                o.epoch = state.text.epoch;
-                if id == state.seat.focus {
-                    o.entered = true;
-                    r.enter(&surface);
-                    r.modifiers_map(b"Shift\0Control\0Mod1\0Mod4\0".to_vec());
-                }
-            }
             t1::Request::Deactivate { .. } => {
                 if o.entered {
                     r.leave();
@@ -493,7 +520,10 @@ impl Dispatch<t1::ZwpTextInputV1, TextKey> for State {
             }
             t1::Request::ShowInputPanel => r.input_panel_state(1),
             t1::Request::HideInputPanel => r.input_panel_state(0),
-            t1::Request::Reset => {}
+            t1::Request::Reset => {
+                state.text.epoch = state.text.epoch.wrapping_add(1);
+                o.epoch = state.text.epoch;
+            }
             _ => {}
         }
         state.changed();
