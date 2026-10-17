@@ -608,6 +608,7 @@ mod tests {
         state.surfaces.get_mut(&3).unwrap().current = None;
         // wl_surface.attach(NULL) also releases popup focus before destruction.
         state.focus_surface(Some(2));
+        state.seat.popups.push(2);
         state.surfaces.get_mut(&2).unwrap().pending_buffer = Some(None);
         state.commit(2);
         assert_eq!(state.seat.focus, Some(1));

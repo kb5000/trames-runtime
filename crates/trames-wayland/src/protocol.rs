@@ -109,7 +109,9 @@ impl State {
         if !pending.callbacks.is_empty() {
             s.callbacks.push_back((s.revision, pending.callbacks));
         }
-        if self.seat.popups.last() == Some(&id) {
+        if self.seat.popups.last() == Some(&id)
+            && self.surfaces.get(&id).is_some_and(|s| s.current.is_some())
+        {
             self.focus_surface(Some(id));
         }
     }
