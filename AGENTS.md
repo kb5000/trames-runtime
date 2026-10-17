@@ -19,3 +19,9 @@
 
 现有实现和限制见 [区域访存](docs/architecture/region-memory.md) 与
 [原生 allocator](docs/architecture/native-allocator.md)。
+
+## 验证与构建
+
+- 按改动范围验证；代码未变的通过结果直接复用，只重跑受影响项目和失败项。
+- 不因文档、记录或测试等待方式的调整重复触发完整 CPU、Linux、网络和图形验收。
+- 完整检查留到合入或正式发版节点。测试 IPA 可以使用已验证且源码未变的 guest 产物。
