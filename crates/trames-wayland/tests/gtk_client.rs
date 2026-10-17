@@ -9,6 +9,170 @@ use std::{
 use trames_wayland::Server;
 
 #[test]
+#[ignore = "requires original system GTK3"]
+fn host_paste_permission_wait_does_not_repeat_or_lose_focus() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use trames_wayland::InputEvent;
+    const TEXT: &str = "host permission 中文 🧪";
+    #[derive(Clone, Default)]
+    struct Clipboard(Arc<AtomicUsize>);
+    impl trames_wayland::HostClipboard for Clipboard {
+        fn read(&self, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // The native provider must not block the compositor while iPadOS
+            // waits for permission. GTK keeps its normal repeat timer running.
+            thread::spawn(move || {
+                use std::io::Write;
+                thread::sleep(Duration::from_secs(2));
+                let mut file = std::fs::File::from(fd);
+                let _ = file.write_all(TEXT.as_bytes());
+            });
+            Ok(())
+        }
+        fn write(&self, _: trames_shared::NativePipe) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let server = Server::new().unwrap();
+    let clipboard = Clipboard::default();
+    server
+        .attach_clipboard(Arc::new(clipboard.clone()))
+        .unwrap();
+    let (_, socket) = server.connect(401, 1000, 1000).unwrap();
+    let fd = socket.as_raw_fd();
+    let temp = std::env::temp_dir().join(format!("trames-gtk-paste-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let marker = temp.join("text");
+    let _ = std::fs::remove_file(&marker);
+    let mut command = Command::new("python3");
+    command
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/gtk-paste.py"),
+        )
+        .env("WAYLAND_SOCKET", fd.to_string())
+        .env("GDK_BACKEND", "wayland")
+        .env("GTK_IM_MODULE", "wayland")
+        .env("GSETTINGS_BACKEND", "memory")
+        .env("GTK_USE_PORTAL", "0")
+        .env("NO_AT_BRIDGE", "1")
+        .env("GTK_CSD", "0")
+        .env("XDG_RUNTIME_DIR", &temp)
+        .env("XDG_CACHE_HOME", &temp)
+        .env("XDG_CONFIG_HOME", &temp)
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .env("TRAMES_GTK_PASTE_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: child-only fcntl on the live inherited Wayland socket.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(socket);
+    let began = Instant::now();
+    let mut focused = false;
+    let mut sent: Option<Instant> = None;
+    let mut second = false;
+    let mut epoch = None;
+    let failure = loop {
+        let scene = server.snapshot();
+        for window in &scene.windows {
+            server
+                .presented(
+                    window.id,
+                    scene.revision,
+                    began.elapsed().as_millis() as u32,
+                )
+                .unwrap();
+            if !focused && !window.scene.is_empty() {
+                server
+                    .input(InputEvent::Focus {
+                        window: Some(window.id),
+                    })
+                    .unwrap();
+                focused = true;
+            }
+        }
+        if focused && sent.is_none() && scene.text.is_some() {
+            epoch = scene.text.as_ref().map(|t| t.epoch);
+            // No physical key-up reaches Trames while the OS alert owns input.
+            server
+                .input(InputEvent::Key {
+                    key: 47,
+                    pressed: true,
+                    modifiers: 4,
+                    time: 1,
+                })
+                .unwrap();
+            sent = Some(Instant::now());
+        }
+        let elapsed = sent.map(|t| t.elapsed()).unwrap_or_default();
+        if sent.is_some() && elapsed > Duration::from_millis(2800) && !second {
+            let text = std::fs::read_to_string(&marker).unwrap_or_default();
+            if clipboard.0.load(Ordering::SeqCst) != 1 || text != TEXT {
+                break Some(format!(
+                    "one paste became {} host reads and text {text:?}",
+                    clipboard.0.load(Ordering::SeqCst)
+                ));
+            }
+            if scene.text.as_ref().map(|t| t.epoch) != epoch {
+                break Some("Permission wait changed the text-input focus/epoch".into());
+            }
+            // A late UIKit key-up, then a deliberate second paste, must work.
+            // A fresh offer models copying again in another iPad application;
+            // otherwise GTK legitimately serves its cached clipboard text.
+            server.clipboard_changed().unwrap();
+            for pressed in [false, true, false] {
+                server
+                    .input(InputEvent::Key {
+                        key: 47,
+                        pressed,
+                        modifiers: if pressed { 4 } else { 0 },
+                        time: 3000,
+                    })
+                    .unwrap();
+            }
+            second = true;
+        }
+        if second && elapsed > Duration::from_millis(5300) {
+            let text = std::fs::read_to_string(&marker).unwrap_or_default();
+            if clipboard.0.load(Ordering::SeqCst) == 2 && text == TEXT.repeat(2) {
+                break None;
+            }
+            break Some(format!(
+                "second paste failed: reads={}, text={text:?}",
+                clipboard.0.load(Ordering::SeqCst)
+            ));
+        }
+        if child.try_wait().unwrap().is_some() || began.elapsed() > Duration::from_secs(15) {
+            break Some(format!(
+                "GTK paste timed out: focused={focused}, sent={sent:?}, second={second}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(temp);
+    assert!(
+        failure.is_none(),
+        "{failure:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CRITICAL"));
+}
+
+#[test]
 #[ignore = "requires original system GTK3 and mousepad"]
 fn original_gtk3_seat_and_mousepad_open_without_gdk_errors() {
     #[derive(Clone)]

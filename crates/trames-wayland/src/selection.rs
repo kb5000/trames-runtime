@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Guest-only clipboard offers. FDs pass directly between Wayland clients;
-//! this never reads or writes the host OS clipboard.
+//! Clipboard offers. Guest FDs pass directly between Wayland clients; the
+//! optional native provider handles host text without blocking this thread.
 use super::*;
 use std::{os::fd::AsFd, sync::Mutex};
 use wayland_server::protocol::{
@@ -271,6 +271,13 @@ impl Dispatch<offer::WlDataOffer, OfferData> for State {
                         source.send(mime_type, fd.as_fd());
                     }
                 } else if TEXT_MIMES.contains(&mime_type.as_str()) {
+                    // GTK repeats held Ctrl+V while UIKit waits for paste
+                    // permission, then applies every queued action to the same
+                    // reply. Cancel keys before the asynchronous handoff, while
+                    // retaining the offer, popup and text-input focus.
+                    if state.selection.host.is_some() {
+                        state.cancel_held_keys();
+                    }
                     if let Some(host) = &state.selection.host {
                         let _ = host.read(fd);
                     }

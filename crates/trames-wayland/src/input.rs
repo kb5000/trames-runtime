@@ -61,6 +61,21 @@ pub(crate) fn globals(handle: &DisplayHandle) {
     handle.create_global::<State, wl_seat::WlSeat, _>(7, ());
 }
 impl State {
+    /// Native clipboard reads can wait on an OS permission dialog which owns
+    /// physical key-up delivery. End the gesture before handing off to UIKit;
+    /// keep selection/text focus so the pending transfer still belongs here.
+    pub(crate) fn cancel_held_keys(&mut self) {
+        let keys = self.seat.pressed.iter().copied().collect::<Vec<_>>();
+        let modifiers = self.seat.modifiers & 2; // Preserve Caps Lock.
+        for key in keys {
+            self.input(InputEvent::Key {
+                key,
+                pressed: false,
+                modifiers,
+                time: 0,
+            });
+        }
+    }
     /// A menu can unmap before its activation sends set_selection. Restore the
     /// nearest mapped parent while the old resource still exists, so keyboard,
     /// text-input and data-device focus leave the popup together.
@@ -548,6 +563,40 @@ mod tests {
     use crate::scene::{BufferData, BufferLease, ImageBuffer, ShmBuffer, Surface, SurfaceKey};
     use std::sync::{Arc, Mutex, Weak};
     use wayland_server::protocol::{wl_buffer, wl_surface};
+
+    #[test]
+    fn clipboard_permission_cancels_held_keys_without_repeating_releases() {
+        let mut state = State::default();
+        for key in [29, 47] {
+            state.input(InputEvent::Key {
+                key,
+                pressed: true,
+                modifiers: 6,
+                time: 1,
+            });
+        }
+        assert_eq!(state.seat.pressed.len(), 2);
+        state.cancel_held_keys();
+        assert!(state.seat.pressed.is_empty());
+        assert_eq!(state.seat.modifiers, 2);
+        let serial = state.serial;
+        state.cancel_held_keys();
+        assert_eq!(state.serial, serial);
+        // A delayed physical release and a fresh gesture are still valid.
+        state.input(InputEvent::Key {
+            key: 47,
+            pressed: false,
+            modifiers: 2,
+            time: 2,
+        });
+        state.input(InputEvent::Key {
+            key: 47,
+            pressed: true,
+            modifiers: 6,
+            time: 3,
+        });
+        assert!(state.seat.pressed.contains(&47));
+    }
 
     #[test]
     fn nested_popup_unmap_restores_mapped_ancestors_without_stealing_other_focus() {
