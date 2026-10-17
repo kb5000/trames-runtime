@@ -249,6 +249,8 @@ mod tests {
 pub struct ProcessInfo {
     pub pid: u32,
     pub processor: u32,
+    pub nice: i32,
+    pub scheduler: u32,
     pub affinity: u64,
     pub tgid: u32,
     pub parent: u32,
@@ -1214,7 +1216,9 @@ impl Vfs {
                             };
                             fields[5] = p.group.to_string();
                             fields[11] = p.user_ticks.to_string();
-                            fields[15] = "20".into();
+                            fields[15] = (20 + p.nice).to_string();
+                            fields[16] = p.nice.to_string();
+                            fields[38] = p.scheduler.to_string();
                             fields[17] = r
                                 .processes
                                 .iter()

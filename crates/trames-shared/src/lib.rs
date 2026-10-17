@@ -16,6 +16,8 @@ use std::{
     },
 };
 
+mod pipe;
+pub use pipe::NativePipe;
 pub const MAX_SHARED_BYTES: usize = 128 * 1024 * 1024;
 const MAP_BLOCK: usize = 65536;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);

@@ -100,6 +100,7 @@ impl State {
             }
         }
         self.text_focus_enter();
+        self.selection_focus_changed();
         self.changed();
     }
     pub(crate) fn input(&mut self, event: InputEvent) {

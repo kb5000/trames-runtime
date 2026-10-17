@@ -584,6 +584,7 @@ dependencies = [
  "trames-core",
  "trames-distro",
  "trames-linux",
+ "trames-shared",
  "trames-vfs",
  "trames-wayland",
 ]

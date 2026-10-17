@@ -20,6 +20,7 @@ impl State {
         handle.create_global::<Self, wl_output::WlOutput, _>(3, ());
         crate::shell::globals(handle);
         crate::input::globals(handle);
+        crate::selection::globals(handle);
         crate::text::globals(handle);
         crate::subsurface::globals(handle);
     }

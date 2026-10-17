@@ -2,7 +2,10 @@
 //! Bounded coordinator-owned adapters between guest AF_UNIX and native services.
 //! Native threads receive only bytes, owned host FDs and host resource leases.
 use super::*;
-use std::{io, os::fd::OwnedFd};
+use std::{
+    io::{self, Read, Write},
+    os::fd::OwnedFd,
+};
 use trames_shared::{NativeSocket, SharedFile, MAX_BYTES_OUT, MAX_FDS_OUT};
 use trames_wayland::Server;
 
@@ -26,6 +29,52 @@ struct Connection {
     outgoing: Option<Outgoing>,
     incoming: Option<Incoming>,
     exports: Vec<trames_shared::ExportLease>,
+    relays: Vec<PipeRelay>,
+}
+// Coordinator-owned pipe ends; native threads never see guest Rc/RefCell state.
+struct PipeRelay {
+    host: trames_shared::NativePipe,
+    guest: Rc<PipeEnd>,
+    to_native: bool,
+}
+impl PipeRelay {
+    fn pump(&mut self) -> bool {
+        let mut pipe = self.guest.pipe.borrow_mut();
+        if self.to_native {
+            if pipe.bytes.is_empty() {
+                return pipe.writers != 0;
+            }
+            let bytes = pipe.bytes.iter().take(16384).copied().collect::<Vec<_>>();
+            match self.host.write(&bytes) {
+                Ok(n) => {
+                    pipe.bytes.drain(..n);
+                    pipe.io_epoch[1] = pipe.io_epoch[1].wrapping_add(1);
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                _ => false,
+            }
+        } else {
+            if pipe.readers == 0 {
+                return false;
+            }
+            let room = (PIPE_CAPACITY - pipe.bytes.len()).min(16384);
+            if room == 0 {
+                return true;
+            }
+            let mut bytes = vec![0; room];
+            match self.host.read(&mut bytes) {
+                Ok(0) => false,
+                Ok(n) => {
+                    pipe.bytes.extend(&bytes[..n]);
+                    pipe.io_epoch[0] = pipe.io_epoch[0].wrapping_add(1);
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                _ => false,
+            }
+        }
+    }
 }
 pub(crate) struct Services {
     server: Server,
@@ -37,6 +86,33 @@ fn io_errno(e: io::Error) -> Errno {
         io::ErrorKind::WouldBlock => Errno(11),
         io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => Errno(32),
         _ => storage::host_errno(e),
+    }
+}
+impl OpenDescription {
+    fn pipe_description(id: u64, owner: (u32, u32), pipe: Rc<RefCell<Pipe>>, write: bool) -> Self {
+        Self {
+            id,
+            owner,
+            kind: if write {
+                FdKind::PipeWrite
+            } else {
+                FdKind::PipeRead
+            },
+            flags: if write { 1 } else { 0 },
+            position: 0,
+            pipe: Some(PipeEnd::new(pipe, !write, write, false)),
+            node: None,
+            socket: None,
+            bridge: None,
+            kernel_log: None,
+            anonymous: None,
+            notification: None,
+            local: None,
+            pty: None,
+            namespace: None,
+            oom: None,
+            mount: None,
+        }
     }
 }
 impl Services {
@@ -63,6 +139,7 @@ impl Services {
                             outgoing: None,
                             incoming: None,
                             exports: Vec::new(),
+                            relays: Vec::new(),
                         });
                         progress = true;
                     }
@@ -95,6 +172,12 @@ impl Services {
 impl Connection {
     fn pump(&mut self, vfs: &Vfs, server: &Server) -> Result<bool> {
         let mut progress = false;
+        self.relays.retain_mut(|relay| {
+            let before = relay.guest.pipe.borrow().bytes.len();
+            let alive = relay.pump();
+            progress |= !alive || relay.guest.pipe.borrow().bytes.len() != before;
+            alive
+        });
         self.exports.retain(|lease| !lease.claimed());
         for _ in 0..16 {
             if self.outgoing.is_none() {
@@ -113,7 +196,26 @@ impl Connection {
                             .iter()
                             .map(|open| {
                                 let open = open.borrow();
-                                if open.flags & O_PATH != 0 || open.flags & 3 == 1 {
+                                if open.flags & O_PATH != 0 {
+                                    return Err(Errno(9));
+                                }
+                                if let Some(end) = &open.pipe {
+                                    if self.relays.len() >= 64 {
+                                        return Err(Errno(24));
+                                    }
+                                    if !end.write || end.read {
+                                        return Err(Errno(95));
+                                    }
+                                    let (reader, writer) =
+                                        trames_shared::NativePipe::pair().map_err(io_errno)?;
+                                    self.relays.push(PipeRelay {
+                                        host: reader,
+                                        guest: PipeEnd::new(end.pipe.clone(), false, true, false),
+                                        to_native: false,
+                                    });
+                                    return Ok((writer.into_fd(), None));
+                                }
+                                if open.flags & 3 == 1 {
                                     return Err(Errno(9));
                                 }
                                 let node = open.node.as_ref().ok_or(Errno(95))?.borrow();
@@ -123,10 +225,12 @@ impl Connection {
                                 data.shared_file()
                                     .ok_or(Errno(95))?
                                     .export()
+                                    .map(|(fd, lease)| (fd, Some(lease)))
                                     .map_err(io_errno)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        let (fds, leases) = exported.into_iter().unzip();
+                        let (fds, leases): (Vec<_>, Vec<_>) = exported.into_iter().unzip();
+                        let leases = leases.into_iter().flatten().collect();
                         self.outgoing = Some(Outgoing {
                             bytes: packet.data,
                             fds,
@@ -175,10 +279,35 @@ impl Connection {
                     Ok(0) => return Err(Errno(32)),
                     Ok(count) => {
                         bytes.truncate(count);
-                        let rights = fds
-                            .into_iter()
-                            .map(|fd| vfs.native_file_description(fd, self.owner))
-                            .collect::<Result<Vec<_>>>()?;
+                        let mut rights = Vec::new();
+                        for fd in fds {
+                            if trames_shared::NativePipe::is_pipe(&fd).map_err(io_errno)? {
+                                if self.relays.len() >= 64 {
+                                    return Err(Errno(24));
+                                }
+                                let host =
+                                    trames_shared::NativePipe::import(fd).map_err(io_errno)?;
+                                if !host.writable().map_err(io_errno)? {
+                                    return Err(Errno(95));
+                                }
+                                let pipe = Pipe::new(vfs.open_id());
+                                let mut open = OpenDescription::pipe_description(
+                                    vfs.open_id(),
+                                    self.owner,
+                                    pipe.clone(),
+                                    true,
+                                );
+                                open.flags = 1;
+                                rights.push(Rc::new(RefCell::new(open)));
+                                self.relays.push(PipeRelay {
+                                    host,
+                                    guest: PipeEnd::new(pipe, true, false, false),
+                                    to_native: true,
+                                });
+                            } else {
+                                rights.push(vfs.native_file_description(fd, self.owner)?);
+                            }
+                        }
                         self.incoming = Some(Incoming {
                             bytes,
                             rights: LocalRights(rights),
@@ -347,6 +476,60 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_pipe_relays_preserve_bytes_backpressure_and_eof() {
+        let mut vfs = Vfs::default();
+        let [read, write] = vfs.pipe(O_NONBLOCK).unwrap();
+        let end = vfs
+            .descriptor(write)
+            .unwrap()
+            .open
+            .borrow()
+            .pipe
+            .clone()
+            .unwrap();
+        let (reader, mut writer) = trames_shared::NativePipe::pair().unwrap();
+        let mut relay = PipeRelay {
+            host: reader,
+            guest: PipeEnd::new(end.pipe.clone(), false, true, false),
+            to_native: false,
+        };
+        drop(end);
+        vfs.close(write).unwrap();
+        assert_eq!(vfs.read(read, 10), Err(Errno(11)));
+        writer.write_all("host 中文".as_bytes()).unwrap();
+        assert!(relay.pump());
+        assert_eq!(vfs.read(read, 100).unwrap(), "host 中文".as_bytes());
+        assert_eq!(vfs.read(read, 1), Err(Errno(11)));
+        drop(writer);
+        assert!(!relay.pump());
+        drop(relay);
+        assert!(vfs.read(read, 1).unwrap().is_empty());
+        let (mut reader, writer) = trames_shared::NativePipe::pair().unwrap();
+        let pipe = Pipe::new(vfs.open_id());
+        let open = Rc::new(RefCell::new(OpenDescription::pipe_description(
+            vfs.open_id(),
+            (0, 0),
+            pipe.clone(),
+            true,
+        )));
+        let (fds, truncated) = vfs.receive_rights(LocalRights(vec![open]), 1, false);
+        assert!(!truncated);
+        let mut relay = PipeRelay {
+            host: writer,
+            guest: PipeEnd::new(pipe, true, false, false),
+            to_native: true,
+        };
+        vfs.write(fds[0], b"guest text").unwrap();
+        vfs.close(fds[0]).unwrap();
+        assert!(relay.pump());
+        let mut bytes = [0; 32];
+        let n = reader.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[..n], b"guest text");
+        assert!(!relay.pump());
+        drop(relay);
+        assert_eq!(reader.read(&mut bytes).unwrap(), 0);
+    }
     #[test]
     fn guest_unix_stream_reaches_the_native_wayland_server_with_standard_wire_messages() {
         let mut vfs = Vfs::default();

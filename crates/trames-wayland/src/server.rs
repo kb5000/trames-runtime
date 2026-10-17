@@ -40,6 +40,8 @@ enum Command {
     Text(TextEdit),
     Gpu(u64, Arc<dyn GpuImage>),
     Exports(u64, Vec<trames_shared::ExportLease>),
+    HostClipboard(Arc<dyn HostClipboard>),
+    ClipboardChanged,
     Stop,
 }
 struct Control {
@@ -128,6 +130,12 @@ impl Server {
         ))?;
         Ok((connection, guest))
     }
+    pub fn attach_clipboard(&self, host: Arc<dyn HostClipboard>) -> io::Result<()> {
+        self.0.send(Command::HostClipboard(host))
+    }
+    pub fn clipboard_changed(&self) -> io::Result<()> {
+        self.0.send(Command::ClipboardChanged)
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.0
             .snapshot
@@ -191,6 +199,11 @@ fn run(
                 Command::Exports(connection, leases) => {
                     compositor.retain_exports(connection, leases)
                 }
+                Command::HostClipboard(host) => {
+                    compositor.state.selection.host = Some(host);
+                    compositor.state.selection_focus_changed();
+                }
+                Command::ClipboardChanged => compositor.state.host_clipboard_changed(),
                 Command::Stop => stopped = true,
             }
         }

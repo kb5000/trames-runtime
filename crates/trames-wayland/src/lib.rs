@@ -4,6 +4,8 @@ use std::{io, os::unix::net::UnixStream, sync::Arc};
 use wayland_server::{backend::ClientData, Display, Resource};
 mod gpu;
 mod input;
+mod selection;
+pub use selection::HostClipboard;
 mod scene;
 pub use gpu::{GpuBudget, GpuImage, GpuPermit};
 mod text;
@@ -39,6 +41,7 @@ struct State {
     revision: u64,
     viewport: (u32, u32),
     seat: input::Seat,
+    selection: selection::Selection,
     text: text::TextInputs,
     surfaces: std::collections::BTreeMap<u64, scene::Surface>,
 }
@@ -50,6 +53,7 @@ impl Default for State {
             revision: 0,
             viewport: (1024, 768),
             seat: Default::default(),
+            selection: Default::default(),
             text: Default::default(),
             surfaces: Default::default(),
         }
