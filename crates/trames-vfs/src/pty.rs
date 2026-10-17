@@ -16,6 +16,8 @@ pub struct Pty {
     pub packet: Cell<bool>,
     pub packet_status: Cell<u8>,
     pub hangup_notified: Cell<bool>,
+    pub host_resize_pending: Cell<bool>,
+    pub host_signals: Cell<u64>,
 }
 pub struct PtyEnd {
     pub pair: Rc<Pty>,
@@ -52,6 +54,14 @@ impl Drop for PtyEnd {
     }
 }
 impl Pty {
+    pub fn resize_from_host(&self, rows: u16, columns: u16) {
+        let mut tty = self.terminal.borrow_mut();
+        let before = tty.window;
+        tty.resize(rows, columns);
+        if before != tty.window {
+            self.host_resize_pending.set(true);
+        }
+    }
     pub(super) fn private(&self) -> bool {
         self.mount.as_ref().is_some_and(|m| m.devpts.is_some())
     }
@@ -213,6 +223,8 @@ impl Vfs {
             packet: Cell::new(false),
             packet_status: Cell::new(0),
             hangup_notified: Cell::new(false),
+            host_resize_pending: Cell::new(false),
+            host_signals: Cell::new(0),
         });
         self.ptys.borrow_mut().insert(id, Rc::downgrade(&pair));
         Ok(PtyEnd::new(pair, true))
