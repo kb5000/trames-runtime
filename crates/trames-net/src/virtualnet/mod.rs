@@ -494,17 +494,17 @@ impl Inner {
                         })
                         .map(|(&key, _)| key)
                 };
-                if let Some(path) = path {
-                    let ttl = if p[0] >> 4 == 4 { 8 } else { 7 };
-                    if p[ttl] <= path.hops {
+                if let (Some(view), Some(path)) = (&dynamic, path) {
+                    if !view
+                        .graph
+                        .borrow()
+                        .filter_path(view.namespace, path, &mut p)
+                    {
                         self.stats.dropped += 1;
+                        let mut graph = view.graph.borrow_mut();
+                        graph.account(view.namespace, path.output, p.len(), true, true);
+                        graph.account(path.namespace, path.input, p.len(), false, true);
                         continue;
-                    }
-                    if path.hops != 0 {
-                        p[ttl] -= path.hops;
-                        if p[0] >> 4 == 4 {
-                            smoltcp::wire::Ipv4Packet::new_unchecked(&mut p).fill_checksum();
-                        }
                     }
                 }
                 if let Some(key) = target {

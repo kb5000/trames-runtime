@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Guest NETLINK_ROUTE sockets, bounded subscriptions and namespace-owned control.
+//! Guest route/netfilter sockets, bounded subscriptions and namespace-owned control.
 //! The logical host eth0 is a read-only view; dynamic links never configure the host.
 use super::*;
 use std::rc::Weak;
@@ -13,6 +13,7 @@ pub(super) struct Namespace {
     id: u64,
     pub(crate) native: std::cell::OnceCell<native::Network>,
     pub(crate) socket_count: Cell<usize>,
+    pub(crate) nft_packet_hooks: Cell<bool>,
     // Netlink sockets also pin the complete stack, not just link metadata.
     pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
     pub(crate) graph: Rc<RefCell<crate::netdev::Topology>>,
@@ -24,7 +25,7 @@ pub(super) struct Namespace {
     quota: Rc<Cell<usize>>,
     live: Cell<usize>,
     next: Cell<u32>,
-    ports: RefCell<BTreeSet<u32>>,
+    ports: RefCell<BTreeSet<(u32, u32)>>,
 }
 impl Default for Namespace {
     fn default() -> Self {
@@ -35,6 +36,7 @@ impl Default for Namespace {
             id,
             native: std::cell::OnceCell::new(),
             socket_count: Cell::new(0),
+            nft_packet_hooks: Cell::new(true),
             stack: std::cell::OnceCell::new(),
             graph,
             fabric: Rc::default(),
@@ -145,6 +147,7 @@ impl Drop for Namespace {
 pub(super) struct Socket {
     namespace: Rc<Namespace>,
     kind: u32,
+    protocol: u32,
     port: Cell<u32>,
     connected: Cell<bool>,
     groups: Cell<u32>,
@@ -220,7 +223,10 @@ fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u3
     listeners.retain(|s| s.strong_count() != 0);
     for (ns, kind, group, data) in changes {
         for listener in listeners.iter().filter_map(Weak::upgrade) {
-            if listener.namespace.id() != ns || listener.groups.get() & group == 0 {
+            if listener.protocol != 0
+                || listener.namespace.id() != ns
+                || listener.groups.get() & group == 0
+            {
                 continue;
             }
             let p = message(kind, 0, 0, 0, &data);
@@ -235,7 +241,7 @@ impl Socket {
         kind: u32,
         protocol: u32,
     ) -> Result<Rc<Self>> {
-        if protocol != 0 {
+        if !matches!(protocol, 0 | 12) {
             return Err(NetError(93));
         }
         if !matches!(kind, 2 | 3) {
@@ -245,6 +251,7 @@ impl Socket {
         let s = Rc::new(Self {
             namespace: namespace.clone(),
             kind,
+            protocol,
             port: Cell::new(0),
             connected: Cell::new(false),
             groups: Cell::new(0),
@@ -262,18 +269,33 @@ impl Socket {
         namespace.listeners.borrow_mut().push(Rc::downgrade(&s));
         Ok(s)
     }
+    fn supported_groups(&self) -> u32 {
+        if self.protocol == 0 {
+            1 | 0x10 | 0x40 | 0x100 | 0x400
+        } else {
+            0
+        }
+    }
     fn autobind(&self) -> Result<()> {
         if self.port.get() != 0 {
             return Ok(());
         }
         let mut next = self.namespace.next.get().max(1);
-        while self.namespace.ports.borrow().contains(&next) {
+        while self
+            .namespace
+            .ports
+            .borrow()
+            .contains(&(self.protocol, next))
+        {
             next = next.checked_add(1).ok_or(NetError(98))?;
         }
         self.namespace
             .next
             .set(next.checked_add(1).ok_or(NetError(98))?);
-        self.namespace.ports.borrow_mut().insert(next);
+        self.namespace
+            .ports
+            .borrow_mut()
+            .insert((self.protocol, next));
         self.port.set(next);
         Ok(())
     }
@@ -282,14 +304,19 @@ impl Socket {
         if self.port.get() != 0 {
             return Err(NetError(22));
         }
-        if groups & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
+        if groups & !self.supported_groups() != 0 {
             return Err(NetError(95));
         }
         self.groups.set(groups);
         if port == 0 {
             return self.autobind();
         }
-        if !self.namespace.ports.borrow_mut().insert(port) {
+        if !self
+            .namespace
+            .ports
+            .borrow_mut()
+            .insert((self.protocol, port))
+        {
             return Err(NetError(98));
         }
         self.port.set(port);
@@ -347,7 +374,7 @@ impl Socket {
         let mut group = 0;
         if let Some(destination) = destination {
             let (port, groups) = decode(destination)?;
-            if port != 0 || groups & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
+            if port != 0 || groups & !self.supported_groups() != 0 {
                 return Err(NetError(95));
             }
             if groups != 0 {
@@ -383,6 +410,29 @@ impl Socket {
         }
         if requests.is_empty() {
             return Err(NetError(22));
+        }
+        if self.protocol == 12 {
+            self.autobind()?;
+            // Admission and commit are one coordinator operation. Never commit
+            // a batch whose replies cannot fit, even when the reader stalls.
+            let mut queue = self.replies.borrow_mut();
+            let available = MAX_BUFFER - queue.iter().map(|p| p.data.len()).sum::<usize>();
+            let generated = crate::nftables::request(
+                &self.namespace,
+                &requests,
+                self.port.get(),
+                net_admin,
+                128 - queue.len(),
+                available,
+            )?;
+            if !generated.is_empty() {
+                self.read_epoch.set(self.read_epoch.get().wrapping_add(1));
+            }
+            queue.extend(generated.into_iter().map(|data| Datagram {
+                data,
+                source: source(0, 0),
+            }));
+            return Ok(bytes.len());
         }
         self.namespace.refresh_native();
         if net_admin
@@ -531,7 +581,7 @@ impl Socket {
             (1, 7 | 8) if value > 0 => self.buffers.set(value.clamp(4096, MAX_BUFFER as i32)),
             (270, 1 | 2) if (1..=32).contains(&value) => {
                 let group = 1u32 << (value - 1);
-                if group & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
+                if group & !self.supported_groups() != 0 {
                     return Err(NetError(95));
                 }
                 self.groups.set(if name == 1 {
@@ -551,8 +601,8 @@ impl Socket {
             (1, 3) => Ok(self.kind as i32),
             (1, 4) => Ok(if self.overrun.replace(false) { 105 } else { 0 }),
             (1, 7 | 8) => Ok(self.buffers.get()),
-            (1, 39) => Ok(0),
-            (1, 38) => Ok(0),
+            (1, 39) => Ok(16),
+            (1, 38) => Ok(self.protocol as i32),
             (270, 11) => Ok(i32::from(self.ext_ack.get())),
             (270, 12) => Ok(i32::from(self.strict.get())),
             _ => Err(NetError(92)),
@@ -562,7 +612,10 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         self.namespace.live.set(self.namespace.live.get() - 1);
-        self.namespace.ports.borrow_mut().remove(&self.port.get());
+        self.namespace
+            .ports
+            .borrow_mut()
+            .remove(&(self.protocol, self.port.get()));
     }
 }
 

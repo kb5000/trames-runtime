@@ -53,6 +53,7 @@ struct Space {
     routes: Vec<Route>,
     direct: bool,
     forwarding: [bool; 2],
+    firewall: Rc<RefCell<crate::nftables::Ruleset>>,
 }
 #[derive(Clone, Default)]
 pub(crate) struct Topology {
@@ -72,7 +73,7 @@ pub(crate) struct PacketPath {
     pub namespace: u64,
     pub output: u32,
     pub input: u32,
-    pub hops: u8,
+    pub transit: [Option<(u64, u32, u32)>; 16],
 }
 impl Address {
     pub fn contains(self, ip: IpAddr) -> bool {
@@ -143,6 +144,7 @@ impl Topology {
                 routes: vec![],
                 direct: false,
                 forwarding: [false; 2],
+                firewall: Rc::default(),
             },
         );
         self.devices.insert(
@@ -693,18 +695,23 @@ impl Topology {
         let (_, first, _) = self.source(id, destination).ok()?;
         let mut current = id;
         let mut hops = 0;
+        let mut transit = [None; 16];
+        let mut incoming = 0;
         let mut visited = BTreeSet::new();
         loop {
             if !visited.insert(current) || hops >= 16 {
                 return None;
             }
             let (_, out, gateway) = self.source(current, destination).ok()?;
+            if current != id {
+                transit[(hops - 1) as usize] = Some((current, incoming, out));
+            }
             if self.own(current, destination) {
                 return Some(PacketPath {
                     namespace: current,
                     output: first,
                     input: out,
-                    hops,
+                    transit,
                 });
             }
             let next = gateway.unwrap_or(destination);
@@ -714,15 +721,58 @@ impl Topology {
                     namespace: ns,
                     output: first,
                     input,
-                    hops,
+                    transit,
                 });
             }
             if !self.forwarding(ns, destination.is_ipv6()) {
                 return None;
             }
             current = ns;
+            incoming = input;
             hops += 1;
         }
+    }
+    pub fn firewall(&self, id: u64) -> Rc<RefCell<crate::nftables::Ruleset>> {
+        self.spaces[&id].firewall.clone()
+    }
+    pub fn filter_path(&self, source: u64, path: PacketPath, packet: &mut [u8]) -> bool {
+        use crate::nftables::Context;
+        let check = |ns: u64, hook, input, output, packet: &[u8]| {
+            let rules = self.spaces[&ns].firewall.borrow();
+            if !rules.active(hook) {
+                return true;
+            }
+            let name = |index| self.device(ns, index).map(|d| d.name).unwrap_or_default();
+            rules.allows(&Context {
+                packet,
+                hook,
+                input,
+                output,
+                input_name: &name(input),
+                output_name: &name(output),
+            })
+        };
+        if !check(source, 3, 0, path.output, packet) || !check(source, 4, 0, path.output, packet) {
+            return false;
+        }
+        for (ns, input, output) in path.transit.into_iter().flatten() {
+            if !check(ns, 0, input, 0, packet) {
+                return false;
+            }
+            let ttl = if packet[0] >> 4 == 4 { 8 } else { 7 };
+            if packet[ttl] <= 1 {
+                return false;
+            }
+            packet[ttl] -= 1;
+            if packet[0] >> 4 == 4 {
+                smoltcp::wire::Ipv4Packet::new_unchecked(&mut *packet).fill_checksum();
+            }
+            if !check(ns, 2, input, output, packet) || !check(ns, 4, 0, output, packet) {
+                return false;
+            }
+        }
+        check(path.namespace, 0, path.input, 0, packet)
+            && check(path.namespace, 1, path.input, 0, packet)
     }
     fn neighbor(&self, id: u64, out: u32, address: IpAddr) -> Option<(u64, u32)> {
         let mut todo = vec![(id, out)];

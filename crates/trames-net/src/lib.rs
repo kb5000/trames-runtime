@@ -7,6 +7,7 @@ mod interfaces;
 mod native;
 mod netdev;
 mod netlink;
+mod nftables;
 mod rtnetlink;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
@@ -130,6 +131,7 @@ impl Network {
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
         let namespace = Rc::new(netlink::Namespace::default());
+        namespace.nft_packet_hooks.set(false);
         namespace
             .graph
             .borrow_mut()
