@@ -78,6 +78,11 @@ impl Network {
             namespace: namespace.id(),
         };
         let stack = fabric.dynamic_environment(mode, view, loopback)?;
+        namespace
+            .stack
+            .set(stack.clone())
+            .ok()
+            .expect("new namespace stack");
         Ok(Self(Backend::Virtual(stack), namespace))
     }
     pub fn devices(&self) -> Vec<Device> {
@@ -116,6 +121,11 @@ impl Network {
             .graph
             .borrow_mut()
             .add_space(namespace.id(), None, Some(stack.info()));
+        namespace
+            .stack
+            .set(stack.clone())
+            .ok()
+            .expect("new explicit fabric namespace stack");
         Ok(Self(Backend::Virtual(stack), namespace))
     }
     pub fn routes(&self) -> Vec<DeviceRoute> {

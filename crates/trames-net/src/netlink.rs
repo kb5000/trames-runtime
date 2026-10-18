@@ -12,6 +12,8 @@ use std::{
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
     id: u64,
+    // Netlink sockets also pin the complete stack, not just link metadata.
+    pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
     pub(crate) graph: Rc<RefCell<crate::netdev::Topology>>,
     pub(crate) fabric: Rc<RefCell<Option<Fabric>>>,
     listeners: Rc<RefCell<Vec<Weak<Socket>>>>,
@@ -30,6 +32,7 @@ impl Default for Namespace {
         graph.borrow_mut().add_space(id, None, None);
         Self {
             id,
+            stack: std::cell::OnceCell::new(),
             graph,
             fabric: Rc::default(),
             listeners: Rc::default(),
@@ -87,6 +90,12 @@ impl Namespace {
 }
 impl Drop for Namespace {
     fn drop(&mut self) {
+        // Tear down sockets before removing connectivity, preserving FIN/RST
+        // handling and the existing fabric teardown order. No ownership cycle:
+        // virtual namespaces hold only the topology, never this identity.
+        if let Some(stack) = self.stack.take() {
+            stack.finish();
+        }
         let changes = {
             let mut graph = self.graph.borrow_mut();
             let removed = graph.removed_with_space(self.id());

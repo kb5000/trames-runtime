@@ -402,3 +402,22 @@ fn explicit_static_routes_work_and_teardown_notifies_without_enabling_host_egres
         Err(NetError(13))
     );
 }
+#[test]
+fn an_old_netlink_fd_keeps_the_protocol_stack_alive_until_last_close() {
+    let root = Network::new(NetworkMode::Full);
+    let a = root.isolated().unwrap();
+    let b = root.isolated().unwrap();
+    let br = bridge(&root, b"br-pin");
+    let ai = pair(&root, &a, b"pin-a", br);
+    let bi = pair(&root, &b, b"pin-b", br);
+    assign(&a, ai, "192.0.2.41", 24);
+    assign(&b, bi, "192.0.2.42", 24);
+    let netlink_only = b.socket(16, 3, 0).unwrap();
+    drop(b);
+    let ping = a.socket(2, 2, 1).unwrap();
+    ping.send(&[8, 0, 0, 0, 0, 0, 0, 1], 0, Some(addr("192.0.2.42", 0)))
+        .unwrap();
+    assert_eq!(ping.recv(32, 0).unwrap().data[0], 0);
+    drop(netlink_only);
+    assert!(root.devices().iter().all(|d| d.name != b"pin-b"));
+}
