@@ -863,13 +863,13 @@ impl Vfs {
             .and_then(|node| inotify::Close::reopen(node, flags, original.notification.as_ref()));
         let descriptor = OpenDescription {
             read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
-                original.read_node.clone().or_else(|| {
-                    let node = original.node.as_ref()?.borrow();
-                    match &node.content {
+                original
+                    .node
+                    .as_ref()
+                    .and_then(|node| match &node.borrow().content {
                         Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
                         _ => None,
-                    }
-                })
+                    })
             } else {
                 None
             },

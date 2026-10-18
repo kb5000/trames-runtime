@@ -1198,7 +1198,7 @@ mod tests {
         );
     }
     #[test]
-    fn proc_reopens_pin_lower_reads_but_writable_reopens_copy_up() {
+    fn proc_reopens_select_current_layer_but_dup_keeps_original_data() {
         let mut v = Vfs::default();
         dirs(&mut v);
         write(&mut v, b"/lower/a", b"lower");
@@ -1217,10 +1217,14 @@ mod tests {
             },
         );
         let path = format!("/proc/self/fd/{reader}");
+        let duplicate = v.dup(reader, 0, false).unwrap();
+        let before_copy = v.open_at(AT_FDCWD, path.as_bytes(), 0, 0).unwrap();
         let writer = v.open_at(AT_FDCWD, path.as_bytes(), 2, 0).unwrap();
         v.write(writer, b"upper").unwrap();
         let reopened = v.open_at(AT_FDCWD, path.as_bytes(), 0, 0).unwrap();
-        assert_eq!(v.pread(reopened, 32, 0).unwrap(), b"lower");
+        assert_eq!(v.pread(reopened, 32, 0).unwrap(), b"upper");
+        assert_eq!(v.pread(duplicate, 32, 0).unwrap(), b"lower");
+        assert_eq!(v.pread(before_copy, 32, 0).unwrap(), b"lower");
         assert_eq!(read(&mut v, b"/merged/a"), b"upper");
         assert_eq!(read(&mut v, b"/lower/a"), b"lower");
     }
