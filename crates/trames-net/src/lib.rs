@@ -16,7 +16,7 @@ pub use native::{
     decode_address, encode_address, NetError, NetworkMode, Received, MAX_BUFFER, MAX_SOCKETS,
     MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
 };
-use std::{net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::Cell, net::SocketAddr, rc::Rc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
 type Result<T> = std::result::Result<T, NetError>;
 #[derive(Clone)]
@@ -242,7 +242,11 @@ impl Network {
         Ok(Socket::wrap(backend, self.1.clone()))
     }
 }
-pub struct Socket(SocketBackend, Rc<netlink::Namespace>);
+pub struct Socket(
+    SocketBackend,
+    Rc<netlink::Namespace>,
+    [Cell<Option<Duration>>; 2],
+);
 enum SocketBackend {
     Hybrid(Rc<hybrid::Socket>),
     Netlink(Rc<netlink::Socket>),
@@ -264,7 +268,15 @@ impl Drop for Socket {
 impl Socket {
     fn wrap(backend: SocketBackend, namespace: Rc<netlink::Namespace>) -> Rc<Self> {
         namespace.socket_count.set(namespace.socket_count.get() + 1);
-        Rc::new(Self(backend, namespace))
+        Rc::new(Self(backend, namespace, [Cell::new(None), Cell::new(None)]))
+    }
+    /// Guest socket timeouts are enforced by the virtual task scheduler; host
+    /// sockets remain nonblocking. The shared socket owns them across dup/fork.
+    pub fn set_io_timeout(&self, receive: bool, timeout: Option<Duration>) {
+        self.2[usize::from(receive)].set(timeout);
+    }
+    pub fn io_timeout(&self, receive: bool) -> Option<Duration> {
+        self.2[usize::from(receive)].get()
     }
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
         match &self.0 {
@@ -469,7 +481,11 @@ impl Socket {
                 (SocketBackend::Virtual(s), peer)
             }
         };
-        Ok((Self::wrap(backend, self.1.clone()), peer))
+        let accepted = Self::wrap(backend, self.1.clone());
+        for receive in [false, true] {
+            accepted.set_io_timeout(receive, self.io_timeout(receive));
+        }
+        Ok((accepted, peer))
     }
 }
 pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {

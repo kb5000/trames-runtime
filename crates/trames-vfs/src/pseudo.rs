@@ -48,6 +48,102 @@ mod tests {
         out
     }
     #[test]
+    fn proc_setgroups_reports_initial_user_namespace_policy() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        assert_eq!(read(&mut v, b"/proc/self/setgroups"), b"allow\n");
+        assert_eq!(read(&mut v, b"/proc/1/task/1/setgroups"), b"allow\n");
+        // User namespaces and changing their setgroups policy are unsupported.
+        assert!(v.open_at(AT_FDCWD, b"/proc/self/setgroups", 1, 0).is_err());
+    }
+    #[test]
+    fn proc_root_inode_matches_linux_across_paths_fds_and_bind_mounts() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let fd = v
+            .open_at(AT_FDCWD, b"/proc", O_PATH | O_DIRECTORY, 0)
+            .unwrap();
+        let root = v.stat_at(AT_FDCWD, b"/proc").unwrap();
+        assert_eq!(&root[8..16], &1u64.to_le_bytes());
+        assert_eq!(v.stat_fd(fd).unwrap(), root);
+        assert_eq!(v.stat_at(fd as i32, b".").unwrap(), root);
+        assert_eq!(&v.statfs_fd(fd).unwrap()[..8], &0x9fa0u64.to_le_bytes());
+        v.mkdir_at(AT_FDCWD, b"/proc-alias", 0o755).unwrap();
+        v.mount(Some(b"/proc"), b"/proc-alias", None, 4096, None)
+            .unwrap();
+        assert_eq!(v.stat_at(AT_FDCWD, b"/proc-alias").unwrap(), root);
+        // Ordinary synthesized entries retain their separate inode range.
+        assert_ne!(
+            &v.stat_at(AT_FDCWD, b"/proc/stat").unwrap()[8..16],
+            &root[8..16]
+        );
+    }
+    #[test]
+    fn proc_readlink_empty_path_retains_symlink_inode_and_refreshes_fd_target() {
+        let mut v = Vfs::default();
+        v.symlink_at(b"missing", AT_FDCWD, b"/link").unwrap();
+        let link = v
+            .open_at(AT_FDCWD, b"/link", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        v.unlink_at(AT_FDCWD, b"/link", false).unwrap();
+        assert_eq!(v.readlink_at(link as i32, b"").unwrap(), b"missing");
+        v.import_file(b"/target", b"data".to_vec()).unwrap();
+        let target = v.open_at(AT_FDCWD, b"/target", 0, 0).unwrap();
+        snapshot(&mut v);
+        let proc_link = v
+            .open_at(
+                AT_FDCWD,
+                format!("/proc/self/fd/{target}").as_bytes(),
+                O_PATH | O_NOFOLLOW,
+                0,
+            )
+            .unwrap();
+        snapshot(&mut v);
+        assert_eq!(v.readlink_at(proc_link as i32, b"").unwrap(), b"/target");
+        v.rename_at(AT_FDCWD, b"/target", AT_FDCWD, b"/renamed", 0)
+            .unwrap();
+        snapshot(&mut v);
+        assert_eq!(v.readlink_at(proc_link as i32, b"").unwrap(), b"/renamed");
+        assert_eq!(v.readlink_at(target as i32, b""), Err(Errno(2)));
+        assert_eq!(v.readlink_at(AT_FDCWD, b""), Err(Errno(2)));
+        let credentials = v.credentials.clone();
+        v.credentials = Credentials::user(1000, 1000);
+        // A fork can retain this link FD, but changing its credentials does
+        // not grant inspection of the original process's descriptor table.
+        v.set_process_context(2);
+        assert_eq!(v.readlink_at(proc_link as i32, b""), Err(Errno(13)));
+        v.set_process_context(1);
+        v.credentials = credentials;
+        v.close(target).unwrap();
+        snapshot(&mut v);
+        assert_eq!(v.readlink_at(proc_link as i32, b""), Err(Errno(2)));
+        assert_eq!(v.readlink_at(250, b""), Err(Errno(9)));
+    }
+    #[test]
+    fn proc_sysctl_path_fd_reopens_with_truncation_and_keeps_network_namespace() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        snapshot(&mut v);
+        let path = b"/proc/sys/net/ipv4/ip_unprivileged_port_start";
+        let original = v.open_at(AT_FDCWD, path, O_PATH, 0).unwrap();
+        v.unshare_net().unwrap();
+        snapshot(&mut v);
+        let fd = v
+            .open_at(
+                AT_FDCWD,
+                format!("/proc/self/fd/{original}").as_bytes(),
+                2 | 0x200,
+                0,
+            )
+            .unwrap();
+        assert_eq!(v.write(fd, b"0\n").unwrap(), 2);
+        v.seek(fd, 0, 0).unwrap();
+        assert_eq!(v.read(fd, 100).unwrap(), b"0\n");
+        assert_eq!(read(&mut v, path), b"1024\n");
+        v.credentials = Credentials::user(1000, 1000);
+        assert_eq!(v.write(fd, b"1\n"), Err(Errno(13)));
+    }
+    #[test]
     fn device_directory_enumerates_only_available_embedding_devices() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -348,7 +444,13 @@ impl PseudoFs {
             } else {
                 0xfd01
             },
-            inode: (1u64 << 63) + self.next_inode,
+            // Linux PROC_ROOT_INO is 1. Original runc/pathrs validates this
+            // along with procfs's superblock type before trusting proc paths.
+            inode: if path == b"/proc" {
+                1
+            } else {
+                (1u64 << 63) + self.next_inode
+            },
             links: 1,
             times: [storage::Timestamp::default(); 3],
             xattrs: BTreeMap::new(),
@@ -902,6 +1004,7 @@ impl Vfs {
         );
         if flags & 0x200 != 0
             && self.descriptor(fd)?.open.borrow().oom.is_none()
+            && self.descriptor(fd)?.open.borrow().network_control.is_none()
             && self
                 .descriptor(fd)?
                 .open
@@ -1210,6 +1313,9 @@ impl Vfs {
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
                         b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
+                        // All tasks currently belong to the initial user
+                        // namespace; supplementary groups are not disabled.
+                        b"setgroups" => b"allow\n".to_vec(),
                         b"comm" => comm(p),
                         b"cgroup" => {
                             [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
@@ -1929,6 +2035,7 @@ impl Vfs {
                             "status",
                             "statm",
                             "oom_score_adj",
+                            "setgroups",
                             "cgroup",
                             "cmdline",
                             "environ",

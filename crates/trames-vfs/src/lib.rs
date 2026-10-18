@@ -953,6 +953,31 @@ impl Vfs {
         self.insert(dest, Content::Symlink(target.to_vec()), 0o120777)
     }
     pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
+        // readlinkat has implicit AT_EMPTY_PATH support for an O_PATH handle
+        // opened with O_NOFOLLOW. Keep the inode alive even after unlink, and
+        // refresh dynamic proc magic links before reading their current target.
+        if path.is_empty() {
+            if dirfd == AT_FDCWD {
+                return Err(Errno(2));
+            }
+            let description = self.descriptor(dirfd as u32)?.open.clone();
+            if let FdKind::Node(path) = &description.borrow().kind {
+                self.check_proc_inspection(
+                    &ResolvedPath {
+                        key: path.clone(),
+                        mount: description.borrow().mount.clone(),
+                    },
+                    true,
+                )?;
+            }
+            self.refresh_pseudo_fd(dirfd as u32)?;
+            let open = description.borrow();
+            let node = open.node.as_ref().ok_or(Errno(2))?.borrow();
+            return match &node.content {
+                Content::Symlink(target) => Ok(target.clone()),
+                _ => Err(Errno(2)),
+            };
+        }
         let dest = self.resolve_final(dirfd, path, false)?;
         self.check_proc_inspection(&dest, true)?;
         let node = self.node(&dest)?;
@@ -2225,14 +2250,20 @@ impl Vfs {
             let path = fs
                 .paths
                 .iter()
-                .find(|(_, n)| n.borrow().inode == node.inode)
+                .find(|(_, n)| {
+                    let n = n.borrow();
+                    n.device == node.device && n.inode == node.inode
+                })
                 .map(|(p, _)| p.clone())
                 .or_else(|| {
                     self.pseudo
                         .borrow()
                         .nodes
                         .iter()
-                        .find(|(_, n)| n.borrow().inode == node.inode)
+                        .find(|(_, n)| {
+                            let n = n.borrow();
+                            n.device == node.device && n.inode == node.inode
+                        })
                         .map(|((_, p), _)| p.clone())
                 });
             if let Some(path) = path {
