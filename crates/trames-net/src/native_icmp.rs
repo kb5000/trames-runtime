@@ -244,6 +244,7 @@ impl Socket {
         data.truncate(count);
         Ok(Received {
             netlink_address: None,
+            packet_info: None,
             data,
             address: Some(address),
             length,

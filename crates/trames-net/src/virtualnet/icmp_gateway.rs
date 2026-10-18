@@ -41,6 +41,12 @@ impl Gateway {
             return false;
         }
         let identifier = u16::from_be_bytes([data[4], data[5]]);
+        let original = self
+            .routed
+            .get(&crate::conntrack::key(p).unwrap())
+            .map(|r| r.original);
+        let owner_identifier = original.map_or(identifier, |k| k.tuple.source.port());
+        let owner_ip = original.map_or(h.tuple.source.ip(), |k| k.tuple.source.ip());
         let owner = nodes.get(&key).and_then(|n| {
             n.registry.iter().filter_map(Weak::upgrade).find(|s| {
                 if s.family != if v4 { 2 } else { 10 } || !matches!(s.kind, 3 | 4) {
@@ -48,11 +54,11 @@ impl Gateway {
                 }
                 let state = s.state.borrow();
                 state.bound.is_some_and(|a| {
-                    (a.ip().is_unspecified() || a.ip() == h.tuple.source.ip())
+                    (a.ip().is_unspecified() || a.ip() == owner_ip)
                         && if s.kind == 3 {
-                            a.port() == identifier
+                            a.port() == owner_identifier
                         } else {
-                            state.raw_identifiers.contains(&identifier)
+                            state.raw_identifiers.contains(&owner_identifier)
                         }
                 }) && state
                     .peer

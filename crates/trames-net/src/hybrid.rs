@@ -36,6 +36,7 @@ impl Socket {
         protocol: u32,
     ) -> Result<Rc<Self>> {
         let native = network.socket(family, kind, protocol)?;
+        native.attach_policy(namespace.clone());
         Ok(Rc::new(Self {
             network,
             namespace,
@@ -56,6 +57,7 @@ impl Socket {
             return Ok(s.clone());
         }
         let s = self.network.socket(self.family, self.kind, self.protocol)?;
+        s.attach_policy(self.namespace.clone());
         for (level, name, value) in self.options.borrow().iter() {
             s.set_option_bytes(*level, *name, value)?;
         }
@@ -93,11 +95,64 @@ impl Socket {
             }
         }
     }
+    fn redirect(&self, peer: SocketAddr) -> bool {
+        if !matches!(self.kind, 1 | 2) {
+            return false;
+        }
+        let graph = self.namespace.graph.borrow();
+        if !graph.firewall(self.namespace.id()).borrow().active(3) {
+            return false;
+        }
+        let peer = match peer.ip() {
+            IpAddr::V6(v) => v
+                .to_ipv4_mapped()
+                .map_or(peer, |v| SocketAddr::new(v.into(), peer.port())),
+            _ => peer,
+        };
+        let Ok((mut source, _, _)) = graph.source(self.namespace.id(), peer.ip()) else {
+            return false;
+        };
+        let bound = self
+            .bound
+            .get()
+            .or_else(|| {
+                self.native
+                    .borrow()
+                    .as_ref()
+                    .and_then(|s| s.local_addr().ok())
+            })
+            .filter(|a| a.port() != 0);
+        if let Some(a) = bound.filter(|a| !a.ip().is_unspecified()) {
+            source = a.ip();
+        }
+        let mut p = crate::conntrack::message(
+            SocketAddr::new(source, bound.map_or(0, |a| a.port())),
+            peer,
+            if self.kind == 1 { 6 } else { 17 },
+            2,
+            &[],
+        );
+        graph.output_redirect(self.namespace.id(), &mut p, bound.is_some())
+    }
     fn internal(&self, address: IpAddr) -> bool {
         let address = match address {
             IpAddr::V6(v) => v.to_ipv4_mapped().map_or(address, IpAddr::V4),
             _ => address,
         };
+        if !address.is_loopback()
+            && self
+                .namespace
+                .graph
+                .borrow()
+                .devices(self.namespace.id())
+                .iter()
+                .any(|d| {
+                    matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. })
+                        && d.addresses.iter().any(|a| a.ip == address)
+                })
+        {
+            return true;
+        }
         !address.is_loopback()
             && self
                 .namespace
@@ -113,6 +168,20 @@ impl Socket {
                         .ok()
                 })
                 .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
+    }
+    pub fn poll_epoch(&self) -> Option<[u64; 2]> {
+        let mut epoch = if self.path.get() != Path::Guest {
+            self.native().ok()?.poll_epoch()?
+        } else {
+            [0; 2]
+        };
+        if let Some(g) = self.guest.borrow().as_ref() {
+            let e = g.poll_epoch();
+            for i in 0..2 {
+                epoch[i] = epoch[i].wrapping_add(e[i]);
+            }
+        }
+        Some(epoch)
     }
     pub fn info(&self) -> SocketInfo {
         if self.path.get() == Path::Guest {
@@ -222,7 +291,7 @@ impl Socket {
         let guest = if self.kind == 1 && self.peer.get().is_some() {
             self.path.get() == Path::Guest
         } else {
-            self.internal(address.ip()) || self.path.get() == Path::Guest
+            self.internal(address.ip()) || self.redirect(address) || self.path.get() == Path::Guest
         };
         self.peer.set(Some(address));
         if guest {
@@ -275,16 +344,25 @@ impl Socket {
         }
     }
     pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
+        self.send_control(bytes, flags, address, None)
+    }
+    pub fn send_control(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        address: Option<SocketAddr>,
+        info: Option<crate::PacketInfo>,
+    ) -> Result<usize> {
         if self.kind != 1
             && self.path.get() != Path::Guest
             && address
                 .or(self.peer.get())
-                .is_some_and(|a| self.internal(a.ip()))
+                .is_some_and(|a| self.internal(a.ip()) || self.redirect(a))
         {
             let s = self.guest()?;
             if self.kind == 3 {
                 self.path.set(Path::Guest);
-                return s.send(bytes, flags, address.or(self.peer.get()));
+                return s.send_control(bytes, flags, address.or(self.peer.get()), info);
             }
             if self.bound.get().is_none() {
                 let wildcard = SocketAddr::new(
@@ -298,13 +376,17 @@ impl Socket {
                 self.bind(wildcard)?;
             }
             self.path.set(Path::Both);
-            return s.send(bytes, flags, address.or(self.peer.get()));
+            return s.send_control(bytes, flags, address.or(self.peer.get()), info);
         }
         if self.path.get() == Path::Guest {
-            self.guest()?.send(bytes, flags, address)
+            self.guest()?.send_control(bytes, flags, address, info)
         } else {
             let native = self.native()?;
-            let result = native.send(bytes, flags, address);
+            let result = if let Some(info) = info {
+                native.send_packet(bytes, flags, address, info)
+            } else {
+                native.send(bytes, flags, address)
+            };
             if result.is_ok() {
                 self.remember_native_binding(&native);
             }

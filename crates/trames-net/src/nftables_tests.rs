@@ -93,6 +93,10 @@ fn allows(ns: &Namespace, hook: u32) -> bool {
             output: 4,
             input_name: b"veth-in",
             output_name: b"br-out",
+            track: None,
+            source_type: 1,
+            destination_type: 1,
+            masquerade: None,
         })
 }
 #[test]
@@ -228,7 +232,7 @@ fn cycles_invalid_registers_and_native_hooks_are_rejected_atomically() {
     assert_eq!(
         errno(&batch(
             &native.1,
-            &[table("f"), chain("f", "input", Some(1), 0, 0)]
+            &[table("f"), chain("f", "invalid", Some(5), 0, 0)]
         )),
         -95
     );
@@ -346,4 +350,44 @@ fn routed_filter_blocks_active_tcp_without_touching_native_path() {
         .send(b"restored", 0, Some("172.25.0.2:19011".parse().unwrap()))
         .unwrap();
     assert_eq!(receiver.recv(64, 0).unwrap().data, b"restored");
+}
+#[test]
+fn native_root_input_and_output_policy_enforces_real_socket_io() {
+    let root = Network::new(NetworkMode::Loopback);
+    let receiver = root.socket(2, 2, 0).unwrap();
+    receiver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = receiver.local_addr().unwrap();
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        errno(&batch(
+            &root.1,
+            &[table("f"), chain("f", "input", Some(1), 0, 0)]
+        )),
+        0
+    );
+    peer.send_to(b"denied", address).unwrap();
+    assert!(matches!(receiver.recv(100, 0), Err(NetError(11))));
+    assert_eq!(
+        errno(&batch(&root.1, &[rule("f", "input", &verdict(1, None))])),
+        0
+    );
+    peer.send_to(b"allowed", address).unwrap();
+    assert_eq!(receiver.recv(100, 0).unwrap().data, b"allowed");
+    assert_eq!(
+        errno(&batch(&root.1, &[chain("f", "output", Some(3), 0, 0)])),
+        0
+    );
+    assert_eq!(
+        receiver.send_bytes(
+            b"outbound",
+            0,
+            Some(&crate::encode_address(peer.local_addr().unwrap()))
+        ),
+        Err(NetError(13))
+    );
+    assert_eq!(
+        peer.recv(&mut [0; 10]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

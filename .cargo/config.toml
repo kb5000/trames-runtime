@@ -1,0 +1,3 @@
+[env]
+# Six guest addresses plus loopback and the read-only native interface view.
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "16"

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Checked sockets with native and isolated userspace packet-stack backends.
+mod conntrack;
 mod direct_dns;
 mod dns;
 mod hybrid;
@@ -31,6 +32,11 @@ pub struct SocketInfo {
     pub tx_queue: Option<usize>,
     pub rx_queue: Option<usize>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketInfo {
+    pub address: std::net::IpAddr,
+    pub interface: u32,
+}
 #[derive(Clone)]
 pub struct Network(Backend, Rc<netlink::Namespace>);
 #[derive(Clone)]
@@ -44,6 +50,21 @@ impl Default for Network {
     }
 }
 impl Network {
+    /// Trusted embedder test/service mapping; never reachable from a guest syscall.
+    pub fn map_host_ip(
+        &self,
+        virtual_ip: std::net::IpAddr,
+        host_ip: std::net::IpAddr,
+    ) -> Result<()> {
+        let fabric = {
+            let mut shared = self.1.fabric.borrow_mut();
+            if shared.is_none() {
+                *shared = Some(Fabric::new()?);
+            }
+            shared.as_ref().unwrap().clone()
+        };
+        fabric.map_host_ip(virtual_ip, host_ip)
+    }
     pub fn namespace_id(&self) -> u64 {
         self.1.id()
     }
@@ -78,7 +99,6 @@ impl Network {
         let view = netdev::View {
             graph: namespace.graph.clone(),
             namespace: namespace.id(),
-            native_root: false,
         };
         let stack = fabric.dynamic_environment(mode, view, loopback)?;
         namespace
@@ -151,6 +171,18 @@ impl Network {
             .graph
             .borrow_mut()
             .set_forwarding(self.namespace_id(), ipv6, enabled);
+    }
+    pub fn bridge_filter(&self, ipv6: bool) -> bool {
+        self.1
+            .graph
+            .borrow()
+            .bridge_filter(self.namespace_id(), ipv6)
+    }
+    pub fn set_bridge_filter(&self, ipv6: bool, enabled: bool) {
+        self.1
+            .graph
+            .borrow_mut()
+            .set_bridge_filter(self.namespace_id(), ipv6, enabled);
     }
     pub fn routes(&self) -> Vec<DeviceRoute> {
         self.1.refresh_native();
@@ -237,7 +269,9 @@ impl Socket {
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
         match &self.0 {
             SocketBackend::Netlink(s) => Some(s.poll_epoch()),
-            _ => None,
+            SocketBackend::Native(s) => s.poll_epoch(),
+            SocketBackend::Hybrid(s) => s.poll_epoch(),
+            SocketBackend::Virtual(s) => Some(s.poll_epoch()),
         }
     }
     pub fn info(&self) -> Option<SocketInfo> {
@@ -268,6 +302,50 @@ impl Socket {
             name,
             i32::from_le_bytes(value[..4].try_into().unwrap()),
         )
+    }
+    pub fn send_packet(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<SocketAddr>,
+        mut info: PacketInfo,
+    ) -> Result<usize> {
+        self.1.refresh_native();
+        let graph = self.1.graph.borrow();
+        let owned_ip = match info.address {
+            std::net::IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map_or(info.address, std::net::IpAddr::V4),
+            ip => ip,
+        };
+        if info.interface != 0 {
+            let device = graph.device(self.1.id(), info.interface)?;
+            if info.address.is_unspecified() {
+                info.address = device
+                    .addresses
+                    .iter()
+                    .find(|a| a.ip.is_ipv4() == info.address.is_ipv4())
+                    .ok_or(NetError(99))?
+                    .ip;
+            } else if !device.addresses.iter().any(|a| {
+                a.ip == owned_ip
+                    || device.kind == DeviceKind::Loopback
+                        && owned_ip.is_loopback()
+                        && a.contains(owned_ip)
+            }) {
+                return Err(NetError(99));
+            }
+        }
+        if !owned_ip.is_unspecified() && !graph.own(self.1.id(), owned_ip) {
+            return Err(NetError(99));
+        }
+        drop(graph);
+        match &self.0 {
+            SocketBackend::Native(s) => s.send_packet(bytes, flags, destination, info),
+            SocketBackend::Virtual(s) => s.send_control(bytes, flags, destination, Some(info)),
+            SocketBackend::Hybrid(s) => s.send_control(bytes, flags, destination, Some(info)),
+            _ => Err(NetError(95)),
+        }
     }
     pub fn ancillary_hop(&self) -> Option<(u32, u32, u8)> {
         if let SocketBackend::Hybrid(s) = &self.0 {

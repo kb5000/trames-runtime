@@ -2,7 +2,7 @@
 //! A bounded IP fabric. Only the trusted gateway opens native sockets.
 use crate::dns;
 mod gateway;
-mod packet;
+pub(crate) mod packet;
 mod sockets;
 use super::native::{
     self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT,
@@ -71,6 +71,7 @@ struct Node {
     iface: Interface,
     sockets: SocketSet<'static>,
     port: Port,
+    filter_rx: Port,
     registry: Vec<Weak<Socket>>,
     detached: Vec<(SocketHandle, Instant)>,
     resets: Vec<(Weak<Socket>, Connection)>,
@@ -120,6 +121,7 @@ struct State {
     icmp_pending: Option<(Vec<u8>, IpAddr)>,
     hop_limit: u8,
     receive_hops: bool,
+    receive_packet_info: bool,
     last_hop: Option<u8>,
     broadcast: bool,
     icmp6_filter: [u8; 32],
@@ -200,6 +202,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         iface,
         sockets: SocketSet::new(Vec::new()),
         port,
+        filter_rx: Port::default(),
         registry: Vec::new(),
         detached: Vec::new(),
         resets: Vec::new(),
@@ -327,6 +330,7 @@ impl Fabric {
             routing: Some(routing),
         });
         node.owner = Rc::downgrade(&ns);
+        node.iface.set_any_ip(true);
         node.configure_dynamic(&mut 0);
         i.nodes.insert(key, node);
         Ok(Network(ns))
@@ -451,62 +455,132 @@ impl Inner {
                     }
                     self.stats.corrupted += 1;
                 }
-                let Some(h) = packet::header(&p) else {
+                let Some(_h) = packet::header(&p) else {
                     self.stats.dropped += 1;
                     if let Some(n) = self.nodes.get_mut(&source) {
                         n.links[usize::from(!lo)].tx_dropped += 1;
                     }
                     continue;
                 };
-                let dst = h.tuple.destination.ip();
-                let dynamic = self
-                    .nodes
-                    .get(&source)
-                    .and_then(|n| n.owner.upgrade())
-                    .and_then(|ns| ns.routing.clone());
-                let path = dynamic
-                    .as_ref()
-                    .and_then(|v| v.graph.borrow().target(v.namespace, dst));
+                if source == 0 {
+                    let rx = &mut self.gateway.node.filter_rx;
+                    if !rx.receive_packet(p) {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
+                    let Some(complete) = rx.rx.pop_front() else {
+                        continue;
+                    };
+                    p = complete;
+                }
+                let Some(h) = packet::header(&p) else {
+                    continue;
+                };
+                let routed_reply = if source == 0 {
+                    self.gateway.reply_route(&p)
+                } else {
+                    None
+                };
+                let dynamic = routed_reply.as_ref().map(|r| r.0.clone()).or_else(|| {
+                    self.nodes
+                        .get(&source)
+                        .and_then(|n| n.owner.upgrade())
+                        .and_then(|ns| ns.routing.clone())
+                });
+                let mut delivery = None;
                 let target = if let Some(view) = &dynamic {
-                    path.and_then(|path| {
-                        let ns = path.namespace;
-                        self.nodes.iter().find_map(|(&key, n)| {
-                            n.owner.upgrade().and_then(|v| {
-                                v.routing.as_ref().and_then(|r| {
-                                    (r.namespace == ns && Rc::ptr_eq(&r.graph, &view.graph))
-                                        .then_some(key)
-                                })
+                    // Reassemble before L4 matching/NAT. A bounded IP queue is
+                    // also used for unfragmented packets without copying them.
+                    if source != 0 {
+                        let rx = &mut self.nodes.get_mut(&source).unwrap().filter_rx;
+                        if !rx.receive_packet(p) {
+                            self.stats.dropped += 1;
+                            continue;
+                        }
+                        let Some(complete) = rx.rx.pop_front() else {
+                            continue;
+                        };
+                        p = complete;
+                    }
+                    if !packet::valid_transport(&p) {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
+                    let original = crate::conntrack::key(&p);
+                    let incoming = routed_reply.as_ref().map(|r| r.1);
+                    delivery = view
+                        .graph
+                        .borrow()
+                        .route_packet(view.namespace, incoming, &mut p);
+                    let Some(route) = delivery else {
+                        self.stats.dropped += 1;
+                        continue;
+                    };
+                    if route.external {
+                        let Some(wire) = crate::conntrack::key(&p) else {
+                            self.stats.dropped += 1;
+                            continue;
+                        };
+                        let mut gateway_view = view.clone();
+                        gateway_view.namespace = route.namespace;
+                        let allowed = self
+                            .nodes
+                            .get(&source)
+                            .and_then(|n| n.owner.upgrade())
+                            .is_some_and(|ns| {
+                                matches!(ns.mode, NetworkMode::Full | NetworkMode::Outbound)
+                            });
+                        let ok = allowed
+                            && self.gateway.route_flow(
+                                wire,
+                                original.unwrap(),
+                                source,
+                                gateway_view,
+                                route.input,
+                            );
+                        let h = packet::header(&p).unwrap();
+                        if !ok
+                            || !self.gateway.ingress(
+                                source,
+                                p,
+                                &h,
+                                &self.nodes,
+                                now,
+                                self.handles() < MAX_HANDLES,
+                            )
+                        {
+                            self.stats.dropped += 1;
+                        }
+                        continue;
+                    }
+                    self.nodes.iter().find_map(|(&key, n)| {
+                        n.owner.upgrade().and_then(|ns| {
+                            ns.routing.as_ref().and_then(|r| {
+                                (r.namespace == route.namespace
+                                    && Rc::ptr_eq(&r.graph, &view.graph))
+                                .then_some(key)
                             })
                         })
                     })
-                } else if dst.is_loopback() {
-                    if source == 0 {
-                        None
-                    } else {
-                        Some(source)
-                    }
                 } else {
-                    self.nodes
-                        .iter()
-                        .find(|(_, n)| {
-                            n.owner.upgrade().is_some_and(|v| v.routing.is_none())
-                                && (dst == IpAddr::V4(v4(n.id)) || dst == IpAddr::V6(v6(n.id)))
-                        })
-                        .map(|(&key, _)| key)
-                };
-                if let (Some(view), Some(path)) = (&dynamic, path) {
-                    if !view
-                        .graph
-                        .borrow()
-                        .filter_path(view.namespace, path, &mut p)
-                    {
-                        self.stats.dropped += 1;
-                        let mut graph = view.graph.borrow_mut();
-                        graph.account(view.namespace, path.output, p.len(), true, true);
-                        graph.account(path.namespace, path.input, p.len(), false, true);
-                        continue;
+                    let dst = h.tuple.destination.ip();
+                    if dst.is_loopback() {
+                        (source != 0).then_some(source)
+                    } else {
+                        self.nodes
+                            .iter()
+                            .find(|(_, n)| {
+                                n.owner.upgrade().is_some_and(|ns| ns.routing.is_none())
+                                    && (dst == IpAddr::V4(v4(n.id)) || dst == IpAddr::V6(v6(n.id)))
+                            })
+                            .map(|(&key, _)| key)
                     }
-                }
+                };
+                let Some(h) = packet::header(&p) else {
+                    self.stats.dropped += 1;
+                    continue;
+                };
+                let dst = h.tuple.destination.ip();
                 if let Some(key) = target {
                     let permitted = source == key
                         || source == 0
@@ -556,7 +630,7 @@ impl Inner {
                     });
                     let size = p.len() as u64;
                     let dropped = !permitted || !enabled || !node.port.receive_packet(p);
-                    if let (Some(view), Some(path)) = (&dynamic, path) {
+                    if let (Some(view), Some(path)) = (&dynamic, delivery) {
                         let mut graph = view.graph.borrow_mut();
                         graph.account(view.namespace, path.output, size as usize, true, dropped);
                         graph.account(path.namespace, path.input, size as usize, false, dropped);
@@ -877,6 +951,7 @@ impl Network {
                 icmp_pending: None,
                 hop_limit: 64,
                 receive_hops: false,
+                receive_packet_info: false,
                 last_hop: None,
                 broadcast: false,
                 icmp6_filter: [0; 32],

@@ -429,7 +429,7 @@ pub(crate) fn request(
                     return Err(NetError(1));
                 }
                 if a.iter().any(|(k, _)| !matches!(k, 1 | 2 | 3 | 4 | 8))
-                    || request[18] & !0x80 != 0
+                    || request[18] & !(if family == 10 { 0x82 } else { 0x80 }) != 0
                 {
                     return Err(NetError(95));
                 }
@@ -450,7 +450,7 @@ pub(crate) fn request(
                     }
                 }
                 if let Some(f) = get(&a, 8) {
-                    if u32v(f)? & !0x80 != 0 {
+                    if u32v(f)? & !(if family == 10 { 0x82 } else { 0x80 }) != 0 {
                         return Err(NetError(95));
                     }
                 }

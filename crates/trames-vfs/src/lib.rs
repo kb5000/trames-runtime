@@ -1622,6 +1622,129 @@ impl Vfs {
         }
         Ok([free[0], free[1]])
     }
+    /// Bounded splice through a pipe. Commit pipe consumption only after the
+    /// destination accepts bytes; EAGAIN must never lose buffered stream data.
+    pub fn splice(
+        &mut self,
+        input: u32,
+        output: u32,
+        count: usize,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> Result<usize> {
+        let source = self.descriptor(input)?.open.clone();
+        let dest = self.descriptor(output)?.open.clone();
+        if Rc::ptr_eq(&source, &dest) {
+            return Err(Errno(22));
+        }
+        let source_pipe = {
+            let o = source.borrow();
+            if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
+                return Err(Errno(9));
+            }
+            o.pipe.as_ref().map(|p| (p.pipe.clone(), p.read))
+        };
+        let dest_pipe = {
+            let o = dest.borrow();
+            if o.flags & O_PATH != 0 || o.flags & 3 == 0 {
+                return Err(Errno(9));
+            }
+            if o.flags & 0x400 != 0 {
+                return Err(Errno(22));
+            }
+            o.pipe.as_ref().map(|p| (p.pipe.clone(), p.write))
+        };
+        for open in [&source, &dest] {
+            let o = open.borrow();
+            if o.socket
+                .as_ref()
+                .is_some_and(|s| s.info().is_some_and(|i| i.kind != 1))
+                || o.local.as_ref().is_some_and(|s| s.kind() != 1)
+            {
+                return Err(Errno(22));
+            }
+        }
+        if source_pipe.is_none() && dest_pipe.is_none() {
+            return Err(Errno(22));
+        }
+        if source_pipe.is_some() && from.is_some() || dest_pipe.is_some() && to.is_some() {
+            return Err(Errno(29));
+        }
+        if let (Some((a, _)), Some((b, _))) = (&source_pipe, &dest_pipe) {
+            if Rc::ptr_eq(a, b) {
+                return Err(Errno(22));
+            }
+        }
+        if source_pipe.as_ref().is_some_and(|(_, read)| !*read)
+            || dest_pipe.as_ref().is_some_and(|(_, write)| !*write)
+        {
+            return Err(Errno(9));
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        if let Some((pipe, _)) = source_pipe {
+            let bytes = {
+                let p = pipe.borrow();
+                if p.bytes.is_empty() && p.writers != 0 {
+                    return Err(Errno(11));
+                }
+                p.bytes
+                    .iter()
+                    .take(count.min(PIPE_CAPACITY))
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let n = if let Some((target, _)) = &dest_pipe {
+                let mut p = target.borrow_mut();
+                if p.readers == 0 {
+                    return Err(Errno(32));
+                }
+                let n = bytes.len().min(PIPE_CAPACITY - p.bytes.len());
+                if n == 0 {
+                    return Err(Errno(11));
+                }
+                p.bytes.extend(&bytes[..n]);
+                p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
+                n
+            } else if let Some(offset) = to {
+                self.pwrite(output, &bytes, offset)?
+            } else {
+                self.write(output, &bytes)?
+            };
+            let mut p = pipe.borrow_mut();
+            p.bytes.drain(..n);
+            if n != 0 {
+                p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
+            }
+            return Ok(n);
+        }
+        let (pipe, _) = dest_pipe.unwrap();
+        let room = {
+            let p = pipe.borrow();
+            if p.readers == 0 {
+                return Err(Errno(32));
+            }
+            PIPE_CAPACITY - p.bytes.len()
+        };
+        if room == 0 {
+            return Err(Errno(11));
+        }
+        let bytes = if let Some(offset) = from {
+            self.pread(input, count.min(room), offset)?
+        } else {
+            self.read(input, count.min(room))?
+        };
+        let mut p = pipe.borrow_mut();
+        p.bytes.extend(&bytes);
+        if !bytes.is_empty() {
+            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
+        }
+        Ok(bytes.len())
+    }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
         let mut o = self.descriptor(fd)?.open.borrow_mut();

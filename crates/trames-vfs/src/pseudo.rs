@@ -1125,8 +1125,8 @@ impl Vfs {
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", MAX_TASKS * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), MAX_TASKS * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
-            b"/proc/sys/net/ipv4/ip_forward"|b"/proc/sys/net/ipv4/conf/all/forwarding"|b"/proc/sys/net/ipv6/conf/all/forwarding"=>return Ok(Some((file(Vec::new()),0o100644))),
-            b"/proc/sys/net/ipv4/conf"|b"/proc/sys/net/ipv4/conf/all"|b"/proc/sys/net/ipv6"|b"/proc/sys/net/ipv6/conf"|b"/proc/sys/net/ipv6/conf/all"=>return Ok(directory()),
+            b"/proc/sys/net/bridge/bridge-nf-call-iptables"|b"/proc/sys/net/bridge/bridge-nf-call-ip6tables"|b"/proc/sys/net/ipv4/ip_forward"|b"/proc/sys/net/ipv4/conf/all/forwarding"|b"/proc/sys/net/ipv6/conf/all/forwarding"=>return Ok(Some((file(Vec::new()),0o100644))),
+            b"/proc/sys/net/bridge"|b"/proc/sys/net/ipv4/conf"|b"/proc/sys/net/ipv4/conf/all"|b"/proc/sys/net/ipv6"|b"/proc/sys/net/ipv6/conf"|b"/proc/sys/net/ipv6/conf/all"=>return Ok(directory()),
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
             b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
@@ -1543,6 +1543,19 @@ impl Vfs {
             if parts.len() == 1 {
                 return Ok(directory());
             }
+            if parts.get(1) == Some(&b"bridge".as_slice())
+                && d.kind == trames_net::DeviceKind::Bridge
+            {
+                if parts.len() == 2 {
+                    return Ok(directory());
+                }
+                // This IP fabric has no STP engine; report its actual disabled
+                // state read-only rather than fabricate configurable STP.
+                if parts.len() == 3 && parts[2] == b"stp_state" {
+                    return Ok(regular(b"0\n".to_vec()));
+                }
+                return Ok(None);
+            }
             if parts.get(1) == Some(&b"brif".as_slice()) && d.kind == trames_net::DeviceKind::Bridge
             {
                 if parts.len() == 2 {
@@ -1810,7 +1823,11 @@ impl Vfs {
             .collect(),
             b"/proc/sys/fs" => vec![b"file-max".to_vec(), b"file-nr".to_vec()],
             b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
-            b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec()],
+            b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],
+            b"/proc/sys/net/bridge" => vec![
+                b"bridge-nf-call-iptables".to_vec(),
+                b"bridge-nf-call-ip6tables".to_vec(),
+            ],
             b"/proc/sys/net/ipv4/conf" | b"/proc/sys/net/ipv6/conf" => vec![b"all".to_vec()],
             b"/proc/sys/net/ipv4/conf/all" | b"/proc/sys/net/ipv6/conf/all" => {
                 vec![b"forwarding".to_vec()]
@@ -1971,6 +1988,7 @@ impl Vfs {
                     );
                     if d.kind == trames_net::DeviceKind::Bridge {
                         names.push(b"brif".to_vec());
+                        names.push(b"bridge".to_vec());
                     }
                     if d.master.is_some() {
                         names.push(b"brport".to_vec());
@@ -1986,6 +2004,12 @@ impl Vfs {
                             .filter(|p| p.master == Some(d.index))
                             .map(|p| p.name),
                     );
+                }
+                if parts.len() == 2
+                    && parts[1] == b"bridge"
+                    && d.kind == trames_net::DeviceKind::Bridge
+                {
+                    return Ok(vec![b"stp_state".to_vec()]);
                 }
                 if parts.len() == 2 && parts[1] == b"brport" && d.master.is_some() {
                     names.push(b"state".to_vec());

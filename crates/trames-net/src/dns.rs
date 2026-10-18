@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded DNS wire service, backed by the supported host system resolver.
 use std::net::IpAddr;
-use std::{
-    net::ToSocketAddrs,
-    sync::{mpsc, Arc, Mutex},
-};
+use std::sync::{mpsc, Arc, Mutex};
 #[derive(Clone)]
 pub(crate) struct Question {
     pub packet: Vec<u8>,
@@ -15,6 +12,61 @@ pub(crate) struct Resolver {
     jobs: Option<mpsc::SyncSender<(u64, String, u16)>>,
     results: mpsc::Receiver<(u64, Vec<IpAddr>, u8)>,
     next: u64,
+}
+// Resolve only the requested family. An A query must not wait for an unrelated
+// AAAA timeout in the host resolver (and vice versa). The blocking call remains
+// on the two bounded workers; guest memory/pointers never enter this API.
+fn resolve(name: &str, kind: u16) -> (Vec<IpAddr>, u8) {
+    use nix::libc;
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return (vec![], 1);
+    };
+    // SAFETY: zero is a valid addrinfo hint, the CString is NUL terminated,
+    // result is written by libc. Each owned result is freed exactly once.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = if kind == 1 {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    hints.ai_socktype = libc::SOCK_STREAM;
+    let mut list = std::ptr::null_mut();
+    let code = unsafe { libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut list) };
+    if code != 0 {
+        return (vec![], if code == libc::EAI_NONAME { 3 } else { 2 });
+    }
+    struct Addresses(*mut libc::addrinfo);
+    impl Drop for Addresses {
+        fn drop(&mut self) {
+            unsafe { libc::freeaddrinfo(self.0) }
+        }
+    }
+    let owned = Addresses(list);
+    let mut out = vec![];
+    let mut cursor = owned.0;
+    for _ in 0..64 {
+        if cursor.is_null() {
+            break;
+        }
+        // SAFETY: nodes/address storage belong to the live libc result list.
+        // Family and length are checked before copying either sockaddr type.
+        let node = unsafe { &*cursor };
+        if !node.ai_addr.is_null() {
+            if node.ai_family == libc::AF_INET
+                && (node.ai_addrlen as usize) >= std::mem::size_of::<libc::sockaddr_in>()
+            {
+                let a = unsafe { &*(node.ai_addr as *const libc::sockaddr_in) };
+                out.push(std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)).into());
+            } else if node.ai_family == libc::AF_INET6
+                && (node.ai_addrlen as usize) >= std::mem::size_of::<libc::sockaddr_in6>()
+            {
+                let a = unsafe { &*(node.ai_addr as *const libc::sockaddr_in6) };
+                out.push(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr).into());
+            }
+        }
+        cursor = node.ai_next;
+    }
+    (out, 0)
 }
 impl Resolver {
     pub fn new() -> Self {
@@ -32,15 +84,7 @@ impl Resolver {
                         break;
                     };
                     let (id, name, kind) = job;
-                    let (mut addresses, code) = match (name.as_str(), 0).to_socket_addrs() {
-                        Ok(a) => (
-                            a.map(|a| a.ip())
-                                .filter(|a| a.is_ipv4() == (kind == 1))
-                                .collect::<Vec<_>>(),
-                            0,
-                        ),
-                        Err(_) => (Vec::new(), 3),
-                    };
+                    let (mut addresses, code) = resolve(&name, kind);
                     addresses.sort();
                     addresses.dedup();
                     addresses.truncate(8);

@@ -50,9 +50,18 @@ struct PendingDns {
     to: ReplyTo,
     expires: Instant,
 }
+#[derive(Clone)]
+struct RoutedFlow {
+    node: u64,
+    original: crate::conntrack::Key,
+    view: crate::netdev::View,
+    input: u32,
+    last: Instant,
+}
 pub(super) struct Gateway {
     pub node: Node,
     pub mappings: BTreeMap<IpAddr, IpAddr>,
+    routed: BTreeMap<crate::conntrack::Key, RoutedFlow>,
     native: native::Network,
     tcp: Vec<TcpFlow>,
     udp: Vec<UdpFlow>,
@@ -90,6 +99,7 @@ impl Gateway {
         Ok(Self {
             node,
             mappings: BTreeMap::new(),
+            routed: BTreeMap::new(),
             native: native::Network::new(NetworkMode::Outbound),
             tcp: Vec::new(),
             udp: Vec::new(),
@@ -101,13 +111,53 @@ impl Gateway {
             icmp: Vec::new(),
         })
     }
+    pub fn route_flow(
+        &mut self,
+        wire: crate::conntrack::Key,
+        original: crate::conntrack::Key,
+        node: u64,
+        view: crate::netdev::View,
+        input: u32,
+    ) -> bool {
+        if self.routed.len() >= 128 && !self.routed.contains_key(&wire) {
+            return false;
+        }
+        self.routed.insert(
+            wire,
+            RoutedFlow {
+                node,
+                original,
+                view,
+                input,
+                last: Instant::now(),
+            },
+        );
+        true
+    }
+    pub fn reply_route(&mut self, packet: &[u8]) -> Option<(crate::netdev::View, u32)> {
+        let key = crate::conntrack::key(packet)?.reverse();
+        let flow = self.routed.get_mut(&key)?;
+        flow.last = Instant::now();
+        Some((flow.view.clone(), flow.input))
+    }
     pub fn pending_handles(&self) -> usize {
         self.tcp.iter().filter(|f| f.handle.is_none()).count()
     }
     pub fn flow_count(&self) -> usize {
         self.tcp.len() + self.udp.len() + self.icmp.len()
     }
-    fn owner(nodes: &BTreeMap<u64, Node>, key: u64, tuple: Tuple, kind: u32) -> Weak<Socket> {
+    fn owner(
+        &self,
+        nodes: &BTreeMap<u64, Node>,
+        key: u64,
+        tuple: Tuple,
+        kind: u32,
+    ) -> Weak<Socket> {
+        let protocol = if kind == 1 { 6 } else { 17 };
+        let tuple = self
+            .routed
+            .get(&crate::conntrack::Key { protocol, tuple })
+            .map_or(tuple, |r| r.original.tuple);
         nodes
             .get(&key)
             .and_then(|n| {
@@ -142,7 +192,10 @@ impl Gateway {
         }
         let tuple = h.tuple;
         let dest = tuple.destination;
-        if dest.ip() == IpAddr::V4(v4(1)) || dest.ip() == IpAddr::V6(v6(1)) {
+
+        if !crate::conntrack::key(&p).is_some_and(|k| self.routed.contains_key(&k))
+            && (dest.ip() == IpAddr::V4(v4(1)) || dest.ip() == IpAddr::V6(v6(1)))
+        {
             return self.node.port.receive_packet(p);
         }
         if h.protocol == 6 && h.first {
@@ -156,7 +209,7 @@ impl Gateway {
                 if !can_add || self.flow_count() >= FLOWS {
                     return false;
                 }
-                let owner = Self::owner(nodes, key, tuple, 1);
+                let owner = self.owner(nodes, key, tuple, 1);
                 if owner.strong_count() == 0 {
                     return false;
                 }
@@ -271,6 +324,9 @@ impl Gateway {
         self.node.port.tx.push_back(bytes);
     }
     pub fn service(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
+        self.routed.retain(|_, r| {
+            nodes.contains_key(&r.node) && r.last.elapsed() < Duration::from_secs(600)
+        });
         self.icmp_service(nodes);
         let mut gone = Vec::new();
         let mut failures = Vec::new();
@@ -399,9 +455,23 @@ impl Gateway {
                     source,
                     destination,
                 };
-                let Some((&node, _)) = nodes.iter().find(|(_, n)| {
-                    source.ip() == IpAddr::V4(v4(n.id)) || source.ip() == IpAddr::V6(v6(n.id))
-                }) else {
+                let node = self
+                    .routed
+                    .get(&crate::conntrack::Key {
+                        protocol: 17,
+                        tuple,
+                    })
+                    .map(|r| r.node)
+                    .or_else(|| {
+                        nodes
+                            .iter()
+                            .find(|(_, n)| {
+                                source.ip() == IpAddr::V4(v4(n.id))
+                                    || source.ip() == IpAddr::V6(v6(n.id))
+                            })
+                            .map(|(&key, _)| key)
+                    });
+                let Some(node) = node else {
                     continue;
                 };
                 let position = if let Some(index) = self
@@ -414,7 +484,7 @@ impl Gateway {
                     if self.flow_count() >= FLOWS {
                         continue;
                     }
-                    let owner = Self::owner(nodes, node, tuple, 2);
+                    let owner = self.owner(nodes, node, tuple, 2);
                     if owner.strong_count() == 0 {
                         continue;
                     }
@@ -546,6 +616,7 @@ impl Gateway {
         waiters
     }
     pub fn close_node(&mut self, key: u64) {
+        self.routed.retain(|_, r| r.node != key);
         self.tcp.retain(|f| {
             if f.node == key {
                 let _ = f.native.shutdown(2);

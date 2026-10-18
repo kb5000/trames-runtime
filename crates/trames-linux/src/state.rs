@@ -579,7 +579,7 @@ impl Linux {
                 self.vfs.set_uts_name(number == 162, &name)?;
                 Ok(0)
             }
-            71 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
+            71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
                 self.file_syscall(number, a, memory, io)
             }
             279 => {

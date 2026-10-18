@@ -2,6 +2,11 @@
 //! Bounded native sockets. All host operations are nonblocking; guest ABI
 //! addresses, flags and errno numbers are translated explicitly.
 use crate::direct_dns;
+#[path = "native_events.rs"]
+mod edge;
+#[path = "native_pktinfo.rs"]
+mod pktinfo;
+use std::os::fd::AsRawFd;
 #[path = "native_icmp.rs"]
 mod icmp;
 use nix::{
@@ -47,7 +52,7 @@ pub enum NetworkMode {
 /// The scheduler waits on a bounded, deduplicated set of opaque socket handles.
 /// No guest descriptor number is used as a host descriptor.
 pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
-    let has_dns = sockets.iter().any(|(s, _)| s.dns.borrow().is_some());
+    let has_dns = sockets.iter().any(|(s, _)| !s.dns.borrow().is_empty());
     let timeout = if has_dns {
         timeout.min(Duration::from_millis(2))
     } else {
@@ -87,6 +92,14 @@ pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
     match poll(&mut fds, timeout) {
         Ok(_) | Err(HostErrno::EINTR) => Ok(()),
         Err(error) => Err(from_errno(error)),
+    }
+}
+fn unmapped(a: SocketAddr) -> SocketAddr {
+    match a.ip() {
+        IpAddr::V6(v) => v
+            .to_ipv4_mapped()
+            .map_or(a, |v| SocketAddr::new(v.into(), a.port())),
+        _ => a,
     }
 }
 struct Namespace {
@@ -216,9 +229,14 @@ impl Network {
             connection: Cell::new(connection),
             pending_error: Cell::new(None),
             blocking_failed: Cell::new(false),
-            dns: RefCell::new(None),
+            dns: RefCell::default(),
+            dns_target: Cell::new(direct_dns::ADDRESS),
             dns_peer: Cell::new(false),
             echo: RefCell::default(),
+            policy: RefCell::default(),
+            events: RefCell::default(),
+            receive_packet_info: Cell::new(false),
+            policy_forward: RefCell::default(),
         })
     }
     fn destination(&self, address: SocketAddr) -> Result<()> {
@@ -310,9 +328,19 @@ pub struct Socket {
     connection: Cell<Connection>,
     pending_error: Cell<Option<u32>>,
     blocking_failed: Cell<bool>,
-    dns: RefCell<Option<Rc<direct_dns::Endpoint>>>,
+    dns: RefCell<std::collections::BTreeMap<SocketAddr, Rc<direct_dns::Endpoint>>>,
+    dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
     echo: RefCell<icmp::Echo>,
+    events: RefCell<Option<edge::Events>>,
+    receive_packet_info: Cell<bool>,
+    policy: RefCell<Option<Rc<crate::netlink::Namespace>>>,
+    policy_forward: RefCell<
+        std::collections::BTreeMap<
+            (SocketAddr, SocketAddr),
+            (crate::netdev::NativeForward, Instant),
+        >,
+    >,
 }
 impl Drop for Socket {
     fn drop(&mut self) {
@@ -322,18 +350,141 @@ impl Drop for Socket {
 pub struct Received {
     /// Non-IP source identity, retained with the individual netlink datagram.
     pub(crate) netlink_address: Option<[u8; 12]>,
+    pub packet_info: Option<crate::PacketInfo>,
     pub data: Vec<u8>,
     pub address: Option<SocketAddr>,
     pub length: usize,
     pub truncated: bool,
 }
 impl Socket {
-    fn dns_endpoint(&self) -> Result<Rc<direct_dns::Endpoint>> {
-        self.network.destination(direct_dns::ADDRESS)?;
+    pub fn poll_epoch(&self) -> Option<[u64; 2]> {
+        let mut events = self.events.borrow_mut();
+        if events.is_none() {
+            *events = Some(edge::Events::new(self.native.as_fd().as_raw_fd())?);
+        }
+        let mut epoch = events.as_mut().unwrap().sample();
+        for dns in self.dns.borrow().values() {
+            epoch[0] = epoch[0].wrapping_add(dns.epoch());
+        }
+        Some(epoch)
+    }
+    pub(crate) fn attach_policy(&self, namespace: Rc<crate::netlink::Namespace>) {
+        *self.policy.borrow_mut() = Some(namespace);
+    }
+    fn policy_check(&self, input: bool, peer: SocketAddr, bytes: &[u8], flags: u8) -> Result<()> {
+        self.policy_check_source(input, peer, bytes, flags, None)
+    }
+    fn policy_check_source(
+        &self,
+        input: bool,
+        peer: SocketAddr,
+        bytes: &[u8],
+        flags: u8,
+        source: Option<IpAddr>,
+    ) -> Result<()> {
+        let policy = self.policy.borrow();
+        let Some(namespace) = policy.as_ref() else {
+            return Ok(());
+        };
+        if !namespace
+            .graph
+            .borrow()
+            .firewall(namespace.id())
+            .borrow()
+            .has_rules()
+        {
+            return Ok(());
+        }
+        namespace.refresh_native();
+        let mut local = self.local_addr()?;
+        let peer = unmapped(peer);
+        if local.port() == 0 && matches!(self.kind, 1 | 2) {
+            self.native
+                .control()
+                .bind(
+                    &SocketAddr::new(
+                        if self.family == 2 {
+                            Ipv4Addr::UNSPECIFIED.into()
+                        } else {
+                            Ipv6Addr::UNSPECIFIED.into()
+                        },
+                        0,
+                    )
+                    .into(),
+                )
+                .map_err(from_io)?;
+            local = self.local_addr()?;
+        }
+        local = unmapped(local);
+        if let Some(source) = source.filter(|ip| !ip.is_unspecified()) {
+            local.set_ip(unmapped(SocketAddr::new(source, 0)).ip());
+        }
+        if local.ip().is_unspecified() {
+            local.set_ip(if peer.ip().is_loopback() {
+                if peer.is_ipv4() {
+                    Ipv4Addr::LOCALHOST.into()
+                } else {
+                    Ipv6Addr::LOCALHOST.into()
+                }
+            } else {
+                namespace
+                    .graph
+                    .borrow()
+                    .source(namespace.id(), peer.ip())
+                    .map(|v| v.0)
+                    .unwrap_or(local.ip())
+            });
+        }
+        let protocol = if self.kind == 1 {
+            6
+        } else if self.kind == 2 {
+            17
+        } else if peer.is_ipv4() {
+            1
+        } else {
+            58
+        };
+        let (source, dest) = if input { (peer, local) } else { (local, peer) };
+        let mut packet = crate::conntrack::message(source, dest, protocol, flags, bytes);
+        let binding = self
+            .policy_forward
+            .borrow()
+            .get(&(local, peer))
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(300))
+            .map(|(f, _)| *f);
+        let result =
+            namespace
+                .graph
+                .borrow()
+                .native_policy(namespace.id(), input, &mut packet, binding);
+        if let Some(forward) = result {
+            if input {
+                let mut cache = self.policy_forward.borrow_mut();
+                if let Some(forward) = forward {
+                    cache.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(300));
+                    if cache.len() >= 512 && !cache.contains_key(&(local, peer)) {
+                        if let Some(key) =
+                            cache.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k)
+                        {
+                            cache.remove(&key);
+                        }
+                    }
+                    cache.insert((local, peer), (forward, Instant::now()));
+                } else {
+                    cache.remove(&(local, peer));
+                }
+            }
+            Ok(())
+        } else {
+            Err(NetError(13))
+        }
+    }
+    fn dns_endpoint(&self, address: SocketAddr) -> Result<Rc<direct_dns::Endpoint>> {
+        self.network.destination(address)?;
         if self.family != 2 || !matches!(self.kind, 1 | 2) {
             return Err(NetError(97));
         }
-        if self.dns.borrow().is_none() {
+        if !self.dns.borrow().contains_key(&address) {
             if self.local_addr()?.port() == 0 {
                 self.native
                     .control()
@@ -350,12 +501,12 @@ impl Socket {
                     )
                     .map_err(from_io)?;
             }
-            *self.dns.borrow_mut() = Some(direct_dns::Endpoint::new(
-                self.network.0.dns.clone(),
-                self.kind == 1,
-            ));
+            self.dns.borrow_mut().insert(
+                address,
+                direct_dns::Endpoint::new(self.network.0.dns.clone(), self.kind == 1),
+            );
         }
-        Ok(self.dns.borrow().as_ref().expect("DNS endpoint").clone())
+        Ok(self.dns.borrow()[&address].clone())
     }
     pub fn info(&self) -> super::SocketInfo {
         super::SocketInfo {
@@ -415,7 +566,7 @@ impl Socket {
         Ok(address.into())
     }
     pub fn bind(&self, address: SocketAddr) -> Result<()> {
-        if address == direct_dns::ADDRESS {
+        if direct_dns::system_address(address) {
             return Err(NetError(98));
         }
         let native = self.address(address)?;
@@ -450,11 +601,19 @@ impl Socket {
         let (native, peer) = self.native.control().accept().map_err(from_io)?;
         configure(&native)?;
         let peer = peer.as_socket().ok_or(NetError(5))?;
-        Ok((
-            self.network
-                .wrap(native, self.family, 1, Connection::Connected),
-            peer,
-        ))
+        let accepted = self
+            .network
+            .wrap(native, self.family, 1, Connection::Connected);
+        if let Some(policy) = self.policy.borrow().as_ref() {
+            accepted.attach_policy(policy.clone());
+        }
+        if accepted.policy_check(true, peer, &[], 2).is_err()
+            || accepted.policy_check(false, peer, &[], 18).is_err()
+        {
+            let _ = accepted.shutdown(2);
+            return Err(NetError(11));
+        }
+        Ok((accepted, peer))
     }
     pub fn connect(&self, address: SocketAddr) -> Result<()> {
         let native = self.address(address)?;
@@ -468,8 +627,12 @@ impl Socket {
                 Connection::Idle => {}
             }
         }
-        if address == direct_dns::ADDRESS {
-            self.dns_endpoint()?;
+        if matches!(self.kind, 1 | 2) {
+            self.policy_check(false, address, &[], 2)?;
+        }
+        if direct_dns::system_address(address) {
+            self.dns_endpoint(address)?;
+            self.dns_target.set(address);
             self.dns_peer.set(true);
             self.connection.set(Connection::Connected);
             return Ok(());
@@ -497,7 +660,16 @@ impl Socket {
                     self.connection.set(Connection::Failed(error));
                     self.pending_error.set(Some(error));
                 } else {
-                    self.connection.set(Connection::Connected);
+                    let check = self
+                        .peer_addr()
+                        .and_then(|peer| self.policy_check(true, peer, &[], 18));
+                    if let Err(e) = check {
+                        self.connection.set(Connection::Failed(e.0));
+                        self.pending_error.set(Some(e.0));
+                        let _ = self.native.control().shutdown(Shutdown::Both);
+                    } else {
+                        self.connection.set(Connection::Connected);
+                    }
                 }
             }
         }
@@ -542,7 +714,7 @@ impl Socket {
     }
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         if self.dns_peer.get() {
-            return Ok(direct_dns::ADDRESS);
+            return Ok(self.dns_target.get());
         }
         self.native
             .control()
@@ -553,7 +725,7 @@ impl Socket {
     }
     pub fn shutdown(&self, how: u32) -> Result<()> {
         if self.dns_peer.get() {
-            return self.dns_endpoint()?.shutdown(how);
+            return self.dns_endpoint(self.dns_target.get())?.shutdown(how);
         }
         let how = match how {
             0 => Shutdown::Read,
@@ -563,7 +735,45 @@ impl Socket {
         };
         self.native.control().shutdown(how).map_err(from_io)
     }
+    pub fn send_packet(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        address: Option<SocketAddr>,
+        info: crate::PacketInfo,
+    ) -> Result<usize> {
+        if self.kind != 2 {
+            return Err(NetError(95));
+        }
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+            return Err(NetError(95));
+        }
+        if bytes.len() > if self.family == 2 { 65507 } else { 65527 } {
+            return Err(NetError(90));
+        }
+        let peer = address
+            .or_else(|| self.peer_addr().ok())
+            .ok_or(NetError(89))?;
+        self.network.destination(peer)?;
+        if peer.is_ipv4() != info.address.is_ipv4() {
+            return Err(NetError(22));
+        }
+        if info.address.is_unspecified() {
+            return self.send(bytes, flags, address);
+        }
+        self.policy_check_source(false, peer, bytes, 24, Some(info.address))?;
+        let n = if direct_dns::system_address(peer) {
+            self.send_inner(bytes, flags, address)?
+        } else {
+            pktinfo::send(self.native.as_fd().as_raw_fd(), bytes, peer, info.address)?
+        };
+        self.network.account(Some(peer.ip()), n, true);
+        Ok(n)
+    }
     pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
+        if let Some(peer) = address.or_else(|| self.peer_addr().ok()) {
+            self.policy_check(false, peer, bytes, 24)?;
+        }
         let sent = self.send_inner(bytes, flags, address)?;
         if sent != 0 || self.kind != 1 {
             self.network.account(
@@ -584,8 +794,12 @@ impl Socket {
         if self.kind == 2 && bytes.len() > if self.family == 2 { 65507 } else { 65527 } {
             return Err(NetError(90));
         }
-        if address == Some(direct_dns::ADDRESS) || address.is_none() && self.dns_peer.get() {
-            return self.dns_endpoint()?.send(bytes);
+        if address.is_some_and(direct_dns::system_address)
+            || address.is_none() && self.dns_peer.get()
+        {
+            return self
+                .dns_endpoint(address.unwrap_or(self.dns_target.get()))?
+                .send(bytes);
         }
         if self.kind == 1 {
             self.before_io()?;
@@ -628,7 +842,40 @@ impl Socket {
         result
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
-        let received = self.recv_inner(count, flags)?;
+        let mut received = self.recv_inner(count, flags)?;
+        let mut allowed = false;
+        for attempt in 0..16 {
+            let Some(peer) = received.address.or_else(|| self.peer_addr().ok()) else {
+                break;
+            };
+            if self
+                .policy_check_source(
+                    true,
+                    peer,
+                    &received.data,
+                    24,
+                    received.packet_info.map(|i| i.address),
+                )
+                .is_ok()
+            {
+                allowed = true;
+                break;
+            }
+            if self.kind == 1 {
+                let _ = self.shutdown(2);
+                return Err(NetError(13));
+            }
+            if flags & MSG_PEEK != 0 {
+                let _ = self.recv_inner(65536, flags & !MSG_PEEK);
+            }
+            if attempt == 15 {
+                return Err(NetError(11));
+            }
+            received = self.recv_inner(count, flags)?;
+        }
+        if !allowed && (received.address.is_some() || self.peer_addr().is_ok()) {
+            return Err(NetError(11));
+        }
         if flags & MSG_PEEK == 0 && (received.length != 0 || self.kind != 1) {
             self.network.account(
                 received
@@ -654,11 +901,23 @@ impl Socket {
         if self.kind == 4 {
             return self.recv_echo(count, flags);
         }
-        if let Some(dns) = self.dns.borrow().as_ref() {
-            match dns.recv(count, flags) {
-                Err(NetError(11)) if !self.dns_peer.get() => {}
-                result => return result,
+        for (&address, dns) in self.dns.borrow().iter() {
+            if self.dns_peer.get() && address != self.dns_target.get() {
+                continue;
             }
+            match dns.recv(count, flags) {
+                Err(NetError(11)) => {}
+                Ok(mut r) => {
+                    if r.address.is_some() {
+                        r.address = Some(address);
+                    }
+                    return Ok(r);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if self.dns_peer.get() {
+            return Err(NetError(11));
         }
         if self.kind == 1 {
             self.before_io()?;
@@ -668,6 +927,7 @@ impl Socket {
                 }
                 return Ok(Received {
                     netlink_address: None,
+                    packet_info: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -677,6 +937,7 @@ impl Socket {
             if count == 0 {
                 return Ok(Received {
                     netlink_address: None,
+                    packet_info: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -687,6 +948,7 @@ impl Socket {
         // Receive a complete UDP datagram into one bounded scratch buffer, even
         // for a zero-sized guest buffer. This preserves MSG_TRUNC and datagrams.
         let mut data = vec![0; if self.kind != 1 { 65536 } else { count }];
+        let mut packet_info = None;
         let (length, address) = match &self.native {
             NativeSocket::Tcp(socket) => {
                 let length = if flags & MSG_PEEK != 0 {
@@ -699,18 +961,36 @@ impl Socket {
                 (length, None)
             }
             NativeSocket::Udp(socket) => {
-                let (length, address) = if flags & MSG_PEEK != 0 {
-                    socket.peek_from(&mut data)
+                if self.receive_packet_info.get() {
+                    let (length, peer, dest) = pktinfo::receive(
+                        self.native.as_fd().as_raw_fd(),
+                        &mut data,
+                        flags & MSG_PEEK != 0,
+                    )?;
+                    packet_info = dest.map(|ip| crate::PacketInfo {
+                        address: ip,
+                        interface: if unmapped(SocketAddr::new(ip, 0)).ip().is_loopback() {
+                            1
+                        } else {
+                            2
+                        },
+                    });
+                    (length, Some(peer))
                 } else {
-                    socket.recv_from(&mut data)
+                    let (length, address) = if flags & MSG_PEEK != 0 {
+                        socket.peek_from(&mut data)
+                    } else {
+                        socket.recv_from(&mut data)
+                    }
+                    .map_err(from_io)?;
+                    (length, Some(address))
                 }
-                .map_err(from_io)?;
-                (length, Some(address))
             }
         };
         data.truncate(length.min(count));
         Ok(Received {
             netlink_address: None,
+            packet_info,
             data,
             address,
             length,
@@ -759,8 +1039,13 @@ impl Socket {
                     0
                 });
         }
-        if let Some(dns) = self.dns.borrow().as_ref() {
-            let ready = dns.poll(events);
+        if !self.dns.borrow().is_empty() {
+            let ready = self
+                .dns
+                .borrow()
+                .iter()
+                .filter(|(a, _)| !self.dns_peer.get() || **a == self.dns_target.get())
+                .fold(0, |out, (_, dns)| out | dns.poll(events));
             if self.dns_peer.get() {
                 return Ok(ready);
             }
@@ -817,6 +1102,20 @@ impl Socket {
                 return Ok(());
             }
         }
+        if matches!((level,name),(0,8)if self.family==2)
+            || matches!((level,name),(41,49)if self.family==10)
+        {
+            if self.kind != 2 {
+                return Err(NetError(92));
+            }
+            pktinfo::enable(
+                self.native.as_fd().as_raw_fd(),
+                self.family == 10,
+                value != 0,
+            )?;
+            self.receive_packet_info.set(value != 0);
+            return Ok(());
+        }
         let result = match (level, name) {
             (1, 2) => self.native.control().set_reuse_address(value != 0),
             (1, 6) => self.native.control().set_broadcast(value != 0),
@@ -867,6 +1166,8 @@ impl Socket {
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
+            (0, 8) if self.family == 2 => Ok(i32::from(self.receive_packet_info.get())),
+            (41, 49) if self.family == 10 => Ok(i32::from(self.receive_packet_info.get())),
             (1, 3) => Ok(match self.kind {
                 3 => 2,
                 4 => 3,

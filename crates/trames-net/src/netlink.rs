@@ -97,7 +97,6 @@ impl Namespace {
         let view = crate::netdev::View {
             graph: self.graph.clone(),
             namespace: self.id(),
-            native_root: true,
         };
         let stack = fabric.dynamic_environment(n.mode(), view, Rc::new(Cell::new(true)))?;
         self.stack
@@ -553,6 +552,7 @@ impl Socket {
         let packet = queue.front().ok_or(NetError(11))?;
         let bytes = &packet.data;
         let result = Received {
+            packet_info: None,
             netlink_address: Some(packet.source),
             data: bytes[..bytes.len().min(count)].to_vec(),
             length: bytes.len(),

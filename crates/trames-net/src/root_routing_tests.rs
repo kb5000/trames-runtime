@@ -188,7 +188,17 @@ fn l3_forwarding_is_per_family_and_hop_limit_and_routes_really_apply() {
         .1
         .graph
         .borrow()
-        .target(a.namespace_id(), "198.51.100.9".parse().unwrap())
+        .route_packet(
+            a.namespace_id(),
+            None,
+            &mut crate::conntrack::message(
+                "172.24.0.2:19000".parse().unwrap(),
+                "198.51.100.9:9".parse().unwrap(),
+                17,
+                0,
+                b"denied"
+            )
+        )
         .is_none());
 }
 #[test]

@@ -9,6 +9,9 @@ use std::{
     rc::Rc,
 };
 type Result<T> = std::result::Result<T, NetError>;
+#[path = "netdev_router.rs"]
+mod router;
+pub(crate) use router::NativeForward;
 const MAX_LINKS: usize = 256;
 const MAX_ADDRESSES: usize = 6; // Plus the two loopback addresses in smoltcp.
 const MAX_ROUTES: usize = 64;
@@ -54,6 +57,8 @@ struct Space {
     direct: bool,
     forwarding: [bool; 2],
     firewall: Rc<RefCell<crate::nftables::Ruleset>>,
+    connections: Rc<RefCell<crate::conntrack::State>>,
+    bridge_filter: [bool; 2],
 }
 #[derive(Clone, Default)]
 pub(crate) struct Topology {
@@ -66,14 +71,6 @@ pub(crate) struct Topology {
 pub(crate) struct View {
     pub graph: Rc<RefCell<Topology>>,
     pub namespace: u64,
-    pub native_root: bool,
-}
-#[derive(Clone, Copy)]
-pub(crate) struct PacketPath {
-    pub namespace: u64,
-    pub output: u32,
-    pub input: u32,
-    pub transit: [Option<(u64, u32, u32)>; 16],
 }
 impl Address {
     pub fn contains(self, ip: IpAddr) -> bool {
@@ -145,6 +142,8 @@ impl Topology {
                 direct: false,
                 forwarding: [false; 2],
                 firewall: Rc::default(),
+                connections: Rc::default(),
+                bridge_filter: [true; 2],
             },
         );
         self.devices.insert(
@@ -294,6 +293,16 @@ impl Topology {
             .get(&id)
             .is_some_and(|s| s.forwarding[usize::from(ipv6)])
     }
+    pub fn bridge_filter(&self, id: u64, ipv6: bool) -> bool {
+        self.spaces
+            .get(&id)
+            .is_some_and(|s| s.bridge_filter[usize::from(ipv6)])
+    }
+    pub fn set_bridge_filter(&mut self, id: u64, ipv6: bool, enabled: bool) {
+        if let Some(s) = self.spaces.get_mut(&id) {
+            s.bridge_filter[usize::from(ipv6)] = enabled;
+        }
+    }
     pub fn set_forwarding(&mut self, id: u64, ipv6: bool, enabled: bool) {
         if let Some(s) = self.spaces.get_mut(&id) {
             s.forwarding[usize::from(ipv6)] = enabled;
@@ -301,6 +310,15 @@ impl Topology {
         }
     }
     pub fn remove_space(&mut self, id: u64) {
+        let ips: Vec<_> = self
+            .devices(id)
+            .iter()
+            .flat_map(|d| d.addresses.iter().map(|a| a.ip))
+            .filter(|ip| !ip.is_loopback())
+            .collect();
+        for space in self.spaces.values() {
+            space.connections.borrow_mut().remove_addresses(&ips);
+        }
         let links: Vec<_> = self
             .devices
             .keys()
@@ -660,7 +678,9 @@ impl Topology {
     }
     pub fn own(&self, id: u64, ip: IpAddr) -> bool {
         self.devices(id).iter().any(|d| {
-            d.addresses.iter().any(|a| a.ip == ip) && (d.kind != DeviceKind::Loopback || d.up)
+            d.addresses.iter().any(|a| {
+                a.ip == ip || d.kind == DeviceKind::Loopback && ip.is_loopback() && a.contains(ip)
+            }) && (d.kind != DeviceKind::Loopback || d.up)
         })
     }
     pub fn source(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
@@ -668,9 +688,31 @@ impl Topology {
             let d = self
                 .devices(id)
                 .into_iter()
-                .find(|d| d.addresses.iter().any(|a| a.ip == destination))
+                .find(|d| {
+                    d.addresses.iter().any(|a| {
+                        a.ip == destination
+                            || d.kind == DeviceKind::Loopback
+                                && destination.is_loopback()
+                                && a.contains(destination)
+                    })
+                })
                 .unwrap();
-            return Ok((destination, d.index, None));
+            let source = d
+                .addresses
+                .iter()
+                .find(|a| a.ip == destination)
+                .or_else(|| d.addresses.iter().find(|a| a.contains(destination)))
+                .ok_or(NetError(99))?
+                .ip;
+            return Ok((
+                source,
+                if d.kind == DeviceKind::Loopback {
+                    d.index
+                } else {
+                    1
+                },
+                None,
+            ));
         }
         let mut routes = self.routes(id);
         routes.sort_by_key(|r| (std::cmp::Reverse(r.destination.prefix), r.metric));
@@ -688,122 +730,22 @@ impl Topology {
         }
         Err(NetError(101))
     }
-    /// Resolve actual L2 adjacency at each L3 hop. Routes never create an
-    /// implicit fabric connection. Native interfaces are deliberately excluded
-    /// from forwarding until explicit filtering/NAT is implemented.
-    pub fn target(&self, id: u64, destination: IpAddr) -> Option<PacketPath> {
-        let (_, first, _) = self.source(id, destination).ok()?;
-        let mut current = id;
-        let mut hops = 0;
-        let mut transit = [None; 16];
-        let mut incoming = 0;
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert(current) || hops >= 16 {
-                return None;
-            }
-            let (_, out, gateway) = self.source(current, destination).ok()?;
-            if current != id {
-                transit[(hops - 1) as usize] = Some((current, incoming, out));
-            }
-            if self.own(current, destination) {
-                return Some(PacketPath {
-                    namespace: current,
-                    output: first,
-                    input: out,
-                    transit,
-                });
-            }
-            let next = gateway.unwrap_or(destination);
-            let (ns, input) = self.neighbor(current, out, next)?;
-            if next == destination || self.own(ns, destination) {
-                return Some(PacketPath {
-                    namespace: ns,
-                    output: first,
-                    input,
-                    transit,
-                });
-            }
-            if !self.forwarding(ns, destination.is_ipv6()) {
-                return None;
-            }
-            current = ns;
-            incoming = input;
-            hops += 1;
+    pub fn address_type(&self, id: u64, ip: IpAddr) -> u32 {
+        if self.own(id, ip) || ip.is_loopback() {
+            2
+        } else if ip.is_multicast() {
+            5
+        } else if matches!(ip,IpAddr::V4(v) if v.is_broadcast()) {
+            3
+        } else {
+            1
         }
+    }
+    pub fn connections(&self, id: u64) -> Rc<RefCell<crate::conntrack::State>> {
+        self.spaces[&id].connections.clone()
     }
     pub fn firewall(&self, id: u64) -> Rc<RefCell<crate::nftables::Ruleset>> {
         self.spaces[&id].firewall.clone()
-    }
-    pub fn filter_path(&self, source: u64, path: PacketPath, packet: &mut [u8]) -> bool {
-        use crate::nftables::Context;
-        let check = |ns: u64, hook, input, output, packet: &[u8]| {
-            let rules = self.spaces[&ns].firewall.borrow();
-            if !rules.active(hook) {
-                return true;
-            }
-            let name = |index| self.device(ns, index).map(|d| d.name).unwrap_or_default();
-            rules.allows(&Context {
-                packet,
-                hook,
-                input,
-                output,
-                input_name: &name(input),
-                output_name: &name(output),
-            })
-        };
-        if !check(source, 3, 0, path.output, packet) || !check(source, 4, 0, path.output, packet) {
-            return false;
-        }
-        for (ns, input, output) in path.transit.into_iter().flatten() {
-            if !check(ns, 0, input, 0, packet) {
-                return false;
-            }
-            let ttl = if packet[0] >> 4 == 4 { 8 } else { 7 };
-            if packet[ttl] <= 1 {
-                return false;
-            }
-            packet[ttl] -= 1;
-            if packet[0] >> 4 == 4 {
-                smoltcp::wire::Ipv4Packet::new_unchecked(&mut *packet).fill_checksum();
-            }
-            if !check(ns, 2, input, output, packet) || !check(ns, 4, 0, output, packet) {
-                return false;
-            }
-        }
-        check(path.namespace, 0, path.input, 0, packet)
-            && check(path.namespace, 1, path.input, 0, packet)
-    }
-    fn neighbor(&self, id: u64, out: u32, address: IpAddr) -> Option<(u64, u32)> {
-        let mut todo = vec![(id, out)];
-        let mut visited = BTreeSet::new();
-        while let Some(key) = todo.pop() {
-            if !visited.insert(key) {
-                continue;
-            }
-            let d = self.device(key.0, key.1).ok()?;
-            if !d.up {
-                continue;
-            }
-            if d.namespace != id && d.addresses.iter().any(|a| a.ip == address) {
-                return Some((d.namespace, d.index));
-            }
-            match d.kind {
-                DeviceKind::Veth { peer } => {
-                    if let Some(p) = self.peer_device(peer) {
-                        todo.push((p.namespace, p.index));
-                    }
-                    if let Some(master) = d.master {
-                        todo.push((d.namespace, master));
-                    }
-                }
-                DeviceKind::Bridge => todo.extend(self.devices.iter().filter_map(|(&key, v)| {
-                    (v.namespace == d.namespace && v.master == Some(d.index)).then_some(key)
-                })),
-                _ => {}
-            }
-        }
-        None
     }
     pub fn peer_device(&self, index: u32) -> Option<Device> {
         self.devices
@@ -837,34 +779,17 @@ impl Topology {
 }
 impl View {
     pub fn own(&self, ip: IpAddr) -> bool {
-        if self.native_root {
-            return self.addresses(false).iter().any(|a| a.ip == ip);
-        }
         self.graph.borrow().own(self.namespace, ip)
     }
     pub fn source(&self, ip: IpAddr) -> Result<IpAddr> {
-        let graph = self.graph.borrow();
-        let (source, index, _) = graph.source(self.namespace, ip)?;
-        if self.native_root
-            && matches!(
-                graph.device(self.namespace, index)?.kind,
-                DeviceKind::Direct | DeviceKind::Loopback
-            )
-        {
-            return Err(NetError(101));
-        }
-        Ok(source)
+        self.graph.borrow().source(self.namespace, ip).map(|v| v.0)
     }
     pub fn addresses(&self, up_only: bool) -> Vec<Address> {
         self.graph
             .borrow()
             .devices(self.namespace)
             .into_iter()
-            .filter(|d| {
-                (!up_only || d.up)
-                    && (!self.native_root
-                        || !matches!(d.kind, DeviceKind::Loopback | DeviceKind::Direct))
-            })
+            .filter(|d| !up_only || d.up)
             .flat_map(|d| d.addresses)
             .collect()
     }

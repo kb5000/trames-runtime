@@ -22,7 +22,7 @@ struct Fragments {
 impl Port {
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
         self.fragments.retain(|f| f.expires > Instant::now());
-        if p.len() > MTU || self.rx.len() == QUEUE {
+        if p.len() > 65575 || self.rx.len() == QUEUE {
             return false;
         }
         let Some(h) = header(&p) else {
@@ -201,17 +201,17 @@ impl Device for Port {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct Tuple {
+pub(crate) struct Tuple {
     pub source: SocketAddr,
     pub destination: SocketAddr,
 }
-pub(super) struct Header {
+pub(crate) struct Header {
     pub tuple: Tuple,
     pub protocol: u8,
     pub offset: usize,
     pub first: bool,
 }
-pub(super) fn header(p: &[u8]) -> Option<Header> {
+pub(crate) fn header(p: &[u8]) -> Option<Header> {
     let (src, dst, proto, offset, first) = match p.first()? >> 4 {
         4 => {
             if p.len() < 20 {
@@ -272,6 +272,35 @@ pub(super) fn header(p: &[u8]) -> Option<Header> {
         offset,
         first,
     })
+}
+pub(crate) fn valid_transport(p: &[u8]) -> bool {
+    let Some(h) = header(p) else {
+        return false;
+    };
+    if !h.first {
+        return false;
+    }
+    let (source, dest) = (
+        smoltcp::wire::IpAddress::from(h.tuple.source.ip()),
+        smoltcp::wire::IpAddress::from(h.tuple.destination.ip()),
+    );
+    let b = &p[h.offset..];
+    match h.protocol {
+        6 => smoltcp::wire::TcpPacket::new_checked(b)
+            .is_ok_and(|p| p.verify_checksum(&source, &dest)),
+        17 => smoltcp::wire::UdpPacket::new_checked(b)
+            .is_ok_and(|p| p.verify_checksum(&source, &dest)),
+        1 => smoltcp::wire::Icmpv4Packet::new_checked(b).is_ok_and(|p| p.verify_checksum()),
+        58 => {
+            if let (IpAddr::V6(s), IpAddr::V6(d)) = (h.tuple.source.ip(), h.tuple.destination.ip())
+            {
+                smoltcp::wire::Icmpv6Packet::new_checked(b).is_ok_and(|p| p.verify_checksum(&s, &d))
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 #[cfg(test)]
 mod tests {

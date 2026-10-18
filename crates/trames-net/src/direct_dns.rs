@@ -11,6 +11,11 @@ use std::{
 
 pub(crate) const ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)), 53);
+pub(crate) const ROUTABLE_ADDRESS: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(169, 254, 0, 53)), 53);
+pub(crate) fn system_address(address: SocketAddr) -> bool {
+    address == ADDRESS || address == ROUTABLE_ADDRESS
+}
 const LIMIT: usize = 8;
 const BUFFER: usize = 8192;
 type Result<T> = std::result::Result<T, NetError>;
@@ -119,6 +124,7 @@ pub(crate) struct Endpoint {
     service: Rc<Service>,
     stream: bool,
     state: RefCell<State>,
+    epoch: std::cell::Cell<u64>,
 }
 impl Endpoint {
     pub fn new(service: Rc<Service>, stream: bool) -> Rc<Self> {
@@ -126,7 +132,11 @@ impl Endpoint {
             service,
             stream,
             state: RefCell::default(),
+            epoch: std::cell::Cell::new(0),
         })
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch.get()
     }
     fn reply(&self, mut packet: Vec<u8>) {
         let mut s = self.state.borrow_mut();
@@ -140,6 +150,7 @@ impl Endpoint {
             packet = framed;
         }
         s.replies.push_back(packet);
+        self.epoch.set(self.epoch.get().wrapping_add(1));
     }
     fn complete(&self, packet: Vec<u8>) {
         self.state.borrow_mut().pending -= 1;
@@ -209,6 +220,7 @@ impl Endpoint {
         }
         let empty = || Received {
             netlink_address: None,
+            packet_info: None,
             data: Vec::new(),
             address: None,
             length: 0,
@@ -236,6 +248,7 @@ impl Endpoint {
         }
         Ok(Received {
             netlink_address: None,
+            packet_info: None,
             data,
             address: (!self.stream).then_some(ADDRESS),
             length,

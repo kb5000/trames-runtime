@@ -6,6 +6,7 @@ enum Sysctl {
     PingRange,
     UnprivilegedPort,
     Forwarding(bool),
+    BridgeFilter(bool),
 }
 impl Sysctl {
     fn path(path: &[u8]) -> Option<Self> {
@@ -16,6 +17,8 @@ impl Sysctl {
                 Some(Self::Forwarding(false))
             }
             b"/proc/sys/net/ipv6/conf/all/forwarding" => Some(Self::Forwarding(true)),
+            b"/proc/sys/net/bridge/bridge-nf-call-iptables" => Some(Self::BridgeFilter(false)),
+            b"/proc/sys/net/bridge/bridge-nf-call-ip6tables" => Some(Self::BridgeFilter(true)),
             _ => None,
         }
     }
@@ -34,6 +37,7 @@ impl Control {
                 format!("{a}\t{b}\n")
             }
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
+            Sysctl::BridgeFilter(ipv6) => format!("{}\n", u8::from(n.bridge_filter(ipv6))),
             Sysctl::Forwarding(ipv6) => format!("{}\n", u8::from(n.forwarding(ipv6))),
         }
         .into_bytes();
@@ -64,6 +68,9 @@ impl Control {
             }
             (Sysctl::UnprivilegedPort, [port]) if *port <= u16::MAX as u32 => {
                 n.set_unprivileged_port(*port as u16)
+            }
+            (Sysctl::BridgeFilter(ipv6), [enabled]) if *enabled <= 1 => {
+                n.set_bridge_filter(ipv6, *enabled != 0)
             }
             (Sysctl::Forwarding(ipv6), [enabled]) if *enabled <= 1 => {
                 n.set_forwarding(ipv6, *enabled != 0)
@@ -110,6 +117,15 @@ impl Vfs {
     pub fn configure_local_fabric(&mut self, mode: NetworkMode) -> Result<()> {
         let fabric = trames_net::Fabric::new().map_err(|e| Errno(e.0))?;
         self.configure_virtual_network(&fabric, 2, mode)
+    }
+    pub fn map_network_host_ip(
+        &self,
+        virtual_ip: std::net::IpAddr,
+        host_ip: std::net::IpAddr,
+    ) -> Result<()> {
+        self.network
+            .map_host_ip(virtual_ip, host_ip)
+            .map_err(|e| Errno(e.0))
     }
     pub fn network_devices(&self) -> Vec<trames_net::Device> {
         let mut devices = self.network.devices();
@@ -302,6 +318,171 @@ mod tests {
         v.credentials = Credentials::user(1000, 1000);
         v.seek(f, 0, 0).unwrap();
         assert_eq!(v.write(f, b"0"), Err(Errno(13)));
+    }
+    #[test]
+    fn bridge_sysctls_are_namespace_pinned_and_authorized() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let fd = v
+            .open_at(
+                AT_FDCWD,
+                b"/proc/sys/net/bridge/bridge-nf-call-iptables",
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(v.read(fd, 10).unwrap(), b"1\n");
+        v.seek(fd, 0, 0).unwrap();
+        v.write(fd, b"0").unwrap();
+        assert!(!v.network.bridge_filter(false));
+        assert!(v.network.bridge_filter(true));
+        v.unshare_net().unwrap();
+        assert!(v.network.bridge_filter(false));
+        v.seek(fd, 0, 0).unwrap();
+        v.write(fd, b"1").unwrap();
+        v.seek(fd, 0, 0).unwrap();
+        assert_eq!(v.write(fd, b"2"), Err(Errno(22)));
+        v.credentials = Credentials::user(1000, 1000);
+        assert_eq!(v.write(fd, b"0"), Err(Errno(13)));
+    }
+    #[test]
+    fn splice_preserves_bytes_under_backpressure_and_stream_half_close() {
+        let mut v = Vfs::default();
+        let [a, b] = v.socketpair(1, 1 | O_NONBLOCK, 0).unwrap();
+        let [r, w] = v.pipe(O_NONBLOCK).unwrap();
+        let [r2, w2] = v.pipe(O_NONBLOCK).unwrap();
+        v.write(a, b"socket to pipe").unwrap();
+        assert_eq!(v.splice(b, w, 6, None, None), Ok(6));
+        assert_eq!(v.read(r, 20).unwrap(), b"socket");
+        assert_eq!(v.splice(b, w, 100, None, None), Ok(8));
+        assert_eq!(v.splice(r, a, 3, None, None), Ok(3));
+        assert_eq!(v.read(b, 10).unwrap(), b" to");
+        assert_eq!(v.read(r, 20).unwrap(), b" pipe");
+        assert_eq!(v.splice(b, w, 100, None, None), Err(Errno(11)));
+        v.write(w, b"preserve").unwrap();
+        v.write(w2, &vec![0; PIPE_CAPACITY]).unwrap();
+        assert_eq!(v.splice(r, w2, 8, None, None), Err(Errno(11)));
+        v.read(r2, 3).unwrap();
+        assert_eq!(v.splice(r, w2, 8, None, None), Ok(3));
+        assert_eq!(v.read(r, 20).unwrap(), b"serve");
+        assert_eq!(v.splice(r, w, 1, None, None), Err(Errno(22)));
+        assert_eq!(v.splice(r, w2, 1, Some(0), None), Err(Errno(29)));
+        v.close(a).unwrap();
+        assert_eq!(v.splice(b, w, 10, None, None), Ok(0));
+    }
+    #[test]
+    fn native_and_virtual_epollet_wake_after_drain_and_new_arrival() {
+        for virtual_socket in [false, true] {
+            let mut v = Vfs::default();
+            v.configure_network(NetworkMode::Loopback).unwrap();
+            if virtual_socket {
+                v.unshare_net().unwrap();
+                v.set_loopback_up(true).unwrap();
+            }
+            let fd = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
+            let receiver = v.socket_fd(fd).unwrap();
+            receiver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = trames_net::encode_address(receiver.local_addr().unwrap());
+            let sender = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
+            let peer = v.socket_fd(sender).unwrap();
+            let ep = v.epoll_create(0).unwrap();
+            v.epoll_ctl(ep, 1, fd, 0x80000001, 7).unwrap();
+            assert!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap().is_empty());
+            for text in [b"one", b"two"] {
+                v.socket_send_bytes(&peer, text, 0, Some(&address)).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let ready = v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap();
+                    if !ready.is_empty() {
+                        assert_eq!(ready, vec![(1, 7)]);
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert_eq!(v.read(fd, 3).unwrap(), text);
+            }
+            assert!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn packet_info_is_per_datagram_and_source_selection_is_real() {
+        for private in [false, true] {
+            for v6 in [false, true] {
+                let mut v = Vfs::default();
+                v.configure_network(NetworkMode::Full).unwrap();
+                if private {
+                    v.unshare_net().unwrap();
+                    v.set_loopback_up(true).unwrap();
+                }
+                let family = if v6 { 10 } else { 2 };
+                let fd = v.socket(family, 2 | O_NONBLOCK, 0).unwrap();
+                let receiver = v.socket_fd(fd).unwrap();
+                receiver
+                    .set_option(if v6 { 41 } else { 0 }, if v6 { 49 } else { 8 }, 1)
+                    .unwrap();
+                receiver
+                    .bind(if v6 { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap())
+                    .unwrap();
+                let dest = SocketAddr::new(
+                    if v6 {
+                        std::net::Ipv6Addr::LOCALHOST.into()
+                    } else {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    },
+                    receiver.local_addr().unwrap().port(),
+                );
+                let sender = v.socket(family, 2 | O_NONBLOCK, 0).unwrap();
+                let sender = v.socket_fd(sender).unwrap();
+                sender.send(b"metadata", 0, Some(dest)).unwrap();
+                let expected = trames_net::PacketInfo {
+                    address: dest.ip(),
+                    interface: 1,
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let peek = loop {
+                    match receiver.recv(100, 2) {
+                        Ok(r) => break r,
+                        Err(trames_net::NetError(11)) => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::yield_now();
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                assert_eq!(peek.packet_info, Some(expected));
+                let r = receiver.recv(100, 0).unwrap();
+                assert_eq!(r.packet_info, peek.packet_info);
+                receiver
+                    .send_packet(b"reply", 0, r.address, expected)
+                    .unwrap();
+                loop {
+                    match sender.recv(100, 0) {
+                        Ok(r) => {
+                            assert_eq!(r.data, b"reply");
+                            assert_eq!(r.address, Some(dest));
+                            break;
+                        }
+                        Err(trames_net::NetError(11)) => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::yield_now();
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                let forged = trames_net::PacketInfo {
+                    address: if v6 { "2001:db8::9" } else { "198.18.0.9" }
+                        .parse()
+                        .unwrap(),
+                    interface: 0,
+                };
+                assert_eq!(
+                    receiver.send_packet(b"spoof", 0, r.address, forged),
+                    Err(trames_net::NetError(99))
+                );
+            }
+        }
     }
     #[test]
     fn fork_dup_cloexec_and_quota_follow_socket_lifetime() {

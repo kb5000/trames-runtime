@@ -8,6 +8,8 @@ use crate::{
 };
 use std::{cell::Cell, cmp::Ordering, collections::BTreeMap};
 type Result<T> = std::result::Result<T, NetError>;
+#[path = "nft_conntrack.rs"]
+mod ctnetlink;
 const SUBSYSTEM: u16 = 10 << 8;
 const MAX_BYTES: usize = 256 * 1024;
 type Attrs<'a> = Vec<(u16, &'a [u8])>;
@@ -96,6 +98,7 @@ struct Chain {
     handle: u64,
     hook: Option<(u32, i32)>,
     policy: u32,
+    chain_type: String,
     userdata: Vec<u8>,
     rules: Vec<Rule>,
     packets: Cell<u64>,
@@ -137,6 +140,47 @@ enum Expr {
         mask: Vec<u8>,
         xor: Vec<u8>,
     },
+    CtGet {
+        dest: usize,
+        key: u32,
+        direction: u8,
+    },
+    CtSet {
+        src: usize,
+        key: u32,
+    },
+    Fib {
+        dest: usize,
+        flags: u32,
+    },
+    ConntrackMatch {
+        revision: u32,
+        info: Vec<u8>,
+    },
+    FixedNat {
+        source: bool,
+        address: Option<std::net::IpAddr>,
+        ports: Option<(u16, u16)>,
+        masquerade: bool,
+    },
+    Zone(u16),
+    AddrType {
+        source: u16,
+        destination: u16,
+        flags: u32,
+    },
+    Nat {
+        source: bool,
+        family: u32,
+        address: Option<usize>,
+        address_max: Option<usize>,
+        port: Option<usize>,
+        port_max: Option<usize>,
+    },
+    Masquerade {
+        port: Option<usize>,
+        port_max: Option<usize>,
+    },
     Counter {
         packets: Cell<u64>,
         bytes: Cell<u64>,
@@ -161,7 +205,7 @@ fn value(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(v.to_vec())
 }
-fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
+fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
     let mut out = vec![];
     let mut initialized = [false; 64];
     for (kind, b) in attrs(bytes)? {
@@ -263,6 +307,241 @@ fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
                     xor,
                 }
             }
+            "ct" => {
+                let a = fields(data, &[1, 2, 3, 4])?;
+                let key = num(&a, 2)?;
+                let len = match key {
+                    0 | 2 | 3 | 19 | 20 | 23 => 4,
+                    1 | 7 | 10 => 1,
+                    11 | 12 | 17 => 2,
+                    8 | 9 => {
+                        if rule_family == 2 {
+                            4
+                        } else {
+                            16
+                        }
+                    }
+                    21 | 22 => 16,
+                    _ => return Err(NetError(95)),
+                };
+                if let Some(src) = get(&a, 4) {
+                    if get(&a, 1).is_some() || !matches!(key, 3 | 17) {
+                        return Err(NetError(95));
+                    }
+                    let src = reg(u32v(src)?, len)?;
+                    if initialized[src..src + len].contains(&false) {
+                        return Err(NetError(22));
+                    }
+                    Expr::CtSet { src, key }
+                } else {
+                    let dest = reg(num(&a, 1)?, len)?;
+                    initialized[dest..dest + len].fill(true);
+                    let direction = get(&a, 3)
+                        .map(|b| {
+                            if b.len() == 1 && b[0] <= 1 {
+                                Ok(b[0])
+                            } else {
+                                Err(NetError(22))
+                            }
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
+                    Expr::CtGet {
+                        dest,
+                        key,
+                        direction,
+                    }
+                }
+            }
+            "fib" => {
+                let a = fields(data, &[1, 2, 3])?;
+                let flags = num(&a, 3)?;
+                if num(&a, 2)? != 3 || !matches!(flags, 1 | 2) {
+                    return Err(NetError(95));
+                }
+                let dest = reg(num(&a, 1)?, 4)?;
+                initialized[dest..dest + 4].fill(true);
+                Expr::Fib { dest, flags }
+            }
+            "match" => {
+                let a = fields(data, &[1, 2, 3])?;
+                let kind = name(&a, 1)?;
+                let revision = num(&a, 2)?;
+                let b = need(&a, 3)?;
+                if kind == "conntrack" {
+                    if revision > 3 || b.len() != if revision == 3 { 168 } else { 160 } {
+                        return Err(NetError(95));
+                    }
+                    let flags = u16::from_le_bytes(b[146..148].try_into().unwrap());
+                    let inverse = u16::from_le_bytes(b[148..150].try_into().unwrap());
+                    if flags & 128 != 0 || inverse & !flags != 0 {
+                        return Err(NetError(95));
+                    }
+                    Expr::ConntrackMatch {
+                        revision,
+                        info: b.to_vec(),
+                    }
+                } else {
+                    if kind != "addrtype" || revision != 1 {
+                        return Err(NetError(95));
+                    }
+                    if b.len() != 8 {
+                        return Err(NetError(22));
+                    }
+                    let source = u16::from_le_bytes(b[..2].try_into().unwrap());
+                    let destination = u16::from_le_bytes(b[2..4].try_into().unwrap());
+                    let flags = u32::from_le_bytes(b[4..].try_into().unwrap());
+                    if flags & !3 != 0 || (source | destination) & !0x2e != 0 {
+                        return Err(NetError(95));
+                    }
+                    Expr::AddrType {
+                        source,
+                        destination,
+                        flags,
+                    }
+                }
+            }
+            "target" => {
+                let a = fields(data, &[1, 2, 3])?;
+                let kind = name(&a, 1)?;
+                let revision = num(&a, 2)?;
+                let b = need(&a, 3)?;
+                if kind == "CT" {
+                    if revision > 1
+                        || b.len() != if revision == 0 { 40 } else { 72 }
+                        || b[..2] != [0, 0]
+                        || b[4..].iter().any(|b| *b != 0)
+                    {
+                        return Err(NetError(95));
+                    }
+                    Expr::Zone(u16::from_le_bytes(b[2..4].try_into().unwrap()))
+                } else {
+                    if !matches!(kind.as_str(), "MASQUERADE" | "DNAT" | "SNAT") || revision > 2 {
+                        return Err(NetError(95));
+                    }
+                    let old = b.len() == 24;
+                    if old && u32::from_le_bytes(b[..4].try_into().unwrap()) != 1
+                        || !old && !matches!(b.len(), 40 | 48)
+                    {
+                        return Err(NetError(22));
+                    }
+                    let at = if old { 4 } else { 0 };
+                    let flags = u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                    if flags & !3 != 0 {
+                        return Err(NetError(95));
+                    }
+                    if !matches!(rule_family, 2 | 10) {
+                        return Err(NetError(95));
+                    }
+                    let address = if flags & 1 == 0 {
+                        None
+                    } else if old {
+                        Some(
+                            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&b[8..12]).unwrap())
+                                .into(),
+                        )
+                    } else {
+                        // nf_nat_range uses 16-byte nf_inet_addr even for IPv4.
+                        // Rule family is checked when evaluating this expression.
+                        if rule_family == 2 {
+                            Some(
+                                std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&b[4..8]).unwrap())
+                                    .into(),
+                            )
+                        } else {
+                            Some(
+                                std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&b[4..20]).unwrap())
+                                    .into(),
+                            )
+                        }
+                    };
+                    let p = if old { 16 } else { 36 };
+                    let ports = if flags & 2 != 0 {
+                        let low = u16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                        let high = u16::from_be_bytes(b[p + 2..p + 4].try_into().unwrap());
+                        if low == 0 || low > high {
+                            return Err(NetError(22));
+                        }
+                        Some((low, high))
+                    } else {
+                        None
+                    };
+                    Expr::FixedNat {
+                        source: kind != "DNAT",
+                        address,
+                        ports,
+                        masquerade: kind == "MASQUERADE",
+                    }
+                }
+            }
+            "nat" | "masq" => {
+                let kind = name(&a, 1)?;
+                let masq = kind == "masq";
+                let a = fields(
+                    data,
+                    if masq {
+                        &[1, 2, 3]
+                    } else {
+                        &[1, 2, 3, 4, 5, 6, 7]
+                    },
+                )?;
+                let flags = get(&a, if masq { 1 } else { 7 })
+                    .map(u32v)
+                    .transpose()?
+                    .unwrap_or(0);
+                if flags & !3 != 0 {
+                    return Err(NetError(95));
+                }
+                let register = |field, len| -> Result<Option<usize>> {
+                    let r = get(&a, field)
+                        .map(u32v)
+                        .transpose()?
+                        .map(|r| reg(r, len))
+                        .transpose()?;
+                    if r.is_some_and(|r| initialized[r..r + len].contains(&false)) {
+                        return Err(NetError(22));
+                    }
+                    Ok(r)
+                };
+                let port = register(if masq { 2 } else { 5 }, 2)?;
+                let port_max = register(if masq { 3 } else { 6 }, 2)?;
+                if port_max.is_some() && port.is_none() {
+                    return Err(NetError(22));
+                }
+                if masq {
+                    Expr::Masquerade { port, port_max }
+                } else {
+                    let source = match num(&a, 1)? {
+                        0 => true,
+                        1 => false,
+                        _ => return Err(NetError(95)),
+                    };
+                    let family = num(&a, 2)?;
+                    if rule_family != 1 && u32::from(rule_family) != family {
+                        return Err(NetError(97));
+                    }
+                    let len = match family {
+                        2 => 4,
+                        10 => 16,
+                        _ => return Err(NetError(97)),
+                    };
+                    let address = register(3, len)?;
+                    let address_max = register(4, len)?;
+                    if address_max.is_some() && address.is_none()
+                        || address.is_none() && port.is_none()
+                    {
+                        return Err(NetError(22));
+                    }
+                    Expr::Nat {
+                        source,
+                        family,
+                        address,
+                        address_max,
+                        port,
+                        port_max,
+                    }
+                }
+            }
             "counter" => {
                 let a = fields(data, &[1, 2, 3])?;
                 Expr::Counter {
@@ -301,7 +580,7 @@ fn chain_data(family: u8, table: &str, name: &str, c: &Chain, references: u32) -
         number(&mut h, 2, priority as u32);
         attr(&mut d, 4 | 0x8000, &h);
         number(&mut d, 5, c.policy);
-        string(&mut d, 7, "filter");
+        string(&mut d, 7, &c.chain_type);
         let mut counters = vec![];
         integer(&mut counters, 1, c.bytes.get());
         integer(&mut counters, 2, c.packets.get());
@@ -428,6 +707,65 @@ impl Ruleset {
             Ok((depth, work))
         }
         for t in self.tables.values() {
+            fn context(
+                t: &Table,
+                n: &str,
+                nat: bool,
+                hook: u32,
+                priority: i32,
+                seen: &mut std::collections::BTreeSet<String>,
+            ) -> Result<()> {
+                if !seen.insert(n.to_owned()) {
+                    return Ok(());
+                }
+                let c = t.chains.get(n).ok_or(NetError(2))?;
+                for r in &c.rules {
+                    for e in &r.expressions {
+                        match e {
+                            Expr::Nat { .. } | Expr::Masquerade { .. } | Expr::FixedNat { .. }
+                                if !nat =>
+                            {
+                                return Err(NetError(95))
+                            }
+                            Expr::Zone(_) | Expr::CtSet { key: 17, .. }
+                                if priority >= -200 || !matches!(hook, 0 | 3) =>
+                            {
+                                return Err(NetError(95))
+                            }
+                            Expr::Nat { source: true, .. }
+                            | Expr::FixedNat { source: true, .. }
+                            | Expr::Masquerade { .. }
+                                if hook != 4 =>
+                            {
+                                return Err(NetError(95))
+                            }
+                            Expr::Nat { source: false, .. }
+                            | Expr::FixedNat { source: false, .. }
+                                if !matches!(hook, 0 | 3) =>
+                            {
+                                return Err(NetError(95))
+                            }
+                            Expr::Verdict(_, Some(next)) => {
+                                context(t, next, nat, hook, priority, seen)?
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            }
+            for (n, c) in &t.chains {
+                if let Some((hook, priority)) = c.hook {
+                    context(
+                        t,
+                        n,
+                        c.chain_type == "nat",
+                        hook,
+                        priority,
+                        &mut std::collections::BTreeSet::new(),
+                    )?;
+                }
+            }
             let mut memo = BTreeMap::new();
             for name in t.chains.keys() {
                 visit(t, name, &mut vec![], &mut memo)?;
@@ -453,10 +791,17 @@ impl Ruleset {
             // payload expressions. Opaque xt match/target blobs remain rejected.
             let a = fields(&r[20..], &[1, 2, 3])?;
             let n = name(&a, 1)?;
-            if !matches!(n.as_str(), "tcp" | "udp" | "icmp" | "icmp6")
-                || num(&a, 2)? != 0
-                || num(&a, 3)? != 0
-            {
+            let revision = num(&a, 2)?;
+            let target = num(&a, 3)?;
+            let supported = match (n.as_str(), target) {
+                ("tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
+                ("addrtype", 0) => revision == 1,
+                ("conntrack", 0) => revision <= 3,
+                ("MASQUERADE" | "SNAT" | "DNAT", 1) => revision <= 2,
+                ("CT", 1) => revision <= 1,
+                _ => false,
+            };
+            if !supported {
                 return Err(NetError(95));
             }
             return Ok(vec![message(kind, 0, seq, port, &r[16..])]);
@@ -642,9 +987,17 @@ impl Ruleset {
                 let typ = get(&a, 7).map(text).transpose()?;
                 // Native BSD socket I/O does not pass through the packet stack.
                 // Root hooks other than FORWARD cannot yet be promised safely.
-                if h.is_some_and(|(hook, _)| {
-                    !ns.nft_packet_hooks.get() || hook > 4 || ns.native.get().is_some() && hook != 2
-                }) || typ.as_deref().is_some_and(|v| v != "filter")
+                if h.is_some_and(|(hook, _)| !ns.nft_packet_hooks.get() || hook > 4)
+                    || typ
+                        .as_deref()
+                        .is_some_and(|v| !matches!(v, "filter" | "nat"))
+                {
+                    return Err(NetError(95));
+                }
+                if typ.as_deref() == Some("nat")
+                    && h.is_none_or(|(hook, priority)| {
+                        !matches!(hook, 0 | 3 | 4) || priority != if hook == 4 { 100 } else { -100 }
+                    })
                 {
                     return Err(NetError(95));
                 }
@@ -675,7 +1028,11 @@ impl Ruleset {
                     if flags & 0x200 != 0 {
                         return Err(NetError(17));
                     }
-                    if h.is_some_and(|v| Some(v) != c.hook) || typ.is_some() && c.hook.is_none() {
+                    if h.is_some_and(|v| Some(v) != c.hook)
+                        || typ
+                            .as_ref()
+                            .is_some_and(|v| c.hook.is_none() || v != &c.chain_type)
+                    {
                         return Err(NetError(95));
                     }
                     if policy.is_some() && c.hook.is_none() {
@@ -702,6 +1059,7 @@ impl Ruleset {
                             handle,
                             hook: h,
                             policy: policy.unwrap_or(1),
+                            chain_type: typ.unwrap_or_else(|| "filter".to_owned()),
                             userdata: userdata.unwrap_or_default(),
                             rules: vec![],
                             packets: Cell::new(packets),
@@ -730,7 +1088,7 @@ impl Ruleset {
             6 => {
                 let cn = name(&a, 2)?;
                 let wire = need(&a, 4)?.to_vec();
-                let expressions = expressions(&wire)?;
+                let expressions = expressions_in(&wire, family)?;
                 let compatibility = get(&a, 5)
                     .map(|b| -> Result<Vec<u8>> {
                         let a = fields(b, &[1, 2])?;
@@ -826,8 +1184,8 @@ impl Ruleset {
         Ok(out)
     }
 }
-/// One datagram is one bounded transaction. Split batches, sets, NAT, conntrack,
-/// xt compat and notifications remain explicit EOPNOTSUPP rather than fake ACKs.
+/// One datagram is one bounded transaction. Unsupported expressions, split
+/// batches, sets and notifications return explicit EOPNOTSUPP.
 pub(crate) fn request(
     ns: &Namespace,
     requests: &[&[u8]],
@@ -836,6 +1194,9 @@ pub(crate) fn request(
     slots: usize,
     capacity: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    if requests.iter().all(|r| kind(r) >> 8 == 1) {
+        return ctnetlink::request(ns, requests, port, admin, slots, capacity);
+    }
     let shared = ns.graph.borrow().firewall(ns.id());
     let mut staged = shared.borrow().clone();
     let batch = kind(requests[0]) == 16;
@@ -897,6 +1258,20 @@ pub(crate) fn request(
         out = vec![ack(r, port, e)];
         mutated = false;
     }
+    // A dump may contain hundreds of rules. Netlink permits multiple aligned
+    // messages in one datagram; queue limits count datagrams, not rules.
+    let mut packed = vec![];
+    let mut datagram = vec![];
+    for message in out {
+        if datagram.len() + message.len() > 32768 && !datagram.is_empty() {
+            packed.push(std::mem::take(&mut datagram));
+        }
+        datagram.extend(message);
+    }
+    if !datagram.is_empty() {
+        packed.push(datagram);
+    }
+    let out = packed;
     if out.len() > slots || out.iter().map(Vec::len).sum::<usize>() > capacity {
         return Err(NetError(105));
     }
@@ -919,6 +1294,10 @@ pub(crate) struct Context<'a> {
     pub output: u32,
     pub input_name: &'a [u8],
     pub output_name: &'a [u8],
+    pub track: Option<crate::conntrack::Track>,
+    pub source_type: u32,
+    pub destination_type: u32,
+    pub masquerade: Option<std::net::IpAddr>,
 }
 impl Context<'_> {
     fn family(&self) -> u8 {
@@ -991,8 +1370,161 @@ impl Context<'_> {
         })
     }
 }
+#[derive(Default)]
+struct Effects {
+    zone: Option<u16>,
+    mark: Option<u32>,
+    nat: Option<NatAction>,
+}
+struct NatAction {
+    source: bool,
+    address: Option<std::net::IpAddr>,
+    ports: Option<(u16, u16)>,
+}
+pub(crate) struct Hook<'a> {
+    pub graph: &'a crate::netdev::Topology,
+    pub namespace: u64,
+    pub hook: u32,
+    pub input: u32,
+    pub output: u32,
+    pub raw: bool,
+}
+impl Ruleset {
+    pub fn process(
+        &self,
+        packet: &mut [u8],
+        meta: &Hook<'_>,
+        track: &mut crate::conntrack::Track,
+        conn: &mut crate::conntrack::State,
+    ) -> bool {
+        let family = if packet[0] >> 4 == 4 { 2 } else { 10 };
+        let mut chains = vec![];
+        for ((f, _), t) in &self.tables {
+            if *f != 1 && *f != family {
+                continue;
+            }
+            for (n, c) in &t.chains {
+                if let Some((h, p)) = c.hook {
+                    if h == meta.hook && (p < -200) == meta.raw {
+                        chains.push((p, t, n, c));
+                    }
+                }
+            }
+        }
+        chains.sort_by_key(|v| v.0);
+        let source = matches!(meta.hook, 1 | 4);
+        let nat_priority = if source { 100 } else { -100 };
+        let nat_stage = matches!(meta.hook, 0 | 1 | 3 | 4) && !meta.raw;
+        let mut applied = false;
+        for (priority, t, n, c) in chains {
+            if nat_stage && !applied && priority >= nat_priority {
+                if !conn.existing_nat(track, packet, source) {
+                    return false;
+                }
+                applied = true;
+            }
+            if c.chain_type == "nat"
+                && (track.reply
+                    || if source {
+                        track.snat_done
+                    } else {
+                        track.dnat_done
+                    })
+            {
+                continue;
+            }
+            let Some(h) = crate::virtualnet::packet::header(packet) else {
+                return false;
+            };
+            let output = if meta.hook == 3 {
+                meta.graph
+                    .source(meta.namespace, h.tuple.destination.ip())
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(meta.output)
+            } else {
+                meta.output
+            };
+            let name = |i| {
+                meta.graph
+                    .device(meta.namespace, i)
+                    .map(|d| d.name)
+                    .unwrap_or_default()
+            };
+            let src_type = meta.graph.address_type(meta.namespace, h.tuple.source.ip());
+            let dst_type = meta
+                .graph
+                .address_type(meta.namespace, h.tuple.destination.ip());
+            let masquerade = meta
+                .graph
+                .device(meta.namespace, output)
+                .ok()
+                .and_then(|d| {
+                    d.addresses
+                        .into_iter()
+                        .find(|a| a.ip.is_ipv4() == (family == 2))
+                })
+                .map(|a| a.ip);
+            let ctx = Context {
+                packet,
+                hook: meta.hook,
+                input: meta.input,
+                output,
+                input_name: &name(meta.input),
+                output_name: &name(output),
+                track: Some(*track),
+                source_type: src_type,
+                destination_type: dst_type,
+                masquerade,
+            };
+            let mut effects = Effects::default();
+            let v = t.verdict(n, &ctx, &mut 8192, &mut effects);
+            if v == 0 {
+                return false;
+            }
+            if v < 0 {
+                c.packets.set(c.packets.get().wrapping_add(1));
+                c.bytes.set(c.bytes.get().wrapping_add(packet.len() as u64));
+                if c.policy == 0 {
+                    return false;
+                }
+            }
+            if let Some(zone) = effects.zone {
+                if !meta.raw {
+                    return false;
+                }
+                track.zone = zone;
+            }
+            if let Some(mark) = effects.mark {
+                track.mark = mark;
+            }
+            if let Some(nat) = effects.nat {
+                if c.chain_type != "nat"
+                    || !conn.nat(track, packet, nat.source, nat.address, nat.ports)
+                {
+                    return false;
+                }
+                if nat.source {
+                    track.snat_done = true;
+                } else {
+                    track.dnat_done = true;
+                }
+            }
+        }
+        if nat_stage {
+            if !applied && !conn.existing_nat(track, packet, source) {
+                return false;
+            }
+            if source {
+                track.snat_done = true;
+            } else {
+                track.dnat_done = true;
+            }
+        }
+        true
+    }
+}
 impl Rule {
-    fn verdict(&self, ctx: &Context<'_>) -> Option<(i32, Option<&str>)> {
+    fn verdict(&self, ctx: &Context<'_>, effects: &mut Effects) -> Option<(i32, Option<&str>)> {
         let mut regs = [0u8; 64];
         for expr in &self.expressions {
             match expr {
@@ -1038,6 +1570,188 @@ impl Rule {
                         regs[*dest + i] = (saved[*src + i] & mask[i]) ^ xor[i];
                     }
                 }
+                Expr::Zone(zone) => effects.zone = Some(*zone),
+                Expr::FixedNat {
+                    source,
+                    address,
+                    ports,
+                    masquerade,
+                } => {
+                    if *source != matches!(ctx.hook, 1 | 4) {
+                        return Some((0, None));
+                    }
+                    let address = if *masquerade {
+                        ctx.masquerade
+                    } else {
+                        *address
+                    };
+                    if *masquerade && address.is_none() {
+                        return Some((0, None));
+                    }
+                    effects.nat = Some(NatAction {
+                        source: *source,
+                        address,
+                        ports: *ports,
+                    });
+                    return Some((1, None));
+                }
+                Expr::ConntrackMatch { revision, info } => {
+                    let t = ctx.track?;
+                    let b = info;
+                    let le = |i| u16::from_le_bytes(b[i..i + 2].try_into().unwrap());
+                    let flags = le(146);
+                    let inverse = le(148);
+                    let check =
+                        |flag, matched| flags & flag == 0 || (matched ^ (inverse & flag != 0));
+                    let state = if t.state == 64 { 256 } else { t.state }
+                        | if t.status & 16 != 0 { 64 } else { 0 }
+                        | if t.status & 32 != 0 { 128 } else { 0 };
+                    let mask = if *revision <= 1 {
+                        u32::from(b[150])
+                    } else {
+                        u32::from(le(150))
+                    };
+                    let status = if *revision <= 1 {
+                        u32::from(b[151])
+                    } else {
+                        u32::from(le(152))
+                    };
+                    if !check(1, state & mask != 0)
+                        || !check(2, u32::from(t.original.protocol) == u32::from(le(136)))
+                        || !check(64, t.status & status == status)
+                        || !check(4096, !t.reply)
+                    {
+                        return None;
+                    }
+                    let reply = t.translated.reverse();
+                    let endpoints = [
+                        t.original.tuple.source,
+                        t.original.tuple.destination,
+                        reply.tuple.source,
+                        reply.tuple.destination,
+                    ];
+                    for (i, ep) in endpoints.into_iter().enumerate() {
+                        let addr = match ep.ip() {
+                            std::net::IpAddr::V4(v) => {
+                                let mut a = [0; 16];
+                                a[..4].copy_from_slice(&v.octets());
+                                a
+                            }
+                            std::net::IpAddr::V6(v) => v.octets(),
+                        };
+                        let a = i * 32;
+                        let matched = addr
+                            .iter()
+                            .enumerate()
+                            .all(|(j, v)| v & b[a + 16 + j] == b[a + j] & b[a + 16 + j]);
+                        if !check(4 << i, matched) {
+                            return None;
+                        }
+                        let p = 138 + i * 2;
+                        let low = if *revision == 3 {
+                            le(p)
+                        } else {
+                            u16::from_be_bytes(b[p..p + 2].try_into().unwrap())
+                        };
+                        let high = if *revision == 3 { le(154 + i * 2) } else { low };
+                        if !check(256 << i, ep.port() >= low && ep.port() <= high) {
+                            return None;
+                        }
+                    }
+                }
+                Expr::CtGet {
+                    dest,
+                    key,
+                    direction,
+                } => {
+                    let b = ctx.track?.load(*key, *direction)?;
+                    regs[*dest..*dest + b.len()].copy_from_slice(&b);
+                }
+                Expr::CtSet { src, key } => {
+                    if *key == 17 {
+                        effects.zone =
+                            Some(u16::from_le_bytes(regs[*src..*src + 2].try_into().unwrap()));
+                    } else {
+                        effects.mark =
+                            Some(u32::from_le_bytes(regs[*src..*src + 4].try_into().unwrap()));
+                    }
+                }
+                Expr::Fib { dest, flags } => {
+                    regs[*dest..*dest + 4].copy_from_slice(
+                        &(if *flags == 1 {
+                            ctx.source_type
+                        } else {
+                            ctx.destination_type
+                        })
+                        .to_le_bytes(),
+                    );
+                }
+                Expr::AddrType {
+                    source,
+                    destination,
+                    flags,
+                } => {
+                    let test = |mask: u16, kind: u32, invert: bool| {
+                        mask == 0 || ((mask & (1 << kind) != 0) ^ invert)
+                    };
+                    if !test(*source, ctx.source_type, *flags & 1 != 0)
+                        || !test(*destination, ctx.destination_type, *flags & 2 != 0)
+                    {
+                        return None;
+                    }
+                }
+                Expr::Nat {
+                    source,
+                    family,
+                    address,
+                    address_max,
+                    port,
+                    port_max,
+                } => {
+                    if *family != u32::from(ctx.family()) {
+                        return None;
+                    }
+                    let ip = |r: usize| -> std::net::IpAddr {
+                        if *family == 2 {
+                            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&regs[r..r + 4]).unwrap())
+                                .into()
+                        } else {
+                            std::net::Ipv6Addr::from(
+                                <[u8; 16]>::try_from(&regs[r..r + 16]).unwrap(),
+                            )
+                            .into()
+                        }
+                    };
+                    let address = address.map(ip);
+                    if address_max.is_some_and(|r| address.is_some_and(|a| ip(r) < a)) {
+                        return Some((0, None));
+                    }
+                    let port = port.map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()));
+                    let high = port_max
+                        .map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()))
+                        .or(port);
+                    effects.nat = Some(NatAction {
+                        source: *source,
+                        address,
+                        ports: port.zip(high),
+                    });
+                    return Some((1, None));
+                }
+                Expr::Masquerade { port, port_max } => {
+                    let Some(address) = ctx.masquerade else {
+                        return Some((0, None));
+                    };
+                    let port = port.map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()));
+                    let high = port_max
+                        .map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()))
+                        .or(port);
+                    effects.nat = Some(NatAction {
+                        source: true,
+                        address: Some(address),
+                        ports: port.zip(high),
+                    });
+                    return Some((1, None));
+                }
                 Expr::Counter { packets, bytes } => {
                     packets.set(packets.get().wrapping_add(1));
                     bytes.set(bytes.get().wrapping_add(ctx.packet.len() as u64));
@@ -1050,19 +1764,25 @@ impl Rule {
     }
 }
 impl Table {
-    fn verdict(&self, chain: &str, ctx: &Context<'_>, budget: &mut usize) -> i32 {
+    fn verdict(
+        &self,
+        chain: &str,
+        ctx: &Context<'_>,
+        budget: &mut usize,
+        effects: &mut Effects,
+    ) -> i32 {
         let c = &self.chains[chain];
         for r in &c.rules {
             if *budget == 0 {
                 return 0;
             }
             *budget -= 1;
-            match r.verdict(ctx) {
+            match r.verdict(ctx, effects) {
                 Some((0, _)) => return 0,
                 Some((1, _)) => return 1,
                 Some((-5, _)) => return -5,
                 Some((code, Some(next))) if matches!(code, -3 | -4) => {
-                    let v = self.verdict(next, ctx, budget);
+                    let v = self.verdict(next, ctx, budget, effects);
                     if v >= 0 {
                         return v;
                     }
@@ -1077,9 +1797,13 @@ impl Table {
     }
 }
 impl Ruleset {
+    pub fn has_rules(&self) -> bool {
+        self.active_hooks != 0
+    }
     pub fn active(&self, hook: u32) -> bool {
         self.active_hooks & (1 << hook) != 0
     }
+    #[cfg(test)]
     pub fn allows(&self, ctx: &Context<'_>) -> bool {
         if self.tables.is_empty() {
             return true;
@@ -1099,7 +1823,7 @@ impl Ruleset {
         }
         hooks.sort_by_key(|(p, _, _, _)| *p);
         for (_, t, n, c) in hooks {
-            let v = t.verdict(n, ctx, &mut 8192);
+            let v = t.verdict(n, ctx, &mut 8192, &mut Effects::default());
             if v == 0 {
                 return false;
             }
@@ -1114,6 +1838,10 @@ impl Ruleset {
         }
         true
     }
+}
+#[cfg(test)]
+fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
+    expressions_in(bytes, 2)
 }
 #[cfg(test)]
 #[path = "nftables_tests.rs"]

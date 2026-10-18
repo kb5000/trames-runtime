@@ -126,6 +126,45 @@ impl Linux {
                 }
                 Ok(result)
             }
+            76 => {
+                if a[5] & !15 != 0 {
+                    return Err(Errno(22));
+                }
+                let input = a[0] as u32;
+                let output = a[2] as u32;
+                // Pipes and sockets reject an offset before pointer access.
+                if a[1] != 0 {
+                    self.vfs.seek(input, 0, 1)?;
+                }
+                if a[3] != 0 {
+                    self.vfs.seek(output, 0, 1)?;
+                }
+                let from = if a[1] == 0 {
+                    None
+                } else {
+                    Some(self.copy_offset(input, a[1], memory)?)
+                };
+                let to = if a[3] == 0 {
+                    None
+                } else {
+                    Some(self.copy_offset(output, a[3], memory)?)
+                };
+                let n =
+                    self.vfs
+                        .splice(input, output, a[4].min(MAX_WRITE as u64) as usize, from, to)?
+                        as u64;
+                if let Some(offset) = from {
+                    memory
+                        .write(a[1], &(offset + n).to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                if let Some(offset) = to {
+                    memory
+                        .write(a[3], &(offset + n).to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                Ok(n)
+            }
             71 | 285 => {
                 let copy = number == 285;
                 let (input, output, in_pointer, out_pointer, count) = if copy {
@@ -199,6 +238,60 @@ mod tests {
     use super::*;
     use crate::CapturedOutput;
     use trames_memory::Permissions;
+    #[test]
+    fn splice_offsets_backpressure_and_pipe_espipe_are_transactional() {
+        let mut l = Linux::new(0x3000);
+        let mut memory = Memory::default();
+        memory.map(0x1000, 4096, Permissions::RW).unwrap();
+        let mut io = CapturedOutput::default();
+        l.vfs.import_file(b"/source", b"abcdef".to_vec()).unwrap();
+        l.vfs.import_file(b"/dest", vec![]).unwrap();
+        let input = l.vfs.open_at(-100, b"/source", 0, 0).unwrap();
+        let output = l.vfs.open_at(-100, b"/dest", 2, 0).unwrap();
+        let [r, w] = l.vfs.pipe(0).unwrap();
+        memory.write(0x1000, &1u64.to_le_bytes()).unwrap();
+        memory.write(0x1010, &0u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            l.file_syscall(
+                76,
+                [input as u64, 0x1000, w as u64, 0, 3, 2],
+                &mut memory,
+                &mut io
+            ),
+            Ok(3)
+        );
+        assert_eq!(memory.read_u64(0x1000).unwrap(), 4);
+        assert_eq!(l.vfs.seek(input, 0, 1).unwrap(), 0);
+        assert_eq!(
+            l.file_syscall(
+                76,
+                [r as u64, 1, output as u64, 0, 3, 2],
+                &mut memory,
+                &mut io
+            ),
+            Err(Errno(29))
+        );
+        assert_eq!(
+            l.file_syscall(
+                76,
+                [r as u64, 0, output as u64, 0x1010, 3, 2],
+                &mut memory,
+                &mut io
+            ),
+            Ok(3)
+        );
+        assert_eq!(memory.read_u64(0x1010).unwrap(), 3);
+        assert_eq!(l.vfs.pread(output, 3, 0).unwrap(), b"bcd");
+        assert_eq!(
+            l.file_syscall(
+                76,
+                [input as u64, 0, output as u64, 0, 3, 0],
+                &mut memory,
+                &mut io
+            ),
+            Err(Errno(22))
+        );
+    }
     #[test]
     fn invalid_copy_offset_does_not_write_or_advance_descriptors() {
         let mut l = Linux::new(0x3000);

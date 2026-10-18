@@ -77,6 +77,20 @@ impl Socket {
     pub fn fabric(&self) -> Fabric {
         self.network.0.fabric.clone()
     }
+    pub fn poll_epoch(&self) -> [u64; 2] {
+        let i = self.network.0.fabric.0.borrow();
+        i.nodes.get(&self.network.0.key).map_or([0; 2], |n| {
+            let rx = n
+                .links
+                .iter()
+                .fold(0u64, |s, l| s.wrapping_add(l.rx_packets));
+            let tx = n
+                .links
+                .iter()
+                .fold(0u64, |s, l| s.wrapping_add(l.tx_packets));
+            [rx, rx.wrapping_add(tx)]
+        })
+    }
     pub fn address_size(&self) -> usize {
         if self.family == 2 {
             16
@@ -155,7 +169,8 @@ impl Socket {
         if self.network.0.mode == NetworkMode::Loopback && !self.own(v) {
             return Err(NetError(13));
         }
-        if v.is_loopback()
+        if self.network.0.routing.is_none()
+            && v.is_loopback()
             && !matches!(v,IpAddr::V4(a) if a==Ipv4Addr::LOCALHOST)
             && v != IpAddr::V6(Ipv6Addr::LOCALHOST)
         {
@@ -419,6 +434,7 @@ impl Socket {
             icmp_pending: None,
             hop_limit: state.hop_limit,
             receive_hops: state.receive_hops,
+            receive_packet_info: state.receive_packet_info,
             last_hop: None,
             broadcast: state.broadcast,
             icmp6_filter: state.icmp6_filter,
@@ -566,6 +582,18 @@ impl Socket {
         Ok(())
     }
     pub fn send(&self, bytes: &[u8], flags: u32, destination: Option<SocketAddr>) -> Result<usize> {
+        self.send_control(bytes, flags, destination, None)
+    }
+    pub fn send_control(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<SocketAddr>,
+        info: Option<crate::PacketInfo>,
+    ) -> Result<usize> {
+        if info.is_some() && self.kind != 2 {
+            return Err(NetError(95));
+        }
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(NetError(95));
         }
@@ -596,7 +624,9 @@ impl Socket {
             if state.write_closed {
                 return Err(NetError(32));
             }
-            let selected = if state.bound.is_some_and(|b| b.ip().is_unspecified()) {
+            let selected = if let Some(info) = info.filter(|i| !i.address.is_unspecified()) {
+                Some(info.address)
+            } else if state.bound.is_some_and(|b| b.ip().is_unspecified()) {
                 self.network
                     .0
                     .routing
@@ -626,7 +656,16 @@ impl Socket {
                 .ok_or(NetError(99))?;
             n.sockets
                 .get_mut::<udp::Socket>(h)
-                .send_slice(bytes, endpoint(a))
+                .send_slice(
+                    bytes,
+                    smoltcp::socket::udp::UdpMetadata {
+                        endpoint: endpoint(a),
+                        local_address: info
+                            .filter(|i| !i.address.is_unspecified())
+                            .map(|i| ip(i.address)),
+                        meta: Default::default(),
+                    },
+                )
                 .map_err(|e| match e {
                     udp::SendError::BufferFull => NetError(11),
                     _ => NetError(99),
@@ -686,6 +725,7 @@ impl Socket {
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
                 netlink_address: None,
+                packet_info: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -696,6 +736,7 @@ impl Socket {
             if matches!(state.connection, Connection::Failed(_)) && !state.blocking_failed {
                 return Ok(Received {
                     netlink_address: None,
+                    packet_info: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -714,6 +755,7 @@ impl Socket {
                 }
                 return Ok(Received {
                     netlink_address: None,
+                    packet_info: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -733,6 +775,7 @@ impl Socket {
             self.fabric().tick();
             Ok(Received {
                 netlink_address: None,
+                packet_info: None,
                 data: bytes,
                 address: None,
                 length: size,
@@ -752,11 +795,33 @@ impl Socket {
                     }
                     let size = data.len();
                     let bytes = data[..count.min(size)].to_vec();
+                    let packet_info = if state.receive_packet_info {
+                        meta.local_address.map(|a| {
+                            let address = addr(a);
+                            let interface = self
+                                .network
+                                .0
+                                .routing
+                                .as_ref()
+                                .and_then(|v| {
+                                    v.graph
+                                        .borrow()
+                                        .devices(v.namespace)
+                                        .into_iter()
+                                        .find(|d| d.addresses.iter().any(|a| a.ip == address))
+                                })
+                                .map_or(if address.is_loopback() { 1 } else { 2 }, |d| d.index);
+                            crate::PacketInfo { address, interface }
+                        })
+                    } else {
+                        None
+                    };
                     if flags & MSG_PEEK == 0 {
                         let _ = s.recv();
                     }
                     return Ok(Received {
                         netlink_address: None,
+                        packet_info,
                         data: bytes,
                         address: Some(self.presented(source)),
                         length: if flags & MSG_TRUNC != 0 {
@@ -840,6 +905,10 @@ impl Socket {
             }
             (41, 16) if self.family == 10 && (-1..=255).contains(&value) => {
                 state.hop_limit = if value == -1 { 64 } else { value as u8 }
+            }
+            (0, 8) if self.family == 2 && self.kind == 2 => state.receive_packet_info = value != 0,
+            (41, 49) if self.family == 10 && self.kind == 2 => {
+                state.receive_packet_info = value != 0
             }
             (0, 12) if self.family == 2 && self.kind == 4 => state.receive_hops = value != 0,
             (41, 51 | 8) if self.family == 10 && self.kind == 4 => {
@@ -941,6 +1010,12 @@ impl Socket {
             (1, 6) => Ok(i32::from(state.broadcast)),
             (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),
             (41, 16) if self.family == 10 => Ok(state.hop_limit as i32),
+            (0, 8) if self.family == 2 && self.kind == 2 => {
+                Ok(i32::from(state.receive_packet_info))
+            }
+            (41, 49) if self.family == 10 && self.kind == 2 => {
+                Ok(i32::from(state.receive_packet_info))
+            }
             (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
             (1, 7 | 8) => Ok(BUFFER as i32),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
@@ -1108,6 +1183,7 @@ impl Socket {
         if state.read_closed {
             return Ok(Received {
                 netlink_address: None,
+                packet_info: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -1167,6 +1243,7 @@ impl Socket {
         let length = data.len();
         let received = Received {
             netlink_address: None,
+            packet_info: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
             length,
@@ -1241,6 +1318,7 @@ impl Socket {
         if state.read_closed {
             return Ok(Received {
                 netlink_address: None,
+                packet_info: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -1274,6 +1352,7 @@ impl Socket {
         let length = data.len();
         let received = Received {
             netlink_address: None,
+            packet_info: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
             length: if flags & MSG_TRUNC != 0 {
