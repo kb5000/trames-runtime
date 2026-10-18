@@ -321,7 +321,7 @@ impl Devpts {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
-                next_inode: device << 32,
+                next_inode: 1,
                 flock: BTreeMap::new(),
                 record_locks: BTreeMap::new(),
                 limits: StorageLimits::memory(),
@@ -353,9 +353,17 @@ impl Devpts {
         gid: u32,
     ) -> Rc<RefCell<Node>> {
         let mut fs = self.fs.borrow_mut();
+        // Linux devpts inode numbers are local to st_dev: root=1, ptmx=2,
+        // slave=index+3. runc validates ptmx's inode before using the handle.
+        let inode = match &content {
+            Content::Directory => 1,
+            Content::Device(pseudo::Device::Ptmx) => 2,
+            Content::Device(pseudo::Device::Pts(_, number)) => u64::from(*number) + 3,
+            _ => unreachable!("devpts only contains its root, ptmx and slaves"),
+        };
         let node = Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
-            inode: fs.next_inode,
+            inode,
             device: self.device,
             content,
             mode,
@@ -367,7 +375,6 @@ impl Devpts {
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        fs.next_inode += 1;
         fs.inodes.retain(|n| n.strong_count() != 0);
         fs.inodes.push(Rc::downgrade(&node));
         fs.paths.insert(path, node.clone());
@@ -388,6 +395,43 @@ mod tests {
             Some(b"newinstance,mode=0620,ptmxmode=0666,gid=5,max=2"),
         )
         .unwrap();
+    }
+    #[test]
+    fn devpts_linux_inode_identity_survives_bind_and_path_handles() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        assert_eq!(
+            v.stat_at(AT_FDCWD, b"/pts").unwrap()[8..16],
+            1u64.to_le_bytes()
+        );
+        let path = v.open_at(AT_FDCWD, b"/pts/ptmx", O_PATH, 0).unwrap();
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        for fd in [path, master] {
+            let st = v.stat_fd(fd).unwrap();
+            assert_eq!(st[8..16], 2u64.to_le_bytes());
+            assert_eq!(st[32..40], 0x502u64.to_le_bytes());
+            assert_eq!(
+                u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o170000,
+                0o20000
+            );
+        }
+        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        assert_eq!(v.stat_fd(slave).unwrap()[8..16], 3u64.to_le_bytes());
+        v.open_at(AT_FDCWD, b"/ptmx-alias", 0x42, 0o600).unwrap();
+        v.mount(Some(b"/pts/ptmx"), b"/ptmx-alias", None, 4096, None)
+            .unwrap();
+        let alias = v.open_at(AT_FDCWD, b"/ptmx-alias", 2, 0).unwrap();
+        assert_eq!(
+            v.stat_fd(alias).unwrap()[..40],
+            v.stat_fd(master).unwrap()[..40]
+        );
+        assert_eq!(v.pty(alias).unwrap().unwrap().pair.number, 1);
+        assert_eq!(
+            v.stat_at(AT_FDCWD, b"/pts/1").unwrap()[8..16],
+            4u64.to_le_bytes()
+        );
     }
     #[test]
     fn independent_devpts_reuses_local_numbers_but_not_terminal_identity() {
@@ -431,10 +475,14 @@ mod tests {
         let again = v.open_at(AT_FDCWD, b"/pts-a/ptmx", 2, 0).unwrap();
         assert_eq!(v.pty(again).unwrap().unwrap().pair.number, 0);
         assert!(!v.pty(sa).unwrap().unwrap().pair.master_alive.get());
-        assert_ne!(
-            v.stat_fd(sa).unwrap()[8..16],
-            v.stat_at(AT_FDCWD, b"/pts-a/0").unwrap()[8..16]
-        );
+        // Linux reuses the slave inode with its local number. Retained FDs
+        // still refer to the old, unlinked object, never the replacement PTY.
+        assert_eq!(v.stat_fd(sa).unwrap()[8..16], 3u64.to_le_bytes());
+        assert_eq!(v.stat_fd(sa).unwrap()[20..24], 0u32.to_le_bytes());
+        assert!(!Rc::ptr_eq(
+            &v.pty(sa).unwrap().unwrap().pair,
+            &v.pty(again).unwrap().unwrap().pair
+        ));
         v.close(other).unwrap();
     }
     #[test]
