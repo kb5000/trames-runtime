@@ -599,7 +599,10 @@ impl Vfs {
             if parent.devpts.is_some() && data.is_some_and(|d| !d.is_empty()) {
                 return Err(Errno(95));
             }
-            if flags & !(REMOUNT | BIND | ATTRS) != 0 {
+            // Linux accepts MS_REC here but MS_REMOUNT|MS_BIND updates only
+            // this mount. Recursive attribute changes require mount_setattr.
+            let ignored = if flags & BIND != 0 { REC } else { 0 };
+            if flags & !(REMOUNT | BIND | ATTRS | ignored) != 0 {
                 return Err(Errno(95));
             }
             if !self.is_mount_root(&target) {
@@ -1443,6 +1446,33 @@ mod tests {
         v.umount(b"/old", 2).unwrap();
         assert!(v.stat_at(AT_FDCWD, b"/old/dst").is_err());
         assert_eq!(read(&mut v, b"/file"), b"shared");
+    }
+    #[test]
+    fn bind_remount_accepts_rec_without_changing_nested_or_source_mounts() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/src/sub", 0o755).unwrap();
+        v.mount(None, b"/src/sub", Some(b"tmpfs"), 0, None).unwrap();
+        v.mount(Some(b"/src"), b"/dst", None, 4096 | 16384, None)
+            .unwrap();
+        v.mount(
+            None,
+            b"/dst",
+            None,
+            32 | 4096 | 16384 | 1 | MS_RELATIME,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/dst/file", 1, 0), Err(Errno(30)));
+        // MS_REC does not make the nested tmpfs read-only on a bind remount.
+        let child = v.open_at(AT_FDCWD, b"/dst/sub/new", 0x41, 0o600).unwrap();
+        v.close(child).unwrap();
+        let source = v.open_at(AT_FDCWD, b"/src/file", 1, 0).unwrap();
+        v.close(source).unwrap();
+        // Clearing read-only is likewise confined to this mount.
+        v.mount(None, b"/dst", None, 32 | 4096 | 16384 | MS_RELATIME, None)
+            .unwrap();
+        let reopened = v.open_at(AT_FDCWD, b"/dst/file", 1, 0).unwrap();
+        v.close(reopened).unwrap();
     }
     #[test]
     fn shared_mapping_pins_mount_and_blocks_readonly_remount() {
