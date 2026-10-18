@@ -3,6 +3,70 @@ use super::*;
 use std::{os::unix::process::ExitStatusExt, process::Command};
 
 #[test]
+fn retired_and_empty_cpu_windows_release_va_without_dropping_fork_bytes() {
+    let mut memory = Memory::default();
+    let base = 0x40000;
+    memory.map(base, 65536, Permissions::RW).unwrap();
+    memory.write_array(base, [42; 8]).unwrap();
+    let window = memory.mmu.window(base, false).unwrap();
+    let cpu_view = Rc::downgrade(&window);
+    let physical = Arc::downgrade(window.mapping.as_ref().unwrap());
+    drop(window);
+    let child = memory.clone();
+    assert!(
+        cpu_view.upgrade().is_none(),
+        "fork retains bytes, not retired CPU VA"
+    );
+    assert!(physical.upgrade().is_some());
+    assert_eq!(child.read_array::<8>(base), Ok([42; 8]));
+    memory.write_array(base, [17; 8]).unwrap();
+    let window = memory.mmu.window(base, false).unwrap();
+    let replacement = Rc::downgrade(&window);
+    drop(window);
+    memory.unmap(base, 65536).unwrap();
+    assert!(
+        replacement.upgrade().is_none(),
+        "last unmap releases the empty window"
+    );
+    assert_eq!(child.read_array::<8>(base), Ok([42; 8]));
+    drop(child);
+    assert!(physical.upgrade().is_none());
+}
+
+#[test]
+fn unavailable_host_window_stays_on_checked_software_until_a_mapping_boundary() {
+    let mut memory = Memory::default();
+    let base = 0x40000;
+    memory.map(base, 65536, Permissions::RW).unwrap();
+    memory.mmu.retire();
+    // Same state as Window::new declining the optional host VA reservation.
+    memory
+        .mmu
+        .unavailable
+        .borrow_mut()
+        .insert(base & !(WINDOW as u64 - 1));
+    let preparations = memory.mmu.preparations.get();
+    for value in 0..1000u32 {
+        memory.write_array(base, value.to_le_bytes()).unwrap();
+    }
+    assert_eq!(memory.read_array::<4>(base), Ok(999u32.to_le_bytes()));
+    assert_eq!(memory.mmu.preparations.get(), preparations);
+    assert!(memory.mmu.windows.borrow().is_empty());
+    memory.protect(base, 65536, Permissions::R).unwrap();
+    assert!(memory.mmu.unavailable.borrow().is_empty());
+    assert_eq!(memory.mmu.read::<4>(base), Some(999u32.to_le_bytes()));
+    assert!(memory.write_array(base, [7]).is_err());
+    let mut empty = Memory::default();
+    empty
+        .mmu
+        .unavailable
+        .borrow_mut()
+        .insert(base & !(WINDOW as u64 - 1));
+    empty.unmap(base, 65536).unwrap();
+    assert!(empty.mmu.unavailable.borrow().is_empty());
+}
+
+#[test]
 fn actual_cpu_alias_obeys_hardware_protections_and_keeps_kernel_bytes_coherent() {
     let mut memory = Memory::default();
     let base = 0x40000;
@@ -290,7 +354,7 @@ fn signal_probe_child() {
             assert_eq!(SEEN.load(Ordering::Relaxed), 2);
             return;
         }
-        let mapping = host::Mapping::new().expect("hardware mapping");
+        let mapping = host::CpuMapping::new().expect("hardware mapping");
         let mut bytes = [0; 8];
         assert!(!access::access::<8>(
             false,

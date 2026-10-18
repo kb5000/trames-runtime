@@ -106,13 +106,13 @@ impl Frozen {
                         })
                 {
                     if !self.windows.contains_key(&base) {
-                        let Some(window) = Window::new(base, self.granule) else {
+                        let Some(window) = Window::for_workers(base, self.granule) else {
                             return;
                         };
                         self.windows.insert(base, Arc::new(window));
                     }
                     let window = &self.windows[&base];
-                    if window.mapping.alias(offset, owner, at, self.granule) {
+                    if window.cpu.alias(offset, owner, at, self.granule) {
                         for (index, (_, _, root)) in physical.iter().enumerate() {
                             window.frames[offset / P + index].store(*root, Ordering::Relaxed);
                         }
@@ -130,6 +130,17 @@ impl Frozen {
         }
         if let Some(window) = self.windows.get(&base) {
             window.protect_run(offset / self.granule, offset / self.granule + 1, state);
+            // No active View can observe this joined snapshot mutation. When
+            // the last eligible group disappears, keep the physical frames,
+            // not a permanently inaccessible CPU reservation.
+            if state & ELIGIBLE == 0
+                && window
+                    .flags
+                    .iter()
+                    .all(|flag| flag.load(Ordering::Relaxed) & ELIGIBLE == 0)
+            {
+                self.windows.remove(&base);
+            }
         }
     }
     #[cold]
@@ -159,6 +170,38 @@ impl Frozen {
         if window.flags[offset >> window.shift].load(Ordering::Relaxed) & ELIGIBLE == 0 {
             return 0;
         }
-        window.mapping.cpu.as_ptr().wrapping_add(offset) as usize
+        window.cpu.cpu.as_ptr().wrapping_add(offset) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn frozen_views_own_no_unused_ram_and_release_the_last_demoted_window() {
+        let physical = Arc::new(host::Mapping::new().unwrap());
+        let granule = host::page_size().unwrap();
+        let frames: Vec<_> = (0..granule / P).map(|i| (&physical, i * P, i)).collect();
+        let mut frozen = Frozen::default();
+        frozen.update(0x40000, Some(Permissions::RW), &frames);
+        let window = frozen.windows.values().next().unwrap();
+        assert!(
+            window.mapping.is_none(),
+            "workers reserve no unused physical window"
+        );
+        let old = Arc::downgrade(window);
+        frozen.update(0x40000, None, &[]);
+        assert!(frozen.windows.is_empty());
+        assert!(old.upgrade().is_none());
+        // The source owner remains usable after its protected CPU view retires.
+        // SAFETY: exclusively owned in-bounds physical storage.
+        unsafe {
+            physical.kernel.as_ptr().write(19);
+        }
+        frozen.update(0x40000, Some(Permissions::R), &frames);
+        let window = frozen.windows.values().next().unwrap();
+        let offset = 0x40000 - window.base as usize;
+        // SAFETY: live readable CPU alias, coherent with the retained source.
+        assert_eq!(unsafe { window.cpu.cpu.as_ptr().add(offset).read() }, 19);
     }
 }

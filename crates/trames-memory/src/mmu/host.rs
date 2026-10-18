@@ -1,35 +1,180 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Two aliases of anonymous RAM. Neither alias is executable host memory.
-use std::ptr::NonNull;
+//! Separate physical RAM and protected CPU views; neither is executable.
+use std::{
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-pub(super) const WINDOW: usize = 16 * 1024 * 1024;
-
-pub(crate) struct Mapping {
-    pub cpu: NonNull<u8>,
-    pub kernel: NonNull<u8>,
-    pub registration: usize,
+// Sparse Go heaps/libraries and retained fork slots must not reserve 32MiB
+// for every small live range. Still a power of two and >= any host granule.
+pub(super) const WINDOW: usize = 1024 * 1024;
+const MAX_VIRTUAL_BYTES: usize = 1024 * 1024 * 1024;
+struct Budget {
+    used: AtomicUsize,
+    limit: usize,
 }
-// SAFETY: ownership is immutable, mappings remain until the final owner drops.
-// Byte access requires the coordinator borrow or worker region guards. Merely
-// owning this handle grants no Rust reference or permission to access bytes.
+impl Budget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+    fn acquire(&'static self) -> Option<Reservation> {
+        self.used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(WINDOW).filter(|&next| next <= self.limit)
+            })
+            .ok()?;
+        Some(Reservation(self))
+    }
+}
+static BUDGET: Budget = Budget::new(MAX_VIRTUAL_BYTES);
+struct Reservation(&'static Budget);
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(WINDOW, Ordering::Relaxed);
+    }
+}
+
+/// Physical owners retain only RW storage. Fork/worker slot ownership cannot
+/// keep an unused CPU reservation alive.
+pub(crate) struct Mapping {
+    pub kernel: NonNull<u8>,
+    _reservation: Reservation,
+}
+// SAFETY: immutable ownership; byte access needs the coordinator borrow or
+// worker region guard. This handle alone grants no byte references.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
+/// Frozen workers reserve only CPU VA; their frames own the actual source RAM.
+pub(super) struct CpuMapping {
+    pub cpu: NonNull<u8>,
+    registration: usize,
+    _reservation: Reservation,
+}
+// SAFETY: frozen views outlive workers and are edited only after join.
+unsafe impl Send for CpuMapping {}
+unsafe impl Sync for CpuMapping {}
+
 pub(super) fn page_size() -> Option<usize> {
-    // SAFETY: sysconf has no pointer arguments and no memory side effects.
+    // SAFETY: sysconf has no pointer arguments or memory side effects.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let size = usize::try_from(size).ok()?;
     (size.is_power_of_two() && (4096..=65536).contains(&size)).then_some(size)
 }
-
 impl Mapping {
-    /// Replace a range of our CPU alias with a shared view of an existing RAM
-    /// object. Source ownership stays in the frozen frames, never a raw lease.
+    pub fn new() -> Option<Self> {
+        Self::with_budget(&BUDGET)
+    }
+    fn with_budget(budget: &'static Budget) -> Option<Self> {
+        let reservation = budget.acquire()?;
+        // SAFETY: kernel-selected RW VA, never executable or fixed over host
+        // allocations. Failed setup releases the FD and reservation budget.
+        let kernel = unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                let fd = libc::memfd_create(c"trames-ram".as_ptr(), libc::MFD_CLOEXEC);
+                if fd < 0 {
+                    return None;
+                }
+                if libc::ftruncate(fd, WINDOW as libc::off_t) != 0 {
+                    libc::close(fd);
+                    return None;
+                }
+                let kernel = libc::mmap(
+                    std::ptr::null_mut(),
+                    WINDOW,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                libc::close(fd);
+                kernel
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    WINDOW,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            }
+        };
+        if kernel == libc::MAP_FAILED {
+            return None;
+        }
+        let Some(kernel) = NonNull::new(kernel.cast()) else {
+            // SAFETY: successful but unusable zero-address mapping.
+            unsafe {
+                libc::munmap(kernel, WINDOW);
+            }
+            return None;
+        };
+        Some(Self {
+            kernel,
+            _reservation: reservation,
+        })
+    }
+}
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: final physical owner; every page/slot reference is gone.
+        unsafe {
+            libc::munmap(self.kernel.as_ptr().cast(), WINDOW);
+        }
+    }
+}
+impl CpuMapping {
+    pub fn new() -> Option<Self> {
+        Self::with_budget(&BUDGET)
+    }
+    fn with_budget(budget: &'static Budget) -> Option<Self> {
+        let reservation = budget.acquire()?;
+        if !super::fault::install() {
+            return None;
+        }
+        // SAFETY: fresh inaccessible, non-executable VA owns no physical guest
+        // bytes. Only alias() replaces subranges of this reservation.
+        unsafe {
+            let cpu = libc::mmap(
+                std::ptr::null_mut(),
+                WINDOW,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            if cpu == libc::MAP_FAILED {
+                return None;
+            }
+            let Some(pointer) = NonNull::new(cpu.cast()) else {
+                libc::munmap(cpu, WINDOW);
+                return None;
+            };
+            let Some(registration) = super::fault::register(cpu as usize) else {
+                libc::munmap(cpu, WINDOW);
+                return None;
+            };
+            Some(Self {
+                cpu: pointer,
+                registration,
+                _reservation: reservation,
+            })
+        }
+    }
+    /// Replace only owned CPU VA with a view of retained physical RAM.
+    /// Source ownership stays in coordinator/frozen frames, never a raw lease.
     pub fn alias(&self, offset: usize, source: &Mapping, source_offset: usize, len: usize) -> bool {
         debug_assert!(offset <= WINDOW && len <= WINDOW - offset);
         debug_assert!(source_offset <= WINDOW && len <= WINDOW - source_offset);
-        // SAFETY: fixed replacement is restricted to our reserved CPU range.
-        // Linux old_size=0 duplicates a MAP_SHARED view instead of moving it.
+        // SAFETY: fixed replacement stays inside our reservation. Linux
+        // old_size=0 duplicates a MAP_SHARED source without moving its storage.
         unsafe {
             let target = self.cpu.as_ptr().add(offset).cast::<libc::c_void>();
             let source = source
@@ -67,122 +212,19 @@ impl Mapping {
             ok
         }
     }
-    pub fn new() -> Option<Self> {
-        if !super::fault::install() {
-            return None;
-        }
-        // SAFETY: all mappings use kernel-selected addresses, never MAP_FIXED
-        // over application allocations. Each success is cleaned up on failure.
-        unsafe {
-            #[cfg(target_os = "linux")]
-            let (cpu, kernel) = {
-                let fd = libc::memfd_create(c"trames-ram".as_ptr(), libc::MFD_CLOEXEC);
-                if fd < 0 {
-                    return None;
-                }
-                if libc::ftruncate(fd, WINDOW as libc::off_t) != 0 {
-                    libc::close(fd);
-                    return None;
-                }
-                let kernel = libc::mmap(
-                    std::ptr::null_mut(),
-                    WINDOW,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                );
-                let cpu = libc::mmap(
-                    std::ptr::null_mut(),
-                    WINDOW,
-                    libc::PROT_NONE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                );
-                libc::close(fd);
-                (cpu, kernel)
-            };
-            #[cfg(target_vendor = "apple")]
-            let (cpu, kernel) = {
-                let kernel = libc::mmap(
-                    std::ptr::null_mut(),
-                    WINDOW,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                );
-                let cpu = libc::mmap(
-                    std::ptr::null_mut(),
-                    WINDOW,
-                    libc::PROT_NONE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                );
-                if kernel != libc::MAP_FAILED && cpu != libc::MAP_FAILED {
-                    let mut address = cpu as u64;
-                    let (mut current, mut maximum) = (0, 0);
-                    let task = mach_task_self_;
-                    if mach_vm_remap(
-                        task,
-                        &mut address,
-                        WINDOW as u64,
-                        0,
-                        0x4000,
-                        task,
-                        kernel as u64,
-                        0,
-                        &mut current,
-                        &mut maximum,
-                        2,
-                    ) != 0
-                        || address != cpu as u64
-                        || libc::mprotect(cpu, WINDOW, libc::PROT_NONE) != 0
-                    {
-                        libc::munmap(cpu, WINDOW);
-                        libc::munmap(kernel, WINDOW);
-                        return None;
-                    }
-                }
-                (cpu, kernel)
-            };
-            if cpu == libc::MAP_FAILED || kernel == libc::MAP_FAILED {
-                if cpu != libc::MAP_FAILED {
-                    libc::munmap(cpu, WINDOW);
-                }
-                if kernel != libc::MAP_FAILED {
-                    libc::munmap(kernel, WINDOW);
-                }
-                return None;
-            }
-            let Some(registration) = super::fault::register(cpu as usize) else {
-                libc::munmap(cpu, WINDOW);
-                libc::munmap(kernel, WINDOW);
-                return None;
-            };
-            Some(Self {
-                cpu: NonNull::new_unchecked(cpu.cast()),
-                kernel: NonNull::new_unchecked(kernel.cast()),
-                registration,
-            })
-        }
-    }
     pub fn protect(&self, offset: usize, len: usize, permissions: i32) -> bool {
         debug_assert!(offset <= WINDOW && len <= WINDOW - offset);
-        // SAFETY: callers provide host-page-aligned ranges within our owned
-        // CPU alias. The kernel alias and unrelated host allocations are intact.
+        // SAFETY: host-page-aligned, owned CPU VA only; physical storage and
+        // unrelated host mappings retain their existing permissions.
         unsafe { libc::mprotect(self.cpu.as_ptr().add(offset).cast(), len, permissions) == 0 }
     }
 }
-impl Drop for Mapping {
+impl Drop for CpuMapping {
     fn drop(&mut self) {
         super::fault::unregister(self.registration);
-        // SAFETY: final ownership; no pointer, slice or worker survives this.
+        // SAFETY: joined/retired CPU view; TLBs/descriptor caches are cleared.
         unsafe {
             libc::munmap(self.cpu.as_ptr().cast(), WINDOW);
-            libc::munmap(self.kernel.as_ptr().cast(), WINDOW);
         }
     }
 }
@@ -202,4 +244,34 @@ unsafe extern "C" {
         maximum: *mut i32,
         inheritance: i32,
     ) -> i32;
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn physical_and_cpu_reservations_are_separate_bounded_and_released() {
+        static BUDGET: Budget = Budget::new(3 * WINDOW);
+        let physical = Mapping::with_budget(&BUDGET).unwrap();
+        let cpu = CpuMapping::with_budget(&BUDGET).unwrap();
+        assert_eq!(BUDGET.used.load(Ordering::Relaxed), 2 * WINDOW);
+        assert!(cpu.alias(0, &physical, 0, WINDOW));
+        assert!(cpu.protect(0, WINDOW, libc::PROT_READ));
+        // SAFETY: private in-bounds storage and its live readable CPU alias.
+        unsafe {
+            physical.kernel.as_ptr().write(42);
+            assert_eq!(cpu.cpu.as_ptr().read(), 42);
+        }
+        let extra = Mapping::with_budget(&BUDGET).unwrap();
+        assert!(Mapping::with_budget(&BUDGET).is_none());
+        assert!(CpuMapping::with_budget(&BUDGET).is_none());
+        drop(cpu);
+        assert_eq!(BUDGET.used.load(Ordering::Relaxed), 2 * WINDOW);
+        // SAFETY: retiring a CPU view leaves the physical owner and bytes live.
+        assert_eq!(unsafe { physical.kernel.as_ptr().read() }, 42);
+        drop(extra);
+        drop(physical);
+        assert_eq!(BUDGET.used.load(Ordering::Relaxed), 0);
+        assert!(CpuMapping::with_budget(&BUDGET).is_some());
+        assert_eq!(BUDGET.used.load(Ordering::Relaxed), 0);
+    }
 }

@@ -3,6 +3,27 @@
 use super::*;
 use std::time::Duration;
 
+// /proc/net/route exposes the guest's little-endian in_addr words, even though
+// Rust's u32::from(Ipv4Addr) is a network-order numeric value. to_le() alone is
+// therefore wrong on a little-endian host. Netlink keeps its separate wire ABI.
+fn proc_ipv4_route_row(
+    name: &[u8],
+    ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: Option<std::net::Ipv4Addr>,
+    metric: u32,
+) -> String {
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    let destination = u32::from_le_bytes((u32::from(ip) & mask).to_be_bytes());
+    let mask = u32::from_le_bytes(mask.to_be_bytes());
+    let gw = gateway.map_or(0, |ip| u32::from_le_bytes(ip.octets()));
+    format!(
+        "{}\t{destination:08X}\t{gw:08X}\t{:04X}\t0\t0\t{metric}\t{mask:08X}\t0\t0\t0\n",
+        String::from_utf8_lossy(name),
+        if gateway.is_some() { 3 } else { 1 }
+    )
+}
+
 #[derive(Clone)]
 pub struct FdInfo {
     pub fd: u32,
@@ -46,6 +67,55 @@ mod tests {
         let out = v.read(fd, 65536).unwrap();
         v.close(fd).unwrap();
         out
+    }
+    #[test]
+    fn proc_route_uses_guest_little_endian_addresses_for_native_and_bridge_rows() {
+        use std::net::Ipv4Addr;
+        // Decode the text exactly as little-endian route/BusyBox consumers do.
+        let decode =
+            |field: &str| Ipv4Addr::from(u32::from_str_radix(field, 16).unwrap().to_le_bytes());
+        for (name, ip, prefix, gateway, destination, mask) in [
+            (
+                b"eth0".as_slice(),
+                [192, 168, 2, 99],
+                24,
+                None,
+                [192, 168, 2, 0],
+                [255, 255, 255, 0],
+            ),
+            (
+                b"eth0",
+                [0, 0, 0, 0],
+                0,
+                Some([192, 168, 2, 1]),
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+            ),
+            (
+                b"docker0",
+                [172, 17, 0, 1],
+                16,
+                None,
+                [172, 17, 0, 0],
+                [255, 255, 0, 0],
+            ),
+            (
+                b"veth0",
+                [10, 23, 8, 7],
+                32,
+                Some([10, 23, 8, 1]),
+                [10, 23, 8, 7],
+                [255, 255, 255, 255],
+            ),
+        ] {
+            let row = proc_ipv4_route_row(name, ip.into(), prefix, gateway.map(Ipv4Addr::from), 7);
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(decode(fields[1]), Ipv4Addr::from(destination));
+            assert_eq!(decode(fields[2]), Ipv4Addr::from(gateway.unwrap_or([0; 4])));
+            assert_eq!(decode(fields[7]), Ipv4Addr::from(mask));
+            assert_eq!(fields[6], "7");
+            assert_eq!(fields[3], if gateway.is_some() { "0003" } else { "0001" });
+        }
     }
     #[test]
     fn proc_setgroups_reports_initial_user_namespace_policy() {
@@ -1570,21 +1640,16 @@ impl Vfs {
                                     else {
                                         continue;
                                     };
-                                    let gw = if let Some(std::net::IpAddr::V4(g)) = route.gateway {
-                                        u32::from_le_bytes(g.octets())
-                                    } else {
-                                        0
+                                    let gateway = match route.gateway {
+                                        Some(std::net::IpAddr::V4(gateway)) => Some(gateway),
+                                        _ => None,
                                     };
-                                    let mask = u32::MAX
-                                        .checked_shl(32 - u32::from(route.destination.prefix))
-                                        .unwrap_or(0);
-                                    data.push_str(&format!(
-                                        "{}\t{:08X}\t{gw:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0\n",
-                                        String::from_utf8_lossy(&d.name),
-                                        u32::from_le_bytes(ip.octets()),
-                                        if route.gateway.is_some() { 3 } else { 1 },
+                                    data.push_str(&proc_ipv4_route_row(
+                                        &d.name,
+                                        ip,
+                                        route.destination.prefix,
+                                        gateway,
                                         route.metric,
-                                        mask.to_le()
                                     ));
                                 }
                             }
@@ -1592,8 +1657,18 @@ impl Vfs {
                         }
                         b"route" => regular(if let Some(n) = info {
                             if n.id == 0 {
-                                let mask = u32::MAX.checked_shl(32 - n.prefix4 as u32).unwrap_or(0);
-                                format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\neth0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\neth0\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0\n", (u32::from(n.ipv4) & mask).to_le(), mask.to_le()).into_bytes()
+                                let mut data = String::from("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n");
+                                data.push_str(&proc_ipv4_route_row(
+                                    b"eth0",
+                                    std::net::Ipv4Addr::UNSPECIFIED,
+                                    0,
+                                    None,
+                                    0,
+                                ));
+                                data.push_str(&proc_ipv4_route_row(
+                                    b"eth0", n.ipv4, n.prefix4, None, 0,
+                                ));
+                                data.into_bytes()
                             } else {
                                 format!("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0\neth0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n", u32::from_le_bytes(n.gateway4.octets())).into_bytes()
                             }

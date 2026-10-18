@@ -96,7 +96,10 @@ impl DerefMut for PageBytes {
 
 pub(crate) struct Window {
     base: u64,
-    mapping: Arc<host::Mapping>,
+    // Workers need only the CPU view. Coordinator windows additionally own
+    // physical bytes; PageBytes retain that owner independently of this view.
+    mapping: Option<Arc<host::Mapping>>,
+    cpu: host::CpuMapping,
     flags: Box<[AtomicU8]>,
     frames: Box<[AtomicUsize]>,
     initialized: Box<[AtomicBool]>,
@@ -105,9 +108,31 @@ pub(crate) struct Window {
 }
 impl Window {
     fn new(base: u64, granule: usize) -> Option<Self> {
-        Some(Self {
+        let mapping = Arc::new(host::Mapping::new()?);
+        let cpu = host::CpuMapping::new()?;
+        if !cpu.alias(0, &mapping, 0, WINDOW) || !cpu.protect(0, WINDOW, libc::PROT_NONE) {
+            return None;
+        }
+        Some(Self::with_view(base, granule, cpu, Some(mapping)))
+    }
+    fn for_workers(base: u64, granule: usize) -> Option<Self> {
+        Some(Self::with_view(
             base,
-            mapping: Arc::new(host::Mapping::new()?),
+            granule,
+            host::CpuMapping::new()?,
+            None,
+        ))
+    }
+    fn with_view(
+        base: u64,
+        granule: usize,
+        cpu: host::CpuMapping,
+        mapping: Option<Arc<host::Mapping>>,
+    ) -> Self {
+        Self {
+            base,
+            mapping,
+            cpu,
             granule,
             shift: granule.trailing_zeros(),
             flags: (0..WINDOW / granule).map(|_| AtomicU8::new(0)).collect(),
@@ -115,20 +140,21 @@ impl Window {
                 .map(|_| AtomicUsize::new(usize::MAX))
                 .collect(),
             initialized: (0..WINDOW / P).map(|_| AtomicBool::new(false)).collect(),
-        })
+        }
     }
     fn page(&self, offset: usize, zero: bool) -> Rc<PageBytes> {
+        let mapping = self.mapping.as_ref().expect("coordinator physical storage");
         if zero && self.initialized[offset / P].swap(true, Ordering::Relaxed) {
             // SAFETY: a newly installed private anonymous page has no existing
             // byte borrows. Fork retires the complete CPU arena before sharing.
             unsafe {
-                std::ptr::write_bytes(self.mapping.kernel.as_ptr().add(offset), 0, P);
+                std::ptr::write_bytes(mapping.kernel.as_ptr().add(offset), 0, P);
             }
         } else {
             self.initialized[offset / P].store(true, Ordering::Relaxed);
         }
         Rc::new(PageBytes::Mapped {
-            owner: self.mapping.clone(),
+            owner: mapping.clone(),
             offset,
             _lease: None,
         })
@@ -143,7 +169,7 @@ impl Window {
         } else {
             0
         };
-        let ok = self.mapping.protect(
+        let ok = self.cpu.protect(
             begin * self.granule,
             (end - begin) * self.granule,
             protection,
@@ -156,6 +182,7 @@ impl Window {
 
 pub(super) struct Arena {
     windows: RefCell<BTreeMap<u64, Rc<Window>>>,
+    unavailable: RefCell<BTreeSet<u64>>,
     cache: Cache,
     granule: usize,
     #[cfg(test)]
@@ -165,6 +192,7 @@ impl Default for Arena {
     fn default() -> Self {
         Self {
             windows: RefCell::new(BTreeMap::new()),
+            unavailable: RefCell::default(),
             cache: Cache::default(),
             granule: host::page_size().unwrap_or(0),
             #[cfg(test)]
@@ -184,7 +212,13 @@ impl Arena {
         if !create {
             return None;
         }
-        let window = Rc::new(Window::new(base, self.granule)?);
+        let Some(window) = Window::new(base, self.granule) else {
+            self.unavailable.borrow_mut().insert(base);
+            self.cache.absent(base);
+            return None;
+        };
+        self.unavailable.borrow_mut().remove(&base);
+        let window = Rc::new(window);
         self.windows.borrow_mut().insert(base, window.clone());
         self.cache.insert(base, NonNull::from(window.as_ref()));
         Some(window)
@@ -212,6 +246,13 @@ impl Arena {
         Some(unsafe { pointer.as_ref() })
     }
     pub fn page(&self, base: u64) -> Option<Rc<PageBytes>> {
+        if self
+            .unavailable
+            .borrow()
+            .contains(&(base & !(WINDOW as u64 - 1)))
+        {
+            return None;
+        }
         let window = self.window(base, true)?;
         Some(window.page((base - window.base) as usize, true))
     }
@@ -220,11 +261,12 @@ impl Arena {
     /// windows are populated lazily; fork does not eagerly copy guest RAM.
     pub fn retire(&self) {
         self.cache.clear();
+        self.unavailable.borrow_mut().clear();
         for window in self.windows.borrow().values() {
             for flag in &window.flags {
                 flag.store(0, Ordering::Relaxed);
             }
-            window.mapping.protect(0, WINDOW, libc::PROT_NONE);
+            window.cpu.protect(0, WINDOW, libc::PROT_NONE);
         }
         self.windows.borrow_mut().clear();
     }
@@ -238,17 +280,25 @@ impl Arena {
         if window.flags[offset >> window.shift].load(Ordering::Relaxed) & ELIGIBLE == 0 {
             return 0;
         }
-        window.mapping.cpu.as_ptr().wrapping_add(offset) as usize
+        window.cpu.cpu.as_ptr().wrapping_add(offset) as usize
     }
     #[inline]
     fn prepared(&self, address: u64) -> bool {
         self.granule == 0
-            || self.reached(address).is_some_and(|window| {
-                window.flags[(address - window.base) as usize >> window.shift]
-                    .load(Ordering::Relaxed)
-                    & (ELIGIBLE | SOFTWARE)
-                    != 0
-            })
+            || match self.reached(address) {
+                Some(window) => {
+                    window.flags[(address - window.base) as usize >> window.shift]
+                        .load(Ordering::Relaxed)
+                        & (ELIGIBLE | SOFTWARE)
+                        != 0
+                }
+                // Optional VA pressure is not a reason to retry a host mapping
+                // on every store. Mapping boundaries retry once per window.
+                None => self
+                    .unavailable
+                    .borrow()
+                    .contains(&(address & !(WINDOW as u64 - 1))),
+            }
     }
     #[inline]
     #[cfg(test)]
@@ -259,7 +309,7 @@ impl Arena {
         let window = self.reached(address)?;
         Self::read_at(
             window,
-            (window.mapping.cpu.as_ptr() as usize).wrapping_sub(window.base as usize),
+            (window.cpu.cpu.as_ptr() as usize).wrapping_sub(window.base as usize),
             address,
         )
     }
@@ -297,7 +347,7 @@ impl Arena {
         let window = self.reached(address)?;
         Self::write_at(
             window,
-            (window.mapping.cpu.as_ptr() as usize).wrapping_sub(window.base as usize),
+            (window.cpu.cpu.as_ptr() as usize).wrapping_sub(window.base as usize),
             address,
             bytes,
         )
@@ -378,11 +428,38 @@ impl Memory {
                 .mmu
                 .window(at, self.pages.range(at..stop).next().is_some())
             else {
+                let base = at & !(WINDOW as u64 - 1);
+                if self
+                    .pages
+                    .range(base..base + WINDOW as u64)
+                    .next()
+                    .is_none()
+                {
+                    self.mmu.unavailable.borrow_mut().remove(&base);
+                }
                 // Huge reserved/hole ranges own no physical windows. Skip the
                 // entire sparse window instead of inspecting every 4KiB page.
                 at = stop;
                 continue;
             };
+            if self
+                .pages
+                .range(window.base..window.base + WINDOW as u64)
+                .next()
+                .is_none()
+            {
+                // Quiescent unmap/fixed-replacement boundary. Byte owners in a
+                // fork or retained snapshot may live on, but not this CPU VA.
+                self.mmu.cache.clear();
+                self.mmu.windows.borrow_mut().remove(&window.base);
+                changed = true;
+                at = stop;
+                continue;
+            }
+            let mapping = window
+                .mapping
+                .as_ref()
+                .expect("coordinator physical storage");
             let mut run: Option<(usize, usize, u8)> = None;
             while at < stop {
                 let first = (at - window.base) as usize;
@@ -409,7 +486,7 @@ impl Memory {
                     if frames.iter().enumerate().any(|(index, &frame)| {
                         let page = self.frames[frame].as_ref().expect("mapped page");
                         Rc::strong_count(&page.bytes) != 1
-                            || !page.bytes.belongs(&window.mapping, first + index * P)
+                            || !page.bytes.belongs(mapping, first + index * P)
                     }) {
                         changed = true;
                         // Capture the complete group before writing: remap may
@@ -425,7 +502,7 @@ impl Memory {
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     bytes.as_ptr(),
-                                    window.mapping.kernel.as_ptr().add(offset),
+                                    mapping.kernel.as_ptr().add(offset),
                                     P,
                                 );
                             }
