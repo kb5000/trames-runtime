@@ -872,6 +872,11 @@ mod tests {
             Err(Errno(14))
         );
         memory.write(0x1020, &0x1400u64.to_le_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while socket.poll(1).unwrap() & 1 == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(
             linux.network_syscall(212, [fd as u64, 0x1000, 0, 0, 0, 0], &mut memory),
             Ok(3)
@@ -889,7 +894,17 @@ mod tests {
             Ok(3)
         );
         let mut bytes = [0; 10];
-        assert_eq!(peer.recv(&mut bytes).unwrap(), 3);
+        let n = loop {
+            match peer.recv(&mut bytes) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(n, 3);
         assert_eq!(&bytes[..3], b"abc");
         memory.write(0x1400, &15u64.to_le_bytes()).unwrap();
         assert_eq!(

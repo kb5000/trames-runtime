@@ -366,13 +366,25 @@ fn native_root_input_and_output_policy_enforces_real_socket_io() {
         )),
         0
     );
+    let ready = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while receiver.poll(1).unwrap() & 1 == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native UDP delivery timed out"
+            );
+            std::thread::yield_now();
+        }
+    };
     peer.send_to(b"denied", address).unwrap();
+    ready();
     assert!(matches!(receiver.recv(100, 0), Err(NetError(11))));
     assert_eq!(
         errno(&batch(&root.1, &[rule("f", "input", &verdict(1, None))])),
         0
     );
     peer.send_to(b"allowed", address).unwrap();
+    ready();
     assert_eq!(receiver.recv(100, 0).unwrap().data, b"allowed");
     assert_eq!(
         errno(&batch(&root.1, &[chain("f", "output", Some(3), 0, 0)])),
