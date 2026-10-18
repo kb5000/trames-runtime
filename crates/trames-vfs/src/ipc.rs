@@ -426,6 +426,7 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
+                    read_node: None,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Socket,

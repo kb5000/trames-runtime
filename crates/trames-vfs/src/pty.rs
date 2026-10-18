@@ -249,6 +249,7 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
+                    read_node: None,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Terminal,
@@ -316,6 +317,7 @@ impl Devpts {
         }
         let out = Self {
             fs: Rc::new(RefCell::new(Filesystem {
+                overlay: None,
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),

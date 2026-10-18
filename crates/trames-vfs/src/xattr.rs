@@ -3,6 +3,12 @@
 use super::*;
 type AttributeNode = (Rc<RefCell<Node>>, Rc<RefCell<Filesystem>>);
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
+pub(super) fn overlay_attribute(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"trusted.overlay.opaque" | b"trusted.overlay.whiteout"
+    )
+}
 pub(super) fn xattr_size(attrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
     attrs.iter().map(|(k, v)| k.len() + 1 + v.len()).sum()
 }
@@ -48,6 +54,17 @@ impl Vfs {
         if name.len() > 255 {
             return Err(Errno(34));
         }
+        if name.starts_with(b"trusted.") {
+            if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+                return Err(Errno(if write { 1 } else { 61 }));
+            }
+            if overlay_attribute(name)
+                && matches!(node.content, Content::File(_) | Content::Directory)
+            {
+                return Ok(());
+            }
+            return Err(Errno(if write { 95 } else { 61 }));
+        }
         if name.starts_with(b"user.") && name.len() > 5 {
             if !matches!(node.content, Content::File(_) | Content::Directory) {
                 return Err(Errno(if write { 1 } else { 61 }));
@@ -89,6 +106,9 @@ impl Vfs {
         let n = node.borrow();
         Ok(n.xattrs
             .keys()
+            .filter(|name| {
+                !name.starts_with(b"trusted.") || self.credentials.has_cap(capabilities::SYS_ADMIN)
+            })
             .flat_map(|k| k.iter().copied().chain([0]))
             .collect())
     }

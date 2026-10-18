@@ -666,6 +666,7 @@ impl Vfs {
         };
         let owner = (node.borrow().uid, node.borrow().gid);
         Ok(Some(Rc::new(RefCell::new(OpenDescription {
+            read_node: None,
             id: self.open_id(),
             owner,
             kind: FdKind::Node(label),
@@ -835,6 +836,16 @@ impl Vfs {
             if let Some(m) = &original.mount {
                 m.writable()?;
             }
+            if let Some(node) = &original.node {
+                self.overlay_prepare(
+                    &ResolvedPath {
+                        key: Vec::new(),
+                        mount: original.mount.clone(),
+                    },
+                    node,
+                    flags & 0x200 != 0,
+                )?;
+            }
         }
         let fd = self.available(0)?;
         let pipe = if let Some(node) = &original.node {
@@ -851,6 +862,17 @@ impl Vfs {
             .as_ref()
             .and_then(|node| inotify::Close::reopen(node, flags, original.notification.as_ref()));
         let descriptor = OpenDescription {
+            read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
+                original.read_node.clone().or_else(|| {
+                    let node = original.node.as_ref()?.borrow();
+                    match &node.content {
+                        Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
+                        _ => None,
+                    }
+                })
+            } else {
+                None
+            },
             id: self.open_id(),
             owner: original.owner,
             kind: original.kind.clone(),
@@ -1100,7 +1122,7 @@ impl Vfs {
             b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
             b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;

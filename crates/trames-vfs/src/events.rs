@@ -217,6 +217,7 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
+                    read_node: None,
                     id: self.open_id(),
                     owner: (0, 0),
                     kind: FdKind::Anonymous,

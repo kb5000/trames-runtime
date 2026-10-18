@@ -178,6 +178,19 @@ impl Instance {
 }
 
 pub(super) fn link(node: &Rc<RefCell<Node>>, parent: &Rc<RefCell<Node>>, name: &[u8]) {
+    node.borrow_mut()
+        .notifications
+        .links
+        .retain(|l| l.parent.borrow().strong_count() != 0);
+    if node.borrow().notifications.links.iter().any(|l| {
+        *l.name.borrow() == name
+            && l.parent
+                .borrow()
+                .upgrade()
+                .is_some_and(|p| Rc::ptr_eq(&p, parent))
+    }) {
+        return;
+    }
     node.borrow_mut().notifications.links.push(Rc::new(Link {
         parent: RefCell::new(Rc::downgrade(parent)),
         name: RefCell::new(name.to_vec()),

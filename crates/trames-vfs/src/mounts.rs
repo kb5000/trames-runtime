@@ -25,6 +25,7 @@ pub(super) enum Kind {
     Cgroup,
     Nsfs,
     Mqueue,
+    Overlay,
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -64,6 +65,13 @@ pub(super) struct Mount {
     pub parent: RefCell<Option<Attachment>>,
 }
 impl Mount {
+    pub(super) fn device(&self) -> u64 {
+        self.fs
+            .borrow()
+            .overlay
+            .as_ref()
+            .map_or_else(|| self.root.borrow().device, |o| o.device)
+    }
     pub fn readonly(&self) -> bool {
         self.flags.get() & MS_RDONLY != 0
     }
@@ -477,7 +485,7 @@ impl Vfs {
             return false;
         }
         match path.mount().map(|m| m.kind) {
-            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue) => false,
+            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue | Kind::Overlay) => false,
             Some(Kind::Root) => {
                 let p = path.key();
                 !p.starts_with(b"/proc/")
@@ -524,7 +532,7 @@ impl Vfs {
 impl Vfs {
     // A proc FD magic link is a retained mount/inode capability. Its display
     // label may have been renamed or replaced and must not select the target.
-    fn mount_location(&self, path: &[u8], follow: bool) -> Result<ResolvedPath> {
+    pub(super) fn mount_location(&self, path: &[u8], follow: bool) -> Result<ResolvedPath> {
         let (path, magic) = self.resolve_entry(AT_FDCWD, path, follow, true)?;
         match magic {
             Some((node, _, mount)) => self.location(&node, &mount),
@@ -600,6 +608,16 @@ impl Vfs {
             if parent.kind == Kind::Sysfs && flags & MS_RDONLY == 0 {
                 return Err(Errno(30));
             }
+            if flags & MS_RDONLY == 0
+                && parent
+                    .fs
+                    .borrow()
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|o| !o.has_upper())
+            {
+                return Err(Errno(30));
+            }
             if flags & MS_RDONLY != 0 && parent.writers.get() != 0 {
                 return Err(Errno(16));
             }
@@ -612,7 +630,7 @@ impl Vfs {
         if flags & REC != 0 && flags & BIND == 0 {
             return Err(Errno(22));
         }
-        let ns = self.mounts.as_ref().ok_or(Errno(22))?;
+        let ns = self.mounts.as_ref().ok_or(Errno(22))?.clone();
         let mut additions = Vec::new();
         let mut devpts = None;
         let mut namespace = None;
@@ -645,6 +663,7 @@ impl Vfs {
                 seals: None,
             }));
             let fs = Rc::new(RefCell::new(Filesystem {
+                overlay: None,
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                 inodes: vec![Rc::downgrade(&root)],
@@ -699,6 +718,18 @@ impl Vfs {
                 return Err(Errno(20));
             }
             match kind.ok_or(Errno(22))? {
+                b"overlay" => {
+                    let (fs, readonly) =
+                        self.overlay_mount(data.ok_or(Errno(22))?, flags & MS_RDONLY != 0)?;
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (
+                        fs,
+                        root,
+                        b"/".to_vec(),
+                        Kind::Overlay,
+                        (flags & ATTRS) | if readonly { MS_RDONLY } else { 0 },
+                    )
+                }
                 b"mqueue" if self.ipc_namespace.mqueue.borrow().is_some() => {
                     if data.is_some_and(|d| !d.is_empty()) {
                         return Err(Errno(95));
@@ -734,6 +765,7 @@ impl Vfs {
                         seals: None,
                     }));
                     let fs = Rc::new(RefCell::new(Filesystem {
+                        overlay: None,
                         shared_budget: trames_shared::SharedBudget::new(
                             memfd::MEMFD_BYTES as usize,
                         ),
@@ -1123,6 +1155,7 @@ impl Mount {
             Kind::Cgroup => "cgroup2",
             Kind::Nsfs => "nsfs",
             Kind::Mqueue => "mqueue",
+            Kind::Overlay => "overlay",
         }
     }
     fn options(&self) -> String {
@@ -1185,6 +1218,12 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             m.fs_name()
         };
         let flags = m.options();
+        let super_options =
+            m.fs.borrow()
+                .overlay
+                .as_ref()
+                .map(|o| format!(",{}", escape_mount_field(o.options())))
+                .unwrap_or_default();
         if info {
             let root = match m.kind {
                 Kind::Proc | Kind::Sysfs | Kind::Devpts => m
@@ -1195,10 +1234,10 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
                 _ => filesystem_root,
             };
             let root = if root.is_empty() { b"/".to_vec() } else { root };
-            let dev = m.root.borrow().device;
+            let dev = m.device();
             let parent = m.parent.borrow().as_ref().map_or(m.id, |a| a.parent.id);
             text.push_str(&format!(
-                "{} {} {}:{} {} {} {} - {} {} {}\n",
+                "{} {} {}:{} {} {} {} - {} {} {}{}\n",
                 m.id,
                 parent,
                 (dev >> 8) & 0xfff,
@@ -1208,15 +1247,17 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
                 flags,
                 m.fs_name(),
                 source,
-                if m.readonly() { "ro" } else { "rw" }
+                if m.readonly() { "ro" } else { "rw" },
+                super_options,
             ));
         } else {
             text.push_str(&format!(
-                "{} {} {} {} 0 0\n",
+                "{} {} {} {}{} 0 0\n",
                 source,
                 escape_mount_field(&target),
                 m.fs_name(),
-                flags
+                flags,
+                super_options,
             ));
         }
     }
@@ -1237,9 +1278,10 @@ impl Vfs {
             Kind::Cgroup => 0x63677270,
             Kind::Nsfs => 0x6e736673,
             Kind::Mqueue => 0x19800202,
+            Kind::Overlay => 0x794c7630,
         };
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
-        if matches!(m.kind, Kind::Root | Kind::Tmpfs) {
+        if matches!(m.kind, Kind::Root | Kind::Tmpfs | Kind::Overlay) {
             for (offset, value) in [
                 (16, capacity.budget_bytes / 4096),
                 (24, capacity.available_bytes / 4096),
@@ -1256,7 +1298,7 @@ impl Vfs {
         for (offset, value) in [
             (0, magic),
             (8, 4096),
-            (56, m.root.borrow().device),
+            (56, m.device()),
             (64, 255),
             (72, 4096),
             (
@@ -1430,7 +1472,7 @@ impl Vfs {
         registry.extend(mounts.iter().map(Rc::downgrade));
         Ok(())
     }
-    fn reap_detached_mounts(&self) {
+    pub(super) fn reap_detached_mounts(&self) {
         // The retained tree owns one reference per mount. Attachment edges
         // own their parents; anything else is an fd/cwd/root/exec/mapping pin.
         self.detached_mounts.borrow_mut().retain(|tree| {

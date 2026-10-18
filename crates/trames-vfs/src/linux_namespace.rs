@@ -415,6 +415,7 @@ impl Vfs {
         ns: NamespaceHandle,
     ) -> Rc<RefCell<OpenDescription>> {
         Rc::new(RefCell::new(OpenDescription {
+            read_node: None,
             id: ns.id(),
             owner: (0, 0),
             kind: FdKind::Anonymous,

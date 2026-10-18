@@ -109,6 +109,8 @@ impl Timestamp {
 }
 
 pub(super) enum FileData {
+    /// Read-through reference; overlay copy-up replaces this before mutation.
+    Lower(Rc<RefCell<Node>>),
     Memory(Vec<u8>),
     Shared(trames_shared::SharedFile),
     Disk(DiskObject),
@@ -150,6 +152,12 @@ impl Drop for DiskObject {
 }
 impl FileData {
     pub fn blocks(&self) -> Result<u64> {
+        if let Self::Lower(node) = self {
+            return match &node.borrow().content {
+                Content::File(data) => data.blocks(),
+                _ => Err(Errno(5)),
+            };
+        }
         if let Self::Mapped(data) = self {
             return data.blocks();
         }
@@ -169,6 +177,7 @@ impl FileData {
         match self {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(_) | Self::Shared(_) => None,
+            Self::Lower(_) => None,
             Self::Disk(d) => Some(d.inode),
         }
     }
@@ -181,6 +190,10 @@ impl FileData {
             Self::Memory(b) => b.len() as u64,
             Self::Shared(file) => file.len() as u64,
             Self::Disk(d) => d.length,
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.len(),
+                _ => 0,
+            },
         }
     }
     pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
@@ -200,6 +213,12 @@ impl FileData {
         }
     }
     pub fn read_at(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
+        if let Self::Lower(node) = self {
+            return match &node.borrow().content {
+                Content::File(data) => data.read_at(offset, count),
+                _ => Err(Errno(5)),
+            };
+        }
         if let Self::Mapped(data) = self {
             return data.read_at(offset, count);
         }
@@ -210,6 +229,7 @@ impl FileData {
             return Ok(Vec::new());
         }
         match self {
+            Self::Lower(_) => unreachable!("lower read delegated"),
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
             Self::Shared(file) => file.read_at(offset, count).map_err(host_errno),
@@ -228,6 +248,7 @@ impl FileData {
             return data.write_at(offset, bytes);
         }
         match self {
+            Self::Lower(_) => Err(Errno(30)),
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Shared(file) => file.write_at(offset, bytes).map_err(host_errno),
             Self::Memory(b) => {
@@ -256,6 +277,7 @@ impl FileData {
             return data.truncate(length);
         }
         match self {
+            Self::Lower(_) => return Err(Errno(30)),
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Shared(file) => file
                 .set_len(usize::try_from(length).map_err(|_| Errno(27))?)
@@ -455,6 +477,9 @@ impl DiskStore {
 
 impl Filesystem {
     pub(super) fn checkpoint(&self) -> Result<()> {
+        if let Some(overlay) = &self.overlay {
+            return overlay.checkpoint(self);
+        }
         let Some(disk) = &self.disk else {
             return Ok(());
         };
@@ -700,7 +725,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 }
                 let name = d.take(len)?.to_vec();
                 let value = d.take(size)?.to_vec();
-                if !name.starts_with(b"user.")
+                if !(name.starts_with(b"user.") || super::xattr::overlay_attribute(&name))
                     || name.len() <= 5
                     || name.contains(&0)
                     || n.xattrs.insert(name, value).is_some()
@@ -781,6 +806,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         }
     }
     Ok(Filesystem {
+        overlay: None,
         shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
         flock: BTreeMap::new(),
         record_locks: BTreeMap::new(),
@@ -967,6 +993,9 @@ impl Vfs {
         Self::filesystem_capacity(&self.fs.borrow())
     }
     pub(super) fn filesystem_capacity(fs: &Filesystem) -> StorageCapacity {
+        if let Some(overlay) = &fs.overlay {
+            return overlay.capacity();
+        }
         let used = fs
             .inodes
             .iter()
@@ -1018,6 +1047,9 @@ impl Vfs {
         Self::filesystem_empty_data(&mut self.fs.borrow_mut())
     }
     pub(super) fn filesystem_empty_data(fs: &mut Filesystem) -> Result<FileData> {
+        if let Some(overlay) = &fs.overlay {
+            return overlay.empty_data();
+        }
         if let Some(d) = &fs.disk {
             let next = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
             let data = d.create(fs.next_inode)?;
@@ -1028,6 +1060,17 @@ impl Vfs {
         }
     }
     pub fn checkpoint(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for mount in self
+            .mount_registry
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            if seen.insert(Rc::as_ptr(&mount.fs)) && mount.fs.borrow().overlay.is_some() {
+                mount.fs.borrow().checkpoint()?;
+            }
+        }
         self.fs.borrow().checkpoint()
     }
     /// Flush every live file, then the namespace and its directory entry.

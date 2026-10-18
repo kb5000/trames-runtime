@@ -84,6 +84,17 @@ impl Vfs {
             return Ok(());
         }
         let is_dir = matches!(src.borrow().content, Content::Directory);
+        if is_dir
+            && filesystem
+                .borrow()
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.lower_directory(&source))
+        {
+            // redirect_dir=off: Linux asks userspace to copy a lower/merged
+            // directory tree rather than silently changing lower dentries.
+            return Err(Errno(18));
+        }
         let mut prefix = source.clone();
         prefix.push(b'/');
         if is_dir && dest.starts_with(&prefix) {

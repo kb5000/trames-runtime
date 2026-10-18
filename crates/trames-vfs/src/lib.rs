@@ -29,6 +29,7 @@ pub use linux_namespace::{
 };
 mod network;
 mod oom;
+mod overlay;
 mod pseudo;
 pub use oom::OomTask;
 mod pty;
@@ -186,6 +187,8 @@ struct OpenDescription {
     flags: u32,
     position: u64,
     node: Option<Rc<RefCell<Node>>>,
+    // Overlay read descriptions retain the real lower file selected at open.
+    read_node: Option<Rc<RefCell<Node>>>,
     pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
@@ -205,6 +208,9 @@ impl Drop for OpenDescription {
     }
 }
 impl OpenDescription {
+    fn data_node(&self) -> Option<Rc<RefCell<Node>>> {
+        self.read_node.clone().or_else(|| self.node.clone())
+    }
     fn metadata_node(&self) -> Option<Rc<RefCell<Node>>> {
         self.node
             .clone()
@@ -244,6 +250,7 @@ type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
 type FlockOwners = Vec<(Weak<RefCell<OpenDescription>>, u32)>;
 struct Filesystem {
+    overlay: Option<Rc<overlay::Overlay>>,
     shared_budget: trames_shared::SharedBudget,
     paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
     inodes: Vec<Weak<RefCell<Node>>>,
@@ -300,6 +307,7 @@ impl Default for Vfs {
             network,
             native_services: Rc::default(),
             fs: Rc::new(RefCell::new(Filesystem {
+                overlay: None,
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -358,6 +366,7 @@ impl Default for Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        read_node: None,
                         id: v.open_id(),
                         owner: (v.credentials.fsuid, v.credentials.fsgid),
                         kind,
@@ -498,6 +507,7 @@ impl Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        read_node: None,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),
                         kind: FdKind::Terminal,
@@ -556,7 +566,15 @@ impl Vfs {
         }
         let old_next = fs.next_inode;
         let inode = if let Content::File(data) = &content {
-            data.inode().unwrap_or(fs.next_inode)
+            match data.inode() {
+                Some(inode) => inode,
+                None => match &fs.overlay {
+                    Some(overlay) => overlay.allocate_inode()?,
+                    None => fs.next_inode,
+                },
+            }
+        } else if let Some(overlay) = &fs.overlay {
+            overlay.allocate_inode()?
         } else {
             fs.next_inode
         };
@@ -1301,7 +1319,7 @@ impl Vfs {
         }
         let node = self.node(&p)?;
         {
-            let mut n = node.borrow_mut();
+            let n = node.borrow();
             self.check_device_open(&n, flags)?;
             if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
                 return Err(Errno(6));
@@ -1336,6 +1354,12 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
+        }
+        if flags & O_PATH == 0 && flags & 3 != 0 {
+            self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
+        }
+        {
+            let mut n = node.borrow_mut();
             if flags & 0x200 != 0
                 && !Self::cgroup_mount(&p)
                 && oom.is_none()
@@ -1413,10 +1437,19 @@ impl Vfs {
             None
         };
         let notification = self.notification_open(&p, &node, flags);
+        let read_node = if flags & O_PATH == 0 && flags & 3 == 0 {
+            match &node.borrow().content {
+                Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.fds.insert(
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(OpenDescription {
+                    read_node,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: if flags & O_PATH == 0
@@ -1597,6 +1630,7 @@ impl Vfs {
                 fd,
                 Descriptor {
                     open: Rc::new(RefCell::new(OpenDescription {
+                        read_node: None,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),
                         kind,
@@ -1802,7 +1836,7 @@ impl Vfs {
             }
             return Ok(p.bytes.drain(..n).collect());
         }
-        let node = o.node.clone().ok_or(Errno(9))?;
+        let node = o.data_node().ok_or(Errno(9))?;
         let mut n = node.borrow_mut();
         let result = match &n.content {
             Content::File(b) => {
@@ -1822,11 +1856,15 @@ impl Vfs {
             mounts::accessed(&mut n, o.mount.as_ref());
         }
         drop(n);
+        let notification_node = o.node.as_ref().unwrap_or(&node);
+        if !Rc::ptr_eq(notification_node, &node) && result.is_ok() {
+            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
+        }
         if result.as_ref().is_ok_and(|b| !b.is_empty())
             && !(node.borrow().seals.is_some() && o.notification.is_none())
         {
             inotify::notify(
-                &node,
+                notification_node,
                 inotify::ACCESS,
                 o.notification.as_ref().and_then(|c| c.link.as_ref()),
             );
@@ -2026,7 +2064,7 @@ impl Vfs {
         if let Some(data) = self.cgroup_read(&o, offset, count)? {
             return Ok(data);
         }
-        let node = o.node.as_ref().ok_or(Errno(29))?;
+        let node = o.data_node().ok_or(Errno(29))?;
         let mut n = node.borrow_mut();
         let result = match &n.content {
             Content::File(b) => b.read_at(offset, count),
@@ -2041,11 +2079,15 @@ impl Vfs {
             mounts::accessed(&mut n, o.mount.as_ref());
         }
         drop(n);
+        let notification_node = o.node.as_ref().unwrap_or(&node);
+        if !Rc::ptr_eq(notification_node, &node) && result.is_ok() {
+            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
+        }
         if result.as_ref().is_ok_and(|b| !b.is_empty())
             && !(node.borrow().seals.is_some() && o.notification.is_none())
         {
             inotify::notify(
-                node,
+                notification_node,
                 inotify::ACCESS,
                 o.notification.as_ref().and_then(|c| c.link.as_ref()),
             );
@@ -2135,7 +2177,7 @@ impl Vfs {
         if o.bridge.is_some() {
             return Err(Errno(29));
         }
-        let node = o.node.clone().ok_or(Errno(29))?;
+        let node = o.data_node().ok_or(Errno(29))?;
         let n = node.borrow();
         if let Some(log) = &o.kernel_log {
             let position = log.borrow().seek(offset, whence)?;
@@ -2170,7 +2212,10 @@ impl Vfs {
     }
     fn stat_node(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
         let mut out = [0; 128];
-        out[..8].copy_from_slice(&node.device.to_le_bytes());
+        let device = mount
+            .filter(|m| m.kind == mounts::Kind::Overlay)
+            .map_or(node.device, |m| m.device());
+        out[..8].copy_from_slice(&device.to_le_bytes());
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         out[16..20].copy_from_slice(&node.mode.to_le_bytes());
         let mut links = node.links;
@@ -2282,7 +2327,14 @@ impl Vfs {
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
         if let Some(n) = o.metadata_node() {
-            return self.stat_node(&n.borrow(), o.mount.as_ref());
+            let mut stat = self.stat_node(&n.borrow(), o.mount.as_ref())?;
+            if let Some(source) = &o.read_node {
+                if let Content::File(data) = &source.borrow().content {
+                    stat[48..56].copy_from_slice(&data.len().to_le_bytes());
+                    stat[64..72].copy_from_slice(&data.blocks()?.to_le_bytes());
+                }
+            }
+            return Ok(stat);
         }
         if matches!(o.kind, FdKind::Terminal) {
             if let Ok(n) = self.node(b"/dev/pts/0") {

@@ -91,6 +91,7 @@ fn io_errno(e: io::Error) -> Errno {
 impl OpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Rc<RefCell<Pipe>>, write: bool) -> Self {
         Self {
+            read_node: None,
             id,
             owner,
             kind: if write {
@@ -453,6 +454,7 @@ impl Vfs {
         fs.inodes.push(Rc::downgrade(&node));
         drop(fs);
         Ok(Rc::new(RefCell::new(OpenDescription {
+            read_node: None,
             id: self.open_id(),
             owner,
             kind: FdKind::Node(b"/memfd:wayland-resource".to_vec()),

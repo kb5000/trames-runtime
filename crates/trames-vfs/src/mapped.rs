@@ -417,7 +417,7 @@ impl Vfs {
         {
             return Err(Errno(19));
         }
-        let node = o.node.clone().ok_or(Errno(19))?;
+        let node = o.data_node().ok_or(Errno(19))?;
         let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());
         if shared && writable && readonly {
             return Err(Errno(30));
