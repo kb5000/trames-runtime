@@ -208,6 +208,7 @@ impl Endpoint {
             return Err(NetError(71));
         }
         let empty = || Received {
+            netlink_address: None,
             data: Vec::new(),
             address: None,
             length: 0,
@@ -234,6 +235,7 @@ impl Endpoint {
             }
         }
         Ok(Received {
+            netlink_address: None,
             data,
             address: (!self.stream).then_some(ADDRESS),
             length,

@@ -39,6 +39,7 @@ pub(super) fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32
             Some(true),
             Some(bridge),
             None,
+            None,
         )
         .unwrap();
     n.set_device_up(b, true).unwrap();
@@ -138,6 +139,7 @@ fn bridge_controls_real_tcp_udp_and_live_link_isolation() {
             None,
             None,
             Some(0),
+            None,
             None,
         )
         .unwrap();
@@ -287,6 +289,271 @@ fn netlink_pair_move_and_rejection_are_atomic_and_notify_subscribers() {
     let mut g = n.1.graph.borrow_mut();
     g.remove_link(ns, peer.index).unwrap();
     assert!(g.device(ns, edge.index).is_err());
+}
+#[test]
+fn docker_link_strings_and_queue_metadata_are_validated_and_atomic() {
+    let root = Network::new(NetworkMode::Full);
+    let n = root.isolated().unwrap();
+    let s = root.socket(16, 3, 0).unwrap();
+    let create = |kind: &[u8], len: &[u8]| {
+        let mut data = vec![0; 16];
+        attr(&mut data, 3, b"docker0\0");
+        attr(&mut data, 13, len);
+        attr(&mut data, 1, &[2, 0, 0, 0, 1, 1]);
+        let mut info = vec![];
+        attr(&mut info, 1, kind);
+        attr(&mut info, 2, &[]);
+        attr(&mut data, 18, &info);
+        data
+    };
+    for (kind, len) in [
+        (b"bridge\0bad".as_slice(), &[0; 4][..]),
+        (b"bridge", &[0; 3][..]),
+    ] {
+        assert_eq!(wire(&s, 16, 0x600, &create(kind, len), true, None), -22);
+        assert!(root.devices().iter().all(|d| d.name != b"docker0"));
+    }
+    assert_eq!(
+        wire(&s, 16, 0x600, &create(b"bridge", &[0; 4]), false, None),
+        -1
+    );
+    assert_eq!(
+        wire(&s, 16, 0x600, &create(b"bridge", &[0; 4]), true, None),
+        0
+    );
+    let br = root
+        .devices()
+        .into_iter()
+        .find(|d| d.name == b"docker0")
+        .unwrap();
+    assert_eq!(br.tx_queue_len, 0);
+    let update = |index: u32, length: u32, name: Option<&[u8]>| {
+        let mut data = vec![0; 16];
+        data[4..8].copy_from_slice(&index.to_le_bytes());
+        attr(&mut data, 13, &length.to_le_bytes());
+        if let Some(name) = name {
+            attr(&mut data, 3, name);
+        }
+        data
+    };
+    assert_eq!(
+        wire(&s, 19, 0, &update(br.index, 23, Some(b"lo\0")), true, None),
+        -17
+    );
+    assert_eq!(
+        root.1
+            .graph
+            .borrow()
+            .device(root.namespace_id(), br.index)
+            .unwrap()
+            .tx_queue_len,
+        0
+    );
+    assert_eq!(
+        wire(
+            &s,
+            19,
+            0,
+            &update(br.index, 23, Some(b"docker-renamed")),
+            true,
+            None
+        ),
+        0
+    );
+    let link = root
+        .1
+        .graph
+        .borrow()
+        .device(root.namespace_id(), br.index)
+        .unwrap();
+    assert_eq!(link.tx_queue_len, 23);
+    assert_eq!(link.name, b"docker-renamed");
+    let reply = rtnetlink::link_data(&root.1.graph.borrow(), &link);
+    assert!(reply.windows(8).any(|v| v == [8, 0, 13, 0, 23, 0, 0, 0]));
+    assert_eq!(wire(&s, 19, 0, &update(2, 23, None), true, None), -95);
+
+    // The veth peer carries its own queue setting through NET_NS_FD moves.
+    let mut data = vec![0; 16];
+    attr(&mut data, 3, b"queue-peer\0");
+    attr(&mut data, 13, &17u32.to_le_bytes());
+    let mut info = vec![];
+    attr(&mut info, 1, b"veth");
+    let mut peer = vec![0; 16];
+    attr(&mut peer, 3, b"eth0\0");
+    attr(&mut peer, 28, &99u32.to_le_bytes());
+    attr(&mut peer, 13, &0u32.to_le_bytes());
+    let mut nested = vec![];
+    attr(&mut nested, 1, &peer);
+    attr(&mut info, 2, &nested);
+    attr(&mut data, 18, &info);
+    assert_eq!(wire(&s, 16, 0x600, &data, true, Some(&n)), 0);
+    assert_eq!(
+        root.devices()
+            .iter()
+            .find(|d| d.name == b"queue-peer")
+            .unwrap()
+            .tx_queue_len,
+        17
+    );
+    assert_eq!(
+        n.devices()
+            .iter()
+            .find(|d| d.name == b"eth0")
+            .unwrap()
+            .tx_queue_len,
+        0
+    );
+}
+#[test]
+fn compact_rtgen_dumps_match_full_link_address_and_route_queries() {
+    let root = Network::new(NetworkMode::Full);
+    let n = root.isolated().unwrap();
+    let br = bridge(&n, b"dump-br");
+    assign(&n, br, "192.0.2.1", 24);
+    let s = n.socket(16, 3, 0).unwrap();
+    for (kind, size) in [(18, 16), (22, 8), (26, 12)] {
+        let mut previous = None;
+        for len in [1, 4, size] {
+            s.send_bytes_authorized(
+                &netlink::message(kind, 0x301, 1, 0, &vec![0; len]),
+                0,
+                None,
+                false,
+            )
+            .unwrap();
+            let mut replies = vec![];
+            loop {
+                let reply = s.recv(65536, 0).unwrap().data;
+                assert_ne!(&reply[4..6], &2u16.to_le_bytes());
+                let done = reply[4..6] == 3u16.to_le_bytes();
+                replies.push(reply);
+                if done {
+                    break;
+                }
+            }
+            if let Some(old) = &previous {
+                assert_eq!(old, &replies);
+            } else {
+                previous = Some(replies);
+            }
+        }
+    }
+    // Compact bodies are a dump-only compatibility rule, never a mutation.
+    assert_eq!(wire(&s, 16, 0, &[0], true, None), -22);
+}
+#[test]
+fn route_get_uses_namespace_routes_and_selected_source_without_mutating_them() {
+    let root = Network::new(NetworkMode::Full);
+    let n = root.isolated().unwrap();
+    let other = root.isolated().unwrap();
+    let br = bridge(&n, b"route-get");
+    assign(&n, br, "192.0.2.1", 24);
+    let query = |net: &Network, dst: &str| {
+        let s = net.socket(16, 3, 0).unwrap();
+        let mut data = vec![2, 32, 0, 0, 0, 0, 0, 0];
+        data.extend_from_slice(&0x1000u32.to_le_bytes());
+        attr(&mut data, 1, &dst.parse::<Ipv4Addr>().unwrap().octets());
+        s.send_bytes_authorized(&netlink::message(26, 1, 9, 0, &data), 0, None, false)
+            .unwrap();
+        s.recv(65536, 0).unwrap().data
+    };
+    let attributes = |reply: &[u8]| {
+        let mut attrs = std::collections::BTreeMap::new();
+        let mut at = 28;
+        while at < reply.len() {
+            let len = u16::from_le_bytes(reply[at..at + 2].try_into().unwrap()) as usize;
+            let kind = u16::from_le_bytes(reply[at + 2..at + 4].try_into().unwrap());
+            attrs.insert(kind, reply[at + 4..at + len].to_vec());
+            at += (len + 3) & !3;
+        }
+        attrs
+    };
+    let routes = n.routes();
+    let direct = query(&n, "192.0.2.20");
+    assert_eq!(&direct[4..6], &24u16.to_le_bytes());
+    let a = attributes(&direct);
+    assert_eq!(a[&4], br.to_le_bytes());
+    assert_eq!(a[&7], [192, 0, 2, 1]);
+    assert!(!a.contains_key(&5));
+    assert_eq!(n.routes(), routes);
+    for (net, dst) in [(&other, "192.0.2.20"), (&n, "198.51.100.2")] {
+        let unreachable = query(net, dst);
+        assert_eq!(&unreachable[4..6], &2u16.to_le_bytes());
+        assert_eq!(
+            i32::from_le_bytes(unreachable[16..20].try_into().unwrap()),
+            -101
+        );
+    }
+    n.1.graph
+        .borrow_mut()
+        .route(
+            n.namespace_id(),
+            netdev::Route {
+                destination: Address {
+                    ip: Ipv4Addr::UNSPECIFIED.into(),
+                    prefix: 0,
+                },
+                device: br,
+                gateway: Some("192.0.2.254".parse().unwrap()),
+                metric: 0,
+                protocol: 3,
+            },
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+    let external = query(&n, "198.51.100.2");
+    assert_eq!(attributes(&external)[&5], [192, 0, 2, 254]);
+    n.set_device_up(br, false).unwrap();
+    let down = query(&n, "198.51.100.2");
+    assert_eq!(i32::from_le_bytes(down[16..20].try_into().unwrap()), -101);
+}
+#[test]
+fn subscriber_dump_multicast_preserves_user_and_kernel_sources_and_namespace() {
+    let root = Network::new(NetworkMode::Full);
+    let child = root.isolated().unwrap();
+    let sender = root.socket(16, 3, 0).unwrap();
+    let subscriber = root.socket(16, 3, 0).unwrap();
+    let other = child.socket(16, 3, 0).unwrap();
+    let mut group = netlink::address(0);
+    group[8..12].copy_from_slice(&1u32.to_le_bytes());
+    for s in [&sender, &subscriber, &other] {
+        s.bind_bytes(&group).unwrap();
+    }
+    let request = netlink::message(18, 0x301, 7, 0, &[0; 16]);
+    assert_eq!(
+        sender.send_bytes_authorized(&request, 0, Some(&group), false),
+        Err(NetError(1))
+    );
+    assert_eq!(subscriber.recv(65536, 0).err(), Some(NetError(11)));
+    sender
+        .send_bytes_authorized(&request, 0, Some(&group), true)
+        .unwrap();
+    let user = subscriber.recv(65536, MSG_PEEK).unwrap();
+    assert_eq!(user.data, request);
+    let from = subscriber.received_address(&user);
+    assert_eq!(&from[4..8], &sender.local_bytes().unwrap()[4..8]);
+    assert_eq!(&from[8..12], &1u32.to_le_bytes());
+    assert_ne!(&from[4..8], &[0; 4]);
+    assert_eq!(subscriber.recv(65536, 0).unwrap().data, request);
+    assert_eq!(other.recv(65536, 0).err(), Some(NetError(11)));
+    let kernel = sender.recv(65536, 0).unwrap();
+    assert_eq!(&kernel.data[4..6], &16u16.to_le_bytes());
+    assert_eq!(sender.received_address(&kernel), netlink::address(0));
+    subscriber
+        .send_bytes_authorized(&request, 0, None, false)
+        .unwrap();
+    let later = subscriber.recv(65536, 0).unwrap();
+    assert_eq!(subscriber.received_address(&later), netlink::address(0));
+    // Retained Received objects do not pick up a later packet's source.
+    assert_eq!(subscriber.received_address(&user), from);
+    let mut invalid = group.clone();
+    invalid[4..8].copy_from_slice(&99u32.to_le_bytes());
+    assert_eq!(
+        sender.send_bytes_authorized(&request, 0, Some(&invalid), true),
+        Err(NetError(95))
+    );
 }
 #[test]
 fn routes_require_configuration_and_namespace_teardown_removes_veth_peer() {

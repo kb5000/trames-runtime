@@ -27,6 +27,8 @@ pub struct Device {
     pub kind: DeviceKind,
     pub up: bool,
     pub mtu: u32,
+    /// Linux netdev queue metadata; noqueue devices still use bounded transport buffers.
+    pub tx_queue_len: u32,
     pub mac: [u8; 6],
     pub master: Option<u32>,
     pub addresses: Vec<Address>,
@@ -152,6 +154,7 @@ impl Topology {
                 kind: DeviceKind::Loopback,
                 up: true,
                 mtu: 65536,
+                tx_queue_len: 0,
                 mac: [0; 6],
                 master: None,
                 addresses: vec![
@@ -206,6 +209,7 @@ impl Topology {
                     kind: DeviceKind::Direct,
                     up: true,
                     mtu: info.mtu,
+                    tx_queue_len: 0,
                     mac: [0; 6],
                     master: None,
                     addresses,
@@ -256,6 +260,7 @@ impl Topology {
                 kind: DeviceKind::Direct,
                 up: true,
                 mtu,
+                tx_queue_len: 0,
                 mac: [0; 6],
                 master: None,
                 addresses: addresses.clone(),
@@ -376,6 +381,7 @@ impl Topology {
                 kind,
                 up: false,
                 mtu: 1500,
+                tx_queue_len: 1000,
                 mac: [
                     2,
                     0,
@@ -428,6 +434,7 @@ impl Topology {
         up: Option<bool>,
         master: Option<u32>,
         mac: Option<[u8; 6]>,
+        tx_queue_len: Option<u32>,
     ) -> Result<()> {
         let old = self.device(id, index)?;
         if old.kind == DeviceKind::Direct {
@@ -443,6 +450,9 @@ impl Topology {
                     None if up => {}
                     None => return Err(NetError(95)),
                 }
+            }
+            if let Some(len) = tx_queue_len {
+                self.devices.get_mut(&(id, index)).unwrap().tx_queue_len = len;
             }
             self.changed();
             return Ok(());
@@ -490,6 +500,9 @@ impl Topology {
         }
         if let Some(mac) = mac {
             d.mac = mac;
+        }
+        if let Some(len) = tx_queue_len {
+            d.tx_queue_len = len;
         }
         self.devices.insert((target, index), d);
         self.changed();

@@ -33,10 +33,13 @@ fn get<'a>(attrs: &[(u16, &'a [u8])], kind: u16) -> Option<&'a [u8]> {
     attrs.iter().find_map(|(k, v)| (*k == kind).then_some(*v))
 }
 fn text(bytes: &[u8]) -> Result<&[u8]> {
-    if bytes.last() != Some(&0) || bytes[..bytes.len() - 1].contains(&0) {
+    // Linux NLA_STRING accepts either representation. Go netlink sends kind
+    // and rename attributes without a NUL, but creation names include one.
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() || bytes.contains(&0) {
         return Err(NetError(22));
     }
-    Ok(&bytes[..bytes.len() - 1])
+    Ok(bytes)
 }
 fn ip(family: u8, bytes: &[u8]) -> Result<IpAddr> {
     match family {
@@ -96,7 +99,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
         }],
     );
     attr(&mut data, 33, &[u8::from(carrier)]);
-    attr(&mut data, 13, &1000u32.to_le_bytes());
+    attr(&mut data, 13, &d.tx_queue_len.to_le_bytes());
     if let Some(master) = d.master {
         attr(&mut data, 10, &master.to_le_bytes());
     }
@@ -146,6 +149,28 @@ pub(crate) fn request(
     let flags = u16::from_le_bytes(request[6..8].try_into().unwrap());
     let seq = u32::from_le_bytes(request[8..12].try_into().unwrap());
     let dump = flags & 0x300 == 0x300;
+    // BusyBox/iproute2 may request a dump using only struct rtgenmsg (one
+    // family byte), while Go sends the complete per-message structure.
+    let padded;
+    let request = if dump && matches!(request.len(), 17 | 20) && matches!(kind, 18 | 22 | 26) {
+        padded = {
+            let mut data = request.to_vec();
+            data.resize(
+                if kind == 18 {
+                    32
+                } else if kind == 22 {
+                    24
+                } else {
+                    28
+                },
+                0,
+            );
+            data
+        };
+        &padded[..]
+    } else {
+        request
+    };
     let ns = namespace.id();
     let mut graph = namespace.graph.borrow_mut();
     let mut changes = vec![];
@@ -159,7 +184,8 @@ pub(crate) fn request(
                 if request.len() < 32 {
                     return Err(NetError(22));
                 }
-                if !matches!(request[16], 0 | 2 | 10) {
+                if !matches!(request[16], 0 | 2 | 10) && !(kind == 18 && dump && request[16] == 17)
+                {
                     return Err(NetError(97));
                 }
                 let a = attrs(&request[32..])?;
@@ -210,11 +236,15 @@ pub(crate) fn request(
                                 return Err(NetError(95));
                             }
                         }
+                        13 => {
+                            u32v(v)?;
+                        }
                         _ => return Err(NetError(95)),
                     }
                 }
                 let name = get(&a, 3).map(text).transpose()?;
                 let master = get(&a, 10).map(u32v).transpose()?;
+                let tx_queue_len = get(&a, 13).map(u32v).transpose()?;
                 let mac = get(&a, 1)
                     .map(|v| v.try_into().map_err(|_| NetError(22)))
                     .transpose()?;
@@ -260,7 +290,7 @@ pub(crate) fn request(
                                 return Err(NetError(95));
                             }
                             let pa = attrs(&peer[16..])?;
-                            if pa.iter().any(|(k, _)| !matches!(k, 1 | 3 | 4 | 28)) {
+                            if pa.iter().any(|(k, _)| !matches!(k, 1 | 3 | 4 | 13 | 28)) {
                                 return Err(NetError(95));
                             }
                             if get(&pa, 4)
@@ -296,6 +326,7 @@ pub(crate) fn request(
                                 (pc & 1 != 0).then_some(pf & 1 != 0),
                                 None,
                                 pm,
+                                get(&pa, 13).map(u32v).transpose()?,
                             )?;
                             changes.push((
                                 peer_ns,
@@ -307,7 +338,7 @@ pub(crate) fn request(
                         }
                         _ => return Err(NetError(95)),
                     };
-                    next.change_link(ns, index, None, target, up, None, mac)?;
+                    next.change_link(ns, index, None, target, up, None, mac, tx_queue_len)?;
                     let current = target.unwrap_or(ns);
                     changes.push((
                         current,
@@ -349,6 +380,7 @@ pub(crate) fn request(
                             up,
                             master,
                             mac,
+                            tx_queue_len,
                         )?;
                         if target.is_some_and(|to| to != ns) {
                             changes.push((ns, 17, 1, link_data(&graph, &d)));
@@ -458,7 +490,43 @@ pub(crate) fn request(
                 let a = attrs(&request[28..])?;
                 if kind == 26 {
                     if !dump {
-                        return Err(NetError(95));
+                        // RouteGet is used by libnetwork to find the actual
+                        // connected interface before installing a gateway.
+                        if !matches!(family, 2 | 10)
+                            || request[17] != if family == 2 { 32 } else { 128 }
+                            || request[18..24] != [0; 6]
+                            || u32v(&request[24..28])? & !0x1000 != 0
+                            || a.iter().any(|(k, _)| !matches!(k, 1 | 4))
+                        {
+                            return Err(NetError(95));
+                        }
+                        let destination = ip(family, get(&a, 1).ok_or(NetError(22))?)?;
+                        let (source, device, gateway) = graph.source(ns, destination)?;
+                        if get(&a, 4)
+                            .map(u32v)
+                            .transpose()?
+                            .is_some_and(|i| i != device)
+                        {
+                            return Err(NetError(101));
+                        }
+                        let mut data = route_data(Route {
+                            destination: Address {
+                                ip: destination,
+                                prefix: request[17],
+                            },
+                            device,
+                            gateway,
+                            metric: 0,
+                            protocol: 0,
+                        });
+                        if graph.own(ns, destination) {
+                            data[4] = 255; // Local table / RTN_LOCAL.
+                            data[6] = 254;
+                            data[7] = 2;
+                        }
+                        attr(&mut data, 7, &octets(source));
+                        out.push(message(24, 0, seq, port, &data));
+                        return Ok(());
                     }
                     for r in graph.routes(ns) {
                         if family == 0 || (family == 2) == r.destination.ip.is_ipv4() {

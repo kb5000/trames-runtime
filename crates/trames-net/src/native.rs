@@ -168,7 +168,11 @@ impl Network {
             icmp::configure(&native, family)?;
         }
         if family == 10 {
-            native.set_only_v6(true).map_err(from_io)?;
+            // Linux TCP/UDP default to dual stack, including on Apple hosts
+            // whose system default may differ. ICMP sockets stay v6-only.
+            native
+                .set_only_v6(native_protocol == Protocol::ICMPV6)
+                .map_err(from_io)?;
         }
         Ok(self.wrap(
             native,
@@ -316,6 +320,8 @@ impl Drop for Socket {
     }
 }
 pub struct Received {
+    /// Non-IP source identity, retained with the individual netlink datagram.
+    pub(crate) netlink_address: Option<[u8; 12]>,
     pub data: Vec<u8>,
     pub address: Option<SocketAddr>,
     pub length: usize,
@@ -661,6 +667,7 @@ impl Socket {
                     return Err(NetError(107));
                 }
                 return Ok(Received {
+                    netlink_address: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -669,6 +676,7 @@ impl Socket {
             }
             if count == 0 {
                 return Ok(Received {
+                    netlink_address: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -702,6 +710,7 @@ impl Socket {
         };
         data.truncate(length.min(count));
         Ok(Received {
+            netlink_address: None,
             data,
             address,
             length,

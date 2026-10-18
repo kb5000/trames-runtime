@@ -866,7 +866,7 @@ impl Network {
                 blocking_failed: false,
                 read_closed: false,
                 write_closed: false,
-                v6_only: family == 10,
+                v6_only: family == 10 && matches!(kind, 3 | 4),
                 reuse: false,
                 nodelay: false,
                 keepalive: false,

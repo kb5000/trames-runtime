@@ -243,6 +243,7 @@ impl Socket {
         let length = data.len();
         data.truncate(count);
         Ok(Received {
+            netlink_address: None,
             data,
             address: Some(address),
             length,

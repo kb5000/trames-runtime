@@ -248,3 +248,82 @@ fn rtm_setlink_updates_guest_devices_and_cannot_change_native_eth0() {
         }
     }
 }
+#[test]
+fn ipv6_defaults_are_dual_stack_for_native_and_guest_tcp_udp() {
+    fn until<T>(mut operation: impl FnMut() -> Result<T>) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match operation() {
+                Ok(value) => return value,
+                Err(NetError(11)) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "socket readiness timed out"
+                ),
+                Err(error) => panic!("socket failed: {error}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let root = Network::new(NetworkMode::Full);
+    let child = root.isolated().unwrap();
+    let br = bridge(&root, b"br-dual");
+    assign(&root, br, "172.30.0.1", 24);
+    let ci = pair(&root, &child, b"dual-peer", br);
+    assign(&child, ci, "172.30.0.2", 24);
+    for server_net in [&root, &child] {
+        let listener = server_net.socket(10, 1, 0).unwrap();
+        assert_eq!(listener.get_option(41, 26), Ok(0));
+        listener.bind(addr("::", 0)).unwrap();
+        listener.listen(1).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = root.socket(2, 1, 0).unwrap();
+        let ip = if server_net.namespace_id() == root.namespace_id() {
+            "127.0.0.1"
+        } else {
+            "172.30.0.2"
+        };
+        assert!(matches!(
+            client.connect(addr(ip, port)),
+            Ok(()) | Err(NetError(115))
+        ));
+        for _ in 0..1000 {
+            if client.connect_complete().unwrap() {
+                break;
+            }
+        }
+        let (accepted, peer) = until(|| listener.accept());
+        assert!(matches!(peer.ip(), std::net::IpAddr::V6(v) if v.to_ipv4_mapped().is_some()));
+        client.send(b"default dual TCP", 0, None).unwrap();
+        let message = until(|| accepted.recv(64, 0));
+        assert_eq!(message.data, b"default dual TCP");
+        let receiver = server_net.socket(10, 2, 0).unwrap();
+        assert_eq!(receiver.get_option(41, 26), Ok(0));
+        receiver.bind(addr("::", 0)).unwrap();
+        let sender = root.socket(2, 2, 0).unwrap();
+        sender
+            .send(
+                b"default dual UDP",
+                0,
+                Some(addr(ip, receiver.local_addr().unwrap().port())),
+            )
+            .unwrap();
+        let message = until(|| receiver.recv(64, 0));
+        assert_eq!(message.data, b"default dual UDP");
+        assert!(
+            matches!(message.address.unwrap().ip(), std::net::IpAddr::V6(v) if v.to_ipv4_mapped().is_some())
+        );
+    }
+    let only = child.socket(10, 1, 0).unwrap();
+    only.set_option(41, 26, 1).unwrap();
+    assert_eq!(only.get_option(41, 26), Ok(1));
+    only.bind(addr("::", 18444)).unwrap();
+    only.listen(1).unwrap();
+    let v4 = child.socket(2, 1, 0).unwrap();
+    v4.bind(addr("0.0.0.0", 18444)).unwrap();
+    v4.listen(1).unwrap();
+    let c = root.socket(2, 1, 0).unwrap();
+    assert_eq!(c.connect(addr("172.30.0.2", 18444)), Err(NetError(115)));
+    assert_eq!(c.connect_complete(), Ok(true));
+    assert!(v4.accept().is_ok());
+    assert!(matches!(only.accept(), Err(NetError(11))));
+}

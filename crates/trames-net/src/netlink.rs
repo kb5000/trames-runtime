@@ -149,11 +149,36 @@ pub(super) struct Socket {
     connected: Cell<bool>,
     groups: Cell<u32>,
     overrun: Cell<bool>,
-    replies: RefCell<VecDeque<Vec<u8>>>,
+    replies: RefCell<VecDeque<Datagram>>,
     read_epoch: Cell<u64>,
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
     strict: Cell<bool>,
+}
+struct Datagram {
+    data: Vec<u8>,
+    source: [u8; 12],
+}
+fn source(port: u32, groups: u32) -> [u8; 12] {
+    let mut bytes = [0; 12];
+    bytes[..2].copy_from_slice(&16u16.to_le_bytes());
+    bytes[4..8].copy_from_slice(&port.to_le_bytes());
+    bytes[8..12].copy_from_slice(&groups.to_le_bytes());
+    bytes
+}
+fn enqueue(listener: &Socket, data: &[u8], source: [u8; 12]) {
+    let mut q = listener.replies.borrow_mut();
+    if q.len() >= 128 || q.iter().map(|p| p.data.len()).sum::<usize>() + data.len() > MAX_BUFFER {
+        listener.overrun.set(true);
+    } else {
+        q.push_back(Datagram {
+            data: data.to_vec(),
+            source,
+        });
+        listener
+            .read_epoch
+            .set(listener.read_epoch.get().wrapping_add(1));
+    }
 }
 pub(super) fn address(port: u32) -> Vec<u8> {
     let mut bytes = vec![0; 12];
@@ -199,15 +224,7 @@ fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u3
                 continue;
             }
             let p = message(kind, 0, 0, 0, &data);
-            let mut q = listener.replies.borrow_mut();
-            if q.len() >= 128 || q.iter().map(Vec::len).sum::<usize>() + p.len() > MAX_BUFFER {
-                listener.overrun.set(true);
-            } else {
-                q.push_back(p);
-                listener
-                    .read_epoch
-                    .set(listener.read_epoch.get().wrapping_add(1));
-            }
+            enqueue(&listener, &p, source(0, group));
         }
     }
 }
@@ -327,9 +344,19 @@ impl Socket {
         if bytes.len() > MAX_TRANSFER {
             return Err(NetError(90));
         }
+        let mut group = 0;
         if let Some(destination) = destination {
-            if decode(destination)? != (0, 0) {
+            let (port, groups) = decode(destination)?;
+            if port != 0 || groups & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
                 return Err(NetError(95));
+            }
+            if groups != 0 {
+                if !net_admin {
+                    return Err(NetError(1));
+                }
+                // Linux selects the first set destination group. Go reuses
+                // the subscriber's bound sockaddr when requesting a dump.
+                group = 1 << groups.trailing_zeros();
             }
         }
         let mut requests = Vec::new();
@@ -370,6 +397,18 @@ impl Socket {
             self.namespace.root_stack()?;
         }
         self.autobind()?;
+        if group != 0 {
+            let mut listeners = self.namespace.listeners.borrow_mut();
+            listeners.retain(|s| s.strong_count() != 0);
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                if listener.namespace.id() == self.namespace.id()
+                    && listener.port.get() != self.port.get()
+                    && listener.groups.get() & group != 0
+                {
+                    enqueue(&listener, bytes, source(self.port.get(), group));
+                }
+            }
+        }
         let mut replies = Vec::new();
         for request in requests {
             // Bound response storage before a mutating request. Dumps remain
@@ -378,7 +417,12 @@ impl Socket {
                 u16::from_le_bytes(request[4..6].try_into().unwrap()),
                 16 | 17 | 19 | 20 | 21 | 24 | 25
             ) && (self.replies.borrow().len() + replies.len() >= 128
-                || self.replies.borrow().iter().map(Vec::len).sum::<usize>()
+                || self
+                    .replies
+                    .borrow()
+                    .iter()
+                    .map(|p| p.data.len())
+                    .sum::<usize>()
                     + replies.iter().map(Vec::len).sum::<usize>()
                     > MAX_BUFFER - 512)
             {
@@ -400,7 +444,7 @@ impl Socket {
         }
         let mut queued = self.replies.borrow_mut();
         if queued.len() + replies.len() > 128
-            || queued.iter().map(Vec::len).sum::<usize>()
+            || queued.iter().map(|p| p.data.len()).sum::<usize>()
                 + replies.iter().map(Vec::len).sum::<usize>()
                 > MAX_BUFFER
         {
@@ -409,7 +453,10 @@ impl Socket {
         if !replies.is_empty() {
             self.read_epoch.set(self.read_epoch.get().wrapping_add(1));
         }
-        queued.extend(replies);
+        queued.extend(replies.into_iter().map(|data| Datagram {
+            data,
+            source: source(0, 0),
+        }));
         Ok(bytes.len())
     }
     pub fn address_size(&self) -> usize {
@@ -453,8 +500,10 @@ impl Socket {
             return Err(NetError(105));
         }
         let mut queue = self.replies.borrow_mut();
-        let bytes = queue.front().ok_or(NetError(11))?;
+        let packet = queue.front().ok_or(NetError(11))?;
+        let bytes = &packet.data;
         let result = Received {
+            netlink_address: Some(packet.source),
             data: bytes[..bytes.len().min(count)].to_vec(),
             length: bytes.len(),
             truncated: count < bytes.len(),

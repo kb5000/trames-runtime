@@ -103,6 +103,7 @@ impl Network {
             Some(up),
             None,
             None,
+            None,
         )
     }
     pub fn loopback_up(&self) -> bool {
@@ -320,7 +321,9 @@ impl Socket {
     }
     pub fn received_address(&self, received: &Received) -> Vec<u8> {
         if matches!(self.0, SocketBackend::Netlink(_)) {
-            netlink::address(0)
+            received
+                .netlink_address
+                .map_or_else(|| netlink::address(0), Vec::from)
         } else {
             received.address.map_or_else(Vec::new, encode_address)
         }

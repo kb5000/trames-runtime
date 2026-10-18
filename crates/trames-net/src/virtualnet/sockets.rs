@@ -685,6 +685,7 @@ impl Socket {
         let state = self.state.borrow();
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
+                netlink_address: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -694,6 +695,7 @@ impl Socket {
         if self.kind == 1 && state.connection != Connection::Connected {
             if matches!(state.connection, Connection::Failed(_)) && !state.blocking_failed {
                 return Ok(Received {
+                    netlink_address: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -711,6 +713,7 @@ impl Socket {
                     return Err(NetError(11));
                 }
                 return Ok(Received {
+                    netlink_address: None,
                     data: Vec::new(),
                     address: None,
                     length: 0,
@@ -729,6 +732,7 @@ impl Socket {
             drop(state);
             self.fabric().tick();
             Ok(Received {
+                netlink_address: None,
                 data: bytes,
                 address: None,
                 length: size,
@@ -752,6 +756,7 @@ impl Socket {
                         let _ = s.recv();
                     }
                     return Ok(Received {
+                        netlink_address: None,
                         data: bytes,
                         address: Some(self.presented(source)),
                         length: if flags & MSG_TRUNC != 0 {
@@ -1102,6 +1107,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                netlink_address: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -1160,6 +1166,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
         let length = data.len();
         let received = Received {
+            netlink_address: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
             length,
@@ -1233,6 +1240,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                netlink_address: None,
                 data: Vec::new(),
                 address: None,
                 length: 0,
@@ -1265,6 +1273,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().unwrap();
         let length = data.len();
         let received = Received {
+            netlink_address: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
             length: if flags & MSG_TRUNC != 0 {

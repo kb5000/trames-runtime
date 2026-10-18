@@ -1543,6 +1543,43 @@ impl Vfs {
             if parts.len() == 1 {
                 return Ok(directory());
             }
+            if parts.get(1) == Some(&b"brif".as_slice()) && d.kind == trames_net::DeviceKind::Bridge
+            {
+                if parts.len() == 2 {
+                    return Ok(directory());
+                }
+                if parts.len() == 3
+                    && self
+                        .network_devices()
+                        .iter()
+                        .any(|p| p.master == Some(d.index) && p.name == parts[2])
+                {
+                    let mut target = b"../../".to_vec();
+                    target.extend_from_slice(parts[2]);
+                    target.extend_from_slice(b"/brport");
+                    return Ok(link(target));
+                }
+                return Ok(None);
+            }
+            if parts.get(1) == Some(&b"brport".as_slice()) {
+                let Some(master) = d.master else {
+                    return Ok(None);
+                };
+                if parts.len() == 2 {
+                    return Ok(directory());
+                }
+                if parts.len() == 3 && parts[2] == b"state" {
+                    // No STP/qdisc layer: an up, connected port forwards;
+                    // detached/down links never claim a forwarding state.
+                    let forwarding = self.network_carrier(&d)
+                        && self
+                            .network_devices()
+                            .iter()
+                            .any(|p| p.index == master && p.up);
+                    return Ok(regular(if forwarding { b"3\n" } else { b"0\n" }.to_vec()));
+                }
+                return Ok(None);
+            }
             if parts.get(1) == Some(&b"statistics".as_slice()) {
                 if parts.len() == 2 {
                     return Ok(directory());
@@ -1617,12 +1654,7 @@ impl Vfs {
                     }
                     .into(),
                     b"carrier" => format!("{}\n", u8::from(carrier)),
-                    b"tx_queue_len" => if lo || d.kind == trames_net::DeviceKind::Direct {
-                        "0\n"
-                    } else {
-                        "1000\n"
-                    }
-                    .into(),
+                    b"tx_queue_len" => format!("{}\n", d.tx_queue_len),
                     _ => return Ok(None),
                 };
                 return Ok(regular(value.into_bytes()));
@@ -1914,7 +1946,11 @@ impl Vfs {
         }
         if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/net/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-            if self.network_devices().iter().any(|d| d.name == parts[0]) {
+            if let Some(d) = self
+                .network_devices()
+                .into_iter()
+                .find(|d| d.name == parts[0])
+            {
                 if parts.len() == 1 {
                     names.extend(
                         [
@@ -1933,6 +1969,26 @@ impl Vfs {
                         .iter()
                         .map(|s| s.as_bytes().to_vec()),
                     );
+                    if d.kind == trames_net::DeviceKind::Bridge {
+                        names.push(b"brif".to_vec());
+                    }
+                    if d.master.is_some() {
+                        names.push(b"brport".to_vec());
+                    }
+                }
+                if parts.len() == 2
+                    && parts[1] == b"brif"
+                    && d.kind == trames_net::DeviceKind::Bridge
+                {
+                    names.extend(
+                        self.network_devices()
+                            .into_iter()
+                            .filter(|p| p.master == Some(d.index))
+                            .map(|p| p.name),
+                    );
+                }
+                if parts.len() == 2 && parts[1] == b"brport" && d.master.is_some() {
+                    names.push(b"state".to_vec());
                 }
                 if parts.len() == 2 && parts[1] == b"statistics" {
                     names.extend(
