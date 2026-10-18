@@ -86,6 +86,44 @@ fn sixteen_kib_host_groups_demote_and_recover_without_permission_leaks() {
 }
 
 #[test]
+fn software_only_host_groups_do_not_rebuild_on_each_store() {
+    let mut memory = Memory::default();
+    memory.mmu.granule = 16384.max(host::page_size().unwrap());
+    let base = 0x40000;
+    // One guest page leaves holes in a 16KiB host group. This is ordinary
+    // small-heap RAM, not a file/device backing that can be skipped separately.
+    memory.map(base, PAGE_SIZE, Permissions::RW).unwrap();
+    let prepared = memory.mmu.preparations.get();
+    for value in 0..1000u32 {
+        memory.write_array(base, value.to_le_bytes()).unwrap();
+    }
+    assert_eq!(memory.read_array::<4>(base), Ok(999u32.to_le_bytes()));
+    assert_eq!(memory.mmu.preparations.get(), prepared);
+    // Mapping the rest must invalidate the negative result and enable aliases.
+    memory
+        .map(
+            base + PAGE_SIZE,
+            memory.mmu.granule as u64 - PAGE_SIZE,
+            Permissions::RW,
+        )
+        .unwrap();
+    assert_eq!(memory.mmu.read::<4>(base), Some(999u32.to_le_bytes()));
+    memory
+        .protect(base + PAGE_SIZE, PAGE_SIZE, Permissions::R)
+        .unwrap();
+    let prepared = memory.mmu.preparations.get();
+    for value in 0..1000u32 {
+        memory.write_array(base, value.to_le_bytes()).unwrap();
+    }
+    assert_eq!(memory.mmu.preparations.get(), prepared);
+    assert!(memory.write_array(base + PAGE_SIZE, [1u8]).is_err());
+    memory
+        .protect(base + PAGE_SIZE, PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    assert_eq!(memory.mmu.read::<4>(base), Some(999u32.to_le_bytes()));
+}
+
+#[test]
 fn fork_remap_discard_and_native_calls_never_leave_stale_hardware_aliases() {
     let mut memory = Memory::default();
     memory.map(0x40000, 65536, Permissions::RW).unwrap();

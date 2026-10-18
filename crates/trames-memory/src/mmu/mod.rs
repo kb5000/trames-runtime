@@ -22,6 +22,10 @@ const ELIGIBLE: u8 = 4;
 const CODE: u8 = 8;
 const READ: u8 = 1;
 const WRITE: u8 = 2;
+// A mapping boundary already proved this host group software-only. Ordinary
+// stores cannot fill holes or change permissions/backing, so do not retry its
+// preparation until the next map/protect/unmap/discard/remap or fork boundary.
+const SOFTWARE: u8 = 16;
 const P: usize = PAGE_SIZE as usize;
 
 /// Kernel/native alias; never changes protection while a Rust slice exists.
@@ -145,7 +149,7 @@ impl Window {
             protection,
         );
         for index in begin..end {
-            self.flags[index].store(if ok { state } else { 0 }, Ordering::Relaxed);
+            self.flags[index].store(if ok { state } else { SOFTWARE }, Ordering::Relaxed);
         }
     }
 }
@@ -154,6 +158,8 @@ pub(super) struct Arena {
     windows: RefCell<BTreeMap<u64, Rc<Window>>>,
     cache: Cache,
     granule: usize,
+    #[cfg(test)]
+    preparations: Cell<usize>,
 }
 impl Default for Arena {
     fn default() -> Self {
@@ -161,6 +167,8 @@ impl Default for Arena {
             windows: RefCell::new(BTreeMap::new()),
             cache: Cache::default(),
             granule: host::page_size().unwrap_or(0),
+            #[cfg(test)]
+            preparations: Cell::new(0),
         }
     }
 }
@@ -233,12 +241,14 @@ impl Arena {
         window.mapping.cpu.as_ptr().wrapping_add(offset) as usize
     }
     #[inline]
-    fn ready(&self, address: u64) -> bool {
-        self.reached(address).is_some_and(|window| {
-            window.flags[(address - window.base) as usize >> window.shift].load(Ordering::Relaxed)
-                & ELIGIBLE
-                != 0
-        })
+    fn prepared(&self, address: u64) -> bool {
+        self.granule == 0
+            || self.reached(address).is_some_and(|window| {
+                window.flags[(address - window.base) as usize >> window.shift]
+                    .load(Ordering::Relaxed)
+                    & (ELIGIBLE | SOFTWARE)
+                    != 0
+            })
     }
     #[inline]
     #[cfg(test)]
@@ -327,7 +337,7 @@ impl Arena {
 impl Memory {
     pub(super) fn prepare_mmu_write(&mut self, address: u64, len: usize) {
         if len <= P - (address as usize & (P - 1)) {
-            if self.mmu.ready(address) {
+            if self.mmu.prepared(address) {
                 return;
             }
             // Backings always retain the software path (including live EOF
@@ -349,6 +359,8 @@ impl Memory {
     /// Called only at quiescent mapping/COW boundaries. Hardware groups with
     /// holes, mixed permissions or backing I/O stay on the shared software path.
     pub(super) fn refresh_mmu(&mut self, address: u64, len: u64) -> bool {
+        #[cfg(test)]
+        self.mmu.preparations.set(self.mmu.preparations.get() + 1);
         let granule = self.mmu.granule;
         if granule == 0 || len == 0 {
             return false;
@@ -389,7 +401,7 @@ impl Memory {
                     permissions = Some(page.permissions);
                     frames.push(frame);
                 }
-                let mut state = 0;
+                let mut state = SOFTWARE;
                 if frames.len() == granule / P
                     && permissions.is_some_and(|p: Permissions| p.read || !p.write)
                 {
