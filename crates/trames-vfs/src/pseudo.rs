@@ -1033,6 +1033,37 @@ impl Vfs {
             .node
             .as_ref()
             .and_then(|node| inotify::Close::reopen(node, flags, original.notification.as_ref()));
+        // Reopening a proc magic link is a fresh device open, not dup(). In
+        // particular, runc reopens an O_PATH ptmx handle to allocate a new PTY.
+        let pty = if flags & O_PATH != 0 {
+            None
+        } else if let Some(node) = &original.node {
+            match node.borrow().content {
+                Content::Device(Device::Ptmx) => {
+                    let key = match &original.kind {
+                        FdKind::Node(path) => path.clone(),
+                        _ if original.mount.as_ref().is_some_and(|m| m.devpts.is_some()) => {
+                            b"/ptmx".to_vec()
+                        }
+                        _ => b"/dev/ptmx".to_vec(),
+                    };
+                    Some(self.allocate_pty(&ResolvedPath {
+                        key,
+                        mount: original.mount.clone(),
+                    })?)
+                }
+                Content::Device(Device::Pts(id, _)) if id != 0 => {
+                    let pair = self.pty_by_id(id).ok_or(Errno(5))?;
+                    if pair.locked.get() || !pair.master_alive.get() {
+                        return Err(Errno(5));
+                    }
+                    Some(pty::PtyEnd::new(pair, false))
+                }
+                _ => original.pty.clone(),
+            }
+        } else {
+            original.pty.clone()
+        };
         let descriptor = OpenDescription {
             read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
                 original
@@ -1047,7 +1078,11 @@ impl Vfs {
             },
             id: self.open_id(),
             owner: original.owner,
-            kind: original.kind.clone(),
+            kind: if pty.is_some() {
+                FdKind::Terminal
+            } else {
+                original.kind.clone()
+            },
             flags: flags & !O_CLOEXEC,
             position: 0,
             node: original.node.clone(),
@@ -1058,7 +1093,7 @@ impl Vfs {
             anonymous: None,
             notification,
             local: None,
-            pty: original.pty.clone(),
+            pty,
             namespace: original.namespace.clone(),
             network_control: original.network_control.clone(),
             oom: original.oom.clone(),

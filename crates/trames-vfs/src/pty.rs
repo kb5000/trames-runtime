@@ -434,6 +434,56 @@ mod tests {
         );
     }
     #[test]
+    fn devpts_proc_path_reopen_allocates_a_fresh_master_and_opens_slave() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let handle = v
+            .open_at(AT_FDCWD, b"/pts/ptmx", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        let snapshot = |v: &mut Vfs| {
+            v.set_runtime_info(
+                1,
+                RuntimeInfo {
+                    processes: vec![ProcessInfo {
+                        pid: 1,
+                        tgid: 1,
+                        fds: v.fd_snapshot(),
+                        ..ProcessInfo::default()
+                    }],
+                    ..RuntimeInfo::default()
+                },
+            );
+        };
+        snapshot(&mut v);
+        assert!(v.live_ptys().is_empty());
+        let link = format!("/proc/self/fd/{handle}");
+        let master = v.open_at(AT_FDCWD, link.as_bytes(), 2 | 0x100, 0).unwrap();
+        let second = v.open_at(AT_FDCWD, link.as_bytes(), 2 | 0x100, 0).unwrap();
+        let a = v.pty(master).unwrap().unwrap();
+        assert!(a.master);
+        assert_ne!(a.pair.id, v.pty(second).unwrap().unwrap().pair.id);
+        assert_eq!(a.pair.number, 0);
+        assert_eq!(v.stat_fd(master).unwrap()[8..16], 2u64.to_le_bytes());
+        let path = v.open_at(AT_FDCWD, b"/pts/0", O_PATH, 0).unwrap();
+        snapshot(&mut v);
+        let slave_link = format!("/proc/self/fd/{path}");
+        assert_eq!(
+            v.open_at(AT_FDCWD, slave_link.as_bytes(), 2, 0),
+            Err(Errno(5))
+        );
+        a.pair.locked.set(false);
+        let slave = v.open_at(AT_FDCWD, slave_link.as_bytes(), 2, 0).unwrap();
+        assert!(!v.pty(slave).unwrap().unwrap().master);
+        assert_eq!(a.pair.slaves.get(), 1);
+        v.close(slave).unwrap();
+        assert_eq!(a.pair.slaves.get(), 0);
+        v.close(second).unwrap();
+        v.umount(b"/pts", 2).unwrap();
+        let detached = v.open_at(AT_FDCWD, link.as_bytes(), 2, 0).unwrap();
+        assert_eq!(v.pty(detached).unwrap().unwrap().pair.number, 1);
+    }
+    #[test]
     fn independent_devpts_reuses_local_numbers_but_not_terminal_identity() {
         let mut v = Vfs::default();
         v.set_runtime_info(1, RuntimeInfo::default());
