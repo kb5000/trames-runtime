@@ -191,6 +191,11 @@ fn native_gateway_tcp_and_udp_both_families() {
         n.finish();
         assert_eq!(f.stats().native_flows, 0);
         let udp = std::net::UdpSocket::bind((localhost, 0)).unwrap();
+        // Darwin's default UDP send buffer is smaller than this 60KB echo.
+        // Match the bounded native adapter rather than reducing packet size.
+        socket2::SockRef::from(&udp)
+            .set_send_buffer_size(64 * 1024)
+            .unwrap();
         let port = udp.local_addr().unwrap().port();
         let thread = std::thread::spawn(move || {
             let mut data = vec![0; 65535];
