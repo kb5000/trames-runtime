@@ -809,14 +809,16 @@ mod tests {
             Ok(0)
         );
         assert_eq!(u32_at(&memory, 0x1100), Ok(1));
-        let reserved = linux.vfs.socket(2, 1, 0).unwrap();
-        let reserved = linux.vfs.socket_fd(reserved).unwrap();
+        let reserved_fd = linux.vfs.socket(2, 1, 0).unwrap();
+        let reserved = linux.vfs.socket_fd(reserved_fd).unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = reserved.local_addr().unwrap();
+        // Test a closed port. Darwin may silently retain SYNs for a bound,
+        // non-listening socket, which is not a portable refusal fixture.
+        linux.vfs.close(reserved_fd).unwrap();
+        drop(reserved);
         let socket = linux.vfs.socket_fd(fd).unwrap();
-        let error = socket
-            .connect(reserved.local_addr().unwrap())
-            .unwrap_err()
-            .0;
+        let error = socket.connect(address).unwrap_err().0;
         assert!(matches!(error, 115 | 111));
         if error == 115 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
