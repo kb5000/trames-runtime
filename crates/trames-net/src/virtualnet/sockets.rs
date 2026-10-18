@@ -125,6 +125,9 @@ impl Socket {
         )
     }
     fn own(&self, a: IpAddr) -> bool {
+        if let Some(v) = &self.network.0.routing {
+            return a.is_unspecified() || v.own(a);
+        }
         a.is_unspecified()
             || (!self.network.is_isolated()
                 && (a == IpAddr::V4(self.network.0.info.ipv4)
@@ -137,7 +140,10 @@ impl Socket {
             return Err(NetError(22));
         }
         let v = a.ip();
-        if self.network.is_isolated() && (!v.is_loopback() || !self.network.0.loopback_up.get()) {
+        if self.network.0.routing.is_none()
+            && self.network.is_isolated()
+            && (!v.is_loopback() || !self.network.0.loopback_up.get())
+        {
             return Err(NetError(101));
         }
         if v.is_unspecified()
@@ -155,6 +161,10 @@ impl Socket {
         {
             return Err(NetError(99));
         }
+        if let Some(view) = &self.network.0.routing {
+            view.source(v)?;
+            return Ok(());
+        }
         if private_ip(v) && v != IpAddr::V4(v4(1)) && v != IpAddr::V6(v6(1)) {
             let i = self.network.0.fabric.0.borrow();
             if !i
@@ -171,6 +181,16 @@ impl Socket {
         let state = self.state.borrow();
         if !bound.ip().is_unspecified() {
             return vec![bound];
+        }
+        if let Some(view) = &self.network.0.routing {
+            let ips = view.addresses(false);
+            return ips
+                .into_iter()
+                .filter(|a| {
+                    a.ip.is_ipv4() == (self.family == 2) || (self.family == 10 && !state.v6_only)
+                })
+                .map(|a| SocketAddr::new(a.ip, bound.port()))
+                .collect();
         }
         let info = self.network.0.info;
         let mut ips = if self.family == 2 {
@@ -226,6 +246,7 @@ impl Socket {
         Err(NetError(98))
     }
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
+        self.fabric().tick();
         let mut a = self.normalize(a)?;
         if self.network.0.finished.get() {
             return Err(NetError(100));
@@ -414,7 +435,9 @@ impl Socket {
         }
         let mut bound = self.state.borrow().bound.unwrap();
         if bound.ip().is_unspecified() {
-            bound.set_ip(if a.ip().is_loopback() {
+            bound.set_ip(if let Some(view) = &self.network.0.routing {
+                view.source(a.ip())?
+            } else if a.ip().is_loopback() {
                 if a.is_ipv4() {
                     Ipv4Addr::LOCALHOST.into()
                 } else {
@@ -952,6 +975,8 @@ impl Socket {
         let bound = state.bound.unwrap().ip();
         let source = if !bound.is_unspecified() {
             bound
+        } else if let Some(view) = &self.network.0.routing {
+            view.source(a.ip())?
         } else if a.ip().is_loopback() {
             if self.family == 2 {
                 Ipv4Addr::LOCALHOST.into()

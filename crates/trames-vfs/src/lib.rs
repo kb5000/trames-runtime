@@ -1737,14 +1737,9 @@ impl Vfs {
             return bridge.write(bytes).map_err(Errno);
         }
         if let Some(socket) = &o.socket {
-            return socket
-                .send_bytes_authorized(
-                    bytes,
-                    0,
-                    None,
-                    self.credentials.has_cap(capabilities::NET_ADMIN),
-                )
-                .map_err(|e| Errno(e.0));
+            let socket = socket.clone();
+            drop(o);
+            return self.socket_send_bytes(&socket, bytes, 0, None);
         }
         if let Some(end) = &o.pipe {
             if !end.write {

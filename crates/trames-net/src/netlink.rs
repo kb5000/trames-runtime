@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Read-only NETLINK_ROUTE views of the guest namespace. No host netlink socket.
+//! Guest NETLINK_ROUTE sockets, bounded subscriptions and namespace-owned control.
+//! The logical host eth0 is a read-only view; dynamic links never configure the host.
 use super::*;
+use std::rc::Weak;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, VecDeque},
@@ -10,6 +12,9 @@ use std::{
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
     id: u64,
+    pub(crate) graph: Rc<RefCell<crate::netdev::Topology>>,
+    pub(crate) fabric: Rc<RefCell<Option<Fabric>>>,
+    listeners: Rc<RefCell<Vec<Weak<Socket>>>>,
     loopback: Option<Rc<Cell<bool>>>,
     pub(super) ping_range: Cell<[u32; 2]>,
     pub(super) unprivileged_port: Cell<u16>,
@@ -20,8 +25,14 @@ pub(super) struct Namespace {
 }
 impl Default for Namespace {
     fn default() -> Self {
+        let id = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        let graph = Rc::new(RefCell::new(crate::netdev::Topology::default()));
+        graph.borrow_mut().add_space(id, None, None);
         Self {
-            id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            id,
+            graph,
+            fabric: Rc::default(),
+            listeners: Rc::default(),
             loopback: None,
             ping_range: Cell::new([0, i32::MAX as u32]),
             unprivileged_port: Cell::new(1024),
@@ -34,12 +45,22 @@ impl Default for Namespace {
 }
 impl Namespace {
     pub fn isolated(&self, loopback: Rc<Cell<bool>>) -> Result<Self> {
+        if !self.graph.borrow().can_add_space() {
+            return Err(NetError(28));
+        }
         if self.quota.get() >= 128 {
             return Err(NetError(28));
         }
         self.quota.set(self.quota.get() + 1);
         let mut namespace = Self::default();
         namespace.quota = self.quota.clone();
+        namespace.graph = self.graph.clone();
+        namespace.fabric = self.fabric.clone();
+        namespace.listeners = self.listeners.clone();
+        namespace
+            .graph
+            .borrow_mut()
+            .add_space(namespace.id(), Some(loopback.clone()), None);
         namespace.loopback = Some(loopback);
         namespace.ping_range.set([1, 0]);
         Ok(namespace)
@@ -66,6 +87,16 @@ impl Namespace {
 }
 impl Drop for Namespace {
     fn drop(&mut self) {
+        let changes = {
+            let mut graph = self.graph.borrow_mut();
+            let removed = graph.removed_with_space(self.id());
+            graph.remove_space(self.id());
+            removed
+                .into_iter()
+                .map(|d| (d.namespace, 17, 1, crate::rtnetlink::link_data(&graph, &d)))
+                .collect()
+        };
+        notify(&self.listeners, changes);
         self.quota.set(self.quota.get() - 1);
     }
 }
@@ -75,6 +106,8 @@ pub(super) struct Socket {
     kind: u32,
     port: Cell<u32>,
     connected: Cell<bool>,
+    groups: Cell<u32>,
+    overrun: Cell<bool>,
     replies: RefCell<VecDeque<Vec<u8>>>,
     read_epoch: Cell<u64>,
     buffers: Cell<i32>,
@@ -99,13 +132,13 @@ fn decode(bytes: &[u8]) -> Result<(u32, u32)> {
         u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
     ))
 }
-fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+pub(crate) fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
     out.extend_from_slice(&((data.len() + 4) as u16).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(data);
     out.resize((out.len() + 3) & !3, 0);
 }
-fn message(kind: u16, flags: u16, sequence: u32, port: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn message(kind: u16, flags: u16, sequence: u32, port: u32, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + data.len());
     out.extend_from_slice(&((16 + data.len()) as u32).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
@@ -115,6 +148,27 @@ fn message(kind: u16, flags: u16, sequence: u32, port: u32, data: &[u8]) -> Vec<
     out.extend_from_slice(data);
     out.resize((out.len() + 3) & !3, 0);
     out
+}
+fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
+    let mut listeners = listeners.borrow_mut();
+    listeners.retain(|s| s.strong_count() != 0);
+    for (ns, kind, group, data) in changes {
+        for listener in listeners.iter().filter_map(Weak::upgrade) {
+            if listener.namespace.id() != ns || listener.groups.get() & group == 0 {
+                continue;
+            }
+            let p = message(kind, 0, 0, 0, &data);
+            let mut q = listener.replies.borrow_mut();
+            if q.len() >= 128 || q.iter().map(Vec::len).sum::<usize>() + p.len() > MAX_BUFFER {
+                listener.overrun.set(true);
+            } else {
+                q.push_back(p);
+                listener
+                    .read_epoch
+                    .set(listener.read_epoch.get().wrapping_add(1));
+            }
+        }
+    }
 }
 impl Socket {
     pub fn new(
@@ -130,18 +184,26 @@ impl Socket {
             return Err(NetError(94));
         }
         namespace.live.set(namespace.live.get() + 1);
-        Ok(Rc::new(Self {
-            namespace,
+        let s = Rc::new(Self {
+            namespace: namespace.clone(),
             info,
             kind,
             port: Cell::new(0),
             connected: Cell::new(false),
+            groups: Cell::new(0),
+            overrun: Cell::new(false),
             replies: RefCell::new(VecDeque::new()),
             read_epoch: Cell::new(0),
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
             strict: Cell::new(false),
-        }))
+        });
+        namespace
+            .listeners
+            .borrow_mut()
+            .retain(|s| s.strong_count() != 0);
+        namespace.listeners.borrow_mut().push(Rc::downgrade(&s));
+        Ok(s)
     }
     fn autobind(&self) -> Result<()> {
         if self.port.get() != 0 {
@@ -163,9 +225,10 @@ impl Socket {
         if self.port.get() != 0 {
             return Err(NetError(22));
         }
-        if groups != 0 {
+        if groups & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
             return Err(NetError(95));
         }
+        self.groups.set(groups);
         if port == 0 {
             return self.autobind();
         }
@@ -208,6 +271,16 @@ impl Socket {
         destination: Option<&[u8]>,
         net_admin: bool,
     ) -> Result<usize> {
+        self.send_with_namespace(bytes, flags, destination, net_admin, &|_| Err(NetError(9)))
+    }
+    pub fn send_with_namespace(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+        resolve: &dyn Fn(u32) -> Result<Network>,
+    ) -> Result<usize> {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(NetError(95));
         }
@@ -247,7 +320,47 @@ impl Socket {
         self.autobind()?;
         let mut replies = Vec::new();
         for request in requests {
-            let generated = self.request(request, net_admin)?;
+            // Bound response storage before a mutating request. Dumps remain
+            // side-effect free and are checked against the exact response size.
+            if matches!(
+                u16::from_le_bytes(request[4..6].try_into().unwrap()),
+                16 | 17 | 19 | 20 | 21 | 24 | 25
+            ) && (self.replies.borrow().len() + replies.len() >= 128
+                || self.replies.borrow().iter().map(Vec::len).sum::<usize>()
+                    + replies.iter().map(Vec::len).sum::<usize>()
+                    > MAX_BUFFER - 512)
+            {
+                return Err(NetError(105));
+            }
+            let generated = if self.namespace.loopback.is_some()
+                || self
+                    .namespace
+                    .graph
+                    .borrow()
+                    .devices(self.namespace.id())
+                    .iter()
+                    .any(|d| {
+                        matches!(
+                            d.kind,
+                            crate::DeviceKind::Veth { .. } | crate::DeviceKind::Bridge
+                        )
+                    })
+                || matches!(
+                    u16::from_le_bytes(request[4..6].try_into().unwrap()),
+                    16 | 17 | 19 | 20 | 21 | 24 | 25
+                ) {
+                let r = crate::rtnetlink::request(
+                    &self.namespace,
+                    request,
+                    self.port.get(),
+                    net_admin,
+                    resolve,
+                )?;
+                notify(&self.namespace.listeners, r.changes);
+                r.messages
+            } else {
+                self.request(request, net_admin)?
+            };
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
             }
@@ -571,6 +684,9 @@ impl Socket {
         if flags & !(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC) != 0 {
             return Err(NetError(95));
         }
+        if self.overrun.replace(false) {
+            return Err(NetError(105));
+        }
         let mut queue = self.replies.borrow_mut();
         let bytes = queue.front().ok_or(NetError(11))?;
         let result = Received {
@@ -588,15 +704,28 @@ impl Socket {
         [self.read_epoch.get(), 0]
     }
     pub fn poll(&self, events: u16) -> Result<u16> {
-        Ok((if self.replies.borrow().is_empty() {
-            0
-        } else {
-            events & 1
-        }) | events & 4)
+        Ok((if self.overrun.get() { 8 } else { 0 })
+            | (if self.replies.borrow().is_empty() {
+                0
+            } else {
+                events & 1
+            })
+            | events & 4)
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         match (level, name) {
             (1, 7 | 8) if value > 0 => self.buffers.set(value.clamp(4096, MAX_BUFFER as i32)),
+            (270, 1 | 2) if (1..=32).contains(&value) => {
+                let group = 1u32 << (value - 1);
+                if group & !(1 | 0x10 | 0x40 | 0x100 | 0x400) != 0 {
+                    return Err(NetError(95));
+                }
+                self.groups.set(if name == 1 {
+                    self.groups.get() | group
+                } else {
+                    self.groups.get() & !group
+                });
+            }
             (270, 11) => self.ext_ack.set(value != 0),
             (270, 12) => self.strict.set(value != 0),
             _ => return Err(NetError(92)),
@@ -606,7 +735,7 @@ impl Socket {
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
             (1, 3) => Ok(self.kind as i32),
-            (1, 4) => Ok(0),
+            (1, 4) => Ok(if self.overrun.replace(false) { 105 } else { 0 }),
             (1, 7 | 8) => Ok(self.buffers.get()),
             (1, 39) => Ok(0),
             (1, 38) => Ok(0),
@@ -637,7 +766,7 @@ mod tests {
             (false, 1, 1, -1i32),
             (true, 1, 1, 0),
             (true, 1, 0, -95),
-            (true, 2, 1, -95),
+            (true, 2, 1, -19),
         ] {
             data[4..8].copy_from_slice(&u32::to_le_bytes(index));
             data[8..12].copy_from_slice(&u32::to_le_bytes(up));

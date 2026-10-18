@@ -132,7 +132,7 @@ impl Linux {
         }
         let request = a[1] as u32;
         if request != 0x5421 {
-            let info = self.vfs.network_info();
+            let devices = self.vfs.network_devices();
             if request == 0x8912 {
                 // SIOCGIFCONF: AArch64 ifconf and two IPv4 ifreq entries.
                 let capacity = u32_at(memory, a[2])?;
@@ -141,13 +141,19 @@ impl Linux {
                 }
                 let pointer = u64_at(memory, a[2] + 8)?;
                 Self::check(memory, a[2], 16, Access::Write)?;
-                let mut interfaces = Vec::new();
-                if self.vfs.loopback_up() {
-                    interfaces.push((b"lo".as_slice(), std::net::Ipv4Addr::LOCALHOST));
-                }
-                if let Some(info) = info.filter(|n| !n.ipv4.is_unspecified()) {
-                    interfaces.push((b"eth0".as_slice(), info.ipv4));
-                }
+                let interfaces: Vec<_> = devices
+                    .iter()
+                    .flat_map(|d| {
+                        d.addresses.iter().filter_map(move |a| {
+                            if let std::net::IpAddr::V4(ip) = a.ip {
+                                (d.kind != trames_net::DeviceKind::Loopback || d.up)
+                                    .then_some((d.name.as_slice(), ip))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
                 let size = if pointer == 0 {
                     interfaces.len() * 40
                 } else {
@@ -177,90 +183,80 @@ impl Linux {
             Self::check(memory, a[2], 40, Access::Write)?;
             let mut entry = [0; 40];
             memory.read(a[2], &mut entry).map_err(|_| Errno(14))?;
-            let loopback = if request == 0x8910 {
-                match u32::from_le_bytes(entry[16..20].try_into().unwrap()) {
-                    1 => true,
-                    2 => false,
-                    _ => return Err(Errno(19)),
-                }
+            let device = if request == 0x8910 {
+                let index = u32::from_le_bytes(entry[16..20].try_into().unwrap());
+                devices.iter().find(|d| d.index == index)
             } else {
                 let end = entry[..16].iter().position(|b| *b == 0).unwrap_or(16);
-                match &entry[..end] {
-                    b"lo" => true,
-                    b"eth0" => false,
-                    _ => return Err(Errno(19)),
-                }
-            };
-            if !loopback && info.is_none() {
-                return Err(Errno(19));
+                devices.iter().find(|d| d.name == entry[..end])
             }
+            .ok_or(Errno(19))?;
+            let loopback = device.kind == trames_net::DeviceKind::Loopback;
             match request {
                 0x8914 => {
-                    if !loopback {
-                        return Err(Errno(95));
-                    }
                     let flags = u16::from_le_bytes(entry[16..18].try_into().unwrap());
-                    if flags & !(1 | 8 | 0x40) != 0 {
+                    if flags & !(1 | 2 | 8 | 0x40 | 0x1000) != 0 {
                         return Err(Errno(95));
                     }
-                    self.vfs.set_loopback_up(flags & 1 != 0)?;
+                    self.vfs
+                        .set_network_device_up(device.index, flags & 1 != 0)?;
                     return Ok(0);
                 }
-                0x8942 => entry[16..20].copy_from_slice(&0u32.to_le_bytes()),
+                0x8942 => entry[16..20].copy_from_slice(&device.master.unwrap_or(0).to_le_bytes()),
                 0x8927 => {
                     entry[16..32].fill(0);
-                    entry[16..18]
-                        .copy_from_slice(&(if loopback { 772u16 } else { 65534 }).to_le_bytes());
+                    entry[16..18].copy_from_slice(
+                        &(if loopback {
+                            772u16
+                        } else if device.kind == trames_net::DeviceKind::Direct {
+                            65534
+                        } else {
+                            1
+                        })
+                        .to_le_bytes(),
+                    );
+                    entry[18..24].copy_from_slice(&device.mac);
                 }
                 0x8910 => {
                     entry[..16].fill(0);
-                    let name = if loopback {
-                        b"lo".as_slice()
-                    } else {
-                        b"eth0".as_slice()
-                    };
-                    entry[..name.len()].copy_from_slice(name);
+                    entry[..device.name.len()].copy_from_slice(&device.name);
                 }
-                0x8913 => entry[16..18].copy_from_slice(
-                    &(if loopback {
-                        if self.vfs.loopback_up() {
-                            0x49u16
-                        } else {
-                            8
-                        }
+                0x8913 => {
+                    let flags: u16 = if loopback {
+                        8 | if device.up { 0x41 } else { 0 }
+                    } else if device.kind == trames_net::DeviceKind::Direct {
+                        0xc1
                     } else {
-                        0xc1u16
-                    })
-                    .to_le_bytes(),
-                ),
+                        0x1002
+                            | u16::from(device.up)
+                            | if self.vfs.network_carrier(device) {
+                                0x40
+                            } else {
+                                0
+                            }
+                    };
+                    entry[16..18].copy_from_slice(&flags.to_le_bytes());
+                }
                 0x8915 | 0x891b => {
-                    if loopback && !self.vfs.loopback_up() {
-                        return Err(Errno(99));
-                    }
+                    let address = device
+                        .addresses
+                        .iter()
+                        .find(|a| a.ip.is_ipv4())
+                        .filter(|_| !loopback || device.up)
+                        .ok_or(Errno(99))?;
                     let ip = if request == 0x891b {
-                        std::net::Ipv4Addr::from(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(
                             u32::MAX
-                                .checked_shl(
-                                    32 - if loopback {
-                                        8
-                                    } else {
-                                        info.unwrap().prefix4 as u32
-                                    },
-                                )
+                                .checked_shl(32 - u32::from(address.prefix))
                                 .unwrap_or(0),
-                        )
-                    } else if loopback {
-                        std::net::Ipv4Addr::LOCALHOST
+                        ))
                     } else {
-                        info.unwrap().ipv4
+                        address.ip
                     };
-                    entry[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
+                    entry[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip, 0)));
                 }
-                0x8921 => entry[16..20].copy_from_slice(
-                    &(if loopback { 65536 } else { info.unwrap().mtu }).to_le_bytes(),
-                ),
-                0x8933 => entry[16..20]
-                    .copy_from_slice(&(if loopback { 1u32 } else { 2u32 }).to_le_bytes()),
+                0x8921 => entry[16..20].copy_from_slice(&device.mtu.to_le_bytes()),
+                0x8933 => entry[16..20].copy_from_slice(&device.index.to_le_bytes()),
                 _ => unreachable!(),
             }
             memory.write(a[2], &entry).map_err(|_| Errno(14))?;
@@ -354,16 +350,10 @@ impl Linux {
                 };
                 let mut bytes = vec![0; a[2] as usize];
                 memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(socket
-                    .send_bytes_authorized(
-                        &bytes,
-                        a[3] as u32,
-                        peer.as_deref(),
-                        self.vfs
-                            .credentials
-                            .has_cap(trames_vfs::capabilities::NET_ADMIN),
-                    )
-                    .map_err(net)? as u64)
+                Ok(self
+                    .vfs
+                    .socket_send_bytes(&socket, &bytes, a[3] as u32, peer.as_deref())?
+                    as u64)
             }
             207 => {
                 let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
@@ -503,16 +493,12 @@ impl Linux {
                     } else {
                         Some(address(memory, name, name_size as u64)?)
                     };
-                    Ok(socket
-                        .send_bytes_authorized(
-                            &vectors.read(memory)?,
-                            a[2] as u32,
-                            peer.as_deref(),
-                            self.vfs
-                                .credentials
-                                .has_cap(trames_vfs::capabilities::NET_ADMIN),
-                        )
-                        .map_err(net)? as u64)
+                    Ok(self.vfs.socket_send_bytes(
+                        &socket,
+                        &vectors.read(memory)?,
+                        a[2] as u32,
+                        peer.as_deref(),
+                    )? as u64)
                 }
             }
             _ => Err(Errno(38)),

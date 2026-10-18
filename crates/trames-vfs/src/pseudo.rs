@@ -1012,7 +1012,6 @@ impl Vfs {
         let directory = || Some((Content::Directory, 0o40555));
         let regular = |value: Vec<u8>| Some((file(value), 0o100444));
         let link = |value: Vec<u8>| Some((Content::Symlink(value), 0o120777));
-        let info = self.network_info();
         if let Some(tail) = path.strip_prefix(b"/dev/pts/") {
             if let Some(id) = std::str::from_utf8(tail)
                 .ok()
@@ -1397,12 +1396,18 @@ impl Vfs {
                         ),
                         b"dev" => {
                             let mut data=String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
-                            if let Some(links) = network.as_ref().and_then(|n| n.links()) {
-                                for (name, s) in ["lo", "eth0"]
-                                    .into_iter()
-                                    .zip(links)
-                                    .filter(|(name, _)| *name == "lo" || info.is_some())
-                                {
+                            if let Some(network) = &network {
+                                let links = network.links();
+                                for mut d in network.devices() {
+                                    if let Some(links) = links {
+                                        if d.kind == trames_net::DeviceKind::Loopback {
+                                            d.stats = links[0];
+                                        } else if d.kind == trames_net::DeviceKind::Direct {
+                                            d.stats = links[1];
+                                        }
+                                    }
+                                    let name = String::from_utf8_lossy(&d.name);
+                                    let s = d.stats;
                                     data.push_str(&format!(
                                         "{name:>6}: {} {} 0 {} 0 0 0 0 {} {} 0 {} 0 0 0 0\n",
                                         s.rx_bytes,
@@ -1411,6 +1416,46 @@ impl Vfs {
                                         s.tx_bytes,
                                         s.tx_packets,
                                         s.tx_dropped
+                                    ));
+                                }
+                            }
+                            regular(data.into_bytes())
+                        }
+                        b"route"
+                            if network.as_ref().is_some_and(|n| {
+                                n.devices().iter().any(|d| {
+                                    matches!(
+                                        d.kind,
+                                        trames_net::DeviceKind::Veth { .. }
+                                            | trames_net::DeviceKind::Bridge
+                                    )
+                                })
+                            }) =>
+                        {
+                            let n = network.as_ref().unwrap();
+                            let devices = n.devices();
+                            let mut data=String::from("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n");
+                            for route in n.routes() {
+                                if let std::net::IpAddr::V4(ip) = route.destination.ip {
+                                    let Some(d) = devices.iter().find(|d| d.index == route.device)
+                                    else {
+                                        continue;
+                                    };
+                                    let gw = if let Some(std::net::IpAddr::V4(g)) = route.gateway {
+                                        u32::from_le_bytes(g.octets())
+                                    } else {
+                                        0
+                                    };
+                                    let mask = u32::MAX
+                                        .checked_shl(32 - u32::from(route.destination.prefix))
+                                        .unwrap_or(0);
+                                    data.push_str(&format!(
+                                        "{}\t{:08X}\t{gw:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0\n",
+                                        String::from_utf8_lossy(&d.name),
+                                        u32::from_le_bytes(ip.octets()),
+                                        if route.gateway.is_some() { 3 } else { 1 },
+                                        route.metric,
+                                        mask.to_le()
                                     ));
                                 }
                             }
@@ -1426,25 +1471,29 @@ impl Vfs {
                         } else {
                             b"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n".to_vec()
                         }),
-                        b"if_inet6" => regular(
-                            format!(
-                                "{}{}",
-                                if network.as_ref().is_some_and(|n| n.loopback_up()) {
-                                    "00000000000000000000000000000001 01 80 10 80 lo\n"
-                                } else {
-                                    ""
-                                },
-                                info.filter(|n| !n.ipv6.is_unspecified()).map_or(
-                                    String::new(),
-                                    |n| format!(
-                                        "{:032x} 02 {:02x} 00 80 eth0\n",
-                                        u128::from_be_bytes(n.ipv6.octets()),
-                                        n.prefix6
-                                    )
-                                )
-                            )
-                            .into_bytes(),
-                        ),
+                        b"if_inet6" => {
+                            let mut data = String::new();
+                            if let Some(n) = &network {
+                                for d in n.devices() {
+                                    if d.kind == trames_net::DeviceKind::Loopback && !d.up {
+                                        continue;
+                                    }
+                                    for a in d.addresses {
+                                        if let std::net::IpAddr::V6(ip) = a.ip {
+                                            data.push_str(&format!(
+                                                "{:032x} {:02x} {:02x} {:02x} 80 {}\n",
+                                                u128::from(ip),
+                                                d.index,
+                                                a.prefix,
+                                                if ip.is_loopback() { 16 } else { 0 },
+                                                String::from_utf8_lossy(&d.name)
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            regular(data.into_bytes())
+                        }
                         _ => None,
                     });
                 }
@@ -1475,7 +1524,7 @@ impl Vfs {
             return Ok(regular(value.into_bytes()));
         }
         if let Some(name) = path.strip_prefix(b"/sys/class/net/") {
-            if matches!(name, b"lo" | b"eth0") && (name == b"lo" || info.is_some()) {
+            if self.network_devices().iter().any(|d| d.name == name) {
                 let mut target = b"../../devices/virtual/net/".to_vec();
                 target.extend_from_slice(name);
                 return Ok(link(target));
@@ -1483,9 +1532,13 @@ impl Vfs {
         }
         if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/net/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-            if !matches!(parts[0], b"lo" | b"eth0") || (parts[0] == b"eth0" && info.is_none()) {
+            let Some(d) = self
+                .network_devices()
+                .into_iter()
+                .find(|d| d.name == parts[0])
+            else {
                 return Ok(None);
-            }
+            };
             if parts.len() == 1 {
                 return Ok(directory());
             }
@@ -1494,56 +1547,81 @@ impl Vfs {
                     return Ok(directory());
                 }
                 if parts.len() == 3 {
-                    let Some(links) = self.network_links() else {
-                        return Ok(None);
-                    };
-                    let s = links[usize::from(parts[0] != b"lo")];
-                    let count = match parts[2] {
-                        b"rx_bytes" => s.rx_bytes,
-                        b"rx_packets" => s.rx_packets,
-                        b"rx_dropped" => s.rx_dropped,
-                        b"tx_bytes" => s.tx_bytes,
-                        b"tx_packets" => s.tx_packets,
-                        b"tx_dropped" => s.tx_dropped,
+                    let v = match parts[2] {
+                        b"rx_bytes" => d.stats.rx_bytes,
+                        b"rx_packets" => d.stats.rx_packets,
+                        b"rx_dropped" => d.stats.rx_dropped,
+                        b"tx_bytes" => d.stats.tx_bytes,
+                        b"tx_packets" => d.stats.tx_packets,
+                        b"tx_dropped" => d.stats.tx_dropped,
                         _ => return Ok(None),
                     };
-                    return Ok(regular(format!("{count}\n").into_bytes()));
+                    return Ok(regular(format!("{v}\n").into_bytes()));
                 }
             }
             if parts.len() == 2 {
-                let lo = parts[0] == b"lo";
+                let lo = d.kind == trames_net::DeviceKind::Loopback;
+                let carrier = self.network_carrier(&d);
                 let value = match parts[1] {
-                    b"ifindex" | b"iflink" => if lo { "1\n" } else { "2\n" }.to_string(),
-                    b"type" => if lo { "772\n" } else { "65534\n" }.to_string(),
-                    b"mtu" => format!("{}\n", info.map_or(65536, |n| n.mtu)),
-                    b"address" | b"broadcast" => "00:00:00:00:00:00\n".to_string(),
-                    b"flags" => if lo {
-                        if self.loopback_up() {
-                            "0x9\n"
+                    b"ifindex" => format!("{}\n", d.index),
+                    b"iflink" => format!(
+                        "{}\n",
+                        if let trames_net::DeviceKind::Veth { peer } = d.kind {
+                            peer
                         } else {
-                            "0x8\n"
+                            d.index
                         }
-                    } else {
-                        "0x11\n"
+                    ),
+                    b"type" => format!(
+                        "{}\n",
+                        if lo {
+                            772
+                        } else if d.kind == trames_net::DeviceKind::Direct {
+                            65534
+                        } else {
+                            1
+                        }
+                    ),
+                    b"mtu" => format!("{}\n", d.mtu),
+                    b"address" | b"broadcast" => {
+                        let mac = if parts[1] == b"broadcast"
+                            && !lo
+                            && d.kind != trames_net::DeviceKind::Direct
+                        {
+                            [255; 6]
+                        } else {
+                            d.mac
+                        };
+                        format!(
+                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                        )
                     }
-                    .to_string(),
-                    b"operstate" => if lo {
-                        if self.loopback_up() {
-                            "unknown\n"
+                    b"flags" => format!(
+                        "0x{:x}\n",
+                        if lo {
+                            8 | u32::from(d.up)
+                        } else if d.kind == trames_net::DeviceKind::Direct {
+                            0x11
                         } else {
-                            "down\n"
+                            0x1002 | u32::from(d.up)
                         }
+                    ),
+                    b"operstate" => if !d.up || !carrier {
+                        "down\n"
+                    } else if lo {
+                        "unknown\n"
                     } else {
                         "up\n"
                     }
-                    .to_string(),
-                    b"carrier" => if lo && !self.loopback_up() {
+                    .into(),
+                    b"carrier" => format!("{}\n", u8::from(carrier)),
+                    b"tx_queue_len" => if lo || d.kind == trames_net::DeviceKind::Direct {
                         "0\n"
                     } else {
-                        "1\n"
+                        "1000\n"
                     }
-                    .to_string(),
-                    b"tx_queue_len" => "0\n".to_string(),
+                    .into(),
                     _ => return Ok(None),
                 };
                 return Ok(regular(value.into_bytes()));
@@ -1678,11 +1756,7 @@ impl Vfs {
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/sys/class/net" | b"/sys/devices/virtual/net" => {
-                let mut n = vec![b"lo".to_vec()];
-                if self.network_info().is_some() {
-                    n.push(b"eth0".to_vec());
-                }
-                n
+                self.network_devices().into_iter().map(|d| d.name).collect()
             }
             b"/proc/sys" => ["kernel", "fs", "vm", "net"]
                 .iter()
@@ -1832,42 +1906,41 @@ impl Vfs {
             }
         }
         if let Some(rest) = path.strip_prefix(b"/sys/devices/virtual/net/") {
-            if matches!(rest, b"lo" | b"eth0") {
-                names.extend(
-                    [
-                        "ifindex",
-                        "iflink",
-                        "type",
-                        "mtu",
-                        "address",
-                        "broadcast",
-                        "flags",
-                        "operstate",
-                        "carrier",
-                        "tx_queue_len",
-                    ]
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec()),
-                );
-            }
-            if matches!(rest, b"lo" | b"eth0") && self.network_links().is_some() {
-                names.push(b"statistics".to_vec());
-            }
-            if matches!(rest, b"lo/statistics" | b"eth0/statistics")
-                && self.network_links().is_some()
-            {
-                names.extend(
-                    [
-                        "rx_bytes",
-                        "rx_packets",
-                        "rx_dropped",
-                        "tx_bytes",
-                        "tx_packets",
-                        "tx_dropped",
-                    ]
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec()),
-                );
+            let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+            if self.network_devices().iter().any(|d| d.name == parts[0]) {
+                if parts.len() == 1 {
+                    names.extend(
+                        [
+                            "ifindex",
+                            "iflink",
+                            "type",
+                            "mtu",
+                            "address",
+                            "broadcast",
+                            "flags",
+                            "operstate",
+                            "carrier",
+                            "tx_queue_len",
+                            "statistics",
+                        ]
+                        .iter()
+                        .map(|s| s.as_bytes().to_vec()),
+                    );
+                }
+                if parts.len() == 2 && parts[1] == b"statistics" {
+                    names.extend(
+                        [
+                            "rx_bytes",
+                            "rx_packets",
+                            "rx_dropped",
+                            "tx_bytes",
+                            "tx_packets",
+                            "tx_dropped",
+                        ]
+                        .iter()
+                        .map(|s| s.as_bytes().to_vec()),
+                    );
+                }
             }
         }
         names.sort();

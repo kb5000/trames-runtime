@@ -75,6 +75,9 @@ struct Node {
     detached: Vec<(SocketHandle, Instant)>,
     resets: Vec<(Weak<Socket>, Connection)>,
     links: [LinkStats; 2],
+    configuration_pending: bool,
+    configuration_revision: u64,
+    configuration_lo: bool,
 }
 struct Namespace {
     fabric: Fabric,
@@ -85,6 +88,7 @@ struct Namespace {
     finished: Cell<bool>,
     isolated: Cell<bool>,
     loopback_up: Rc<Cell<bool>>,
+    routing: Option<crate::netdev::View>,
 }
 #[derive(Clone)]
 pub(super) struct Network(Rc<Namespace>);
@@ -200,6 +204,9 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         detached: Vec::new(),
         resets: Vec::new(),
         links: [LinkStats::default(); 2],
+        configuration_pending: false,
+        configuration_revision: u64::MAX,
+        configuration_lo: false,
     })
 }
 impl Fabric {
@@ -280,8 +287,47 @@ impl Fabric {
             finished: Cell::new(false),
             isolated: Cell::new(false),
             loopback_up: Rc::new(Cell::new(true)),
+            routing: None,
         });
         node.owner = Rc::downgrade(&ns);
+        i.nodes.insert(key, node);
+        Ok(Network(ns))
+    }
+    pub(super) fn dynamic_environment(
+        &self,
+        mode: NetworkMode,
+        routing: crate::netdev::View,
+        loopback_up: Rc<Cell<bool>>,
+    ) -> Result<Network> {
+        let mut i = self.0.borrow_mut();
+        if i.nodes.len() >= 128 {
+            return Err(NetError(28));
+        }
+        let key = i.next_node;
+        i.next_node = i.next_node.checked_add(1).ok_or(NetError(28))?;
+        let mut node = make_node(2, i.now())?;
+        let ns = Rc::new(Namespace {
+            fabric: self.clone(),
+            key,
+            info: NetworkInfo {
+                id: 2,
+                ipv4: Ipv4Addr::UNSPECIFIED,
+                ipv6: Ipv6Addr::UNSPECIFIED,
+                gateway4: Ipv4Addr::UNSPECIFIED,
+                gateway6: Ipv6Addr::UNSPECIFIED,
+                mtu: 1500,
+                prefix4: 0,
+                prefix6: 0,
+            },
+            mode,
+            live: Cell::new(0),
+            finished: Cell::new(false),
+            isolated: Cell::new(true),
+            loopback_up,
+            routing: Some(routing),
+        });
+        node.owner = Rc::downgrade(&ns);
+        node.configure_dynamic(&mut 0);
         i.nodes.insert(key, node);
         Ok(Network(ns))
     }
@@ -335,7 +381,9 @@ impl Inner {
     fn tick(&mut self) {
         let now = self.now();
         let time = Instant::now();
+        let mut spare = MAX_HANDLES.saturating_sub(self.handles());
         for node in self.nodes.values_mut() {
+            node.configure_dynamic(&mut spare);
             node.registry.retain(|s| s.strong_count() != 0);
             for (_, socket) in node.sockets.iter_mut() {
                 if let smoltcp::socket::Socket::Tcp(t) = socket {
@@ -411,7 +459,26 @@ impl Inner {
                     continue;
                 };
                 let dst = h.tuple.destination.ip();
-                let target = if dst.is_loopback() {
+                let dynamic = self
+                    .nodes
+                    .get(&source)
+                    .and_then(|n| n.owner.upgrade())
+                    .and_then(|ns| ns.routing.clone());
+                let path = dynamic
+                    .as_ref()
+                    .and_then(|v| v.graph.borrow().target(v.namespace, dst));
+                let target = if let Some(view) = &dynamic {
+                    path.and_then(|(ns, _, _)| {
+                        self.nodes.iter().find_map(|(&key, n)| {
+                            n.owner.upgrade().and_then(|v| {
+                                v.routing.as_ref().and_then(|r| {
+                                    (r.namespace == ns && Rc::ptr_eq(&r.graph, &view.graph))
+                                        .then_some(key)
+                                })
+                            })
+                        })
+                    })
+                } else if dst.is_loopback() {
                     if source == 0 {
                         None
                     } else {
@@ -420,7 +487,10 @@ impl Inner {
                 } else {
                     self.nodes
                         .iter()
-                        .find(|(_, n)| dst == IpAddr::V4(v4(n.id)) || dst == IpAddr::V6(v6(n.id)))
+                        .find(|(_, n)| {
+                            n.owner.upgrade().is_some_and(|v| v.routing.is_none())
+                                && (dst == IpAddr::V4(v4(n.id)) || dst == IpAddr::V6(v6(n.id)))
+                        })
                         .map(|(&key, _)| key)
                 };
                 if let Some(key) = target {
@@ -471,7 +541,13 @@ impl Inner {
                                 || matches!(ns.mode, NetworkMode::Outbound | NetworkMode::Full))
                     });
                     let size = p.len() as u64;
-                    if !permitted || !enabled || !node.port.receive_packet(p) {
+                    let dropped = !permitted || !enabled || !node.port.receive_packet(p);
+                    if let (Some(view), Some((ns, out, input))) = (&dynamic, path) {
+                        let mut graph = view.graph.borrow_mut();
+                        graph.account(view.namespace, out, size as usize, true, dropped);
+                        graph.account(ns, input, size as usize, false, dropped);
+                    }
+                    if dropped {
                         node.links[usize::from(!lo)].rx_dropped += 1;
                         self.stats.dropped += 1;
                     } else {
@@ -480,6 +556,7 @@ impl Inner {
                         s.rx_bytes += size;
                     }
                 } else if source != 0
+                    && dynamic.is_none()
                     && (!private_ip(dst) || dst == IpAddr::V4(v4(1)) || dst == IpAddr::V6(v6(1)))
                 {
                     if !self.gateway.ingress(
@@ -536,6 +613,149 @@ impl Inner {
         }
     }
 }
+impl Node {
+    fn configure_dynamic(&mut self, spare: &mut usize) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let Some(view) = &owner.routing else { return };
+        let revision = view.graph.borrow().revision();
+        if !self.configuration_pending
+            && self.configuration_revision == revision
+            && self.configuration_lo == owner.loopback_up.get()
+        {
+            return;
+        }
+        self.configuration_revision = revision;
+        self.configuration_lo = owner.loopback_up.get();
+        let addresses = view.addresses(true);
+        let old = self.iface.ip_addrs();
+        if !self.configuration_pending
+            && old.len() == addresses.len()
+            && old
+                .iter()
+                .zip(&addresses)
+                .all(|(old, new)| old.address() == ip(new.ip) && old.prefix_len() == new.prefix)
+        {
+            return;
+        }
+        self.configuration_pending = false;
+        self.iface.update_ip_addrs(|out| {
+            out.clear();
+            for a in &addresses {
+                out.push(IpCidr::new(ip(a.ip), a.prefix))
+                    .expect("topology address budget");
+            }
+        });
+        self.iface.routes_mut().remove_default_ipv4_route();
+        self.iface.routes_mut().remove_default_ipv6_route();
+        // Actual egress selection is performed by the topology. Give smoltcp
+        // an on-link next hop for off-link datagrams; this never grants access
+        // through an absent guest route or between disconnected bridges.
+        if let Some(a) = addresses.iter().find_map(|a| {
+            if let IpAddr::V4(a) = a.ip {
+                Some(a)
+            } else {
+                None
+            }
+        }) {
+            self.iface.routes_mut().add_default_ipv4_route(a).unwrap();
+        }
+        if let Some(a) = addresses.iter().find_map(|a| {
+            if let IpAddr::V6(a) = a.ip {
+                Some(a)
+            } else {
+                None
+            }
+        }) {
+            self.iface.routes_mut().add_default_ipv6_route(a).unwrap();
+        }
+        // Wildcard listeners/bindings must acquire addresses configured after
+        // bind(). Keep established TCP handles intact during address changes.
+        let all = view.addresses(false);
+        let expected: Vec<_> = all.iter().map(|a| a.ip).collect();
+        for weak in &self.registry {
+            let Some(socket) = weak.upgrade() else {
+                continue;
+            };
+            let mut state = socket.state.borrow_mut();
+            let Some(bound) = state.bound.filter(|a| a.ip().is_unspecified()) else {
+                continue;
+            };
+            if socket.kind != 2 && !(socket.kind == 1 && state.connection == Connection::Listening)
+            {
+                continue;
+            }
+            let ipv4 = socket.family == 2;
+            let dual = socket.family == 10 && !state.v6_only;
+            let desired: Vec<_> = expected
+                .iter()
+                .copied()
+                .filter(|a| a.is_ipv4() == ipv4 || dual)
+                .collect();
+            state.handles.retain(|&h| {
+                let endpoint = if socket.kind == 2 {
+                    self.sockets.get::<udp::Socket>(h).endpoint().addr
+                } else {
+                    self.sockets
+                        .get::<tcp::Socket>(h)
+                        .local_endpoint()
+                        .map(|e| e.addr)
+                };
+                if endpoint.is_some_and(|a| !desired.contains(&addr(a))) {
+                    if socket.kind == 1 && self.sockets.get::<tcp::Socket>(h).is_active() {
+                        true
+                    } else {
+                        self.sockets.remove(h);
+                        *spare += 1;
+                        false
+                    }
+                } else {
+                    true
+                }
+            });
+            for a in &desired {
+                let count = state
+                    .handles
+                    .iter()
+                    .filter(|&&h| {
+                        if socket.kind == 2 {
+                            self.sockets.get::<udp::Socket>(h).endpoint().addr == Some(ip(*a))
+                        } else {
+                            self.sockets
+                                .get::<tcp::Socket>(h)
+                                .local_endpoint()
+                                .is_some_and(|e| e.addr == ip(*a))
+                        }
+                    })
+                    .count();
+                let needed = if socket.kind == 2 { 1 } else { state.backlog };
+                for _ in count..needed {
+                    if *spare == 0 {
+                        self.configuration_pending = true;
+                        break;
+                    }
+                    let ep = SocketAddr::new(*a, bound.port());
+                    let handle = if socket.kind == 2 {
+                        let mut u = udp_socket();
+                        if u.bind(endpoint(ep)).is_err() {
+                            break;
+                        }
+                        self.sockets.add(u)
+                    } else {
+                        let mut t = tcp_socket();
+                        if t.listen(endpoint(ep)).is_err() {
+                            break;
+                        }
+                        self.sockets.add(t)
+                    };
+                    *spare -= 1;
+                    state.handles.push(handle);
+                }
+            }
+        }
+    }
+}
 impl Namespace {
     fn finish(&self) {
         if self.finished.replace(true) {
@@ -565,15 +785,8 @@ impl Network {
     pub(super) fn mode(&self) -> NetworkMode {
         self.0.mode
     }
-    pub(super) fn isolate(&self) {
-        self.0.isolated.set(true);
-        self.0.loopback_up.set(false);
-    }
     pub(super) fn is_isolated(&self) -> bool {
         self.0.isolated.get()
-    }
-    pub(super) fn loopback_control(&self) -> Rc<Cell<bool>> {
-        self.0.loopback_up.clone()
     }
     pub fn links(&self) -> [LinkStats; 2] {
         self.0

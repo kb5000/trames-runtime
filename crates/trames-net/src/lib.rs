@@ -4,7 +4,10 @@ mod direct_dns;
 mod dns;
 mod interfaces;
 mod native;
+mod netdev;
 mod netlink;
+mod rtnetlink;
+pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
 pub use native::{
     decode_address, encode_address, NetError, NetworkMode, Received, MAX_BUFFER, MAX_SOCKETS,
@@ -61,18 +64,35 @@ impl Network {
             Backend::Native(n) => n.mode(),
             Backend::Virtual(n) => n.mode(),
         };
-        let fabric = Fabric::new()?;
-        let stack = fabric.environment(
-            2,
-            if mode == NetworkMode::Off {
-                NetworkMode::Off
-            } else {
-                NetworkMode::Loopback
-            },
-        )?;
-        stack.isolate();
-        let namespace = self.1.isolated(stack.loopback_control())?;
-        Ok(Self(Backend::Virtual(stack), Rc::new(namespace)))
+        let fabric = {
+            let mut shared = self.1.fabric.borrow_mut();
+            if shared.is_none() {
+                *shared = Some(Fabric::new()?);
+            }
+            shared.as_ref().unwrap().clone()
+        };
+        let loopback = Rc::new(std::cell::Cell::new(false));
+        let namespace = Rc::new(self.1.isolated(loopback.clone())?);
+        let view = netdev::View {
+            graph: namespace.graph.clone(),
+            namespace: namespace.id(),
+        };
+        let stack = fabric.dynamic_environment(mode, view, loopback)?;
+        Ok(Self(Backend::Virtual(stack), namespace))
+    }
+    pub fn devices(&self) -> Vec<Device> {
+        self.1.graph.borrow().devices(self.namespace_id())
+    }
+    pub fn set_device_up(&self, index: u32, up: bool) -> Result<()> {
+        self.1.graph.borrow_mut().change_link(
+            self.namespace_id(),
+            index,
+            None,
+            None,
+            Some(up),
+            None,
+            None,
+        )
     }
     pub fn loopback_up(&self) -> bool {
         self.1.loopback_up()
@@ -81,16 +101,28 @@ impl Network {
         self.1.set_loopback_up(up)
     }
     pub fn new(mode: NetworkMode) -> Self {
-        Self(
-            Backend::Native(native::Network::new(mode)),
-            Rc::new(netlink::Namespace::default()),
-        )
+        let native = native::Network::new(mode);
+        let namespace = Rc::new(netlink::Namespace::default());
+        namespace
+            .graph
+            .borrow_mut()
+            .add_space(namespace.id(), None, native.info());
+        Self(Backend::Native(native), namespace)
     }
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
-        Ok(Self(
-            Backend::Virtual(fabric.environment(id, mode)?),
-            Rc::new(netlink::Namespace::default()),
-        ))
+        let stack = fabric.environment(id, mode)?;
+        let namespace = Rc::new(netlink::Namespace::default());
+        namespace
+            .graph
+            .borrow_mut()
+            .add_space(namespace.id(), None, Some(stack.info()));
+        Ok(Self(Backend::Virtual(stack), namespace))
+    }
+    pub fn routes(&self) -> Vec<DeviceRoute> {
+        self.1.graph.borrow().routes(self.namespace_id())
+    }
+    pub fn device_carrier(&self, d: &Device) -> bool {
+        self.1.graph.borrow().carrier(d)
     }
     pub fn live_sockets(&self) -> usize {
         self.1.live()
@@ -254,8 +286,18 @@ impl Socket {
         destination: Option<&[u8]>,
         net_admin: bool,
     ) -> Result<usize> {
+        self.send_bytes_with_namespace(bytes, flags, destination, net_admin, &|_| Err(NetError(9)))
+    }
+    pub fn send_bytes_with_namespace(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+        resolve: &dyn Fn(u32) -> Result<Network>,
+    ) -> Result<usize> {
         if let SocketBackend::Netlink(s) = &self.0 {
-            s.send_bytes_authorized(bytes, flags, destination, net_admin)
+            s.send_with_namespace(bytes, flags, destination, net_admin, resolve)
         } else {
             self.send(bytes, flags, destination.map(decode_address).transpose()?)
         }
@@ -320,3 +362,6 @@ pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod routing_tests;

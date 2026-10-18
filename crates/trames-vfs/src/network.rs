@@ -102,6 +102,59 @@ impl Vfs {
         let fabric = trames_net::Fabric::new().map_err(|e| Errno(e.0))?;
         self.configure_virtual_network(&fabric, 2, mode)
     }
+    pub fn network_devices(&self) -> Vec<trames_net::Device> {
+        let mut devices = self.network.devices();
+        if let Some(links) = self.network.links() {
+            for d in &mut devices {
+                if d.kind == trames_net::DeviceKind::Loopback {
+                    d.stats = links[0];
+                } else if d.kind == trames_net::DeviceKind::Direct {
+                    d.stats = links[1];
+                }
+            }
+        }
+        devices
+    }
+    pub fn network_routes(&self) -> Vec<trames_net::DeviceRoute> {
+        self.network.routes()
+    }
+    pub fn network_carrier(&self, d: &trames_net::Device) -> bool {
+        self.network.device_carrier(d)
+    }
+    pub fn set_network_device_up(&self, index: u32, up: bool) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+            return Err(Errno(1));
+        }
+        self.network
+            .set_device_up(index, up)
+            .map_err(|e| Errno(e.0))
+    }
+    pub fn socket_send_bytes(
+        &self,
+        socket: &NetSocket,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+    ) -> Result<usize> {
+        socket
+            .send_bytes_with_namespace(
+                bytes,
+                flags,
+                destination,
+                self.credentials.has_cap(capabilities::NET_ADMIN),
+                &|fd| {
+                    let descriptor = self.descriptor(fd).map_err(|e| trames_net::NetError(e.0))?;
+                    let open = descriptor.open.borrow();
+                    match &open.namespace {
+                        Some(linux_namespace::NamespaceHandle::Net(ns)) => {
+                            Ok(ns.network.borrow().clone())
+                        }
+                        _ => Err(trames_net::NetError(22)),
+                    }
+                },
+            )
+            .map_err(|e| Errno(e.0))
+    }
     pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
         self.network.info()
     }
