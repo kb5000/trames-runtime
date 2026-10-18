@@ -104,6 +104,9 @@ impl Default for Network {
     }
 }
 impl Network {
+    pub(super) fn mode(&self) -> NetworkMode {
+        self.0.mode
+    }
     pub fn new(mode: NetworkMode) -> Self {
         Self(Rc::new(Namespace {
             mode,
@@ -350,6 +353,7 @@ impl Socket {
     }
     pub fn info(&self) -> super::SocketInfo {
         super::SocketInfo {
+            namespace_id: 0, // Filled by the public socket wrapper.
             family: self.family,
             kind: match self.kind {
                 3 => 2,

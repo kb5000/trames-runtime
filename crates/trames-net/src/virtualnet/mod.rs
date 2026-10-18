@@ -83,6 +83,8 @@ struct Namespace {
     mode: NetworkMode,
     live: Cell<usize>,
     finished: Cell<bool>,
+    isolated: Cell<bool>,
+    loopback_up: Rc<Cell<bool>>,
 }
 #[derive(Clone)]
 pub(super) struct Network(Rc<Namespace>);
@@ -276,6 +278,8 @@ impl Fabric {
             mode,
             live: Cell::new(0),
             finished: Cell::new(false),
+            isolated: Cell::new(false),
+            loopback_up: Rc::new(Cell::new(true)),
         });
         node.owner = Rc::downgrade(&ns);
         i.nodes.insert(key, node);
@@ -462,6 +466,7 @@ impl Inner {
 
                     let enabled = node.owner.upgrade().is_some_and(|ns| {
                         ns.mode != NetworkMode::Off
+                            && (!lo || ns.loopback_up.get())
                             && (source == key
                                 || matches!(ns.mode, NetworkMode::Outbound | NetworkMode::Full))
                     });
@@ -557,6 +562,19 @@ impl Drop for Namespace {
     }
 }
 impl Network {
+    pub(super) fn mode(&self) -> NetworkMode {
+        self.0.mode
+    }
+    pub(super) fn isolate(&self) {
+        self.0.isolated.set(true);
+        self.0.loopback_up.set(false);
+    }
+    pub(super) fn is_isolated(&self) -> bool {
+        self.0.isolated.get()
+    }
+    pub(super) fn loopback_control(&self) -> Rc<Cell<bool>> {
+        self.0.loopback_up.clone()
+    }
     pub fn links(&self) -> [LinkStats; 2] {
         self.0
             .fabric

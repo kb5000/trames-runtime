@@ -1,7 +1,79 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use std::net::SocketAddr;
+#[derive(Clone, Copy)]
+enum Sysctl {
+    PingRange,
+    UnprivilegedPort,
+}
+impl Sysctl {
+    fn path(path: &[u8]) -> Option<Self> {
+        match path {
+            b"/proc/sys/net/ipv4/ping_group_range" => Some(Self::PingRange),
+            b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(Self::UnprivilegedPort),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone)]
+pub(super) struct Control {
+    namespace: Rc<linux_namespace::RootNetwork>,
+    kind: Sysctl,
+}
+impl Control {
+    pub fn read(&self, offset: u64, count: usize) -> Vec<u8> {
+        let n = self.namespace.network.borrow();
+        let data = match self.kind {
+            Sysctl::PingRange => {
+                let [a, b] = n.ping_range();
+                format!("{a}\t{b}\n")
+            }
+            Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
+        }
+        .into_bytes();
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        data[start..start + count.min(data.len() - start)].to_vec()
+    }
+    pub fn write(&self, bytes: &[u8], offset: u64, authorized: bool) -> Result<usize> {
+        if !authorized {
+            return Err(Errno(13));
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if bytes.len() > 4096 || offset != 0 {
+            return Err(Errno(22));
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?;
+        let values = text
+            .split_ascii_whitespace()
+            .map(|v| v.parse::<u32>().map_err(|_| Errno(22)))
+            .collect::<Result<Vec<_>>>()?;
+        let n = self.namespace.network.borrow();
+        match (self.kind, values.as_slice()) {
+            (Sysctl::PingRange, [a, b]) if *a != u32::MAX && *b != u32::MAX => {
+                n.set_ping_range([*a, *b])
+            }
+            (Sysctl::UnprivilegedPort, [port]) if *port <= u16::MAX as u32 => {
+                n.set_unprivileged_port(*port as u16)
+            }
+            _ => return Err(Errno(22)),
+        }
+        Ok(bytes.len())
+    }
+}
 impl Vfs {
+    pub(super) fn network_control(&self, path: &ResolvedPath) -> Option<Control> {
+        if !self.uses_pseudo(path) {
+            return None;
+        }
+        Some(Control {
+            namespace: self.root_network.clone(),
+            kind: Sysctl::path(path)?,
+        })
+    }
     /// Selected by the embedding app, never by guest syscalls. Forks share the
     /// namespace quota and sockets through their open descriptions.
     pub fn configure_network(&mut self, mode: NetworkMode) -> Result<()> {
@@ -9,6 +81,7 @@ impl Vfs {
             return Err(Errno(16));
         }
         self.network = trames_net::Network::new(mode);
+        *self.root_network.network.borrow_mut() = self.network.clone();
         Ok(())
     }
     pub fn configure_virtual_network(
@@ -22,6 +95,7 @@ impl Vfs {
         }
         self.network =
             trames_net::Network::virtual_network(fabric, id, mode).map_err(|e| Errno(e.0))?;
+        *self.root_network.network.borrow_mut() = self.network.clone();
         Ok(())
     }
     pub fn configure_local_fabric(&mut self, mode: NetworkMode) -> Result<()> {
@@ -30,6 +104,15 @@ impl Vfs {
     }
     pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
         self.network.info()
+    }
+    pub fn loopback_up(&self) -> bool {
+        self.network.loopback_up()
+    }
+    pub fn set_loopback_up(&self, up: bool) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+            return Err(Errno(1));
+        }
+        self.network.set_loopback_up(up).map_err(|e| Errno(e.0))
     }
     pub fn network_links(&self) -> Option<[trames_net::LinkStats; 2]> {
         self.network.links()
@@ -40,6 +123,15 @@ impl Vfs {
     pub fn socket(&mut self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
         if family == 1 {
             return self.local_create(kind, protocol);
+        }
+        if matches!((family, kind & 0xf, protocol), (2, 2, 1) | (10, 2, 58)) {
+            let [low, high] = self.network.ping_range();
+            if !std::iter::once(self.credentials.egid)
+                .chain(self.credentials.groups.iter().copied())
+                .any(|gid| (low..=high).contains(&gid))
+            {
+                return Err(Errno(13));
+            }
         }
         if matches!(family, 2 | 10)
             && kind & 0xf == 3
@@ -78,6 +170,7 @@ impl Vfs {
                     local: None,
                     pty: None,
                     namespace: None,
+                    network_control: None,
                     oom: None,
                     mount: None,
                 })),

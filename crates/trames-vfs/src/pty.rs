@@ -263,6 +263,7 @@ impl Vfs {
                     notification: None,
                     local: None,
                     namespace: None,
+                    network_control: None,
                     oom: None,
                     mount: end.pair.mount.clone(),
                     pty: Some(PtyEnd::new(end.pair.clone(), false)),

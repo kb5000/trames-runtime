@@ -21,6 +21,8 @@ struct Channel {
     epochs: [[u64; 2]; 2],
 }
 pub struct LocalSocket {
+    namespace: Rc<RefCell<LocalNamespace>>,
+    network: Rc<linux_namespace::RootNetwork>,
     channel: RefCell<Rc<RefCell<Channel>>>,
     side: Cell<usize>,
     connected: Cell<bool>,
@@ -51,8 +53,14 @@ pub struct LocalReceived {
     pub rights: LocalRights,
 }
 impl LocalSocket {
-    fn new(kind: u32, credentials: [u32; 3]) -> Rc<Self> {
+    fn new(
+        kind: u32,
+        credentials: [u32; 3],
+        network: Rc<linux_namespace::RootNetwork>,
+    ) -> Rc<Self> {
         Rc::new(Self {
+            namespace: network.local.clone(),
+            network,
             channel: RefCell::new(Rc::new(RefCell::new(Channel {
                 queues: [VecDeque::new(), VecDeque::new()],
                 ends: [Weak::new(), Weak::new()],
@@ -388,7 +396,14 @@ impl Drop for LocalSocket {
 }
 impl Vfs {
     fn new_local(&self, kind: u32) -> Result<Rc<LocalSocket>> {
-        let mut ns = self.local_namespace.borrow_mut();
+        self.new_local_in(kind, &self.root_network)
+    }
+    fn new_local_in(
+        &self,
+        kind: u32,
+        network: &Rc<linux_namespace::RootNetwork>,
+    ) -> Result<Rc<LocalSocket>> {
+        let mut ns = network.local.borrow_mut();
         ns.sockets.retain(|s| s.strong_count() != 0);
         ns.abstract_names.retain(|_, s| s.strong_count() != 0);
         if ns.sockets.len() >= 1024 {
@@ -401,6 +416,7 @@ impl Vfs {
                 self.credentials.euid,
                 self.credentials.egid,
             ],
+            network.clone(),
         );
         ns.sockets.push(Rc::downgrade(&socket));
         Ok(socket)
@@ -425,6 +441,7 @@ impl Vfs {
                     local: Some(local),
                     pty: None,
                     namespace: None,
+                    network_control: None,
                     oom: None,
                     mount: None,
                 })),
@@ -481,7 +498,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         if abstract_ {
-            let mut ns = self.local_namespace.borrow_mut();
+            let mut ns = socket.namespace.borrow_mut();
             if ns
                 .abstract_names
                 .get(&name)
@@ -522,7 +539,8 @@ impl Vfs {
             return Err(Errno(95));
         }
         let peer = if abstract_ {
-            self.local_namespace
+            socket
+                .namespace
                 .borrow()
                 .abstract_names
                 .get(&name)
@@ -548,7 +566,7 @@ impl Vfs {
         if l.pending.len() > l.backlog {
             return Err(Errno(11));
         }
-        let accepted = self.new_local(socket.kind)?;
+        let accepted = self.new_local_in(socket.kind, &peer.network)?;
         accepted.credentials.set(peer.credentials.get());
         socket.credentials.set([
             self.lock_owner,

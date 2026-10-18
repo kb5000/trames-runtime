@@ -18,6 +18,7 @@ pub const SYS_CHROOT: u32 = 18;
 pub const SYS_PTRACE: u32 = 19;
 pub const SYS_ADMIN: u32 = 21;
 pub const SYS_NICE: u32 = 23;
+pub const NET_BIND_SERVICE: u32 = 10;
 pub const SYS_RESOURCE: u32 = 24;
 pub const MKNOD: u32 = 27;
 pub const SYSLOG: u32 = 34;

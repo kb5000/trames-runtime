@@ -232,6 +232,7 @@ impl Vfs {
                     local: None,
                     pty: None,
                     namespace: None,
+                    network_control: None,
                     oom: None,
                     mount: None,
                 })),

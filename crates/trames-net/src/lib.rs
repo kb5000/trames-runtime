@@ -15,6 +15,8 @@ pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
 type Result<T> = std::result::Result<T, NetError>;
 #[derive(Clone)]
 pub struct SocketInfo {
+    /// Identity of the socket's creating network namespace, retained across setns.
+    pub namespace_id: u64,
     pub family: u32,
     pub kind: u32,
     pub protocol: u32,
@@ -37,6 +39,47 @@ impl Default for Network {
     }
 }
 impl Network {
+    pub fn namespace_id(&self) -> u64 {
+        self.1.id()
+    }
+    pub fn ping_range(&self) -> [u32; 2] {
+        self.1.ping_range.get()
+    }
+    pub fn set_ping_range(&self, range: [u32; 2]) {
+        self.1.ping_range.set(range);
+    }
+    pub fn unprivileged_port(&self) -> u16 {
+        self.1.unprivileged_port.get()
+    }
+    pub fn set_unprivileged_port(&self, port: u16) {
+        self.1.unprivileged_port.set(port);
+    }
+    /// A new Linux network namespace starts with an unconfigured, down lo and
+    /// no external devices. Its stack never binds a host listener.
+    pub fn isolated(&self) -> Result<Self> {
+        let mode = match &self.0 {
+            Backend::Native(n) => n.mode(),
+            Backend::Virtual(n) => n.mode(),
+        };
+        let fabric = Fabric::new()?;
+        let stack = fabric.environment(
+            2,
+            if mode == NetworkMode::Off {
+                NetworkMode::Off
+            } else {
+                NetworkMode::Loopback
+            },
+        )?;
+        stack.isolate();
+        let namespace = self.1.isolated(stack.loopback_control())?;
+        Ok(Self(Backend::Virtual(stack), Rc::new(namespace)))
+    }
+    pub fn loopback_up(&self) -> bool {
+        self.1.loopback_up()
+    }
+    pub fn set_loopback_up(&self, up: bool) -> Result<()> {
+        self.1.set_loopback_up(up)
+    }
     pub fn new(mode: NetworkMode) -> Self {
         Self(
             Backend::Native(native::Network::new(mode)),
@@ -59,7 +102,7 @@ impl Network {
     pub fn info(&self) -> Option<NetworkInfo> {
         match &self.0 {
             Backend::Native(n) => n.info(),
-            Backend::Virtual(n) => Some(n.info()),
+            Backend::Virtual(n) => (!n.is_isolated()).then(|| n.info()),
         }
     }
     pub fn links(&self) -> Option<[LinkStats; 2]> {
@@ -78,18 +121,24 @@ impl Network {
             return Err(NetError(24));
         }
         if family == 16 {
-            return Ok(Rc::new(Socket(SocketBackend::Netlink(
-                netlink::Socket::new(self.1.clone(), self.info(), kind, protocol)?,
-            ))));
+            return Ok(Rc::new(Socket(
+                SocketBackend::Netlink(netlink::Socket::new(
+                    self.1.clone(),
+                    self.info(),
+                    kind,
+                    protocol,
+                )?),
+                self.1.clone(),
+            )));
         }
         let backend = match &self.0 {
             Backend::Native(n) => SocketBackend::Native(n.socket(family, kind, protocol)?),
             Backend::Virtual(n) => SocketBackend::Virtual(n.socket(family, kind, protocol)?),
         };
-        Ok(Rc::new(Socket(backend)))
+        Ok(Rc::new(Socket(backend, self.1.clone())))
     }
 }
-pub struct Socket(SocketBackend);
+pub struct Socket(SocketBackend, Rc<netlink::Namespace>);
 enum SocketBackend {
     Netlink(Rc<netlink::Socket>),
     Native(Rc<native::Socket>),
@@ -110,11 +159,13 @@ impl Socket {
         }
     }
     pub fn info(&self) -> Option<SocketInfo> {
-        match &self.0 {
+        let mut info = match &self.0 {
             SocketBackend::Virtual(s) => Some(s.info()),
             SocketBackend::Native(s) => Some(s.info()),
             SocketBackend::Netlink(_) => None,
-        }
+        }?;
+        info.namespace_id = self.1.id();
+        Some(info)
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         if let SocketBackend::Native(s) = &self.0 {
@@ -147,6 +198,18 @@ impl Socket {
         } else {
             self.bind(decode_address(bytes)?)
         }
+    }
+    pub fn bind_authorized(&self, bytes: &[u8], can_bind_service: bool) -> Result<()> {
+        if self.info().is_some_and(|s| matches!(s.protocol, 6 | 17)) {
+            let address = decode_address(bytes)?;
+            if address.port() != 0
+                && address.port() < self.1.unprivileged_port.get()
+                && !can_bind_service
+            {
+                return Err(NetError(13));
+            }
+        }
+        self.bind_bytes(bytes)
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
         if let SocketBackend::Netlink(s) = &self.0 {
@@ -223,7 +286,7 @@ impl Socket {
                 (SocketBackend::Virtual(s), peer)
             }
         };
-        Ok((Rc::new(Self(backend)), peer))
+        Ok((Rc::new(Self(backend, self.1.clone())), peer))
     }
 }
 pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {

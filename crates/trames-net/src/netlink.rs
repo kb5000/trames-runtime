@@ -5,16 +5,68 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::atomic::{AtomicU64, Ordering},
 };
-#[derive(Default)]
+static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
+    id: u64,
+    loopback: Option<Rc<Cell<bool>>>,
+    pub(super) ping_range: Cell<[u32; 2]>,
+    pub(super) unprivileged_port: Cell<u16>,
+    quota: Rc<Cell<usize>>,
     live: Cell<usize>,
     next: Cell<u32>,
     ports: RefCell<BTreeSet<u32>>,
 }
+impl Default for Namespace {
+    fn default() -> Self {
+        Self {
+            id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            loopback: None,
+            ping_range: Cell::new([0, i32::MAX as u32]),
+            unprivileged_port: Cell::new(1024),
+            quota: Rc::new(Cell::new(1)),
+            live: Cell::new(0),
+            next: Cell::new(0),
+            ports: RefCell::default(),
+        }
+    }
+}
 impl Namespace {
+    pub fn isolated(&self, loopback: Rc<Cell<bool>>) -> Result<Self> {
+        if self.quota.get() >= 128 {
+            return Err(NetError(28));
+        }
+        self.quota.set(self.quota.get() + 1);
+        let mut namespace = Self::default();
+        namespace.quota = self.quota.clone();
+        namespace.loopback = Some(loopback);
+        namespace.ping_range.set([1, 0]);
+        Ok(namespace)
+    }
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    pub fn loopback_up(&self) -> bool {
+        self.loopback.as_ref().is_none_or(|lo| lo.get())
+    }
+    pub fn set_loopback_up(&self, up: bool) -> Result<()> {
+        match &self.loopback {
+            Some(lo) => {
+                lo.set(up);
+                Ok(())
+            }
+            None if up => Ok(()),
+            None => Err(NetError(95)),
+        }
+    }
     pub fn live(&self) -> usize {
         self.live.get()
+    }
+}
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        self.quota.set(self.quota.get() - 1);
     }
 }
 pub(super) struct Socket {
@@ -231,16 +283,23 @@ impl Socket {
                 // The direct root network has an always-up loopback. Accept
                 // only the exact idempotent LinkSetUp request; never pretend
                 // that down, rename, MTU, address or route changes took effect.
-                let already_up = kind == 16
+                let loopback_change = kind == 16
                     && request.len() == 32
                     && flags & !5 == 0
                     && request[16..20] == [0; 4]
                     && request[20..24] == 1u32.to_le_bytes()
-                    && request[24..28] == 1u32.to_le_bytes()
+                    && matches!(
+                        u32::from_le_bytes(request[24..28].try_into().unwrap()),
+                        0 | 1
+                    )
                     && request[28..32] == 1u32.to_le_bytes();
+                let up = request.get(24..28) == Some(1u32.to_le_bytes().as_slice());
                 let errno: i32 = if !net_admin {
                     -1
-                } else if already_up {
+                } else if loopback_change && (self.namespace.loopback.is_some() || up) {
+                    if let Some(lo) = &self.namespace.loopback {
+                        lo.set(up);
+                    }
                     0
                 } else {
                     -95
@@ -287,7 +346,18 @@ impl Socket {
                     let mut data = vec![0; 16];
                     data[2..4].copy_from_slice(&(if lo { 772u16 } else { 65534 }).to_le_bytes());
                     data[4..8].copy_from_slice(&i.to_le_bytes());
-                    data[8..12].copy_from_slice(&(if lo { 0x49u32 } else { 0xc1 }).to_le_bytes());
+                    data[8..12].copy_from_slice(
+                        &(if lo {
+                            if self.namespace.loopback_up() {
+                                0x49u32
+                            } else {
+                                8
+                            }
+                        } else {
+                            0xc1
+                        })
+                        .to_le_bytes(),
+                    );
                     data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
                     attr(&mut data, 3, if lo { b"lo\0" } else { b"eth0\0" });
                     attr(
@@ -297,14 +367,33 @@ impl Socket {
                     );
                     attr(&mut data, 1, &[0; 6]);
                     attr(&mut data, 2, &[0; 6]);
-                    attr(&mut data, 16, &[if lo { 0 } else { 6 }]);
-                    attr(&mut data, 33, &[1]);
+                    attr(
+                        &mut data,
+                        16,
+                        &[if lo {
+                            if self.namespace.loopback_up() {
+                                0
+                            } else {
+                                2
+                            }
+                        } else {
+                            6
+                        }],
+                    );
+                    attr(
+                        &mut data,
+                        33,
+                        &[u8::from(!lo || self.namespace.loopback_up())],
+                    );
                     attr(&mut data, 13, &0u32.to_le_bytes());
                     out.push(message(16, multipart, sequence, self.port.get(), &data));
                 }
             }
             22 if request.len() >= 17 => {
                 for i in interfaces {
+                    if i == 1 && !self.namespace.loopback_up() {
+                        continue;
+                    }
                     for af in [2u8, 10] {
                         if family != 0 && family != af {
                             continue;

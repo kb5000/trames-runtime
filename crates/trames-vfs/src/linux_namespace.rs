@@ -5,15 +5,72 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
+pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 const MAX_NAMESPACES: usize = 128;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(0xf000_0000);
 
-/// The single network owned by one guest kernel. New network namespaces are
-/// deliberately unavailable until sockets and routing can be isolated too.
-pub(super) struct RootNetwork(u64);
+/// A network identity owns both its IP stack and abstract Unix address space.
+/// Existing socket FDs retain their creating stack after unshare/setns.
+pub(super) struct RootNetwork {
+    inode: u64,
+    pub network: RefCell<trames_net::Network>,
+    pub local: Rc<RefCell<ipc::LocalNamespace>>,
+    live: Rc<Cell<usize>>,
+}
 impl Default for RootNetwork {
     fn default() -> Self {
-        Self(NEXT_INODE.fetch_add(1, Ordering::Relaxed))
+        Self {
+            inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
+            network: RefCell::default(),
+            local: Rc::default(),
+            live: Rc::new(Cell::new(1)),
+        }
+    }
+}
+impl Drop for RootNetwork {
+    fn drop(&mut self) {
+        self.live.set(self.live.get() - 1);
+    }
+}
+pub(super) struct IpcNamespace {
+    inode: u64,
+    pub mqueue: RefCell<Option<Rc<RefCell<Filesystem>>>>,
+    live: Rc<Cell<usize>>,
+}
+impl Default for IpcNamespace {
+    fn default() -> Self {
+        Self {
+            inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
+            mqueue: RefCell::default(),
+            live: Rc::new(Cell::new(1)),
+        }
+    }
+}
+impl Drop for IpcNamespace {
+    fn drop(&mut self) {
+        self.live.set(self.live.get() - 1);
+    }
+}
+pub(super) struct CgroupNamespace {
+    inode: u64,
+    pub root: Option<Rc<RefCell<Node>>>,
+    pub path: Vec<u8>,
+    live: Rc<Cell<usize>>,
+}
+impl Default for CgroupNamespace {
+    fn default() -> Self {
+        Self {
+            inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
+            root: None,
+            path: b"/".to_vec(),
+            live: Rc::new(Cell::new(1)),
+        }
+    }
+}
+impl Drop for CgroupNamespace {
+    fn drop(&mut self) {
+        self.live.set(self.live.get() - 1);
     }
 }
 
@@ -70,6 +127,8 @@ pub(super) enum NamespaceHandle {
     Mount(MountNamespace),
     Pid(PidNamespace),
     Net(Rc<RootNetwork>),
+    Ipc(Rc<IpcNamespace>),
+    Cgroup(Rc<CgroupNamespace>),
 }
 impl NamespaceHandle {
     pub fn id(&self) -> u64 {
@@ -77,7 +136,9 @@ impl NamespaceHandle {
             Self::Uts(n) => n.id(),
             Self::Mount(n) => n.id(),
             Self::Pid(n) => n.id(),
-            Self::Net(n) => n.0,
+            Self::Net(n) => n.inode,
+            Self::Ipc(n) => n.inode,
+            Self::Cgroup(n) => n.inode,
         }
     }
     pub fn kind(&self) -> u64 {
@@ -86,6 +147,8 @@ impl NamespaceHandle {
             Self::Mount(_) => CLONE_NEWNS,
             Self::Pid(_) => CLONE_NEWPID,
             Self::Net(_) => CLONE_NEWNET,
+            Self::Ipc(_) => CLONE_NEWIPC,
+            Self::Cgroup(_) => CLONE_NEWCGROUP,
         }
     }
     pub fn label(&self) -> Vec<u8> {
@@ -93,7 +156,9 @@ impl NamespaceHandle {
             Self::Uts(n) => n.label(),
             Self::Mount(n) => format!("mnt:[{}]", n.id()).into_bytes(),
             Self::Pid(n) => n.label(),
-            Self::Net(n) => format!("net:[{}]", n.0).into_bytes(),
+            Self::Net(n) => format!("net:[{}]", n.inode).into_bytes(),
+            Self::Ipc(n) => format!("ipc:[{}]", n.inode).into_bytes(),
+            Self::Cgroup(n) => format!("cgroup:[{}]", n.inode).into_bytes(),
         }
     }
 }
@@ -101,7 +166,9 @@ impl NamespaceHandle {
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
     uts: Weak<Uts>,
-    net: Weak<RootNetwork>,
+    pub(super) net: Weak<RootNetwork>,
+    ipc: Weak<IpcNamespace>,
+    cgroup: Weak<CgroupNamespace>,
     pub(super) pid: Weak<pid_namespace::PidSpace>,
     pub(super) pid_children: Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
@@ -113,6 +180,8 @@ impl Vfs {
         NamespaceSnapshot {
             uts: Rc::downgrade(&self.uts.0),
             net: Rc::downgrade(&self.root_network),
+            ipc: Rc::downgrade(&self.ipc_namespace),
+            cgroup: Rc::downgrade(&self.cgroup_namespace),
             pid: Rc::downgrade(&self.pid_ns.0),
             pid_children: Rc::downgrade(&self.pid_children.0),
             mount: self
@@ -126,6 +195,93 @@ impl Vfs {
                 )
             }),
         }
+    }
+    pub fn unshare_net(&mut self) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+            return Err(Errno(1));
+        }
+        let live = self.root_network.live.clone();
+        if live.get() >= MAX_NAMESPACES {
+            return Err(Errno(28));
+        }
+        let network = self.network.isolated().map_err(|e| Errno(e.0))?;
+        let inode = NEXT_INODE
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Errno(28))?;
+        live.set(live.get() + 1);
+        self.root_network = Rc::new(RootNetwork {
+            inode,
+            network: RefCell::new(network.clone()),
+            local: Rc::default(),
+            live,
+        });
+        self.network = network;
+        Ok(())
+    }
+    pub fn unshare_ipc(&mut self) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+            return Err(Errno(1));
+        }
+        let live = self.ipc_namespace.live.clone();
+        if live.get() >= MAX_NAMESPACES {
+            return Err(Errno(28));
+        }
+        let inode = NEXT_INODE
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Errno(28))?;
+        live.set(live.get() + 1);
+        self.ipc_namespace = Rc::new(IpcNamespace {
+            inode,
+            mqueue: RefCell::default(),
+            live,
+        });
+        Ok(())
+    }
+    pub fn unshare_cgroup(&mut self) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+            return Err(Errno(1));
+        }
+        let live = self.cgroup_namespace.live.clone();
+        if live.get() >= MAX_NAMESPACES {
+            return Err(Errno(28));
+        }
+        let path = self.cgroup_path(self.pid);
+        let root = self
+            .cgroups
+            .borrow()
+            .fs
+            .borrow()
+            .paths
+            .get(&path)
+            .cloned()
+            .ok_or(Errno(2))?;
+        let inode = NEXT_INODE
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Errno(28))?;
+        live.set(live.get() + 1);
+        self.cgroup_namespace = Rc::new(CgroupNamespace {
+            inode,
+            root: Some(root),
+            path,
+            live,
+        });
+        Ok(())
+    }
+    pub(super) fn cgroup_view_path(&self, path: &[u8]) -> Vec<u8> {
+        let components = |p: &[u8]| {
+            p.split(|b| *b == b'/')
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>()
+        };
+        let root = components(&self.cgroup_namespace.path);
+        let target = components(path);
+        let common = root.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        let mut parts = vec![b"..".to_vec(); root.len() - common];
+        parts.extend_from_slice(&target[common..]);
+        let mut out = b"/".to_vec();
+        out.extend(parts.join(&b'/'));
+        out
     }
     pub fn unshare_uts(&mut self) -> Result<()> {
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
@@ -163,10 +319,11 @@ impl Vfs {
         }
         match ns {
             NamespaceHandle::Net(ns) => {
-                if !Rc::ptr_eq(&ns, &self.root_network) {
-                    return Err(Errno(95));
-                }
+                self.network = ns.network.borrow().clone();
+                self.root_network = ns;
             }
+            NamespaceHandle::Ipc(ns) => self.ipc_namespace = ns,
+            NamespaceHandle::Cgroup(ns) => self.cgroup_namespace = ns,
             NamespaceHandle::Uts(ns) => self.uts = ns,
             NamespaceHandle::Pid(ns) => {
                 if !self.pid_ns.contains(&ns) {
@@ -206,12 +363,10 @@ impl Vfs {
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
         let (group, pid, kind) = match parts.as_slice() {
-            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net")] => {
-                (None, *pid, *kind)
-            }
-            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net")] => {
-                (Some(*group), *pid, *kind)
-            }
+            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
+            | b"cgroup")] => (None, *pid, *kind),
+            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
+            | b"cgroup")] => (Some(*group), *pid, *kind),
             _ => return Ok(None),
         };
         let parse = |p: &[u8]| {
@@ -234,6 +389,10 @@ impl Vfs {
         }
         Ok(Some(match kind {
             b"net" => NamespaceHandle::Net(process.namespaces.net.upgrade().ok_or(Errno(2))?),
+            b"ipc" => NamespaceHandle::Ipc(process.namespaces.ipc.upgrade().ok_or(Errno(2))?),
+            b"cgroup" => {
+                NamespaceHandle::Cgroup(process.namespaces.cgroup.upgrade().ok_or(Errno(2))?)
+            }
             b"uts" => NamespaceHandle::Uts(UtsNamespace(
                 process.namespaces.uts.upgrade().ok_or(Errno(2))?,
             )),
@@ -271,6 +430,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: Some(ns),
+            network_control: None,
             oom: None,
             mount: None,
         }))
@@ -300,6 +460,14 @@ pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Optio
             .net
             .upgrade()
             .map(|ns| NamespaceHandle::Net(ns).label()),
+        b"ipc" => snapshot
+            .ipc
+            .upgrade()
+            .map(|ns| NamespaceHandle::Ipc(ns).label()),
+        b"cgroup" => snapshot
+            .cgroup
+            .upgrade()
+            .map(|ns| NamespaceHandle::Cgroup(ns).label()),
         b"uts" => snapshot.uts.upgrade().map(|ns| UtsNamespace(ns).label()),
         b"pid" => snapshot.pid.upgrade().map(|ns| PidNamespace(ns).label()),
         b"pid_for_children" => snapshot
@@ -320,6 +488,7 @@ pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     fn snapshot(v: &mut Vfs) {
         v.set_runtime_info(
             1,
@@ -338,6 +507,7 @@ mod tests {
     fn root_network_handle_binds_pins_and_reenters_without_creating_isolation() {
         let mut v = Vfs::default();
         snapshot(&mut v);
+        assert!(v.accesses_proc(AT_FDCWD, b"/proc/self/ns/net"));
         let fd = v.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
         let before = v.stat_fd(fd).unwrap();
         assert_eq!(v.namespace_type(fd), Ok(Some(CLONE_NEWNET)));
@@ -360,6 +530,180 @@ mod tests {
         assert_eq!(v.namespace_type(bound), Ok(Some(CLONE_NEWNET)));
         v.credentials = Credentials::user(1000, 1000);
         assert_eq!(v.setns(bound, CLONE_NEWNET), Err(Errno(1)));
+    }
+    #[test]
+    fn isolated_network_has_private_ports_abstract_names_and_retains_old_fds() {
+        let mut root = Vfs::default();
+        root.configure_network(NetworkMode::Loopback).unwrap();
+        snapshot(&mut root);
+        let nsfd = root.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
+        let server = root.socket(2, 1, 0).unwrap();
+        let server = root.socket_fd(server).unwrap();
+        server.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        server.listen(2).unwrap();
+        let address = server.local_addr().unwrap();
+        let old = root.socket(2, 1, 0).unwrap();
+        let name = b"\x01\0\0isolated";
+        let abstract_fd = root.socket(1, 1, 0).unwrap();
+        let abstract_socket = root.local_socket(abstract_fd).unwrap().unwrap();
+        root.local_bind(&abstract_socket, name).unwrap();
+        abstract_socket.listen(2).unwrap();
+        let old_abstract = root.socket(1, 1, 0).unwrap();
+        let mut child = root.clone();
+        child.unshare_net().unwrap();
+        assert!(!child.loopback_up());
+        assert!(child.network_info().is_none());
+        assert_ne!(root.network.namespace_id(), child.network.namespace_id());
+        let fd = child.socket(2, 1, 0).unwrap();
+        let private = child.socket_fd(fd).unwrap();
+        assert_eq!(private.bind(address), Err(trames_net::NetError(99)));
+        child.set_loopback_up(true).unwrap();
+        private.bind(address).unwrap();
+        private.listen(2).unwrap();
+        let client = child.socket(2, 1, 0).unwrap();
+        let client = child.socket_fd(client).unwrap();
+        assert_eq!(client.connect(address), Err(trames_net::NetError(115)));
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        let accepted = loop {
+            if let Ok((s, _)) = private.accept() {
+                break s;
+            }
+            assert!(std::time::Instant::now() < end);
+            trames_net::wait(&[(private.clone(), 1)], Duration::from_millis(1)).unwrap();
+        };
+        assert_eq!(server.poll(1), Ok(0));
+        client.send(b"private", 0, None).unwrap();
+        let received = loop {
+            if let Ok(r) = accepted.recv(7, 0) {
+                break r.data;
+            }
+            assert!(std::time::Instant::now() < end);
+            trames_net::wait(&[(accepted.clone(), 1)], Duration::from_millis(1)).unwrap();
+        };
+        assert_eq!(received, b"private");
+        assert_eq!(
+            client.info().unwrap().namespace_id,
+            child.network.namespace_id()
+        );
+        assert_eq!(
+            child.socket_fd(old).unwrap().info().unwrap().namespace_id,
+            root.network.namespace_id()
+        );
+        let local = child.socket(1, 1, 0).unwrap();
+        let local = child.local_socket(local).unwrap().unwrap();
+        assert_eq!(child.local_connect(&local, name), Err(Errno(111)));
+        child.local_bind(&local, name).unwrap();
+        local.listen(1).unwrap();
+        let inherited = child.local_socket(old_abstract).unwrap().unwrap();
+        child.local_connect(&inherited, name).unwrap();
+        assert!(abstract_socket.poll(1) & 1 != 0);
+        assert_eq!(local.poll(1) & 1, 0);
+        child.setns(nsfd, CLONE_NEWNET).unwrap();
+        assert_eq!(child.network.namespace_id(), root.network.namespace_id());
+        assert_eq!(private.local_addr(), Ok(address));
+        child.credentials = Credentials::user(1000, 1000);
+        let previous = child.network.namespace_id();
+        assert_eq!(child.unshare_net(), Err(Errno(1)));
+        assert_eq!(child.network.namespace_id(), previous);
+    }
+    #[test]
+    fn ipc_namespace_mqueue_identity_and_pinned_mounts_are_independent() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let original = v.open_at(AT_FDCWD, b"/proc/self/ns/ipc", 0, 0).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/b", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/c", 0o755).unwrap();
+        v.mount(None, b"/a", Some(b"mqueue"), 0, None).unwrap();
+        let a = v.open_at(AT_FDCWD, b"/a", 0, 0).unwrap();
+        v.unshare_ipc().unwrap();
+        snapshot(&mut v);
+        let own = v.open_at(AT_FDCWD, b"/proc/self/ns/ipc", 0, 0).unwrap();
+        assert_ne!(
+            v.stat_fd(original).unwrap()[8..16],
+            v.stat_fd(own).unwrap()[8..16]
+        );
+        assert_eq!(v.namespace_type(own), Ok(Some(CLONE_NEWIPC)));
+        v.mount(None, b"/b", Some(b"mqueue"), 0, None).unwrap();
+        let b = v.open_at(AT_FDCWD, b"/b", 0, 0).unwrap();
+        assert_ne!(v.stat_fd(a).unwrap()[0..8], v.stat_fd(b).unwrap()[0..8]);
+        v.setns(original, 0).unwrap();
+        v.mount(None, b"/c", Some(b"mqueue"), 0, None).unwrap();
+        let c = v.open_at(AT_FDCWD, b"/c", 0, 0).unwrap();
+        assert_eq!(v.stat_fd(a).unwrap()[0..8], v.stat_fd(c).unwrap()[0..8]);
+    }
+    #[test]
+    fn network_sysctls_pin_their_namespace_and_change_actual_ping_policy() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        snapshot(&mut v);
+        let root = v.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
+        let original = v
+            .open_at(AT_FDCWD, b"/proc/sys/net/ipv4/ping_group_range", 2, 0)
+            .unwrap();
+        v.unshare_net().unwrap();
+        assert_eq!(v.socket(2, 2, 1), Err(Errno(13)));
+        let own = v
+            .open_at(AT_FDCWD, b"/proc/sys/net/ipv4/ping_group_range", 2, 0)
+            .unwrap();
+        assert_eq!(v.read(own, 100).unwrap(), b"1\t0\n");
+        v.seek(own, 0, 0).unwrap();
+        v.write(own, b"0 2147483647\n").unwrap();
+        let ping = v.socket(2, 2, 1).unwrap();
+        v.close(ping).unwrap();
+        v.write(original, b"1000 2000\n").unwrap();
+        assert_eq!(v.network.ping_range(), [0, 2147483647]);
+        let port = v
+            .open_at(
+                AT_FDCWD,
+                b"/proc/sys/net/ipv4/ip_unprivileged_port_start",
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(v.write(port, b"65536\n"), Err(Errno(22)));
+        v.write(port, b"0\n").unwrap();
+        assert_eq!(v.network.unprivileged_port(), 0);
+        v.setns(root, CLONE_NEWNET).unwrap();
+        assert_eq!(v.network.ping_range(), [1000, 2000]);
+        assert_eq!(v.network.unprivileged_port(), 1024);
+        v.credentials.caps.effective &= !(1 << capabilities::NET_ADMIN);
+        v.seek(own, 0, 0).unwrap();
+        assert_eq!(v.write(own, b"0 0"), Ok(3));
+        v.credentials = Credentials::user(1000, 1000);
+        v.seek(own, 0, 0).unwrap();
+        assert_eq!(v.write(own, b"0 0"), Err(Errno(13)));
+    }
+    #[test]
+    fn private_cgroup_namespace_rebases_proc_and_new_mount_without_moving_tasks() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/outer", 0o755)
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/outer/inner", 0o755)
+            .unwrap();
+        let membership = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/outer/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(membership, b"1").unwrap();
+        v.close(membership).unwrap();
+        let root = v.open_at(AT_FDCWD, b"/proc/self/ns/cgroup", 0, 0).unwrap();
+        v.unshare_cgroup().unwrap();
+        assert_eq!(v.cgroup_path(1), b"/outer");
+        assert_eq!(v.cgroup_view_path(b"/outer"), b"/");
+        assert_eq!(v.cgroup_view_path(b"/outer/inner"), b"/inner");
+        assert_eq!(v.cgroup_view_path(b"/"), b"/..");
+        v.mkdir_at(AT_FDCWD, b"/private-cgroup", 0o755).unwrap();
+        v.mount(None, b"/private-cgroup", Some(b"cgroup2"), 0, None)
+            .unwrap();
+        assert_eq!(
+            &v.stat_at(AT_FDCWD, b"/private-cgroup").unwrap()[..16],
+            &v.stat_at(AT_FDCWD, b"/sys/fs/cgroup/outer").unwrap()[..16]
+        );
+        assert!(v.stat_at(AT_FDCWD, b"/private-cgroup/inner").is_ok());
+        assert!(v.stat_at(AT_FDCWD, b"/private-cgroup/outer").is_err());
+        v.setns(root, CLONE_NEWCGROUP).unwrap();
+        assert_eq!(v.cgroup_view_path(b"/outer"), b"/outer");
     }
     #[test]
     fn namespace_fd_pins_identity_across_unshare_and_setns() {

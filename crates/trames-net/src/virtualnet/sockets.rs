@@ -49,6 +49,7 @@ impl Socket {
         }
         rx += state.icmp_pending.as_ref().map_or(0, |p| p.0.len());
         crate::SocketInfo {
+            namespace_id: 0, // Filled by the public socket wrapper.
             family: self.family,
             kind: if self.kind == 4 {
                 3
@@ -125,16 +126,20 @@ impl Socket {
     }
     fn own(&self, a: IpAddr) -> bool {
         a.is_unspecified()
-            || a == IpAddr::V4(self.network.0.info.ipv4)
-            || a == IpAddr::V6(self.network.0.info.ipv6)
-            || a == IpAddr::V4(Ipv4Addr::LOCALHOST)
-            || a == IpAddr::V6(Ipv6Addr::LOCALHOST)
+            || (!self.network.is_isolated()
+                && (a == IpAddr::V4(self.network.0.info.ipv4)
+                    || a == IpAddr::V6(self.network.0.info.ipv6)))
+            || (self.network.0.loopback_up.get()
+                && (a == IpAddr::V4(Ipv4Addr::LOCALHOST) || a == IpAddr::V6(Ipv6Addr::LOCALHOST)))
     }
     fn destination(&self, a: SocketAddr) -> Result<()> {
         if a.port() == 0 && !matches!(self.kind, 3 | 4) {
             return Err(NetError(22));
         }
         let v = a.ip();
+        if self.network.is_isolated() && (!v.is_loopback() || !self.network.0.loopback_up.get()) {
+            return Err(NetError(101));
+        }
         if v.is_unspecified()
             || v.is_multicast()
             || matches!(v,IpAddr::V4(a) if a.is_broadcast() || a.octets()[0]>=240)
@@ -176,6 +181,10 @@ impl Socket {
         if self.family == 10 && !state.v6_only {
             ips.extend([IpAddr::V4(info.ipv4), Ipv4Addr::LOCALHOST.into()]);
         }
+        // Wildcard bindings belong to the namespace, even while lo is down.
+        // Keep their loopback handles ready for a later LinkSetUp; packet
+        // delivery is gated by the live interface state in the fabric.
+        ips.retain(|a| !self.network.is_isolated() || a.is_loopback());
         ips.into_iter()
             .map(|ip| SocketAddr::new(ip, bound.port()))
             .collect()
@@ -878,7 +887,7 @@ impl Socket {
             let device = match &value[..end] {
                 b"" => None,
                 b"lo" => Some(1),
-                b"eth0" => Some(2),
+                b"eth0" if !self.network.is_isolated() => Some(2),
                 _ => return Err(NetError(19)),
             };
             if self.kind != 4 {

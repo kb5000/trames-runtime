@@ -132,7 +132,7 @@ impl Linux {
         }
         let request = a[1] as u32;
         if request != 0x5421 {
-            let info = self.vfs.network_info().ok_or(Errno(25))?;
+            let info = self.vfs.network_info();
             if request == 0x8912 {
                 // SIOCGIFCONF: AArch64 ifconf and two IPv4 ifreq entries.
                 let capacity = u32_at(memory, a[2])?;
@@ -141,22 +141,22 @@ impl Linux {
                 }
                 let pointer = u64_at(memory, a[2] + 8)?;
                 Self::check(memory, a[2], 16, Access::Write)?;
+                let mut interfaces = Vec::new();
+                if self.vfs.loopback_up() {
+                    interfaces.push((b"lo".as_slice(), std::net::Ipv4Addr::LOCALHOST));
+                }
+                if let Some(info) = info.filter(|n| !n.ipv4.is_unspecified()) {
+                    interfaces.push((b"eth0".as_slice(), info.ipv4));
+                }
                 let size = if pointer == 0 {
-                    80
+                    interfaces.len() * 40
                 } else {
-                    (capacity as usize / 40).min(2) * 40
+                    (capacity as usize / 40).min(interfaces.len()) * 40
                 };
                 if pointer != 0 {
                     Self::check(memory, pointer, size, Access::Write)?;
                     let mut entries = vec![0; size];
-                    for (i, (name, ip)) in [
-                        (b"lo".as_slice(), std::net::Ipv4Addr::LOCALHOST),
-                        (b"eth0".as_slice(), info.ipv4),
-                    ]
-                    .into_iter()
-                    .take(size / 40)
-                    .enumerate()
-                    {
+                    for (i, (name, ip)) in interfaces.into_iter().take(size / 40).enumerate() {
                         let e = &mut entries[i * 40..(i + 1) * 40];
                         e[..name.len()].copy_from_slice(name);
                         e[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
@@ -170,7 +170,7 @@ impl Linux {
             }
             if !matches!(
                 request,
-                0x8910 | 0x8913 | 0x8915 | 0x891b | 0x8921 | 0x8933 | 0x8942 | 0x8927
+                0x8910 | 0x8913 | 0x8914 | 0x8915 | 0x891b | 0x8921 | 0x8933 | 0x8942 | 0x8927
             ) {
                 return Err(Errno(25));
             }
@@ -191,7 +191,21 @@ impl Linux {
                     _ => return Err(Errno(19)),
                 }
             };
+            if !loopback && info.is_none() {
+                return Err(Errno(19));
+            }
             match request {
+                0x8914 => {
+                    if !loopback {
+                        return Err(Errno(95));
+                    }
+                    let flags = u16::from_le_bytes(entry[16..18].try_into().unwrap());
+                    if flags & !(1 | 8 | 0x40) != 0 {
+                        return Err(Errno(95));
+                    }
+                    self.vfs.set_loopback_up(flags & 1 != 0)?;
+                    return Ok(0);
+                }
                 0x8942 => entry[16..20].copy_from_slice(&0u32.to_le_bytes()),
                 0x8927 => {
                     entry[16..32].fill(0);
@@ -207,23 +221,44 @@ impl Linux {
                     };
                     entry[..name.len()].copy_from_slice(name);
                 }
-                0x8913 => entry[16..18]
-                    .copy_from_slice(&(if loopback { 0x49u16 } else { 0xc1u16 }).to_le_bytes()),
+                0x8913 => entry[16..18].copy_from_slice(
+                    &(if loopback {
+                        if self.vfs.loopback_up() {
+                            0x49u16
+                        } else {
+                            8
+                        }
+                    } else {
+                        0xc1u16
+                    })
+                    .to_le_bytes(),
+                ),
                 0x8915 | 0x891b => {
+                    if loopback && !self.vfs.loopback_up() {
+                        return Err(Errno(99));
+                    }
                     let ip = if request == 0x891b {
                         std::net::Ipv4Addr::from(
                             u32::MAX
-                                .checked_shl(32 - if loopback { 8 } else { info.prefix4 as u32 })
+                                .checked_shl(
+                                    32 - if loopback {
+                                        8
+                                    } else {
+                                        info.unwrap().prefix4 as u32
+                                    },
+                                )
                                 .unwrap_or(0),
                         )
                     } else if loopback {
                         std::net::Ipv4Addr::LOCALHOST
                     } else {
-                        info.ipv4
+                        info.unwrap().ipv4
                     };
                     entry[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip.into(), 0)));
                 }
-                0x8921 => entry[16..20].copy_from_slice(&info.mtu.to_le_bytes()),
+                0x8921 => entry[16..20].copy_from_slice(
+                    &(if loopback { 65536 } else { info.unwrap().mtu }).to_le_bytes(),
+                ),
                 0x8933 => entry[16..20]
                     .copy_from_slice(&(if loopback { 1u32 } else { 2u32 }).to_le_bytes()),
                 _ => unreachable!(),
@@ -268,7 +303,14 @@ impl Linux {
             200 | 203 => {
                 let peer = address(memory, a[1], a[2])?;
                 if number == 200 {
-                    socket.bind_bytes(&peer).map_err(net)?;
+                    socket
+                        .bind_authorized(
+                            &peer,
+                            self.vfs
+                                .credentials
+                                .has_cap(trames_vfs::capabilities::NET_BIND_SERVICE),
+                        )
+                        .map_err(net)?;
                 } else {
                     socket.connect_bytes(&peer).map_err(net)?;
                 }

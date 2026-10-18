@@ -699,11 +699,11 @@ impl Vfs {
                 return Err(Errno(20));
             }
             match kind.ok_or(Errno(22))? {
-                b"mqueue" if self.pseudo.borrow().mqueue.is_some() => {
+                b"mqueue" if self.ipc_namespace.mqueue.borrow().is_some() => {
                     if data.is_some_and(|d| !d.is_empty()) {
                         return Err(Errno(95));
                     }
-                    let fs = self.pseudo.borrow().mqueue.as_ref().unwrap().clone();
+                    let fs = self.ipc_namespace.mqueue.borrow().as_ref().unwrap().clone();
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Mqueue, flags & ATTRS)
                 }
@@ -750,7 +750,7 @@ impl Vfs {
                         volume: None,
                     }));
                     if mqueue {
-                        self.pseudo.borrow_mut().mqueue = Some(fs.clone());
+                        *self.ipc_namespace.mqueue.borrow_mut() = Some(fs.clone());
                     }
                     (
                         fs,
@@ -765,8 +765,19 @@ impl Vfs {
                         return Err(Errno(95));
                     }
                     let fs = self.cgroups.borrow().fs.clone();
-                    let root = fs.borrow().paths[b"/".as_slice()].clone();
-                    (fs, root, b"/".to_vec(), Kind::Cgroup, flags & ATTRS)
+                    let (root, key) = if let Some(root) = &self.cgroup_namespace.root {
+                        let key = fs
+                            .borrow()
+                            .paths
+                            .iter()
+                            .find(|(_, n)| Rc::ptr_eq(n, root))
+                            .map(|(p, _)| p.clone())
+                            .ok_or(Errno(2))?;
+                        (root.clone(), key)
+                    } else {
+                        (fs.borrow().paths[b"/".as_slice()].clone(), b"/".to_vec())
+                    };
+                    (fs, root, key, Kind::Cgroup, flags & ATTRS)
                 }
                 b"devpts" => {
                     let pts = pty::Devpts::new(new_mount_id()?, data.unwrap_or_default())?;

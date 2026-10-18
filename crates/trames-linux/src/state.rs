@@ -411,7 +411,10 @@ impl Linux {
         }
         let flags = a[3];
         let shared = flags & 3 != 2;
-        const ALLOWED: u64 = 3 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x100000;
+        // Linux currently treats MAP_STACK as an advisory no-op. glibc uses
+        // it for thread-stack reservations even when the initial prot is NONE.
+        const ALLOWED: u64 =
+            3 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x20000 | 0x100000;
         if a[2] & !7 != 0
             || flags & !ALLOWED != 0
             || flags & 3 == 0

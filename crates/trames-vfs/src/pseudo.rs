@@ -263,6 +263,8 @@ pub struct ProcessInfo {
     pub command: Vec<u8>,
     pub cgroup: Vec<u8>,
     pub nondumpable: bool,
+    pub seccomp: u32,
+    pub seccomp_filters: usize,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable: Vec<u8>,
@@ -303,9 +305,6 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
-    // One empty POSIX queue filesystem for the current guest IPC scope.
-    // mq_* calls remain unsupported; ordinary VFS operations cannot invent queues.
-    pub(super) mqueue: Option<Rc<RefCell<Filesystem>>>,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) nodes: BTreeMap<(u64, Vec<u8>), Rc<RefCell<Node>>>,
@@ -682,6 +681,7 @@ impl Vfs {
             local: None,
             pty: None,
             namespace: None,
+            network_control: None,
             oom: None,
             mount,
         }))))
@@ -866,6 +866,7 @@ impl Vfs {
             local: None,
             pty: original.pty.clone(),
             namespace: original.namespace.clone(),
+            network_control: original.network_control.clone(),
             oom: original.oom.clone(),
             mount: original.mount.clone(),
         };
@@ -925,7 +926,7 @@ impl Vfs {
     }
     pub(super) fn refresh_pseudo_fd(&self, fd: u32) -> Result<()> {
         let o = self.descriptor(fd)?.open.borrow();
-        if o.oom.is_some() {
+        if o.oom.is_some() || o.network_control.is_some() {
             return Ok(());
         }
         if let FdKind::Node(key) = &o.kind {
@@ -1128,7 +1129,7 @@ impl Vfs {
             b"/proc/sys/net/ipv4/ip_forward" => return Ok(regular(b"0\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
-            b"/proc/sys/net/ipv4/ping_group_range" => return Ok(regular(b"0\t2147483647\n".to_vec())),
+            b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
             _ => {},
         }
         if let Some(rest) = path.strip_prefix(b"/proc/") {
@@ -1166,7 +1167,13 @@ impl Vfs {
                     && key == b"ns"
                     && matches!(
                         parts[i + 1],
-                        b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net"
+                        b"uts"
+                            | b"mnt"
+                            | b"pid"
+                            | b"pid_for_children"
+                            | b"net"
+                            | b"ipc"
+                            | b"cgroup"
                     )
                 {
                     return Ok(
@@ -1182,12 +1189,9 @@ impl Vfs {
                         b"exe" => return Ok(None),
                         b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
                         b"comm" => comm(p),
-                        b"cgroup" => [
-                            b"0::".as_slice(),
-                            if p.cgroup.is_empty() { b"/" } else { &p.cgroup },
-                            b"\n",
-                        ]
-                        .concat(),
+                        b"cgroup" => {
+                            [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
+                        }
                         b"cmdline" => nul_list(&p.arguments),
                         b"environ" => nul_list(&p.environment),
                         b"auxv" => p.auxiliary.clone(),
@@ -1261,6 +1265,10 @@ impl Vfs {
                                 "\nNoNewPrivs:\t{}",
                                 u32::from(c.caps.no_new_privs)
                             ));
+                            name.push_str(&format!(
+                                "\nSeccomp:\t{}\nSeccomp_filters:\t{}",
+                                p.seccomp, p.seccomp_filters
+                            ));
                             for (key, ids) in ["NStgid", "NSpid", "NSpgid", "NSsid"]
                                 .iter()
                                 .zip(&p.namespace_ids)
@@ -1318,6 +1326,12 @@ impl Vfs {
                     ));
                 }
                 if parts.len() == i + 2 && key == b"net" {
+                    let network = p
+                        .namespaces
+                        .net
+                        .upgrade()
+                        .map(|ns| ns.network.borrow().clone());
+                    let info = network.as_ref().and_then(|n| n.info());
                     return Ok(match parts[i + 1] {
                         b"tcp" | b"tcp6" | b"udp" | b"udp6" | b"raw" | b"raw6" | b"icmp"
                         | b"icmp6" => {
@@ -1362,7 +1376,10 @@ impl Vfs {
                             for process in &r.processes {
                                 for fd in &process.fds {
                                     if let Some(s) = fd.socket.as_ref().filter(|s| {
-                                        s.family == family
+                                        network
+                                            .as_ref()
+                                            .is_some_and(|n| n.namespace_id() == s.namespace_id)
+                                            && s.family == family
                                             && s.kind == kind
                                             && s.protocol == protocol
                                     }) {
@@ -1380,8 +1397,12 @@ impl Vfs {
                         ),
                         b"dev" => {
                             let mut data=String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
-                            if let Some(links) = self.network_links() {
-                                for (name, s) in ["lo", "eth0"].into_iter().zip(links) {
+                            if let Some(links) = network.as_ref().and_then(|n| n.links()) {
+                                for (name, s) in ["lo", "eth0"]
+                                    .into_iter()
+                                    .zip(links)
+                                    .filter(|(name, _)| *name == "lo" || info.is_some())
+                                {
                                     data.push_str(&format!(
                                         "{name:>6}: {} {} 0 {} 0 0 0 0 {} {} 0 {} 0 0 0 0\n",
                                         s.rx_bytes,
@@ -1407,7 +1428,12 @@ impl Vfs {
                         }),
                         b"if_inet6" => regular(
                             format!(
-                                "00000000000000000000000000000001 01 80 10 80 lo\n{}",
+                                "{}{}",
+                                if network.as_ref().is_some_and(|n| n.loopback_up()) {
+                                    "00000000000000000000000000000001 01 80 10 80 lo\n"
+                                } else {
+                                    ""
+                                },
                                 info.filter(|n| !n.ipv6.is_unspecified()).map_or(
                                     String::new(),
                                     |n| format!(
@@ -1491,9 +1517,32 @@ impl Vfs {
                     b"type" => if lo { "772\n" } else { "65534\n" }.to_string(),
                     b"mtu" => format!("{}\n", info.map_or(65536, |n| n.mtu)),
                     b"address" | b"broadcast" => "00:00:00:00:00:00\n".to_string(),
-                    b"flags" => if lo { "0x9\n" } else { "0x11\n" }.to_string(),
-                    b"operstate" => if lo { "unknown\n" } else { "up\n" }.to_string(),
-                    b"carrier" => "1\n".to_string(),
+                    b"flags" => if lo {
+                        if self.loopback_up() {
+                            "0x9\n"
+                        } else {
+                            "0x8\n"
+                        }
+                    } else {
+                        "0x11\n"
+                    }
+                    .to_string(),
+                    b"operstate" => if lo {
+                        if self.loopback_up() {
+                            "unknown\n"
+                        } else {
+                            "down\n"
+                        }
+                    } else {
+                        "up\n"
+                    }
+                    .to_string(),
+                    b"carrier" => if lo && !self.loopback_up() {
+                        "0\n"
+                    } else {
+                        "1\n"
+                    }
+                    .to_string(),
                     b"tx_queue_len" => "0\n".to_string(),
                     _ => return Ok(None),
                 };
@@ -1657,6 +1706,7 @@ impl Vfs {
             b"/proc/sys/net" => vec![b"ipv4".to_vec()],
             b"/proc/sys/net/ipv4" => [
                 "ip_forward",
+                "ip_unprivileged_port_start",
                 "ip_local_port_range",
                 "ip_default_ttl",
                 "ping_group_range",
@@ -1759,6 +1809,8 @@ impl Vfs {
                         names.push(b"pid".to_vec());
                         names.push(b"pid_for_children".to_vec());
                         names.push(b"net".to_vec());
+                        names.push(b"ipc".to_vec());
+                        names.push(b"cgroup".to_vec());
                         if p.namespaces.mount.strong_count() != 0 {
                             names.push(b"mnt".to_vec());
                         }

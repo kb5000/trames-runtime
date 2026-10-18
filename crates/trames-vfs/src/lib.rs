@@ -24,7 +24,9 @@ mod pid_namespace;
 pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
 mod namespace;
 mod xattr;
-pub use linux_namespace::{NamespaceSnapshot, UtsNamespace, CLONE_NEWUTS};
+pub use linux_namespace::{
+    NamespaceSnapshot, UtsNamespace, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWUTS,
+};
 mod network;
 mod oom;
 mod pseudo;
@@ -194,6 +196,7 @@ struct OpenDescription {
     pty: Option<Rc<PtyEnd>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<Weak<OomTask>>,
+    network_control: Option<network::Control>,
     mount: Option<Rc<Mount>>,
 }
 impl Drop for OpenDescription {
@@ -254,7 +257,6 @@ struct Filesystem {
 #[derive(Clone)]
 pub struct Vfs {
     network: trames_net::Network,
-    local_namespace: Rc<RefCell<ipc::LocalNamespace>>,
     native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
     fs: Rc<RefCell<Filesystem>>,
     fds: BTreeMap<u32, Descriptor>,
@@ -262,6 +264,8 @@ pub struct Vfs {
     root_node: Option<Rc<RefCell<Node>>>,
     uts: UtsNamespace,
     root_network: Rc<linux_namespace::RootNetwork>,
+    ipc_namespace: Rc<linux_namespace::IpcNamespace>,
+    cgroup_namespace: Rc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
@@ -290,9 +294,10 @@ pub struct Vfs {
 impl Default for Vfs {
     fn default() -> Self {
         let pid_ns = PidNamespace::default();
+        let root_network = Rc::new(linux_namespace::RootNetwork::default());
+        let network = root_network.network.borrow().clone();
         let mut v = Self {
-            network: trames_net::Network::default(),
-            local_namespace: Rc::default(),
+            network,
             native_services: Rc::default(),
             fs: Rc::new(RefCell::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
@@ -309,7 +314,9 @@ impl Default for Vfs {
             cwd_node: None,
             root_node: None,
             uts: UtsNamespace::default(),
-            root_network: Rc::default(),
+            root_network,
+            ipc_namespace: Rc::default(),
+            cgroup_namespace: Rc::default(),
             pid_ns: pid_ns.clone(),
             pid_children: pid_ns,
             mounts: None,
@@ -366,6 +373,7 @@ impl Default for Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        network_control: None,
                         oom: None,
                         mount: None,
                     })),
@@ -505,6 +513,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        network_control: None,
                         oom: None,
                         mount: None,
                     })),
@@ -1262,7 +1271,9 @@ impl Vfs {
             p.writable()?;
         }
         let oom = self.oom_for_path(&p);
+        let network_control = self.network_control(&p);
         if oom.is_none()
+            && network_control.is_none()
             && self.uses_pseudo(&p)
             && self.pseudo_readonly(&p)
             && (flags & 3 != 0 || flags & 0x240 != 0)
@@ -1306,6 +1317,9 @@ impl Vfs {
             }
             if existed
                 && flags & O_PATH == 0
+                && !(network_control.is_some()
+                    && (self.credentials.euid == 0
+                        || self.credentials.has_cap(capabilities::NET_ADMIN)))
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
                     || (flags & 3 != 0 && !self.allowed(&n, 2)))
             {
@@ -1322,7 +1336,11 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
-            if flags & 0x200 != 0 && !Self::cgroup_mount(&p) && oom.is_none() {
+            if flags & 0x200 != 0
+                && !Self::cgroup_mount(&p)
+                && oom.is_none()
+                && network_control.is_none()
+            {
                 if let Content::File(b) = &mut n.content {
                     b.truncate(0)?;
                     n.times[1] = storage::Timestamp::now();
@@ -1425,6 +1443,7 @@ impl Vfs {
                     local: None,
                     pty,
                     namespace: None,
+                    network_control,
                     oom,
                 })),
                 cloexec: flags & O_CLOEXEC != 0,
@@ -1593,6 +1612,7 @@ impl Vfs {
                         local: None,
                         pty: None,
                         namespace: None,
+                        network_control: None,
                         oom: None,
                         mount: None,
                     })),
@@ -1607,6 +1627,11 @@ impl Vfs {
         let mut o = self.descriptor(fd)?.open.borrow_mut();
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(control) = &o.network_control {
+            let data = control.read(o.position, count);
+            o.position += data.len() as u64;
+            return Ok(data);
         }
         if let Some(data) = Self::oom_read(&o, o.position, count)? {
             o.position += data.len() as u64;
@@ -1760,6 +1785,17 @@ impl Vfs {
         if o.flags & 3 == 0 {
             return Err(Errno(9));
         }
+        if let Some(control) = &o.network_control {
+            let count = control.write(
+                bytes,
+                offset.unwrap_or(o.position),
+                self.credentials.euid == 0 || self.credentials.has_cap(capabilities::NET_ADMIN),
+            )?;
+            if offset.is_none() {
+                o.position += count as u64;
+            }
+            return Ok(count);
+        }
         if let Some(count) = self.oom_write(&o, bytes)? {
             // proc oom_score_adj_write ignores and does not advance f_pos.
             return Ok(count);
@@ -1862,6 +1898,9 @@ impl Vfs {
         }
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(control) = &o.network_control {
+            return Ok(control.read(offset, count));
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {
             return Ok(data);
