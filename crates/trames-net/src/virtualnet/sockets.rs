@@ -272,6 +272,7 @@ impl Socket {
                 icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
                 icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
             );
+            s.set_hop_limit(Some(self.state.borrow().hop_limit));
             s.bind(icmp::Endpoint::Ident(a.port()))
                 .map_err(|_| NetError(22))?;
             self.state.borrow_mut().handles = vec![n.sockets.add(s)];
@@ -304,6 +305,7 @@ impl Socket {
             let mut handles = Vec::new();
             for address in addresses {
                 let mut s = udp_socket();
+                s.set_hop_limit(Some(self.state.borrow().hop_limit));
                 s.bind(IpListenEndpoint {
                     addr: Some(ip(address.ip())),
                     port: address.port(),
@@ -315,6 +317,26 @@ impl Socket {
         }
         self.state.borrow_mut().bound = Some(a);
         Ok(())
+    }
+    pub(crate) fn preflight_listen(&self, backlog: u32) -> Result<()> {
+        if self.kind != 1 {
+            return Err(NetError(95));
+        }
+        let state = self.state.borrow();
+        if state.connection == Connection::Listening {
+            return Ok(());
+        }
+        if state.connection != Connection::Idle {
+            return Err(NetError(22));
+        }
+        let bound = state.bound.ok_or(NetError(22))?;
+        drop(state);
+        self.network
+            .0
+            .fabric
+            .0
+            .borrow()
+            .reserve(self.addresses(bound).len() * backlog.clamp(1, 8) as usize)
     }
     pub fn listen(&self, backlog: u32) -> Result<()> {
         if self.kind != 1 {
@@ -338,6 +360,7 @@ impl Socket {
         for a in addresses {
             for _ in 0..backlog {
                 let mut s = tcp_socket();
+                s.set_hop_limit(Some(state.hop_limit));
                 s.listen(endpoint(a)).map_err(|_| NetError(22))?;
                 state.handles.push(n.sockets.add(s));
             }
@@ -371,6 +394,7 @@ impl Socket {
         let local = address(s.local_endpoint().unwrap());
         let peer = address(s.remote_endpoint().unwrap());
         let mut replacement = tcp_socket();
+        replacement.set_hop_limit(Some(state.hop_limit));
         replacement
             .listen(endpoint(local))
             .map_err(|_| NetError(22))?;
@@ -462,6 +486,7 @@ impl Socket {
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))
             .map_err(|_| NetError(22))?;
         let mut state = self.state.borrow_mut();
+        s.set_hop_limit(Some(state.hop_limit));
         s.set_nagle_enabled(!state.nodelay);
         if state.keepalive {
             s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
@@ -571,6 +596,16 @@ impl Socket {
             if state.write_closed {
                 return Err(NetError(32));
             }
+            let selected = if state.bound.is_some_and(|b| b.ip().is_unspecified()) {
+                self.network
+                    .0
+                    .routing
+                    .as_ref()
+                    .map(|view| view.source(a.ip()))
+                    .transpose()?
+            } else {
+                None
+            };
             let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let h = state
@@ -579,8 +614,12 @@ impl Socket {
                 .find(|h| {
                     let ep = n.sockets.get::<udp::Socket>(**h).endpoint();
                     ep.addr.is_some_and(|p| {
-                        addr(p).is_ipv4() == a.is_ipv4()
-                            && addr(p).is_loopback() == a.ip().is_loopback()
+                        if let Some(source) = selected {
+                            addr(p) == source
+                        } else {
+                            addr(p).is_ipv4() == a.is_ipv4()
+                                && addr(p).is_loopback() == a.ip().is_loopback()
+                        }
                     })
                 })
                 .copied()
@@ -839,12 +878,28 @@ impl Socket {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             for h in &state.handles {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
+                s.set_hop_limit(Some(state.hop_limit));
                 s.set_nagle_enabled(!state.nodelay);
                 s.set_keep_alive(
                     state
                         .keepalive
                         .then_some(smoltcp::time::Duration::from_secs(state.keep_idle as u64)),
                 );
+            }
+        }
+        if matches!(self.kind, 2 | 3) {
+            let mut i = self.network.0.fabric.0.borrow_mut();
+            let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+            for h in &state.handles {
+                if self.kind == 2 {
+                    n.sockets
+                        .get_mut::<udp::Socket>(*h)
+                        .set_hop_limit(Some(state.hop_limit));
+                } else {
+                    n.sockets
+                        .get_mut::<icmp::Socket>(*h)
+                        .set_hop_limit(Some(state.hop_limit));
+                }
             }
         }
         Ok(())
@@ -1141,7 +1196,12 @@ impl Socket {
         if a.is_ipv4() {
             smoltcp::wire::Icmpv4Packet::new_unchecked(&mut data).fill_checksum();
         } else {
-            let source = if a.ip().is_loopback() {
+            let source = if let Some(view) = &self.network.0.routing {
+                let IpAddr::V6(source) = view.source(a.ip())? else {
+                    return Err(NetError(97));
+                };
+                source
+            } else if a.ip().is_loopback() {
                 Ipv6Addr::LOCALHOST
             } else {
                 self.network.0.info.ipv6

@@ -84,7 +84,17 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
             [255; 6]
         },
     );
-    attr(&mut data, 16, &[if carrier { 6 } else { 2 }]);
+    attr(
+        &mut data,
+        16,
+        &[if !carrier {
+            2
+        } else if d.kind == DeviceKind::Loopback {
+            0
+        } else {
+            6
+        }],
+    );
     attr(&mut data, 33, &[u8::from(carrier)]);
     attr(&mut data, 13, &1000u32.to_le_bytes());
     if let Some(master) = d.master {
@@ -180,9 +190,6 @@ pub(crate) fn request(
                 }
                 if !admin {
                     return Err(NetError(1));
-                }
-                if kind == 19 {
-                    return Err(NetError(95));
                 }
                 let change = u32v(&request[28..32])?;
                 let state = u32v(&request[24..28])?;

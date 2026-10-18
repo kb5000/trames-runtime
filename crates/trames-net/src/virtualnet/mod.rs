@@ -468,7 +468,8 @@ impl Inner {
                     .as_ref()
                     .and_then(|v| v.graph.borrow().target(v.namespace, dst));
                 let target = if let Some(view) = &dynamic {
-                    path.and_then(|(ns, _, _)| {
+                    path.and_then(|path| {
+                        let ns = path.namespace;
                         self.nodes.iter().find_map(|(&key, n)| {
                             n.owner.upgrade().and_then(|v| {
                                 v.routing.as_ref().and_then(|r| {
@@ -493,6 +494,19 @@ impl Inner {
                         })
                         .map(|(&key, _)| key)
                 };
+                if let Some(path) = path {
+                    let ttl = if p[0] >> 4 == 4 { 8 } else { 7 };
+                    if p[ttl] <= path.hops {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
+                    if path.hops != 0 {
+                        p[ttl] -= path.hops;
+                        if p[0] >> 4 == 4 {
+                            smoltcp::wire::Ipv4Packet::new_unchecked(&mut p).fill_checksum();
+                        }
+                    }
+                }
                 if let Some(key) = target {
                     let permitted = source == key
                         || source == 0
@@ -542,10 +556,10 @@ impl Inner {
                     });
                     let size = p.len() as u64;
                     let dropped = !permitted || !enabled || !node.port.receive_packet(p);
-                    if let (Some(view), Some((ns, out, input))) = (&dynamic, path) {
+                    if let (Some(view), Some(path)) = (&dynamic, path) {
                         let mut graph = view.graph.borrow_mut();
-                        graph.account(view.namespace, out, size as usize, true, dropped);
-                        graph.account(ns, input, size as usize, false, dropped);
+                        graph.account(view.namespace, path.output, size as usize, true, dropped);
+                        graph.account(path.namespace, path.input, size as usize, false, dropped);
                     }
                     if dropped {
                         node.links[usize::from(!lo)].rx_dropped += 1;
@@ -738,12 +752,14 @@ impl Node {
                     let ep = SocketAddr::new(*a, bound.port());
                     let handle = if socket.kind == 2 {
                         let mut u = udp_socket();
+                        u.set_hop_limit(Some(state.hop_limit));
                         if u.bind(endpoint(ep)).is_err() {
                             break;
                         }
                         self.sockets.add(u)
                     } else {
                         let mut t = tcp_socket();
+                        t.set_hop_limit(Some(state.hop_limit));
                         if t.listen(endpoint(ep)).is_err() {
                             break;
                         }

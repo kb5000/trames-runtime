@@ -49,6 +49,8 @@ pub struct Route {
 struct Space {
     lo: Option<Rc<Cell<bool>>>,
     routes: Vec<Route>,
+    direct: bool,
+    forwarding: [bool; 2],
 }
 #[derive(Clone, Default)]
 pub(crate) struct Topology {
@@ -61,6 +63,14 @@ pub(crate) struct Topology {
 pub(crate) struct View {
     pub graph: Rc<RefCell<Topology>>,
     pub namespace: u64,
+    pub native_root: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct PacketPath {
+    pub namespace: u64,
+    pub output: u32,
+    pub input: u32,
+    pub hops: u8,
 }
 impl Address {
     pub fn contains(self, ip: IpAddr) -> bool {
@@ -124,7 +134,15 @@ impl Topology {
     pub fn add_space(&mut self, id: u64, lo: Option<Rc<Cell<bool>>>, info: Option<NetworkInfo>) {
         self.changed();
         self.next = self.next.max(3);
-        self.spaces.insert(id, Space { lo, routes: vec![] });
+        self.spaces.insert(
+            id,
+            Space {
+                lo,
+                routes: vec![],
+                direct: false,
+                forwarding: [false; 2],
+            },
+        );
         self.devices.insert(
             (id, 1),
             Device {
@@ -196,6 +214,85 @@ impl Topology {
             );
         }
     }
+    pub fn refresh_direct(&mut self, id: u64, enabled: bool, info: Option<NetworkInfo>) {
+        let Some(space) = self.spaces.get_mut(&id) else {
+            return;
+        };
+        space.direct = enabled;
+        let addresses: Vec<_> = info
+            .into_iter()
+            .flat_map(|i| {
+                [
+                    (IpAddr::V4(i.ipv4), i.prefix4),
+                    (IpAddr::V6(i.ipv6), i.prefix6),
+                ]
+            })
+            .filter(|(ip, _)| !ip.is_unspecified())
+            .map(|(ip, prefix)| Address { ip, prefix })
+            .collect();
+        if !enabled {
+            if self.devices.remove(&(id, 2)).is_some() {
+                self.spaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .routes
+                    .retain(|r| r.device != 2);
+                self.changed();
+            }
+            return;
+        }
+        let mtu = info.map_or(1500, |i| i.mtu);
+        if self.devices.get(&(id, 2)).is_some_and(|d| {
+            d.kind == DeviceKind::Direct && d.addresses == addresses && d.mtu == mtu
+        }) {
+            return;
+        }
+        self.devices.insert(
+            (id, 2),
+            Device {
+                index: 2,
+                name: b"eth0".to_vec(),
+                namespace: id,
+                kind: DeviceKind::Direct,
+                up: true,
+                mtu,
+                mac: [0; 6],
+                master: None,
+                addresses: addresses.clone(),
+                stats: LinkStats::default(),
+            },
+        );
+        let space = self.spaces.get_mut(&id).unwrap();
+        space.routes.retain(|r| r.device != 2);
+        for a in addresses {
+            space.routes.push(Route {
+                destination: Address {
+                    ip: if a.ip.is_ipv4() {
+                        Ipv4Addr::UNSPECIFIED.into()
+                    } else {
+                        Ipv6Addr::UNSPECIFIED.into()
+                    },
+                    prefix: 0,
+                },
+                device: 2,
+                gateway: None,
+                metric: 0,
+                protocol: 3,
+            });
+        }
+        self.changed();
+    }
+    pub fn forwarding(&self, id: u64, ipv6: bool) -> bool {
+        self.spaces
+            .get(&id)
+            .is_some_and(|s| s.forwarding[usize::from(ipv6)])
+    }
+    pub fn set_forwarding(&mut self, id: u64, ipv6: bool, enabled: bool) {
+        if let Some(s) = self.spaces.get_mut(&id) {
+            s.forwarding[usize::from(ipv6)] = enabled;
+            self.changed();
+        }
+    }
     pub fn remove_space(&mut self, id: u64) {
         let links: Vec<_> = self
             .devices
@@ -233,6 +330,9 @@ impl Topology {
             .ok_or(NetError(19))
     }
     fn name_available(&self, id: u64, name: &[u8], except: Option<u32>) -> Result<()> {
+        if name == b"eth0" && except != Some(2) && self.spaces.get(&id).is_some_and(|s| s.direct) {
+            return Err(NetError(17));
+        }
         if name.is_empty()
             || name.len() > 15
             || name == b"."
@@ -459,7 +559,7 @@ impl Topology {
             && self
                 .devices(id)
                 .iter()
-                .filter(|d| d.kind != DeviceKind::Loopback)
+                .filter(|d| !matches!(d.kind, DeviceKind::Loopback | DeviceKind::Direct))
                 .map(|d| d.addresses.len())
                 .sum::<usize>()
                 >= MAX_ADDRESSES
@@ -573,16 +673,45 @@ impl Topology {
         }
         Err(NetError(101))
     }
-    /// L2 reachability over configured veth pairs and bridge membership. No
-    /// cross-bridge routing or external forwarding is implicitly granted.
-    pub fn target(&self, id: u64, destination: IpAddr) -> Option<(u64, u32, u32)> {
-        let (_, out, gateway) = self.source(id, destination).ok()?;
-        if self.own(id, destination) {
-            return Some((id, out, out));
+    /// Resolve actual L2 adjacency at each L3 hop. Routes never create an
+    /// implicit fabric connection. Native interfaces are deliberately excluded
+    /// from forwarding until explicit filtering/NAT is implemented.
+    pub fn target(&self, id: u64, destination: IpAddr) -> Option<PacketPath> {
+        let (_, first, _) = self.source(id, destination).ok()?;
+        let mut current = id;
+        let mut hops = 0;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) || hops >= 16 {
+                return None;
+            }
+            let (_, out, gateway) = self.source(current, destination).ok()?;
+            if self.own(current, destination) {
+                return Some(PacketPath {
+                    namespace: current,
+                    output: first,
+                    input: out,
+                    hops,
+                });
+            }
+            let next = gateway.unwrap_or(destination);
+            let (ns, input) = self.neighbor(current, out, next)?;
+            if next == destination || self.own(ns, destination) {
+                return Some(PacketPath {
+                    namespace: ns,
+                    output: first,
+                    input,
+                    hops,
+                });
+            }
+            if !self.forwarding(ns, destination.is_ipv6()) {
+                return None;
+            }
+            current = ns;
+            hops += 1;
         }
-        if gateway.is_some_and(|g| g != destination) {
-            return None;
-        }
+    }
+    fn neighbor(&self, id: u64, out: u32, address: IpAddr) -> Option<(u64, u32)> {
         let mut todo = vec![(id, out)];
         let mut visited = BTreeSet::new();
         while let Some(key) = todo.pop() {
@@ -593,23 +722,21 @@ impl Topology {
             if !d.up {
                 continue;
             }
-            if d.namespace != id && d.addresses.iter().any(|a| a.ip == destination) {
-                return Some((d.namespace, out, d.index));
+            if d.namespace != id && d.addresses.iter().any(|a| a.ip == address) {
+                return Some((d.namespace, d.index));
             }
             match d.kind {
                 DeviceKind::Veth { peer } => {
-                    if let Some((&key, _)) = self.devices.iter().find(|(_, d)| d.index == peer) {
-                        todo.push(key);
+                    if let Some(p) = self.peer_device(peer) {
+                        todo.push((p.namespace, p.index));
                     }
                     if let Some(master) = d.master {
                         todo.push((d.namespace, master));
                     }
                 }
-                DeviceKind::Bridge => {
-                    todo.extend(self.devices.iter().filter_map(|(&key, v)| {
-                        (v.namespace == d.namespace && v.master == Some(d.index)).then_some(key)
-                    }));
-                }
+                DeviceKind::Bridge => todo.extend(self.devices.iter().filter_map(|(&key, v)| {
+                    (v.namespace == d.namespace && v.master == Some(d.index)).then_some(key)
+                })),
                 _ => {}
             }
         }
@@ -647,20 +774,34 @@ impl Topology {
 }
 impl View {
     pub fn own(&self, ip: IpAddr) -> bool {
+        if self.native_root {
+            return self.addresses(false).iter().any(|a| a.ip == ip);
+        }
         self.graph.borrow().own(self.namespace, ip)
     }
     pub fn source(&self, ip: IpAddr) -> Result<IpAddr> {
-        self.graph
-            .borrow()
-            .source(self.namespace, ip)
-            .map(|(ip, _, _)| ip)
+        let graph = self.graph.borrow();
+        let (source, index, _) = graph.source(self.namespace, ip)?;
+        if self.native_root
+            && matches!(
+                graph.device(self.namespace, index)?.kind,
+                DeviceKind::Direct | DeviceKind::Loopback
+            )
+        {
+            return Err(NetError(101));
+        }
+        Ok(source)
     }
     pub fn addresses(&self, up_only: bool) -> Vec<Address> {
         self.graph
             .borrow()
             .devices(self.namespace)
             .into_iter()
-            .filter(|d| !up_only || d.up)
+            .filter(|d| {
+                (!up_only || d.up)
+                    && (!self.native_root
+                        || !matches!(d.kind, DeviceKind::Loopback | DeviceKind::Direct))
+            })
             .flat_map(|d| d.addresses)
             .collect()
     }

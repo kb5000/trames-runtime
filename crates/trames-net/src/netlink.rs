@@ -6,12 +6,13 @@ use std::rc::Weak;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, VecDeque},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
     id: u64,
+    pub(crate) native: std::cell::OnceCell<native::Network>,
+    pub(crate) socket_count: Cell<usize>,
     // Netlink sockets also pin the complete stack, not just link metadata.
     pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
     pub(crate) graph: Rc<RefCell<crate::netdev::Topology>>,
@@ -32,6 +33,8 @@ impl Default for Namespace {
         graph.borrow_mut().add_space(id, None, None);
         Self {
             id,
+            native: std::cell::OnceCell::new(),
+            socket_count: Cell::new(0),
             stack: std::cell::OnceCell::new(),
             graph,
             fabric: Rc::default(),
@@ -68,6 +71,39 @@ impl Namespace {
         namespace.ping_range.set([1, 0]);
         Ok(namespace)
     }
+    pub fn refresh_native(&self) {
+        if let Some(n) = self.native.get() {
+            self.graph.borrow_mut().refresh_direct(
+                self.id(),
+                matches!(n.mode(), NetworkMode::Full | NetworkMode::Outbound),
+                n.info(),
+            );
+        }
+    }
+    pub fn root_stack(&self) -> Result<virtualnet::Network> {
+        if let Some(stack) = self.stack.get() {
+            return Ok(stack.clone());
+        }
+        let n = self.native.get().ok_or(NetError(95))?;
+        let fabric = {
+            let mut shared = self.fabric.borrow_mut();
+            if shared.is_none() {
+                *shared = Some(Fabric::new()?);
+            }
+            shared.as_ref().unwrap().clone()
+        };
+        let view = crate::netdev::View {
+            graph: self.graph.clone(),
+            namespace: self.id(),
+            native_root: true,
+        };
+        let stack = fabric.dynamic_environment(n.mode(), view, Rc::new(Cell::new(true)))?;
+        self.stack
+            .set(stack.clone())
+            .ok()
+            .expect("root stack initialized by coordinator");
+        Ok(stack)
+    }
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -83,9 +119,6 @@ impl Namespace {
             None if up => Ok(()),
             None => Err(NetError(95)),
         }
-    }
-    pub fn live(&self) -> usize {
-        self.live.get()
     }
 }
 impl Drop for Namespace {
@@ -111,7 +144,6 @@ impl Drop for Namespace {
 }
 pub(super) struct Socket {
     namespace: Rc<Namespace>,
-    info: Option<NetworkInfo>,
     kind: u32,
     port: Cell<u32>,
     connected: Cell<bool>,
@@ -182,7 +214,7 @@ fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u3
 impl Socket {
     pub fn new(
         namespace: Rc<Namespace>,
-        info: Option<NetworkInfo>,
+        _info: Option<NetworkInfo>,
         kind: u32,
         protocol: u32,
     ) -> Result<Rc<Self>> {
@@ -195,7 +227,6 @@ impl Socket {
         namespace.live.set(namespace.live.get() + 1);
         let s = Rc::new(Self {
             namespace: namespace.clone(),
-            info,
             kind,
             port: Cell::new(0),
             connected: Cell::new(false),
@@ -326,6 +357,18 @@ impl Socket {
         if requests.is_empty() {
             return Err(NetError(22));
         }
+        self.namespace.refresh_native();
+        if net_admin
+            && self.namespace.native.get().is_some()
+            && requests.iter().any(|r| {
+                matches!(
+                    u16::from_le_bytes(r[4..6].try_into().unwrap()),
+                    16 | 17 | 19 | 20 | 21 | 24 | 25
+                )
+            })
+        {
+            self.namespace.root_stack()?;
+        }
         self.autobind()?;
         let mut replies = Vec::new();
         for request in requests {
@@ -341,35 +384,15 @@ impl Socket {
             {
                 return Err(NetError(105));
             }
-            let generated = if self.namespace.loopback.is_some()
-                || self
-                    .namespace
-                    .graph
-                    .borrow()
-                    .devices(self.namespace.id())
-                    .iter()
-                    .any(|d| {
-                        matches!(
-                            d.kind,
-                            crate::DeviceKind::Veth { .. } | crate::DeviceKind::Bridge
-                        )
-                    })
-                || matches!(
-                    u16::from_le_bytes(request[4..6].try_into().unwrap()),
-                    16 | 17 | 19 | 20 | 21 | 24 | 25
-                ) {
-                let r = crate::rtnetlink::request(
-                    &self.namespace,
-                    request,
-                    self.port.get(),
-                    net_admin,
-                    resolve,
-                )?;
-                notify(&self.namespace.listeners, r.changes);
-                r.messages
-            } else {
-                self.request(request, net_admin)?
-            };
+            let r = crate::rtnetlink::request(
+                &self.namespace,
+                request,
+                self.port.get(),
+                net_admin,
+                resolve,
+            )?;
+            notify(&self.namespace.listeners, r.changes);
+            let generated = r.messages;
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
             }
@@ -388,273 +411,6 @@ impl Socket {
         }
         queued.extend(replies);
         Ok(bytes.len())
-    }
-    fn request(&self, request: &[u8], net_admin: bool) -> Result<Vec<Vec<u8>>> {
-        let kind = u16::from_le_bytes(request[4..6].try_into().unwrap());
-        let flags = u16::from_le_bytes(request[6..8].try_into().unwrap());
-        let sequence = u32::from_le_bytes(request[8..12].try_into().unwrap());
-        let dump = flags & 0x300 == 0x300;
-        let multipart = if dump { 2 } else { 0 };
-        let family = request.get(16).copied().unwrap_or(0);
-        let mut out = Vec::new();
-        let interfaces = [1u32, 2]
-            .into_iter()
-            .filter(|i| *i == 1 || self.info.is_some());
-        match kind {
-            16 | 17 | 20 | 21 | 24 | 25 => {
-                // The direct root network has an always-up loopback. Accept
-                // only the exact idempotent LinkSetUp request; never pretend
-                // that down, rename, MTU, address or route changes took effect.
-                let loopback_change = kind == 16
-                    && request.len() == 32
-                    && flags & !5 == 0
-                    && request[16..20] == [0; 4]
-                    && request[20..24] == 1u32.to_le_bytes()
-                    && matches!(
-                        u32::from_le_bytes(request[24..28].try_into().unwrap()),
-                        0 | 1
-                    )
-                    && request[28..32] == 1u32.to_le_bytes();
-                let up = request.get(24..28) == Some(1u32.to_le_bytes().as_slice());
-                let errno: i32 = if !net_admin {
-                    -1
-                } else if loopback_change && (self.namespace.loopback.is_some() || up) {
-                    if let Some(lo) = &self.namespace.loopback {
-                        lo.set(up);
-                    }
-                    0
-                } else {
-                    -95
-                };
-                if errno != 0 || flags & 4 != 0 {
-                    let mut data = errno.to_le_bytes().to_vec();
-                    data.extend_from_slice(&request[..16]);
-                    out.push(message(2, 0, sequence, self.port.get(), &data));
-                }
-                return Ok(out);
-            }
-            18 if request.len() >= 17 => {
-                let mut name = None;
-                let mut at = 32;
-                while at < request.len() {
-                    if request.len() - at < 4 {
-                        return Err(NetError(22));
-                    }
-                    let len = u16::from_le_bytes(request[at..at + 2].try_into().unwrap()) as usize;
-                    let kind =
-                        u16::from_le_bytes(request[at + 2..at + 4].try_into().unwrap()) & 0x3fff;
-                    if len < 4 || len > request.len() - at {
-                        return Err(NetError(22));
-                    }
-                    if kind == 3 {
-                        let value = &request[at + 4..at + len];
-                        let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
-                        name = Some(&value[..end]);
-                    }
-                    at += (len + 3) & !3;
-                }
-                let index = if request.len() >= 24 {
-                    u32::from_le_bytes(request[20..24].try_into().unwrap())
-                } else {
-                    0
-                };
-                for i in interfaces.filter(|i| {
-                    dump || (index == 0 || *i == index)
-                        && name.is_none_or(|name| {
-                            name == if *i == 1 { b"lo".as_slice() } else { b"eth0" }
-                        })
-                }) {
-                    let lo = i == 1;
-                    let mut data = vec![0; 16];
-                    data[2..4].copy_from_slice(&(if lo { 772u16 } else { 65534 }).to_le_bytes());
-                    data[4..8].copy_from_slice(&i.to_le_bytes());
-                    data[8..12].copy_from_slice(
-                        &(if lo {
-                            if self.namespace.loopback_up() {
-                                0x49u32
-                            } else {
-                                8
-                            }
-                        } else {
-                            0xc1
-                        })
-                        .to_le_bytes(),
-                    );
-                    data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-                    attr(&mut data, 3, if lo { b"lo\0" } else { b"eth0\0" });
-                    attr(
-                        &mut data,
-                        4,
-                        &self.info.map_or(65536, |n| n.mtu).to_le_bytes(),
-                    );
-                    attr(&mut data, 1, &[0; 6]);
-                    attr(&mut data, 2, &[0; 6]);
-                    attr(
-                        &mut data,
-                        16,
-                        &[if lo {
-                            if self.namespace.loopback_up() {
-                                0
-                            } else {
-                                2
-                            }
-                        } else {
-                            6
-                        }],
-                    );
-                    attr(
-                        &mut data,
-                        33,
-                        &[u8::from(!lo || self.namespace.loopback_up())],
-                    );
-                    attr(&mut data, 13, &0u32.to_le_bytes());
-                    out.push(message(16, multipart, sequence, self.port.get(), &data));
-                }
-            }
-            22 if request.len() >= 17 => {
-                for i in interfaces {
-                    if i == 1 && !self.namespace.loopback_up() {
-                        continue;
-                    }
-                    for af in [2u8, 10] {
-                        if family != 0 && family != af {
-                            continue;
-                        }
-                        let lo = i == 1;
-                        let address = match (af, lo) {
-                            (2, true) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                            (10, true) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-                            (2, false) => IpAddr::V4(self.info.unwrap().ipv4),
-                            _ => IpAddr::V6(self.info.unwrap().ipv6),
-                        };
-                        if address.is_unspecified() {
-                            continue;
-                        }
-                        let mut data = vec![
-                            af,
-                            if lo {
-                                if af == 2 {
-                                    8
-                                } else {
-                                    128
-                                }
-                            } else if af == 2 {
-                                self.info.unwrap().prefix4
-                            } else {
-                                self.info.unwrap().prefix6
-                            },
-                            0x80,
-                            if lo { 254 } else { 0 },
-                        ];
-                        data.extend_from_slice(&i.to_le_bytes());
-                        let bytes = match address {
-                            IpAddr::V4(a) => a.octets().to_vec(),
-                            IpAddr::V6(a) => a.octets().to_vec(),
-                        };
-                        attr(&mut data, 1, &bytes);
-                        attr(&mut data, 2, &bytes);
-                        attr(&mut data, 3, if lo { b"lo\0" } else { b"eth0\0" });
-                        attr(&mut data, 8, &0x80u32.to_le_bytes());
-                        out.push(message(20, multipart, sequence, self.port.get(), &data));
-                    }
-                }
-            }
-            26 if request.len() >= 17 && dump => {
-                for af in [2u8, 10] {
-                    if family != 0 && family != af {
-                        continue;
-                    }
-                    if let Some(n) = self.info {
-                        if (af == 2 && n.ipv4.is_unspecified())
-                            || (af == 10 && n.ipv6.is_unspecified())
-                        {
-                            continue;
-                        }
-                        let mut data = vec![af, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
-                        attr(&mut data, 4, &2u32.to_le_bytes());
-                        if n.id != 0 {
-                            attr(
-                                &mut data,
-                                5,
-                                &if af == 2 {
-                                    n.gateway4.octets().to_vec()
-                                } else {
-                                    n.gateway6.octets().to_vec()
-                                },
-                            );
-                        }
-                        out.push(message(24, 2, sequence, self.port.get(), &data));
-                        let mut data = vec![
-                            af,
-                            if af == 2 { n.prefix4 } else { n.prefix6 },
-                            0,
-                            0,
-                            254,
-                            2,
-                            253,
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ];
-                        attr(&mut data, 4, &2u32.to_le_bytes());
-                        attr(
-                            &mut data,
-                            1,
-                            &if af == 2 {
-                                (u32::from(n.ipv4)
-                                    & (u32::MAX.checked_shl(32 - n.prefix4 as u32).unwrap_or(0)))
-                                .to_be_bytes()
-                                .to_vec()
-                            } else {
-                                (u128::from(n.ipv6)
-                                    & (u128::MAX.checked_shl(128 - n.prefix6 as u32).unwrap_or(0)))
-                                .to_be_bytes()
-                                .to_vec()
-                            },
-                        );
-                        attr(
-                            &mut data,
-                            7,
-                            &if af == 2 {
-                                n.ipv4.octets().to_vec()
-                            } else {
-                                n.ipv6.octets().to_vec()
-                            },
-                        );
-                        out.push(message(24, 2, sequence, self.port.get(), &data));
-                    }
-                }
-            }
-            _ => {
-                let errno = if matches!(kind, 16 | 17 | 19 | 20 | 21 | 24 | 25 | 27) {
-                    -95i32
-                } else {
-                    -22
-                };
-                let mut data = errno.to_le_bytes().to_vec();
-                data.extend_from_slice(&request[..request.len().min(256)]);
-                out.push(message(2, 0, sequence, self.port.get(), &data));
-                return Ok(out);
-            }
-        }
-        if dump {
-            out.push(message(
-                3,
-                2,
-                sequence,
-                self.port.get(),
-                &0i32.to_le_bytes(),
-            ));
-        } else if out.is_empty() || flags & 4 != 0 {
-            let mut data = (if out.is_empty() { -19i32 } else { 0 })
-                .to_le_bytes()
-                .to_vec();
-            data.extend_from_slice(&request[..16]);
-            out.push(message(2, 0, sequence, self.port.get(), &data));
-        }
-        Ok(out)
     }
     pub fn address_size(&self) -> usize {
         12

@@ -5,12 +5,17 @@ use std::net::SocketAddr;
 enum Sysctl {
     PingRange,
     UnprivilegedPort,
+    Forwarding(bool),
 }
 impl Sysctl {
     fn path(path: &[u8]) -> Option<Self> {
         match path {
             b"/proc/sys/net/ipv4/ping_group_range" => Some(Self::PingRange),
             b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(Self::UnprivilegedPort),
+            b"/proc/sys/net/ipv4/ip_forward" | b"/proc/sys/net/ipv4/conf/all/forwarding" => {
+                Some(Self::Forwarding(false))
+            }
+            b"/proc/sys/net/ipv6/conf/all/forwarding" => Some(Self::Forwarding(true)),
             _ => None,
         }
     }
@@ -29,6 +34,7 @@ impl Control {
                 format!("{a}\t{b}\n")
             }
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
+            Sysctl::Forwarding(ipv6) => format!("{}\n", u8::from(n.forwarding(ipv6))),
         }
         .into_bytes();
         let start = usize::try_from(offset)
@@ -58,6 +64,9 @@ impl Control {
             }
             (Sysctl::UnprivilegedPort, [port]) if *port <= u16::MAX as u32 => {
                 n.set_unprivileged_port(*port as u16)
+            }
+            (Sysctl::Forwarding(ipv6), [enabled]) if *enabled <= 1 => {
+                n.set_forwarding(ipv6, *enabled != 0)
             }
             _ => return Err(Errno(22)),
         }
@@ -257,6 +266,43 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarding_controls_pin_namespace_recheck_authority_and_validate_values() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    credentials: Credentials::default(),
+                    namespaces: v.namespace_snapshot(),
+                    ..ProcessInfo::default()
+                }],
+                ..RuntimeInfo::default()
+            },
+        );
+        let f = v
+            .open_at(AT_FDCWD, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
+            .unwrap();
+        assert_eq!(v.read(f, 100).unwrap(), b"0\n");
+        v.seek(f, 0, 0).unwrap();
+        assert_eq!(v.write(f, b"2"), Err(Errno(22)));
+        v.unshare_net().unwrap();
+        assert!(!v.network.forwarding(false));
+        v.write(f, b"1").unwrap();
+        assert!(!v.network.forwarding(false));
+        let alias = v
+            .open_at(AT_FDCWD, b"/proc/sys/net/ipv6/conf/all/forwarding", 2, 0)
+            .unwrap();
+        v.write(alias, b"1").unwrap();
+        assert!(v.network.forwarding(true));
+        assert!(!v.network.forwarding(false));
+        v.credentials = Credentials::user(1000, 1000);
+        v.seek(f, 0, 0).unwrap();
+        assert_eq!(v.write(f, b"0"), Err(Errno(13)));
+    }
     #[test]
     fn fork_dup_cloexec_and_quota_follow_socket_lifetime() {
         let mut parent = Vfs::default();

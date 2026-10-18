@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 fn addr(ip: &str, port: u16) -> SocketAddr {
     SocketAddr::new(ip.parse().unwrap(), port)
 }
-fn assign(n: &Network, index: u32, ip: &str, prefix: u8) {
+pub(super) fn assign(n: &Network, index: u32, ip: &str, prefix: u8) {
     n.1.graph
         .borrow_mut()
         .address(
@@ -21,7 +21,7 @@ fn assign(n: &Network, index: u32, ip: &str, prefix: u8) {
         .unwrap();
     n.set_device_up(index, true).unwrap();
 }
-fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32 {
+pub(super) fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32 {
     let (a, b) = root
         .1
         .graph
@@ -44,7 +44,7 @@ fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32 {
     n.set_device_up(b, true).unwrap();
     b
 }
-fn bridge(root: &Network, name: &[u8]) -> u32 {
+pub(super) fn bridge(root: &Network, name: &[u8]) -> u32 {
     let i = root
         .1
         .graph
