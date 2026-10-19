@@ -26,6 +26,21 @@ pub fn install_vulkan_icd(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool,
     let manifest = replace(vfs, MANIFEST, JSON)?;
     Ok(library || manifest)
 }
+/// The optional app-owned Mesa EGL platform adapter uses the standard SONAME
+/// in musl's /usr/local/lib search path. Original apk-owned Mesa/Gallium files
+/// stay under /usr/lib, so installing/upgrading signed packages cannot overwrite
+/// the adapter and existing rootfs data needs no migration.
+pub fn install_zink_egl(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
+    let mut bytes = Vec::new();
+    reader.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > LIMIT
+        || bytes.get(..6) != Some(b"\x7fELF\x02\x01")
+        || bytes.get(18..20) != Some(&183u16.to_le_bytes())
+    {
+        return Err(Error::Invalid("invalid bundled AArch64 Mesa EGL adapter"));
+    }
+    replace(vfs, b"/usr/local/lib/libEGL.so.1", &bytes)
+}
 fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
     if let Ok(fd) = vfs.open_at(AT_FDCWD, path, 0, 0) {
         let current = vfs.read(fd, bytes.len() + 1);
@@ -134,5 +149,23 @@ mod tests {
         assert_eq!(read(&mut vfs, LIBRARY), bytes);
         assert!(install_vulkan_icd(&mut b"bad".as_slice(), &mut vfs).is_err());
         assert_eq!(read(&mut vfs, LIBRARY), bytes);
+    }
+    #[test]
+    fn egl_adapter_install_is_atomic_and_keeps_apk_owned_mesa() {
+        let mut vfs = Vfs::default();
+        let apk = b"original signed Mesa package";
+        vfs.import_file(b"/usr/lib/libEGL.so.1", apk.to_vec())
+            .unwrap();
+        let mut bytes = library();
+        let path = b"/usr/local/lib/libEGL.so.1";
+        assert!(install_zink_egl(&mut bytes.as_slice(), &mut vfs).unwrap());
+        let first = vfs.stat_at(AT_FDCWD, path).unwrap();
+        assert!(!install_zink_egl(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert_eq!(&first[8..16], &vfs.stat_at(AT_FDCWD, path).unwrap()[8..16]);
+        bytes.push(1);
+        assert!(install_zink_egl(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert!(install_zink_egl(&mut b"invalid".as_slice(), &mut vfs).is_err());
+        assert_eq!(read(&mut vfs, path), bytes);
+        assert_eq!(read(&mut vfs, b"/usr/lib/libEGL.so.1"), apk);
     }
 }
