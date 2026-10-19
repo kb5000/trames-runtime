@@ -4,6 +4,7 @@ mod bpf;
 pub mod capabilities;
 mod cgroup;
 mod credentials;
+mod directory;
 mod events;
 mod executable;
 pub use executable::ExecutableFile;
@@ -234,6 +235,9 @@ enum Content {
 }
 struct Node {
     notifications: inotify::Marks,
+    // A validated name hint, not an authorization or lifetime cache. It follows
+    // the inode and is not serialized; rename/unlink/bind-root changes miss.
+    path_hint: RefCell<Option<Vec<u8>>>,
     device: u64,
     content: Content,
     mode: u32,
@@ -245,6 +249,26 @@ struct Node {
     times: [storage::Timestamp; 3],
     seals: Option<u32>,
     xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+impl Node {
+    fn path_in(
+        &self,
+        paths: &BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
+        root: &[u8],
+    ) -> Option<Vec<u8>> {
+        let matches = |node: &Rc<RefCell<Node>>| std::ptr::eq(&*node.borrow(), self);
+        if let Some(path) = self.path_hint.borrow().as_ref() {
+            if mounts::below(path, root) && paths.get(path).is_some_and(matches) {
+                return Some(path.clone());
+            }
+        }
+        let path = paths
+            .iter()
+            .find(|(path, node)| mounts::below(path, root) && matches(node))
+            .map(|(path, _)| path.clone());
+        *self.path_hint.borrow_mut() = path.clone();
+        path
+    }
 }
 type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
@@ -586,6 +610,7 @@ impl Vfs {
         }
         let node = Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
+            path_hint: RefCell::default(),
             device: path
                 .mount
                 .as_ref()
@@ -677,12 +702,8 @@ impl Vfs {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
             return Ok(path);
         }
-        self.fs
-            .borrow()
-            .paths
-            .iter()
-            .find(|(_, n)| Rc::ptr_eq(n, node))
-            .map(|(p, _)| p.clone())
+        node.borrow()
+            .path_in(&self.fs.borrow().paths, b"/")
             .ok_or(Errno(2))
     }
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
@@ -1633,6 +1654,7 @@ impl Vfs {
         let inode = p.borrow().inode;
         p.borrow_mut().metadata = Some(Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
+            path_hint: RefCell::default(),
             device: 6,
             content: Content::Null,
             mode: 0o10600,
@@ -2247,40 +2269,25 @@ impl Vfs {
         if links != 0 && matches!(node.content, Content::Directory) {
             // Persistent links count path owners; stat counts . and children's .. too.
             let fs = mount.map_or(&self.fs, |m| &m.fs).borrow();
-            let path = fs
-                .paths
-                .iter()
-                .find(|(_, n)| {
-                    let n = n.borrow();
-                    n.device == node.device && n.inode == node.inode
-                })
-                .map(|(p, _)| p.clone())
-                .or_else(|| {
-                    self.pseudo
-                        .borrow()
-                        .nodes
-                        .iter()
-                        .find(|(_, n)| {
-                            let n = n.borrow();
-                            n.device == node.device && n.inode == node.inode
-                        })
-                        .map(|((_, p), _)| p.clone())
-                });
+            let path = node.path_in(&fs.paths, b"/").or_else(|| {
+                self.pseudo
+                    .borrow()
+                    .nodes
+                    .iter()
+                    .find(|(_, n)| {
+                        let n = n.borrow();
+                        n.device == node.device && n.inode == node.inode
+                    })
+                    .map(|((_, p), _)| p.clone())
+            });
             if let Some(path) = path {
                 let mut prefix = path.clone();
                 if prefix != b"/" {
                     prefix.push(b'/');
                 }
                 let mut directories = std::collections::BTreeSet::new();
-                for (p, n) in fs.paths.range(prefix.clone()..) {
-                    if !p.starts_with(&prefix) {
-                        break;
-                    }
-                    let name = &p[prefix.len()..];
-                    if !name.is_empty()
-                        && !name.contains(&b'/')
-                        && matches!(n.borrow().content, Content::Directory)
-                    {
+                for (name, n) in directory::children(&fs.paths, &path) {
+                    if matches!(n.borrow().content, Content::Directory) {
                         directories.insert(name.to_vec());
                     }
                 }
@@ -2375,6 +2382,7 @@ impl Vfs {
         self.stat_node(
             &Node {
                 notifications: inotify::Marks::default(),
+                path_hint: RefCell::default(),
                 device: if o.namespace.is_some() {
                     17
                 } else if o.anonymous.is_some() {
@@ -2464,14 +2472,7 @@ impl Vfs {
         if prefix != b"/" {
             prefix.push(b'/');
         }
-        for (path, node) in fs.paths.range(prefix.key.clone()..) {
-            if !path.starts_with(&prefix) {
-                break;
-            }
-            let name = &path[prefix.len()..];
-            if name.is_empty() || name.contains(&b'/') {
-                continue;
-            }
+        for (name, node) in directory::children(&fs.paths, &p.key) {
             let n = node.borrow();
             children.insert(name.to_vec(), (n.inode, ((n.mode & 0o170000) >> 12) as u8));
         }
@@ -2514,6 +2515,58 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reverse_path_hint_validates_rename_unlink_and_replacement_inode() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/tree", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/tree/dir", 0o755).unwrap();
+        v.chdir(b"/tree/dir").unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/tree/dir");
+        v.rename_at(AT_FDCWD, b"/tree", AT_FDCWD, b"/moved", 0)
+            .unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/moved/dir");
+        v.import_file(b"/moved/file", b"old".to_vec()).unwrap();
+        v.link_at(AT_FDCWD, b"/moved/file", AT_FDCWD, b"/alias")
+            .unwrap();
+        let node = v
+            .node(&v.resolve(AT_FDCWD, b"/moved/file").unwrap())
+            .unwrap();
+        assert!(node
+            .borrow()
+            .path_in(&v.fs.borrow().paths, b"/moved")
+            .is_some());
+        v.unlink_at(AT_FDCWD, b"/moved/file", false).unwrap();
+        v.import_file(b"/moved/file", b"replacement".to_vec())
+            .unwrap();
+        assert_eq!(
+            node.borrow().path_in(&v.fs.borrow().paths, b"/"),
+            Some(b"/alias".to_vec())
+        );
+        v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+        assert_eq!(node.borrow().path_in(&v.fs.borrow().paths, b"/"), None);
+    }
+    #[test]
+    fn reverse_path_hint_cannot_escape_a_bind_root_through_a_hardlink() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/inside", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/view", 0o755).unwrap();
+        v.import_file(b"/outside", b"same inode".to_vec()).unwrap();
+        v.link_at(AT_FDCWD, b"/outside", AT_FDCWD, b"/inside/file")
+            .unwrap();
+        let node = v.node(&v.resolve(AT_FDCWD, b"/outside").unwrap()).unwrap();
+        // Prime a valid path from outside the later bind mount root.
+        assert_eq!(
+            node.borrow().path_in(&v.fs.borrow().paths, b"/outside"),
+            Some(b"/outside".to_vec())
+        );
+        v.mount(Some(b"/inside"), b"/view", None, 4096, None)
+            .unwrap();
+        let mount = v.resolve(AT_FDCWD, b"/view").unwrap().mount.unwrap();
+        assert_eq!(mount.key_of(&node), Some(b"/inside/file".to_vec()));
+        v.unlink_at(AT_FDCWD, b"/inside/file", false).unwrap();
+        assert_eq!(mount.key_of(&node), None);
+        assert!(v.stat_at(AT_FDCWD, b"/outside").is_ok());
+    }
     #[test]
     fn paths_cannot_escape_root_or_traverse_regular_files() {
         let mut v = Vfs::default();

@@ -87,12 +87,7 @@ impl Mount {
             return Some(self.root_path());
         }
         let root = self.root_path();
-        self.fs
-            .borrow()
-            .paths
-            .iter()
-            .find(|(p, n)| below(p, &root) && Rc::ptr_eq(n, node))
-            .map(|(p, _)| p.clone())
+        node.borrow().path_in(&self.fs.borrow().paths, &root)
     }
     fn root_path(&self) -> Vec<u8> {
         let fs = self.fs.borrow();
@@ -103,10 +98,10 @@ impl Mount {
         {
             return self.root_key.clone();
         }
-        fs.paths
-            .iter()
-            .find(|(_, n)| Rc::ptr_eq(n, &self.root))
-            .map_or_else(|| self.root_key.clone(), |(p, _)| p.clone())
+        self.root
+            .borrow()
+            .path_in(&fs.paths, b"/")
+            .unwrap_or_else(|| self.root_key.clone())
     }
 }
 pub(super) struct Table {
@@ -653,6 +648,7 @@ impl Vfs {
             }
             let root = Rc::new(RefCell::new(Node {
                 notifications: inotify::Marks::default(),
+                path_hint: RefCell::default(),
                 device: 17,
                 inode: handle.id(),
                 content: Content::Null,
@@ -755,6 +751,7 @@ impl Vfs {
                     let inode = id << 32;
                     let root = Rc::new(RefCell::new(Node {
                         notifications: inotify::Marks::default(),
+                        path_hint: RefCell::default(),
                         device: id,
                         content: Content::Directory,
                         mode: 0o40000 | mode,
@@ -1087,7 +1084,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         parent: RefCell::new(None),
     }))
 }
-fn below(path: &[u8], root: &[u8]) -> bool {
+pub(super) fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
 }
 fn tmpfs_options(data: &[u8]) -> Result<(u64, usize, u32)> {

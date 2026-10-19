@@ -78,6 +78,7 @@ impl Vfs {
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
+            path_hint: RefCell::default(),
             device: 16,
             content: Content::File(storage::FileData::Shared(
                 trames_shared::SharedFile::anonymous_in(fs.shared_budget.clone())

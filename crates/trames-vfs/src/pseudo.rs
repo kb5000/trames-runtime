@@ -500,6 +500,7 @@ impl PseudoFs {
         self.next_inode = self.next_inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
+            path_hint: RefCell::default(),
             content,
             mode,
             uid: 0,

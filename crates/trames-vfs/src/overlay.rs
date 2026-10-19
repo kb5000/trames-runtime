@@ -319,6 +319,7 @@ impl Overlay {
                 backing.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
                 let n = Rc::new(RefCell::new(Node {
                     notifications: inotify::Marks::default(),
+                    path_hint: RefCell::default(),
                     device: upper.fs_device(),
                     content: pseudo::Device::node(0, false),
                     mode: 0o20000,
@@ -640,6 +641,7 @@ impl Vfs {
                 };
                 let copy = Rc::new(RefCell::new(Node {
                     notifications: inotify::Marks::default(),
+                    path_hint: RefCell::default(),
                     device: n.device,
                     content,
                     mode: n.mode,

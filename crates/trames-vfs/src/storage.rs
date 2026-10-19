@@ -682,6 +682,7 @@ fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             ino,
             Rc::new(RefCell::new(Node {
                 notifications: inotify::Marks::default(),
+                path_hint: RefCell::default(),
                 device: 0xfd01,
                 content,
                 mode,
@@ -883,6 +884,7 @@ impl Vfs {
         let links = old.borrow().links;
         let new = Rc::new(RefCell::new(Node {
             notifications: inotify::Marks::default(),
+            path_hint: RefCell::default(),
             device: 0xfd01,
             content: Content::File(data),
             mode: 0o100755,
