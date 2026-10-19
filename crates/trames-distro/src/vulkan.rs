@@ -9,7 +9,7 @@ static NEXT_STAGING: AtomicU64 = AtomicU64::new(1);
 const LIMIT: usize = 4 * 1024 * 1024;
 const LIBRARY: &[u8] = b"/usr/lib/libtrames_vulkan_icd.so";
 const MANIFEST: &[u8] = b"/usr/share/vulkan/icd.d/trames.json";
-const JSON: &[u8] = br#"{"file_format_version":"1.0.0","ICD":{"api_version":"1.0.0","library_path":"/usr/lib/libtrames_vulkan_icd.so"}}"#;
+const JSON: &[u8] = br#"{"file_format_version":"1.0.0","ICD":{"api_version":"1.1.0","library_path":"/usr/lib/libtrames_vulkan_icd.so"}}"#;
 
 /// Validate before changing the namespace, keep identical inodes, and replace
 /// updated files with a synced sibling + atomic rename before guest startup.
@@ -78,6 +78,28 @@ mod tests {
         let mut bytes = Vec::new();
         vfs.export_writer(path, &mut bytes).unwrap();
         bytes
+    }
+    #[test]
+    fn refreshes_old_instance_manifest_without_replacing_identical_library() {
+        let mut vfs = Vfs::default();
+        let bytes = library();
+        vfs.import_file(LIBRARY, bytes.clone()).unwrap();
+        vfs.import_file(
+            MANIFEST,
+            String::from_utf8(JSON.to_vec())
+                .unwrap()
+                .replace("1.1.0", "1.0.0")
+                .into_bytes(),
+        )
+        .unwrap();
+        let inode = vfs.stat_at(AT_FDCWD, LIBRARY).unwrap();
+        assert!(install_vulkan_icd(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert_eq!(read(&mut vfs, MANIFEST), JSON);
+        assert_eq!(
+            &inode[8..16],
+            &vfs.stat_at(AT_FDCWD, LIBRARY).unwrap()[8..16]
+        );
+        assert!(!install_vulkan_icd(&mut bytes.as_slice(), &mut vfs).unwrap());
     }
     #[test]
     fn repeated_install_keeps_inodes_updates_bundles_and_preserves_user_files() {
