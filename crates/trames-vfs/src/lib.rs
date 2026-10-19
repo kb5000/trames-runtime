@@ -223,6 +223,42 @@ struct Descriptor {
     open: Rc<RefCell<OpenDescription>>,
     cloexec: bool,
 }
+/// Each task retains its own descriptor references (including fork/exit/EOF
+/// semantics). CLONE_FILES synchronization need only copy a changed table.
+/// The identity follows clones, and every mutable map access invalidates it.
+/// Open-description state is already shared separately through Rc<RefCell<_>>.
+#[derive(Clone, Default)]
+struct DescriptorTable {
+    entries: BTreeMap<u32, Descriptor>,
+    identity: Rc<()>,
+}
+impl DescriptorTable {
+    // Keep two-phase receiver borrowing for expressions such as
+    // `self.fds.insert(fd, Descriptor { id: self.open_id(), .. })`.
+    fn insert(&mut self, fd: u32, descriptor: Descriptor) -> Option<Descriptor> {
+        std::ops::DerefMut::deref_mut(self).insert(fd, descriptor)
+    }
+    fn synchronize(&mut self, other: &Self) {
+        if !Rc::ptr_eq(&self.identity, &other.identity) {
+            self.entries.clone_from(&other.entries);
+            self.identity.clone_from(&other.identity);
+        }
+    }
+}
+impl std::ops::Deref for DescriptorTable {
+    type Target = BTreeMap<u32, Descriptor>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl std::ops::DerefMut for DescriptorTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if Rc::strong_count(&self.identity) > 1 {
+            self.identity = Rc::new(());
+        }
+        &mut self.entries
+    }
+}
 enum Content {
     Directory,
     File(storage::FileData),
@@ -290,7 +326,7 @@ pub struct Vfs {
     network: trames_net::Network,
     native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
     fs: Rc<RefCell<Filesystem>>,
-    fds: BTreeMap<u32, Descriptor>,
+    fds: DescriptorTable,
     cwd_node: Option<Rc<RefCell<Node>>>,
     root_node: Option<Rc<RefCell<Node>>>,
     uts: UtsNamespace,
@@ -342,7 +378,7 @@ impl Default for Vfs {
                 disk: None,
                 volume: None,
             })),
-            fds: BTreeMap::new(),
+            fds: DescriptorTable::default(),
             cwd_node: None,
             root_node: None,
             uts: UtsNamespace::default(),
@@ -436,7 +472,7 @@ impl Vfs {
     }
     /// Cooperatively shared clone resources are synchronized at syscall boundaries.
     pub fn share_descriptors_from(&mut self, other: &Self) {
-        self.fds.clone_from(&other.fds);
+        self.fds.synchronize(&other.fds);
     }
     pub fn share_context_from(&mut self, other: &Self) {
         self.cwd_node.clone_from(&other.cwd_node);
@@ -2664,6 +2700,51 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+    #[test]
+    fn shared_file_table_observes_edits_after_repeated_unchanged_syncs() {
+        let mut parent = Vfs::default();
+        parent.import_file(b"/file", b"abcd".to_vec()).unwrap();
+        let fd = parent.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        let mut peer = parent.clone();
+        for _ in 0..8 {
+            peer.share_descriptors_from(&parent);
+        }
+        assert_eq!(peer.read(fd, 1).unwrap(), b"a");
+        assert_eq!(parent.read(fd, 1).unwrap(), b"b");
+        parent.set_status_flags(fd, 2 | O_NONBLOCK).unwrap();
+        assert_ne!(peer.flags(fd).unwrap() & O_NONBLOCK, 0);
+        let copy = parent.dup(fd, 20, true).unwrap();
+        parent.close(fd).unwrap();
+        peer.share_descriptors_from(&parent);
+        assert_eq!(peer.fd_kind(fd), Err(Errno(9)));
+        assert_eq!(peer.read(copy, 1).unwrap(), b"c");
+        peer.set_cloexec(copy, false).unwrap();
+        parent.share_descriptors_from(&peer);
+        parent.close_exec();
+        assert_eq!(parent.read(copy, 1).unwrap(), b"d");
+        peer.close_all();
+        parent.share_descriptors_from(&peer);
+        assert_eq!(parent.fd_kind(copy), Err(Errno(9)));
+    }
+    #[test]
+    fn independent_fork_edits_cannot_share_a_file_table_version() {
+        let mut parent = Vfs::default();
+        parent.import_file(b"/file", vec![]).unwrap();
+        let fd = parent.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        let mut left = parent.clone();
+        let mut right = parent.clone();
+        left.set_cloexec(fd, true).unwrap();
+        let copy = right.dup(fd, 20, false).unwrap();
+        // Equally many edits on independent forks must not look unchanged.
+        right.share_descriptors_from(&left);
+        assert_eq!(right.fd_kind(copy), Err(Errno(9)));
+        assert_ne!(right.flags(fd).unwrap() & O_CLOEXEC, 0);
+        assert_eq!(parent.flags(fd).unwrap() & O_CLOEXEC, 0);
+        right.detach_file_table();
+        left.share_descriptors_from(&right);
+        assert_eq!(left.fd_kind(fd), Err(Errno(9)));
+        assert!(parent.fd_kind(fd).is_ok());
+    }
     #[test]
     fn fork_shares_storage_and_open_position_but_not_descriptor_table() {
         let mut parent = Vfs::default();

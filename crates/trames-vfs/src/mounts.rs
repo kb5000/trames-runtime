@@ -90,6 +90,11 @@ impl Mount {
         node.borrow().path_in(&self.fs.borrow().paths, &root)
     }
     fn root_path(&self) -> Vec<u8> {
+        // Proc/sysfs inodes live in PseudoFs, never in the backing disk's path
+        // map. Their immutable mount keys cannot be found by scanning that map.
+        if matches!(self.kind, Kind::Proc | Kind::Sysfs) && self.root.borrow().volatile {
+            return self.root_key.clone();
+        }
         let fs = self.fs.borrow();
         if fs
             .paths
@@ -298,6 +303,16 @@ impl Vfs {
         node: &Rc<RefCell<Node>>,
         mount: &Option<Rc<Mount>>,
     ) -> Result<ResolvedPath> {
+        // Pseudo endpoints are stored separately. Looking in an unrelated disk
+        // map first turns every proc FD snapshot into a full rootfs scan.
+        if node.borrow().volatile {
+            if let Some(key) = self.pseudo.borrow().path_of(node) {
+                return Ok(ResolvedPath {
+                    key,
+                    mount: mount.clone(),
+                });
+            }
+        }
         let key = match mount {
             Some(m) => m
                 .key_of(node)
@@ -1573,6 +1588,30 @@ mod boundary_tests {
             v.mkdir_at(-100, d, 0o755).unwrap();
         }
         v
+    }
+    #[test]
+    fn proc_paths_keep_their_mount_identity_after_bind_and_namespace_clone() {
+        let mut v = vfs();
+        v.mount(Some(b"/proc"), b"/b", None, 4096, None).unwrap();
+        v.chdir(b"/b/1").unwrap();
+        let fd = v.open_at(-100, b"status", 0, 0).unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/b/1");
+        assert_eq!(
+            v.fd_snapshot().iter().find(|f| f.fd == fd).unwrap().target,
+            b"/b/1/status"
+        );
+        v.unshare_mounts().unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/b/1");
+        let after = v.open_at(-100, b"status", 0, 0).unwrap();
+        assert_eq!(
+            v.fd_snapshot()
+                .iter()
+                .find(|f| f.fd == after)
+                .unwrap()
+                .target,
+            b"/b/1/status"
+        );
+        assert!(v.read(fd, 4096).unwrap().starts_with(b"Name:"));
     }
     #[test]
     fn detached_subtree_remains_traversable_and_releases_its_quota() {
