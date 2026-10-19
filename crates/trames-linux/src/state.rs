@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{errno, io_errno, GuestOutput, OutputFd, SyscallOutcome, MAX_WRITE};
 use trames_cpu::Cpu;
-use trames_memory::{Access, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
+use trames_memory::{
+    Access, CpuMemory, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE,
+};
 use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH, O_NONBLOCK};
 
@@ -82,7 +84,12 @@ impl Linux {
             .record_lock_conflict(a[0] as u32, requested)?
             .map(|lock| lock.owner))
     }
-    pub fn check(memory: &Memory, address: u64, count: usize, access: Access) -> Result<()> {
+    pub fn check(
+        memory: &impl CpuMemory,
+        address: u64,
+        count: usize,
+        access: Access,
+    ) -> Result<()> {
         if address >= ADDRESS_LIMIT {
             return Err(Errno(14));
         }
@@ -121,7 +128,12 @@ impl Linux {
             FdKind::Terminal => Err(Errno(25)),
         }
     }
-    fn read(&mut self, a: [u64; 6], memory: &mut Memory, io: &mut impl GuestOutput) -> Result<u64> {
+    pub fn read(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        io: &mut impl GuestOutput,
+    ) -> Result<u64> {
         let fd = a[0] as u32;
         self.vfs.fd_kind(fd)?;
         let count = a[2].min(MAX_WRITE as u64) as usize;
@@ -204,13 +216,45 @@ impl Linux {
         Self::scatter(memory, &parts, &bytes)?;
         Ok(bytes.len() as u64)
     }
-    fn write(&mut self, a: [u64; 6], memory: &Memory, io: &mut impl GuestOutput) -> Result<u64> {
+    pub fn write(
+        &mut self,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        io: &mut impl GuestOutput,
+    ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         let count = a[2].min(MAX_WRITE as u64) as usize;
         Self::check(memory, a[1], count, Access::Read)?;
         let mut bytes = vec![0; count];
         memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
         self.write_bytes(a[0] as u32, &bytes, io)
+    }
+    /// Metadata/offset queries do not change mappings or file contents. The
+    /// coordinator and in-epoch service use the same ABI and memory validation.
+    pub fn fd_query(
+        &mut self,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64> {
+        match number {
+            25 => {
+                let flags = self.vfs.flags(a[0] as u32)?;
+                match a[1] {
+                    1 => Ok(u64::from(flags & 0x80000 != 0)),
+                    3 => Ok((flags & !(0x80000 | 0x40 | 0x80 | 0x100 | 0x200)) as u64),
+                    _ => Err(Errno(22)),
+                }
+            }
+            62 => self.vfs.seek(a[0] as u32, a[1] as i64, a[2] as u32),
+            80 => {
+                let stat = self.vfs.stat_fd(a[0] as u32)?;
+                Self::check(memory, a[1], 128, Access::Write)?;
+                memory.write(a[1], &stat).map_err(|_| Errno(14))?;
+                Ok(0)
+            }
+            _ => Err(Errno(38)),
+        }
     }
     pub(super) fn writev(
         &mut self,
@@ -832,7 +876,7 @@ impl Linux {
                 self.vfs.mkdir_at(a[0] as i32, &path, a[2] as u32)?;
                 Ok(0)
             }
-            62 => self.vfs.seek(a[0] as u32, a[1] as i64, a[2] as u32),
+            62 => self.fd_query(62, a, memory),
             61 => {
                 let count = a[2].min(MAX_WRITE as u64) as usize;
                 self.vfs.fd_kind(a[0] as u32)?;
@@ -856,12 +900,7 @@ impl Linux {
                 memory.write(a[2], &stat).map_err(|_| Errno(14))?;
                 Ok(0)
             }
-            80 => {
-                let stat = self.vfs.stat_fd(a[0] as u32)?;
-                Self::check(memory, a[1], 128, Access::Write)?;
-                memory.write(a[1], &stat).map_err(|_| Errno(14))?;
-                Ok(0)
-            }
+            80 => self.fd_query(80, a, memory),
             17 => {
                 let mut bytes = self.vfs.cwd()?;
                 let len = bytes.len() + 1;
@@ -882,6 +921,7 @@ impl Linux {
                 self.vfs.chdir(&path)?;
                 Ok(0)
             }
+            25 if matches!(a[1], 1 | 3) => self.fd_query(25, a, memory),
             25 => {
                 let flags = self.vfs.flags(a[0] as u32)?;
                 if flags & trames_vfs::O_PATH != 0 && !matches!(a[1], 0..=3 | 1030) {
@@ -891,12 +931,10 @@ impl Linux {
                     1033 => Ok(self.vfs.seals(a[0] as u32, Some(a[2] as u32))? as u64),
                     1034 => Ok(self.vfs.seals(a[0] as u32, None)? as u64),
                     0 | 1030 => Ok(self.vfs.dup(a[0] as u32, a[2] as u32, a[1] == 1030)? as u64),
-                    1 => Ok(if flags & 0x80000 != 0 { 1 } else { 0 }),
                     2 => {
                         self.vfs.set_cloexec(a[0] as u32, a[2] & 1 != 0)?;
                         Ok(0)
                     }
-                    3 => Ok((flags & !(0x80000 | 0x40 | 0x80 | 0x100 | 0x200)) as u64),
                     4 => {
                         self.vfs.set_status_flags(a[0] as u32, a[2] as u32)?;
                         Ok(0)

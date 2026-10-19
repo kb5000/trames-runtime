@@ -42,7 +42,7 @@ mod storage_tests;
 pub use credentials::Credentials;
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::{BTreeMap, VecDeque},
     fmt,
     rc::{Rc, Weak},
@@ -56,6 +56,7 @@ pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
 pub const MAX_FDS: u32 = 256;
+pub type FdMask = [u64; (MAX_FDS as usize).div_ceil(64)];
 /// Scheduler task budget, also reported by procfs and RLIMIT_NPROC.
 pub const MAX_TASKS: usize = 256;
 pub const PIPE_CAPACITY: usize = 65536;
@@ -230,7 +231,11 @@ struct Descriptor {
 #[derive(Clone, Default)]
 struct DescriptorTable {
     entries: BTreeMap<u32, Descriptor>,
-    identity: Rc<()>,
+    identity: Rc<DescriptorVersion>,
+}
+#[derive(Clone, Default)]
+struct DescriptorVersion {
+    streams: OnceCell<FdMask>,
 }
 impl DescriptorTable {
     // Keep two-phase receiver borrowing for expressions such as
@@ -253,9 +258,7 @@ impl std::ops::Deref for DescriptorTable {
 }
 impl std::ops::DerefMut for DescriptorTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        if Rc::strong_count(&self.identity) > 1 {
-            self.identity = Rc::new(());
-        }
+        Rc::make_mut(&mut self.identity).streams.take();
         &mut self.entries
     }
 }
@@ -473,6 +476,26 @@ impl Vfs {
     /// Cooperatively shared clone resources are synchronized at syscall boundaries.
     pub fn share_descriptors_from(&mut self, other: &Self) {
         self.fds.synchronize(&other.fds);
+    }
+    /// Immutable descriptor kinds for one CPU epoch. Cached per shared table
+    /// version, so dispatch does not scan all descriptors on every syscall.
+    pub fn stream_descriptors(&self) -> FdMask {
+        *self.fds.identity.streams.get_or_init(|| {
+            let mut mask = [0; (MAX_FDS as usize).div_ceil(64)];
+            for (&fd, d) in self.fds.iter() {
+                if matches!(
+                    d.open.borrow().kind,
+                    FdKind::Stdin
+                        | FdKind::Stdout
+                        | FdKind::Stderr
+                        | FdKind::PipeRead
+                        | FdKind::PipeWrite
+                ) {
+                    mask[fd as usize / 64] |= 1 << (fd % 64);
+                }
+            }
+            mask
+        })
     }
     pub fn share_context_from(&mut self, other: &Self) {
         self.cwd_node.clone_from(&other.cwd_node);
@@ -2700,6 +2723,28 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+    #[test]
+    fn stream_admission_follows_shared_fd_edits_and_independent_forks() {
+        let mut parent = Vfs::default();
+        let original = parent.stream_descriptors();
+        let mut peer = parent.clone();
+        let [read, write] = parent.pipe(0).unwrap();
+        let streams = parent.stream_descriptors();
+        assert_ne!(streams, original);
+        assert_eq!(peer.stream_descriptors(), original);
+        peer.share_descriptors_from(&parent);
+        assert_eq!(peer.stream_descriptors(), streams);
+        let duplicate = parent.dup(write, 20, true).unwrap();
+        assert_ne!(parent.stream_descriptors(), streams);
+        parent.close_exec();
+        assert_eq!(parent.stream_descriptors(), streams);
+        assert_eq!(parent.fd_kind(duplicate), Err(Errno(9)));
+        parent.close(read).unwrap();
+        assert_ne!(parent.stream_descriptors(), streams);
+        assert_eq!(peer.stream_descriptors(), streams);
+        parent.detach_file_table();
+        assert!(parent.stream_descriptors().iter().all(|word| *word == 0));
+    }
     #[test]
     fn shared_file_table_observes_edits_after_repeated_unchanged_syncs() {
         let mut parent = Vfs::default();
