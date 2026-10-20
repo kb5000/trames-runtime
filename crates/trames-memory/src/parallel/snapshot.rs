@@ -21,16 +21,14 @@ impl Snapshot {
         if *count == 0 {
             self.identities.remove(&frame.bytes.identity);
         }
-        self.dynamic_code_pages -=
-            usize::from(frame.permissions.execute && frame.bytes.constant.is_none());
+        self.dynamic_code_pages -= usize::from(frame.dynamic_code);
         Some(frame)
     }
     fn insert_frame(&mut self, frame: Frame, backed: bool) {
         let count = self.identities.entry(frame.bytes.identity).or_insert(0);
         self.alias_count += usize::from(*count == 1);
         *count += 1;
-        self.dynamic_code_pages +=
-            usize::from(frame.permissions.execute && frame.bytes.constant.is_none());
+        self.dynamic_code_pages += usize::from(frame.dynamic_code);
         if backed {
             self.backed_pages.insert(frame.base);
         }
@@ -94,7 +92,8 @@ impl Memory {
             let Some(&root_frame) = self.pages.get(&base) else {
                 continue;
             };
-            let page = self.frames[root_frame].as_ref().expect("mapped frame");
+            self.prepare_shared_storage(base, root_frame, registry);
+            let page = self.frames[root_frame].as_mut().expect("mapped frame");
             if page
                 .backing
                 .as_ref()

@@ -23,6 +23,16 @@ pub trait PageBacking {
     fn parallel_key(&self) -> Option<(u64, u64)> {
         None
     }
+    /// Share resident physical bytes with workers. The provider keeps metadata
+    /// coordinator-local; every CPU/native byte access must use these guards.
+    fn shared_page(&self) -> Option<std::sync::Arc<SharedPage>> {
+        None
+    }
+    /// Publish dirty metadata after workers have joined, without copying bytes.
+    /// Called only for a provider that returned shared_page().
+    fn publish_write(&self, _offset: usize, _len: usize) -> Result<(), MemoryError> {
+        Err(MemoryError::BackingIo(95))
+    }
     fn check(&self, address: u64) -> Result<(), MemoryError>;
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
@@ -77,6 +87,14 @@ impl Page {
         }
         Ok(())
     }
+    pub(crate) fn shared_storage(&self) -> Option<std::sync::Arc<SharedPage>> {
+        if let Some(b) = &self.backing {
+            if b.shared || !b.private_copy {
+                return b.object.shared_page();
+            }
+        }
+        self.bytes.shared().cloned()
+    }
     // Fixed-size interpreter callers should compile resident copies to host
     // loads/stores. Live backing and COW checks still run on every access.
     #[inline]
@@ -86,7 +104,8 @@ impl Page {
                 return b.object.read(offset, out);
             }
         }
-        out.copy_from_slice(&self.bytes[offset..offset + out.len()]);
+        self.bytes
+            .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
         Ok(())
     }
     #[inline]
@@ -102,7 +121,8 @@ impl Page {
                 b.private_copy = true;
             }
         }
-        Rc::make_mut(&mut self.bytes)[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Rc::make_mut(&mut self.bytes)
+            .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
         Ok(())
     }
 }
@@ -359,14 +379,14 @@ impl Memory {
 }
 
 struct AnonymousPage {
-    bytes: RefCell<Box<[u8; PAGE_SIZE as usize]>>,
+    bytes: std::sync::Arc<SharedPage>,
     revision: Cell<u64>,
     identity: u64,
 }
 impl AnonymousPage {
     fn allocate() -> Rc<dyn PageBacking> {
         Rc::new(Self {
-            bytes: RefCell::new(Box::new([0; PAGE_SIZE as usize])),
+            bytes: std::sync::Arc::new(SharedPage::new([0; PAGE_SIZE as usize])),
             revision: Cell::new(0),
             identity: new_backing_identity(),
         })
@@ -382,15 +402,25 @@ impl PageBacking for AnonymousPage {
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((self.identity, 0))
     }
+    fn shared_page(&self) -> Option<std::sync::Arc<SharedPage>> {
+        Some(self.bytes.clone())
+    }
+    fn publish_write(&self, _: usize, _: usize) -> Result<(), MemoryError> {
+        self.revision.set(self.revision.get().wrapping_add(1));
+        backing_changed();
+        Ok(())
+    }
     fn check(&self, _: u64) -> Result<(), MemoryError> {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-        out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+        self.bytes
+            .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
         Ok(())
     }
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.bytes
+            .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
         self.revision.set(self.revision.get().wrapping_add(1));
         backing_changed();
         Ok(())
@@ -401,7 +431,7 @@ impl PageBacking for AnonymousPage {
         len: usize,
         f: &mut dyn FnMut(&[u8]),
     ) -> Result<bool, MemoryError> {
-        f(&self.bytes.borrow()[offset..offset + len]);
+        self.bytes.with_read(offset, len, f);
         Ok(true)
     }
     fn with_write(
@@ -410,17 +440,18 @@ impl PageBacking for AnonymousPage {
         len: usize,
         f: &mut dyn FnMut(&mut [u8]),
     ) -> Result<bool, MemoryError> {
-        let mut bytes = self.bytes.borrow_mut();
         self.revision.set(self.revision.get().wrapping_add(1));
         backing_changed();
-        f(&mut bytes[offset..offset + len]);
+        self.bytes.with_write(offset, len, f);
         Ok(true)
     }
     fn sync(&self) -> Result<(), MemoryError> {
         Ok(())
     }
     fn version(&self) -> u64 {
-        self.revision.get()
+        self.revision
+            .get()
+            .wrapping_add(self.bytes.version.load(Ordering::Acquire))
     }
     fn writable(&self) -> bool {
         true

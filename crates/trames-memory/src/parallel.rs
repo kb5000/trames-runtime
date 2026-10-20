@@ -4,7 +4,9 @@
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
 mod hardware;
 mod native;
-mod page;
+pub(super) mod page;
+#[cfg(test)]
+mod sharing;
 mod snapshot;
 use super::*;
 use std::sync::{Arc, Weak};
@@ -27,17 +29,37 @@ pub struct Metrics {
     pub source_page_reads: u64,
     pub incremental_updates: u64,
     pub incremental_pages: u64,
+    /// Frames sharing the coordinator allocation, without byte transport.
+    pub shared_frames: u64,
+    pub copied_publish_bytes: u64,
+    pub cow_detach_bytes: u64,
 }
 struct ConcurrentPage {
     identity: u64,
     constant: Option<Arc<PageBytes>>,
-    bytes: Option<page::MutablePage>,
+    bytes: Option<Arc<page::MutablePage>>,
     dirty: AtomicU64,
     version: AtomicU64,
     executable: std::sync::atomic::AtomicBool,
     code_epoch: Arc<AtomicU64>,
 }
 impl ConcurrentPage {
+    fn shared(bytes: Arc<SharedPage>, code_epoch: Arc<AtomicU64>) -> Self {
+        Self {
+            identity: bytes.identity,
+            bytes: Some(bytes),
+            constant: None,
+            dirty: AtomicU64::new(0),
+            version: AtomicU64::new(0),
+            executable: std::sync::atomic::AtomicBool::new(false),
+            code_epoch,
+        }
+    }
+    fn version(&self) -> &AtomicU64 {
+        self.bytes
+            .as_ref()
+            .map_or(&self.version, |bytes| &bytes.version)
+    }
     fn new(
         bytes: [u8; PAGE_SIZE as usize],
         zero: bool,
@@ -64,13 +86,13 @@ impl ConcurrentPage {
         let mutable = if constant {
             None
         } else {
-            Some(if zero {
+            Some(Arc::new(if zero {
                 page::MutablePage::new_zero(slot)
             } else if let Some(slot) = slot {
                 page::MutablePage::new_mapped(bytes, slot)
             } else {
                 page::MutablePage::new(bytes)
-            })
+            }))
         };
         Self {
             identity: new_backing_identity(),
@@ -86,7 +108,10 @@ impl ConcurrentPage {
         if len == 0 {
             return;
         }
-        let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let version = self
+            .version()
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
         state.invalidate(offset, len, version);
         // One bit per 64-byte fragment. No unrelated clean bytes are written
         // back over an alias; full-page snapshots would lose concurrent edits.
@@ -114,7 +139,10 @@ impl ConcurrentPage {
         {
             // A coordinator ABA write invalidates reservations even if bytes match.
             guard.write(0, PAGE_SIZE as usize).copy_from_slice(bytes);
-            let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
+            let version = self
+                .version()
+                .fetch_add(1, Ordering::Release)
+                .wrapping_add(1);
             guard.invalidate(0, PAGE_SIZE as usize, version);
             if self.executable.load(Ordering::Relaxed) {
                 self.code_epoch.fetch_add(1, Ordering::Release);
@@ -135,10 +163,25 @@ struct Frame {
     error: Option<MemoryError>,
     bytes: Arc<ConcurrentPage>,
     charge: Arc<Charge>,
+    direct: bool,
+    dynamic_code: bool,
 }
+fn direct_matches(page: &Page, frame: &Frame) -> bool {
+    let storage = page
+        .backing
+        .as_ref()
+        .filter(|b| b.shared || !b.private_copy)
+        .and_then(|b| b.object.shared_page());
+    storage
+        .as_ref()
+        .or_else(|| page.bytes.shared())
+        .zip(frame.bytes.bytes.as_ref())
+        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+}
+
 fn prepare_frame(
     space: u64,
-    page: &Page,
+    page: &mut Page,
     base: u64,
     root_frame: usize,
     previous: Option<&Frame>,
@@ -146,10 +189,16 @@ fn prepare_frame(
 ) -> Option<Frame> {
     let error = page.check_backing(base).err();
     let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
+    let resident_backing = page
+        .backing
+        .as_ref()
+        .filter(|b| b.shared || (!b.private_copy && !page.permissions.write))
+        .filter(|_| error.is_none())
+        .and_then(|b| b.object.shared_page());
     let key = page
         .backing
         .as_ref()
-        .filter(|b| b.shared)
+        .filter(|b| b.shared || resident_backing.is_some())
         .and_then(|b| b.object.parallel_key());
     let previous = previous.filter(|f| {
         f.root_frame == root_frame
@@ -161,7 +210,76 @@ fn prepare_frame(
             && f.backing_version.load(Ordering::Relaxed) == backing_version
             && f.error == error
     });
-    let bytes = if let Some(frame) = same {
+    let direct_owned = page
+        .backing
+        .as_ref()
+        .is_none_or(|b| !b.shared && b.private_copy);
+    let direct = direct_owned || resident_backing.is_some();
+    let bytes = if let Some(shared) = resident_backing {
+        registry.metrics.shared_frames += 1;
+        let previous = previous.map(|f| &f.bytes);
+        let reused = previous
+            .filter(|bytes| {
+                bytes
+                    .bytes
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, &shared))
+            })
+            .cloned()
+            .or_else(|| {
+                key.and_then(|key| registry.shared.get(&key))
+                    .and_then(Weak::upgrade)
+                    .filter(|bytes| {
+                        bytes
+                            .bytes
+                            .as_ref()
+                            .is_some_and(|old| Arc::ptr_eq(old, &shared))
+                    })
+            });
+        let bytes = reused.unwrap_or_else(|| {
+            Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
+        });
+        if let Some(key) = key {
+            registry.shared.insert(key, Arc::downgrade(&bytes));
+        }
+        bytes
+    } else if direct_owned {
+        let shared = if page.bytes.shared().is_some()
+            && (Rc::strong_count(&page.bytes) == 1 || !page.permissions.write)
+        {
+            page.bytes.shared().unwrap().clone()
+        } else {
+            let old = std::mem::replace(&mut page.bytes, Rc::new(PageBytes::Zero));
+            let owned = Rc::try_unwrap(old).unwrap_or_else(|old| {
+                if !page.charge.resident() {
+                    return PageBytes::Zero;
+                }
+                if !old.is_zero() {
+                    registry.metrics.cow_detach_bytes += PAGE_SIZE;
+                }
+                (*old).clone()
+            });
+            let slot = owned
+                .is_zero()
+                .then(|| registry.mmu.slot(space, base))
+                .flatten();
+            let shared = Arc::new(SharedPage::from_owned(owned, slot));
+            page.bytes = Rc::new(PageBytes::Concurrent(shared.clone()));
+            shared
+        };
+        registry.metrics.shared_frames += 1;
+        if let Some(previous) = previous.filter(|f| {
+            f.direct
+                && f.bytes
+                    .bytes
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, &shared))
+        }) {
+            previous.bytes.clone()
+        } else {
+            Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
+        }
+    } else if let Some(frame) = same {
         frame.bytes.clone()
     } else if error.is_some() {
         Arc::new(ConcurrentPage::new(
@@ -178,6 +296,7 @@ fn prepare_frame(
         let zero = error.is_some() || (page.backing.is_none() && page.bytes.is_zero());
         if error.is_none() && !zero {
             registry.metrics.source_page_reads += 1;
+            registry.metrics.copied_publish_bytes += PAGE_SIZE;
             page.read_bytes(0, &mut data).ok()?;
         }
         if let Some(key) = key {
@@ -228,15 +347,22 @@ fn prepare_frame(
         native_live_private: std::sync::atomic::AtomicBool::new(
             page.backing
                 .as_ref()
-                .is_some_and(|b| !b.shared && !b.private_copy),
+                .is_some_and(|b| !b.shared && !b.private_copy && !direct),
         ),
         error,
         bytes,
         charge: page.charge.clone(),
+        direct,
+        dynamic_code: page.permissions.execute
+            && (page.permissions.write
+                || page
+                    .backing
+                    .as_ref()
+                    .is_some_and(|b| b.shared || !b.private_copy)),
     })
 }
 
-struct Snapshot {
+pub(super) struct Snapshot {
     mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
@@ -257,9 +383,19 @@ struct Snapshot {
     code_epoch: Arc<AtomicU64>,
 }
 pub(super) struct SnapshotCache {
-    snapshot: Arc<Snapshot>,
+    pub(super) snapshot: Arc<Snapshot>,
     source_revision: u64,
+    source_fork_epoch: u64,
     source_backing_revision: u64,
+}
+impl SnapshotCache {
+    pub(super) fn code_epoch(&self) -> u64 {
+        if self.snapshot.dynamic_code {
+            self.snapshot.code_epoch.load(Ordering::Acquire)
+        } else {
+            0
+        }
+    }
 }
 /// Send, with worker-local translations; never Sync and never retains Rc data.
 pub struct View {
@@ -597,7 +733,7 @@ impl CpuMemory for View {
         Ok((
             self.snapshot.identity,
             frame.bytes.identity,
-            frame.bytes.version.load(Ordering::Acquire),
+            frame.bytes.version().load(Ordering::Acquire),
         ))
     }
     fn atomic_update<T>(
@@ -689,6 +825,38 @@ impl Memory {
             }
         }
     }
+    pub(super) fn prepare_shared_storage(
+        &mut self,
+        base: u64,
+        frame: usize,
+        registry: &mut Registry,
+    ) {
+        let page = self.frames[frame].as_ref().expect("mapped frame");
+        if page.backing.is_some() {
+            return;
+        }
+        let forked = Rc::strong_count(&page.bytes) > 1;
+        let zero = page.bytes.is_zero() || (!page.charge.resident() && forked);
+        let copy = !zero
+            && ((forked && page.permissions.write) || matches!(&*page.bytes, PageBytes::Heap(_)));
+        if zero || copy {
+            // Keep eligible hardware aliases over the same source physical slot.
+            // A true fork detaches a writable COW page once, into mapped RAM;
+            // worker Arc owners alone never trigger that copy.
+            let data = copy.then(|| page.bytes.snapshot());
+            if let Some(mut bytes) = self.mmu.page(base) {
+                if let Some(data) = data {
+                    Rc::get_mut(&mut bytes)
+                        .expect("fresh page owner")
+                        .with_write(0, PAGE_SIZE as usize, |out| out.copy_from_slice(&data));
+                    if forked {
+                        registry.metrics.cow_detach_bytes += PAGE_SIZE;
+                    }
+                }
+                self.frames[frame].as_mut().unwrap().bytes = bytes;
+            }
+        }
+    }
     /// Shared futexes identify the backing page, including aliases at different
     /// virtual addresses and after fork. Private/anonymous addresses use mm+VA.
     pub fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
@@ -713,11 +881,10 @@ impl Memory {
         // A resumed runtime can construct a new coordinator registry. Cached
         // shared pages must join that registry's alias/code domain, not silently
         // retain an earlier one while fork peers allocate duplicate snapshots.
-        if self
-            .parallel_cache
-            .as_ref()
-            .is_some_and(|c| !Arc::ptr_eq(&c.snapshot.code_epoch, &registry.code_epoch))
-        {
+        if self.parallel_cache.as_ref().is_some_and(|c| {
+            !Arc::ptr_eq(&c.snapshot.code_epoch, &registry.code_epoch)
+                || c.source_fork_epoch != self.fork_epoch.get()
+        }) {
             self.parallel_cache = None;
         }
         let backing_revision = backing::backing_revision();
@@ -736,6 +903,11 @@ impl Memory {
                 && c.snapshot.identity == self.identity
                 && self.parallel_mappings.is_empty()
                 && !self.parallel_reservations_dirty
+                && self.parallel_dirty.iter().all(|&index| {
+                    let frame =
+                        &c.snapshot.frames[c.snapshot.positions[index].expect("dirty frame")];
+                    !frame.direct || direct_matches(self.frames[index].as_ref().unwrap(), frame)
+                })
         }) {
             registry.metrics.dirty_refreshes += 1;
             let mut cache = self.parallel_cache.take().expect("checked cache");
@@ -750,10 +922,13 @@ impl Memory {
                 let page = self.frames[index].as_mut().expect("same mapped frame");
                 let frame = &cache.snapshot.frames
                     [cache.snapshot.positions[index].expect("same mapped frame")];
-                let mut data = [0; PAGE_SIZE as usize];
-                registry.metrics.source_page_reads += 1;
-                page.read_bytes(0, &mut data).ok()?;
-                frame.bytes.refresh(&data);
+                if !frame.direct {
+                    let mut data = [0; PAGE_SIZE as usize];
+                    registry.metrics.source_page_reads += 1;
+                    registry.metrics.copied_publish_bytes += PAGE_SIZE;
+                    page.read_bytes(0, &mut data).ok()?;
+                    frame.bytes.refresh(&data);
+                }
                 frame
                     .native_retryable
                     .store(page.native_retryable(), Ordering::Relaxed);
@@ -763,7 +938,7 @@ impl Memory {
                 frame.native_live_private.store(
                     page.backing
                         .as_ref()
-                        .is_some_and(|b| !b.shared && !b.private_copy),
+                        .is_some_and(|b| !b.shared && !b.private_copy && !frame.direct),
                     Ordering::Relaxed,
                 );
                 frame
@@ -810,8 +985,14 @@ impl Memory {
         let mut identities = BTreeMap::new();
         let mut alias_count = 0usize;
         let mut backed_pages = BTreeSet::new();
-        for (&base, &root_frame) in &self.pages {
-            let page = self.frames[root_frame].as_ref().expect("mapped frame");
+        let mapped: Vec<_> = self
+            .pages
+            .iter()
+            .map(|(&base, &frame)| (base, frame))
+            .collect();
+        for (base, root_frame) in mapped {
+            self.prepare_shared_storage(base, root_frame, registry);
+            let page = self.frames[root_frame].as_mut().expect("mapped frame");
             let previous = old
                 .as_ref()
                 .and_then(|c| c.snapshot.pages.get(&base).map(|&i| &c.snapshot.frames[i]));
@@ -829,13 +1010,8 @@ impl Memory {
         let mut snapshot = Snapshot {
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
-            dynamic_code: frames
-                .iter()
-                .any(|frame| frame.permissions.execute && frame.bytes.constant.is_none()),
-            dynamic_code_pages: frames
-                .iter()
-                .filter(|frame| frame.permissions.execute && frame.bytes.constant.is_none())
-                .count(),
+            dynamic_code: frames.iter().any(|frame| frame.dynamic_code),
+            dynamic_code_pages: frames.iter().filter(|frame| frame.dynamic_code).count(),
             identities,
             alias_count,
             backed_pages,
@@ -872,6 +1048,7 @@ impl Memory {
         self.parallel_cache = Some(SnapshotCache {
             snapshot: snapshot.clone(),
             source_revision: self.revision,
+            source_fork_epoch: self.fork_epoch.get(),
             source_backing_revision: backing_revision,
         });
         self.parallel_mappings.clear();
@@ -883,8 +1060,9 @@ impl Memory {
         }
         Some(View::new(snapshot))
     }
-    /// Joined CPUs publish changed fragments through the normal COW/backing/code
-    /// hooks before any syscall, signal frame or native operation can observe them.
+    /// Joined CPUs publish dirty metadata and persistence/code hooks. Resident
+    /// source pages already contain the writes; only legacy/custom backings copy
+    /// dirty fragments through the provider's write method.
     pub fn commit_parallel(&mut self) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().commit_parallel();
@@ -908,34 +1086,77 @@ impl Memory {
                         word.store(pending, Ordering::Relaxed);
                         continue;
                     }
-                    let guard = frame
-                        .bytes
-                        .bytes
-                        .as_ref()
-                        .expect("dirty writable page")
-                        .lock(0, PAGE_SIZE as usize);
-                    while dirty != 0 {
-                        let first = dirty.trailing_zeros() as usize;
-                        let count = (dirty >> first).trailing_ones() as usize;
-                        if let Err(error) = self.write(
-                            frame.base + (first * 64) as u64,
-                            guard.read(first * 64, count * 64),
-                        ) {
-                            frame.bytes.dirty.fetch_or(dirty, Ordering::Relaxed);
-                            return Err(error);
+                    if frame.direct {
+                        let page = self.frames[frame.root_frame]
+                            .as_mut()
+                            .expect("mapped shared bytes");
+                        assert!(
+                            direct_matches(page, frame),
+                            "mapping changes require joined commit"
+                        );
+                        if let Some(backing) = page.backing.as_ref().filter(|b| b.shared) {
+                            // Dirty byte ranges still drive persistence/version
+                            // hooks; the backing already owns these exact bytes.
+                            while dirty != 0 {
+                                let first = dirty.trailing_zeros() as usize;
+                                let count = (dirty >> first).trailing_ones() as usize;
+                                if let Err(error) =
+                                    backing.object.publish_write(first * 64, count * 64)
+                                {
+                                    frame.bytes.dirty.fetch_or(dirty, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                                dirty &= if count == 64 {
+                                    0
+                                } else {
+                                    !(((1u64 << count) - 1) << first)
+                                };
+                            }
                         }
-                        // Coalesce adjacent dirty fragments without writing through
-                        // a clean hole or overwriting another backing alias's bytes.
-                        if count == 64 {
-                            dirty = 0;
-                        } else {
-                            dirty &= !(((1u64 << count) - 1) << first);
+                        // The bytes are already authoritative. Only publish the
+                        // coordinator's instruction/data generations here.
+                        page.data_revision = page.data_revision.wrapping_add(1);
+                        self.revision = self.revision.wrapping_add(1);
+                        if page.permissions.execute {
+                            page.instruction_revision = self.code_revision.wrapping_add(1);
+                            self.advance_code_revision();
+                        }
+                    } else {
+                        let guard = frame
+                            .bytes
+                            .bytes
+                            .as_ref()
+                            .expect("dirty writable page")
+                            .lock(0, PAGE_SIZE as usize);
+                        while dirty != 0 {
+                            let first = dirty.trailing_zeros() as usize;
+                            let count = (dirty >> first).trailing_ones() as usize;
+                            if let Err(error) = self.write(
+                                frame.base + (first * 64) as u64,
+                                guard.read(first * 64, count * 64),
+                            ) {
+                                frame.bytes.dirty.fetch_or(dirty, Ordering::Relaxed);
+                                return Err(error);
+                            }
+                            // Coalesce adjacent dirty fragments without writing through
+                            // a clean hole or overwriting another backing alias's bytes.
+                            if count == 64 {
+                                dirty = 0;
+                            } else {
+                                dirty &= !(((1u64 << count) - 1) << first);
+                            }
                         }
                     }
                     let page = self.frames[frame.root_frame]
                         .as_ref()
                         .expect("committed page");
-                    if page.instruction_revision != frame.code_revision {
+                    if page.instruction_revision != frame.code_revision
+                        || (!frame.direct
+                            && page
+                                .backing
+                                .as_ref()
+                                .is_some_and(|b| !b.shared && b.private_copy))
+                    {
                         self.parallel_mappings.insert(frame.base);
                     }
                     frame
@@ -947,7 +1168,7 @@ impl Memory {
                     frame.native_live_private.store(
                         page.backing
                             .as_ref()
-                            .is_some_and(|b| !b.shared && !b.private_copy),
+                            .is_some_and(|b| !b.shared && !b.private_copy && !frame.direct),
                         Ordering::Relaxed,
                     );
                     frame
@@ -968,7 +1189,8 @@ impl Memory {
         cache.source_revision = self.revision;
         // Retain the captured backing epoch: writes through another mapping
         // may require refreshing an undetached private file view next round.
-        if cache.snapshot.code_revision != self.code_revision {
+        if cache.snapshot.code_revision != self.code_revision || !self.parallel_mappings.is_empty()
+        {
             cache.source_revision = self.revision.wrapping_sub(1);
         }
         self.parallel_cache = Some(cache);

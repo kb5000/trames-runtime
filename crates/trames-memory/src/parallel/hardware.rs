@@ -37,7 +37,7 @@ impl Snapshot {
                         .bytes
                         .bytes
                         .as_ref()
-                        .and_then(page::MutablePage::physical)
+                        .and_then(|bytes| bytes.physical())
                 };
                 let Some((mapping, offset)) = storage else {
                     break;

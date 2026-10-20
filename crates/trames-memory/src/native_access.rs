@@ -109,6 +109,9 @@ impl NativeMemory for Memory {
         {
             return Ok(None);
         }
+        if page.bytes.shared().is_some() {
+            return Ok(None);
+        }
         Ok(Some(&page.bytes))
     }
     #[inline]
@@ -147,6 +150,30 @@ impl NativeMemory for Memory {
         n: usize,
         f: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<(T, bool, bool), NativeAccessError> {
+        if let Some(shared) = &self.shared {
+            return NativeMemory::with_read_pair(&*shared.borrow(), a, b, n, f);
+        }
+        let a = a & 0x00ffffffffffffff;
+        let b = b & 0x00ffffffffffffff;
+        if n != 0 {
+            let left = self.page_for_access(a, n, Access::Read)?.shared_storage();
+            let right = self.page_for_access(b, n, Access::Read)?.shared_storage();
+            if let (Some(left), Some(right)) = (left, right) {
+                let ai = (a % PAGE_SIZE) as usize;
+                let bi = (b % PAGE_SIZE) as usize;
+                if std::sync::Arc::ptr_eq(&left, &right) {
+                    let guard = left.lock_pair(ai, bi, n);
+                    return Ok((f(guard.read(ai, n), guard.read(bi, n)), true, true));
+                }
+                let (ag, bg) = if left.identity < right.identity {
+                    (left.lock(ai, n), right.lock(bi, n))
+                } else {
+                    let bg = right.lock(bi, n);
+                    (left.lock(ai, n), bg)
+                };
+                return Ok((f(ag.read(ai, n), bg.read(bi, n)), true, true));
+            }
+        }
         let (right, ld) = self.with_read_chunk(a, n, |left| {
             self.with_read_chunk(b, n, |right| f(left, right))
         })?;
@@ -237,7 +264,7 @@ impl Memory {
             .as_ref()
             .is_none_or(|b| !b.shared && b.private_copy)
         {
-            return Ok((operation(&page.bytes[offset..offset + len]), true));
+            return Ok((page.bytes.with_read(offset, len, operation), true));
         }
         let mut operation = Some(operation);
         let mut result = None;
@@ -327,12 +354,12 @@ impl Memory {
             return Ok((result, false));
         }
         Ok((
-            operation(&mut Rc::make_mut(&mut page.bytes)[offset..offset + len]),
+            Rc::make_mut(&mut page.bytes).with_write(offset, len, operation),
             true,
         ))
     }
 
-    fn mark_native_write(&mut self, frame: usize) {
+    pub(crate) fn mark_native_write(&mut self, frame: usize) {
         self.note_parallel_write(frame);
         self.revision = self.revision.wrapping_add(1);
         if self.frames[frame]
@@ -464,7 +491,14 @@ impl Memory {
             let si = (src % PAGE_SIZE) as usize;
             if df == sf {
                 let page = self.frames[df].as_mut().expect("page");
-                Rc::make_mut(&mut page.bytes).copy_within(si..si + count, di);
+                let bytes = Rc::make_mut(&mut page.bytes);
+                if let Some(shared) = bytes.shared() {
+                    let mut guard = shared.lock_pair(si, di, count);
+                    shared.changed(&mut guard, di, count);
+                    guard.copy_within(si, di, count);
+                } else {
+                    bytes.copy_within(si..si + count, di);
+                }
             } else {
                 let (d, s) = if df < sf {
                     let (left, right) = self.frames.split_at_mut(sf);
@@ -479,10 +513,23 @@ impl Memory {
                         left[sf].as_ref().expect("source"),
                     )
                 };
-                copy(
-                    &mut Rc::make_mut(&mut d.bytes)[di..di + count],
-                    &s.bytes[si..si + count],
-                );
+                let destination = Rc::make_mut(&mut d.bytes);
+                // Distinct private source pages cannot alias: a fork detaches
+                // the destination before taking either byte guard.
+                if let (Some(dst), Some(src)) = (destination.shared(), s.bytes.shared()) {
+                    let (mut dg, sg) = if dst.identity < src.identity {
+                        (dst.lock(di, count), src.lock(si, count))
+                    } else {
+                        let sg = src.lock(si, count);
+                        (dst.lock(di, count), sg)
+                    };
+                    dst.changed(&mut dg, di, count);
+                    copy(dg.write(di, count), sg.read(si, count));
+                } else {
+                    s.bytes.with_read(si, count, |input| {
+                        destination.with_write(di, count, |out| copy(out, input))
+                    });
+                }
             }
             stats.direct_read += count as u64;
             stats.direct_write += count as u64;

@@ -6,6 +6,7 @@ mod mmu;
 use mmu::PageBytes;
 mod native_access;
 pub mod parallel;
+pub use parallel::page::MutablePage as SharedPage;
 mod reservations;
 mod residency;
 use backing::Backed;
@@ -99,10 +100,9 @@ impl std::error::Error for MemoryError {}
 
 #[derive(Clone)]
 struct Page {
-    // Coordinator-only COW storage. Memory/Backed are already !Send/!Sync;
-    // workers get separate Arc<ConcurrentPage> bytes at joined checkpoints.
-    // Rc preserves fork COW without an atomic refcount RMW on every CPU/native
-    // store. Never send this allocation (or a borrowed slice) to a worker.
+    // Rc counts coordinator/fork owners only; worker Arc handles refer to the
+    // same SharedPage without causing false COW. The Rc and backing providers
+    // stay !Send/!Sync; every shared byte borrow uses the common region guards.
     bytes: Rc<PageBytes>,
     charge: std::sync::Arc<Charge>,
     permissions: Permissions,
@@ -218,6 +218,7 @@ pub struct Memory {
     has_backings: bool,
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
+    fork_epoch: Cell<u64>,
     parallel_dirty: Vec<usize>,
     parallel_mappings: BTreeSet<u64>,
     parallel_reservations_dirty: bool,
@@ -230,6 +231,7 @@ impl Clone for Memory {
         }
         self.invalidate_translations();
         self.mmu.retire();
+        self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
         let account = self.fork_account();
         Self {
             mmu: mmu::Arena::default(),
@@ -241,6 +243,18 @@ impl Clone for Memory {
                 .map(|page| {
                     page.as_ref().map(|page| {
                         let mut page = page.clone();
+                        if self
+                            .parallel_cache
+                            .as_ref()
+                            .is_some_and(|c| std::sync::Arc::strong_count(&c.snapshot) > 1)
+                            && page.bytes.shared().is_some()
+                        {
+                            page.bytes = Rc::new(if page.charge.resident() {
+                                (*page.bytes).clone()
+                            } else {
+                                PageBytes::Zero
+                            });
+                        }
                         let charge = Charge::new(&account);
                         if page.charge.resident() {
                             charge.ensure().expect("fork admitted by can_fork");
@@ -262,6 +276,7 @@ impl Clone for Memory {
             has_backings: self.has_backings,
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
+            fork_epoch: Cell::new(0),
             parallel_dirty: Vec::new(),
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
@@ -322,6 +337,7 @@ impl Memory {
             has_backings: false,
             cpu_borrow_safe: true,
             parallel_cache: None,
+            fork_epoch: Cell::new(0),
             parallel_dirty: Vec::new(),
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
@@ -530,11 +546,12 @@ impl Memory {
         (
             self.identity,
             self.code_revision,
-            if self.has_backings {
+            (if self.has_backings {
                 backing::backing_revision()
             } else {
-                0
-            },
+                0u64
+            })
+            .wrapping_add(self.parallel_cache.as_ref().map_or(0, |c| c.code_epoch())),
         )
     }
 
@@ -554,7 +571,8 @@ impl Memory {
             page.backing
                 .as_ref()
                 .filter(|b| b.shared || !b.private_copy)
-                .map_or(0, |b| b.object.version()),
+                .map_or(0, |b| b.object.version())
+                .wrapping_add(page.bytes.shared().map_or(0, |bytes| bytes.revision())),
         ))
     }
 
@@ -1020,6 +1038,8 @@ impl Memory {
             if matches!(N, 1 | 2 | 4 | 8 | 16) {
                 // SAFETY: live owning TLB, page-contained operand, no callbacks
                 // or mutation before the guarded CPU load.
+                let page = self.translated_page(entry);
+                let _guard = page.bytes.shared().map(|b| b.lock(offset, N));
                 if let Some(bytes) = unsafe { entry.read::<N>(offset) } {
                     return Ok(bytes);
                 }
@@ -1059,7 +1079,20 @@ impl Memory {
         })?;
         // SAFETY: same owning-TLB/lifetime bound as read, exclusive coordinator
         // access and one guest page. Failed protected stores have no effects.
-        if matches!(N, 1 | 2 | 4 | 8 | 16) && unsafe { entry.write(offset, bytes) } {
+        let stored = if matches!(N, 1 | 2 | 4 | 8 | 16) {
+            let page = self.translated_page(entry);
+            let mut guard = page.bytes.shared().map(|b| b.lock(offset, N));
+            let stored = unsafe { entry.write(offset, bytes) };
+            if stored {
+                if let (Some(shared), Some(guard)) = (page.bytes.shared(), guard.as_mut()) {
+                    shared.changed(guard, offset, N);
+                }
+            }
+            stored
+        } else {
+            false
+        };
+        if stored {
             self.revision = self.revision.wrapping_add(1);
             self.note_parallel_write(entry.frame);
             return Ok(());

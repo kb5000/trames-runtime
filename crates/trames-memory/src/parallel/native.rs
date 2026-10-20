@@ -659,7 +659,7 @@ mod tests {
         {
             let frame = view.frame(0x1000, Access::Write).unwrap();
             let _guard = frame.bytes.bytes.as_ref().unwrap().lock(0, 4096);
-            frame.bytes.version.store(u64::MAX - 1, Ordering::Relaxed);
+            frame.bytes.version().store(u64::MAX - 1, Ordering::Relaxed);
         }
         view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();
         let old = view.exclusive_read(0x1000, &mut bytes).unwrap();

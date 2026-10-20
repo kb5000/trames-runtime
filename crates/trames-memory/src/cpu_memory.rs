@@ -130,7 +130,39 @@ impl CpuMemory for Memory {
         n: usize,
         f: impl FnOnce(&mut [u8]) -> (T, bool),
     ) -> Result<T, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().atomic_update(a, n, f);
+        }
+        let a = a & 0x00ffffffffffffff;
         self.check(a, n, Access::Write)?;
+        self.check(a, n, Access::Read)?;
+        if n == 0 || n > 16 {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.prepare_mmu_write(a, n)?;
+        let page = self.page_for_access(a, n, Access::Write)?;
+        if let Some(storage) = page.shared_storage() {
+            let offset = (a % crate::PAGE_SIZE) as usize;
+            let backing = page
+                .backing
+                .as_ref()
+                .filter(|b| b.shared)
+                .map(|b| b.object.clone());
+            let mut guard = storage.lock(offset, n);
+            let (value, write) = f(guard.write(offset, n));
+            if write {
+                storage.changed(&mut guard, offset, n);
+                drop(guard);
+                if let Some(backing) = backing {
+                    backing.publish_write(offset, n)?;
+                }
+                let frame = self
+                    .frame(a & !(crate::PAGE_SIZE - 1))
+                    .expect("checked atomic");
+                self.mark_native_write(frame);
+            }
+            return Ok(value);
+        }
         let mut bytes = [0; 16];
         if n > bytes.len() {
             return Err(MemoryError::InvalidRange);
@@ -143,6 +175,17 @@ impl CpuMemory for Memory {
         Ok(result)
     }
     fn exclusive_read(&self, a: u64, b: &mut [u8]) -> Result<u128, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().exclusive_read(a, b);
+        }
+        let a = a & 0x00ffffffffffffff;
+        let page = self.page_for_access(a, b.len(), Access::Read)?;
+        if let Some(storage) = page.shared_storage() {
+            let offset = (a % crate::PAGE_SIZE) as usize;
+            let guard = storage.lock(offset, b.len());
+            b.copy_from_slice(guard.read(offset, b.len()));
+            return Ok((storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128);
+        }
         self.read(a, b)?;
         Ok(self.revision() as u128)
     }
@@ -152,11 +195,49 @@ impl CpuMemory for Memory {
         b: &[u8],
         token: Option<u128>,
     ) -> Result<bool, MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().exclusive_write(a, b, token);
+        }
+        let a = a & 0x00ffffffffffffff;
+        if token.is_none() {
+            return Ok(false);
+        }
+        self.check(a, b.len(), Access::Write)?;
+        self.prepare_mmu_write(a, b.len())?;
+        let page = self.page_for_access(a, b.len(), Access::Write)?;
+        if let Some(storage) = page.shared_storage() {
+            let offset = (a % crate::PAGE_SIZE) as usize;
+            let backing = page
+                .backing
+                .as_ref()
+                .filter(|b| b.shared)
+                .map(|b| b.object.clone());
+            let mut guard = storage.lock(offset, b.len());
+            if token
+                != Some((storage.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
+            {
+                return Ok(false);
+            }
+            guard.write(offset, b.len()).copy_from_slice(b);
+            storage.changed(&mut guard, offset, b.len());
+            drop(guard);
+            if let Some(backing) = backing {
+                backing.publish_write(offset, b.len())?;
+            }
+            let frame = self
+                .frame(a & !(crate::PAGE_SIZE - 1))
+                .expect("checked exclusive");
+            self.mark_native_write(frame);
+            return Ok(true);
+        }
         if token != Some(self.revision() as u128) {
             return Ok(false);
         }
         self.write(a, b)?;
         Ok(true)
+    }
+    fn fence(&self, order: Ordering) {
+        std::sync::atomic::fence(order);
     }
 }
 

@@ -18,14 +18,44 @@ are in [AGENTS.md](../../AGENTS.md).
 
 ## Scoped ownership
 
-Coordinator `Memory` pages use `Rc<PageBytes>` (shared immutable zeros, heap or mapped RAM) for fork COW. `Memory` and its
-backing objects are already local, non-`Send`/non-`Sync` objects. Ordinary CPU
-stores and native fragment writes therefore check local reference counts, without
-an atomic `Arc::make_mut` RMW for each store. Snapshot creation reads the bytes
-into separate `Arc<ConcurrentPage>` allocations; no coordinator Rc or borrowed
-slice crosses to a worker. Joined commit writes back through the same COW,
-backing, dirty and executable-invalidation hooks. Sharing a guest VM still uses
-the existing local borrow or concurrent view, rather than sharing the Rc itself.
+Coordinator `Memory` pages retain `Rc<PageBytes>` for fork ownership, while
+published CPU/native views retain an `Arc<SharedPage>` **over the same physical
+bytes**. Moving an owned heap Box into UnsafeCell storage preserves its address;
+mapped pages transfer their existing physical owner/slot lease. Publishing more
+cores does not copy bytes or change the Rc fork count. No coordinator Rc, VFS
+provider, or unguarded borrowed slice crosses to workers. Immutable mapping
+snapshots and per-worker software TLBs still describe permissions and lifetimes.
+
+Coordinator reads/writes, hardware CPU aliases, native fragments, atomic RMW and
+exclusive monitors acquire the same physical region guards. Byte writes become
+visible without commit or refresh. The coordinator uses scoped shared borrows;
+its optional unguarded native page-borrow API declines a shared page. Pair reads
+and moves handle physical aliases under a union guard or ordered page guards.
+No native function gains an algorithm-level lock.
+
+Shared anonymous mappings, shared file mappings and memfd/shm buffers expose
+resident `SharedPage` handles through `PageBacking::shared_page`. File cache pages
+move their original allocations into that domain; memfd retains its existing
+mapped allocation, including native display/GPU leases. Read-only private file
+mappings can read the same backing storage until COW. Mutable undetached private
+file mappings and custom providers without this opt-in retain bounded shadows
+and dirty-copy commit; their live EOF, fallible I/O and private-COW behavior are
+not bypassed. A private page that has detached rejoins the common shared path.
+
+A real fork retains Rc COW ownership, rather than treating CPU views as fork
+owners. Its epoch invalidates the parent's cached mapping view even if no bytes
+changed. Before writable fork pages return to workers, they detach once into
+owned physical storage; read-only shared storage can stay shared. A safe fork
+with an externally retained writer snapshots the child's private bytes, because
+the old view still has a writable capability. Normal runtime fork joins workers
+first. `CLONE_VM` never detaches or duplicates bytes. Remap/protect/truncate/
+discard and persistence still use joined checkpoints.
+
+Anonymous zeros remain unpaid and physically sparse in mapped storage. If the
+optional MMU arena is unavailable, a shared zero page's software allocation is
+also lazy: reads borrow immutable zeros, and the first guarded write publishes
+one zero-initialized allocation. Quota admission still precedes stores and
+kernel/native output effects; sharing a worker view does not charge again.
 
 `parallel/page.rs` owns stable heap or mapped byte storage and an atomic held
 mask: one bit for each 64-byte region in a 4 KiB page. A guard atomically acquires
@@ -70,10 +100,12 @@ Override/region masks, rather than numerical comparisons, handle epoch wrap.
 Local metadata rows use the same region guard; only page-wide epochs/masks need
 atomic storage. This avoids per-granule atomic/version writes for bulk interiors.
 
-Joined commit combines adjacent 64-byte dirty bits into one checked write. A
-fully dirty page needs one backing write instead of 64; sparse dirty runs never
-publish clean holes over another backing alias. COW, live EOF, mtime/writeback,
-reservation and executable invalidation hooks remain on the original paths.
+Joined commit publishes source generations and dirty metadata for shared
+resident storage without moving bytes. Shared providers receive coalesced dirty
+ranges through `publish_write` to retain mtime, persistence and backing epochs.
+Legacy/custom shadow providers still combine adjacent 64-byte dirty bits into
+one checked backing write; sparse runs never overwrite clean alias holes.
+Live EOF, retryable writeback and executable invalidation remain enforced.
 Dirty publication skips the RMW when all touched regions are already marked in
 the joined epoch. Only a quiescent coordinator clears those bits.
 
@@ -86,7 +118,11 @@ refreshes, including earlier views retaining the same physical pages. Mapping
 changes require joined workers and create a new bitmap. Worker completion/join
 publishes bytes and relaxed bitmap marks before the coordinator clears them.
 The original physical 64-byte dirty mask still coalesces runs and handles aliases;
-failed backing writes retain outstanding fragments and frame bits for retry.
+failed backing hooks retain outstanding fragments and frame bits for retry.
+
+[Shared-storage comparison](../validation/shared-memory.md) records source/worker
+physical memory and dirty commit before and after the change. RSS alone can
+count multiple aliases of a page; PSS counts their physical share once.
 
 The coordinator commits each selected shared VM once per round, before processing
 any returned syscall, signal or exit. Fork address spaces remain distinct, even

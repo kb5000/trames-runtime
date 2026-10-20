@@ -9,22 +9,51 @@ use std::{
 
 const REGION: usize = 64;
 const PAGE: usize = PAGE_SIZE as usize;
+static ZERO: [u8; PAGE] = [0; PAGE];
 
 /// Byte cells are never exposed without a matching, live range guard. The Box
 /// stays at one allocation for the lifetime of every guard and borrowed slice.
 enum Bytes {
     Heap(Box<[UnsafeCell<u8>; PAGE]>),
-    Mapped(std::sync::Arc<crate::mmu::Slot>),
+    Zero(OnceLock<Box<[UnsafeCell<u8>; PAGE]>>),
+    External {
+        pointer: usize,
+        _owner: Box<dyn Send + Sync>,
+    },
+    Mapped {
+        owner: std::sync::Arc<crate::mmu::host::Mapping>,
+        offset: usize,
+        _lease: Option<std::sync::Arc<crate::mmu::Slot>>,
+    },
 }
 impl Bytes {
+    fn write_ptr(&self) -> *mut u8 {
+        if let Self::Zero(bytes) = self {
+            bytes
+                .get_or_init(|| Box::new(std::array::from_fn(|_| UnsafeCell::new(0))))
+                .as_ptr()
+                .cast::<u8>()
+                .cast_mut()
+        } else {
+            self.as_ptr().cast::<u8>().cast_mut()
+        }
+    }
     fn as_ptr(&self) -> *const UnsafeCell<u8> {
         match self {
             Self::Heap(bytes) => bytes.as_ptr(),
-            Self::Mapped(slot) => slot.pointer().cast(),
+            Self::Zero(bytes) => bytes
+                .get()
+                .map_or(ZERO.as_ptr().cast(), |bytes| bytes.as_ptr()),
+            Self::External { pointer, .. } => *pointer as *const UnsafeCell<u8>,
+            Self::Mapped { owner, offset, .. } => {
+                owner.kernel.as_ptr().wrapping_add(*offset).cast()
+            }
         }
     }
 }
-pub(super) struct MutablePage {
+pub struct MutablePage {
+    pub(crate) identity: u64,
+    pub(crate) version: AtomicU64,
     bytes: Bytes,
     held: AtomicU64,
     reservations: OnceLock<Box<ReservationRows>>,
@@ -56,12 +85,77 @@ fn mask(offset: usize, len: usize) -> u64 {
 }
 
 impl MutablePage {
+    /// Retain an externally mapped page in the CPU byte domain.
+    ///
+    /// # Safety
+    /// `pointer` denotes a complete initialized RW page owned by `owner` until
+    /// its drop. All CPU references/accesses use this SharedPage's guards;
+    /// external raw GPU access follows the display protocol's buffer ownership.
+    pub unsafe fn from_mapping(pointer: *mut u8, owner: impl Send + Sync + 'static) -> Self {
+        assert!(!pointer.is_null());
+        Self::with_storage(Bytes::External {
+            pointer: pointer as usize,
+            _owner: Box::new(owner),
+        })
+    }
+    /// Move a coordinator allocation into the shared byte domain without copying.
+    pub fn from_box(bytes: Box<[u8; PAGE]>) -> Self {
+        // SAFETY: UnsafeCell<u8> is transparent, with the same allocation layout.
+        // Ownership is transferred; no reference to the old Box survives.
+        let bytes = unsafe { Box::from_raw(Box::into_raw(bytes).cast::<[UnsafeCell<u8>; PAGE]>()) };
+        Self::with_storage(Bytes::Heap(bytes))
+    }
+    pub(crate) fn from_owned(
+        bytes: crate::mmu::PageBytes,
+        slot: Option<std::sync::Arc<crate::mmu::Slot>>,
+    ) -> Self {
+        match bytes {
+            crate::mmu::PageBytes::Zero => Self::new_zero(slot),
+            crate::mmu::PageBytes::Heap(bytes) => Self::from_box(bytes),
+            crate::mmu::PageBytes::Mapped {
+                owner,
+                offset,
+                _lease,
+            } => Self::with_storage(Bytes::Mapped {
+                owner,
+                offset,
+                _lease,
+            }),
+            crate::mmu::PageBytes::Concurrent(_) => unreachable!("already shared"),
+        }
+    }
+    /// Scoped access, using the very same region guard as CPU/native workers.
+    pub fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+        let guard = self.lock(offset, len);
+        f(guard.read(offset, len))
+    }
+    pub fn with_write<T>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+        let mut guard = self.lock(offset, len);
+        self.changed(&mut guard, offset, len);
+        f(guard.write(offset, len))
+    }
+    pub(crate) fn changed(&self, guard: &mut Guard<'_>, offset: usize, len: usize) {
+        let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
+        guard.invalidate(offset, len, version);
+    }
+    pub fn revision(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+    pub(crate) fn snapshot(&self) -> [u8; PAGE] {
+        self.with_read(0, PAGE, |b| b.try_into().unwrap())
+    }
+    /// A shared logical zero page stays unallocated until its first write.
+    pub fn zero() -> Self {
+        Self::with_storage(Bytes::Zero(OnceLock::new()))
+    }
     pub fn new(bytes: [u8; PAGE]) -> Self {
         Self::with_storage(Bytes::Heap(Box::new(bytes.map(UnsafeCell::new))))
     }
     fn with_storage(bytes: Bytes) -> Self {
         Self {
             bytes,
+            identity: crate::new_backing_identity(),
+            version: AtomicU64::new(0),
             held: AtomicU64::new(0),
             reservations: OnceLock::new(),
             reservation_base: AtomicU64::new(0),
@@ -70,26 +164,34 @@ impl MutablePage {
     }
     pub(super) fn new_mapped(bytes: [u8; PAGE], slot: std::sync::Arc<crate::mmu::Slot>) -> Self {
         slot.initialize(&bytes);
-        Self::with_storage(Bytes::Mapped(slot))
+        Self::with_storage(Bytes::Mapped {
+            owner: slot.owner.clone(),
+            offset: slot.offset,
+            _lease: Some(slot),
+        })
     }
     pub(super) fn new_zero(slot: Option<std::sync::Arc<crate::mmu::Slot>>) -> Self {
         if let Some(slot) = slot {
             slot.initialize_zero();
-            Self::with_storage(Bytes::Mapped(slot))
+            Self::with_storage(Bytes::Mapped {
+                owner: slot.owner.clone(),
+                offset: slot.offset,
+                _lease: Some(slot),
+            })
         } else {
-            Self::new([0; PAGE])
+            Self::zero()
         }
     }
-    pub(super) fn physical(&self) -> Option<(&std::sync::Arc<crate::mmu::host::Mapping>, usize)> {
+    pub(crate) fn physical(&self) -> Option<(&std::sync::Arc<crate::mmu::host::Mapping>, usize)> {
         match &self.bytes {
-            Bytes::Mapped(slot) => Some((&slot.owner, slot.offset)),
+            Bytes::Mapped { owner, offset, .. } => Some((owner, *offset)),
             _ => None,
         }
     }
-    pub fn lock(&self, offset: usize, len: usize) -> Guard<'_> {
+    pub(crate) fn lock(&self, offset: usize, len: usize) -> Guard<'_> {
         self.lock_mask(mask(offset, len))
     }
-    pub fn lock_pair(&self, a: usize, b: usize, len: usize) -> Guard<'_> {
+    pub(crate) fn lock_pair(&self, a: usize, b: usize, len: usize) -> Guard<'_> {
         self.lock_mask(mask(a, len) | mask(b, len))
     }
     fn lock_mask(&self, mask: u64) -> Guard<'_> {
@@ -116,7 +218,7 @@ impl MutablePage {
     }
 }
 
-pub(super) struct Guard<'a> {
+pub(crate) struct Guard<'a> {
     page: &'a MutablePage,
     mask: u64,
 }
@@ -136,12 +238,7 @@ impl Guard<'_> {
         self.covers(offset, len);
         // SAFETY: the live exclusive region mask excludes every overlapping
         // reader/writer. &mut self also excludes another slice from this guard.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.page.bytes.as_ptr().cast::<u8>().cast_mut().add(offset),
-                len,
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.page.bytes.write_ptr().add(offset), len) }
     }
     pub fn copy_within(&mut self, source: usize, destination: usize, len: usize) {
         self.covers(source, len);
@@ -149,13 +246,16 @@ impl Guard<'_> {
         // SAFETY: both ranges are protected by this single guard; ptr::copy
         // permits overlap. No byte reference is alive across this mutable call.
         unsafe {
-            let ptr = self.page.bytes.as_ptr().cast::<u8>().cast_mut();
+            let ptr = self.page.bytes.write_ptr();
             std::ptr::copy(ptr.add(source), ptr.add(destination), len);
         }
     }
     pub fn reservation(&self, slot: usize) -> u64 {
         self.covers(slot * 16, 16);
         let rows = self.page.reservations.get_or_init(|| {
+            self.page
+                .reservation_base
+                .store(self.page.version.load(Ordering::Relaxed), Ordering::Relaxed);
             Box::new(ReservationRows {
                 values: std::array::from_fn(|_| UnsafeCell::new([0; 4])),
                 overrides: std::array::from_fn(|_| UnsafeCell::new(0)),
@@ -252,6 +352,18 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn software_zero_pages_allocate_only_on_first_write() {
+        let page = MutablePage::zero();
+        page.with_read(0, PAGE, |bytes| assert!(bytes.iter().all(|&b| b == 0)));
+        assert!(matches!(&page.bytes, Bytes::Zero(bytes) if bytes.get().is_none()));
+        page.with_write(64, 8, |bytes| bytes.fill(42));
+        page.with_read(0, PAGE, |bytes| {
+            assert_eq!(&bytes[64..72], &[42; 8]);
+            assert!(bytes[..64].iter().chain(&bytes[72..]).all(|&b| b == 0));
+        });
+        assert!(matches!(&page.bytes, Bytes::Zero(bytes) if bytes.get().is_some()));
+    }
     #[test]
     fn ordinary_writes_need_no_exclusive_table_and_late_monitors_observe_aba() {
         let page = MutablePage::new([0; PAGE]);

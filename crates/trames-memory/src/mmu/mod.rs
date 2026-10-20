@@ -33,6 +33,7 @@ const P: usize = PAGE_SIZE as usize;
 /// the existing fork-COW contract even when the physical storage is mapped.
 pub(super) enum PageBytes {
     Zero,
+    Concurrent(Arc<crate::SharedPage>),
     Heap(Box<[u8; P]>),
     Mapped {
         owner: Arc<host::Mapping>,
@@ -41,6 +42,39 @@ pub(super) enum PageBytes {
     },
 }
 impl PageBytes {
+    pub(crate) fn shared(&self) -> Option<&Arc<crate::SharedPage>> {
+        if let Self::Concurrent(bytes) = self {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn snapshot(&self) -> [u8; P] {
+        if let Some(bytes) = self.shared() {
+            bytes.snapshot()
+        } else {
+            **self
+        }
+    }
+    pub(crate) fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+        if let Some(bytes) = self.shared() {
+            bytes.with_read(offset, len, f)
+        } else {
+            f(&self[offset..offset + len])
+        }
+    }
+    pub(crate) fn with_write<T>(
+        &mut self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> T,
+    ) -> T {
+        if let Self::Concurrent(bytes) = self {
+            bytes.with_write(offset, len, f)
+        } else {
+            f(&mut self[offset..offset + len])
+        }
+    }
     pub fn is_zero(&self) -> bool {
         matches!(self, Self::Zero)
     }
@@ -55,14 +89,15 @@ impl PageBytes {
         }
     }
     pub(super) fn physical(&self) -> Option<(&Arc<host::Mapping>, usize)> {
-        if let Self::Mapped { owner, offset, .. } = self {
-            Some((owner, *offset))
-        } else {
-            None
+        match self {
+            Self::Mapped { owner, offset, .. } => Some((owner, *offset)),
+            Self::Concurrent(bytes) => bytes.physical(),
+            _ => None,
         }
     }
     fn belongs(&self, owner: &Arc<host::Mapping>, offset: usize) -> bool {
-        matches!(self, Self::Mapped { owner: old, offset: at, .. } if Arc::ptr_eq(owner, old) && *at == offset)
+        self.physical()
+            .is_some_and(|(old, at)| Arc::ptr_eq(owner, old) && at == offset)
     }
 }
 impl Clone for PageBytes {
@@ -70,7 +105,7 @@ impl Clone for PageBytes {
         if self.is_zero() {
             Self::Zero
         } else {
-            Self::new(**self)
+            Self::new(self.snapshot())
         }
     }
 }
@@ -78,6 +113,7 @@ impl Deref for PageBytes {
     type Target = [u8; P];
     fn deref(&self) -> &Self::Target {
         match self {
+            Self::Concurrent(_) => panic!("shared bytes require a scoped region guard"),
             Self::Zero => &[0; P],
             Self::Heap(bytes) => bytes,
             // SAFETY: offset denotes one complete, initialized, 4KiB page of
@@ -95,6 +131,7 @@ impl DerefMut for PageBytes {
             *self = Self::new([0; P]);
         }
         match self {
+            Self::Concurrent(_) => panic!("shared bytes require a scoped region guard"),
             Self::Zero => unreachable!(),
             Self::Heap(bytes) => bytes,
             // SAFETY: Rc::make_mut detached any fork peers. Different page
@@ -537,7 +574,7 @@ impl Memory {
                             .iter()
                             .map(|&frame| {
                                 let page = self.frames[frame].as_ref().unwrap();
-                                (!page.bytes.is_zero()).then(|| **page.bytes)
+                                (!page.bytes.is_zero()).then(|| page.bytes.snapshot())
                             })
                             .collect();
                         for (index, (&frame, bytes)) in frames.iter().zip(&data).enumerate() {

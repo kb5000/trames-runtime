@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Coherent mapped pages retained by mappings, not by the inode's weak cache.
 use super::*;
+use std::sync::Arc;
 use storage::FileData;
-use trames_memory::{MemoryError, PageBacking, PAGE_SIZE};
+use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
 pub(super) struct FilePage {
     identity: u64,
     bytes: RefCell<PageStorage>,
@@ -14,11 +15,16 @@ enum PageStorage {
     Zero,
     Heap(Box<[u8; PAGE_SIZE as usize]>),
     Shared(trames_shared::Mapping),
+    Concurrent {
+        bytes: Arc<SharedPage>,
+        shared: bool,
+    },
 }
 impl std::ops::Deref for PageStorage {
     type Target = [u8; PAGE_SIZE as usize];
     fn deref(&self) -> &Self::Target {
         match self {
+            Self::Concurrent { .. } => panic!("shared bytes require a scoped guard"),
             Self::Zero => &[0; PAGE_SIZE as usize],
             Self::Heap(bytes) => bytes,
             // SAFETY: map() proved a full guest page; the owning RefCell supplies
@@ -34,11 +40,64 @@ impl std::ops::DerefMut for PageStorage {
             *self = Self::Heap(Box::new([0; PAGE_SIZE as usize]));
         }
         match self {
+            Self::Concurrent { .. } => panic!("shared bytes require a scoped guard"),
             Self::Zero => unreachable!(),
             Self::Heap(bytes) => bytes,
             // SAFETY: exclusive coordinator page borrow, same retained range.
             // SharedFile never physically truncates a live mapping.
             Self::Shared(map) => unsafe { &mut *map.pointer().cast() },
+        }
+    }
+}
+impl PageStorage {
+    fn is_shared(&self) -> bool {
+        matches!(
+            self,
+            Self::Shared(_) | Self::Concurrent { shared: true, .. }
+        )
+    }
+    fn shared_page(&mut self) -> Arc<SharedPage> {
+        if let Self::Concurrent { bytes, .. } = self {
+            return bytes.clone();
+        }
+        let old = std::mem::replace(self, Self::Zero);
+        let shared = old.is_shared();
+        let bytes = Arc::new(match old {
+            Self::Zero => SharedPage::zero(),
+            Self::Heap(bytes) => SharedPage::from_box(bytes),
+            Self::Shared(map) => {
+                // SAFETY: this retained mapping covers one initialized page.
+                // All FilePage CPU accesses use the new common guards; native
+                // GPU buffer ownership is unchanged. No old CPU borrow survives.
+                unsafe { SharedPage::from_mapping(map.pointer(), map) }
+            }
+            Self::Concurrent { .. } => unreachable!(),
+        });
+        *self = Self::Concurrent {
+            bytes: bytes.clone(),
+            shared,
+        };
+        bytes
+    }
+    fn version(&self) -> u64 {
+        if let Self::Concurrent { bytes, .. } = self {
+            bytes.revision()
+        } else {
+            0
+        }
+    }
+    fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+        if let Self::Concurrent { bytes, .. } = self {
+            bytes.with_read(offset, len, f)
+        } else {
+            f(&self[offset..offset + len])
+        }
+    }
+    fn with_write<T>(&mut self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
+        if let Self::Concurrent { bytes, .. } = self {
+            bytes.with_write(offset, len, f)
+        } else {
+            f(&mut self[offset..offset + len])
         }
     }
 }
@@ -60,7 +119,8 @@ impl MappedData {
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
-        // open descriptions. Workers keep shadow pages until a joined commit.
+        // open descriptions. Bytes are shared with workers; dirty metadata and
+        // persistence hooks still require a joined checkpoint.
         let conflict = if write {
             self.pages
                 .borrow()
@@ -91,7 +151,7 @@ impl MappedData {
         };
         for (&offset, page) in self.pages.borrow().iter() {
             let Some(page) = page.upgrade() else { continue };
-            if !matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
+            if !page.bytes.borrow().is_shared() {
                 if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
                     *page.bytes.borrow_mut() = PageStorage::Shared(map);
                 }
@@ -180,8 +240,13 @@ impl MappedData {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                out[(start - offset) as usize..(to - offset) as usize].copy_from_slice(
-                    &p.bytes.borrow()[(start - base) as usize..(to - base) as usize],
+                p.bytes.borrow().with_read(
+                    (start - base) as usize,
+                    (to - start) as usize,
+                    |bytes| {
+                        out[(start - offset) as usize..(to - offset) as usize]
+                            .copy_from_slice(bytes);
+                    },
                 );
             }
         }
@@ -195,9 +260,16 @@ impl MappedData {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                if !matches!(*p.bytes.borrow(), PageStorage::Shared(_)) {
-                    p.bytes.borrow_mut()[(start - base) as usize..(to - base) as usize]
-                        .copy_from_slice(&bytes[(start - offset) as usize..(to - offset) as usize]);
+                if !p.bytes.borrow().is_shared() {
+                    p.bytes.borrow_mut().with_write(
+                        (start - base) as usize,
+                        (to - start) as usize,
+                        |out| {
+                            out.copy_from_slice(
+                                &bytes[(start - offset) as usize..(to - offset) as usize],
+                            );
+                        },
+                    );
                 }
                 p.version.set(p.version.get().wrapping_add(1));
             }
@@ -209,16 +281,15 @@ impl MappedData {
         if !page.dirty.get() {
             return Ok(());
         }
-        if matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
+        if page.bytes.borrow().is_shared() {
             page.dirty.set(false);
             return Ok(());
         }
         let count = self.len().saturating_sub(offset).min(PAGE_SIZE) as usize;
         if count != 0 {
-            let written = self
-                .data
-                .borrow_mut()
-                .write_at(offset, &page.bytes.borrow()[..count])?;
+            let written = page.bytes.borrow().with_read(0, count, |bytes| {
+                self.data.borrow_mut().write_at(offset, bytes)
+            })?;
             if written != count {
                 return Err(Errno(5));
             }
@@ -253,14 +324,16 @@ impl MappedData {
         self.refresh_shared_pages();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                if !matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
+                if !page.bytes.borrow().is_shared() {
                     let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
                     let mut content = page.bytes.borrow_mut();
                     if bytes.is_empty() {
                         *content = PageStorage::Zero;
                     } else {
-                        content.fill(0);
-                        content[..bytes.len()].copy_from_slice(&bytes);
+                        content.with_write(0, PAGE_SIZE as usize, |out| {
+                            out.fill(0);
+                            out[..bytes.len()].copy_from_slice(&bytes);
+                        });
                     }
                 }
                 page.version.set(page.version.get().wrapping_add(1));
@@ -322,6 +395,21 @@ impl PageBacking for FileMapping {
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((self.page.identity, 0))
     }
+    fn shared_page(&self) -> Option<Arc<SharedPage>> {
+        Some(self.page.bytes.borrow_mut().shared_page())
+    }
+    fn publish_write(&self, _: usize, _: usize) -> std::result::Result<(), MemoryError> {
+        if !self.writable {
+            return Err(MemoryError::BackingIo(13));
+        }
+        self.page.dirty.set(true);
+        self.page
+            .version
+            .set(self.page.version.get().wrapping_add(1));
+        self.node.borrow_mut().times[1] = storage::Timestamp::now();
+        trames_memory::backing_changed();
+        Ok(())
+    }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
         let n = self.node.borrow();
         let Content::File(data) = &n.content else {
@@ -333,14 +421,20 @@ impl PageBacking for FileMapping {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> std::result::Result<(), MemoryError> {
-        out.copy_from_slice(&self.page.bytes.borrow()[offset..offset + out.len()]);
+        self.page
+            .bytes
+            .borrow()
+            .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
         Ok(())
     }
     fn write(&self, offset: usize, bytes: &[u8]) -> std::result::Result<(), MemoryError> {
         if !self.writable {
             return Err(MemoryError::BackingIo(13));
         }
-        self.page.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.page
+            .bytes
+            .borrow_mut()
+            .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
         self.page.dirty.set(true);
         self.page
             .version
@@ -355,7 +449,7 @@ impl PageBacking for FileMapping {
         len: usize,
         f: &mut dyn FnMut(&[u8]),
     ) -> std::result::Result<bool, MemoryError> {
-        f(&self.page.bytes.borrow()[offset..offset + len]);
+        self.page.bytes.borrow().with_read(offset, len, f);
         Ok(true)
     }
     fn with_write(
@@ -374,7 +468,7 @@ impl PageBacking for FileMapping {
             .set(self.page.version.get().wrapping_add(1));
         self.node.borrow_mut().times[1] = storage::Timestamp::now();
         trames_memory::backing_changed();
-        f(&mut bytes[offset..offset + len]);
+        bytes.with_write(offset, len, f);
         Ok(true)
     }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
@@ -388,7 +482,10 @@ impl PageBacking for FileMapping {
         Some(self.node.borrow().inode)
     }
     fn version(&self) -> u64 {
-        self.page.version.get()
+        self.page
+            .version
+            .get()
+            .wrapping_add(self.page.bytes.borrow().version())
     }
     fn executable(&self) -> bool {
         self.executable
@@ -516,6 +613,73 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn workers_share_file_and_memfd_bytes_without_a_publication_copy() {
+        use trames_memory::{parallel::Registry, CpuMemory, NativeMemory};
+        for memfd in [false, true] {
+            let mut v = Vfs::default();
+            let fd = if memfd {
+                v.memfd_create(b"shared-page", 0).unwrap()
+            } else {
+                v.open_at(AT_FDCWD, b"/shared-page", 0x42, 0o600).unwrap()
+            };
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            let mut memory = Memory::default();
+            mapped(
+                &v,
+                &mut memory,
+                fd,
+                0x40000,
+                PAGE_SIZE,
+                true,
+                Permissions::RW,
+            );
+            mapped(
+                &v,
+                &mut memory,
+                fd,
+                0x50000,
+                PAGE_SIZE,
+                false,
+                Permissions::RX,
+            );
+            let mut registry = Registry::default();
+            let mut view = memory.parallel_view(&mut registry).unwrap();
+            assert_eq!(registry.metrics.copied_publish_bytes, 0);
+            let code_epoch = view.instruction_identity();
+            let code_page = memory.instruction_page_identity(0x50008).unwrap();
+            view.write_array(0x40008, *b"worker!!").unwrap();
+            assert_ne!(code_epoch, view.instruction_identity());
+            assert_ne!(
+                code_page,
+                memory.instruction_page_identity(0x50008).unwrap()
+            );
+            // File I/O and a private read-only alias read the same physical bytes
+            // even before metadata/persistence commit.
+            v.seek(fd, 8, 0).unwrap();
+            assert_eq!(v.read(fd, 8).unwrap(), b"worker!!");
+            assert_eq!(memory.read_array::<8>(0x50008).unwrap(), *b"worker!!");
+            let pair =
+                NativeMemory::with_read_pair(&memory, 0x40008, 0x50008, 8, |a, b| a == b).unwrap();
+            assert_eq!(pair, (true, true, true));
+            let mut old = [0; 8];
+            let token = view.exclusive_read(0x40008, &mut old).unwrap();
+            memory
+                .with_write_chunk(0x40008, 8, |bytes| bytes.copy_from_slice(b"native!!"))
+                .unwrap();
+            assert!(!view
+                .exclusive_write(0x40008, b"stale!!!", Some(token))
+                .unwrap());
+            assert_eq!(view.read_array::<8>(0x50008).unwrap(), *b"native!!");
+            drop(view);
+            memory.commit_parallel().unwrap();
+            drop(memory.parallel_view(&mut registry).unwrap());
+            assert_eq!(registry.metrics.copied_publish_bytes, 0);
+            memory.sync_range(0x40000, PAGE_SIZE).unwrap();
+            v.seek(fd, 8, 0).unwrap();
+            assert_eq!(v.read(fd, 8).unwrap(), b"native!!");
+        }
+    }
     #[test]
     fn eof_placeholders_stay_zero_and_growth_updates_existing_mappings() {
         let data = MappedData::new(FileData::Memory(vec![17; 10]));
