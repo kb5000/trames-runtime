@@ -190,8 +190,12 @@ pub(crate) enum Role {
     Popup,
     Subsurface,
     Cursor,
+    X11,
 }
 pub(crate) struct Surface {
+    pub x11: Option<(crate::xwm::Identity, u32)>,
+    pub xserial: Option<u64>,
+    pub pending_xserial: Option<u64>,
     pub role: Role,
     pub dismissed: bool,
     pub resource: WlSurface,
@@ -238,6 +242,9 @@ pub(crate) struct Surface {
     pub pending_input: Option<Option<Region>>,
 }
 impl Surface {
+    pub fn is_toplevel(&self) -> bool {
+        self.top.is_some() || (self.x11.is_some() && self.parent.is_none())
+    }
     pub fn take_pending(&mut self) -> CachedCommit {
         CachedCommit {
             buffer: self
@@ -254,6 +261,9 @@ impl Surface {
     }
     pub fn new(resource: WlSurface, connection: u64) -> Self {
         Self {
+            x11: None,
+            xserial: None,
+            pending_xserial: None,
             resource,
             connection,
             role: Role::None,
@@ -353,7 +363,7 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
     }
     surfaces
         .iter()
-        .filter(|(_, s)| s.top.is_some() && s.current.is_some())
+        .filter(|(_, s)| s.is_toplevel() && s.current.is_some())
         .map(|(&id, s)| {
             let mut scene = Vec::new();
             let (gx, gy, ..) = s.geometry.unwrap_or((0, 0, 0, 0));

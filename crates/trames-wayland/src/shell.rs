@@ -27,6 +27,12 @@ impl State {
         self.changed();
     }
     pub fn configure(&mut self, id: u64) {
+        if let Some(s) = self.surfaces.get(&id) {
+            let (w, h) = s.requested_size;
+            if w > 0 && h > 0 {
+                self.xcommand(id, |xid| crate::xwm::Command::Resize(xid, w, h));
+            }
+        }
         self.serial = self.serial.wrapping_add(1).max(1);
         let serial = self.serial;
         let Some(s) = self.surfaces.get_mut(&id) else {

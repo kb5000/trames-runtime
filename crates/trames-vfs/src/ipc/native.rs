@@ -22,6 +22,7 @@ struct Incoming {
     done: usize,
 }
 struct Connection {
+    xwm: bool,
     local: Rc<LocalSocket>,
     native: NativeSocket,
     token: u64,
@@ -78,7 +79,7 @@ impl PipeRelay {
 }
 pub(crate) struct Services {
     server: Server,
-    bindings: Vec<(Vec<u8>, Rc<LocalSocket>)>,
+    bindings: Vec<(Vec<u8>, Rc<LocalSocket>, bool)>,
     connections: Vec<Connection>,
 }
 fn io_errno(e: io::Error) -> Errno {
@@ -120,7 +121,7 @@ impl OpenDescription {
 impl Services {
     fn pump(&mut self, vfs: &Vfs) -> bool {
         let mut progress = false;
-        for (_, listener) in &self.bindings {
+        for (_, listener, xwm) in &self.bindings {
             let mut pending = listener.listener.borrow_mut();
             let Some(pending) = pending.as_mut() else {
                 continue;
@@ -131,9 +132,17 @@ impl Services {
                     continue;
                 }
                 let [pid, uid, gid] = local.peer_credentials.get();
-                match self.server.connect(pid, uid, gid) {
+                let connected = if *xwm {
+                    self.server
+                        .connect_xwm(pid, uid, gid)
+                        .map(|socket| (0, socket))
+                } else {
+                    self.server.connect(pid, uid, gid)
+                };
+                match connected {
                     Ok((token, native)) => {
                         self.connections.push(Connection {
+                            xwm: *xwm,
                             local,
                             native: native.into(),
                             token,
@@ -342,6 +351,36 @@ impl Connection {
     }
 }
 impl Vfs {
+    fn clear_stale_x11_endpoints(&mut self) {
+        let Ok(directory) = self.resolve_final(AT_FDCWD, b"/tmp/.X11-unix", false) else {
+            return;
+        };
+        let names = {
+            let fs = directory.mount().map_or(&self.fs, |m| &m.fs).borrow();
+            crate::directory::children(&fs.paths,directory.key()).filter(|(name,node)| {
+                name.starts_with(b"X") && name.len()>1 && name[1..].iter().all(u8::is_ascii_digit)
+                 && matches!(&node.borrow().content,Content::Socket(peer) if peer.strong_count()==0)
+            }).map(|(name,_)|name.to_vec()).collect::<Vec<_>>()
+        };
+        for name in names {
+            let mut socket = b"/tmp/.X11-unix/".to_vec();
+            socket.extend_from_slice(&name);
+            if self.unlink_at(AT_FDCWD, &socket, false).is_err() {
+                continue;
+            }
+            let mut lock = b"/tmp/.".to_vec();
+            lock.extend_from_slice(&name);
+            lock.extend_from_slice(b"-lock");
+            if let Ok(path) = self.resolve_final(AT_FDCWD, &lock, false) {
+                let regular = self
+                    .node(&path)
+                    .is_ok_and(|node| matches!(node.borrow().content, Content::File(_)));
+                if regular {
+                    let _ = self.unlink_at(AT_FDCWD, &lock, false);
+                }
+            }
+        }
+    }
     pub fn enable_wayland(&mut self, directory: &[u8]) -> Result<Server> {
         if !directory.starts_with(b"/") || directory.contains(&0) {
             return Err(Errno(22));
@@ -355,11 +394,14 @@ impl Vfs {
                 Err(e) => return Err(e),
             }
         }
-        path.extend_from_slice(b"/wayland-0");
         let services = self.native_services.borrow().clone();
         let services = match services {
             Some(services) => services,
             None => {
+                // A persisted X11 socket without a live endpoint proves its
+                // lock belongs to an earlier session. Linux PIDs restart at 1,
+                // so kill(old_pid,0) alone can mistake a reused PID for Xwayland.
+                self.clear_stale_x11_endpoints();
                 let server = Server::new().map_err(io_errno)?;
                 let services = Rc::new(RefCell::new(Services {
                     server,
@@ -370,29 +412,43 @@ impl Vfs {
                 services
             }
         };
-        if services.borrow().bindings.iter().any(|(p, _)| p == &path) {
-            return Ok(services.borrow().server.clone());
-        }
-        // Persisted socket inodes have no live endpoint after a cold restart.
-        // Replace only such a stale socket; never replace an ordinary user file.
-        if let Ok(resolved) = self.resolve_final(AT_FDCWD, &path, false) {
-            if let Ok(node) = self.node(&resolved) {
-                let stale =
-                    matches!(&node.borrow().content,Content::Socket(peer)if peer.strong_count()==0);
-                if stale {
-                    self.unlink_at(AT_FDCWD, &path, false)?;
+        // Register the XWM endpoint before the Wayland display: a launcher
+        // connects it first and then execs Xwayland without changing its PID.
+        for (name, xwm) in [
+            (b"/trames-xwm".as_slice(), true),
+            (b"/wayland-0".as_slice(), false),
+        ] {
+            let mut path = path.clone();
+            path.extend_from_slice(name);
+            if services
+                .borrow()
+                .bindings
+                .iter()
+                .any(|(p, _, _)| p == &path)
+            {
+                continue;
+            }
+            // Persisted socket inodes have no live endpoint after a cold restart.
+            // Replace only such a stale socket; never replace an ordinary user file.
+            if let Ok(resolved) = self.resolve_final(AT_FDCWD, &path, false) {
+                if let Ok(node) = self.node(&resolved) {
+                    let stale = matches!(&node.borrow().content,Content::Socket(peer)if peer.strong_count()==0);
+                    if stale {
+                        self.unlink_at(AT_FDCWD, &path, false)?;
+                    }
                 }
             }
+            let listener = self.new_local(1)?;
+            let mut name = vec![1, 0];
+            name.extend_from_slice(&path);
+            name.push(0);
+            self.local_bind(&listener, &name)?;
+            self.local_listen(&listener, 32)?;
+            let mut services = services.borrow_mut();
+            services.bindings.push((path, listener, xwm));
         }
-        let listener = self.new_local(1)?;
-        let mut name = vec![1, 0];
-        name.extend_from_slice(&path);
-        name.push(0);
-        self.local_bind(&listener, &name)?;
-        self.local_listen(&listener, 32)?;
-        let mut services = services.borrow_mut();
-        services.bindings.push((path, listener));
-        Ok(services.server.clone())
+        let server = services.borrow().server.clone();
+        Ok(server)
     }
     pub fn pump_native_services(&self) -> bool {
         let services = self.native_services.borrow().clone();
@@ -419,7 +475,7 @@ impl Vfs {
         let token = services
             .connections
             .iter()
-            .find(|c| Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow()))
+            .find(|c| !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow()))
             .map(|c| c.token)
             .ok_or(Errno(9))?;
         Ok((services.server.clone(), token))
@@ -572,5 +628,33 @@ mod tests {
         assert_eq!(&response.data[..4], &2u32.to_ne_bytes());
         assert!(vfs.wayland_connection(fd).unwrap().1 > 0);
         drop(server);
+    }
+    #[test]
+    fn cold_wayland_start_removes_only_dead_x11_sockets_and_their_locks() {
+        let mut v = Vfs::default();
+        let _ = v.mkdir_at(AT_FDCWD, b"/tmp", 0o1777);
+        v.mkdir_at(AT_FDCWD, b"/tmp/.X11-unix", 0o1777).unwrap();
+        let address = |n| format!("\x01\x00/tmp/.X11-unix/X{n}\x00").into_bytes();
+        let dead = v.new_local(1).unwrap();
+        v.local_bind(&dead, &address(0)).unwrap();
+        drop(dead);
+        let live = v.new_local(1).unwrap();
+        v.local_bind(&live, &address(1)).unwrap();
+        v.import_file(b"/tmp/.X0-lock", b"4".to_vec()).unwrap();
+        v.import_file(b"/tmp/.X1-lock", b"5".to_vec()).unwrap();
+        v.import_file(b"/tmp/.X11-unix/X2", b"user file".to_vec())
+            .unwrap();
+        v.import_file(b"/tmp/.X2-lock", b"6".to_vec()).unwrap();
+        let _server = v.enable_wayland(b"/run/user/0").unwrap();
+        assert_eq!(v.stat_at(AT_FDCWD, b"/tmp/.X11-unix/X0"), Err(Errno(2)));
+        assert_eq!(v.stat_at(AT_FDCWD, b"/tmp/.X0-lock"), Err(Errno(2)));
+        for path in [
+            b"/tmp/.X11-unix/X1".as_slice(),
+            b"/tmp/.X1-lock",
+            b"/tmp/.X11-unix/X2",
+            b"/tmp/.X2-lock",
+        ] {
+            assert!(v.stat_at(AT_FDCWD, path).is_ok());
+        }
     }
 }

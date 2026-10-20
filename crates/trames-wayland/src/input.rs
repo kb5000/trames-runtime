@@ -151,6 +151,7 @@ impl State {
         }
         self.text_focus_leave();
         self.seat.focus = id;
+        self.xfocus(id);
         // Losing native focus cancels held keys rather than leaving a guest
         // modifier stuck after switching to the terminal or another window.
         self.seat.pressed.clear();
@@ -168,6 +169,9 @@ impl State {
         self.changed();
     }
     pub(crate) fn input(&mut self, event: InputEvent) {
+        if self.defer_xkey(&event) {
+            return;
+        }
         self.seat.keyboards.retain(Resource::is_alive);
         self.seat.pointers.retain(Resource::is_alive);
         match event {

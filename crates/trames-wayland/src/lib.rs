@@ -18,6 +18,8 @@ mod popup;
 mod protocol;
 mod shell;
 mod subsurface;
+mod xwayland;
+mod xwm;
 pub use scene::{BufferLease, ImageBuffer, ShmBuffer, SurfaceImage, WindowMode, WindowSnapshot};
 
 /// Guest identity is attached by the VM bridge, never inferred from the host UID.
@@ -45,6 +47,7 @@ struct State {
     seat: input::Seat,
     selection: selection::Selection,
     text: text::TextInputs,
+    xwayland: xwayland::Xwayland,
     surfaces: std::collections::BTreeMap<u64, scene::Surface>,
 }
 impl Default for State {
@@ -57,6 +60,7 @@ impl Default for State {
             seat: Default::default(),
             selection: Default::default(),
             text: Default::default(),
+            xwayland: Default::default(),
             surfaces: Default::default(),
         }
     }
@@ -64,8 +68,8 @@ impl Default for State {
 impl Compositor {
     pub fn new() -> io::Result<Self> {
         let display = Display::new().map_err(io::Error::other)?;
-        State::globals(&display.handle());
         let mut state = State::default();
+        State::globals(&display.handle(), state.xwayland.authorized.clone());
         state.initialize_input()?;
         Ok(Self {
             display,
@@ -94,6 +98,7 @@ impl Compositor {
         true
     }
     pub fn close(&mut self, id: u64) {
+        self.state.xcommand(id, xwm::Command::Close);
         if let Some(top) = self.state.surfaces.get(&id).and_then(|s| s.top.as_ref()) {
             top.close();
         }
@@ -128,7 +133,7 @@ impl Compositor {
         let Some(root) = self.state.surfaces.get(&window) else {
             return;
         };
-        if root.top.is_none() {
+        if !root.is_toplevel() {
             return;
         }
         let mut visit = vec![window];
@@ -174,6 +179,7 @@ impl Compositor {
     }
     /// Nonblocking protocol progress. Native event-loop integration owns polling.
     pub fn dispatch(&mut self) -> io::Result<usize> {
+        self.state.pump_xwm();
         let count = self.display.dispatch_clients(&mut self.state)?;
         self.callback_timeout = self.flush_callbacks();
         self.display.flush_clients()?;

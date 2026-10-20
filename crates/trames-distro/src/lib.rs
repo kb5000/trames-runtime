@@ -2,6 +2,7 @@
 //! Pinned distribution verification and checked import into the private VFS.
 mod timezone;
 mod vulkan;
+mod xwayland;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -10,6 +11,7 @@ use std::{
 pub use timezone::synchronize_timezone;
 use trames_vfs::{Errno, Vfs, AT_FDCWD, MAX_PATH};
 pub use vulkan::{install_vulkan_icd, install_zink_egl};
+pub use xwayland::install_xwayland_launcher;
 pub const ALPINE_VERSION: &str = "3.22.6";
 pub const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.6-aarch64.tar.gz";
 pub const ALPINE_SHA256: &str = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe";

@@ -32,6 +32,7 @@ pub struct SurfaceInfo {
 }
 enum Command {
     Connect(UnixStream, ClientIdentity),
+    ConnectXwm(UnixStream, crate::xwm::Identity),
     Resize(u64, u32, u32),
     Mode(u64, WindowMode),
     Close(u64),
@@ -77,6 +78,14 @@ impl Drop for Control {
 #[derive(Clone)]
 pub struct Server(Arc<Control>);
 impl Server {
+    /// Paired with Xwayland's -wm descriptor by the guest launcher. The VFS
+    /// supplies credentials; the native XWM never opens a guest path itself.
+    pub fn connect_xwm(&self, pid: u32, uid: u32, gid: u32) -> io::Result<UnixStream> {
+        let (guest, native) = UnixStream::pair()?;
+        guest.set_nonblocking(true)?;
+        self.0.send(Command::ConnectXwm(native, (pid, uid, gid)))?;
+        Ok(guest)
+    }
     pub fn new() -> io::Result<Self> {
         let compositor = Compositor::new()?;
         let (wake, read) = UnixStream::pair()?;
@@ -184,6 +193,18 @@ fn run(
     while !stopped {
         while let Ok(command) = receiver.try_recv() {
             match command {
+                Command::ConnectXwm(socket, key) => {
+                    if compositor.state.xwayland.managers.len() < 4
+                        && !compositor.state.xwayland.managers.contains_key(&key)
+                    {
+                        if let Ok(wm) = crate::xwm::Manager::new(socket) {
+                            if let Ok(mut allowed) = compositor.state.xwayland.authorized.lock() {
+                                allowed.insert(key);
+                            }
+                            compositor.state.xwayland.managers.insert(key, wm);
+                        }
+                    }
+                }
                 Command::Connect(stream, identity) => {
                     let _ = compositor.connect(stream, identity);
                 }

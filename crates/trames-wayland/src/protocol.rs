@@ -14,7 +14,10 @@ pub(crate) struct Pool {
     size: usize,
 }
 impl State {
-    pub fn globals(handle: &DisplayHandle) {
+    pub fn globals(
+        handle: &DisplayHandle,
+        xwayland: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::xwm::Identity>>>,
+    ) {
         handle.create_global::<Self, wl_compositor::WlCompositor, _>(4, ());
         handle.create_global::<Self, wl_shm::WlShm, _>(1, ());
         handle.create_global::<Self, wl_output::WlOutput, _>(3, ());
@@ -23,6 +26,7 @@ impl State {
         crate::selection::globals(handle);
         crate::text::globals(handle);
         crate::subsurface::globals(handle);
+        crate::xwayland::globals(handle, xwayland);
     }
     pub fn id(&mut self) -> u64 {
         let id = self.next;
@@ -36,6 +40,7 @@ impl State {
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn commit(&mut self, id: u64) {
+        self.xcommit(id);
         let synchronized = self.effectively_synchronized(id);
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
