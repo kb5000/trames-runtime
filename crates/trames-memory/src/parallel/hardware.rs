@@ -93,7 +93,7 @@ impl View {
         offset: usize,
         bytes: [u8; N],
     ) -> bool {
-        if entry.cpu == 0 || entry.tag & 4 != 0 {
+        if entry.cpu == 0 || entry.tag & (4 | Translation::RESIDENT) != Translation::RESIDENT {
             return false;
         }
         // SAFETY: same retained immutable snapshot and page-contained operand.

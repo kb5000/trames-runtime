@@ -40,14 +40,21 @@ struct ConcurrentPage {
 impl ConcurrentPage {
     fn new(
         bytes: [u8; PAGE_SIZE as usize],
+        zero: bool,
         constant: bool,
         code_epoch: Arc<AtomicU64>,
         slot: Option<Arc<mmu::Slot>>,
     ) -> Self {
         let immutable = if constant {
             Some(Arc::new(if let Some(slot) = &slot {
-                slot.initialize(&bytes);
+                if zero {
+                    slot.initialize_zero();
+                } else {
+                    slot.initialize(&bytes);
+                }
                 PageBytes::from_slot(slot.clone())
+            } else if zero {
+                PageBytes::Zero
             } else {
                 PageBytes::new(bytes)
             }))
@@ -57,7 +64,9 @@ impl ConcurrentPage {
         let mutable = if constant {
             None
         } else {
-            Some(if let Some(slot) = slot {
+            Some(if zero {
+                page::MutablePage::new_zero(slot)
+            } else if let Some(slot) = slot {
                 page::MutablePage::new_mapped(bytes, slot)
             } else {
                 page::MutablePage::new(bytes)
@@ -125,6 +134,7 @@ struct Frame {
     native_live_private: std::sync::atomic::AtomicBool,
     error: Option<MemoryError>,
     bytes: Arc<ConcurrentPage>,
+    charge: Arc<Charge>,
 }
 fn prepare_frame(
     space: u64,
@@ -153,9 +163,20 @@ fn prepare_frame(
     });
     let bytes = if let Some(frame) = same {
         frame.bytes.clone()
+    } else if error.is_some() {
+        Arc::new(ConcurrentPage::new(
+            [0; PAGE_SIZE as usize],
+            true,
+            true,
+            registry.code_epoch.clone(),
+            None,
+        ))
     } else {
         let mut data = [0; PAGE_SIZE as usize];
-        if error.is_none() {
+        // A live EOF/backing error rejects every access before byte transport.
+        // Do not allocate/copy placeholder RAM for an oversized ELF mmap tail.
+        let zero = error.is_some() || (page.backing.is_none() && page.bytes.is_zero());
+        if error.is_none() && !zero {
             registry.metrics.source_page_reads += 1;
             page.read_bytes(0, &mut data).ok()?;
         }
@@ -166,6 +187,7 @@ fn prepare_frame(
             } else {
                 let bytes = Arc::new(ConcurrentPage::new(
                     data,
+                    false,
                     false,
                     registry.code_epoch.clone(),
                     None,
@@ -179,7 +201,8 @@ fn prepare_frame(
         } else {
             Arc::new(ConcurrentPage::new(
                 data,
-                !page.permissions.write,
+                zero,
+                !page.permissions.write || error.is_some(),
                 registry.code_epoch.clone(),
                 if page.backing.is_none() {
                     registry.mmu.slot(space, base)
@@ -209,6 +232,7 @@ fn prepare_frame(
         ),
         error,
         bytes,
+        charge: page.charge.clone(),
     })
 }
 
@@ -297,13 +321,17 @@ impl View {
                 other => other.clone(),
             });
         }
-        self.translations[Translation::slot(base)].set(Translation::new(
+        let mut entry = Translation::new(
             base,
             index,
             frame.permissions,
             false,
             self.snapshot.mmu.page_alias(&self.mmu_cache, base),
-        ));
+        );
+        if frame.charge.resident() {
+            entry.tag |= Translation::RESIDENT;
+        }
+        self.translations[Translation::slot(base)].set(entry);
         Ok(frame)
     }
     #[inline]
@@ -331,7 +359,11 @@ impl View {
                 .as_ref()
                 .expect("mutable page")
                 .lock(offset, out.len());
-            out.copy_from_slice(guard.read(offset, out.len()));
+            if frame.charge.resident() {
+                out.copy_from_slice(guard.read(offset, out.len()));
+            } else {
+                out.fill(0);
+            }
         }
     }
     #[inline]
@@ -344,6 +376,18 @@ impl View {
                 word.fetch_or(bit, Ordering::Relaxed);
             }
         }
+    }
+    fn ensure_resident(&self, frame: &Frame) -> Result<(), MemoryError> {
+        frame.charge.ensure()?;
+        // A first store upgrades only this view's cached tag. Subsequent CPU
+        // stores use the ordinary hardware/TLB path without an atomic charge.
+        let cell = &self.translations[Translation::slot(frame.base)];
+        let mut entry = cell.get();
+        if entry.matches(frame.base, Translation::VALID) {
+            entry.tag |= Translation::RESIDENT;
+            cell.set(entry);
+        }
+        Ok(())
     }
     /// Mapping/EOF validation is complete before this private transport helper.
     fn copy_read(&self, mut address: u64, out: &mut [u8]) -> Result<(), MemoryError> {
@@ -398,7 +442,13 @@ impl View {
         self.copy_read(address, out)?;
         Ok(())
     }
-    fn write_fragment(&self, frame: &Frame, offset: usize, input: &[u8]) {
+    fn write_fragment(
+        &self,
+        frame: &Frame,
+        offset: usize,
+        input: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.ensure_resident(frame)?;
         let mut guard = frame
             .bytes
             .bytes
@@ -407,6 +457,7 @@ impl View {
             .lock(offset, input.len());
         guard.write(offset, input.len()).copy_from_slice(input);
         self.changed(frame, &mut guard, offset, input.len());
+        Ok(())
     }
 }
 impl CpuMemory for View {
@@ -417,7 +468,10 @@ impl CpuMemory for View {
             return Ok(());
         }
         for at in (address & !(PAGE_SIZE - 1)..address + len as u64).step_by(PAGE_SIZE as usize) {
-            self.frame(at.max(address), access)?;
+            let frame = self.frame(at.max(address), access)?;
+            if access == Access::Write {
+                self.ensure_resident(frame)?;
+            }
         }
         Ok(())
     }
@@ -482,16 +536,23 @@ impl CpuMemory for View {
         }
         if input.len() <= (PAGE_SIZE - address % PAGE_SIZE) as usize {
             let (frame, offset) = self.reached(address, input.len(), Access::Write)?;
-            self.write_fragment(frame, offset, input);
+            self.write_fragment(frame, offset, input)?;
             return Ok(());
         }
         self.check(address, input.len(), Access::Write)?;
+        for at in
+            (address & !(PAGE_SIZE - 1)..address + input.len() as u64).step_by(PAGE_SIZE as usize)
+        {
+            self.frame(at.max(address), Access::Write)?
+                .charge
+                .ensure()?;
+        }
         let mut done = 0;
         while done < input.len() {
             let frame = self.frame(address, Access::Write)?;
             let offset = (address % PAGE_SIZE) as usize;
             let len = (input.len() - done).min(PAGE_SIZE as usize - offset);
-            self.write_fragment(frame, offset, &input[done..done + len]);
+            self.write_fragment(frame, offset, &input[done..done + len])?;
             address += len as u64;
             done += len;
         }
@@ -562,6 +623,7 @@ impl CpuMemory for View {
             .as_ref()
             .expect("writable page")
             .lock(offset, len);
+        self.ensure_resident(frame)?;
         let (value, write) = update(guard.write(offset, len));
         if write {
             self.changed(frame, &mut guard, offset, len)
@@ -606,6 +668,7 @@ impl CpuMemory for View {
         {
             return Ok(false);
         }
+        self.ensure_resident(frame)?;
         guard.write(offset, bytes.len()).copy_from_slice(bytes);
         self.changed(frame, &mut guard, offset, bytes.len());
         Ok(true)

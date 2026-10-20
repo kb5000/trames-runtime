@@ -18,7 +18,7 @@ are in [AGENTS.md](../../AGENTS.md).
 
 ## Scoped ownership
 
-Coordinator `Memory` pages use `Rc<PageBytes>` (heap or mapped RAM) for fork COW. `Memory` and its
+Coordinator `Memory` pages use `Rc<PageBytes>` (shared immutable zeros, heap or mapped RAM) for fork COW. `Memory` and its
 backing objects are already local, non-`Send`/non-`Sync` objects. Ordinary CPU
 stores and native fragment writes therefore check local reference counts, without
 an atomic `Arc::make_mut` RMW for each store. Snapshot creation reads the bytes
@@ -58,7 +58,11 @@ stronger subset, not a complete enumeration of ARM's weak-memory outcomes.
 ## Reservation and commit costs
 
 The page's monotonically wrapping version still authorizes code/cache changes.
-Each 64-byte region has four 16-byte reservation values and a small override mask.
+The first exclusive read lazily allocates a page's reservation rows. Before any
+monitor exists, ordinary writes need no reservation table. Publication occurs
+under the reader's region guard; an overlapping earlier writer must unlock
+before that reader can capture a token. Once published, the table remains live
+for the page. Each 64-byte region has four 16-byte reservation values and a small override mask.
 A full page uses one inherited epoch; a full region replaces its base once.
 Partial writes only update touched granules. Replacing the base for granule zero
 first materializes unaffected inherited values, so neighbors retain valid tokens.
@@ -134,3 +138,33 @@ aliases and RW native aliases. A per-view single-level page TLB caches eligible
 CPU alias addresses, avoiding repeated sparse-window and group lookups. Hardware-compatible groups use native scalar
 operands; special mappings and cross-page operations retain the checked software
 path. Region guards, COW, reservations and dirty/code publication are unchanged.
+
+## Sparse zeros and first-write budgets
+
+Untouched private anonymous pages use immutable zero storage. Reads and snapshot
+preparation do not copy a full page; fresh worker physical slots retain the host
+zero-fill behavior. Reused slots clear retired data. File/EOF errors retain their
+precise faults while their inaccessible snapshot bytes need no allocation.
+
+CPU and native first stores reserve the same per-VM and aggregate quota before
+changing bytes. A page charge is retained by both its coordinator mapping and
+worker frames, so concurrent stores pay once, joined commit does not pay again,
+and retained views cannot release their charge early. Later ordinary hardware
+stores use a resident bit in the existing TLB tag, without a quota RMW on each
+store. A first-touch quota failure terminates the faulting guest group with
+SIGKILL; mmap/fork admission still returns its ordinary errno. This is a bounded
+OOM policy, not Linux victim selection.
+
+File mappings preflight available quota before VFS page storage is created.
+Fixed file replacements reuse charged destination slots. File mappings and
+materialized fork COW pages are still charged conservatively per address space;
+CLONE_VM shares one account and now builds a shared task directly, avoiding an
+intermediate page-table clone and MMU retirement. The per-process mapped-page
+cap still bounds page-table metadata, including untouched readable mappings.
+This is not complete Linux demand paging or exact host RSS/PSS accounting.
+Runtime shadow storage, COW windows and host allocator bookkeeping are outside
+the guest byte quota and remain further memory work.
+
+The [Firefox memory investigation](../validation/firefox-memory.md) records the
+original Scudo ELF, the 512MiB BSS oracle, budgets, complete/partial diagnostics
+and the remaining first-frame failure.

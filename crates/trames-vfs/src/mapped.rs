@@ -11,6 +11,7 @@ pub(super) struct FilePage {
     version: Cell<u64>,
 }
 enum PageStorage {
+    Zero,
     Heap(Box<[u8; PAGE_SIZE as usize]>),
     Shared(trames_shared::Mapping),
 }
@@ -18,6 +19,7 @@ impl std::ops::Deref for PageStorage {
     type Target = [u8; PAGE_SIZE as usize];
     fn deref(&self) -> &Self::Target {
         match self {
+            Self::Zero => &[0; PAGE_SIZE as usize],
             Self::Heap(bytes) => bytes,
             // SAFETY: map() proved a full guest page; the owning RefCell supplies
             // scoped coordinator borrows. Native display holds raw GPU views,
@@ -28,7 +30,11 @@ impl std::ops::Deref for PageStorage {
 }
 impl std::ops::DerefMut for PageStorage {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        if matches!(self, Self::Zero) {
+            *self = Self::Heap(Box::new([0; PAGE_SIZE as usize]));
+        }
         match self {
+            Self::Zero => unreachable!(),
             Self::Heap(bytes) => bytes,
             // SAFETY: exclusive coordinator page borrow, same retained range.
             // SharedFile never physically truncates a live mapping.
@@ -85,7 +91,7 @@ impl MappedData {
         };
         for (&offset, page) in self.pages.borrow().iter() {
             let Some(page) = page.upgrade() else { continue };
-            if matches!(*page.bytes.borrow(), PageStorage::Heap(_)) {
+            if !matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
                 if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
                     *page.bytes.borrow_mut() = PageStorage::Shared(map);
                 }
@@ -103,9 +109,13 @@ impl MappedData {
             PageStorage::Shared(map)
         } else {
             let data = self.data.borrow().read_at(offset, PAGE_SIZE as usize)?;
-            let mut bytes = Box::new([0; PAGE_SIZE as usize]);
-            bytes[..data.len()].copy_from_slice(&data);
-            PageStorage::Heap(bytes)
+            if data.is_empty() {
+                PageStorage::Zero
+            } else {
+                let mut bytes = Box::new([0; PAGE_SIZE as usize]);
+                bytes[..data.len()].copy_from_slice(&data);
+                PageStorage::Heap(bytes)
+            }
         };
         let page = Rc::new(FilePage {
             identity: trames_memory::new_backing_identity(),
@@ -136,18 +146,21 @@ impl MappedData {
                 let page = if let Some(page) = existing {
                     page
                 } else {
-                    let mut data = Box::new([0; PAGE_SIZE as usize]);
                     let available = bytes
                         .len()
                         .saturating_sub(inside as usize)
                         .min(PAGE_SIZE as usize);
-                    if available != 0 {
+                    let storage = if available != 0 {
+                        let mut data = Box::new([0; PAGE_SIZE as usize]);
                         data[..available]
                             .copy_from_slice(&bytes[inside as usize..inside as usize + available]);
-                    }
+                        PageStorage::Heap(data)
+                    } else {
+                        PageStorage::Zero
+                    };
                     let page = Rc::new(FilePage {
                         identity: trames_memory::new_backing_identity(),
-                        bytes: RefCell::new(PageStorage::Heap(data)),
+                        bytes: RefCell::new(storage),
                         dirty: Cell::new(false),
                         writers: Cell::new(0),
                         version: Cell::new(0),
@@ -182,7 +195,7 @@ impl MappedData {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                if matches!(*p.bytes.borrow(), PageStorage::Heap(_)) {
+                if !matches!(*p.bytes.borrow(), PageStorage::Shared(_)) {
                     p.bytes.borrow_mut()[(start - base) as usize..(to - base) as usize]
                         .copy_from_slice(&bytes[(start - offset) as usize..(to - offset) as usize]);
                 }
@@ -240,11 +253,15 @@ impl MappedData {
         self.refresh_shared_pages();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                if matches!(*page.bytes.borrow(), PageStorage::Heap(_)) {
+                if !matches!(*page.bytes.borrow(), PageStorage::Shared(_)) {
                     let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
                     let mut content = page.bytes.borrow_mut();
-                    content.fill(0);
-                    content[..bytes.len()].copy_from_slice(&bytes);
+                    if bytes.is_empty() {
+                        *content = PageStorage::Zero;
+                    } else {
+                        content.fill(0);
+                        content[..bytes.len()].copy_from_slice(&bytes);
+                    }
                 }
                 page.version.set(page.version.get().wrapping_add(1));
                 page.dirty.set(false);
@@ -499,6 +516,59 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn eof_placeholders_stay_zero_and_growth_updates_existing_mappings() {
+        let data = MappedData::new(FileData::Memory(vec![17; 10]));
+        let pages = data.batch(0, 32 * PAGE_SIZE).unwrap();
+        assert!(matches!(*pages[0].bytes.borrow(), PageStorage::Heap(_)));
+        assert!(pages[1..]
+            .iter()
+            .all(|p| matches!(*p.bytes.borrow(), PageStorage::Zero)));
+        data.truncate(4 * PAGE_SIZE).unwrap();
+        data.write_at(3 * PAGE_SIZE + 8, b"grown").unwrap();
+        assert_eq!(&pages[3].bytes.borrow()[8..13], b"grown");
+        assert!(matches!(*pages[31].bytes.borrow(), PageStorage::Zero));
+        data.truncate(0).unwrap();
+        assert!(pages
+            .iter()
+            .all(|p| matches!(*p.bytes.borrow(), PageStorage::Zero)));
+
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.open_at(AT_FDCWD, b"/grow-eof", 0x42, 0o600).unwrap();
+        v.write(fd, b"x").unwrap();
+        let mut m = Memory::default();
+        mapped(
+            &v,
+            &mut m,
+            fd,
+            0x10000,
+            4 * PAGE_SIZE,
+            true,
+            Permissions::RW,
+        );
+        let mut registry = Registry::default();
+        let mut before = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(
+            before.read_array::<1>(0x13000),
+            Err(MemoryError::Bus(0x13000))
+        );
+        assert_eq!(
+            before.write_array(0x13000, [42u8]),
+            Err(MemoryError::Bus(0x13000))
+        );
+        drop(before);
+        v.truncate_fd(fd, 4 * PAGE_SIZE).unwrap();
+        v.seek(fd, (3 * PAGE_SIZE) as i64, 0).unwrap();
+        v.write(fd, b"z").unwrap();
+        let mut grown = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(grown.read_array::<1>(0x13000), Ok(*b"z"));
+        grown.write_array(0x13000, *b"!").unwrap();
+        drop(grown);
+        m.commit_parallel().unwrap();
+        v.seek(fd, (3 * PAGE_SIZE) as i64, 0).unwrap();
+        assert_eq!(v.read(fd, 1).unwrap(), b"!");
+    }
     #[test]
     fn epoch_file_io_checks_live_inode_aliases_in_any_vm_not_the_cached_fd_mask() {
         let mut v = Vfs::default();

@@ -29,6 +29,9 @@ impl View {
             // Validate all permissions/EOF before returning a typed defer, with
             // the exact first fault address, in one mapping traversal.
             let frame = self.frame(base.max(address), access)?;
+            if access == Access::Write {
+                self.ensure_resident(frame)?;
+            }
             defer |= frame.native_live_private.load(Ordering::Relaxed);
             match gate {
                 Gate::Write => defer |= !frame.native_one_shot.load(Ordering::Relaxed),
@@ -50,6 +53,7 @@ impl View {
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<T, MemoryError> {
         let (frame, offset) = self.reached(address, len, Access::Write)?;
+        self.ensure_resident(frame)?;
         let mut guard = frame
             .bytes
             .bytes
@@ -261,6 +265,7 @@ impl NativeMemory for View {
                 (d, s, count)
             };
             let (df, di) = self.reached(d, count, Access::Write)?;
+            self.ensure_resident(df)?;
             let (sf, si) = self.reached(s, count, Access::Read)?;
             let dst = &df.bytes;
             let src = &sf.bytes;

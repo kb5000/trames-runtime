@@ -7,6 +7,7 @@ use std::sync::Weak;
 pub(crate) struct Slot {
     pub(crate) owner: Arc<host::Mapping>,
     pub(crate) offset: usize,
+    fresh: bool,
 }
 impl Slot {
     pub fn pointer(&self) -> *mut u8 {
@@ -19,10 +20,16 @@ impl Slot {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer(), P);
         }
     }
+    pub fn initialize_zero(&self) {
+        if !self.fresh {
+            self.initialize(&[0; P]);
+        }
+    }
 }
 struct PhysicalWindow {
     owner: Weak<host::Mapping>,
     slots: Box<[Weak<Slot>]>,
+    used: Box<[bool]>,
 }
 #[derive(Default)]
 pub(crate) struct Pool {
@@ -42,6 +49,7 @@ impl Pool {
             .or_insert_with(|| PhysicalWindow {
                 owner: Weak::new(),
                 slots: (0..WINDOW / P).map(|_| Weak::new()).collect(),
+                used: vec![false; WINDOW / P].into_boxed_slice(),
             });
         let owner = match entry
             .owner
@@ -53,10 +61,16 @@ impl Pool {
                 let owner = Arc::new(host::Mapping::new()?);
                 entry.owner = Arc::downgrade(&owner);
                 entry.slots.fill_with(Weak::new);
+                entry.used.fill(false);
                 owner
             }
         };
-        let slot = Arc::new(Slot { owner, offset });
+        let slot = Arc::new(Slot {
+            owner,
+            offset,
+            fresh: !entry.used[offset / P],
+        });
+        entry.used[offset / P] = true;
         entry.slots[offset / P] = Arc::downgrade(&slot);
         Some(slot)
     }
@@ -177,6 +191,24 @@ impl Frozen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_reused_worker_slot_zeroes_retired_data() {
+        let mut pool = Pool::default();
+        let first = pool.slot(1, 0x40000).unwrap();
+        first.initialize(&[42; P]);
+        let peer = pool.slot(1, 0x41000).unwrap();
+        let owner = first.owner.clone();
+        drop(first);
+        let reused = pool.slot(1, 0x40000).unwrap();
+        assert!(Arc::ptr_eq(&reused.owner, &owner));
+        assert!(!reused.fresh);
+        reused.initialize_zero();
+        // SAFETY: retained exclusive unpublished test slots.
+        assert!(unsafe { std::slice::from_raw_parts(reused.pointer(), P) }
+            .iter()
+            .all(|&b| b == 0));
+        peer.initialize_zero();
+    }
     #[test]
     fn frozen_views_own_no_unused_ram_and_release_the_last_demoted_window() {
         let physical = Arc::new(host::Mapping::new().unwrap());

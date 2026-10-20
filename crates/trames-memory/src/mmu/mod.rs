@@ -32,6 +32,7 @@ const P: usize = PAGE_SIZE as usize;
 /// A clone copies bytes instead of aliasing writable pages: Rc::make_mut keeps
 /// the existing fork-COW contract even when the physical storage is mapped.
 pub(super) enum PageBytes {
+    Zero,
     Heap(Box<[u8; P]>),
     Mapped {
         owner: Arc<host::Mapping>,
@@ -40,6 +41,9 @@ pub(super) enum PageBytes {
     },
 }
 impl PageBytes {
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Self::Zero)
+    }
     pub fn new(bytes: [u8; P]) -> Self {
         Self::Heap(Box::new(bytes))
     }
@@ -63,13 +67,18 @@ impl PageBytes {
 }
 impl Clone for PageBytes {
     fn clone(&self) -> Self {
-        Self::new(**self)
+        if self.is_zero() {
+            Self::Zero
+        } else {
+            Self::new(**self)
+        }
     }
 }
 impl Deref for PageBytes {
     type Target = [u8; P];
     fn deref(&self) -> &Self::Target {
         match self {
+            Self::Zero => &[0; P],
             Self::Heap(bytes) => bytes,
             // SAFETY: offset denotes one complete, initialized, 4KiB page of
             // this live RW kernel mapping. Coordinator access is !Send/!Sync;
@@ -82,7 +91,11 @@ impl Deref for PageBytes {
 }
 impl DerefMut for PageBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        if self.is_zero() {
+            *self = Self::new([0; P]);
+        }
         match self {
+            Self::Zero => unreachable!(),
             Self::Heap(bytes) => bytes,
             // SAFETY: Rc::make_mut detached any fork peers. Different page
             // objects cover disjoint subranges; this exclusive borrow excludes
@@ -103,6 +116,7 @@ pub(crate) struct Window {
     flags: Box<[AtomicU8]>,
     frames: Box<[AtomicUsize]>,
     initialized: Box<[AtomicBool]>,
+    zeroed: Box<[AtomicBool]>,
     granule: usize,
     shift: u32,
 }
@@ -140,11 +154,15 @@ impl Window {
                 .map(|_| AtomicUsize::new(usize::MAX))
                 .collect(),
             initialized: (0..WINDOW / P).map(|_| AtomicBool::new(false)).collect(),
+            zeroed: (0..WINDOW / P).map(|_| AtomicBool::new(true)).collect(),
         }
     }
     fn page(&self, offset: usize, zero: bool) -> Rc<PageBytes> {
         let mapping = self.mapping.as_ref().expect("coordinator physical storage");
-        if zero && self.initialized[offset / P].swap(true, Ordering::Relaxed) {
+        if zero
+            && self.initialized[offset / P].swap(true, Ordering::Relaxed)
+            && !self.zeroed[offset / P].load(Ordering::Relaxed)
+        {
             // SAFETY: a newly installed private anonymous page has no existing
             // byte borrows. Fork retires the complete CPU arena before sharing.
             unsafe {
@@ -153,11 +171,26 @@ impl Window {
         } else {
             self.initialized[offset / P].store(true, Ordering::Relaxed);
         }
+        self.zeroed[offset / P].store(false, Ordering::Relaxed);
         Rc::new(PageBytes::Mapped {
             owner: mapping.clone(),
             offset,
             _lease: None,
         })
+    }
+    fn zero_page(&self, offset: usize) {
+        self.initialized[offset / P].store(true, Ordering::Relaxed);
+        if !self.zeroed[offset / P].swap(true, Ordering::Relaxed) {
+            // SAFETY: mapping checkpoint, no CPU or byte borrow is live. A
+            // previously used slot must be cleared before exposing a zero page.
+            unsafe {
+                std::ptr::write_bytes(
+                    self.mapping.as_ref().unwrap().kernel.as_ptr().add(offset),
+                    0,
+                    P,
+                );
+            }
+        }
     }
     fn protect_run(&self, begin: usize, end: usize, state: u8) {
         let protection = (if state & READ != 0 {
@@ -385,10 +418,17 @@ impl Arena {
 }
 
 impl Memory {
-    pub(super) fn prepare_mmu_write(&mut self, address: u64, len: usize) {
+    pub(super) fn prepare_mmu_write(
+        &mut self,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        if self.materialize_zero(address, len)? {
+            self.invalidate_translations();
+        }
         if len <= P - (address as usize & (P - 1)) {
             if self.mmu.prepared(address) {
-                return;
+                return Ok(());
             }
             // Backings always retain the software path (including live EOF
             // checks after private COW). Rebuilding host groups on every file
@@ -399,12 +439,13 @@ impl Memory {
                     .as_ref()
                     .is_some_and(|page| page.backing.is_some())
             }) {
-                return;
+                return Ok(());
             }
         }
         if self.refresh_mmu(address, len as u64) {
             self.invalidate_translations();
         }
+        Ok(())
     }
     /// Called only at quiescent mapping/COW boundaries. Hardware groups with
     /// holes, mixed permissions or backing I/O stay on the shared software path.
@@ -485,17 +526,24 @@ impl Memory {
                     let permissions = permissions.expect("complete group");
                     if frames.iter().enumerate().any(|(index, &frame)| {
                         let page = self.frames[frame].as_ref().expect("mapped page");
-                        Rc::strong_count(&page.bytes) != 1
-                            || !page.bytes.belongs(mapping, first + index * P)
+                        !page.bytes.is_zero()
+                            && (Rc::strong_count(&page.bytes) != 1
+                                || !page.bytes.belongs(mapping, first + index * P))
                     }) {
                         changed = true;
                         // Capture the complete group before writing: remap may
                         // move overlapping ranges within an existing window.
                         let data: Vec<_> = frames
                             .iter()
-                            .map(|&frame| **self.frames[frame].as_ref().unwrap().bytes)
+                            .map(|&frame| {
+                                let page = self.frames[frame].as_ref().unwrap();
+                                (!page.bytes.is_zero()).then(|| **page.bytes)
+                            })
                             .collect();
                         for (index, (&frame, bytes)) in frames.iter().zip(&data).enumerate() {
+                            let Some(bytes) = bytes else {
+                                continue;
+                            };
                             let offset = first + index * P;
                             // SAFETY: private destination, all old sources were
                             // captured; no Rust references alias this write.
@@ -510,6 +558,9 @@ impl Memory {
                         }
                     }
                     for (index, &frame) in frames.iter().enumerate() {
+                        if self.frames[frame].as_ref().unwrap().bytes.is_zero() {
+                            window.zero_page(first + index * P);
+                        }
                         window.frames[first / P + index].store(frame, Ordering::Relaxed);
                     }
                     state = ELIGIBLE

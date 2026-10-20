@@ -4,6 +4,7 @@ use crate::PAGE_SIZE;
 use std::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU64, Ordering},
+    sync::OnceLock,
 };
 
 const REGION: usize = 64;
@@ -26,11 +27,17 @@ impl Bytes {
 pub(super) struct MutablePage {
     bytes: Bytes,
     held: AtomicU64,
-    reservations: [UnsafeCell<[u64; 4]>; PAGE / REGION],
-    reservation_overrides: [UnsafeCell<u8>; PAGE / REGION],
+    reservations: OnceLock<Box<ReservationRows>>,
     reservation_base: AtomicU64,
     reservation_written: AtomicU64,
 }
+struct ReservationRows {
+    values: [UnsafeCell<[u64; 4]>; PAGE / REGION],
+    overrides: [UnsafeCell<u8>; PAGE / REGION],
+}
+// SAFETY: rows are published once, then every row/override uses the same byte
+// region guard as MutablePage. Allocating a table never grants byte access.
+unsafe impl Sync for ReservationRows {}
 // SAFETY: all non-atomic byte accesses are inside a guard for their complete
 // region mask. Overlapping masks are mutually exclusive; disjoint slice ranges
 // cannot alias. Each reservation row/override byte uses its same region guard;
@@ -56,8 +63,7 @@ impl MutablePage {
         Self {
             bytes,
             held: AtomicU64::new(0),
-            reservations: std::array::from_fn(|_| UnsafeCell::new([0; 4])),
-            reservation_overrides: std::array::from_fn(|_| UnsafeCell::new(0)),
+            reservations: OnceLock::new(),
             reservation_base: AtomicU64::new(0),
             reservation_written: AtomicU64::new(0),
         }
@@ -65,6 +71,14 @@ impl MutablePage {
     pub(super) fn new_mapped(bytes: [u8; PAGE], slot: std::sync::Arc<crate::mmu::Slot>) -> Self {
         slot.initialize(&bytes);
         Self::with_storage(Bytes::Mapped(slot))
+    }
+    pub(super) fn new_zero(slot: Option<std::sync::Arc<crate::mmu::Slot>>) -> Self {
+        if let Some(slot) = slot {
+            slot.initialize_zero();
+            Self::with_storage(Bytes::Mapped(slot))
+        } else {
+            Self::new([0; PAGE])
+        }
     }
     pub(super) fn physical(&self) -> Option<(&std::sync::Arc<crate::mmu::host::Mapping>, usize)> {
         match &self.bytes {
@@ -141,18 +155,20 @@ impl Guard<'_> {
     }
     pub fn reservation(&self, slot: usize) -> u64 {
         self.covers(slot * 16, 16);
+        let rows = self.page.reservations.get_or_init(|| {
+            Box::new(ReservationRows {
+                values: std::array::from_fn(|_| UnsafeCell::new([0; 4])),
+                overrides: std::array::from_fn(|_| UnsafeCell::new(0)),
+            })
+        });
         let region = slot / 4;
         if self.page.reservation_written.load(Ordering::Relaxed) & (1 << region) == 0 {
             return self.page.reservation_base.load(Ordering::Relaxed);
         }
         // SAFETY: this region's byte mask also protects its reservation row
         // and override byte; no mutable metadata reference survives unlock.
-        let (values, overrides) = unsafe {
-            (
-                &*self.page.reservations[region].get(),
-                *self.page.reservation_overrides[region].get(),
-            )
-        };
+        let (values, overrides) =
+            unsafe { (&*rows.values[region].get(), *rows.overrides[region].get()) };
         let local = slot % 4;
         values[if local == 0 || overrides & (1 << local) != 0 {
             local
@@ -165,6 +181,13 @@ impl Guard<'_> {
         if len == 0 {
             return;
         }
+        // Before the first exclusive read there is no monitor to invalidate.
+        // A writer that observes no table still holds its region guard: an
+        // overlapping reader can only create/capture a monitor after unlock.
+        // Disjoint initialization/readers do not monitor this writer's region.
+        let Some(rows) = self.page.reservations.get() else {
+            return;
+        };
         if offset == 0 && len == PAGE {
             self.page.reservation_base.store(version, Ordering::Relaxed);
             self.page.reservation_written.store(0, Ordering::Relaxed);
@@ -177,8 +200,8 @@ impl Guard<'_> {
                 // region. Different guards only access disjoint metadata rows.
                 let (values, overrides) = unsafe {
                     (
-                        &mut *self.page.reservations[region].get(),
-                        &mut *self.page.reservation_overrides[region].get(),
+                        &mut *rows.values[region].get(),
+                        &mut *rows.overrides[region].get(),
                     )
                 };
                 if active & (1 << region) == 0 {
@@ -229,6 +252,29 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_writes_need_no_exclusive_table_and_late_monitors_observe_aba() {
+        let page = MutablePage::new([0; PAGE]);
+        {
+            let mut guard = page.lock(0, PAGE);
+            guard.write(0, 8).copy_from_slice(&17u64.to_le_bytes());
+            guard.invalidate(0, 8, 1);
+        }
+        assert!(page.reservations.get().is_none());
+        let token = page.lock(0, 16).reservation(0);
+        assert!(page.reservations.get().is_some());
+        {
+            let mut peer = page.lock(64, 16);
+            peer.invalidate(64, 8, 2);
+        }
+        assert_eq!(page.lock(0, 16).reservation(0), token);
+        {
+            let mut writer = page.lock(0, 16);
+            writer.invalidate(0, 8, 3);
+            writer.invalidate(0, 8, 4);
+        }
+        assert_ne!(page.lock(0, 16).reservation(0), token);
+    }
     use std::{
         sync::{mpsc, Arc},
         time::Duration,

@@ -135,16 +135,36 @@ impl Memory {
             });
         }
         let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
+        self.check_backed_mapping(address, len, fixed)?;
+        let charges: Vec<_> = objects
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let charge = if fixed {
+                    self.pages
+                        .get(&(address + i as u64 * PAGE_SIZE))
+                        .and_then(|&frame| self.frames[frame].as_ref())
+                        .filter(|page| page.charge.resident())
+                        .map(|page| page.charge.clone())
+                        .unwrap_or_else(|| Charge::new(&self.account))
+                } else {
+                    Charge::new(&self.account)
+                };
+                charge.ensure()?;
+                Ok(charge)
+            })
+            .collect::<Result<_, MemoryError>>()?;
         if fixed {
             self.map_fixed(address, len, permissions)?;
         } else {
             self.map(address, len, permissions)?;
         }
-        let zero = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
-        for (i, object) in objects.into_iter().enumerate() {
+        let zero = Rc::new(PageBytes::Zero);
+        for (i, (object, charge)) in objects.into_iter().zip(charges).enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
             let page = self.frames[frame].as_mut().expect("mapped page");
             page.bytes = zero.clone();
+            page.charge = charge;
             page.backing = Some(Backed {
                 object,
                 shared: shared_mapping,
@@ -184,10 +204,10 @@ impl Memory {
             .map(|base| {
                 self.pages.get(&base).map_or(0, |&frame| {
                     let page = self.frames[frame].as_ref().expect("page");
-                    u8::from(page.check_backing(base).is_ok())
+                    u8::from(page.charge.resident() && page.check_backing(base).is_ok())
                 })
             })
-            .collect()) // Existing valid page objects are eagerly resident.
+            .collect())
     }
     pub fn discard(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
@@ -204,7 +224,10 @@ impl Memory {
             if self.parallel_cache.is_some() {
                 self.parallel_mappings.insert(base);
             }
-            page.bytes = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
+            page.bytes = Rc::new(PageBytes::Zero);
+            if page.backing.is_none() {
+                page.charge = Charge::new(&self.account);
+            }
             if let Some(b) = &mut page.backing {
                 b.private_copy = false;
             }
@@ -299,8 +322,10 @@ impl Memory {
             let original_count = pages.len();
             for i in original_count..count {
                 let mut page = last.clone();
-                page.bytes = Rc::new(PageBytes::new([0; PAGE_SIZE as usize]));
+                page.bytes = Rc::new(PageBytes::Zero);
+                page.charge = Charge::new(&self.account);
                 if let Some(b) = &mut page.backing {
+                    page.charge.ensure()?;
                     b.object = last
                         .backing
                         .as_ref()
@@ -413,6 +438,7 @@ impl Memory {
         fixed: bool,
     ) -> Result<(), MemoryError> {
         Self::mapping_end(address, len)?;
+        self.check_backed_mapping(address, len, fixed)?;
         let objects = (0..len / PAGE_SIZE)
             .map(|_| AnonymousPage::allocate())
             .collect();

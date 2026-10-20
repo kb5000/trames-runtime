@@ -71,6 +71,9 @@ fn actual_cpu_alias_obeys_hardware_protections_and_keeps_kernel_bytes_coherent()
     let mut memory = Memory::default();
     let base = 0x40000;
     memory.map(base, 65536, Permissions::RW).unwrap();
+    // This test exercises raw backend stores, below the production TLB's
+    // first-write accounting gate. Commit the target page through Memory first.
+    memory.write_array(base, [0u8]).unwrap();
     assert!(
         memory.mmu.read::<8>(base).is_some(),
         "test requires a real host mapping"
@@ -223,8 +226,11 @@ fn worker_cpu_aliases_native_bytes_and_dirty_publication_share_one_region_protoc
     let mut registry = parallel::Registry::default();
     let mut worker = memory.parallel_view(&mut registry).unwrap();
     let peer = worker.clone();
-    assert_eq!(worker.mmu_read::<8>(0x40000), Some([0; 8]));
+    assert_eq!(worker.mmu_read::<8>(0x40000), None);
+    assert_eq!(worker.read_array::<8>(0x40000), Ok([0; 8]));
+    assert_eq!(memory.resident_bytes(), 0);
     worker.write_array(0x40000, [7; 8]).unwrap();
+    assert_eq!(worker.mmu_read::<8>(0x40000), Some([7; 8]));
     assert_eq!(peer.mmu_read::<8>(0x40000), Some([7; 8]));
     worker.fill_with(0x40000, 8, |bytes| bytes.fill(9)).unwrap();
     assert_eq!(peer.mmu_read::<8>(0x40000), Some([9; 8]));

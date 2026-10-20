@@ -547,6 +547,11 @@ impl Linux {
             write: a[2] & 2 != 0,
             execute: a[2] & 4 != 0,
         };
+        if flags & 0x20 == 0 || shared {
+            memory
+                .check_backed_mapping(address, len, flags & 0x10 != 0)
+                .map_err(Self::memory_errno)?;
+        }
         if flags & 0x20 == 0 {
             a[5].checked_add(len)
                 .filter(|n| *n <= i64::MAX as u64)
@@ -1435,6 +1440,32 @@ impl Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_touch_output_quota_failure_does_not_consume_file_input() {
+        let mut l = Linux::new(0);
+        let mut m = Memory::new(4 * PAGE_SIZE as usize);
+        m.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        m.set_total_limit(PAGE_SIZE as usize).unwrap();
+        m.write_array(0x1000, [17u8]).unwrap();
+        l.vfs
+            .import_file(b"/quota-input", b"retained".to_vec())
+            .unwrap();
+        let fd = l
+            .vfs
+            .open_at(trames_vfs::AT_FDCWD, b"/quota-input", 0, 0)
+            .unwrap();
+        assert_eq!(
+            l.syscall(
+                63,
+                [fd as u64, 0x2000, 8, 0, 0, 0],
+                &mut m,
+                &mut CapturedOutput::default()
+            ),
+            Err(Errno(14))
+        );
+        assert_eq!(m.read_array::<8>(0x2000), Ok([0; 8]));
+        assert_eq!(l.vfs.read(fd, 8).unwrap(), b"retained");
+    }
     #[test]
     fn reused_write_scratch_shrinks_and_never_emits_stale_or_faulting_bytes() {
         let mut linux = Linux::new(0);
