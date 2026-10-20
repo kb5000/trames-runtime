@@ -23,9 +23,11 @@ fn memory() -> Memory {
     memory
 }
 fn views(memory: &mut Memory, registry: &mut Registry, count: usize) -> Vec<View> {
-    (0..count)
-        .map(|_| memory.parallel_view(registry).unwrap())
-        .collect()
+    let mut views = vec![memory.parallel_view(registry).unwrap()];
+    for _ in 1..count {
+        views.push(views[0].clone());
+    }
+    views
 }
 fn admit(views: &mut [View]) -> bool {
     // SAFETY: test sources stay quiescent until every admitted View is dropped.

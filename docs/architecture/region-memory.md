@@ -165,8 +165,12 @@ backings, COW peers and retained other-VM storage. A read-only VMA over a writab
 file is not immutable storage: fd/backing writers remain possible, so it stays
 guarded even if no current guest VMA can write it.
 
-After preparing all selected Views, the scheduler groups them by actual Memory
-root and accounts for every coordinate handle. `try_private_epoch` also requires
+The scheduler prepares one frozen View per actual Memory root per epoch and
+clones worker-local translations for its other selected CPUs. This avoids
+repeated mapping/backing checks and prevents unrelated global backing epochs
+from giving a VM's peers different snapshots. These reuses count as cache hits.
+After preparing all selected Views, it accounts for every coordinate handle.
+`try_private_epoch` also requires
 the **same Snapshot Arc** and an all-generation live-View count exactly equal to
 the group size. A missing/external View or a different mapping generation rejects
 the entire admission. One actor receives the previous exclusive mode; multiple
