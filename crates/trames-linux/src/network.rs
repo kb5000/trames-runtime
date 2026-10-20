@@ -951,6 +951,29 @@ mod tests {
     }
     #[test]
     fn invalid_accept_destination_does_not_drop_queued_connection() {
+        fn ready<T>(
+            socket: &std::rc::Rc<trames_net::Socket>,
+            mut operation: impl FnMut() -> Result<T>,
+        ) -> T {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match operation() {
+                    Ok(value) => return value,
+                    Err(Errno(11)) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "socket readiness timed out"
+                        );
+                        trames_net::wait(
+                            &[(socket.clone(), 1)],
+                            std::time::Duration::from_millis(10),
+                        )
+                        .unwrap();
+                    }
+                    Err(error) => panic!("unexpected socket error: {error:?}"),
+                }
+            }
+        }
         let mut linux = Linux::new(0x10000);
         linux.vfs.configure_network(NetworkMode::Loopback).unwrap();
         let fd = linux.vfs.socket(2, 1, 0).unwrap();
@@ -966,11 +989,14 @@ mod tests {
             Err(Errno(14))
         );
         assert_eq!(linux.vfs.live_sockets(), 1);
-        let accepted = linux
-            .network_syscall(202, [fd as u64, 0x1100, 0x1000, 0, 0, 0], &mut memory)
-            .unwrap() as u32;
+        // Successful connect/send does not synchronously publish readiness to
+        // the nonblocking guest endpoint on every host (notably Darwin).
+        let accepted = ready(&socket, || {
+            linux.network_syscall(202, [fd as u64, 0x1100, 0x1000, 0, 0, 0], &mut memory)
+        }) as u32;
         client.write_all(b"x").unwrap();
-        assert_eq!(linux.vfs.read(accepted, 1).unwrap(), b"x");
+        let socket = linux.vfs.socket_fd(accepted).unwrap();
+        assert_eq!(ready(&socket, || linux.vfs.read(accepted, 1)), b"x");
     }
     #[test]
     fn socket_output_preflight_and_descriptor_type_errors() {
