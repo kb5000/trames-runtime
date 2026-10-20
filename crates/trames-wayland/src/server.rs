@@ -210,9 +210,12 @@ fn run(
         if stopped {
             break;
         }
+        // A deferred callback belongs to an already displayed commit. It must
+        // progress even when UIKit has paused drawing an unchanged texture.
         if compositor.dispatch().is_err() {
             break;
         }
+        let callback_timeout = compositor.callback_timeout;
         let waiting_for_gpu = compositor.state.poll_gpu();
         if compositor.state.revision != published {
             let surfaces = compositor
@@ -261,7 +264,10 @@ fn run(
         // A producer wakeup can precede fence completion. Sleeping a full 16ms
         // then misses a display refresh even when rendering itself was fast.
         // Keep the idle/backpressure timeout; only retry pending fences at 1ms.
-        let timeout = if waiting_for_gpu { 1 } else { 16 };
+        let mut timeout = if waiting_for_gpu { 1 } else { 16 };
+        if let Some(left) = callback_timeout {
+            timeout = timeout.min(left.as_millis().saturating_add(1).min(16) as i32);
+        }
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             break;

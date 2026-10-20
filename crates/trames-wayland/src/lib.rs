@@ -2,6 +2,7 @@
 //! Native, platform-independent Wayland compositor protocol and window state.
 use std::{io, os::unix::net::UnixStream, sync::Arc};
 use wayland_server::{backend::ClientData, Display, Resource};
+mod frame;
 mod gpu;
 mod input;
 mod selection;
@@ -34,6 +35,7 @@ pub struct Compositor {
     state: State,
     clients: std::collections::BTreeMap<u64, wayland_server::Client>,
     exports: Vec<(u64, trames_shared::ExportLease)>,
+    callback_timeout: Option<std::time::Duration>,
 }
 struct State {
     next: u64,
@@ -70,6 +72,7 @@ impl Compositor {
             state,
             clients: Default::default(),
             exports: Vec::new(),
+            callback_timeout: None,
         })
     }
     pub fn windows(&self) -> Vec<WindowSnapshot> {
@@ -121,6 +124,7 @@ impl Compositor {
         }
     }
     pub fn presented(&mut self, window: u64, revision: u64, milliseconds: u32) {
+        let now = std::time::Instant::now();
         let Some(root) = self.state.surfaces.get(&window) else {
             return;
         };
@@ -138,19 +142,17 @@ impl Compositor {
             if revision >= s.revision {
                 s.gpu_presented = true;
             }
-            while s
-                .callbacks
-                .front()
-                .is_some_and(|(serial, _)| *serial <= revision)
-            {
-                for callback in s.callbacks.pop_front().unwrap().1 {
-                    if callback.is_alive() {
-                        callback.done(milliseconds);
-                    }
-                }
-            }
+            s.callback_pacer.presented(revision, milliseconds, now);
             index += 1;
         }
+    }
+    fn flush_callbacks(&mut self) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        self.state
+            .surfaces
+            .values_mut()
+            .filter_map(|s| s.flush_callbacks(now))
+            .min()
     }
     pub fn connect(&mut self, stream: UnixStream, identity: ClientIdentity) -> io::Result<()> {
         let client = self
@@ -173,6 +175,7 @@ impl Compositor {
     /// Nonblocking protocol progress. Native event-loop integration owns polling.
     pub fn dispatch(&mut self) -> io::Result<usize> {
         let count = self.display.dispatch_clients(&mut self.state)?;
+        self.callback_timeout = self.flush_callbacks();
         self.display.flush_clients()?;
         let handle = self.display.handle().backend_handle();
         self.clients

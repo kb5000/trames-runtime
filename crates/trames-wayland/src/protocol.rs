@@ -462,7 +462,7 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for State {
             wl_output::Mode::Current | wl_output::Mode::Preferred,
             state.viewport.0 as i32,
             state.viewport.1 as i32,
-            60000,
+            crate::frame::REFRESH_MILLIHERTZ,
         );
         if r.version() >= 2 {
             r.scale(1);
