@@ -64,7 +64,7 @@ pub trait CpuMemory {
         len: usize,
         update: impl FnOnce(&mut [u8]) -> (T, bool),
     ) -> Result<T, MemoryError>;
-    fn exclusive_read(&self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError>;
+    fn exclusive_read(&mut self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError>;
     fn exclusive_write(
         &mut self,
         address: u64,
@@ -174,11 +174,51 @@ impl CpuMemory for Memory {
         }
         Ok(result)
     }
-    fn exclusive_read(&self, a: u64, b: &mut [u8]) -> Result<u128, MemoryError> {
+    fn exclusive_read(&mut self, a: u64, b: &mut [u8]) -> Result<u128, MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow().exclusive_read(a, b);
+            return shared.borrow_mut().exclusive_read(a, b);
         }
         let a = a & 0x00ffffffffffffff;
+        let page = self.page_for_access(a, b.len(), Access::Read)?;
+        if page
+            .backing
+            .as_ref()
+            .is_none_or(|b| !b.shared && b.private_copy)
+            && (page.bytes.shared().is_none() || std::rc::Rc::strong_count(&page.bytes) > 1)
+        {
+            // Give serial LL/SC the same 16-byte reservation domain as workers.
+            // A global memory revision makes a compiler's unrelated stack spill
+            // between LDAXR/STLXR fail every retry. Only atomic pages are promoted;
+            // non-atomic pages acquire no new monitor bookkeeping.
+            let base = a & !(crate::PAGE_SIZE - 1);
+            let frame = self.frame(base).expect("checked exclusive page");
+            let page = self.frames[frame].as_mut().unwrap();
+            let old = std::mem::replace(
+                &mut page.bytes,
+                std::rc::Rc::new(crate::mmu::PageBytes::Zero),
+            );
+            let mut owned = std::rc::Rc::try_unwrap(old).unwrap_or_else(|old| {
+                if page.charge.resident() {
+                    (*old).clone()
+                } else {
+                    crate::mmu::PageBytes::Zero
+                }
+            });
+            if owned.is_zero() {
+                if let Some(bytes) = self.mmu.page(base) {
+                    owned = std::rc::Rc::try_unwrap(bytes)
+                        .unwrap_or_else(|_| unreachable!("fresh MMU page"));
+                }
+            }
+            let storage = std::sync::Arc::new(crate::SharedPage::from_owned(owned, None));
+            self.frames[frame].as_mut().unwrap().bytes =
+                std::rc::Rc::new(crate::mmu::PageBytes::Concurrent(storage));
+            if self.parallel_cache.is_some() {
+                self.parallel_mappings.insert(base);
+            }
+            self.revision = self.revision.wrapping_add(1);
+            self.invalidate_translations();
+        }
         let page = self.page_for_access(a, b.len(), Access::Read)?;
         if let Some(storage) = page.shared_storage() {
             let offset = (a % crate::PAGE_SIZE) as usize;
@@ -249,6 +289,59 @@ mod tests {
         cell::RefCell,
         rc::{Rc, Weak},
     };
+
+    #[test]
+    fn serial_reservations_track_granules_aba_native_writes_and_fork_cow() {
+        let base = 0x40000;
+        let mut memory = Memory::default();
+        memory.map(base, 65536, Permissions::RW).unwrap();
+        memory.write_array(base, 1u64.to_le_bytes()).unwrap();
+        let mut old = [0; 8];
+        let token = memory.exclusive_read(base, &mut old).unwrap();
+        memory.write_array(base + 16, [7; 8]).unwrap();
+        assert!(memory
+            .exclusive_write(base, &2u64.to_le_bytes(), Some(token))
+            .unwrap());
+        let token = memory.exclusive_read(base, &mut old).unwrap();
+        memory.write_array(base + 8, [8; 8]).unwrap();
+        memory.write_array(base + 8, [0; 8]).unwrap();
+        assert!(!memory.exclusive_write(base, &[3; 8], Some(token)).unwrap());
+        let token = memory.exclusive_read(base, &mut old).unwrap();
+        memory.with_write_chunk(base, 8, |b| b.fill(5)).unwrap();
+        assert!(!memory.exclusive_write(base, &[3; 8], Some(token)).unwrap());
+        let mut child = memory.clone();
+        let mut stored = false;
+        for _ in 0..3 {
+            let token = child.exclusive_read(base, &mut old).unwrap();
+            stored = child.exclusive_write(base, &[9; 8], Some(token)).unwrap();
+            if stored {
+                break;
+            }
+        }
+        assert!(stored);
+        assert_eq!(child.read_array::<8>(base), Ok([9; 8]));
+        assert_eq!(memory.read_array::<8>(base), Ok([5; 8]));
+        let token = memory.exclusive_read(base, &mut old).unwrap();
+        memory.unmap(base, PAGE_SIZE).unwrap();
+        memory.map(base, PAGE_SIZE, Permissions::RW).unwrap();
+        assert!(!memory.exclusive_write(base, &[3; 8], Some(token)).unwrap());
+    }
+
+    #[test]
+    fn serial_exclusive_zero_load_preserves_demand_zero_accounting_and_cpu_alias() {
+        let base = 0x40000;
+        let mut memory = Memory::default();
+        memory.map(base, 65536, Permissions::RW).unwrap();
+        let mut old = [0; 8];
+        let token = memory.exclusive_read(base, &mut old).unwrap();
+        assert_eq!(old, [0; 8]);
+        assert_eq!(memory.resident_bytes(), 0);
+        assert!(memory.exclusive_write(base, &[7; 8], Some(token)).unwrap());
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(memory.read_array::<8>(base), Ok([7; 8]));
+        memory.write_array(base, [9; 8]).unwrap();
+        assert_eq!(memory.read_array::<8>(base), Ok([9; 8]));
+    }
 
     #[test]
     fn trusted_backings_borrow_once_and_unknown_read_callbacks_can_reenter() {

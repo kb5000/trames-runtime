@@ -905,7 +905,7 @@ impl CpuMemory for View {
         }
         Ok(value)
     }
-    fn exclusive_read(&self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError> {
+    fn exclusive_read(&mut self, address: u64, out: &mut [u8]) -> Result<u128, MemoryError> {
         let address = address & 0x00ffffffffffffff;
         let (frame, offset) = self.reached(address, out.len(), Access::Read)?;
         if let Some(bytes) = &frame.bytes.constant {
@@ -1565,7 +1565,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let mut registry = Registry::default();
-        let a = memory.parallel_view(&mut registry).unwrap();
+        let mut a = memory.parallel_view(&mut registry).unwrap();
         let mut old = [0; 8];
         let token = a.exclusive_read(0x1000, &mut old).unwrap();
         drop(a);
