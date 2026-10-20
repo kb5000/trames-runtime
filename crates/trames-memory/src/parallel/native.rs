@@ -54,12 +54,7 @@ impl View {
     ) -> Result<T, MemoryError> {
         let (frame, offset) = self.reached(address, len, Access::Write)?;
         self.ensure_resident(frame)?;
-        let mut guard = frame
-            .bytes
-            .bytes
-            .as_ref()
-            .expect("writable page")
-            .lock(offset, len);
+        let mut guard = self.frame_guard(frame, offset, len);
         // Invalidate reservations/code before exposing a mutable slice, including
         // an internal panic. Dirty-fragment commit uses the existing CPU hooks.
         self.changed(frame, &mut guard, offset, len);
@@ -115,12 +110,7 @@ impl NativeMemory for View {
         let result = if let Some(bytes) = &frame.bytes.constant {
             operation(&bytes[offset..offset + len])
         } else {
-            let guard = frame
-                .bytes
-                .bytes
-                .as_ref()
-                .expect("mutable page")
-                .lock(offset, len);
+            let guard = self.frame_guard(frame, offset, len);
             operation(guard.read(offset, len))
         };
         Ok((result, true))
@@ -142,32 +132,34 @@ impl NativeMemory for View {
         {
             return Err(NativeAccessError::Checkpoint);
         }
+        let ap = a.private_unique;
+        let bp = b.private_unique;
         let a = &a.bytes;
         let b = &b.bytes;
         let result = match (&a.constant, &b.constant) {
             (Some(a), Some(b)) => operation(&a[ai..ai + len], &b[bi..bi + len]),
             (Some(a), None) => {
-                let bg = b.bytes.as_ref().unwrap().lock(bi, len);
+                let bg = self.page_guard(b, bp, bi, len);
                 operation(&a[ai..ai + len], bg.read(bi, len))
             }
             (None, Some(b)) => {
-                let ag = a.bytes.as_ref().unwrap().lock(ai, len);
+                let ag = self.page_guard(a, ap, ai, len);
                 operation(ag.read(ai, len), &b[bi..bi + len])
             }
             (None, None) if Arc::ptr_eq(a, b) => {
-                let guard = a.bytes.as_ref().unwrap().lock_pair(ai, bi, len);
+                let guard = self.page_guard_pair(a, ap, ai, bi, len);
                 operation(guard.read(ai, len), guard.read(bi, len))
             }
             (None, None) => {
                 // Physical identity order applies equally to aliases and opposite
                 // direction comparisons; no AB/BA lock inversion is possible.
                 let (ag, bg) = if a.identity < b.identity {
-                    let ag = a.bytes.as_ref().unwrap().lock(ai, len);
-                    let bg = b.bytes.as_ref().unwrap().lock(bi, len);
+                    let ag = self.page_guard(a, ap, ai, len);
+                    let bg = self.page_guard(b, bp, bi, len);
                     (ag, bg)
                 } else {
-                    let bg = b.bytes.as_ref().unwrap().lock(bi, len);
-                    let ag = a.bytes.as_ref().unwrap().lock(ai, len);
+                    let bg = self.page_guard(b, bp, bi, len);
+                    let ag = self.page_guard(a, ap, ai, len);
                     (ag, bg)
                 };
                 operation(ag.read(ai, len), bg.read(bi, len))
@@ -270,23 +262,19 @@ impl NativeMemory for View {
             let dst = &df.bytes;
             let src = &sf.bytes;
             if Arc::ptr_eq(dst, src) {
-                let mut guard = dst
-                    .bytes
-                    .as_ref()
-                    .expect("writable page")
-                    .lock_pair(si, di, count);
+                let mut guard = self.page_guard_pair(dst, df.private_unique, si, di, count);
                 self.changed(df, &mut guard, di, count);
                 guard.copy_within(si, di, count);
             } else if let Some(bytes) = &src.constant {
                 self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
             } else {
                 let (mut dg, sg) = if dst.identity < src.identity {
-                    let dg = dst.bytes.as_ref().unwrap().lock(di, count);
-                    let sg = src.bytes.as_ref().unwrap().lock(si, count);
+                    let dg = self.page_guard(dst, df.private_unique, di, count);
+                    let sg = self.page_guard(src, sf.private_unique, si, count);
                     (dg, sg)
                 } else {
-                    let sg = src.bytes.as_ref().unwrap().lock(si, count);
-                    let dg = dst.bytes.as_ref().unwrap().lock(di, count);
+                    let sg = self.page_guard(src, sf.private_unique, si, count);
+                    let dg = self.page_guard(dst, df.private_unique, di, count);
                     (dg, sg)
                 };
                 self.changed(df, &mut dg, di, count);

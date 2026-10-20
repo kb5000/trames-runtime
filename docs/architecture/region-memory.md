@@ -27,7 +27,9 @@ provider, or unguarded borrowed slice crosses to workers. Immutable mapping
 snapshots and per-worker software TLBs still describe permissions and lifetimes.
 
 Coordinator reads/writes, hardware CPU aliases, native fragments, atomic RMW and
-exclusive monitors acquire the same physical region guards. Byte writes become
+exclusive monitors share one physical ownership protocol. Concurrent shared
+bytes acquire region guards; admitted sole-executor private bytes skip that
+acquisition, as described below. Byte writes become
 visible without commit or refresh. The coordinator uses scoped shared borrows;
 its optional unguarded native page-borrow API declines a shared page. Pair reads
 and moves handle physical aliases under a union guard or ordered page guards.
@@ -86,19 +88,71 @@ progress while a smaller native borrow is held. Native functions remain bounded;
 kernel mutation and persistence still use joined checkpoints.
 
 The module's `unsafe impl Sync` has one invariant: every non-atomic byte and local
-reservation-row access is covered by a live guard for that region. Slices expose
+reservation-row access has exclusive range ownership, from a live region lock
+or the scheduler's private-epoch proof. Slices expose
 only their checked subrange, never a mutable reference to the entire page.
 Mutable slices borrow the guard mutably and cannot outlive it. Same-page moves
 use overlap-safe raw copy under one union mask; different pages retain physical
 identity lock ordering. Guards release on unwind. Rc backing hooks stay on the
 coordinator. Tests and fully instrumented ThreadSanitizer check this boundary.
 
-Unsafe permits controlled raw access; it does not legalize an unguarded Rust/C
-data race. Guest nondeterminism comes from allowed instruction/fragment
+This implementation does not form racing Rust/C byte slices. Guest
+nondeterminism comes from allowed instruction/fragment
 interleavings. Aligned loads/stores and 128-bit RMWs remain protected; failed CAS
 and LL/SC semantics, code tokens and dirty-byte publication are preserved. Region
 guards can still exclude some weak outcomes that physical ARM allows. This is a
 stronger subset, not a complete enumeration of ARM's weak-memory outcomes.
+
+## Exclusive private epochs
+
+When different address spaces execute in parallel, each can have a single active
+CPU. The scheduler now admits a lock-free private-page path for those epochs:
+
+1. Prepare **all** chosen Views before admission. Count dispatches by actual
+   address-space identity, not PID or `vm_id`; require precisely one for this VM.
+2. Compare the actual coordinator `Memory` owner count with the Kernel's handles
+   for that root. A host callback retaining `Memory::share()` blocks admission.
+   Count real roots, including blocked tasks and retired zombie memories, so an
+   unrelated process record cannot substitute for an external alias.
+3. Require the all-generations View user count to be one. An externally retained
+   View, including one from a previous mapping generation, blocks admission.
+4. Each eligible frame must be anonymous or a detached private copy, with one
+   coordinate Rc owner and exactly the coordinate/ConcurrentPage physical Arc
+   owners. This additional physical test rejects retained read-only fork Views
+   after their coordinator has gone. Writable fork pages detach before dispatch.
+   Shared mappings, live private file shadows and custom providers stay guarded.
+
+These are checkpoint checks, not per-operand refcount loads or permission walks.
+An admitted frame uses an unlocked scoped guard: checked subranges, reference
+lifetimes, alias-aware pair/move behavior, unwind cleanup and monitor invalidation
+remain the same. Scalar hardware/software reads and writes, instruction fetch,
+native fragments/fill/copy, atomic RMW and LL/SC all use this single boundary.
+The acquisition mode is stored in an unused aligned page-pointer bit, keeping
+the guard at two words on supported 64-bit hosts. Rust `map_addr` preserves
+provenance, the lifetime marker retains the page, and every dereference clears
+the tag; no tagged pointer escapes. This avoids widening hot guard return values.
+Private version increments, dirty masks and reservation-row publication use
+single-writer relaxed load/store instead of atomic RMW. Global executable epochs
+remain atomic; explicit guest acquire/release/fence behavior remains intact.
+
+Only this actor may access the VM's private bytes/monitor metadata until the View
+is dropped. The coordinator performs no guest byte inspection, mapping mutation,
+fork, signal delivery or futex operation while it executes. Ready I/O can **move
+the same View** to a service actor while the CPU is parked, after ending scoped
+borrows; asynchronous disk jobs use host buffers and scatter through that View
+before returning it. Channels and joined completion publish bytes and relaxed
+metadata, so private stores need no extra inter-CPU publication fence. View
+cloning during this unsafe admission is forbidden; normal clones start guarded.
+
+The metric `exclusive_private_views` counts admitted dispatches, not accesses or
+cores. [Private-memory validation](../validation/private-memory.md) retains the
+fixed-work comparison and source hashes. Shared-VM multithreading, shared physical
+backings and the ordinary coordinator `Memory` path remain guarded. Extending
+lock-free ordinary ARM64 accesses there requires a separate protocol for native
+slice borrows, mixed-width atomics and exclusive-monitor metadata; simply
+removing their guards would not establish those requirements. Aligned raw-asm
+loads/stores are a candidate, rather than an obligation to simulate stronger ARM
+ordering. No global native-function safety lock or new race errno is introduced.
 
 ## Reservation and commit costs
 

@@ -301,6 +301,15 @@ impl Memory {
             ..Self::new(self.limit)
         }
     }
+    /// Address-space identity and number of coordinator-local `Memory` owners.
+    /// A scheduler can compare the count with its own handles before admitting
+    /// exclusive worker access. This includes aliases retained by host callbacks;
+    /// published worker Views are counted separately across all generations.
+    pub fn coordinator_ownership(&self) -> (u64, usize) {
+        self.shared.as_ref().map_or((self.identity, 1), |shared| {
+            (shared.borrow().identity, Rc::strong_count(shared))
+        })
+    }
     pub fn limit(&self) -> usize {
         self.shared
             .as_ref()

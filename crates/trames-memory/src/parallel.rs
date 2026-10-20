@@ -2,6 +2,8 @@
 //! CPU/native views between quiescent kernel checkpoints. Scoped page guards
 //! stay on workers; Rc backings, mappings and persistence stay coordinated.
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
+#[cfg(test)]
+mod exclusive;
 mod hardware;
 mod native;
 pub(super) mod page;
@@ -33,6 +35,8 @@ pub struct Metrics {
     pub shared_frames: u64,
     pub copied_publish_bytes: u64,
     pub cow_detach_bytes: u64,
+    /// Quiescent dispatches with one execution owner for private VM bytes.
+    pub exclusive_private_views: u64,
 }
 struct ConcurrentPage {
     identity: u64,
@@ -108,10 +112,17 @@ impl ConcurrentPage {
         if len == 0 {
             return;
         }
-        let version = self
-            .version()
-            .fetch_add(1, Ordering::Release)
-            .wrapping_add(1);
+        let version = if state.is_exclusive() {
+            let next = self.version().load(Ordering::Relaxed).wrapping_add(1);
+            // One private actor; the epoch/channel handoff publishes metadata
+            // with the bytes. No per-store inter-CPU fence or RMW is required.
+            self.version().store(next, Ordering::Relaxed);
+            next
+        } else {
+            self.version()
+                .fetch_add(1, Ordering::Release)
+                .wrapping_add(1)
+        };
         state.invalidate(offset, len, version);
         // One bit per 64-byte fragment. No unrelated clean bytes are written
         // back over an alias; full-page snapshots would lose concurrent edits.
@@ -121,7 +132,12 @@ impl ConcurrentPage {
         // Only the joined coordinator clears dirty bits. Once this region is
         // dirty in an epoch, another RMW per store/copy adds no information.
         if self.dirty.load(Ordering::Relaxed) & mask != mask {
-            self.dirty.fetch_or(mask, Ordering::Relaxed);
+            if state.is_exclusive() {
+                self.dirty
+                    .store(self.dirty.load(Ordering::Relaxed) | mask, Ordering::Relaxed);
+            } else {
+                self.dirty.fetch_or(mask, Ordering::Relaxed);
+            }
         }
         if self.executable.load(Ordering::Relaxed) {
             self.code_epoch.fetch_add(1, Ordering::Release);
@@ -165,6 +181,7 @@ struct Frame {
     charge: Arc<Charge>,
     direct: bool,
     dynamic_code: bool,
+    private_unique: bool,
 }
 fn direct_matches(page: &Page, frame: &Frame) -> bool {
     let storage = page
@@ -350,8 +367,14 @@ fn prepare_frame(
                 .is_some_and(|b| !b.shared && !b.private_copy && !direct),
         ),
         error,
-        bytes,
         charge: page.charge.clone(),
+        private_unique: direct_owned
+            && Rc::strong_count(&page.bytes) == 1
+            && bytes
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| Arc::strong_count(bytes) == 2),
+        bytes,
         direct,
         dynamic_code: page.permissions.execute
             && (page.permissions.write
@@ -403,6 +426,7 @@ pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     mmu_cache: mmu::Cache,
+    exclusive_private: bool,
 }
 /// Clone a worker-local view over the same frozen address space, with its own
 /// translation cells. This is a shared-VM view, not a process fork.
@@ -422,8 +446,68 @@ impl View {
         Self {
             snapshot,
             mmu_cache: mmu::Cache::default(),
+            exclusive_private: false,
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
+    }
+    /// Admit the private-page fast path for one joined runtime epoch.
+    /// Returns false if any other View of this VM survives, across generations.
+    ///
+    /// # Safety
+    /// Until this View returns/drops, at most one thread may access its private
+    /// byte storage/monitor metadata at a time. The caller must not clone the
+    /// View, dispatch another CPU in this VM, fork/mutate mappings, or access
+    /// coordinator private bytes concurrently. A stopped caller may transfer
+    /// this very View to a service thread and back, after ending its borrows.
+    /// Shared/custom backings and physically shared fork pages never qualify.
+    pub unsafe fn try_exclusive_private(&mut self) -> bool {
+        self.exclusive_private = false;
+        if self.snapshot.users.load(Ordering::Acquire) != 1 {
+            return false;
+        }
+        self.exclusive_private = true;
+        true
+    }
+    pub fn exclusive_private_enabled(&self) -> bool {
+        self.exclusive_private
+    }
+    #[inline]
+    fn page_guard<'a>(
+        &self,
+        bytes: &'a ConcurrentPage,
+        private: bool,
+        offset: usize,
+        len: usize,
+    ) -> page::Guard<'a> {
+        let storage = bytes.bytes.as_ref().expect("mutable page");
+        if self.exclusive_private && private {
+            // SAFETY: unsafe admission proves one owner for this epoch; frame
+            // construction proves these bytes are not shared with another VM.
+            unsafe { storage.exclusive(offset, len) }
+        } else {
+            storage.lock(offset, len)
+        }
+    }
+    #[inline]
+    fn page_guard_pair<'a>(
+        &self,
+        bytes: &'a ConcurrentPage,
+        private: bool,
+        a: usize,
+        b: usize,
+        len: usize,
+    ) -> page::Guard<'a> {
+        let storage = bytes.bytes.as_ref().expect("mutable page");
+        if self.exclusive_private && private {
+            // SAFETY: same epoch/physical ownership proof for both subranges.
+            unsafe { storage.exclusive_pair(a, b, len) }
+        } else {
+            storage.lock_pair(a, b, len)
+        }
+    }
+    #[inline]
+    fn frame_guard<'a>(&self, frame: &'a Frame, offset: usize, len: usize) -> page::Guard<'a> {
+        self.page_guard(&frame.bytes, frame.private_unique, offset, len)
     }
     #[inline]
     fn frame(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {
@@ -496,12 +580,7 @@ impl View {
         if let Some(bytes) = &frame.bytes.constant {
             out.copy_from_slice(&bytes[offset..offset + out.len()]);
         } else {
-            let guard = frame
-                .bytes
-                .bytes
-                .as_ref()
-                .expect("mutable page")
-                .lock(offset, out.len());
+            let guard = self.frame_guard(frame, offset, out.len());
             // Logical zero storage itself supplies zeros. Quota membership is
             // not a byte-publication fence or an extra read-side condition.
             out.copy_from_slice(guard.read(offset, out.len()));
@@ -514,7 +593,11 @@ impl View {
             let word = &self.snapshot.dirty_pages[frame.root_frame / 64];
             let bit = 1 << (frame.root_frame % 64);
             if word.load(Ordering::Relaxed) & bit == 0 {
-                word.fetch_or(bit, Ordering::Relaxed);
+                if state.is_exclusive() {
+                    word.store(word.load(Ordering::Relaxed) | bit, Ordering::Relaxed);
+                } else {
+                    word.fetch_or(bit, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -594,12 +677,7 @@ impl View {
         input: &[u8],
     ) -> Result<(), MemoryError> {
         self.ensure_resident(frame)?;
-        let mut guard = frame
-            .bytes
-            .bytes
-            .as_ref()
-            .expect("writable page")
-            .lock(offset, input.len());
+        let mut guard = self.frame_guard(frame, offset, input.len());
         guard.write(offset, input.len()).copy_from_slice(input);
         self.changed(frame, &mut guard, offset, input.len());
         Ok(())
@@ -712,12 +790,7 @@ impl CpuMemory for View {
         if let Some(data) = &frame.bytes.constant {
             bytes.copy_from_slice(&data[offset..offset + 4]);
         } else {
-            let guard = frame
-                .bytes
-                .bytes
-                .as_ref()
-                .expect("mutable page")
-                .lock(offset, 4);
+            let guard = self.frame_guard(frame, offset, 4);
             bytes.copy_from_slice(guard.read(offset, 4));
         }
         Ok(u32::from_le_bytes(bytes))
@@ -762,12 +835,7 @@ impl CpuMemory for View {
                 access: Access::Read,
             });
         }
-        let mut guard = frame
-            .bytes
-            .bytes
-            .as_ref()
-            .expect("writable page")
-            .lock(offset, len);
+        let mut guard = self.frame_guard(frame, offset, len);
         self.ensure_resident(frame)?;
         let (value, write) = update(guard.write(offset, len));
         if write {
@@ -782,12 +850,7 @@ impl CpuMemory for View {
             out.copy_from_slice(&bytes[offset..offset + out.len()]);
             return Ok((frame.bytes.identity as u128) << 64);
         }
-        let guard = frame
-            .bytes
-            .bytes
-            .as_ref()
-            .expect("mutable page")
-            .lock(offset, out.len());
+        let guard = self.frame_guard(frame, offset, out.len());
         out.copy_from_slice(guard.read(offset, out.len()));
         Ok((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
     }
@@ -802,12 +865,7 @@ impl CpuMemory for View {
         }
         let address = address & 0x00ffffffffffffff;
         let (frame, offset) = self.reached(address, bytes.len(), Access::Write)?;
-        let mut guard = frame
-            .bytes
-            .bytes
-            .as_ref()
-            .expect("writable page")
-            .lock(offset, bytes.len());
+        let mut guard = self.frame_guard(frame, offset, bytes.len());
         if token
             != Some((frame.bytes.identity as u128) << 64 | guard.reservation(offset / 16) as u128)
         {

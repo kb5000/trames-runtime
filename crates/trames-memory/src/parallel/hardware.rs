@@ -81,7 +81,7 @@ impl View {
             .bytes
             .bytes
             .as_ref()
-            .map(|bytes| bytes.lock(offset, N));
+            .map(|_| self.frame_guard(frame, offset, N));
         // SAFETY: mutable physical bytes retain the exact same region guard;
         // constant frames cannot be mutated through any published view.
         unsafe { entry.read(offset) }
@@ -98,10 +98,10 @@ impl View {
         }
         // SAFETY: same retained immutable snapshot and page-contained operand.
         let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
-        let Some(storage) = &frame.bytes.bytes else {
+        let Some(_) = &frame.bytes.bytes else {
             return false;
         };
-        let mut guard = storage.lock(offset, N);
+        let mut guard = self.frame_guard(frame, offset, N);
         // SAFETY: same guarded physical bytes back the protected alias. A failed
         // store leaves them unchanged and the checked path supplies the errno.
         if unsafe { entry.write(offset, bytes) } {
