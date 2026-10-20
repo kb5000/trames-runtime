@@ -260,6 +260,65 @@ fn disk_read_offsets_conflicts_short_reads_and_errors_commit_once() {
     assert!(v.prepare_disk_read(fd, 4, Some(100)).unwrap().is_none());
 }
 #[test]
+fn cached_disk_handles_observe_writes_truncate_and_recycled_short_reads() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", vec![0xa5; 32768]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
+    let mut cache = DiskReadCache::default();
+    let (read, job) = v.prepare_disk_read(fd, 32768, Some(0)).unwrap().unwrap();
+    let bytes = read.finish(job.run_cached(&mut cache, Vec::new())).unwrap();
+    let allocation = bytes.as_ptr();
+    v.pwrite(fd, b"new", 0).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32768, Some(0)).unwrap().unwrap();
+    let bytes = read.finish(job.run_cached(&mut cache, bytes)).unwrap();
+    assert_eq!(bytes.as_ptr(), allocation);
+    assert_eq!(&bytes[..3], b"new");
+    v.truncate_fd(fd, 1).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32768, Some(0)).unwrap().unwrap();
+    let bytes = read.finish(job.run_cached(&mut cache, bytes)).unwrap();
+    assert_eq!(bytes, b"n");
+    v.truncate_fd(fd, 32768).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32768, Some(0)).unwrap().unwrap();
+    let bytes = read.finish(job.run_cached(&mut cache, bytes)).unwrap();
+    assert_eq!(bytes.as_ptr(), allocation);
+    assert_eq!(bytes[0], b'n');
+    assert!(bytes[1..].iter().all(|b| *b == 0));
+}
+#[test]
+fn cached_handles_do_not_retain_store_lock_or_confuse_replaced_inodes() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"old".to_vec()).unwrap();
+    let old = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    let mut cache = DiskReadCache::default();
+    let (read, job) = v.prepare_disk_read(old, 32, Some(0)).unwrap().unwrap();
+    assert_eq!(
+        read.finish(job.run_cached(&mut cache, Vec::new())).unwrap(),
+        b"old"
+    );
+    v.import_reader_replace(b"/data", &mut &b"replacement"[..])
+        .unwrap();
+    let new = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    for (fd, expected) in [(new, &b"replacement"[..]), (old, &b"old"[..])] {
+        let (read, job) = v.prepare_disk_read(fd, 32, Some(0)).unwrap().unwrap();
+        assert_eq!(
+            read.finish(job.run_cached(&mut cache, Vec::new())).unwrap(),
+            expected
+        );
+    }
+    drop(v);
+    // Cache remains alive with weak identities/host read descriptors. It must
+    // neither pin orphan paths/store locks nor authorize a future incarnation.
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32, Some(0)).unwrap().unwrap();
+    assert_eq!(
+        read.finish(job.run_cached(&mut cache, Vec::new())).unwrap(),
+        b"replacement"
+    );
+}
+#[test]
 fn device_nodes_persist_numbers_links_and_driver_behavior() {
     let dir = Temp::new();
     let mut v = dir.open();

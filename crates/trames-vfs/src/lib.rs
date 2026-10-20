@@ -6,7 +6,7 @@ mod cgroup;
 mod credentials;
 mod directory;
 mod disk_io;
-pub use disk_io::{DiskRead, DiskReadJob};
+pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob};
 mod events;
 mod executable;
 pub use executable::ExecutableFile;

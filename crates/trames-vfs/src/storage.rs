@@ -161,6 +161,14 @@ impl Drop for DiskBacking {
     }
 }
 impl FileData {
+    pub(super) fn disk_backed(&self) -> bool {
+        match self {
+            Self::Disk(_) => true,
+            Self::Lower(node) => matches!(&node.borrow().content,
+                Content::File(data) if data.disk_backed()),
+            _ => false,
+        }
+    }
     pub(super) fn disk_source(&self) -> Option<(Arc<DiskBacking>, u64)> {
         match self {
             Self::Disk(d) => Some((d.backing.clone(), d.length)),

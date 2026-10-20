@@ -1,7 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Coordinator capabilities and Send-only host work are deliberately distinct.
 use super::*;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
+/// Worker-local, bounded host handles. Weak identities neither retain an
+/// unlinked object nor keep a store locked after its last guest/job reference.
+#[derive(Default)]
+pub struct DiskReadCache {
+    entries: Vec<(std::sync::Weak<storage::DiskBacking>, File)>,
+}
+impl DiskReadCache {
+    fn file(&mut self, backing: &Arc<storage::DiskBacking>) -> Result<&File> {
+        // Do not leave dead/orphan handles behind a frequently hit live entry.
+        self.entries.retain(|(key, _)| key.strong_count() != 0);
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(key, _)| key.as_ptr() == Arc::as_ptr(backing))
+        {
+            // The retained Weak prevents address reuse while an entry exists.
+            let entry = self.entries.remove(index);
+            self.entries.push(entry);
+        } else {
+            let file = backing.open(false)?;
+            if self.entries.len() == 16 {
+                self.entries.remove(0);
+            }
+            self.entries.push((Arc::downgrade(backing), file));
+        }
+        Ok(&self.entries.last().expect("opened disk handle").1)
+    }
+}
 
 /// Retained only by the coordinator until the submitted read is completed.
 pub struct DiskRead {
@@ -19,13 +50,25 @@ pub struct DiskReadJob {
 }
 impl DiskReadJob {
     pub fn run(self) -> Result<Vec<u8>> {
-        // Identical confinement, errno mapping, transfer cap and single-read
-        // short-read semantics to FileData::read_at; open itself is off-thread.
-        let mut file = self.backing.open(false)?;
-        file.seek(SeekFrom::Start(self.offset))
+        self.run_cached(&mut DiskReadCache::default(), Vec::new())
+    }
+    pub fn run_cached(self, cache: &mut DiskReadCache, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+        // Revalidate guest admission each time; only the private object handle
+        // is cached. First open keeps regular/O_NOFOLLOW/metadata confinement.
+        let file = cache.file(&self.backing)?;
+        bytes.resize(self.count, 0);
+        #[cfg(unix)]
+        let count = file
+            .read_at(&mut bytes, self.offset)
             .map_err(storage::host_errno)?;
-        let mut bytes = vec![0; self.count];
-        let count = file.read(&mut bytes).map_err(storage::host_errno)?;
+        #[cfg(not(unix))]
+        let count = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = file;
+            file.seek(SeekFrom::Start(self.offset))
+                .map_err(storage::host_errno)?;
+            file.read(&mut bytes).map_err(storage::host_errno)?
+        };
         bytes.truncate(count);
         Ok(bytes)
     }
@@ -65,8 +108,9 @@ impl DiskRead {
 impl Vfs {
     pub fn disk_read_candidate(&self, fd: u32) -> bool {
         self.descriptor(fd).is_ok_and(|d| {
-            Self::ordinary_file(&d.open.borrow(), false).is_some_and(|node|
-                matches!(&node.borrow().content, Content::File(data) if data.disk_source().is_some()))
+            Self::ordinary_file(&d.open.borrow(), false).is_some_and(
+                |node| matches!(&node.borrow().content, Content::File(data) if data.disk_backed()),
+            )
         })
     }
     /// Call only in an epoch, before changing this inode/OFD or mapping state.
