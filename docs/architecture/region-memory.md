@@ -33,6 +33,16 @@ its optional unguarded native page-borrow API declines a shared page. Pair reads
 and moves handle physical aliases under a union guard or ordered page guards.
 No native function gains an algorithm-level lock.
 
+The primary guest and host are both AArch64. Protected scalar/SIMD access already
+uses native LDR/STR and needs no additional per-access fence; explicit guest
+acquire/release/fence instructions retain their required ordering. Region guards
+remain for scoped Rust/native borrows, mixed atomics and monitor bookkeeping;
+they currently admit a stronger subset of ARM interleavings and are a future
+optimization boundary, not a requirement to strengthen every guest access.
+Quota membership is not a byte-publication fence: its warm state uses relaxed
+loads, software/native stores reuse the paid per-view TLB bit, and reads consume
+initialized shared storage directly without a second residency/acquire check.
+
 Shared anonymous mappings, shared file mappings and memfd/shm buffers expose
 resident `SharedPage` handles through `PageBacking::shared_page`. File cache pages
 move their original allocations into that domain; memfd retains its existing

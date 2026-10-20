@@ -502,11 +502,9 @@ impl View {
                 .as_ref()
                 .expect("mutable page")
                 .lock(offset, out.len());
-            if frame.charge.resident() {
-                out.copy_from_slice(guard.read(offset, out.len()));
-            } else {
-                out.fill(0);
-            }
+            // Logical zero storage itself supplies zeros. Quota membership is
+            // not a byte-publication fence or an extra read-side condition.
+            out.copy_from_slice(guard.read(offset, out.len()));
         }
     }
     #[inline]
@@ -521,11 +519,15 @@ impl View {
         }
     }
     fn ensure_resident(&self, frame: &Frame) -> Result<(), MemoryError> {
-        frame.charge.ensure()?;
-        // A first store upgrades only this view's cached tag. Subsequent CPU
-        // stores use the ordinary hardware/TLB path without an atomic charge.
+        // Residency is monotonic for the lifetime of this immutable frame.
+        // CPU software stores and native chunks reuse the same paid TLB bit as
+        // hardware stores; no quota acquire is needed on each fragment.
         let cell = &self.translations[Translation::slot(frame.base)];
         let mut entry = cell.get();
+        if entry.matches(frame.base, Translation::RESIDENT) {
+            return Ok(());
+        }
+        frame.charge.ensure()?;
         if entry.matches(frame.base, Translation::VALID) {
             entry.tag |= Translation::RESIDENT;
             cell.set(entry);

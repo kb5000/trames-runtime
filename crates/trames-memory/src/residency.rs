@@ -92,7 +92,10 @@ impl Charge {
         })
     }
     pub(super) fn resident(&self) -> bool {
-        self.state.load(Ordering::Acquire) == 2
+        // Only quota membership: bytes are initialized before view publication
+        // and shared CPU/native accesses use their own region/ARM ordering.
+        // Do not turn accounting into a second acquire on ordinary accesses.
+        self.state.load(Ordering::Relaxed) == 2
     }
     pub(super) fn ensure(&self) -> Result<(), MemoryError> {
         if self.resident() {
