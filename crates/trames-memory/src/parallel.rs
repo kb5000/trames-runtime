@@ -381,6 +381,7 @@ pub(super) struct Snapshot {
     dirty_pages: Arc<[AtomicU64]>,
     reservations: BTreeMap<u64, u64>,
     code_epoch: Arc<AtomicU64>,
+    users: Arc<std::sync::atomic::AtomicUsize>,
 }
 pub(super) struct SnapshotCache {
     pub(super) snapshot: Arc<Snapshot>,
@@ -410,8 +411,14 @@ impl Clone for View {
         Self::new(self.snapshot.clone())
     }
 }
+impl Drop for View {
+    fn drop(&mut self) {
+        self.snapshot.users.fetch_sub(1, Ordering::Release);
+    }
+}
 impl View {
     fn new(snapshot: Arc<Snapshot>) -> Self {
+        snapshot.users.fetch_add(1, Ordering::Relaxed);
         Self {
             snapshot,
             mmu_cache: mmu::Cache::default(),
@@ -825,6 +832,9 @@ impl Memory {
             }
         }
     }
+    pub(super) fn has_parallel_users(&self) -> bool {
+        self.parallel_users.load(Ordering::Acquire) != 0
+    }
     pub(super) fn prepare_shared_storage(
         &mut self,
         base: u64,
@@ -1042,6 +1052,7 @@ impl Memory {
             frames,
             reservations: self.reservations.clone(),
             code_epoch: registry.code_epoch.clone(),
+            users: self.parallel_users.clone(),
         };
         snapshot.refresh_mmu_all();
         let snapshot = Arc::new(snapshot);

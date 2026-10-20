@@ -219,6 +219,7 @@ pub struct Memory {
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
     fork_epoch: Cell<u64>,
+    parallel_users: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     parallel_dirty: Vec<usize>,
     parallel_mappings: BTreeSet<u64>,
     parallel_reservations_dirty: bool,
@@ -243,12 +244,7 @@ impl Clone for Memory {
                 .map(|page| {
                     page.as_ref().map(|page| {
                         let mut page = page.clone();
-                        if self
-                            .parallel_cache
-                            .as_ref()
-                            .is_some_and(|c| std::sync::Arc::strong_count(&c.snapshot) > 1)
-                            && page.bytes.shared().is_some()
-                        {
+                        if self.has_parallel_users() && page.bytes.shared().is_some() {
                             page.bytes = Rc::new(if page.charge.resident() {
                                 (*page.bytes).clone()
                             } else {
@@ -277,6 +273,7 @@ impl Clone for Memory {
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
             fork_epoch: Cell::new(0),
+            parallel_users: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             parallel_dirty: Vec::new(),
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
@@ -338,6 +335,7 @@ impl Memory {
             cpu_borrow_safe: true,
             parallel_cache: None,
             fork_epoch: Cell::new(0),
+            parallel_users: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             parallel_dirty: Vec::new(),
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
@@ -652,7 +650,7 @@ impl Memory {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.refresh_mmu(address, len);
+        self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }
@@ -679,7 +677,7 @@ impl Memory {
         }
         self.revision = self.revision.wrapping_add(1);
         self.advance_code_revision();
-        self.refresh_mmu(address, len);
+        self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }
@@ -759,7 +757,7 @@ impl Memory {
             self.insert_page(base, permissions);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.refresh_mmu(address, len as u64);
+        self.refresh_mapping_mmu(address, len as u64);
         self.invalidate_translations();
         Ok(())
     }
@@ -821,7 +819,7 @@ impl Memory {
             page.instruction_revision = self.code_revision;
         }
         self.revision = self.revision.wrapping_add(1);
-        self.refresh_mmu(address, len);
+        self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         Ok(())
     }

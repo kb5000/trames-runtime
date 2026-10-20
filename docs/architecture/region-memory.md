@@ -48,8 +48,13 @@ changed. Before writable fork pages return to workers, they detach once into
 owned physical storage; read-only shared storage can stay shared. A safe fork
 with an externally retained writer snapshots the child's private bytes, because
 the old view still has a writable capability. Normal runtime fork joins workers
-first. `CLONE_VM` never detaches or duplicates bytes. Remap/protect/truncate/
-discard and persistence still use joined checkpoints.
+first. `CLONE_VM` never detaches or duplicates bytes. Source mapping changes
+retire CPU windows if any external View survives, including views from previous
+snapshot generations. A VM-level lifetime counter changes only when a View is
+created/dropped; ordinary CPU/native byte accesses do not update it. This keeps
+retired physical slots from being zeroed/reused under an older reader/writer.
+Normal joined runtime mapping paths reuse their existing windows. Remap/protect/
+truncate/discard and persistence still use joined checkpoints.
 
 Anonymous zeros remain unpaid and physically sparse in mapped storage. If the
 optional MMU arena is unavailable, a shared zero page's software allocation is

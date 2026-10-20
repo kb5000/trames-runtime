@@ -484,6 +484,18 @@ impl Memory {
         }
         Ok(())
     }
+    /// A safe external caller can retain a View across mapping changes. Retire
+    /// old source CPU windows before any slot is cleared/reused, so the view's
+    /// physical owners remain frozen. Track all snapshot generations, not just
+    /// strong references to the current cached Snapshot. Runtime joined paths
+    /// normally have no users and retain their existing source windows.
+    pub(super) fn refresh_mapping_mmu(&mut self, address: u64, len: u64) -> bool {
+        if self.has_parallel_users() {
+            self.invalidate_translations();
+            self.mmu.retire();
+        }
+        self.refresh_mmu(address, len)
+    }
     /// Called only at quiescent mapping/COW boundaries. Hardware groups with
     /// holes, mixed permissions or backing I/O stay on the shared software path.
     pub(super) fn refresh_mmu(&mut self, address: u64, len: u64) -> bool {

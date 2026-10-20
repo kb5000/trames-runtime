@@ -191,7 +191,7 @@ impl Memory {
                 private_copy: false,
             });
         }
-        self.refresh_mmu(address, len);
+        self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         self.has_backings = true;
         self.cpu_borrow_safe &= cpu_safe;
@@ -253,7 +253,7 @@ impl Memory {
             }
             page.instruction_revision = self.code_revision;
         }
-        self.refresh_mmu(address, len);
+        self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         self.revision = self.revision.wrapping_add(1);
         Ok(())
@@ -372,7 +372,7 @@ impl Memory {
             let frame = self.pages[&(new + i as u64 * PAGE_SIZE)];
             self.frames[frame] = Some(page);
         }
-        self.refresh_mmu(new, new_len);
+        self.refresh_mapping_mmu(new, new_len);
         self.invalidate_translations();
         Ok(())
     }

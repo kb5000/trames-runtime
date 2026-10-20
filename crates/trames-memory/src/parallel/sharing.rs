@@ -200,3 +200,31 @@ fn a_private_file_copy_rejoins_shared_storage_after_its_first_cow_write() {
     memory.commit_parallel().unwrap();
     assert_eq!(registry.metrics.copied_publish_bytes, published);
 }
+
+#[test]
+fn retired_views_keep_reused_slots_with_live_neighbors_and_snapshot_generations() {
+    for refresh in [false, true] {
+        let mut memory = Memory::default();
+        memory.map(0x40000, 4 * PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x40000, [11; 8]).unwrap();
+        memory.write_array(0x41000, [22; 8]).unwrap();
+        let mut registry = Registry::default();
+        let old = memory.parallel_view(&mut registry).unwrap();
+        if refresh {
+            backing::backing_changed();
+            // Old View now belongs to a different Snapshot from the cache.
+            drop(memory.parallel_view(&mut registry).unwrap());
+        }
+        memory.unmap(0x40000, PAGE_SIZE).unwrap();
+        memory.map(0x40000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x40000, [33; 8]).unwrap();
+        assert_eq!(old.read_array::<8>(0x40000).unwrap(), [11; 8]);
+        assert_eq!(old.read_array::<8>(0x41000).unwrap(), [22; 8]);
+        assert_eq!(memory.read_array::<8>(0x40000).unwrap(), [33; 8]);
+        let next = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(next.read_array::<8>(0x40000).unwrap(), [33; 8]);
+        drop(old);
+        drop(next);
+        assert!(!memory.has_parallel_users());
+    }
+}
