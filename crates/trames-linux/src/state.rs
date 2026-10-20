@@ -164,7 +164,7 @@ impl Linux {
         };
         Ok(bytes)
     }
-    pub fn readv_parts(memory: &Memory, a: [u64; 6]) -> Result<(Vec<(u64, usize)>, usize)> {
+    pub fn readv_parts(memory: &impl CpuMemory, a: [u64; 6]) -> Result<(Vec<(u64, usize)>, usize)> {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
@@ -188,7 +188,11 @@ impl Linux {
         }
         Ok((parts, total))
     }
-    pub fn scatter(memory: &mut Memory, parts: &[(u64, usize)], bytes: &[u8]) -> Result<()> {
+    pub fn scatter(
+        memory: &mut impl CpuMemory,
+        parts: &[(u64, usize)],
+        bytes: &[u8],
+    ) -> Result<()> {
         let mut offset = 0;
         for &(pointer, length) in parts {
             let take = length.min(bytes.len() - offset);
@@ -204,10 +208,10 @@ impl Linux {
         }
         Ok(())
     }
-    pub(super) fn readv(
+    pub fn readv(
         &mut self,
         a: [u64; 6],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
@@ -228,6 +232,31 @@ impl Linux {
         let mut bytes = vec![0; count];
         memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
         self.write_bytes(a[0] as u32, &bytes, io)
+    }
+    /// ARM64 positioned scalar I/O, shared by joined and in-epoch dispatch.
+    pub fn positioned(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        write: bool,
+    ) -> Result<u64> {
+        self.vfs.fd_kind(a[0] as u32)?;
+        let count = a[2].min(MAX_WRITE as u64) as usize;
+        Self::check(
+            memory,
+            a[1],
+            count,
+            if write { Access::Read } else { Access::Write },
+        )?;
+        if write {
+            let mut bytes = vec![0; count];
+            memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
+            Ok(self.vfs.pwrite(a[0] as u32, &bytes, a[3])? as u64)
+        } else {
+            let bytes = self.vfs.pread(a[0] as u32, count, a[3])?;
+            memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+            Ok(bytes.len() as u64)
+        }
     }
     /// Metadata/offset queries do not change mappings or file contents. The
     /// coordinator and in-epoch service use the same ABI and memory validation.
@@ -256,10 +285,10 @@ impl Linux {
             _ => Err(Errno(38)),
         }
     }
-    pub(super) fn writev(
+    pub fn writev(
         &mut self,
         a: [u64; 6],
-        memory: &Memory,
+        memory: &impl CpuMemory,
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
@@ -292,10 +321,10 @@ impl Linux {
         }
         self.write_bytes(a[0] as u32, &bytes, io)
     }
-    pub(super) fn positioned_vector(
+    pub fn positioned_vector(
         &mut self,
         a: [u64; 6],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
         write: bool,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
@@ -779,29 +808,7 @@ impl Linux {
                 self.vfs.chown_fd(a[0] as u32, a[1] as u32, a[2] as u32)?;
                 Ok(0)
             }
-            67 | 68 => {
-                self.vfs.fd_kind(a[0] as u32)?;
-                let count = a[2].min(MAX_WRITE as u64) as usize;
-                Self::check(
-                    memory,
-                    a[1],
-                    count,
-                    if number == 67 {
-                        Access::Write
-                    } else {
-                        Access::Read
-                    },
-                )?;
-                if number == 67 {
-                    let bytes = self.vfs.pread(a[0] as u32, count, a[3])?;
-                    memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
-                    Ok(bytes.len() as u64)
-                } else {
-                    let mut bytes = vec![0; count];
-                    memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                    Ok(self.vfs.pwrite(a[0] as u32, &bytes, a[3])? as u64)
-                }
-            }
+            67 | 68 => self.positioned(a, memory, number == 68),
             82 | 83 => {
                 self.vfs.sync_fd(a[0] as u32, number == 83)?;
                 Ok(0)

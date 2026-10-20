@@ -50,6 +50,16 @@ impl MappedData {
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
     }
+    pub(super) fn epoch_io_safe(&self) -> bool {
+        // FileMapping owns these pages across all VMs, hard links and retained
+        // open descriptions. Workers keep shadow pages until a joined commit.
+        !self
+            .pages
+            .borrow()
+            .values()
+            .any(|page| page.strong_count() != 0)
+            && self.data.borrow().epoch_io_safe()
+    }
     pub(super) fn inode(&self) -> Option<u64> {
         self.data.borrow().inode()
     }
@@ -473,6 +483,49 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn epoch_file_io_checks_live_inode_aliases_in_any_vm_not_the_cached_fd_mask() {
+        let mut v = Vfs::default();
+        v.import_file(b"/original", b"abcdefgh".to_vec()).unwrap();
+        v.link_at(AT_FDCWD, b"/original", AT_FDCWD, b"/alias")
+            .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/original", 2, 0).unwrap();
+        let alias = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
+        let candidate = v.file_descriptors();
+        assert!(v.epoch_file_io(alias, false));
+        assert!(v.epoch_file_io(alias, true));
+        let mut other_vm = Memory::default();
+        let pages = v.mapping_pages(fd, 0, PAGE_SIZE, false, false).unwrap();
+        other_vm
+            .map_backed(0x8000, pages, false, Permissions::R, false)
+            .unwrap();
+        assert_eq!(v.file_descriptors(), candidate);
+        assert!(!v.epoch_file_io(alias, false));
+        assert!(!v.epoch_file_io(alias, true));
+        v.rename_at(AT_FDCWD, b"/alias", AT_FDCWD, b"/moved", 0)
+            .unwrap();
+        v.unlink_at(AT_FDCWD, b"/original", false).unwrap();
+        assert!(!v.epoch_file_io(alias, false));
+        // A pathname replacement is a different inode; it remains eligible.
+        v.import_file(b"/original", b"replacement".to_vec())
+            .unwrap();
+        let replacement = v.open_at(AT_FDCWD, b"/original", 0, 0).unwrap();
+        assert!(v.epoch_file_io(replacement, false));
+        other_vm.unmap(0x8000, PAGE_SIZE).unwrap();
+        assert!(v.epoch_file_io(alias, false));
+        assert!(v.epoch_file_io(alias, true));
+        let host_shared = v.memfd_create(b"host-display", 0).unwrap();
+        assert!(!v.epoch_file_io(host_shared, false));
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let dynamic = v.open_at(AT_FDCWD, b"/proc/stat", 0, 0).unwrap();
+        assert!(!v.epoch_file_io(dynamic, false));
+        let _ = v.file_descriptors();
+        v.close(replacement).unwrap();
+        assert_eq!(
+            v.file_descriptors()[replacement as usize / 64] & (1 << (replacement % 64)),
+            0
+        );
+    }
     #[test]
     fn memfd_native_views_share_guest_pages_and_keep_physical_budget_until_last_lease() {
         let mut v = Vfs::default();

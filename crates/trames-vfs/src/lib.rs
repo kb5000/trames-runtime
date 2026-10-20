@@ -235,7 +235,7 @@ struct DescriptorTable {
 }
 #[derive(Clone, Default)]
 struct DescriptorVersion {
-    streams: OnceCell<FdMask>,
+    io: OnceCell<(FdMask, FdMask)>,
 }
 impl DescriptorTable {
     // Keep two-phase receiver borrowing for expressions such as
@@ -258,7 +258,7 @@ impl std::ops::Deref for DescriptorTable {
 }
 impl std::ops::DerefMut for DescriptorTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Rc::make_mut(&mut self.identity).streams.take();
+        Rc::make_mut(&mut self.identity).io.take();
         &mut self.entries
     }
 }
@@ -480,21 +480,65 @@ impl Vfs {
     /// Immutable descriptor kinds for one CPU epoch. Cached per shared table
     /// version, so dispatch does not scan all descriptors on every syscall.
     pub fn stream_descriptors(&self) -> FdMask {
-        *self.fds.identity.streams.get_or_init(|| {
-            let mut mask = [0; (MAX_FDS as usize).div_ceil(64)];
+        self.descriptor_io_masks().0
+    }
+    fn descriptor_io_masks(&self) -> &(FdMask, FdMask) {
+        self.fds.identity.io.get_or_init(|| {
+            let mut streams = [0; (MAX_FDS as usize).div_ceil(64)];
+            let mut files = streams;
             for (&fd, d) in self.fds.iter() {
+                let o = d.open.borrow();
                 if matches!(
-                    d.open.borrow().kind,
+                    o.kind,
                     FdKind::Stdin
                         | FdKind::Stdout
                         | FdKind::Stderr
                         | FdKind::PipeRead
                         | FdKind::PipeWrite
                 ) {
-                    mask[fd as usize / 64] |= 1 << (fd % 64);
+                    streams[fd as usize / 64] |= 1 << (fd % 64);
+                } else if Self::ordinary_file(&o, false).is_some() {
+                    files[fd as usize / 64] |= 1 << (fd % 64);
                 }
             }
-            mask
+            (streams, files)
+        })
+    }
+    /// Candidate regular files, not a cached authorization or mapping decision.
+    /// Recheck epoch_file_io before effects: mmap need not edit the FD table.
+    pub fn file_descriptors(&self) -> FdMask {
+        self.descriptor_io_masks().1
+    }
+    fn ordinary_file(o: &OpenDescription, write: bool) -> Option<Rc<RefCell<Node>>> {
+        if !matches!(o.kind, FdKind::Node(_))
+            || o.bridge.is_some()
+            || o.kernel_log.is_some()
+            || o.oom.is_some()
+            || o.network_control.is_some()
+            || o.mount.as_ref().is_some_and(|m| {
+                matches!(
+                    m.kind,
+                    mounts::Kind::Proc | mounts::Kind::Sysfs | mounts::Kind::Cgroup
+                )
+            })
+        {
+            return None;
+        }
+        let node = if write { o.node.clone() } else { o.data_node() }?;
+        let regular = {
+            let n = node.borrow();
+            !n.volatile && matches!(&n.content, Content::File(data) if data.shared_file().is_none())
+        };
+        regular.then_some(node)
+    }
+    /// Coordinator-only check against the retained inode, never a path lookup.
+    /// Reject every live file mapping, including read-only/private mappings and
+    /// mappings in a different VM. Their page snapshots are committed at join.
+    pub fn epoch_file_io(&self, fd: u32, write: bool) -> bool {
+        self.descriptor(fd).is_ok_and(|d| {
+            Self::ordinary_file(&d.open.borrow(), write).is_some_and(|node| {
+                matches!(&node.borrow().content, Content::File(data) if data.epoch_io_safe())
+            })
         })
     }
     pub fn share_context_from(&mut self, other: &Self) {

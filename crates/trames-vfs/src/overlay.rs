@@ -800,6 +800,27 @@ mod tests {
         assert_eq!(read(&mut v, b"/merged/a"), b"new");
     }
     #[test]
+    fn epoch_io_tracks_lower_mappings_and_keeps_copy_up_inodes_independent() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/a", b"lower");
+        mount(&mut v);
+        let lower = v.open_at(AT_FDCWD, b"/lower/a", 0, 0).unwrap();
+        let old = v.open_at(AT_FDCWD, b"/merged/a", 0, 0).unwrap();
+        assert!(v.epoch_file_io(old, false));
+        let pages = v.mapping_pages(lower, 0, 4096, false, false).unwrap();
+        assert!(!v.epoch_file_io(old, false));
+        write(&mut v, b"/merged/a", b"upper");
+        let new = v.open_at(AT_FDCWD, b"/merged/a", 2, 0).unwrap();
+        assert!(v.epoch_file_io(new, true));
+        assert!(v.epoch_file_io(new, false));
+        assert!(!v.epoch_file_io(old, false));
+        drop(pages);
+        assert!(v.epoch_file_io(old, false));
+        assert_eq!(v.pread(old, 10, 0).unwrap(), b"lower");
+        assert_eq!(v.pread(new, 10, 0).unwrap(), b"upper");
+    }
+    #[test]
     fn whiteouts_opaque_recreation_symlinks_and_remount() {
         let mut v = Vfs::default();
         dirs(&mut v);
