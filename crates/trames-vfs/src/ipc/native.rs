@@ -558,6 +558,9 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let response = loop {
             vfs.pump_native_services();
+            if vfs.poll(fd, 1) & 1 != 0 {
+                assert_eq!(vfs.readable_bytes(fd), Ok(Some(24)));
+            }
             match socket.recv(4096, 0x40) {
                 Ok(packet) => break packet,
                 Err(Errno(11)) => assert!(std::time::Instant::now() < deadline),

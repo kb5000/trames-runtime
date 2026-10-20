@@ -531,9 +531,10 @@ impl Linux {
         if fixed && !a[0].is_multiple_of(PAGE_SIZE) {
             return Err(Errno(22));
         }
+        let hinted = !fixed && a[0] != 0 && memory.is_free(a[0] & !(PAGE_SIZE - 1), len);
         let address = if fixed {
             a[0]
-        } else if a[0] != 0 && memory.is_free(a[0] & !(PAGE_SIZE - 1), len) {
+        } else if hinted {
             a[0] & !(PAGE_SIZE - 1)
         } else {
             memory.find_free(self.mmap_next, len).ok_or(Errno(12))?
@@ -576,7 +577,10 @@ impl Linux {
                 .map(address, len, permissions)
                 .map_err(Self::memory_errno)?;
         }
-        if !fixed {
+        // A successful caller-chosen hint must not move the ordinary search
+        // cursor. Scudo deliberately probes randomized high addresses; moving
+        // every later allocation there creates enormous sparse region spans.
+        if !fixed && !hinted {
             self.mmap_next = address + len;
         }
         Ok(address)
@@ -1030,7 +1034,7 @@ impl Linux {
                     return Err(Errno(9));
                 }
                 if a[1] as u32 == 0x541b {
-                    if let Some(bytes) = self.vfs.inotify_available(a[0] as u32)? {
+                    if let Some(bytes) = self.vfs.readable_bytes(a[0] as u32)? {
                         memory
                             .write(a[2], &(bytes as u32).to_le_bytes())
                             .map_err(|_| Errno(14))?;
@@ -1631,6 +1635,78 @@ mod tests {
         assert_eq!(reopened.read(fd, 64).unwrap(), b"durable length and data");
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn accepted_mmap_hints_do_not_relocate_ordinary_allocations() {
+        let mut linux = Linux::new(0x3000);
+        let mut m = memory();
+        let high = 0x4000_0000_0000;
+        let args = [high, PAGE_SIZE, 0, 0x22, u64::MAX, 0];
+        assert_eq!(linux.mmap(args, &mut m), Ok(high));
+        assert_eq!(
+            linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
+            Ok(0x1000_0000)
+        );
+        // A conflicting hint falls back to the ordinary cursor, not the hint.
+        assert_eq!(linux.mmap(args, &mut m), Ok(0x1000_1000));
+        assert_eq!(
+            linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
+            Ok(0x1000_2000)
+        );
+        assert_eq!(
+            linux.mmap([high + PAGE_SIZE, PAGE_SIZE, 0, 0x32, u64::MAX, 0], &mut m),
+            Ok(high + PAGE_SIZE)
+        );
+        assert_eq!(
+            linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
+            Ok(0x1000_3000)
+        );
+    }
+    #[test]
+    fn fionread_bad_pointer_preserves_socket_and_pipe_data() {
+        for pipe in [false, true] {
+            let mut linux = Linux::new(0x3000);
+            let [read, write] = if pipe {
+                linux.vfs.pipe(O_NONBLOCK).unwrap()
+            } else {
+                linux.vfs.socketpair(1, 1 | O_NONBLOCK, 0).unwrap()
+            };
+            linux.vfs.write(write, b"queued").unwrap();
+            let alias = linux.vfs.dup(read, 3, true).unwrap();
+            let mut m = memory();
+            let mut out = CapturedOutput::default();
+            assert_eq!(
+                linux.syscall(
+                    29,
+                    [alias as u64, 0x541b, u64::MAX, 0, 0, 0],
+                    &mut m,
+                    &mut out
+                ),
+                Err(Errno(14))
+            );
+            assert_eq!(
+                linux.syscall(
+                    29,
+                    [alias as u64, 0x541b, 0x1000, 0, 0, 0],
+                    &mut m,
+                    &mut out
+                ),
+                Ok(0)
+            );
+            assert_eq!(u32::from_le_bytes(m.read_array(0x1000).unwrap()), 6);
+            assert_eq!(linux.vfs.read(read, 6).unwrap(), b"queued");
+            linux.vfs.close(write).unwrap();
+            assert_eq!(
+                linux.syscall(
+                    29,
+                    [alias as u64, 0x541b, 0x1000, 0, 0, 0],
+                    &mut m,
+                    &mut out
+                ),
+                Ok(0)
+            );
+            assert_eq!(m.read_array::<4>(0x1000).unwrap(), [0; 4]);
+        }
     }
     #[test]
     fn stdio_nonblocking_ioctl_preserves_alias_flags_and_fault_atomicity() {

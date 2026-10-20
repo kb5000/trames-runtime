@@ -6,6 +6,37 @@ pub(crate) use native::Services as NativeServices;
 
 #[derive(Clone, Default)]
 pub struct LocalRights(pub(super) Vec<Rc<RefCell<OpenDescription>>>);
+thread_local! {
+    // Releasing a queued socket may release another queue. Drain ownership
+    // iteratively so an acyclic FD chain cannot exhaust the host thread stack.
+    static RIGHTS_DROP: RefCell<Option<Vec<Rc<RefCell<OpenDescription>>>>> = const { RefCell::new(None) };
+}
+impl Drop for LocalRights {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        RIGHTS_DROP.with(|pending| {
+            let mut queue = pending.borrow_mut();
+            if let Some(queue) = queue.as_mut() {
+                queue.append(&mut self.0);
+                return;
+            }
+            *queue = Some(std::mem::take(&mut self.0));
+            drop(queue);
+            loop {
+                let next = pending.borrow_mut().as_mut().expect("rights drain").pop();
+                if let Some(open) = next {
+                    // Release the worklist borrow before nested socket drops.
+                    drop(open);
+                } else {
+                    *pending.borrow_mut() = None;
+                    break;
+                }
+            }
+        });
+    }
+}
 impl LocalRights {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -53,6 +84,22 @@ pub struct LocalReceived {
     pub rights: LocalRights,
 }
 impl LocalSocket {
+    pub fn readable_bytes(&self) -> Result<usize> {
+        if self.listening() {
+            return Err(Errno(22));
+        }
+        let binding = self.channel.borrow();
+        let channel = binding.borrow();
+        let queue = &channel.queues[self.side.get()];
+        // Linux AF_UNIX reports one datagram, but all queued bytes for stream
+        // and seqpacket. Do not recv/peek here: rights and zero-length packets
+        // must remain queued, including after shutdown(SHUT_RD).
+        Ok(if self.kind == 2 {
+            queue.front().map_or(0, |packet| packet.data.len())
+        } else {
+            queue.iter().map(|packet| packet.data.len()).sum()
+        })
+    }
     fn new(
         kind: u32,
         credentials: [u32; 3],
@@ -172,7 +219,6 @@ impl LocalSocket {
         }
         if how != 1 {
             self.read_closed.set(true);
-            self.channel.borrow().borrow_mut().queues[self.side.get()].clear();
         }
         if how != 0 {
             self.write_closed.set(true);
@@ -190,7 +236,9 @@ impl LocalSocket {
         self.send_rights(bytes, flags, LocalRights::default())
     }
     pub fn send_rights(&self, bytes: &[u8], flags: u32, rights: LocalRights) -> Result<usize> {
-        if flags & !(0x40 | 0x4000) != 0 {
+        // Linux ignores the receive-only MSG_CMSG_CLOEXEC on sendmsg/sendto.
+        // Firefox's Wayland proxy reuses this flag for both directions.
+        if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
         if !self.connected.get() {
@@ -200,13 +248,39 @@ impl LocalSocket {
             return Err(Errno(32));
         }
         let binding = self.channel.borrow();
-        let mut channel = binding.borrow_mut();
-        let peer = channel.ends[1 - self.side.get()]
+        let peer = binding.borrow().ends[1 - self.side.get()]
             .upgrade()
             .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
         if peer.read_closed.get() {
             return Err(Errno(32));
         }
+        // Queued rights own their open descriptions. Permit Unix FD handoff
+        // between independent channels, but reject a new owning cycle before
+        // enqueue (Linux has a collector for cyclic SCM_RIGHTS; we do not).
+        // Ordinary messages/rights without local sockets avoid this traversal.
+        let mut pending: Vec<_> = rights
+            .0
+            .iter()
+            .filter_map(|open| open.borrow().local.clone())
+            .collect();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(socket) = pending.pop() {
+            if Rc::ptr_eq(&socket, &peer) {
+                return Err(Errno(95));
+            }
+            if !visited.insert(Rc::as_ptr(&socket) as usize) {
+                continue;
+            }
+            let channel = socket.channel.borrow();
+            for packet in &channel.borrow().queues[socket.side.get()] {
+                for open in &packet.rights.0 {
+                    if let Some(socket) = &open.borrow().local {
+                        pending.push(socket.clone());
+                    }
+                }
+            }
+        }
+        let mut channel = binding.borrow_mut();
         if self.kind == 1 && bytes.is_empty() {
             return Ok(0);
         }
@@ -245,7 +319,8 @@ impl LocalSocket {
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
-        if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x40000000) != 0 {
+        // MSG_NOSIGNAL is accepted but has no effect on Linux receives.
+        if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
@@ -263,10 +338,7 @@ impl LocalSocket {
                 .upgrade()
                 .is_none_or(|s| s.write_closed.get());
         let queue = &mut channel.queues[self.side.get()];
-        if self.read_closed.get()
-            || (self.kind == 1 && count == 0)
-            || (eof && queue.is_empty() && self.kind != 2)
-        {
+        if (self.kind == 1 && count == 0) || (eof && queue.is_empty() && self.kind != 2) {
             return Ok(LocalReceived {
                 data: Vec::new(),
                 length: 0,
@@ -388,10 +460,13 @@ impl Drop for LocalSocket {
         // Rights queued for a closed receiver must release their open files.
         let binding = self.channel.borrow();
         let mut channel = binding.borrow_mut();
-        channel.queues[self.side.get()].clear();
+        let queued = std::mem::take(&mut channel.queues[self.side.get()]);
         for counter in &mut channel.epochs[1 - self.side.get()] {
             *counter = counter.wrapping_add(1);
         }
+        drop(channel);
+        // A queued FD can refer to the opposite endpoint of this channel.
+        drop(queued);
     }
 }
 impl Vfs {
@@ -606,18 +681,13 @@ impl Vfs {
         let mut rights = Vec::new();
         for fd in fds {
             let open = &self.descriptor(*fd)?.open;
-            // UNIX-socket transfer needs an in-flight graph garbage collector.
-            // Reject it explicitly until cycles can be reclaimed correctly.
-            if open.borrow().local.is_some() {
-                return Err(Errno(95));
-            }
             rights.push(open.clone());
         }
         Ok(LocalRights(rights))
     }
     pub fn receive_rights(
         &mut self,
-        rights: LocalRights,
+        mut rights: LocalRights,
         capacity: usize,
         cloexec: bool,
     ) -> (Vec<u32>, bool) {
@@ -626,7 +696,7 @@ impl Vfs {
             .take(capacity.min(rights.0.len()))
             .collect();
         let truncated = free.len() < rights.0.len();
-        for (&fd, open) in free.iter().zip(rights.0) {
+        for (&fd, open) in free.iter().zip(rights.0.drain(..free.len())) {
             self.fds.insert(fd, Descriptor { open, cloexec });
         }
         (free, truncated)
@@ -666,6 +736,139 @@ impl Vfs {
 #[cfg(test)]
 mod waitall_tests {
     use super::*;
+    #[test]
+    fn sender_self_rights_and_deep_queue_chains_release_without_recursive_borrows() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut v = Vfs::default();
+                let [a, b] = v.socketpair(1, 1, 0).unwrap();
+                let weak_a = Rc::downgrade(&v.local_socket(a).unwrap().unwrap());
+                v.local_socket(a)
+                    .unwrap()
+                    .unwrap()
+                    .send_rights(b"self", 0, v.send_rights(&[a]).unwrap())
+                    .unwrap();
+                v.close(a).unwrap();
+                assert!(weak_a.upgrade().is_some());
+                v.close(b).unwrap();
+                assert!(weak_a.upgrade().is_none());
+                let [mut sender, root] = v.socketpair(1, 1, 0).unwrap();
+                let mut weak = Vec::new();
+                for _ in 0..600 {
+                    let [next, receiver] = v.socketpair(1, 1, 0).unwrap();
+                    weak.push(Rc::downgrade(&v.local_socket(receiver).unwrap().unwrap()));
+                    v.local_socket(sender)
+                        .unwrap()
+                        .unwrap()
+                        .send_rights(b"fd", 0, v.send_rights(&[receiver]).unwrap())
+                        .unwrap();
+                    v.close(receiver).unwrap();
+                    v.close(sender).unwrap();
+                    sender = next;
+                }
+                v.close(sender).unwrap();
+                let rights = v.send_rights(&[root]).unwrap();
+                v.close(root).unwrap();
+                // Truncated ancillary reception must use the same bounded
+                // destruction path as an unread queue closing.
+                let (fds, truncated) = v.receive_rights(rights, 0, false);
+                assert!(fds.is_empty() && truncated);
+                assert!(weak.iter().all(|socket| socket.upgrade().is_none()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn unix_rights_handoff_preserves_lifetime_and_rejects_direct_and_indirect_cycles() {
+        let mut v = Vfs::default();
+        let [a, b] = v.socketpair(1, 1, 0).unwrap();
+        let [c, d] = v.socketpair(1, 1, 0).unwrap();
+        let tx = v.local_socket(a).unwrap().unwrap();
+        let rx = v.local_socket(b).unwrap().unwrap();
+        let c_socket = v.local_socket(c).unwrap().unwrap();
+        let weak = Rc::downgrade(&c_socket);
+        assert_eq!(
+            tx.send_rights(b"cycle", 0, v.send_rights(&[b]).unwrap()),
+            Err(Errno(95))
+        );
+        tx.send_rights(b"fd", 0, v.send_rights(&[c]).unwrap())
+            .unwrap();
+        assert_eq!(
+            v.local_socket(d).unwrap().unwrap().send_rights(
+                b"cycle",
+                0,
+                v.send_rights(&[b]).unwrap()
+            ),
+            Err(Errno(95))
+        );
+        assert_eq!(v.readable_bytes(d), Ok(Some(0)));
+        v.close(c).unwrap();
+        drop(c_socket);
+        assert!(weak.upgrade().is_some());
+        let packet = rx.recv(2, 0).unwrap();
+        assert_eq!(packet.data, b"fd");
+        let (fds, truncated) = v.receive_rights(packet.rights, 1, true);
+        assert!(!truncated);
+        assert_ne!(v.flags(fds[0]).unwrap() & O_CLOEXEC, 0);
+        v.write(d, b"still open").unwrap();
+        assert_eq!(v.read(fds[0], 32).unwrap(), b"still open");
+        v.close(fds[0]).unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn fionread_keeps_packet_boundaries_rights_and_shutdown_queues() {
+        for kind in [1, 2, 5] {
+            let mut v = Vfs::default();
+            let [a, b] = v.socketpair(1, kind | O_NONBLOCK, 0).unwrap();
+            let receiver = v.local_socket(a).unwrap().unwrap();
+            let sender = v.local_socket(b).unwrap().unwrap();
+            let [reader, writer] = v.pipe(0).unwrap();
+            sender
+                .send_rights(b"abc", 0x40000040, v.send_rights(&[writer]).unwrap())
+                .unwrap();
+            sender.send(b"defgh", 0).unwrap();
+            assert_eq!(v.readable_bytes(a), Ok(Some(if kind == 2 { 3 } else { 8 })));
+            receiver.shutdown(0).unwrap();
+            assert_eq!(v.readable_bytes(a), Ok(Some(if kind == 2 { 3 } else { 8 })));
+            // Linux shutdown(SHUT_RD) keeps already queued data/rights readable.
+            let packet = receiver.recv(32, 0).unwrap();
+            assert_eq!(packet.data, b"abc");
+            assert_eq!(packet.rights.0.len(), 1);
+            v.close(writer).unwrap();
+            assert_eq!(v.read(reader, 1), Err(Errno(11)));
+            drop(packet);
+            assert_eq!(v.read(reader, 1), Ok(Vec::new()));
+            assert_eq!(v.readable_bytes(a), Ok(Some(5)));
+            assert_eq!(receiver.recv(32, 0).unwrap().data, b"defgh");
+            assert_eq!(v.readable_bytes(a), Ok(Some(0)));
+            assert_eq!(sender.send(b"late", 0), Err(Errno(32)));
+        }
+        let mut v = Vfs::default();
+        let [a, b] = v.socketpair(1, 2, 0).unwrap();
+        v.write(b, b"").unwrap();
+        v.write(b, b"next").unwrap();
+        assert_eq!(v.readable_bytes(a), Ok(Some(0)));
+        assert!(v
+            .local_socket(a)
+            .unwrap()
+            .unwrap()
+            .recv(32, 0)
+            .unwrap()
+            .data
+            .is_empty());
+        assert_eq!(v.readable_bytes(a), Ok(Some(4)));
+        assert_eq!(v.read(a, 32).unwrap(), b"next");
+        assert_eq!(v.readable_bytes(a), Ok(Some(0)));
+        let fd = v.local_create(1, 0).unwrap();
+        let listener = v.local_socket(fd).unwrap().unwrap();
+        assert_eq!(v.readable_bytes(fd), Ok(Some(0)));
+        v.local_bind(&listener, b"\x01\x00\x00fionread-listener")
+            .unwrap();
+        v.local_listen(&listener, 1).unwrap();
+        assert_eq!(v.readable_bytes(fd), Err(Errno(22)));
+    }
     #[test]
     fn fragmented_waitall_preserves_prefix_and_nonblocking_and_eof_return_short_reads() {
         let mut v = Vfs::default();

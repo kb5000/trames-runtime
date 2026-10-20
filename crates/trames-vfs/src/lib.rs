@@ -640,6 +640,21 @@ impl Vfs {
     pub fn poll(&self, fd: u32, events: u16) -> u16 {
         self.poll_signals(fd, events, 0)
     }
+    /// Non-consuming FIONREAD query for guest queues, including native Wayland
+    /// connections (whose incoming bytes use the same local socket channel).
+    pub fn readable_bytes(&self, fd: u32) -> Result<Option<usize>> {
+        let open = self.descriptor(fd)?.open.borrow();
+        if let Some(socket) = &open.local {
+            return socket.readable_bytes().map(Some);
+        }
+        if let Some(end) = &open.pipe {
+            return Ok(Some(end.pipe.borrow().bytes.len()));
+        }
+        Ok(match &open.anonymous {
+            Some(events::Anonymous::Inotify(i)) => Some(i.borrow().available()),
+            _ => None,
+        })
+    }
     pub fn poll_signals(&self, fd: u32, events: u16, pending: u64) -> u16 {
         let Ok(d) = self.descriptor(fd) else {
             return 32;
