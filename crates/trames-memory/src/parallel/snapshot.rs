@@ -2,6 +2,44 @@
 //! Incremental metadata maintenance at joined coordinator checkpoints.
 use super::*;
 
+#[derive(Default)]
+pub(super) struct BackingIndex {
+    domains: BTreeMap<u64, BackingDomain>,
+    unscoped: BTreeSet<u64>,
+}
+struct BackingDomain {
+    generation: u64,
+    pages: BTreeSet<u64>,
+}
+impl BackingIndex {
+    pub(super) fn insert(&mut self, base: u64, domain: Option<(u64, u64)>) {
+        if let Some((identity, generation)) = domain {
+            // Adding one new mapping cannot acknowledge changes to old pages.
+            self.domains
+                .entry(identity)
+                .or_insert_with(|| BackingDomain {
+                    generation,
+                    pages: BTreeSet::new(),
+                })
+                .pages
+                .insert(base);
+        } else {
+            self.unscoped.insert(base);
+        }
+    }
+    fn remove(&mut self, base: u64, domain: Option<(u64, u64)>) {
+        if let Some((identity, _)) = domain {
+            let group = self.domains.get_mut(&identity).expect("indexed domain");
+            group.pages.remove(&base);
+            if group.pages.is_empty() {
+                self.domains.remove(&identity);
+            }
+        } else {
+            self.unscoped.remove(&base);
+        }
+    }
+}
+
 impl Snapshot {
     fn remove_frame(&mut self, base: u64) -> Option<Frame> {
         let index = self.pages.remove(&base)?;
@@ -11,7 +49,9 @@ impl Snapshot {
             self.positions[moved.root_frame] = Some(index);
         }
         self.positions[frame.root_frame] = None;
-        self.backed_pages.remove(&base);
+        if self.backed_pages.remove(&base) {
+            self.backings.remove(base, frame.backing_domain);
+        }
         let count = self
             .identities
             .get_mut(&frame.bytes.identity)
@@ -31,6 +71,7 @@ impl Snapshot {
         self.dynamic_code_pages += usize::from(frame.dynamic_code);
         if backed {
             self.backed_pages.insert(frame.base);
+            self.backings.insert(frame.base, frame.backing_domain);
         }
         self.pages.insert(frame.base, self.frames.len());
         self.positions[frame.root_frame] = Some(self.frames.len());
@@ -62,13 +103,40 @@ impl Memory {
         }
         if cache.source_backing_revision != backing_revision {
             registry.metrics.backing_invalidations += 1;
-            // An unrelated file/SHM write must not remove/reinsert every ELF
-            // page or remap its MMU group. Versioned providers still check EOF;
-            // mapping/coordinator dirty edits are already in `changed` above.
-            for &base in &snapshot.backed_pages {
+            // Query one live representative per file, not every ELF page after
+            // an unrelated SHM write. No provider ownership or Rc is retained
+            // here; dropping/unmapping a file keeps its original lifetime.
+            let mut candidates = snapshot.backings.unscoped.clone();
+            for (&identity, group) in &mut snapshot.backings.domains {
+                let Some(base) = group.pages.iter().find(|base| !changed.contains(base)) else {
+                    // All old members are already being replaced or removed.
+                    continue;
+                };
+                let frame = &snapshot.frames[snapshot.pages[base]];
+                let page = self.frames[frame.root_frame]
+                    .as_ref()
+                    .expect("backed frame");
+                let backing = page.backing.as_ref().expect("indexed backing");
+                registry.metrics.backing_domain_checks += 1;
+                match backing.object.parallel_change_domain() {
+                    Some((id, generation)) if id == identity => {
+                        if generation == group.generation {
+                            continue;
+                        }
+                        group.generation = generation;
+                    }
+                    // A provider changing its declared domain is conservative.
+                    _ => {}
+                }
+                candidates.extend(group.pages.iter().copied());
+            }
+            // Changed domains retain individual versions and live EOF checks.
+            // Unknown providers retain the original conservative preparation.
+            for base in candidates {
                 if changed.contains(&base) {
                     continue;
                 }
+                registry.metrics.backing_page_checks += 1;
                 let frame = &snapshot.frames[snapshot.pages[&base]];
                 let page = self.frames[frame.root_frame]
                     .as_ref()

@@ -29,6 +29,9 @@ pub struct Metrics {
     pub full_rebuilds: u64,
     pub full_rebuild_pages: u64,
     pub backing_invalidations: u64,
+    /// Joined checks of backing change domains and individual backing pages.
+    pub backing_domain_checks: u64,
+    pub backing_page_checks: u64,
     pub code_invalidations: u64,
     pub source_page_reads: u64,
     pub incremental_updates: u64,
@@ -177,6 +180,7 @@ struct Frame {
     code_revision: u64,
     data_revision: AtomicU64,
     backing_version: AtomicU64,
+    backing_domain: Option<(u64, u64)>,
     native_retryable: std::sync::atomic::AtomicBool,
     native_one_shot: std::sync::atomic::AtomicBool,
     native_live_private: std::sync::atomic::AtomicBool,
@@ -370,6 +374,12 @@ fn prepare_frame(
         code_revision: page.instruction_revision,
         data_revision: AtomicU64::new(page.data_revision),
         backing_version: AtomicU64::new(backing_version),
+        backing_domain: page.backing.as_ref().and_then(|b| {
+            b.object
+                .parallel_versioned()
+                .then(|| b.object.parallel_change_domain())
+                .flatten()
+        }),
         native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
         native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
         native_live_private: std::sync::atomic::AtomicBool::new(
@@ -408,6 +418,7 @@ pub(super) struct Snapshot {
     identities: BTreeMap<u64, usize>,
     alias_count: usize,
     backed_pages: BTreeSet<u64>,
+    backings: snapshot::BackingIndex,
     positions: Vec<Option<usize>>,
     backing_revision: u64,
     identity: u64,
@@ -1117,6 +1128,7 @@ impl Memory {
         let mut identities = BTreeMap::new();
         let mut alias_count = 0usize;
         let mut backed_pages = BTreeSet::new();
+        let mut backings = snapshot::BackingIndex::default();
         let mapped: Vec<_> = self
             .pages
             .iter()
@@ -1134,6 +1146,7 @@ impl Memory {
             *count += 1;
             if page.backing.is_some() {
                 backed_pages.insert(base);
+                backings.insert(base, frame.backing_domain);
             }
             pages.insert(base, frames.len());
             positions[root_frame] = Some(frames.len());
@@ -1147,6 +1160,7 @@ impl Memory {
             identities,
             alias_count,
             backed_pages,
+            backings,
             positions,
             backing_revision,
             identity: self.identity,

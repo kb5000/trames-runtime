@@ -179,6 +179,19 @@ cloning, mapping/fork/protection changes and coordinate byte/monitor access unti
 every admitted View is dropped. Ready services still move their parked CPU's
 own View, rather than introducing another byte owner.
 
+Joined incremental snapshots index versioned file backings by a stable inode
+change domain. A global backing notification queries one live representative
+per domain; an unchanged generation skips that file's pages entirely. Changed
+files still receive per-page version and live EOF checks, including detached
+private COW mappings. File I/O, truncation, coordinator/native mapped writes and
+joined worker publication advance the inode generation. The index contains only
+identities and virtual addresses, so it does not extend VFS/page lifetimes or
+send Rc metadata to workers. Mapping removal/replacement updates the index
+incrementally. Unknown providers retain individual checks and conservative
+refresh; retained external Views keep the full immutable snapshot path. This
+changes coordinator metadata work, with no extra ordinary CPU-store operation,
+byte lock, permission rule or memory-order fence.
+
 Each immutable frame has no writable alias/capability among these actors. All
 CPU and native write paths retain their existing Write permission check before
 creating a mutable byte reference. RW frames keep normal guards, atomic RMW,

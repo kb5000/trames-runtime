@@ -102,6 +102,8 @@ impl PageStorage {
     }
 }
 pub(super) struct MappedData {
+    identity: u64,
+    generation: Cell<u64>,
     data: RefCell<Box<FileData>>,
     pages: RefCell<BTreeMap<u64, Weak<FilePage>>>,
     writers_cached: Cell<Option<bool>>,
@@ -109,6 +111,8 @@ pub(super) struct MappedData {
 impl MappedData {
     pub(super) fn new(data: FileData) -> Self {
         Self {
+            identity: trames_memory::new_backing_identity(),
+            generation: Cell::new(0),
             data: RefCell::new(Box::new(data)),
             pages: RefCell::new(BTreeMap::new()),
             writers_cached: Cell::new(None),
@@ -116,6 +120,10 @@ impl MappedData {
     }
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
+    }
+    fn changed(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        trames_memory::backing_changed();
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
@@ -277,7 +285,7 @@ impl MappedData {
                 p.version.set(p.version.get().wrapping_add(1));
             }
         }
-        trames_memory::backing_changed();
+        self.changed();
         Ok(count)
     }
     fn flush(&self, offset: u64, page: &FilePage) -> Result<()> {
@@ -324,6 +332,9 @@ impl MappedData {
     pub(super) fn truncate(&self, length: u64) -> Result<()> {
         self.sync(false)?;
         self.data.borrow_mut().truncate(length)?;
+        // The length has changed even if a later page reload fails. Publish
+        // that fact before fallible I/O; no VM/provider re-entry occurs here.
+        self.changed();
         self.refresh_shared_pages();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
@@ -343,7 +354,6 @@ impl MappedData {
                 page.dirty.set(false);
             }
         }
-        trames_memory::backing_changed();
         Ok(())
     }
 }
@@ -356,6 +366,13 @@ struct FileMapping {
     executable: bool,
 }
 impl FileMapping {
+    fn changed(&self) {
+        let mut node = self.node.borrow_mut();
+        node.times[1] = storage::Timestamp::now();
+        if let Content::File(FileData::Mapped(data)) = &node.content {
+            data.changed();
+        }
+    }
     fn create(
         node: Rc<RefCell<Node>>,
         mount: Option<Rc<Mount>>,
@@ -389,6 +406,13 @@ impl PageBacking for FileMapping {
     fn parallel_versioned(&self) -> bool {
         true
     }
+    fn parallel_change_domain(&self) -> Option<(u64, u64)> {
+        if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
+            Some((data.identity, data.generation.get()))
+        } else {
+            None
+        }
+    }
     fn cpu_borrow_safe(&self) -> bool {
         // CPU and native-span methods inspect resident file bytes/metadata
         // only; they cannot re-enter the containing VM. Span callbacks invoke
@@ -412,8 +436,7 @@ impl PageBacking for FileMapping {
         self.page
             .version
             .set(self.page.version.get().wrapping_add(1));
-        self.node.borrow_mut().times[1] = storage::Timestamp::now();
-        trames_memory::backing_changed();
+        self.changed();
         Ok(())
     }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
@@ -445,8 +468,7 @@ impl PageBacking for FileMapping {
         self.page
             .version
             .set(self.page.version.get().wrapping_add(1));
-        self.node.borrow_mut().times[1] = storage::Timestamp::now();
-        trames_memory::backing_changed();
+        self.changed();
         Ok(())
     }
     fn with_read(
@@ -472,8 +494,7 @@ impl PageBacking for FileMapping {
         self.page
             .version
             .set(self.page.version.get().wrapping_add(1));
-        self.node.borrow_mut().times[1] = storage::Timestamp::now();
-        trames_memory::backing_changed();
+        self.changed();
         bytes.with_write(offset, len, f);
         Ok(true)
     }
@@ -695,6 +716,9 @@ mod tests {
         }
         assert_eq!(registry.metrics.full_rebuilds, 1);
         assert_eq!(registry.metrics.incremental_pages, 8);
+        // Display-buffer writes must not revisit all 257 unrelated ELF/COW
+        // mappings. File versions and EOF checks remain live for changed files.
+        assert_eq!(registry.metrics.backing_page_checks, 8);
         v.seek(cold, 0, 0).unwrap();
         v.write(cold, &0xd503201fu32.to_le_bytes()).unwrap();
         let view = m.parallel_view(&mut registry).unwrap();
@@ -714,6 +738,64 @@ mod tests {
         let view = m.parallel_view(&mut registry).unwrap();
         assert_eq!(view.fetch_u32(0x100000).unwrap(), 0);
         assert_eq!(view.read_array::<1>(0x400000).unwrap(), [88]);
+    }
+    #[test]
+    fn file_change_domains_survive_mapping_replacement_and_retained_views() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let a = v.open_at(AT_FDCWD, b"/a", 0x42, 0o600).unwrap();
+        let b = v.open_at(AT_FDCWD, b"/b", 0x42, 0o600).unwrap();
+        v.truncate_fd(a, 2 * PAGE_SIZE).unwrap();
+        v.write(b, &[2]).unwrap();
+        let mut m = Memory::default();
+        mapped(&v, &mut m, a, 0x10000, 2 * PAGE_SIZE, true, Permissions::R);
+        mapped(&v, &mut m, b, 0x20000, PAGE_SIZE, true, Permissions::R);
+        let mut registry = Registry::default();
+        drop(m.parallel_view(&mut registry).unwrap());
+
+        // Remove the old representative, reuse its root slot with another
+        // file, and add a fresh alias after changing a surviving old page.
+        m.unmap(0x10000, PAGE_SIZE).unwrap();
+        v.seek(a, PAGE_SIZE as i64, 0).unwrap();
+        v.write(a, &[11]).unwrap();
+        mapped(&v, &mut m, b, 0x10000, PAGE_SIZE, true, Permissions::R);
+        mapped(&v, &mut m, a, 0x30000, PAGE_SIZE, true, Permissions::R);
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(0x11000), Ok([11]));
+        assert_eq!(view.read_array::<1>(0x10000), Ok([2]));
+        assert_eq!(view.read_array::<1>(0x30000), Ok([0]));
+        drop(view);
+
+        // EOF must still invalidate every alias even when another member is
+        // simultaneously unmapped. Then remove the last member of the domain.
+        v.truncate_fd(a, 0).unwrap();
+        m.unmap(0x11000, PAGE_SIZE).unwrap();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(
+            view.read_array::<1>(0x30000),
+            Err(MemoryError::Bus(0x30000))
+        );
+        drop(view);
+        m.unmap(0x30000, PAGE_SIZE).unwrap();
+        drop(m.parallel_view(&mut registry).unwrap());
+        v.truncate_fd(a, PAGE_SIZE).unwrap();
+        mapped(&v, &mut m, a, 0x40000, PAGE_SIZE, true, Permissions::R);
+        let old = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(old.read_array::<1>(0x40000), Ok([0]));
+
+        // An externally retained View takes the full snapshot path. Its address
+        // table stays frozen, and shared file bytes remain coherent in both.
+        v.seek(b, 0, 0).unwrap();
+        v.write(b, &[9]).unwrap();
+        m.unmap(0x10000, PAGE_SIZE).unwrap();
+        let new = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(old.read_array::<1>(0x10000), Ok([9]));
+        assert_eq!(
+            new.read_array::<1>(0x10000),
+            Err(MemoryError::Unmapped(0x10000))
+        );
+        assert_eq!(new.read_array::<1>(0x20000), Ok([9]));
+        assert_eq!(registry.metrics.full_rebuilds, 2);
     }
     #[test]
     fn workers_share_file_and_memfd_bytes_without_a_publication_copy() {

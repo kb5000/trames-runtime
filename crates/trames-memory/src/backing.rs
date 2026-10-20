@@ -35,6 +35,15 @@ pub trait PageBacking {
     fn parallel_versioned(&self) -> bool {
         false
     }
+    /// Optional change domain for versioned providers at joined checkpoints.
+    /// The identity is stable for the mapping lifetime and shared by all pages
+    /// covered by the generation. An unchanged generation guarantees unchanged
+    /// version/check results, storage identities and native-span capabilities
+    /// for every page in that domain. Notify backing_changed() on changes too.
+    /// Unknown providers retain individual page checks; no Rc reaches workers.
+    fn parallel_change_domain(&self) -> Option<(u64, u64)> {
+        None
+    }
     /// Publish dirty metadata after workers have joined, without copying bytes.
     /// Called only for a provider that returned shared_page().
     fn publish_write(&self, _offset: usize, _len: usize) -> Result<(), MemoryError> {
