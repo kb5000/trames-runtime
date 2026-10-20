@@ -118,10 +118,15 @@ pub(super) enum FileData {
 }
 pub(super) struct DiskObject {
     length: u64,
+    backing: Arc<DiskBacking>,
+}
+// Only immutable host paths/handles and an orphan flag cross the I/O boundary.
+// This lease retains both the object and the store lock until the last job ends.
+pub(super) struct DiskBacking {
     path: PathBuf,
-    remove_on_drop: bool,
+    remove_on_drop: std::sync::atomic::AtomicBool,
     // An open-unlinked file must keep the store's exclusive lock alive.
-    _store: Rc<DiskStore>,
+    _store: Arc<DiskStore>,
     inode: u64,
 }
 impl DiskObject {
@@ -129,6 +134,11 @@ impl DiskObject {
     // with thousands of closed files must not consume thousands of iOS handles.
     // Orphans retain their private object path until the last guest reference dies.
     fn open(&self, write: bool) -> Result<File> {
+        self.backing.open(write)
+    }
+}
+impl DiskBacking {
+    pub(super) fn open(&self, write: bool) -> Result<File> {
         regular(&self.path)?;
         let mut options = OpenOptions::new();
         options.read(true).write(write);
@@ -143,14 +153,26 @@ impl DiskObject {
         Ok(file)
     }
 }
-impl Drop for DiskObject {
+impl Drop for DiskBacking {
     fn drop(&mut self) {
-        if self.remove_on_drop {
+        if self.remove_on_drop.load(Ordering::Relaxed) {
             let _ = fs::remove_file(&self.path);
         }
     }
 }
 impl FileData {
+    pub(super) fn disk_source(&self) -> Option<(Arc<DiskBacking>, u64)> {
+        match self {
+            Self::Disk(d) => Some((d.backing.clone(), d.length)),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.disk_source(),
+                _ => None,
+            },
+            // MappedData may contain dirty cached pages even without current
+            // writers. Keep its established overlay/writeback path intact.
+            _ => None,
+        }
+    }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         match self {
             Self::Memory(_) | Self::Disk(_) => true,
@@ -176,7 +198,9 @@ impl FileData {
         }
         #[cfg(unix)]
         if let Self::Disk(d) = self {
-            return Ok(fs::symlink_metadata(&d.path).map_err(host_errno)?.blocks());
+            return Ok(fs::symlink_metadata(&d.backing.path)
+                .map_err(host_errno)?
+                .blocks());
         }
         if let Self::Shared(file) = self {
             return Ok(file.allocated().div_ceil(512) as u64);
@@ -191,7 +215,7 @@ impl FileData {
             Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Memory(_) | Self::Shared(_) => None,
             Self::Lower(_) => None,
-            Self::Disk(d) => Some(d.inode),
+            Self::Disk(d) => Some(d.backing.inode),
         }
     }
     pub fn len(&self) -> u64 {
@@ -329,7 +353,7 @@ impl FileData {
             return data.orphan(value);
         }
         if let Self::Disk(d) = self {
-            d.remove_on_drop = value;
+            d.backing.remove_on_drop.store(value, Ordering::Relaxed);
         }
     }
 }
@@ -349,7 +373,7 @@ fn regular(path: &Path) -> Result<()> {
     Ok(())
 }
 impl DiskStore {
-    fn open(path: &Path) -> Result<Rc<Self>> {
+    fn open(path: &Path) -> Result<Arc<Self>> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -389,12 +413,12 @@ impl DiskStore {
         {
             return Err(Errno(22));
         }
-        Ok(Rc::new(Self { root, _lock: lock }))
+        Ok(Arc::new(Self { root, _lock: lock }))
     }
     fn object_path(&self, inode: u64) -> PathBuf {
         self.root.join("objects").join(format!("{inode:016x}.dat"))
     }
-    pub fn create(self: &Rc<Self>, inode: u64) -> Result<FileData> {
+    pub fn create(self: &Arc<Self>, inode: u64) -> Result<FileData> {
         let path = self.object_path(inode);
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -403,22 +427,26 @@ impl DiskStore {
         drop(options.open(&path).map_err(host_errno)?);
         Ok(FileData::Disk(DiskObject {
             length: 0,
-            path,
-            remove_on_drop: true,
-            _store: self.clone(),
-            inode,
+            backing: Arc::new(DiskBacking {
+                path,
+                remove_on_drop: std::sync::atomic::AtomicBool::new(true),
+                _store: self.clone(),
+                inode,
+            }),
         }))
     }
-    fn load(self: &Rc<Self>, inode: u64) -> Result<FileData> {
+    fn load(self: &Arc<Self>, inode: u64) -> Result<FileData> {
         let path = self.object_path(inode);
         regular(&path)?;
         let length = fs::symlink_metadata(&path).map_err(host_errno)?.len();
         Ok(FileData::Disk(DiskObject {
             length,
-            path,
-            remove_on_drop: false,
-            _store: self.clone(),
-            inode,
+            backing: Arc::new(DiskBacking {
+                path,
+                remove_on_drop: std::sync::atomic::AtomicBool::new(false),
+                _store: self.clone(),
+                inode,
+            }),
         }))
     }
     fn commit(&self, bytes: &[u8]) -> Result<()> {
@@ -608,7 +636,7 @@ impl<'a> Decoder<'a> {
         ))
     }
 }
-fn decode(disk: &Rc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
+fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     if data.len() < 48 {
         return Err(Errno(22));
     }

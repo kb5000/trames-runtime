@@ -5,6 +5,8 @@ pub mod capabilities;
 mod cgroup;
 mod credentials;
 mod directory;
+mod disk_io;
+pub use disk_io::{DiskRead, DiskReadJob};
 mod events;
 mod executable;
 pub use executable::ExecutableFile;
@@ -349,7 +351,7 @@ struct Filesystem {
     flock: BTreeMap<u64, FlockOwners>,
     record_locks: BTreeMap<u64, Vec<RecordLock>>,
     limits: StorageLimits,
-    disk: Option<Rc<storage::DiskStore>>,
+    disk: Option<Arc<storage::DiskStore>>,
     volume: Option<(VolumeSpace, u64)>,
 }
 #[derive(Clone)]
@@ -2056,7 +2058,7 @@ impl Vfs {
             return Ok(p.bytes.drain(..n).collect());
         }
         let node = o.data_node().ok_or(Errno(9))?;
-        let mut n = node.borrow_mut();
+        let n = node.borrow();
         let result = match &n.content {
             Content::File(b) => {
                 let out = b.read_at(o.position, count)?;
@@ -2071,23 +2073,8 @@ impl Vfs {
             Content::Terminal => Err(Errno(11)),
             Content::Fifo(_) => Err(Errno(29)),
         };
-        if result.is_ok() {
-            mounts::accessed(&mut n, o.mount.as_ref());
-        }
         drop(n);
-        let notification_node = o.node.as_ref().unwrap_or(&node);
-        if !Rc::ptr_eq(notification_node, &node) && result.is_ok() {
-            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
-        }
-        if result.as_ref().is_ok_and(|b| !b.is_empty())
-            && !(node.borrow().seals.is_some() && o.notification.is_none())
-        {
-            inotify::notify(
-                notification_node,
-                inotify::ACCESS,
-                o.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
-        }
+        Self::complete_file_read(&o, &node, &result, true);
         result
     }
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
@@ -2284,7 +2271,7 @@ impl Vfs {
             return Ok(data);
         }
         let node = o.data_node().ok_or(Errno(29))?;
-        let mut n = node.borrow_mut();
+        let n = node.borrow();
         let result = match &n.content {
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
@@ -2294,23 +2281,8 @@ impl Vfs {
             Content::Symlink(_) => Err(Errno(40)),
             Content::Terminal | Content::Fifo(_) => Err(Errno(29)),
         };
-        if count != 0 && result.is_ok() {
-            mounts::accessed(&mut n, o.mount.as_ref());
-        }
         drop(n);
-        let notification_node = o.node.as_ref().unwrap_or(&node);
-        if !Rc::ptr_eq(notification_node, &node) && result.is_ok() {
-            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
-        }
-        if result.as_ref().is_ok_and(|b| !b.is_empty())
-            && !(node.borrow().seals.is_some() && o.notification.is_none())
-        {
-            inotify::notify(
-                notification_node,
-                inotify::ACCESS,
-                o.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
-        }
+        Self::complete_file_read(&o, &node, &result, count != 0);
         result
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {

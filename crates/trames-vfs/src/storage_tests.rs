@@ -210,6 +210,56 @@ fn size(stat: [u8; 128]) -> u64 {
     u64::from_le_bytes(stat[48..56].try_into().unwrap())
 }
 #[test]
+fn disk_read_lease_retains_unlinked_object_and_store_without_vfs() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"payload".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32, None).unwrap().unwrap();
+    v.unlink_at(AT_FDCWD, b"/data", false).unwrap();
+    v.close(fd).unwrap();
+    drop(read);
+    drop(v);
+    // Neither a guest FD nor a coordinator capability is needed to keep the
+    // private object safe until a job sent to a different host thread finishes.
+    assert!(matches!(
+        Vfs::open_disk(&dir.0, DiskOptions::default()),
+        Err(Errno(16))
+    ));
+    let bytes = std::thread::spawn(move || job.run())
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, b"payload");
+    let reopened = dir.open();
+    assert_eq!(reopened.stat_at(AT_FDCWD, b"/data"), Err(Errno(2)));
+}
+#[test]
+fn disk_read_offsets_conflicts_short_reads_and_errors_commit_once() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"abcdef".to_vec()).unwrap();
+    v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
+    let dup = v.dup(fd, 0, false).unwrap();
+    let alias = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 4, None).unwrap().unwrap();
+    assert!(read.conflicts(&v, dup, 63));
+    assert!(read.conflicts(&v, alias, 68));
+    assert!(!read.conflicts(&v, alias, 67));
+    assert_eq!(read.finish(job.run()).unwrap(), b"abcd");
+    assert_eq!(v.seek(dup, 0, 1).unwrap(), 4);
+    let (read, job) = v.prepare_disk_read(fd, 100, Some(5)).unwrap().unwrap();
+    assert_eq!(read.finish(job.run()).unwrap(), b"f");
+    assert_eq!(v.seek(dup, 0, 1).unwrap(), 4);
+    let (read, job) = v.prepare_disk_read(fd, 100, None).unwrap().unwrap();
+    drop(job);
+    assert_eq!(read.finish(Err(Errno(5))), Err(Errno(5)));
+    assert_eq!(v.seek(dup, 0, 1).unwrap(), 4);
+    assert!(v.prepare_disk_read(fd, 0, None).unwrap().is_none());
+    assert!(v.prepare_disk_read(fd, 4, Some(100)).unwrap().is_none());
+}
+#[test]
 fn device_nodes_persist_numbers_links_and_driver_behavior() {
     let dir = Temp::new();
     let mut v = dir.open();
