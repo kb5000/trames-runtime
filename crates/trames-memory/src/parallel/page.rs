@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Audited mutable bytes: region guards, or proven exclusive epoch ownership.
+//! Audited bytes: region locks, or proven exclusive/immutable epoch ownership.
 use crate::PAGE_SIZE;
 use std::{
     cell::UnsafeCell,
@@ -70,9 +70,11 @@ struct ReservationRows {
 // ownership as MutablePage. Allocating a table never grants byte access.
 unsafe impl Sync for ReservationRows {}
 // SAFETY: all non-atomic byte accesses are inside a guard for their complete
-// region mask, or unsafe admission proves one execution owner for private bytes.
+// region mask, or unsafe admission proves exclusive/immutable private ownership.
 // Overlapping locked masks are mutually exclusive; disjoint slices cannot alias.
-// Each reservation row/override byte uses the same byte ownership;
+// Immutable epochs have shared byte references and no byte/row invalidators;
+// first monitor initialization is published by OnceLock. Each reservation
+// row/override byte otherwise uses the same exclusive byte ownership;
 // page-wide epochs/masks are atomic and resets hold every region. No whole-page
 // mutable reference or bare pointer escapes this module.
 unsafe impl Sync for MutablePage {}
@@ -197,16 +199,27 @@ impl MutablePage {
         self.lock_mask(mask(offset, len))
     }
     /// # Safety
-    /// The caller has exclusive execution ownership of these private byte ranges
-    /// and their monitor metadata until the guard and every derived slice end.
-    /// No concurrent coordinator/native/view byte access may overlap them.
-    pub(crate) unsafe fn exclusive(&self, offset: usize, len: usize) -> Guard<'_> {
-        Guard::new(self, mask(offset, len), true)
+    /// The caller owns these private byte ranges and monitor metadata until the
+    /// guard and derived slices end: either one exclusive actor, or read-only
+    /// actors with no byte/monitor writers (OnceLock initialization is allowed).
+    /// Read-only ownership never grants mutable access through this guard.
+    pub(crate) unsafe fn unlocked(&self, offset: usize, len: usize, readonly: bool) -> Guard<'_> {
+        Guard::new(self, mask(offset, len), if readonly { 2 } else { 1 })
     }
     /// # Safety
-    /// Same ownership contract as exclusive(), for the union of both ranges.
-    pub(crate) unsafe fn exclusive_pair(&self, a: usize, b: usize, len: usize) -> Guard<'_> {
-        Guard::new(self, mask(a, len) | mask(b, len), true)
+    /// Same ownership contract as unlocked(), for the union of both ranges.
+    pub(crate) unsafe fn unlocked_pair(
+        &self,
+        a: usize,
+        b: usize,
+        len: usize,
+        readonly: bool,
+    ) -> Guard<'_> {
+        Guard::new(
+            self,
+            mask(a, len) | mask(b, len),
+            if readonly { 2 } else { 1 },
+        )
     }
     pub(crate) fn lock_pair(&self, a: usize, b: usize, len: usize) -> Guard<'_> {
         self.lock_mask(mask(a, len) | mask(b, len))
@@ -227,7 +240,7 @@ impl MutablePage {
             {
                 #[cfg(test)]
                 self.acquisitions.fetch_add(1, Ordering::Relaxed);
-                return Guard::new(self, mask, false);
+                return Guard::new(self, mask, 0);
             }
             // Native borrows are bounded. Avoid an unbounded tight spin when a
             // peer is descheduled while holding an overlapping region.
@@ -241,19 +254,19 @@ impl MutablePage {
     }
 }
 
-// The mode occupies an unused aligned pointer bit, keeping this hot return
+// The mode occupies two unused aligned pointer bits, keeping this hot return
 // value at two words on supported 64-bit hosts. map_addr preserves provenance;
 // no tagged pointer is dereferenced or exposed outside this scoped guard.
-const _: () = assert!(std::mem::align_of::<MutablePage>() >= 2);
+const _: () = assert!(std::mem::align_of::<MutablePage>() >= 4);
 pub(crate) struct Guard<'a> {
     page: *const MutablePage,
     mask: u64,
     _owner: std::marker::PhantomData<&'a MutablePage>,
 }
 impl<'a> Guard<'a> {
-    fn new(page: &'a MutablePage, mask: u64, exclusive: bool) -> Self {
+    fn new(page: &'a MutablePage, mask: u64, mode: usize) -> Self {
         Self {
-            page: std::ptr::from_ref(page).map_addr(|at| at | usize::from(exclusive)),
+            page: std::ptr::from_ref(page).map_addr(|at| at | mode),
             mask,
             _owner: std::marker::PhantomData,
         }
@@ -261,11 +274,17 @@ impl<'a> Guard<'a> {
     #[inline]
     fn page(&self) -> &'a MutablePage {
         // SAFETY: constructed from a live, aligned page with its provenance and
-        // lifetime retained. Clearing only our low tag restores that pointer.
-        unsafe { &*self.page.map_addr(|at| at & !1) }
+        // lifetime retained. Clearing only our low tags restores that pointer.
+        unsafe { &*self.page.map_addr(|at| at & !3) }
     }
     pub(crate) fn is_exclusive(&self) -> bool {
         self.page.addr() & 1 != 0
+    }
+    fn is_readonly(&self) -> bool {
+        self.page.addr() & 2 != 0
+    }
+    fn is_locked(&self) -> bool {
+        self.page.addr() & 3 == 0
     }
     fn covers(&self, offset: usize, len: usize) {
         assert_eq!(mask(offset, len) & !self.mask, 0, "unguarded byte range");
@@ -279,12 +298,14 @@ impl<'a> Guard<'a> {
         }
     }
     pub fn write(&mut self, offset: usize, len: usize) -> &mut [u8] {
+        debug_assert!(!self.is_readonly(), "read-only guard cannot grant mutation");
         self.covers(offset, len);
         // SAFETY: the live exclusive region mask excludes every overlapping
         // reader/writer. &mut self also excludes another slice from this guard.
         unsafe { std::slice::from_raw_parts_mut(self.page().bytes.write_ptr().add(offset), len) }
     }
     pub fn copy_within(&mut self, source: usize, destination: usize, len: usize) {
+        debug_assert!(!self.is_readonly(), "read-only guard cannot grant mutation");
         self.covers(source, len);
         self.covers(destination, len);
         // SAFETY: both ranges are protected by this single guard; ptr::copy
@@ -310,8 +331,10 @@ impl<'a> Guard<'a> {
         if self.page().reservation_written.load(Ordering::Relaxed) & (1 << region) == 0 {
             return self.page().reservation_base.load(Ordering::Relaxed);
         }
-        // SAFETY: this region's byte mask also protects its reservation row
-        // and override byte; no mutable metadata reference survives unlock.
+        // SAFETY: this region's ownership also protects its reservation row and
+        // override byte. Immutable epochs have no invalidators; OnceLock above
+        // publishes initialization to all readers. No mutable reference survives
+        // a locked/exclusive epoch boundary.
         let (values, overrides) =
             unsafe { (&*rows.values[region].get(), *rows.overrides[region].get()) };
         let local = slot % 4;
@@ -322,6 +345,10 @@ impl<'a> Guard<'a> {
         }]
     }
     pub fn invalidate(&mut self, offset: usize, len: usize, version: u64) {
+        debug_assert!(
+            !self.is_readonly(),
+            "read-only guard cannot change monitors"
+        );
         self.covers(offset, len);
         if len == 0 {
             return;
@@ -398,7 +425,7 @@ impl<'a> Guard<'a> {
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        if !self.is_exclusive() {
+        if self.is_locked() {
             self.page().held.fetch_and(!self.mask, Ordering::Release);
         }
     }
@@ -407,6 +434,23 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readonly_guard_keeps_region_ownership_and_the_compact_layout() {
+        let page = MutablePage::new([37; PAGE]);
+        let held = page.lock(0, REGION);
+        let before = page.held.load(Ordering::Relaxed);
+        // SAFETY: this scope only reads bytes; even the overlapping held guard
+        // remains read-only. No byte/monitor invalidation can run concurrently.
+        let read = unsafe { page.unlocked_pair(0, 32, 8, true) };
+        assert_eq!(read.read(0, 8), read.read(32, 8));
+        assert!(!read.is_exclusive());
+        assert!(read.is_readonly());
+        assert_eq!(std::mem::size_of_val(&read), 16);
+        drop(read);
+        assert_eq!(page.held.load(Ordering::Relaxed), before);
+        drop(held);
+        assert_eq!(page.held.load(Ordering::Relaxed), 0);
+    }
     #[test]
     fn software_zero_pages_allocate_only_on_first_write() {
         let page = MutablePage::zero();

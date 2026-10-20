@@ -8,6 +8,8 @@ mod hardware;
 mod native;
 pub(super) mod page;
 #[cfg(test)]
+mod readonly;
+#[cfg(test)]
 mod sharing;
 mod snapshot;
 use super::*;
@@ -37,6 +39,8 @@ pub struct Metrics {
     pub cow_detach_bytes: u64,
     /// Quiescent dispatches with one execution owner for private VM bytes.
     pub exclusive_private_views: u64,
+    /// Dispatches sharing immutable private pages across CPUs of one VM.
+    pub readonly_private_views: u64,
 }
 struct ConcurrentPage {
     identity: u64,
@@ -181,7 +185,8 @@ struct Frame {
     charge: Arc<Charge>,
     direct: bool,
     dynamic_code: bool,
-    private_unique: bool,
+    // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
+    private_access: u8,
 }
 fn direct_matches(page: &Page, frame: &Frame) -> bool {
     let storage = page
@@ -352,6 +357,12 @@ fn prepare_frame(
         bytes.executable.store(true, Ordering::Relaxed);
     }
 
+    let private_unique = direct_owned
+        && Rc::strong_count(&page.bytes) == 1
+        && bytes
+            .bytes
+            .as_ref()
+            .is_some_and(|bytes| Arc::strong_count(bytes) == 2);
     Some(Frame {
         base,
         root_frame,
@@ -368,12 +379,16 @@ fn prepare_frame(
         ),
         error,
         charge: page.charge.clone(),
-        private_unique: direct_owned
-            && Rc::strong_count(&page.bytes) == 1
-            && bytes
-                .bytes
-                .as_ref()
-                .is_some_and(|bytes| Arc::strong_count(bytes) == 2),
+        private_access: if private_unique {
+            PrivateMode::Exclusive as u8
+                | if !page.permissions.write {
+                    PrivateMode::ReadOnly as u8
+                } else {
+                    0
+                }
+        } else {
+            0
+        },
         bytes,
         direct,
         dynamic_code: page.permissions.execute
@@ -421,12 +436,19 @@ impl SnapshotCache {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PrivateMode {
+    Guarded = 0,
+    Exclusive = 1,
+    ReadOnly = 2,
+}
 /// Send, with worker-local translations; never Sync and never retains Rc data.
 pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     mmu_cache: mmu::Cache,
-    exclusive_private: bool,
+    private_mode: PrivateMode,
 }
 /// Clone a worker-local view over the same frozen address space, with its own
 /// translation cells. This is a shared-VM view, not a process fork.
@@ -446,7 +468,7 @@ impl View {
         Self {
             snapshot,
             mmu_cache: mmu::Cache::default(),
-            exclusive_private: false,
+            private_mode: PrivateMode::Guarded,
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
     }
@@ -461,29 +483,68 @@ impl View {
     /// this very View to a service thread and back, after ending its borrows.
     /// Shared/custom backings and physically shared fork pages never qualify.
     pub unsafe fn try_exclusive_private(&mut self) -> bool {
-        self.exclusive_private = false;
+        self.private_mode = PrivateMode::Guarded;
         if self.snapshot.users.load(Ordering::Acquire) != 1 {
             return false;
         }
-        self.exclusive_private = true;
+        self.private_mode = PrivateMode::Exclusive;
         true
     }
     pub fn exclusive_private_enabled(&self) -> bool {
-        self.exclusive_private
+        self.private_mode == PrivateMode::Exclusive
+    }
+    /// Admit all dispatched Views of one frozen VM as a single epoch.
+    /// One View receives private read/write ownership; multiple Views can read
+    /// immutable private pages without region locks, while RW pages stay guarded.
+    ///
+    /// # Safety
+    /// Every coordinator Memory handle of this VM must be controlled by the
+    /// caller. No coordinate byte/monitor access, mapping change, fork or View
+    /// cloning may occur until all these Views are dropped. Parked service
+    /// actors may move their caller's same View, after ending scoped borrows.
+    /// This set must contain every execution actor of the VM. Admission checks
+    /// identical snapshots and the all-generations View count, not host aliases.
+    pub unsafe fn try_private_epoch(views: &mut [&mut Self]) -> bool {
+        for view in views.iter_mut() {
+            view.private_mode = PrivateMode::Guarded;
+        }
+        let Some(first) = views.first() else {
+            return false;
+        };
+        if first.snapshot.users.load(Ordering::Acquire) != views.len()
+            || views
+                .iter()
+                .any(|v| !Arc::ptr_eq(&first.snapshot, &v.snapshot))
+        {
+            return false;
+        }
+        let mode = if views.len() == 1 {
+            PrivateMode::Exclusive
+        } else {
+            PrivateMode::ReadOnly
+        };
+        for view in views {
+            view.private_mode = mode;
+        }
+        true
+    }
+    pub fn readonly_private_enabled(&self) -> bool {
+        self.private_mode == PrivateMode::ReadOnly
     }
     #[inline]
     fn page_guard<'a>(
         &self,
         bytes: &'a ConcurrentPage,
-        private: bool,
+        private_access: u8,
         offset: usize,
         len: usize,
     ) -> page::Guard<'a> {
         let storage = bytes.bytes.as_ref().expect("mutable page");
-        if self.exclusive_private && private {
-            // SAFETY: unsafe admission proves one owner for this epoch; frame
-            // construction proves these bytes are not shared with another VM.
-            unsafe { storage.exclusive(offset, len) }
+        let mode = self.private_mode as u8 & private_access;
+        if mode != 0 {
+            // SAFETY: admission proves exclusive or immutable epoch ownership;
+            // frame bits exclude other VMs and writable read-only admission.
+            unsafe { storage.unlocked(offset, len, mode == PrivateMode::ReadOnly as u8) }
         } else {
             storage.lock(offset, len)
         }
@@ -492,22 +553,23 @@ impl View {
     fn page_guard_pair<'a>(
         &self,
         bytes: &'a ConcurrentPage,
-        private: bool,
+        private_access: u8,
         a: usize,
         b: usize,
         len: usize,
     ) -> page::Guard<'a> {
         let storage = bytes.bytes.as_ref().expect("mutable page");
-        if self.exclusive_private && private {
+        let mode = self.private_mode as u8 & private_access;
+        if mode != 0 {
             // SAFETY: same epoch/physical ownership proof for both subranges.
-            unsafe { storage.exclusive_pair(a, b, len) }
+            unsafe { storage.unlocked_pair(a, b, len, mode == PrivateMode::ReadOnly as u8) }
         } else {
             storage.lock_pair(a, b, len)
         }
     }
     #[inline]
     fn frame_guard<'a>(&self, frame: &'a Frame, offset: usize, len: usize) -> page::Guard<'a> {
-        self.page_guard(&frame.bytes, frame.private_unique, offset, len)
+        self.page_guard(&frame.bytes, frame.private_access, offset, len)
     }
     #[inline]
     fn frame(&self, address: u64, access: Access) -> Result<&Frame, MemoryError> {

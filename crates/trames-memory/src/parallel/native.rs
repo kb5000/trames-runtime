@@ -132,8 +132,8 @@ impl NativeMemory for View {
         {
             return Err(NativeAccessError::Checkpoint);
         }
-        let ap = a.private_unique;
-        let bp = b.private_unique;
+        let ap = a.private_access;
+        let bp = b.private_access;
         let a = &a.bytes;
         let b = &b.bytes;
         let result = match (&a.constant, &b.constant) {
@@ -262,19 +262,19 @@ impl NativeMemory for View {
             let dst = &df.bytes;
             let src = &sf.bytes;
             if Arc::ptr_eq(dst, src) {
-                let mut guard = self.page_guard_pair(dst, df.private_unique, si, di, count);
+                let mut guard = self.page_guard_pair(dst, df.private_access, si, di, count);
                 self.changed(df, &mut guard, di, count);
                 guard.copy_within(si, di, count);
             } else if let Some(bytes) = &src.constant {
                 self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
             } else {
                 let (mut dg, sg) = if dst.identity < src.identity {
-                    let dg = self.page_guard(dst, df.private_unique, di, count);
-                    let sg = self.page_guard(src, sf.private_unique, si, count);
+                    let dg = self.page_guard(dst, df.private_access, di, count);
+                    let sg = self.page_guard(src, sf.private_access, si, count);
                     (dg, sg)
                 } else {
-                    let sg = self.page_guard(src, sf.private_unique, si, count);
-                    let dg = self.page_guard(dst, df.private_unique, di, count);
+                    let sg = self.page_guard(src, sf.private_access, si, count);
+                    let dg = self.page_guard(dst, df.private_access, di, count);
                     (dg, sg)
                 };
                 self.changed(df, &mut dg, di, count);

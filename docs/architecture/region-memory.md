@@ -27,8 +27,8 @@ provider, or unguarded borrowed slice crosses to workers. Immutable mapping
 snapshots and per-worker software TLBs still describe permissions and lifetimes.
 
 Coordinator reads/writes, hardware CPU aliases, native fragments, atomic RMW and
-exclusive monitors share one physical ownership protocol. Concurrent shared
-bytes acquire region guards; admitted sole-executor private bytes skip that
+exclusive monitors share one physical ownership protocol. Mutable shared bytes
+acquire region guards; admitted exclusive or immutable private bytes skip that
 acquisition, as described below. Byte writes become
 visible without commit or refresh. The coordinator uses scoped shared borrows;
 its optional unguarded native page-borrow API declines a shared page. Pair reads
@@ -88,8 +88,8 @@ progress while a smaller native borrow is held. Native functions remain bounded;
 kernel mutation and persistence still use joined checkpoints.
 
 The module's `unsafe impl Sync` has one invariant: every non-atomic byte and local
-reservation-row access has exclusive range ownership, from a live region lock
-or the scheduler's private-epoch proof. Slices expose
+reservation-row access has exclusive or immutable range ownership, from a live
+region lock or the scheduler's private-epoch proof. Slices expose
 only their checked subrange, never a mutable reference to the entire page.
 Mutable slices borrow the guard mutably and cannot outlive it. Same-page moves
 use overlap-safe raw copy under one union mask; different pages retain physical
@@ -127,7 +127,7 @@ An admitted frame uses an unlocked scoped guard: checked subranges, reference
 lifetimes, alias-aware pair/move behavior, unwind cleanup and monitor invalidation
 remain the same. Scalar hardware/software reads and writes, instruction fetch,
 native fragments/fill/copy, atomic RMW and LL/SC all use this single boundary.
-The acquisition mode is stored in an unused aligned page-pointer bit, keeping
+The acquisition mode is stored in two unused aligned page-pointer bits, keeping
 the guard at two words on supported 64-bit hosts. Rust `map_addr` preserves
 provenance, the lifetime marker retains the page, and every dereference clears
 the tag; no tagged pointer escapes. This avoids widening hot guard return values.
@@ -146,13 +146,62 @@ cloning during this unsafe admission is forbidden; normal clones start guarded.
 
 The metric `exclusive_private_views` counts admitted dispatches, not accesses or
 cores. [Private-memory validation](../validation/private-memory.md) retains the
-fixed-work comparison and source hashes. Shared-VM multithreading, shared physical
+fixed-work comparison and source hashes. Mutable shared-VM frames, shared physical
 backings and the ordinary coordinator `Memory` path remain guarded. Extending
 lock-free ordinary ARM64 accesses there requires a separate protocol for native
 slice borrows, mixed-width atomics and exclusive-monitor metadata; simply
 removing their guards would not establish those requirements. Aligned raw-asm
 loads/stores are a candidate, rather than an obligation to simulate stronger ARM
 ordering. No global native-function safety lock or new race errno is introduced.
+
+## Immutable private pages in a shared VM
+
+Multiple CPUs of one VM can now read its physically private, non-writable pages
+without a region acquisition/release. This includes private RX code and R data;
+execute-only pages still permit instruction fetch only. It does not depend on
+the absence of writes observed in a profile. The frozen mapping must prohibit
+writing, and the same physical-ownership proof used above must reject shared
+backings, COW peers and retained other-VM storage. A read-only VMA over a writable
+file is not immutable storage: fd/backing writers remain possible, so it stays
+guarded even if no current guest VMA can write it.
+
+After preparing all selected Views, the scheduler groups them by actual Memory
+root and accounts for every coordinate handle. `try_private_epoch` also requires
+the **same Snapshot Arc** and an all-generation live-View count exactly equal to
+the group size. A missing/external View or a different mapping generation rejects
+the entire admission. One actor receives the previous exclusive mode; multiple
+actors receive immutable-read mode. Clones start guarded, and admission forbids
+cloning, mapping/fork/protection changes and coordinate byte/monitor access until
+every admitted View is dropped. Ready services still move their parked CPU's
+own View, rather than introducing another byte owner.
+
+Each immutable frame has no writable alias/capability among these actors. All
+CPU and native write paths retain their existing Write permission check before
+creating a mutable byte reference. RW frames keep normal guards, atomic RMW,
+dirty publication and exclusive invalidation. For reads, a view-mode byte and
+precomputed frame-access mask select an unlocked read-only guard; no per-operand
+refcount, page scan, added permission walk or fence is required. Pair reads and
+the source of native copies share this protocol. Native slices can overlap
+between readers, including reentrant immutable reads. The 16-byte guard uses
+mode tags for locked, exclusive and read-only ownership; read-only drop performs
+no unlock RMW and never grants mutation or monitor invalidation.
+
+LDXR on an R mapping is legal and needs a monitor token. Its first use publishes
+the reservation table through the existing OnceLock, so parallel first readers
+initialize it once. Subsequent row/override reads are immutable for this epoch;
+no byte writer or monitor invalidator exists for that page. Atomics and STXR
+require Write access and cannot enter this route. After every View and native
+borrow has ended, a joined protection change can admit writers again, using the
+same version/monitor invalidation protocol. Acquire/release/fence instructions
+retain their guest behavior. This neither adds a function-wide safety lock nor
+converts a guest data race into a special result.
+
+`readonly_private_views` counts admitted shared-VM dispatches, not lock-free
+pages or individual operations. [Shared-readonly validation](../validation/shared-readonly.md)
+records overlap, monitor, alias/lifetime tests and the fixed-work comparison,
+including a guarded RW control. Shared **mutable** ordinary accesses still need
+a compatible raw-ARM/native-borrow/atomic/monitor protocol before they can skip
+region locks; they are not covered by this immutable proof.
 
 ## Reservation and commit costs
 

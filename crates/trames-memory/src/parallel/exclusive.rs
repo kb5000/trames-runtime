@@ -150,8 +150,16 @@ fn shared_backings_remain_atomic_across_private_vm_epochs() {
     let mut b = child.parallel_view(&mut registry).unwrap();
     for view in [&mut a, &mut b] {
         admit(view);
-        assert!(view.frame(0x40000, Access::Write).unwrap().private_unique);
-        assert!(!view.frame(0x50000, Access::Write).unwrap().private_unique);
+        assert!(
+            view.frame(0x40000, Access::Write).unwrap().private_access
+                & PrivateMode::Exclusive as u8
+                != 0
+        );
+        assert_eq!(
+            view.frame(0x50000, Access::Write).unwrap().private_access
+                & PrivateMode::Exclusive as u8,
+            0
+        );
     }
     let gate = Arc::new(std::sync::Barrier::new(2));
     let joins: Vec<_> = [a, b]
@@ -218,7 +226,7 @@ fn retained_readonly_fork_storage_is_not_mistaken_for_unique_bytes() {
     let mut child_view = child.parallel_view(&mut registry).unwrap();
     admit(&mut child_view);
     let frame = child_view.frame(0x40000, Access::Read).unwrap();
-    assert!(!frame.private_unique);
+    assert_eq!(frame.private_access & PrivateMode::Exclusive as u8, 0);
     assert!(!child_view.frame_guard(frame, 0, 8).is_exclusive());
     assert_eq!(child_view.read_array::<8>(0x40000).unwrap(), [7; 8]);
     assert_eq!(parent_view.read_array::<8>(0x40000).unwrap(), [7; 8]);
