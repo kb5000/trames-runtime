@@ -365,6 +365,9 @@ impl State {
                         self.seat.press_serial = Some((serial, id));
                     }
                 }
+                if self.xkey(key, pressed, modifiers) {
+                    return;
+                }
                 if let Some(s) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
                     for k in &self.seat.keyboards {
                         if connection(k) == s.connection {

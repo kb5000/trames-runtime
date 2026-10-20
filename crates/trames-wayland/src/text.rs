@@ -126,6 +126,9 @@ impl State {
         }
     }
     pub(crate) fn text_context(&self) -> Option<TextContext> {
+        if let Some(context) = self.xtext_context() {
+            return Some(context);
+        }
         let (&id, o) = self
             .text
             .objects
@@ -179,6 +182,17 @@ impl State {
             return;
         };
         if context.id != edit.context || context.epoch != edit.epoch {
+            return;
+        }
+        if context.version == 4 {
+            // XIM has no delete-surrounding-text operation. UIKit keeps its
+            // composition locally and sends physical editing keys separately.
+            if edit.delete_before != 0 || edit.delete_after != 0 {
+                return;
+            }
+            if let Some(text) = edit.commit.filter(|s| s.len() <= 4096 && !s.contains('\0')) {
+                self.xtext_commit(context.surface, text);
+            }
             return;
         }
         let Some(o) = self.text.objects.get(&edit.context) else {

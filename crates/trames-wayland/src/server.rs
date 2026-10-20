@@ -202,6 +202,7 @@ fn run(
                                 allowed.insert(key);
                             }
                             compositor.state.xwayland.managers.insert(key, wm);
+                            compositor.state.xclipboard_sync();
                         }
                     }
                 }
@@ -223,6 +224,7 @@ fn run(
                 Command::HostClipboard(host) => {
                     compositor.state.selection.host = Some(host);
                     compositor.state.selection_focus_changed();
+                    compositor.state.xclipboard_sync();
                 }
                 Command::ClipboardChanged => compositor.state.host_clipboard_changed(),
                 Command::Stop => stopped = true,

@@ -17,6 +17,10 @@ use x11rb::{
     wrapper::ConnectionExt as _,
     CURRENT_TIME, NONE,
 };
+mod clipboard;
+mod ime;
+mod keys;
+pub(crate) use ime::Text;
 
 pub(crate) type Identity = (u32, u32, u32);
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -37,11 +41,17 @@ pub(crate) enum Update {
     Window(Window),
     Remove(u32),
     Focus(u64, u32),
+    Clipboard(String),
+    ReadClipboard(std::os::fd::OwnedFd),
+    Text(Option<Text>),
 }
 pub(crate) enum Command {
     Resize(u32, u32, u32),
     Focus(u64, Option<u32>),
     Close(u32),
+    ClipboardProxy(bool),
+    Text(u64, String),
+    Key(u32, bool, u32),
 }
 pub(crate) struct Manager {
     pub commands: mpsc::SyncSender<Command>,
@@ -220,6 +230,10 @@ fn run(
         &[a.name, a.active, a.check],
     )?;
     c.flush()?;
+    let mut clipboard = clipboard::Clipboard::new(&c, owner)?;
+    let mut ime = ime::Ime::new(&c, updates.clone())?;
+    x11rb::protocol::xtest::get_version(&c, 2, 2)?.reply()?;
+    let mut keys = keys::Keys::default();
     let mut windows: BTreeMap<u32, Window> = BTreeMap::new();
     // A full bounded queue disconnects this XWM, never blocks compositor teardown.
     let publish = |u| {
@@ -254,6 +268,9 @@ fn run(
     loop {
         while let Ok(command) = commands.try_recv() {
             match command {
+                Command::ClipboardProxy(enabled) => clipboard.proxy(&c, enabled)?,
+                Command::Text(token, text) => ime.commit(token, &text)?,
+                Command::Key(key, pressed, modifiers) => keys.key(&c, key, pressed, modifiers)?,
                 Command::Resize(id, w, h) => {
                     c.configure_window(
                         id,
@@ -261,6 +278,7 @@ fn run(
                     )?;
                 }
                 Command::Focus(serial, id) => {
+                    keys.release(&c)?;
                     let id = id.unwrap_or(NONE);
                     c.set_input_focus(InputFocus::POINTER_ROOT, id, CURRENT_TIME)?;
                     c.change_property32(
@@ -319,6 +337,9 @@ fn run(
             let Some(event) = c.poll_for_event()? else {
                 break;
             };
+            if clipboard.filter(&c, &event, &updates)? || ime.filter(&event)? {
+                continue;
+            }
             match event {
                 Event::MapRequest(e) => {
                     if windows.len() >= 256 && !windows.contains_key(&e.window) {
@@ -389,6 +410,7 @@ fn run(
                 _ => {}
             }
         }
+        clipboard.tick(&c)?;
         c.flush()?;
         let mut fd = libc::pollfd {
             fd: c.stream().as_raw_fd(),

@@ -19,6 +19,8 @@ pub(crate) struct Xwayland {
     last_serial: BTreeMap<Identity, u64>,
     focus_serial: u64,
     pending_focus: Option<PendingFocus>,
+    texts: BTreeMap<Identity, xwm::Text>,
+    text_epoch: u64,
 }
 struct PendingFocus {
     owner: Identity,
@@ -26,6 +28,7 @@ struct PendingFocus {
     serial: u64,
     keys: Vec<InputEvent>,
 }
+
 fn identity(client: &Client) -> Option<Identity> {
     client
         .get_data::<ClientIdentity>()
@@ -56,6 +59,7 @@ impl State {
     pub(crate) fn xfocus(&mut self, id: Option<u64>) {
         let focused = id.and_then(|id| self.surfaces.get(&id)).and_then(|s| s.x11);
         self.xwayland.focus_serial = self.xwayland.focus_serial.wrapping_add(1).max(1);
+        self.xwayland.text_epoch = self.xwayland.text_epoch.wrapping_add(1).max(1);
         let serial = self.xwayland.focus_serial;
         self.xwayland.pending_focus = focused.map(|(owner, xid)| PendingFocus {
             owner,
@@ -70,10 +74,46 @@ impl State {
             ));
         }
     }
+    pub(crate) fn xtext_context(&self) -> Option<TextContext> {
+        let surface = self.seat.focus?;
+        let (key, xid) = self.surfaces.get(&surface)?.x11?;
+        let text = self.xwayland.texts.get(&key)?;
+        if text.window != xid {
+            return None;
+        }
+        Some(TextContext {
+            version: 4,
+            id: surface | (1 << 63),
+            epoch: self.xwayland.text_epoch,
+            surface,
+            window: surface,
+            caret: text.caret,
+            ..TextContext::default()
+        })
+    }
+    pub(crate) fn xtext_commit(&self, surface: u64, text: String) {
+        if let Some((key, _)) = self.surfaces.get(&surface).and_then(|s| s.x11) {
+            if let Some(context) = self.xwayland.texts.get(&key) {
+                self.xcommand(surface, |_| xwm::Command::Text(context.token, text));
+            }
+        }
+    }
+    pub(crate) fn xkey(&self, key: u32, pressed: bool, modifiers: u32) -> bool {
+        let Some(surface) = self
+            .seat
+            .focus
+            .filter(|id| self.surfaces.get(id).is_some_and(|s| s.x11.is_some()))
+        else {
+            return false;
+        };
+        self.xcommand(surface, |_| xwm::Command::Key(key, pressed, modifiers));
+        true
+    }
     pub(crate) fn defer_xkey(&mut self, event: &InputEvent) -> bool {
         if !matches!(event, InputEvent::Key { .. }) {
             return false;
         }
+
         let Some(pending) = self.xwayland.pending_focus.as_mut() else {
             return false;
         };
@@ -232,6 +272,30 @@ impl State {
         }
         for (key, update) in updates {
             match update {
+                xwm::Update::Clipboard(text) => self.set_xclipboard(key, text),
+                xwm::Update::ReadClipboard(fd) => {
+                    if self
+                        .seat
+                        .focus
+                        .and_then(|id| self.surfaces.get(&id))
+                        .and_then(|s| s.x11)
+                        .is_some_and(|(owner, _)| owner == key)
+                    {
+                        self.selection_read(fd);
+                    }
+                }
+                xwm::Update::Text(text) => {
+                    let previous = self.xwayland.texts.remove(&key);
+                    if previous.as_ref().map(|t| (t.token, t.window, t.generation))
+                        != text.as_ref().map(|t| (t.token, t.window, t.generation))
+                    {
+                        self.xwayland.text_epoch = self.xwayland.text_epoch.wrapping_add(1).max(1);
+                    }
+                    if let Some(t) = text {
+                        self.xwayland.texts.insert(key, t);
+                    }
+                    self.changed();
+                }
                 xwm::Update::Focus(serial, xid) => self.xfocus_ready(key, serial, xid),
                 xwm::Update::Window(w) => {
                     if self.xwayland.windows.get(&(key, w.id)) == Some(&w) {
@@ -272,6 +336,9 @@ impl State {
                 allowed.remove(&key);
             }
             self.xwayland.managers.remove(&key);
+            self.xwayland.texts.remove(&key);
+            // X11 selection bytes are already owned, unlike a live Wayland
+            // data source. Preserve copied text after its X server exits.
             self.xwayland.windows.retain(|(k, _), _| *k != key);
             self.xwayland.last_serial.remove(&key);
             let ids = self
