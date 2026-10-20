@@ -226,12 +226,21 @@ impl Linux {
         memory: &impl CpuMemory,
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
+        self.write_scratch(a, memory, io, &mut Vec::new())
+    }
+    pub fn write_scratch(
+        &mut self,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        io: &mut impl GuestOutput,
+        bytes: &mut Vec<u8>,
+    ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         let count = a[2].min(MAX_WRITE as u64) as usize;
         Self::check(memory, a[1], count, Access::Read)?;
-        let mut bytes = vec![0; count];
-        memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-        self.write_bytes(a[0] as u32, &bytes, io)
+        bytes.resize(count, 0);
+        memory.read(a[1], bytes).map_err(|_| Errno(14))?;
+        self.write_bytes(a[0] as u32, bytes, io)
     }
     /// ARM64 positioned scalar I/O, shared by joined and in-epoch dispatch.
     pub fn positioned(
@@ -239,6 +248,15 @@ impl Linux {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
         write: bool,
+    ) -> Result<u64> {
+        self.positioned_scratch(a, memory, write, &mut Vec::new())
+    }
+    pub fn positioned_scratch(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        write: bool,
+        bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         let count = a[2].min(MAX_WRITE as u64) as usize;
@@ -249,9 +267,9 @@ impl Linux {
             if write { Access::Read } else { Access::Write },
         )?;
         if write {
-            let mut bytes = vec![0; count];
-            memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-            Ok(self.vfs.pwrite(a[0] as u32, &bytes, a[3])? as u64)
+            bytes.resize(count, 0);
+            memory.read(a[1], bytes).map_err(|_| Errno(14))?;
+            Ok(self.vfs.pwrite(a[0] as u32, bytes, a[3])? as u64)
         } else {
             let bytes = self.vfs.pread(a[0] as u32, count, a[3])?;
             memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
@@ -267,14 +285,7 @@ impl Linux {
         memory: &mut impl CpuMemory,
     ) -> Result<u64> {
         match number {
-            25 => {
-                let flags = self.vfs.flags(a[0] as u32)?;
-                match a[1] {
-                    1 => Ok(u64::from(flags & 0x80000 != 0)),
-                    3 => Ok((flags & !(0x80000 | 0x40 | 0x80 | 0x100 | 0x200)) as u64),
-                    _ => Err(Errno(22)),
-                }
-            }
+            25 => trames_vfs::query_fd_flags(self.vfs.flags(a[0] as u32)?, a[1]),
             62 => self.vfs.seek(a[0] as u32, a[1] as i64, a[2] as u32),
             80 => {
                 let stat = self.vfs.stat_fd(a[0] as u32)?;
@@ -290,6 +301,15 @@ impl Linux {
         a: [u64; 6],
         memory: &impl CpuMemory,
         io: &mut impl GuestOutput,
+    ) -> Result<u64> {
+        self.writev_scratch(a, memory, io, &mut Vec::new())
+    }
+    pub fn writev_scratch(
+        &mut self,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        io: &mut impl GuestOutput,
+        bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         if a[2] > 1024 {
@@ -311,7 +331,7 @@ impl Linux {
             vectors.push((address, take));
             total += take;
         }
-        let mut bytes = vec![0; total];
+        bytes.resize(total, 0);
         let mut position = 0;
         for (address, count) in vectors {
             memory
@@ -319,13 +339,22 @@ impl Linux {
                 .map_err(|_| Errno(14))?;
             position += count;
         }
-        self.write_bytes(a[0] as u32, &bytes, io)
+        self.write_bytes(a[0] as u32, bytes, io)
     }
     pub fn positioned_vector(
         &mut self,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
         write: bool,
+    ) -> Result<u64> {
+        self.positioned_vector_scratch(a, memory, write, &mut Vec::new())
+    }
+    pub fn positioned_vector_scratch(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        write: bool,
+        bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
         // Native arm64 uses the full 64-bit offset in pos_l (x3), not a 32-bit split.
@@ -360,7 +389,7 @@ impl Linux {
             total += take;
         }
         if write {
-            let mut bytes = vec![0; total];
+            bytes.resize(total, 0);
             let mut cursor = 0;
             for (pointer, take) in parts {
                 if take != 0 {
@@ -370,7 +399,7 @@ impl Linux {
                 }
                 cursor += take;
             }
-            Ok(self.vfs.pwrite(a[0] as u32, &bytes, offset)? as u64)
+            Ok(self.vfs.pwrite(a[0] as u32, bytes, offset)? as u64)
         } else {
             let bytes = self.vfs.pread(a[0] as u32, total, offset)?;
             Self::scatter(memory, &parts, &bytes)?;
@@ -1402,6 +1431,52 @@ impl Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reused_write_scratch_shrinks_and_never_emits_stale_or_faulting_bytes() {
+        let mut linux = Linux::new(0);
+        let mut memory = memory();
+        let fd = linux
+            .vfs
+            .open_at(trames_vfs::AT_FDCWD, b"/scratch", 0x42, 0o600)
+            .unwrap();
+        let mut buffer = Vec::new();
+        let mut io = crate::CapturedOutput::default();
+        memory.write(0x1000, b"abcdef").unwrap();
+        assert_eq!(
+            linux.write_scratch(
+                [fd as u64, 0x1000, 6, 0, 0, 0],
+                &memory,
+                &mut io,
+                &mut buffer
+            ),
+            Ok(6)
+        );
+        let capacity = buffer.capacity();
+        linux.vfs.seek(fd, 0, 0).unwrap();
+        memory.write(0x1000, b"x").unwrap();
+        assert_eq!(
+            linux.write_scratch(
+                [fd as u64, 0x1000, 1, 0, 0, 0],
+                &memory,
+                &mut io,
+                &mut buffer
+            ),
+            Ok(1)
+        );
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.capacity(), capacity);
+        assert_eq!(
+            linux.write_scratch(
+                [fd as u64, 0x9000, 2, 0, 0, 0],
+                &memory,
+                &mut io,
+                &mut buffer
+            ),
+            Err(Errno(14))
+        );
+        assert_eq!(linux.vfs.seek(fd, 0, 1).unwrap(), 1);
+        assert_eq!(linux.vfs.pread(fd, 6, 0).unwrap(), b"xbcdef");
+    }
     #[test]
     fn mmap_uses_configured_budget_instead_of_the_legacy_half_gib_cap() {
         let mut linux = Linux::new(0);

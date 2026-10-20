@@ -39,26 +39,33 @@ impl std::ops::DerefMut for PageStorage {
 pub(super) struct MappedData {
     data: RefCell<Box<FileData>>,
     pages: RefCell<BTreeMap<u64, Weak<FilePage>>>,
+    writers_cached: Cell<Option<bool>>,
 }
 impl MappedData {
     pub(super) fn new(data: FileData) -> Self {
         Self {
             data: RefCell::new(Box::new(data)),
             pages: RefCell::new(BTreeMap::new()),
+            writers_cached: Cell::new(None),
         }
     }
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
     }
-    pub(super) fn epoch_io_safe(&self) -> bool {
+    pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
         // open descriptions. Workers keep shadow pages until a joined commit.
-        !self
-            .pages
-            .borrow()
-            .values()
-            .any(|page| page.strong_count() != 0)
-            && self.data.borrow().epoch_io_safe()
+        let conflict = if write {
+            self.pages
+                .borrow()
+                .values()
+                .any(|page| page.strong_count() != 0)
+        } else {
+            // Private COW never publishes to FileMapping; read-only mappings
+            // cannot dirty the inode. Only possible shared writers conflict.
+            self.has_writers()
+        };
+        !conflict && self.data.borrow().epoch_io_safe(write)
     }
     pub(super) fn inode(&self) -> Option<u64> {
         self.data.borrow().inode()
@@ -207,11 +214,17 @@ impl MappedData {
         Ok(())
     }
     pub(super) fn has_writers(&self) -> bool {
-        self.pages
+        if let Some(value) = self.writers_cached.get() {
+            return value;
+        }
+        let value = self
+            .pages
             .borrow()
             .values()
             .filter_map(Weak::upgrade)
-            .any(|p| p.writers.get() != 0)
+            .any(|p| p.writers.get() != 0);
+        self.writers_cached.set(Some(value));
+        value
     }
     pub(super) fn sync(&self, data_only: bool) -> Result<()> {
         for (&base, page) in self.pages.borrow().iter() {
@@ -258,6 +271,7 @@ impl FileMapping {
         executable: bool,
     ) -> Result<Rc<dyn PageBacking>> {
         let page = if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
+            data.writers_cached.set(None);
             data.page(offset)?
         } else {
             return Err(Errno(19));
@@ -394,6 +408,7 @@ impl Drop for FileMapping {
         }
         // Closing the descriptor/unlinking the path never invalidates this inode.
         if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
+            data.writers_cached.set(None);
             let _ = data.flush(self.offset, &self.page);
             if Rc::strong_count(&self.page) == 1 {
                 data.pages.borrow_mut().remove(&self.offset);
@@ -448,6 +463,7 @@ impl Vfs {
         }
         offset.checked_add(len).ok_or(Errno(22))?;
         let buffers = if let FileData::Mapped(data) = data {
+            data.writers_cached.set(None);
             data.batch(offset, len)?
         } else {
             unreachable!("mapped data")
@@ -500,8 +516,13 @@ mod tests {
             .map_backed(0x8000, pages, false, Permissions::R, false)
             .unwrap();
         assert_eq!(v.file_descriptors(), candidate);
-        assert!(!v.epoch_file_io(alias, false));
+        assert!(v.epoch_file_io(alias, false));
         assert!(!v.epoch_file_io(alias, true));
+        let shared = v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap();
+        other_vm
+            .map_backed(0x9000, shared, true, Permissions::RW, false)
+            .unwrap();
+        assert!(!v.epoch_file_io(alias, false));
         v.rename_at(AT_FDCWD, b"/alias", AT_FDCWD, b"/moved", 0)
             .unwrap();
         v.unlink_at(AT_FDCWD, b"/original", false).unwrap();
@@ -512,6 +533,8 @@ mod tests {
         let replacement = v.open_at(AT_FDCWD, b"/original", 0, 0).unwrap();
         assert!(v.epoch_file_io(replacement, false));
         other_vm.unmap(0x8000, PAGE_SIZE).unwrap();
+        assert!(!v.epoch_file_io(alias, false));
+        other_vm.unmap(0x9000, PAGE_SIZE).unwrap();
         assert!(v.epoch_file_io(alias, false));
         assert!(v.epoch_file_io(alias, true));
         let host_shared = v.memfd_create(b"host-display", 0).unwrap();

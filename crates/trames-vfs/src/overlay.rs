@@ -809,6 +809,9 @@ mod tests {
         let old = v.open_at(AT_FDCWD, b"/merged/a", 0, 0).unwrap();
         assert!(v.epoch_file_io(old, false));
         let pages = v.mapping_pages(lower, 0, 4096, false, false).unwrap();
+        assert!(v.epoch_file_io(old, false));
+        let writable = v.open_at(AT_FDCWD, b"/lower/a", 2, 0).unwrap();
+        let shared = v.mapping_pages(writable, 0, 4096, true, true).unwrap();
         assert!(!v.epoch_file_io(old, false));
         write(&mut v, b"/merged/a", b"upper");
         let new = v.open_at(AT_FDCWD, b"/merged/a", 2, 0).unwrap();
@@ -816,6 +819,8 @@ mod tests {
         assert!(v.epoch_file_io(new, false));
         assert!(!v.epoch_file_io(old, false));
         drop(pages);
+        assert!(!v.epoch_file_io(old, false));
+        drop(shared);
         assert!(v.epoch_file_io(old, false));
         assert_eq!(v.pread(old, 10, 0).unwrap(), b"lower");
         assert_eq!(v.pread(new, 10, 0).unwrap(), b"upper");

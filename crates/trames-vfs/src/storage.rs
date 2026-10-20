@@ -151,16 +151,16 @@ impl Drop for DiskObject {
     }
 }
 impl FileData {
-    pub(super) fn epoch_io_safe(&self) -> bool {
+    pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         match self {
             Self::Memory(_) | Self::Disk(_) => true,
             // SharedFile can also be retained by host display/GPU consumers.
             Self::Shared(_) => false,
-            Self::Mapped(data) => data.epoch_io_safe(),
+            Self::Mapped(data) => data.epoch_io_safe(write),
             Self::Lower(node) => {
                 let node = node.borrow();
                 !node.volatile
-                    && matches!(&node.content, Content::File(data) if data.epoch_io_safe())
+                    && matches!(&node.content, Content::File(data) if data.epoch_io_safe(write))
             }
         }
     }

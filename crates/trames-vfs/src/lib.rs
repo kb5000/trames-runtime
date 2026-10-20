@@ -46,7 +46,32 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     rc::{Rc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
+// Status flags belong to a shared open description, including across forked
+// independent FD tables. Mutations occur joined; invalidate cached snapshots.
+static FD_FLAGS_REVISION: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Default)]
+pub struct FdFlags(Arc<[Option<u32>]>);
+pub enum EpochIo {
+    Stream,
+    File,
+}
+impl FdFlags {
+    pub fn get(&self, fd: u32) -> Result<u32> {
+        self.0.get(fd as usize).copied().flatten().ok_or(Errno(9))
+    }
+}
+pub fn query_fd_flags(flags: u32, command: u64) -> Result<u64> {
+    match command {
+        1 => Ok(u64::from(flags & O_CLOEXEC != 0)),
+        3 => Ok((flags & !(O_CLOEXEC | 0x40 | 0x80 | 0x100 | 0x200)) as u64),
+        _ => Err(Errno(22)),
+    }
+}
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub use trames_net::{NetworkMode, Socket as NetSocket};
 pub fn kernel_log_capacity() -> usize {
@@ -236,6 +261,7 @@ struct DescriptorTable {
 #[derive(Clone, Default)]
 struct DescriptorVersion {
     io: OnceCell<(FdMask, FdMask)>,
+    flags: RefCell<Option<(u64, FdFlags)>>,
 }
 impl DescriptorTable {
     // Keep two-phase receiver borrowing for expressions such as
@@ -258,7 +284,9 @@ impl std::ops::Deref for DescriptorTable {
 }
 impl std::ops::DerefMut for DescriptorTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Rc::make_mut(&mut self.identity).io.take();
+        let version = Rc::make_mut(&mut self.identity);
+        version.io.take();
+        version.flags.get_mut().take();
         &mut self.entries
     }
 }
@@ -482,20 +510,49 @@ impl Vfs {
     pub fn stream_descriptors(&self) -> FdMask {
         self.descriptor_io_masks().0
     }
+    /// Plain immutable values; no VFS Rc is sent to a CPU worker. Status-flag
+    /// mutations in a forked table invalidate this cache through the revision.
+    pub fn fd_flags_snapshot(&self) -> FdFlags {
+        let revision = FD_FLAGS_REVISION.load(Ordering::Relaxed);
+        let mut cached = self.fds.identity.flags.borrow_mut();
+        if let Some((old, snapshot)) = &*cached {
+            if *old == revision {
+                return snapshot.clone();
+            }
+        }
+        let mut entries = vec![
+            None;
+            self.fds
+                .last_key_value()
+                .map_or(0, |(&fd, _)| fd as usize + 1)
+        ];
+        for (&fd, d) in self.fds.iter() {
+            entries[fd as usize] =
+                Some(d.open.borrow().flags | if d.cloexec { O_CLOEXEC } else { 0 });
+        }
+        let snapshot = FdFlags(entries.into());
+        *cached = Some((revision, snapshot.clone()));
+        snapshot
+    }
+    fn ordinary_stream(o: &OpenDescription) -> bool {
+        matches!(
+            o.kind,
+            FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::PipeRead | FdKind::PipeWrite
+        ) || o.bridge.is_none() && o.local.as_ref().is_some_and(|socket| socket.kind() == 1)
+    }
+    /// Ready byte I/O only; recvmsg/SCM_RIGHTS, native bridge and PTY job control
+    /// stay on their joined paths. Local sockets never reference worker Memory.
+    pub fn epoch_stream_io(&self, fd: u32) -> bool {
+        self.descriptor(fd)
+            .is_ok_and(|d| Self::ordinary_stream(&d.open.borrow()))
+    }
     fn descriptor_io_masks(&self) -> &(FdMask, FdMask) {
         self.fds.identity.io.get_or_init(|| {
             let mut streams = [0; (MAX_FDS as usize).div_ceil(64)];
             let mut files = streams;
             for (&fd, d) in self.fds.iter() {
                 let o = d.open.borrow();
-                if matches!(
-                    o.kind,
-                    FdKind::Stdin
-                        | FdKind::Stdout
-                        | FdKind::Stderr
-                        | FdKind::PipeRead
-                        | FdKind::PipeWrite
-                ) {
+                if Self::ordinary_stream(&o) {
                     streams[fd as usize / 64] |= 1 << (fd % 64);
                 } else if Self::ordinary_file(&o, false).is_some() {
                     files[fd as usize / 64] |= 1 << (fd % 64);
@@ -532,14 +589,22 @@ impl Vfs {
         regular.then_some(node)
     }
     /// Coordinator-only check against the retained inode, never a path lookup.
-    /// Reject every live file mapping, including read-only/private mappings and
-    /// mappings in a different VM. Their page snapshots are committed at join.
+    /// Reads exclude shared writers in every VM; writes exclude all live maps.
+    /// Writable shared snapshots must be committed before VFS can observe them.
     pub fn epoch_file_io(&self, fd: u32, write: bool) -> bool {
-        self.descriptor(fd).is_ok_and(|d| {
-            Self::ordinary_file(&d.open.borrow(), write).is_some_and(|node| {
-                matches!(&node.borrow().content, Content::File(data) if data.epoch_io_safe())
-            })
-        })
+        matches!(self.epoch_io(fd, write), Some(EpochIo::File))
+    }
+    /// One retained-description lookup for service admission; no path cloning
+    /// or second stream/file table walk in the coordinator's common I/O path.
+    pub fn epoch_io(&self, fd: u32, write: bool) -> Option<EpochIo> {
+        let o = self.descriptor(fd).ok()?.open.borrow();
+        if Self::ordinary_stream(&o) {
+            return Some(EpochIo::Stream);
+        }
+        let node = Self::ordinary_file(&o, write)?;
+        let ready =
+            matches!(&node.borrow().content, Content::File(data) if data.epoch_io_safe(write));
+        ready.then_some(EpochIo::File)
     }
     pub fn share_context_from(&mut self, other: &Self) {
         self.cwd_node.clone_from(&other.cwd_node);
@@ -1739,7 +1804,11 @@ impl Vfs {
         if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | 0x101000) != 0 {
             return Err(Errno(22));
         }
-        o.flags = (o.flags & !CHANGEABLE) | (flags & CHANGEABLE);
+        let value = (o.flags & !CHANGEABLE) | (flags & CHANGEABLE);
+        if value != o.flags {
+            o.flags = value;
+            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
     pub fn pipe(&mut self, flags: u32) -> Result<[u32; 2]> {
@@ -2767,6 +2836,43 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+    #[test]
+    fn immutable_fd_flags_refresh_after_shared_status_and_independent_cloexec_changes() {
+        let mut parent = Vfs::default();
+        parent.import_file(b"/file", Vec::new()).unwrap();
+        let fd = parent
+            .open_at(AT_FDCWD, b"/file", 2 | O_CLOEXEC, 0)
+            .unwrap();
+        let mut child = parent.clone();
+        let old = parent.fd_flags_snapshot();
+        assert_eq!(query_fd_flags(old.get(fd).unwrap(), 1), Ok(1));
+        child.set_status_flags(fd, 2 | O_NONBLOCK).unwrap();
+        assert_eq!(
+            query_fd_flags(parent.fd_flags_snapshot().get(fd).unwrap(), 3),
+            Ok((2 | O_NONBLOCK) as u64)
+        );
+        assert_eq!(query_fd_flags(old.get(fd).unwrap(), 3), Ok(2));
+        child.set_cloexec(fd, false).unwrap();
+        assert_eq!(
+            query_fd_flags(child.fd_flags_snapshot().get(fd).unwrap(), 1),
+            Ok(0)
+        );
+        assert_eq!(
+            query_fd_flags(parent.fd_flags_snapshot().get(fd).unwrap(), 1),
+            Ok(1)
+        );
+        let duplicate = parent.dup(fd, 20, false).unwrap();
+        assert_eq!(child.fd_flags_snapshot().get(duplicate), Err(Errno(9)));
+        child.share_descriptors_from(&parent);
+        assert_eq!(
+            child.fd_flags_snapshot().get(duplicate),
+            parent.fd_flags_snapshot().get(duplicate)
+        );
+        parent.close_exec();
+        assert_eq!(parent.fd_flags_snapshot().get(fd), Err(Errno(9)));
+        assert!(parent.fd_flags_snapshot().get(duplicate).is_ok());
+        assert_eq!(parent.fd_flags_snapshot().get(u32::MAX), Err(Errno(9)));
+    }
     #[test]
     fn stream_admission_follows_shared_fd_edits_and_independent_forks() {
         let mut parent = Vfs::default();
