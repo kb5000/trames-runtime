@@ -26,6 +26,11 @@ pub struct Linux {
 }
 
 impl Linux {
+    /// Scalar CLONE_VM allocation context; the bytes/page tables are already
+    /// shared by Memory. Used only at joined syscall boundaries.
+    pub fn heap_context(&self) -> (u64, u64, u64) {
+        (self.brk_base, self.brk, self.mmap_next)
+    }
     pub fn share_heap_from(&mut self, other: &Self) {
         self.brk_base = other.brk_base;
         self.brk = other.brk;

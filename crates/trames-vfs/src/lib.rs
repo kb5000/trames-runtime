@@ -3,6 +3,8 @@
 mod bpf;
 pub mod capabilities;
 mod cgroup;
+mod clone_resources;
+pub use clone_resources::CloneResources;
 mod credentials;
 mod directory;
 mod disk_io;

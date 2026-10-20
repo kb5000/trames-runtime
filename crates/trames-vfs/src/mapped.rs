@@ -154,6 +154,9 @@ impl MappedData {
             if !page.bytes.borrow().is_shared() {
                 if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
                     *page.bytes.borrow_mut() = PageStorage::Shared(map);
+                    // Snapshot versions cover physical identity, including
+                    // untouched pages upgraded when an inode gains SHM storage.
+                    page.version.set(page.version.get().wrapping_add(1));
                 }
             }
         }
@@ -383,6 +386,9 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn parallel_versioned(&self) -> bool {
+        true
+    }
     fn cpu_borrow_safe(&self) -> bool {
         // CPU and native-span methods inspect resident file bytes/metadata
         // only; they cannot re-enter the containing VM. Span callbacks invoke
@@ -613,6 +619,71 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn backing_epochs_rebuild_only_changed_file_pages_and_still_check_eof_and_cow() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let cold = v.open_at(AT_FDCWD, b"/elf-text", 0x42, 0o600).unwrap();
+        let hot = v.memfd_create(b"display-buffer", 0).unwrap();
+        v.truncate_fd(cold, PAGE_SIZE * 256).unwrap();
+        v.truncate_fd(hot, PAGE_SIZE).unwrap();
+        let mut m = Memory::default();
+        mapped(
+            &v,
+            &mut m,
+            cold,
+            0x100000,
+            PAGE_SIZE * 256,
+            false,
+            Permissions::RX,
+        );
+        mapped(
+            &v,
+            &mut m,
+            cold,
+            0x400000,
+            PAGE_SIZE,
+            false,
+            Permissions::RW,
+        );
+        mapped(&v, &mut m, hot, 0x500000, PAGE_SIZE, true, Permissions::RW);
+        m.write_array(0x400000, [88]).unwrap();
+        let mut registry = Registry::default();
+        let view = m.parallel_view(&mut registry).unwrap();
+        let code = view.instruction_identity();
+        drop(view);
+        for value in 1..=8u8 {
+            v.seek(hot, 0, 0).unwrap();
+            v.write(hot, &[value]).unwrap();
+            let view = m.parallel_view(&mut registry).unwrap();
+            assert_eq!(view.instruction_identity(), code);
+            assert_eq!(view.read_array::<1>(0x500000).unwrap(), [value]);
+            assert_eq!(view.fetch_u32(0x100000).unwrap(), 0);
+            assert_eq!(view.read_array::<1>(0x400000).unwrap(), [88]);
+            drop(view);
+        }
+        assert_eq!(registry.metrics.full_rebuilds, 1);
+        assert_eq!(registry.metrics.incremental_pages, 8);
+        v.seek(cold, 0, 0).unwrap();
+        v.write(cold, &0xd503201fu32.to_le_bytes()).unwrap();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_ne!(view.instruction_identity(), code);
+        assert_eq!(view.fetch_u32(0x100000).unwrap(), 0xd503201f);
+        assert_eq!(view.read_array::<1>(0x400000).unwrap(), [88]);
+        drop(view);
+        v.truncate_fd(cold, 0).unwrap();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.fetch_u32(0x100000), Err(MemoryError::Bus(0x100000)));
+        assert_eq!(
+            view.read_array::<1>(0x400000),
+            Err(MemoryError::Bus(0x400000))
+        );
+        drop(view);
+        v.truncate_fd(cold, PAGE_SIZE * 256).unwrap();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.fetch_u32(0x100000).unwrap(), 0);
+        assert_eq!(view.read_array::<1>(0x400000).unwrap(), [88]);
+    }
     #[test]
     fn workers_share_file_and_memfd_bytes_without_a_publication_copy() {
         use trames_memory::{parallel::Registry, CpuMemory, NativeMemory};

@@ -28,6 +28,13 @@ pub trait PageBacking {
     fn shared_page(&self) -> Option<std::sync::Arc<SharedPage>> {
         None
     }
+    /// Joined snapshot metadata is unchanged when version() and check() match.
+    /// Opt-in providers must version every physical-storage/key replacement as
+    /// well as byte changes; their native-span capabilities must remain stable.
+    /// Unknown/custom providers retain full per-epoch preparation.
+    fn parallel_versioned(&self) -> bool {
+        false
+    }
     /// Publish dirty metadata after workers have joined, without copying bytes.
     /// Called only for a provider that returned shared_page().
     fn publish_write(&self, _offset: usize, _len: usize) -> Result<(), MemoryError> {

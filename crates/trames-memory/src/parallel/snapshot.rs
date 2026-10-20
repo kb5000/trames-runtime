@@ -62,13 +62,44 @@ impl Memory {
         }
         if cache.source_backing_revision != backing_revision {
             registry.metrics.backing_invalidations += 1;
-            // Global backing epochs must not force walks of anonymous pages.
-            // Every actual file-backed page still checks its own version/EOF.
-            changed.extend(snapshot.backed_pages.iter().copied());
+            // An unrelated file/SHM write must not remove/reinsert every ELF
+            // page or remap its MMU group. Versioned providers still check EOF;
+            // mapping/coordinator dirty edits are already in `changed` above.
+            for &base in &snapshot.backed_pages {
+                if changed.contains(&base) {
+                    continue;
+                }
+                let frame = &snapshot.frames[snapshot.pages[&base]];
+                let page = self.frames[frame.root_frame]
+                    .as_ref()
+                    .expect("backed frame");
+                let backing = page.backing.as_ref().expect("indexed backing");
+                if !backing.object.parallel_versioned()
+                    || frame.backing_version.load(Ordering::Relaxed) != backing.object.version()
+                    || frame.error != page.check_backing(base).err()
+                {
+                    changed.insert(base);
+                }
+            }
         }
         registry.metrics.code_invalidations +=
             u64::from(snapshot.code_revision != self.code_revision);
         registry.metrics.incremental_pages += changed.len() as u64;
+        // instruction_identity uses this token, not source_backing_revision.
+        // Data-only file/SHM writes must not discard every CPU's decoded ELF
+        // code. Unknown providers still enter `changed`; executable removals,
+        // replacements, version/EOF changes retain conservative invalidation.
+        let executable_changed = changed.iter().any(|base| {
+            snapshot
+                .pages
+                .get(base)
+                .is_some_and(|&i| snapshot.frames[i].permissions.execute)
+                || self.pages.get(base).is_some_and(|&i| {
+                    self.frames[i]
+                        .as_ref()
+                        .is_some_and(|p| p.permissions.execute)
+                })
+        });
         snapshot.positions.resize(self.frames.len(), None);
         if snapshot.dirty_pages.len() < self.frames.len().div_ceil(64) {
             // All worker writes have been committed. A new bitmap changes no
@@ -118,7 +149,9 @@ impl Memory {
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
         snapshot.identity = self.identity;
         snapshot.code_revision = self.code_revision;
-        snapshot.backing_revision = backing_revision;
+        if executable_changed {
+            snapshot.backing_revision = backing_revision;
+        }
         if self.parallel_reservations_dirty {
             snapshot.reservations = self.reservations.clone();
             self.parallel_reservations_dirty = false;
@@ -137,6 +170,58 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unversioned_provider_storage_replacement_keeps_the_conservative_refresh() {
+        struct Backing(RefCell<Arc<SharedPage>>);
+        impl PageBacking for Backing {
+            fn parallel_key(&self) -> Option<(u64, u64)> {
+                Some((987654, 0))
+            }
+            fn shared_page(&self) -> Option<Arc<SharedPage>> {
+                Some(self.0.borrow().clone())
+            }
+            fn check(&self, _: u64) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+                self.0
+                    .borrow()
+                    .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
+                Ok(())
+            }
+            fn write(&self, _: usize, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!()
+            }
+            fn sync(&self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn version(&self) -> u64 {
+                0
+            }
+            fn writable(&self) -> bool {
+                false
+            }
+            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+                unreachable!()
+            }
+        }
+        let backing = Rc::new(Backing(RefCell::new(Arc::new(SharedPage::new(
+            [1; PAGE_SIZE as usize],
+        )))));
+        let mut m = Memory::default();
+        m.map_backed(0x1000, vec![backing.clone()], true, Permissions::R, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(0x1000).unwrap(), [1]);
+        drop(view);
+        *backing.0.borrow_mut() = Arc::new(SharedPage::new([2; PAGE_SIZE as usize]));
+        backing_changed();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(0x1000).unwrap(), [2]);
+        assert_eq!(registry.metrics.incremental_pages, 1);
+    }
 
     #[test]
     fn committed_worker_code_writes_refresh_their_frame_metadata() {
