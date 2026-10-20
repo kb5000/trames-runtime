@@ -620,6 +620,37 @@ mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
     #[test]
+    fn serial_private_file_atomics_detach_without_modifying_file_or_peer() {
+        use trames_memory::CpuMemory;
+        for exclusive in [false, true] {
+            let mut v = Vfs::default();
+            let fd = v.memfd_create(b"private-atomic", 0).unwrap();
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            let mut memory = Memory::default();
+            for base in [0x40000, 0x50000] {
+                mapped(&v, &mut memory, fd, base, PAGE_SIZE, false, Permissions::RW);
+            }
+            if exclusive {
+                let mut old = [0; 8];
+                let token = memory.exclusive_read(0x40000, &mut old).unwrap();
+                assert!(memory
+                    .exclusive_write(0x40000, &[7; 8], Some(token))
+                    .unwrap());
+            } else {
+                memory
+                    .atomic_update(0x40000, 8, |b| {
+                        b.fill(7);
+                        ((), true)
+                    })
+                    .unwrap();
+            }
+            assert_eq!(memory.read_array::<8>(0x40000), Ok([7; 8]));
+            assert_eq!(memory.read_array::<8>(0x50000), Ok([0; 8]));
+            v.seek(fd, 0, 0).unwrap();
+            assert_eq!(v.read(fd, 8).unwrap(), [0; 8]);
+        }
+    }
+    #[test]
     fn backing_epochs_rebuild_only_changed_file_pages_and_still_check_eof_and_cow() {
         use trames_memory::{parallel::Registry, CpuMemory};
         let mut v = Vfs::default();

@@ -141,7 +141,7 @@ impl CpuMemory for Memory {
         }
         self.prepare_mmu_write(a, n)?;
         let page = self.page_for_access(a, n, Access::Write)?;
-        if let Some(storage) = page.shared_storage() {
+        if let Some(storage) = page.shared_write_storage() {
             let offset = (a % crate::PAGE_SIZE) as usize;
             let backing = page
                 .backing
@@ -183,7 +183,7 @@ impl CpuMemory for Memory {
         if page
             .backing
             .as_ref()
-            .is_none_or(|b| !b.shared && b.private_copy)
+            .is_none_or(|b| !b.shared && (b.private_copy || page.permissions.write))
             && (page.bytes.shared().is_none() || std::rc::Rc::strong_count(&page.bytes) > 1)
         {
             // Give serial LL/SC the same 16-byte reservation domain as workers.
@@ -193,6 +193,9 @@ impl CpuMemory for Memory {
             let base = a & !(crate::PAGE_SIZE - 1);
             let frame = self.frame(base).expect("checked exclusive page");
             let page = self.frames[frame].as_mut().unwrap();
+            // Private file reads may borrow the page cache; an exclusive store
+            // must instead reserve private COW bytes, never the file's bytes.
+            page.detach_private()?;
             let old = std::mem::replace(
                 &mut page.bytes,
                 std::rc::Rc::new(crate::mmu::PageBytes::Zero),
@@ -245,7 +248,7 @@ impl CpuMemory for Memory {
         self.check(a, b.len(), Access::Write)?;
         self.prepare_mmu_write(a, b.len())?;
         let page = self.page_for_access(a, b.len(), Access::Write)?;
-        if let Some(storage) = page.shared_storage() {
+        if let Some(storage) = page.shared_write_storage() {
             let offset = (a % crate::PAGE_SIZE) as usize;
             let backing = page
                 .backing

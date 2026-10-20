@@ -102,6 +102,29 @@ impl Page {
         }
         self.bytes.shared().cloned()
     }
+    pub(super) fn shared_write_storage(&self) -> Option<std::sync::Arc<SharedPage>> {
+        if self
+            .backing
+            .as_ref()
+            .is_some_and(|b| !b.shared && !b.private_copy)
+        {
+            return None;
+        }
+        self.shared_storage()
+    }
+    pub(super) fn detach_private(&mut self) -> Result<(), MemoryError> {
+        if let Some(b) = self
+            .backing
+            .as_mut()
+            .filter(|b| !b.shared && !b.private_copy)
+        {
+            let mut page = [0; PAGE_SIZE as usize];
+            b.object.read(0, &mut page)?;
+            self.bytes = Rc::new(PageBytes::new(page));
+            b.private_copy = true;
+        }
+        Ok(())
+    }
     // Fixed-size interpreter callers should compile resident copies to host
     // loads/stores. Live backing and COW checks still run on every access.
     #[inline]
@@ -117,17 +140,10 @@ impl Page {
     }
     #[inline]
     pub(super) fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-        if let Some(b) = &mut self.backing {
-            if b.shared {
-                return b.object.write(offset, bytes);
-            }
-            if !b.private_copy {
-                let mut page = [0; PAGE_SIZE as usize];
-                b.object.read(0, &mut page)?;
-                self.bytes = Rc::new(PageBytes::new(page));
-                b.private_copy = true;
-            }
+        if let Some(b) = self.backing.as_ref().filter(|b| b.shared) {
+            return b.object.write(offset, bytes);
         }
+        self.detach_private()?;
         Rc::make_mut(&mut self.bytes)
             .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
         Ok(())
