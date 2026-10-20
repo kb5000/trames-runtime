@@ -603,6 +603,13 @@ impl Memory {
                                     P,
                                 );
                             }
+                            // One guest mapping edit can relocate every page in
+                            // its host group. Refresh those neighbors too: a
+                            // cached worker frame must not retain their old
+                            // SharedPage after the coordinator replaces it.
+                            if self.parallel_cache.is_some() {
+                                self.parallel_mappings.insert(at + index as u64 * PAGE_SIZE);
+                            }
                             self.frames[frame].as_mut().unwrap().bytes = window.page(offset, false);
                         }
                     }

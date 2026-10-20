@@ -500,3 +500,35 @@ fn native_cow_promotion_invalidates_cached_neighbor_pages() {
     assert_eq!(memory.read_array::<8>(base), Ok([0; 8]));
     assert_eq!(memory.read_array::<8>(base + PAGE_SIZE), Ok([0; 8]));
 }
+
+#[test]
+fn host_group_relocation_refreshes_unchanged_parallel_neighbors() {
+    let mut memory = Memory::default();
+    let granule = 16384.max(host::page_size().unwrap());
+    memory.mmu.granule = granule;
+    let base = 0x40000;
+    memory.map(base, granule as u64, Permissions::RW).unwrap();
+    let mut registry = parallel::Registry::default();
+    let mut retained = memory.parallel_view(&mut registry).unwrap();
+    retained.write_array(base, [11; 8]).unwrap();
+    memory.commit_parallel().unwrap();
+    // A retained view retires the coordinator's old CPU window. Rehoming one
+    // guest page can move its whole 16 KiB host group, including untouched peers.
+    memory.protect(base, PAGE_SIZE, Permissions::RW).unwrap();
+    assert_eq!(retained.read_array::<8>(base), Ok([11; 8]));
+    drop(retained);
+    let mut next = memory.parallel_view(&mut registry).unwrap();
+    for index in 0..granule / PAGE_SIZE as usize {
+        next.write_array(base + index as u64 * PAGE_SIZE, [42 + index as u8; 8])
+            .unwrap();
+    }
+    drop(next);
+    memory.commit_parallel().unwrap();
+    for index in 0..granule / PAGE_SIZE as usize {
+        assert_eq!(
+            memory.read_array::<8>(base + index as u64 * PAGE_SIZE),
+            Ok([42 + index as u8; 8])
+        );
+    }
+    assert!(registry.metrics.incremental_updates > 0);
+}
