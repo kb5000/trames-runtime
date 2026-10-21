@@ -6,7 +6,7 @@ use std::sync::{
     OnceLock,
 };
 
-const MAX_WINDOWS: usize = 2048;
+const MAX_WINDOWS: usize = 32768;
 static WINDOWS: [AtomicUsize; MAX_WINDOWS] = [const { AtomicUsize::new(0) }; MAX_WINDOWS];
 static SEGV_RESET: AtomicBool = AtomicBool::new(false);
 static BUS_RESET: AtomicBool = AtomicBool::new(false);

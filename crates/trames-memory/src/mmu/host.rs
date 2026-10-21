@@ -8,7 +8,11 @@ use std::{
 // Sparse Go heaps/libraries and retained fork slots must not reserve 32MiB
 // for every small live range. Still a power of two and >= any host granule.
 pub(super) const WINDOW: usize = 1024 * 1024;
-const MAX_VIRTUAL_BYTES: usize = 1024 * 1024 * 1024;
+// Physical storage, coordinator views and retained fork/worker CPU aliases all
+// consume this virtual budget. A 4 GiB guest can need many GiB of aliases
+// without duplicating its resident RAM. Keep a bounded VA ceiling without
+// forcing large multi-process workloads onto software memory access.
+const MAX_VIRTUAL_BYTES: usize = 32 * 1024 * 1024 * 1024;
 struct Budget {
     used: AtomicUsize,
     limit: usize,
@@ -248,6 +252,17 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sparse_cpu_aliases_do_not_exhaust_a_one_gib_guest_workload() {
+        // A physical window, its coordinator alias and a retained fork alias
+        // already need 3 GiB of VA for 1 GiB of guest RAM. These inaccessible
+        // CPU reservations allocate no guest storage and must stay eligible
+        // beyond the old combined 1 GiB / 2048-registration limits.
+        let views: Vec<_> = (0..2050)
+            .map(|_| CpuMapping::new().expect("CPU VA capacity"))
+            .collect();
+        assert_eq!(views.len(), 2050);
+    }
     #[test]
     fn physical_and_cpu_reservations_are_separate_bounded_and_released() {
         static BUDGET: Budget = Budget::new(3 * WINDOW);
