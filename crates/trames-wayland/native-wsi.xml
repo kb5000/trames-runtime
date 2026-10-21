@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="trames_native_wsi">
+  <copyright>SPDX-License-Identifier: GPL-3.0-or-later</copyright>
+  <interface name="trames_native_wsi_v1" version="1">
+    <description summary="connection capability for native Vulkan WSI">
+      Internal guest ICD/compositor protocol. Sending an anonymous shared file
+      binds its retained native inode identity to this Wayland connection.
+      A NativeCall carrying a descriptor for that same file can resolve only
+      this connection's protocol objects. Byte contents, guest fd numbers,
+      numeric object IDs alone and host pathnames confer no authority.
+      Transparent relays forward the file with normal SCM_RIGHTS.
+      The grant expires when this object or connection is destroyed.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="authenticate">
+      <description summary="bind a fresh shared file to this connection">
+        Each object accepts one fresh file. Reusing a previously granted inode
+        is a protocol error, including reuse through another connection.
+      </description>
+      <arg name="file" type="fd"/>
+    </request>
+  </interface>
+</protocol>

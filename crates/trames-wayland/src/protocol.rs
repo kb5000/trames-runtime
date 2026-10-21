@@ -27,6 +27,7 @@ impl State {
         crate::text::globals(handle);
         crate::subsurface::globals(handle);
         crate::xwayland::globals(handle, xwayland);
+        crate::wsi::globals(handle);
     }
     pub fn id(&mut self) -> u64 {
         let id = self.next;

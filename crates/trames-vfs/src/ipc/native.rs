@@ -469,15 +469,28 @@ impl Vfs {
     /// Resolve an authenticated Wayland connection from a live guest descriptor.
     pub fn wayland_connection(&self, fd: u32) -> Result<(Server, u64)> {
         self.pump_native_services();
-        let socket = self.local_socket(fd)?.ok_or(Errno(88))?;
         let services = self.native_services.borrow().clone().ok_or(Errno(95))?;
         let services = services.borrow();
-        let token = services
-            .connections
-            .iter()
-            .find(|c| !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow()))
-            .map(|c| c.token)
-            .ok_or(Errno(9))?;
+        let token = if let Some(socket) = self.local_socket(fd)? {
+            services
+                .connections
+                .iter()
+                .find(|c| !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow()))
+                .map(|c| c.token)
+                .ok_or(Errno(9))?
+        } else {
+            // The compositor registered this same retained shared inode from
+            // SCM_RIGHTS on its actual connection. A socket pair, guessed
+            // object ID or a file containing copied bytes cannot mint a grant.
+            let file = self.shared_file(fd)?;
+            services
+                .server
+                .snapshot()
+                .wsi_connections
+                .get(&file.key())
+                .ok_or(Errno(11))?
+                .connection
+        };
         Ok((services.server.clone(), token))
     }
     fn native_file_description(

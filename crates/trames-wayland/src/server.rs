@@ -19,6 +19,9 @@ pub struct Snapshot {
     pub windows: Vec<WindowSnapshot>,
     /// Connection-scoped protocol IDs, never guest pointers or host layer IDs.
     pub surfaces: BTreeMap<(u64, u32), SurfaceInfo>,
+    /// Live shared-inode capabilities delivered through the actual protocol
+    /// connection, including transparent byte/SCM_RIGHTS relays.
+    pub wsi_connections: BTreeMap<(u64, u64), crate::WsiConnection>,
 }
 #[derive(Clone, Debug)]
 pub struct SurfaceInfo {
@@ -265,6 +268,7 @@ fn run(
                 windows: compositor.windows(),
                 text: compositor.state.text_context(),
                 surfaces,
+                wsi_connections: compositor.state.wsi.connections(),
             };
             published = snapshot.revision;
             if let Ok(mut output) = output.lock() {

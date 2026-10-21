@@ -789,6 +789,7 @@ dependencies = [
  "trames-shared",
  "wayland-backend",
  "wayland-protocols",
+ "wayland-scanner",
  "wayland-server",
  "x11rb",
  "xim",

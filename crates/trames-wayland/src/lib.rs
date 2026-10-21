@@ -6,7 +6,9 @@ mod frame;
 mod gpu;
 mod input;
 mod selection;
+mod wsi;
 pub use selection::HostClipboard;
+pub use wsi::WsiConnection;
 mod scene;
 pub use gpu::{GpuBudget, GpuImage, GpuPermit};
 mod text;
@@ -48,6 +50,7 @@ struct State {
     selection: selection::Selection,
     text: text::TextInputs,
     xwayland: xwayland::Xwayland,
+    wsi: wsi::Grants,
     surfaces: std::collections::BTreeMap<u64, scene::Surface>,
 }
 impl Default for State {
@@ -61,6 +64,7 @@ impl Default for State {
             selection: Default::default(),
             text: Default::default(),
             xwayland: Default::default(),
+            wsi: Default::default(),
             surfaces: Default::default(),
         }
     }

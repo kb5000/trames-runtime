@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 trames-shared = { path = "../trames-shared" }
 wayland-server = "=0.31.14"
+wayland-scanner = "=0.31.11"
 wayland-backend = "=0.3.17"
 wayland-protocols = { version = "=0.32.13", features = ["server", "unstable", "staging"] }
 libc = "0.2"
