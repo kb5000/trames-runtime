@@ -573,6 +573,22 @@ impl Memory {
                     && permissions.is_some_and(|p: Permissions| p.read || !p.write)
                 {
                     let permissions = permissions.expect("complete group");
+                    // A worker/retired fork alias is storage, not proof that
+                    // this anonymous page was ever written. Promoting every
+                    // uncharged alias through snapshot()+memcpy materializes
+                    // sparse BSS/heap zeros at mapping and 16KiB regrouping
+                    // boundaries. Quota admission precedes every real store;
+                    // uncharged anonymous bytes are therefore still zeros.
+                    for (index, &frame) in frames.iter().enumerate() {
+                        let page = self.frames[frame].as_mut().expect("mapped page");
+                        if !page.charge.resident() && !page.bytes.is_zero() {
+                            page.bytes = Rc::new(PageBytes::Zero);
+                            if self.parallel_cache.is_some() {
+                                self.parallel_mappings.insert(at + index as u64 * PAGE_SIZE);
+                            }
+                            changed = true;
+                        }
+                    }
                     if frames.iter().enumerate().any(|(index, &frame)| {
                         let page = self.frames[frame].as_ref().expect("mapped page");
                         !page.bytes.is_zero()

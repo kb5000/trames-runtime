@@ -3,6 +3,51 @@ use super::*;
 use std::{os::unix::process::ExitStatusExt, process::Command};
 
 #[test]
+fn forked_untouched_parallel_pages_stay_sparse_when_host_groups_relocate() {
+    let base = 0x40000;
+    let len = 16 * PAGE_SIZE;
+    let mut parent = Memory::default();
+    parent.mmu.granule = 16384;
+    parent.map(base, len, Permissions::RW).unwrap();
+    let mut registry = crate::parallel::Registry::default();
+    drop(parent.parallel_view(&mut registry).unwrap());
+    parent.commit_parallel().unwrap();
+    assert_eq!(parent.resident_bytes(), 0);
+    let mut child = parent.clone();
+    child.mmu.granule = 16384;
+    child.refresh_mapping_mmu(base, len);
+    assert!(
+        child.pages.values().all(|&i| {
+            let page = child.frames[i].as_ref().unwrap();
+            page.bytes.is_zero() && !page.charge.resident()
+        }),
+        "relocating untouched aliases must not copy/materialize zero RAM"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let window = child.mmu.window(base, false).unwrap();
+        let owner = window.mapping.as_ref().unwrap();
+        let mut resident = vec![0u8; WINDOW / host::page_size().unwrap()];
+        // SAFETY: mincore only reports residency for this complete live mapping.
+        assert_eq!(
+            unsafe { libc::mincore(owner.kernel.as_ptr().cast(), WINDOW, resident.as_mut_ptr()) },
+            0
+        );
+        assert!(
+            resident.iter().all(|p| p & 1 == 0),
+            "no physical zero-page copy"
+        );
+    }
+    child.write_array(base + PAGE_SIZE, [42; 8]).unwrap();
+    assert_eq!(child.resident_bytes(), PAGE_SIZE as usize);
+    assert_eq!(parent.read_array::<8>(base + PAGE_SIZE).unwrap(), [0; 8]);
+    assert_eq!(child.read_array::<8>(base).unwrap(), [0; 8]);
+    assert_eq!(child.read_array::<8>(base + PAGE_SIZE).unwrap(), [42; 8]);
+    parent.write_array(base + 2 * PAGE_SIZE, [17; 8]).unwrap();
+    assert_eq!(child.read_array::<8>(base + 2 * PAGE_SIZE).unwrap(), [0; 8]);
+}
+
+#[test]
 fn retired_and_empty_cpu_windows_release_va_without_dropping_fork_bytes() {
     let mut memory = Memory::default();
     let base = 0x40000;
