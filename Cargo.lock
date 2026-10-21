@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "trames-accel"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "serde",
  "sha2",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "trames-bridge"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "trames-cli"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "serde_json",
  "trames-core",
@@ -660,11 +660,11 @@ dependencies = [
 
 [[package]]
 name = "trames-compute"
-version = "1.2.0"
+version = "1.3.0"
 
 [[package]]
 name = "trames-core"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "trames-accel",
  "trames-cpu",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "trames-cpu"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "trames-compute",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "trames-distro"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "flate2",
  "sha2",
@@ -700,14 +700,14 @@ dependencies = [
 
 [[package]]
 name = "trames-elf"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "trames-memory",
 ]
 
 [[package]]
 name = "trames-ffi"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "trames-linux"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "trames-cpu",
@@ -733,18 +733,18 @@ dependencies = [
 
 [[package]]
 name = "trames-memory"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "trames-native"
-version = "1.2.0"
+version = "1.3.0"
 
 [[package]]
 name = "trames-net"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "nix",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "trames-shared"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "libc",
  "rustix",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "trames-vfs"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "trames-bridge",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "trames-vulkan"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "ash",
  "trames-memory",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "trames-wayland"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "libc",
  "trames-shared",
