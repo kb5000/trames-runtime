@@ -8,6 +8,13 @@ use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH, O_NONBLOCK};
 
 type Result<T> = std::result::Result<T, Errno>;
+
+// Keep anonymous PROT_NONE cages/stacks away from the ordinary mmap cursor.
+// Otherwise a large virtual-only reservation scatters subsequent small heap
+// regions, making allocators such as Scudo scan vast empty spans on release.
+// Memory's sparse reservation table finds/reuses holes without committing RAM.
+const RESERVATION_BASE: u64 = 0x4000_0000_0000;
+
 #[derive(Clone)]
 pub struct Linux {
     pub vfs: Vfs,
@@ -542,7 +549,12 @@ impl Linux {
         } else if hinted {
             a[0] & !(PAGE_SIZE - 1)
         } else {
-            memory.find_free(self.mmap_next, len).ok_or(Errno(12))?
+            let start = if reservation {
+                RESERVATION_BASE
+            } else {
+                self.mmap_next
+            };
+            memory.find_free(start, len).ok_or(Errno(12))?
         };
         if flags & 0x100000 != 0 && !memory.is_free(address, len) {
             return Err(Errno(17));
@@ -590,7 +602,7 @@ impl Linux {
         // A successful caller-chosen hint must not move the ordinary search
         // cursor. Scudo deliberately probes randomized high addresses; moving
         // every later allocation there creates enormous sparse region spans.
-        if !fixed && !hinted {
+        if !fixed && !hinted && !reservation {
             self.mmap_next = address + len;
         }
         Ok(address)
@@ -601,7 +613,8 @@ impl Linux {
         if a[3] & !3 != 0 || a[3] & 2 != 0 && a[3] & 1 == 0 {
             return Err(Errno(22));
         }
-        if !memory.is_reserved(a[0], old_len) && new_len > memory.limit() as u64 {
+        let reservation = memory.is_reserved(a[0], old_len);
+        if !reservation && new_len > memory.limit() as u64 {
             return Err(Errno(12));
         }
         let fixed = a[3] & 2 != 0;
@@ -615,14 +628,19 @@ impl Linux {
         {
             a[0]
         } else if a[3] & 1 != 0 {
-            memory.find_free(self.mmap_next, new_len).ok_or(Errno(12))?
+            let start = if reservation {
+                RESERVATION_BASE
+            } else {
+                self.mmap_next
+            };
+            memory.find_free(start, new_len).ok_or(Errno(12))?
         } else {
             return Err(Errno(12));
         };
         memory
             .remap(a[0], old_len, address, new_len, fixed)
             .map_err(Self::memory_errno)?;
-        if address != a[0] {
+        if address != a[0] && !fixed && !reservation {
             self.mmap_next = address + new_len;
         }
         Ok(address)
@@ -1673,6 +1691,36 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
+    fn virtual_reservations_do_not_scatter_ordinary_heap_regions() {
+        let mut linux = Linux::new(0x3000);
+        let mut m = memory();
+        let first = linux
+            .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m)
+            .unwrap();
+        let large = linux
+            .mmap([0, 16 << 30, 0, 0x4022, u64::MAX, 0], &mut m)
+            .unwrap();
+        assert_eq!(m.resident_bytes(), 0);
+        let next = linux
+            .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m)
+            .unwrap();
+        assert_eq!(next, first + PAGE_SIZE);
+        // The reservation remains exclusive and can be committed in place.
+        assert!(!m.is_free(large, 16 << 30));
+        let at = large + (8 << 30);
+        assert_eq!(
+            linux.mmap([at, PAGE_SIZE, 3, 0x32, u64::MAX, 0], &mut m),
+            Ok(at)
+        );
+        m.write(at, b"reserved").unwrap();
+        assert_eq!(m.read_array::<8>(at).unwrap(), *b"reserved");
+        assert_eq!(
+            linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
+            Ok(next + PAGE_SIZE)
+        );
+        assert!(m.is_reserved(at + PAGE_SIZE, PAGE_SIZE));
+    }
+    #[test]
     fn accepted_mmap_hints_do_not_relocate_ordinary_allocations() {
         let mut linux = Linux::new(0x3000);
         let mut m = memory();
@@ -1683,11 +1731,11 @@ mod tests {
             linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
             Ok(0x1000_0000)
         );
-        // A conflicting hint falls back to the ordinary cursor, not the hint.
-        assert_eq!(linux.mmap(args, &mut m), Ok(0x1000_1000));
+        // A conflicting reservation hint searches the virtual-only arena.
+        assert_eq!(linux.mmap(args, &mut m), Ok(high + PAGE_SIZE));
         assert_eq!(
             linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
-            Ok(0x1000_2000)
+            Ok(0x1000_1000)
         );
         assert_eq!(
             linux.mmap([high + PAGE_SIZE, PAGE_SIZE, 0, 0x32, u64::MAX, 0], &mut m),
@@ -1695,7 +1743,36 @@ mod tests {
         );
         assert_eq!(
             linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
-            Ok(0x1000_3000)
+            Ok(0x1000_2000)
+        );
+    }
+    #[test]
+    fn reservation_remaps_and_fixed_moves_preserve_ordinary_cursor() {
+        let mut linux = Linux::new(0x3000);
+        let mut m = memory();
+        let args = [0, PAGE_SIZE, 0, 0x22, u64::MAX, 0];
+        let first = linux.mmap(args, &mut m).unwrap();
+        let second = linux.mmap(args, &mut m).unwrap();
+        let moved = linux
+            .mremap([first, PAGE_SIZE, PAGE_SIZE * 2, 1, 0, 0], &mut m)
+            .unwrap();
+        assert_eq!(moved, second + PAGE_SIZE);
+        assert!(m.is_reserved(moved, PAGE_SIZE * 2));
+        assert!(m.is_free(first, PAGE_SIZE));
+        assert_eq!(linux.mmap(args, &mut m), Ok(first));
+        let heap = linux
+            .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m)
+            .unwrap();
+        m.write(heap, b"remapped").unwrap();
+        let fixed = RESERVATION_BASE + (32 << 30);
+        assert_eq!(
+            linux.mremap([heap, PAGE_SIZE, PAGE_SIZE, 3, fixed, 0], &mut m),
+            Ok(fixed)
+        );
+        assert_eq!(m.read_array::<8>(fixed).unwrap(), *b"remapped");
+        assert_eq!(
+            linux.mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m),
+            Ok(heap + PAGE_SIZE)
         );
     }
     #[test]
