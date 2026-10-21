@@ -140,6 +140,7 @@ pub(crate) struct Subsurface {
 }
 pub(crate) struct CachedCommit {
     pub buffer: Option<Option<Arc<BufferLease>>>,
+    pub damaged: bool,
     pub callbacks: Vec<WlCallback>,
     pub scale: i32,
     pub geometry: Option<(i32, i32, u32, u32)>,
@@ -153,6 +154,7 @@ impl CachedCommit {
             self.buffer = next.buffer;
         }
         self.callbacks.append(&mut next.callbacks);
+        self.damaged |= next.damaged;
         self.scale = next.scale;
         self.transform = next.transform;
         if let Some((x, y)) = next.offset {
@@ -218,6 +220,7 @@ pub(crate) struct Surface {
     pub max_size: (u32, u32),
     pub restore_size: (u32, u32),
     pub pending_buffer: Option<Option<WlBuffer>>,
+    pub pending_damage: bool,
     pub current: Option<ImageBuffer>,
     pub gpu_pending: VecDeque<Arc<dyn crate::GpuImage>>,
     pub gpu_presented: bool,
@@ -247,6 +250,7 @@ impl Surface {
     }
     pub fn take_pending(&mut self) -> CachedCommit {
         CachedCommit {
+            damaged: std::mem::take(&mut self.pending_damage),
             buffer: self
                 .pending_buffer
                 .take()
@@ -286,6 +290,7 @@ impl Surface {
             max_size: (0, 0),
             restore_size: (640, 480),
             pending_buffer: None,
+            pending_damage: false,
             current: None,
             gpu_pending: VecDeque::new(),
             gpu_presented: true,
@@ -320,7 +325,7 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
         out: &mut Vec<SurfaceImage>,
     ) {
         let Some(s) = surfaces.get(&id) else { return };
-        if s.dismissed {
+        if s.dismissed || s.current.is_none() {
             return;
         }
         // Subsurface stacking is relative to the parent and its siblings.

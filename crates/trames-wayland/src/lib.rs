@@ -147,6 +147,13 @@ impl Compositor {
                 index += 1;
                 continue;
             };
+            // An unmapped subtree was absent from the displayed scene. In
+            // particular, a parent's SHM frame cannot acknowledge a child's
+            // first GPU frame before that child has attached any image.
+            if s.dismissed || s.current.is_none() {
+                index += 1;
+                continue;
+            }
             visit.extend_from_slice(&s.children);
             if revision >= s.revision {
                 s.gpu_presented = true;
@@ -201,6 +208,158 @@ impl Compositor {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn parent_presentation_does_not_signal_unmapped_subsurface_callbacks() {
+        fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
+            [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]
+                .into_iter()
+                .chain(words.iter().copied())
+                .flat_map(u32::to_ne_bytes)
+                .collect()
+        }
+        fn replies(client: &mut UnixStream) -> Vec<u32> {
+            let mut bytes = [0; 4096];
+            let n = match client.read(&mut bytes) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                Err(e) => panic!("callback read: {e}"),
+            };
+            let mut callbacks = Vec::new();
+            let mut cursor = 0;
+            while cursor < n {
+                let id = u32::from_ne_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                let header = u32::from_ne_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                if (9..15).contains(&id) && header & 0xffff == 0 {
+                    callbacks.push(id);
+                }
+                cursor += (header >> 16) as usize;
+            }
+            callbacks.sort();
+            callbacks
+        }
+        struct Image;
+        // SAFETY: this protocol-only image owns no native resource or pointer.
+        unsafe impl GpuImage for Image {
+            fn dimensions(&self) -> (u32, u32) {
+                (16, 16)
+            }
+            fn metal_texture(&self) -> usize {
+                0
+            }
+            fn ready(&self) -> io::Result<bool> {
+                Ok(true)
+            }
+        }
+        let mut compositor = Compositor::new().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        compositor
+            .connect(
+                server,
+                ClientIdentity {
+                    connection: 42,
+                    pid: 7,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .unwrap();
+        client.write_all(&message(1, 1, &[2])).unwrap();
+        compositor.dispatch().unwrap();
+        replies(&mut client);
+        let mut bind = vec![1, 14]; // the advertised core compositor global
+        bind.extend(
+            b"wl_compositor\0\0\0"
+                .chunks_exact(4)
+                .map(|s| u32::from_ne_bytes(s.try_into().unwrap())),
+        );
+        bind.extend([4, 3]);
+        client.write_all(&message(2, 0, &bind)).unwrap();
+        for id in 4..9 {
+            client.write_all(&message(3, 0, &[id])).unwrap();
+        }
+        for id in 4..9 {
+            client.write_all(&message(id, 3, &[id + 5])).unwrap();
+            client.write_all(&message(id, 6, &[])).unwrap();
+        }
+        for _ in 0..20 {
+            compositor.dispatch().unwrap();
+        }
+        let ids: Vec<_> = (4..9)
+            .map(|id| {
+                *compositor
+                    .state
+                    .surfaces
+                    .iter()
+                    .find(|(_, s)| s.resource.id().protocol_id() == id)
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let [root, empty, nested, visible, dismissed]: [u64; 5] = ids.try_into().unwrap();
+        for id in [root, nested, visible, dismissed] {
+            compositor.state.surfaces.get_mut(&id).unwrap().current =
+                Some(ImageBuffer::Gpu(Arc::new(Image)));
+        }
+        compositor.state.surfaces.get_mut(&root).unwrap().x11 = Some(((1, 0, 0), 1));
+        compositor.state.surfaces.get_mut(&root).unwrap().children =
+            vec![empty, visible, dismissed];
+        compositor.state.surfaces.get_mut(&empty).unwrap().children = vec![nested];
+        for (id, parent) in [
+            (empty, root),
+            (nested, empty),
+            (visible, root),
+            (dismissed, root),
+        ] {
+            compositor.state.surfaces.get_mut(&id).unwrap().parent = Some((parent, 0, 0));
+        }
+        compositor
+            .state
+            .surfaces
+            .get_mut(&dismissed)
+            .unwrap()
+            .dismissed = true;
+        // A displayed parent is not evidence that a bufferless child, or its
+        // descendants, was displayed. Firefox uses this distinction to stop
+        // its initial-frame fallback timer only after the first real buffer.
+        compositor.presented(root, compositor.state.revision, 1000);
+        compositor.dispatch().unwrap();
+        assert_eq!(replies(&mut client), vec![9, 12]);
+        assert_eq!(
+            compositor.windows()[0]
+                .scene
+                .iter()
+                .map(|i| i.surface)
+                .collect::<Vec<_>>(),
+            vec![root, visible]
+        );
+
+        compositor.state.surfaces.get_mut(&empty).unwrap().current =
+            Some(ImageBuffer::Gpu(Arc::new(Image)));
+        compositor.presented(root, compositor.state.revision, 1020);
+        compositor.dispatch().unwrap();
+        assert_eq!(replies(&mut client), vec![10, 11]);
+
+        let revision = compositor.state.revision;
+        client.write_all(&message(4, 3, &[14])).unwrap();
+        client.write_all(&message(4, 6, &[])).unwrap();
+        for _ in 0..4 {
+            compositor.dispatch().unwrap();
+        }
+        assert_eq!(compositor.state.revision, revision);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        compositor.dispatch().unwrap();
+        assert_eq!(replies(&mut client), vec![14]);
+        // A client may update the same buffer in place: explicit damage still
+        // publishes new content even without another attach request.
+        client.write_all(&message(4, 2, &[0, 0, 16, 16])).unwrap();
+        client.write_all(&message(4, 6, &[])).unwrap();
+        for _ in 0..4 {
+            compositor.dispatch().unwrap();
+        }
+        assert!(compositor.state.revision > revision);
+    }
     #[test]
     fn disconnected_clients_cancel_unconsumed_shared_fd_transfers() {
         let server = Server::new().unwrap();

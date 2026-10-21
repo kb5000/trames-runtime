@@ -72,6 +72,13 @@ impl State {
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
         };
+        let changed = pending.buffer.is_some()
+            || pending.damaged
+            || pending.scale != s.scale
+            || pending.transform != s.transform
+            || pending.input.is_some()
+            || pending.offset.is_some()
+            || pending.geometry.is_some();
         if let Some(attachment) = pending.buffer {
             if attachment.is_some() && s.xdg.is_some() && !s.acknowledged {
                 if let Some(xdg) = &s.xdg {
@@ -110,8 +117,13 @@ impl State {
                 .map(|(_, _, w, h)| (w, h))
                 .unwrap_or((w / s.scale as u32, h / s.scale as u32));
         }
-        self.revision = self.revision.wrapping_add(1);
-        s.revision = self.revision;
+        // A frame callback requests scheduling, not new image content. Reuse
+        // the displayed content revision so the existing pacer can deliver it
+        // on its timer without republishing/repainting an unchanged scene.
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+            s.revision = self.revision;
+        }
         if !pending.callbacks.is_empty() {
             s.callbacks.push_back((s.revision, pending.callbacks));
         }
@@ -229,6 +241,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
             | wl_surface::Request::DamageBuffer { width, height, .. } => {
                 if width < 0 || height < 0 {
                     r.post_error(2u32, "negative damage extent");
+                } else if width != 0 && height != 0 {
+                    s.pending_damage = true;
                 }
             }
             wl_surface::Request::Frame { callback } => {
