@@ -158,7 +158,8 @@ impl Compositor {
             if revision >= s.revision {
                 s.gpu_presented = true;
             }
-            s.callback_pacer.presented(revision, milliseconds, now);
+            s.callback_pacer
+                .presented(revision.min(s.revision), milliseconds, now);
             index += 1;
         }
     }
@@ -348,7 +349,13 @@ mod tests {
             compositor.dispatch().unwrap();
         }
         assert_eq!(compositor.state.revision, revision);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(replies(&mut client).is_empty());
+        compositor
+            .state
+            .surfaces
+            .get_mut(&root)
+            .unwrap()
+            .flush_callbacks(std::time::Instant::now() + std::time::Duration::from_secs(1));
         compositor.dispatch().unwrap();
         assert_eq!(replies(&mut client), vec![14]);
         // A client may update the same buffer in place: explicit damage still
