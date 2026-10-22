@@ -51,7 +51,7 @@ impl Vfs {
         };
         let base = match whence {
             0 => 0,
-            1 => o.position,
+            1 => o.current_position(),
             2 => data.len(),
             _ => return Err(Errno(22)),
         };

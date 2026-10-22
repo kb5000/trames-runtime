@@ -239,6 +239,7 @@ impl Vfs {
                     kind: FdKind::Socket,
                     flags: 2 | (flags & O_NONBLOCK),
                     position: 0,
+                    file_position: Arc::default(),
                     node: None,
                     pipe: None,
                     socket: Some(socket),

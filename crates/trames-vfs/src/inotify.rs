@@ -30,6 +30,23 @@ pub(super) struct Link {
     name: RefCell<Vec<u8>>,
     linked: Cell<bool>,
 }
+pub(super) fn observed(node: &Rc<RefCell<Node>>, link: Option<&Rc<Link>>) -> bool {
+    let n = node.borrow();
+    if !n.notifications.watchers.is_empty() {
+        return true;
+    }
+    let watched_parent = |link: &Rc<Link>| {
+        link.parent
+            .borrow()
+            .upgrade()
+            .is_some_and(|parent| !parent.borrow().notifications.watchers.is_empty())
+    };
+    if let Some(link) = link {
+        watched_parent(link)
+    } else {
+        n.notifications.links.iter().any(watched_parent)
+    }
+}
 pub(super) struct Close {
     node: Weak<RefCell<Node>>,
     pub(super) link: Option<Rc<Link>>,

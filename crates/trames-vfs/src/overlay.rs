@@ -181,7 +181,7 @@ impl Overlay {
             let mut copy = if let Some(disk) = &fs.disk {
                 disk.create(n.inode)?
             } else {
-                storage::FileData::Memory(Vec::new())
+                storage::FileData::memory(Vec::new())
             };
             drop(fs);
             let mut offset = 0;

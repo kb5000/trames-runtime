@@ -101,7 +101,7 @@ impl Cgroups {
             content: if directory {
                 Content::Directory
             } else {
-                Content::File(storage::FileData::Memory(Vec::new()))
+                Content::File(storage::FileData::memory(Vec::new()))
             },
             mode: mode | if directory { 0o40000 } else { 0o100000 },
             uid: 0,

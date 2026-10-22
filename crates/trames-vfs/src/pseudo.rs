@@ -608,7 +608,7 @@ impl Device {
     }
 }
 fn file(data: impl Into<Vec<u8>>) -> Content {
-    Content::File(storage::FileData::Memory(data.into()))
+    Content::File(storage::FileData::memory(data.into()))
 }
 fn nul_list(values: &[Vec<u8>]) -> Vec<u8> {
     values
@@ -753,7 +753,7 @@ impl Vfs {
                     },
                     fd,
                     target,
-                    position: o.position,
+                    position: o.current_position(),
                     flags: o.flags | if d.cloexec { O_CLOEXEC } else { 0 },
                     inode,
                     mount_id: o.mount.as_ref().map_or(
@@ -845,6 +845,7 @@ impl Vfs {
             kind: FdKind::Node(label),
             flags: 0,
             position: 0,
+            file_position: Arc::default(),
             node: Some(node),
             pipe: None,
             socket: None,
@@ -1086,6 +1087,7 @@ impl Vfs {
             },
             flags: flags & !O_CLOEXEC,
             position: 0,
+            file_position: Arc::default(),
             node: original.node.clone(),
             pipe,
             socket: None,

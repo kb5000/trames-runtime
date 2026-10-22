@@ -9,28 +9,30 @@ use std::os::unix::fs::FileExt;
 /// unlinked object nor keep a store locked after its last guest/job reference.
 #[derive(Default)]
 pub struct DiskReadCache {
-    entries: Vec<(std::sync::Weak<storage::DiskBacking>, File)>,
+    entries: Vec<(std::sync::Weak<storage::DiskBacking>, bool, File)>,
 }
 impl DiskReadCache {
-    fn file(&mut self, backing: &Arc<storage::DiskBacking>) -> Result<&File> {
+    pub(super) fn file(
+        &mut self,
+        backing: &Arc<storage::DiskBacking>,
+        write: bool,
+    ) -> Result<&File> {
         // Do not leave dead/orphan handles behind a frequently hit live entry.
-        self.entries.retain(|(key, _)| key.strong_count() != 0);
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(key, _)| key.as_ptr() == Arc::as_ptr(backing))
-        {
+        self.entries.retain(|(key, _, _)| key.strong_count() != 0);
+        if let Some(index) = self.entries.iter().position(|(key, writable, _)| {
+            key.as_ptr() == Arc::as_ptr(backing) && (!write || *writable)
+        }) {
             // The retained Weak prevents address reuse while an entry exists.
             let entry = self.entries.remove(index);
             self.entries.push(entry);
         } else {
-            let file = backing.open(false)?;
+            let file = backing.open(write)?;
             if self.entries.len() == 16 {
                 self.entries.remove(0);
             }
-            self.entries.push((Arc::downgrade(backing), file));
+            self.entries.push((Arc::downgrade(backing), write, file));
         }
-        Ok(&self.entries.last().expect("opened disk handle").1)
+        Ok(&self.entries.last().expect("opened disk handle").2)
     }
 }
 
@@ -40,6 +42,8 @@ pub struct DiskRead {
     node: Rc<RefCell<Node>>,
     backing: Arc<storage::DiskBacking>,
     positioned: bool,
+    position: Arc<std::sync::Mutex<file_data::FilePosition>>,
+    _lease: Option<file_data::ReadLease>,
     count: usize,
 }
 /// Contains no guest memory, VFS Rc, descriptor table, or borrowed page.
@@ -55,7 +59,7 @@ impl DiskReadJob {
     pub fn run_cached(self, cache: &mut DiskReadCache, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
         // Revalidate guest admission each time; only the private object handle
         // is cached. First open keeps regular/O_NOFOLLOW/metadata confinement.
-        let file = cache.file(&self.backing)?;
+        let file = cache.file(&self.backing, false)?;
         bytes.resize(self.count, 0);
         #[cfg(unix)]
         let count = file
@@ -73,6 +77,13 @@ impl DiskReadJob {
         Ok(bytes)
     }
 }
+impl Drop for DiskRead {
+    fn drop(&mut self) {
+        if !self.positioned {
+            self.position.lock().unwrap().pending -= 1;
+        }
+    }
+}
 impl DiskRead {
     /// While this read is outstanding, offset-changing operations on the same
     /// OFD and writes/sync on the same backing must wait. Positioned reads on
@@ -81,7 +92,7 @@ impl DiskRead {
         let Ok(d) = vfs.descriptor(fd) else {
             return false;
         };
-        if Rc::ptr_eq(&self.open, &d.open) && matches!(number, 62..=66) {
+        if !self.positioned && Rc::ptr_eq(&self.open, &d.open) && matches!(number, 62..=66) {
             return true;
         }
         if !matches!(number, 64 | 66 | 68 | 70 | 82 | 83) {
@@ -95,10 +106,10 @@ impl DiskRead {
                 if data.disk_source().is_some_and(|(b,_)| Arc::ptr_eq(&b, &self.backing)))
     }
     pub fn finish(self, result: Result<Vec<u8>>) -> Result<Vec<u8>> {
-        let mut o = self.open.borrow_mut();
+        let o = self.open.borrow();
         if !self.positioned {
             if let Ok(bytes) = &result {
-                o.position += bytes.len() as u64;
+                self.position.lock().unwrap().value += bytes.len() as u64;
             }
         }
         Vfs::complete_file_read(&o, &self.node, &result, self.count != 0);
@@ -142,7 +153,8 @@ impl Vfs {
         if o.flags & O_PATH != 0 || o.flags & 3 == 1 {
             return Err(Errno(9));
         }
-        let position = offset.unwrap_or(o.position);
+        let mut file_position = o.file_position.lock().unwrap();
+        let position = offset.unwrap_or(file_position.value);
         let size = count
             .min(storage::MAX_TRANSFER)
             .min(usize::try_from(length.saturating_sub(position)).unwrap_or(usize::MAX));
@@ -155,7 +167,17 @@ impl Vfs {
             offset: position,
             count: size,
         };
+        if offset.is_none() {
+            file_position.pending += 1;
+        }
+        let lease = if let Content::File(storage::FileData::Plain(data)) = &n.content {
+            Some(data.register_read())
+        } else {
+            None
+        };
         let read = DiskRead {
+            position: o.file_position.clone(),
+            _lease: lease,
             open: descriptor.open.clone(),
             node: node.clone(),
             backing,

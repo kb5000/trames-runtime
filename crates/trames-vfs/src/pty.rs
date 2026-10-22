@@ -255,6 +255,7 @@ impl Vfs {
                     kind: FdKind::Terminal,
                     flags: flags & !O_CLOEXEC,
                     position: 0,
+                    file_position: Arc::default(),
                     node: Some(node),
                     pipe: None,
                     socket: None,

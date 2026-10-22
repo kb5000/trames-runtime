@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! In-process event descriptors. No guest descriptor is a host descriptor.
 use super::*;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
@@ -9,37 +10,48 @@ pub(super) enum Anonymous {
     Signal {
         mask: u64,
     },
-    Event {
-        count: u64,
-        semaphore: bool,
-        epoch: [u64; 2],
-    },
-    Timer {
-        clock: u32,
-        deadline: Option<Instant>,
-        interval: Duration,
-        pending: u64,
-    },
+    Event(Arc<direct_io::EventCounter>),
+    Timer(Arc<TimerFd>),
     Epoll {
         watches: BTreeMap<(u32, u64), Watch>,
-        cursor: Option<(u32, u64)>,
+        cursor: Arc<Mutex<Option<(u32, u64)>>>,
     },
 }
 
 pub(super) struct Watch {
-    open: Weak<RefCell<OpenDescription>>,
-    events: u32,
-    data: u64,
-    armed: bool,
-    last_ready: Cell<u16>,
-    last_epoch: Cell<[u64; 2]>,
+    pub(super) open: Weak<RefCell<OpenDescription>>,
+    pub(super) state: Arc<Mutex<WatchState>>,
 }
-impl Watch {
-    fn ready(&self, ready: u16, epoch: [u64; 2]) -> bool {
+pub(super) struct WatchState {
+    pub events: u32,
+    pub data: u64,
+    pub armed: bool,
+    last_ready: u16,
+    last_epoch: [u64; 2],
+}
+impl WatchState {
+    pub fn ready(&self, ready: u16, epoch: [u64; 2]) -> bool {
         self.events & 0x80000000 == 0
-            || ready & !self.last_ready.get() != 0
-            || ready & 3 != 0 && epoch[0] != self.last_epoch.get()[0]
-            || ready & 4 != 0 && epoch[1] != self.last_epoch.get()[1]
+            || ready & !self.last_ready != 0
+            || ready & 3 != 0 && epoch[0] != self.last_epoch[0]
+            || ready & 4 != 0 && epoch[1] != self.last_epoch[1]
+    }
+    pub fn observe(&mut self, ready: u16, epoch: [u64; 2]) -> Option<(u32, u64)> {
+        if !self.armed {
+            return None;
+        }
+        let deliver = ready != 0 && self.ready(ready, epoch);
+        if deliver || ready == 0 {
+            self.last_ready = ready;
+            self.last_epoch = epoch;
+        }
+        if !deliver {
+            return None;
+        }
+        if self.events & 0x40000000 != 0 {
+            self.armed = false;
+        }
+        Some((ready as u32, self.data))
     }
 }
 impl Anonymous {
@@ -48,39 +60,9 @@ impl Anonymous {
             Self::Bpf(_) => b"anon_inode:bpf-prog",
             Self::Inotify(_) => b"anon_inode:inotify",
             Self::Signal { .. } => b"anon_inode:[signalfd]",
-            Self::Event { .. } => b"anon_inode:[eventfd]",
-            Self::Timer { .. } => b"anon_inode:[timerfd]",
+            Self::Event(_) => b"anon_inode:[eventfd]",
+            Self::Timer(_) => b"anon_inode:[timerfd]",
             Self::Epoll { .. } => b"anon_inode:[eventpoll]",
-        }
-    }
-    fn tick(&mut self) {
-        if let Self::Timer {
-            deadline,
-            interval,
-            pending,
-            ..
-        } = self
-        {
-            let now = Instant::now();
-            if let Some(d) = deadline.filter(|d| *d <= now) {
-                let elapsed = now.saturating_duration_since(d);
-                let extra = if interval.is_zero() {
-                    0
-                } else {
-                    elapsed.as_nanos() / interval.as_nanos()
-                };
-                *pending =
-                    pending.saturating_add(extra.saturating_add(1).min(u64::MAX as u128) as u64);
-                *deadline = if interval.is_zero() {
-                    None
-                } else {
-                    let left = interval.as_nanos() - elapsed.as_nanos() % interval.as_nanos();
-                    now.checked_add(Duration::new(
-                        (left / 1_000_000_000) as u64,
-                        (left % 1_000_000_000) as u32,
-                    ))
-                };
-            }
         }
     }
     pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
@@ -100,26 +82,16 @@ impl Anonymous {
                     0
                 }
             }
-            Self::Event { count, .. } => {
-                (if *count > 0 { events & 1 } else { 0 })
-                    | (if *count < u64::MAX - 1 { events & 4 } else { 0 })
-            }
-            Self::Timer {
-                pending, deadline, ..
-            } => {
-                if *pending != 0 || deadline.is_some_and(|d| d <= Instant::now()) {
-                    events & 1
-                } else {
-                    0
-                }
-            }
+            Self::Event(counter) => counter.poll(events),
+            Self::Timer(timer) => timer.poll(events).0,
             Self::Epoll { watches, .. } => {
                 if watches.values().any(|w| {
-                    w.armed
+                    let state = w.state.lock().unwrap();
+                    state.armed
                         && w.open.upgrade().is_some_and(|o| {
                             let o = o.borrow();
-                            let ready = Vfs::poll_open(&o, w.events as u16, pending);
-                            ready != 0 && w.ready(ready, Vfs::poll_epoch(&o))
+                            let ready = Vfs::poll_open(&o, state.events as u16, pending);
+                            ready != 0 && state.ready(ready, Vfs::poll_epoch(&o))
                         })
                 }) {
                     events & 1
@@ -136,50 +108,19 @@ impl Anonymous {
         if count < 8 {
             return Err(Errno(22));
         }
-        self.tick();
-        let value = match self {
-            Self::Event {
-                count,
-                semaphore,
-                epoch,
-            } => {
-                if *count == 0 {
-                    return Err(Errno(11));
-                }
-                let value = if *semaphore { 1 } else { *count };
-                *count -= value;
-                epoch[1] = epoch[1].wrapping_add(1);
-                value
-            }
-            Self::Timer { pending, .. } => {
-                if *pending == 0 {
-                    return Err(Errno(11));
-                }
-                std::mem::take(pending)
-            }
+        match self {
+            Self::Event(counter) => counter.read(count),
+            Self::Timer(timer) => timer.read(count),
             Self::Bpf(_) | Self::Signal { .. } | Self::Epoll { .. } | Self::Inotify(_) => {
-                return Err(Errno(22))
+                Err(Errno(22))
             }
-        };
-        Ok(value.to_le_bytes().to_vec())
+        }
     }
     pub(super) fn write(&mut self, bytes: &[u8]) -> Result<usize> {
-        let Self::Event { count, epoch, .. } = self else {
+        let Self::Event(counter) = self else {
             return Err(Errno(22));
         };
-        if bytes.len() < 8 {
-            return Err(Errno(22));
-        }
-        let value = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
-        if value == u64::MAX {
-            return Err(Errno(22));
-        }
-        *count = count
-            .checked_add(value)
-            .filter(|n| *n < u64::MAX)
-            .ok_or(Errno(11))?;
-        epoch[0] = epoch[0].wrapping_add(1);
-        Ok(8)
+        counter.write(bytes)
     }
 }
 impl Vfs {
@@ -223,6 +164,7 @@ impl Vfs {
                     kind: FdKind::Anonymous,
                     flags: access | (flags & O_NONBLOCK),
                     position: 0,
+                    file_position: Arc::default(),
                     node: None,
                     pipe: None,
                     socket: None,
@@ -248,48 +190,29 @@ impl Vfs {
         }
         self.anonymous(
             flags,
-            Anonymous::Event {
-                count: initial as u64,
-                semaphore: flags & 1 != 0,
-                epoch: [0; 2],
-            },
+            Anonymous::Event(Arc::new(direct_io::EventCounter::new(
+                initial as u64,
+                flags & 1 != 0,
+            ))),
         )
     }
     pub fn timerfd(&mut self, clock: u32, flags: u32) -> Result<u32> {
         if !matches!(clock, 0 | 1 | 7) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
-        self.anonymous(
-            flags,
-            Anonymous::Timer {
-                clock,
-                deadline: None,
-                interval: Duration::ZERO,
-                pending: 0,
-            },
-        )
+        self.anonymous(flags, Anonymous::Timer(TimerFd::new(clock)))
+    }
+    pub fn timerfd_resource(&self, fd: u32) -> Result<Arc<TimerFd>> {
+        match &self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Timer(timer)) => Ok(timer.clone()),
+            _ => Err(Errno(22)),
+        }
     }
     pub fn timerfd_clock(&self, fd: u32) -> Result<u32> {
-        match self.descriptor(fd)?.open.borrow().anonymous {
-            Some(Anonymous::Timer { clock, .. }) => Ok(clock),
-            _ => Err(Errno(22)),
-        }
+        Ok(self.timerfd_resource(fd)?.clock)
     }
     pub fn timerfd_get(&self, fd: u32) -> Result<(Duration, Duration)> {
-        let mut o = self.descriptor(fd)?.open.borrow_mut();
-        let a = o.anonymous.as_mut().ok_or(Errno(22))?;
-        a.tick();
-        match a {
-            Anonymous::Timer {
-                interval, deadline, ..
-            } => Ok((
-                *interval,
-                deadline.map_or(Duration::ZERO, |d| {
-                    d.saturating_duration_since(Instant::now())
-                }),
-            )),
-            _ => Err(Errno(22)),
-        }
+        Ok(self.timerfd_resource(fd)?.update(None))
     }
     pub fn timerfd_set(
         &self,
@@ -297,27 +220,15 @@ impl Vfs {
         interval: Duration,
         deadline: Option<Instant>,
     ) -> Result<()> {
-        let mut o = self.descriptor(fd)?.open.borrow_mut();
-        match o.anonymous.as_mut() {
-            Some(Anonymous::Timer {
-                interval: i,
-                deadline: d,
-                pending,
-                ..
-            }) => {
-                *i = interval;
-                *d = deadline;
-                *pending = 0;
-                Ok(())
-            }
-            _ => Err(Errno(22)),
-        }
+        self.timerfd_resource(fd)?
+            .update(Some((interval, deadline)));
+        Ok(())
     }
     pub fn next_timerfd_deadline(&self) -> Option<Instant> {
         self.fds
             .values()
-            .filter_map(|d| match d.open.borrow().anonymous {
-                Some(Anonymous::Timer { deadline, .. }) => deadline,
+            .filter_map(|d| match &d.open.borrow().anonymous {
+                Some(Anonymous::Timer(timer)) => timer.deadline(),
                 _ => None,
             })
             .min()
@@ -330,7 +241,7 @@ impl Vfs {
             flags,
             Anonymous::Epoll {
                 watches: BTreeMap::new(),
-                cursor: None,
+                cursor: Arc::default(),
             },
         )
     }
@@ -356,7 +267,7 @@ impl Vfs {
             && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
             && !matches!(
                 t.anonymous,
-                Some(Anonymous::Event { .. } | Anonymous::Inotify(_))
+                Some(Anonymous::Event(_) | Anonymous::Timer(_) | Anonymous::Inotify(_))
             )
         {
             return Err(Errno(95));
@@ -370,7 +281,10 @@ impl Vfs {
         let key = (target_number, t.id);
         // The caller's descriptor number distinguishes separate dup registrations.
         drop(t);
-        self.epoll_ctl_key(epoll, target, key, op, events, data)
+        self.epoll_ctl_key(epoll, target, key, op, events, data)?;
+        // Cached worker snapshots include the complete frozen watch set.
+        FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
     fn epoll_ctl_key(
         &self,
@@ -407,11 +321,13 @@ impl Vfs {
                     key,
                     Watch {
                         open: Rc::downgrade(&target),
-                        events,
-                        data,
-                        armed: true,
-                        last_ready: Cell::new(0),
-                        last_epoch: Cell::new([0; 2]),
+                        state: Arc::new(Mutex::new(WatchState {
+                            events,
+                            data,
+                            armed: true,
+                            last_ready: 0,
+                            last_epoch: [0; 2],
+                        })),
                     },
                 );
                 Ok(())
@@ -433,7 +349,7 @@ impl Vfs {
             return epoch;
         }
         if let Some(end) = &o.pipe {
-            return end.pipe.borrow().io_epoch;
+            return end.pipe.borrow().data.lock().unwrap().io_epoch;
         }
         if let Some(local) = &o.local {
             return local.poll_epoch();
@@ -441,8 +357,11 @@ impl Vfs {
         if let Some(Anonymous::Inotify(i)) = &o.anonymous {
             return [i.borrow().epoch, 0];
         }
-        if let Some(Anonymous::Event { epoch, .. }) = &o.anonymous {
-            return *epoch;
+        if let Some(Anonymous::Event(counter)) = &o.anonymous {
+            return counter.epoch();
+        }
+        if let Some(Anonymous::Timer(timer)) = &o.anonymous {
+            return timer.epoch();
         }
         o.pty
             .as_ref()
@@ -460,20 +379,21 @@ impl Vfs {
             return Err(Errno(22));
         };
         watches.retain(|_, w| w.open.strong_count() != 0);
+        let mut cursor = cursor.lock().unwrap();
         let keys: Vec<_> = watches.keys().copied().collect();
         let start = cursor.map_or(0, |c| keys.partition_point(|k| *k <= c));
         let mut result = Vec::new();
-        let mut selected = Vec::new();
         for &key in keys[start..].iter().chain(keys[..start].iter()) {
             let watch = watches.get(&key).expect("watch");
-            if !watch.armed {
+            let mut state = watch.state.lock().unwrap();
+            if !state.armed {
                 continue;
             }
             let Some(open) = watch.open.upgrade() else {
                 continue;
             };
             let o = open.borrow();
-            let requested = (watch.events & 0xffff) as u16;
+            let requested = (state.events & 0xffff) as u16;
             let override_ready = if o.pty.is_none() {
                 special(&o.kind, requested)?
             } else {
@@ -485,24 +405,12 @@ impl Vfs {
                     Self::poll_epoch(&o),
                 )
             });
-            if ready != 0 && watch.ready(ready, epoch) {
-                watch.last_ready.set(ready);
-                watch.last_epoch.set(epoch);
-                result.push((ready as u32, watch.data));
-                selected.push(key);
+            if let Some(event) = state.observe(ready, epoch) {
+                result.push(event);
+                *cursor = Some(key);
                 if result.len() == max {
                     break;
                 }
-            } else if ready == 0 {
-                watch.last_ready.set(0);
-                watch.last_epoch.set(epoch);
-            }
-        }
-        for key in selected {
-            *cursor = Some(key);
-            let watch = watches.get_mut(&key).expect("selected watch");
-            if watch.events & 0x40000000 != 0 {
-                watch.armed = false;
             }
         }
         Ok(result)

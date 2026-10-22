@@ -2,10 +2,10 @@
 //! Private inode objects and an atomic, versioned namespace manifest.
 use super::*;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -111,29 +111,28 @@ impl Timestamp {
 pub(super) enum FileData {
     /// Read-through reference; overlay copy-up replaces this before mutation.
     Lower(Rc<RefCell<Node>>),
-    Memory(Vec<u8>),
+    Plain(Arc<crate::file_data::PlainFile>),
     Shared(trames_shared::SharedFile),
-    Disk(DiskObject),
     Mapped(Box<mapped::MappedData>),
 }
 pub(super) struct DiskObject {
-    length: u64,
-    backing: Arc<DiskBacking>,
+    pub(super) length: u64,
+    pub(super) backing: Arc<DiskBacking>,
 }
 // Only immutable host paths/handles and an orphan flag cross the I/O boundary.
 // This lease retains both the object and the store lock until the last job ends.
 pub(super) struct DiskBacking {
-    path: PathBuf,
-    remove_on_drop: std::sync::atomic::AtomicBool,
+    pub(super) path: PathBuf,
+    pub(super) remove_on_drop: std::sync::atomic::AtomicBool,
     // An open-unlinked file must keep the store's exclusive lock alive.
     _store: Arc<DiskStore>,
-    inode: u64,
+    pub(super) inode: u64,
 }
 impl DiskObject {
     // Guest inode lifetime is independent of host descriptor lifetime. A store
     // with thousands of closed files must not consume thousands of iOS handles.
     // Orphans retain their private object path until the last guest reference dies.
-    fn open(&self, write: bool) -> Result<File> {
+    pub(super) fn open(&self, write: bool) -> Result<File> {
         self.backing.open(write)
     }
 }
@@ -161,30 +160,38 @@ impl Drop for DiskBacking {
     }
 }
 impl FileData {
+    pub(super) fn memory(bytes: Vec<u8>) -> Self {
+        Self::Plain(crate::file_data::PlainFile::new(
+            crate::file_data::Bytes::Memory(bytes),
+        ))
+    }
+    fn disk(data: DiskObject) -> Self {
+        Self::Plain(crate::file_data::PlainFile::new(
+            crate::file_data::Bytes::Disk(data),
+        ))
+    }
     pub(super) fn disk_backed(&self) -> bool {
         match self {
-            Self::Disk(_) => true,
-            Self::Lower(node) => matches!(&node.borrow().content,
-                Content::File(data) if data.disk_backed()),
+            Self::Plain(data) => data.disk_backed(),
+            Self::Lower(node) => {
+                matches!(&node.borrow().content, Content::File(data) if data.disk_backed())
+            }
             _ => false,
         }
     }
     pub(super) fn disk_source(&self) -> Option<(Arc<DiskBacking>, u64)> {
         match self {
-            Self::Disk(d) => Some((d.backing.clone(), d.length)),
+            Self::Plain(data) => data.disk_source(),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.disk_source(),
                 _ => None,
             },
-            // MappedData may contain dirty cached pages even without current
-            // writers. Keep its established overlay/writeback path intact.
             _ => None,
         }
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         match self {
-            Self::Memory(_) | Self::Disk(_) => true,
-            // SharedFile can also be retained by host display/GPU consumers.
+            Self::Plain(_) => true,
             Self::Shared(_) => false,
             Self::Mapped(data) => data.epoch_io_safe(write),
             Self::Lower(node) => {
@@ -195,46 +202,28 @@ impl FileData {
         }
     }
     pub fn blocks(&self) -> Result<u64> {
-        if let Self::Lower(node) = self {
-            return match &node.borrow().content {
+        match self {
+            Self::Plain(data) => data.blocks(),
+            Self::Mapped(data) => data.blocks(),
+            Self::Shared(file) => Ok(file.allocated().div_ceil(512) as u64),
+            Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.blocks(),
                 _ => Err(Errno(5)),
-            };
+            },
         }
-        if let Self::Mapped(data) = self {
-            return data.blocks();
-        }
-        #[cfg(unix)]
-        if let Self::Disk(d) = self {
-            return Ok(fs::symlink_metadata(&d.backing.path)
-                .map_err(host_errno)?
-                .blocks());
-        }
-        if let Self::Shared(file) = self {
-            return Ok(file.allocated().div_ceil(512) as u64);
-        }
-        Ok(self.len().div_ceil(512))
     }
     pub fn inode(&self) -> Option<u64> {
-        if let Self::Mapped(data) = self {
-            return data.inode();
-        }
         match self {
-            Self::Mapped(_) => unreachable!("mapped file delegated"),
-            Self::Memory(_) | Self::Shared(_) => None,
-            Self::Lower(_) => None,
-            Self::Disk(d) => Some(d.backing.inode),
+            Self::Plain(data) => data.inode(),
+            Self::Mapped(data) => data.inode(),
+            _ => None,
         }
     }
     pub fn len(&self) -> u64 {
-        if let Self::Mapped(data) = self {
-            return data.len();
-        }
         match self {
-            Self::Mapped(_) => unreachable!("mapped file delegated"),
-            Self::Memory(b) => b.len() as u64,
+            Self::Plain(data) => data.len(),
             Self::Shared(file) => file.len() as u64,
-            Self::Disk(d) => d.length,
+            Self::Mapped(data) => data.len(),
             Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.len(),
                 _ => 0,
@@ -250,118 +239,61 @@ impl FileData {
     }
     pub(super) fn growth_charge(&self, length: u64) -> u64 {
         if self.shared_file().is_some() {
-            // Sparse logical growth is free. SharedFile charges actual write /
-            // mapping ranges and explicit fallocate reservations atomically.
             0
         } else {
             length.saturating_sub(self.len())
         }
     }
     pub fn read_at(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
-        if let Self::Lower(node) = self {
-            return match &node.borrow().content {
+        match self {
+            Self::Plain(data) => data.read_at(offset, count, None),
+            Self::Mapped(data) => data.read_at(offset, count),
+            Self::Lower(node) => match &node.borrow().content {
                 Content::File(data) => data.read_at(offset, count),
                 _ => Err(Errno(5)),
-            };
-        }
-        if let Self::Mapped(data) = self {
-            return data.read_at(offset, count);
-        }
-        let count = count
-            .min(MAX_TRANSFER)
-            .min(self.len().saturating_sub(offset) as usize);
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        match self {
-            Self::Lower(_) => unreachable!("lower read delegated"),
-            Self::Mapped(_) => unreachable!("mapped file delegated"),
-            Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
-            Self::Shared(file) => file.read_at(offset, count).map_err(host_errno),
-            Self::Disk(d) => {
-                let mut file = d.open(false)?;
-                file.seek(SeekFrom::Start(offset)).map_err(host_errno)?;
-                let mut bytes = vec![0; count];
-                let n = file.read(&mut bytes).map_err(host_errno)?;
-                bytes.truncate(n);
-                Ok(bytes)
+            },
+            Self::Shared(file) => {
+                let count = count
+                    .min(MAX_TRANSFER)
+                    .min(self.len().saturating_sub(offset) as usize);
+                if count == 0 {
+                    Ok(Vec::new())
+                } else {
+                    file.read_at(offset, count).map_err(host_errno)
+                }
             }
         }
     }
     pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
-        if let Self::Mapped(data) = self {
-            return data.write_at(offset, bytes);
-        }
         match self {
+            Self::Plain(data) => data.write_at(offset, bytes),
+            Self::Mapped(data) => data.write_at(offset, bytes),
             Self::Lower(_) => Err(Errno(30)),
-            Self::Mapped(_) => unreachable!("mapped file delegated"),
             Self::Shared(file) => file.write_at(offset, bytes).map_err(host_errno),
-            Self::Memory(b) => {
-                let end = usize::try_from(offset)
-                    .ok()
-                    .and_then(|n| n.checked_add(bytes.len()))
-                    .ok_or(Errno(27))?;
-                if end > b.len() {
-                    b.try_reserve(end - b.len()).map_err(|_| Errno(12))?;
-                    b.resize(end, 0);
-                }
-                b[offset as usize..end].copy_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            Self::Disk(d) => {
-                let mut file = d.open(true)?;
-                file.seek(SeekFrom::Start(offset)).map_err(host_errno)?;
-                let n = file.write(bytes).map_err(host_errno)?;
-                d.length = d.length.max(offset + n as u64);
-                Ok(n)
-            }
         }
     }
     pub fn truncate(&mut self, length: u64) -> Result<()> {
-        if let Self::Mapped(data) = self {
-            return data.truncate(length);
-        }
         match self {
-            Self::Lower(_) => return Err(Errno(30)),
-            Self::Mapped(_) => unreachable!("mapped file delegated"),
+            Self::Plain(data) => data.truncate(length),
+            Self::Mapped(data) => data.truncate(length),
+            Self::Lower(_) => Err(Errno(30)),
             Self::Shared(file) => file
                 .set_len(usize::try_from(length).map_err(|_| Errno(27))?)
-                .map_err(host_errno)?,
-            Self::Memory(b) => {
-                let n = usize::try_from(length).map_err(|_| Errno(27))?;
-                if n > b.len() {
-                    b.try_reserve(n - b.len()).map_err(|_| Errno(12))?;
-                }
-                b.resize(n, 0);
-            }
-            Self::Disk(d) => {
-                d.open(true)?.set_len(length).map_err(host_errno)?;
-                d.length = length;
-            }
+                .map_err(host_errno),
         }
-        Ok(())
     }
     pub fn sync(&self, data_only: bool) -> Result<()> {
-        if let Self::Mapped(data) = self {
-            return data.sync(data_only);
+        match self {
+            Self::Plain(data) => data.sync(data_only),
+            Self::Mapped(data) => data.sync(data_only),
+            _ => Ok(()),
         }
-        if let Self::Disk(d) = self {
-            let file = d.open(false)?;
-            if data_only {
-                file.sync_data()
-            } else {
-                file.sync_all()
-            }
-            .map_err(host_errno)?;
-        }
-        Ok(())
     }
     pub fn orphan(&mut self, value: bool) {
-        if let Self::Mapped(data) = self {
-            return data.orphan(value);
-        }
-        if let Self::Disk(d) = self {
-            d.backing.remove_on_drop.store(value, Ordering::Relaxed);
+        match self {
+            Self::Plain(data) => data.orphan(value),
+            Self::Mapped(data) => data.orphan(value),
+            _ => {}
         }
     }
 }
@@ -433,7 +365,7 @@ impl DiskStore {
         #[cfg(unix)]
         options.mode(0o600);
         drop(options.open(&path).map_err(host_errno)?);
-        Ok(FileData::Disk(DiskObject {
+        Ok(FileData::disk(DiskObject {
             length: 0,
             backing: Arc::new(DiskBacking {
                 path,
@@ -447,7 +379,7 @@ impl DiskStore {
         let path = self.object_path(inode);
         regular(&path)?;
         let length = fs::symlink_metadata(&path).map_err(host_errno)?.len();
-        Ok(FileData::Disk(DiskObject {
+        Ok(FileData::disk(DiskObject {
             length,
             backing: Arc::new(DiskBacking {
                 path,
@@ -546,7 +478,8 @@ impl Filesystem {
         for (ino, node) in nodes {
             let n = node.borrow();
             out.extend(ino.to_le_bytes());
-            out.extend(n.mode.to_le_bytes());
+            let metadata = n.file_metadata();
+            out.extend(metadata.mode.to_le_bytes());
             out.extend(n.uid.to_le_bytes());
             out.extend(n.gid.to_le_bytes());
             out.extend([
@@ -570,7 +503,7 @@ impl Filesystem {
                 0,
                 0,
             ]);
-            for t in n.times {
+            for t in metadata.times {
                 out.extend(t.seconds.to_le_bytes());
                 out.extend(t.nanos.to_le_bytes());
                 out.extend([0; 4]);
@@ -1107,7 +1040,7 @@ impl Vfs {
             fs.next_inode = next;
             Ok(data)
         } else {
-            Ok(FileData::Memory(Vec::new()))
+            Ok(FileData::memory(Vec::new()))
         }
     }
     pub fn checkpoint(&self) -> Result<()> {

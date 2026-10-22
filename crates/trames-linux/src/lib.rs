@@ -4,9 +4,14 @@ use std::io;
 use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
+mod direct;
+pub use direct::{epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo};
 mod file_calls;
 mod network;
+mod poll;
 mod state;
+mod timer;
+pub use timer::timerfd_control;
 mod xattr;
 pub use state::Linux;
 

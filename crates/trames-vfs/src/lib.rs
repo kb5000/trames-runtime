@@ -9,6 +9,16 @@ mod credentials;
 mod directory;
 mod disk_io;
 pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob};
+mod direct_io;
+mod file_data;
+mod file_io;
+use direct_io::PipeResource;
+pub use file_io::{DirectFile, DirectFiles, FileEpoch};
+mod readiness;
+mod timer_io;
+pub use direct_io::{DirectFd, DirectFds};
+pub use readiness::{IoSignal, IoSubscription, IoWake};
+pub use timer_io::TimerFd;
 mod events;
 mod executable;
 pub use executable::ExecutableFile;
@@ -22,7 +32,7 @@ mod mounts;
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
-pub use ipc::{LocalReceived, LocalRights, LocalSocket};
+pub use ipc::{LocalReceived, LocalRights, LocalSocket, WaylandAuth};
 pub use locks::RecordLock;
 mod linux_namespace;
 mod pid_namespace;
@@ -120,12 +130,7 @@ pub enum FdKind {
 struct Pipe {
     inode: u64,
     metadata: Option<Rc<RefCell<Node>>>,
-    bytes: VecDeque<u8>,
-    readers: u32,
-    writers: u32,
-    read_epoch: u64,
-    write_epoch: u64,
-    io_epoch: [u64; 2],
+    data: Arc<PipeResource>,
 }
 struct PipeEnd {
     pipe: Rc<RefCell<Pipe>>,
@@ -139,12 +144,7 @@ impl Pipe {
         Rc::new(RefCell::new(Self {
             inode,
             metadata: None,
-            bytes: VecDeque::new(),
-            readers: 0,
-            writers: 0,
-            read_epoch: 0,
-            write_epoch: 0,
-            io_epoch: [0; 2],
+            data: Arc::new(PipeResource::new()),
         }))
     }
 }
@@ -155,7 +155,11 @@ impl PipeEnd {
         }
         let read = flags & 3 != 1;
         let write = flags & 3 != 0;
-        if write && !read && flags & O_NONBLOCK != 0 && pipe.borrow().readers == 0 {
+        if write
+            && !read
+            && flags & O_NONBLOCK != 0
+            && pipe.borrow().data.lock().unwrap().readers == 0
+        {
             return Err(Errno(6));
         }
         Ok(Some(Self::new(
@@ -166,7 +170,8 @@ impl PipeEnd {
         )))
     }
     fn new(pipe: Rc<RefCell<Pipe>>, read: bool, write: bool, block: bool) -> Rc<Self> {
-        let mut p = pipe.borrow_mut();
+        let pipe_ref = pipe.borrow();
+        let mut p = pipe_ref.data.lock().unwrap();
         let initial_write_epoch = p.write_epoch.wrapping_sub(u64::from(p.writers != 0));
         let waiting = if block && read && !write && p.writers == 0 {
             Some(p.write_epoch)
@@ -186,6 +191,7 @@ impl PipeEnd {
             p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
         }
         drop(p);
+        drop(pipe_ref);
         Rc::new(Self {
             pipe,
             read,
@@ -197,7 +203,8 @@ impl PipeEnd {
 }
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        let mut p = self.pipe.borrow_mut();
+        let pipe_ref = self.pipe.borrow();
+        let mut p = pipe_ref.data.lock().unwrap();
         p.readers -= u32::from(self.read);
         p.writers -= u32::from(self.write);
         if self.read {
@@ -217,6 +224,7 @@ struct OpenDescription {
     kind: FdKind,
     flags: u32,
     position: u64,
+    file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
     node: Option<Rc<RefCell<Node>>>,
     // Overlay read descriptions retain the real lower file selected at open.
     read_node: Option<Rc<RefCell<Node>>>,
@@ -235,10 +243,32 @@ struct OpenDescription {
 }
 impl Drop for OpenDescription {
     fn drop(&mut self) {
+        // Epoll snapshots in another forked FD table may retain this resource
+        // without retaining the open description. Last-close must invalidate
+        // those tables too, so their next snapshot removes the dead watch.
+        if self.pipe.is_some()
+            || self.local.is_some()
+            || matches!(
+                self.anonymous,
+                Some(events::Anonymous::Event(_) | events::Anonymous::Timer(_))
+            )
+        {
+            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
         drop(self.notification.take());
     }
 }
 impl OpenDescription {
+    fn current_position(&self) -> u64 {
+        if self.data_node().is_some_and(|n| {
+            let n = n.borrow();
+            !n.volatile && matches!(n.content, Content::File(_))
+        }) {
+            self.file_position.lock().unwrap().value
+        } else {
+            self.position
+        }
+    }
     fn data_node(&self) -> Option<Rc<RefCell<Node>>> {
         self.read_node.clone().or_else(|| self.node.clone())
     }
@@ -266,6 +296,7 @@ struct DescriptorTable {
 struct DescriptorVersion {
     io: OnceCell<(FdMask, FdMask)>,
     flags: RefCell<Option<(u64, FdFlags)>>,
+    direct: RefCell<Option<(u64, DirectFds)>>,
 }
 impl DescriptorTable {
     // Keep two-phase receiver borrowing for expressions such as
@@ -291,6 +322,7 @@ impl std::ops::DerefMut for DescriptorTable {
         let version = Rc::make_mut(&mut self.identity);
         version.io.take();
         version.flags.get_mut().take();
+        version.direct.get_mut().take();
         &mut self.entries
     }
 }
@@ -322,6 +354,17 @@ struct Node {
     xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 impl Node {
+    fn file_metadata(&self) -> file_data::FileMeta {
+        if let Content::File(storage::FileData::Plain(data)) = &self.content {
+            if let Some(meta) = data.metadata() {
+                return meta;
+            }
+        }
+        file_data::FileMeta {
+            mode: self.mode,
+            times: self.times,
+        }
+    }
     fn path_in(
         &self,
         paths: &BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
@@ -467,6 +510,7 @@ impl Default for Vfs {
                         kind,
                         flags,
                         position: 0,
+                        file_position: Arc::default(),
                         node: None,
                         pipe: None,
                         socket: None,
@@ -530,12 +574,15 @@ impl Vfs {
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
+        let mut direct = vec![None; entries.len()];
         for (&fd, d) in self.fds.iter() {
-            entries[fd as usize] =
-                Some(d.open.borrow().flags | if d.cloexec { O_CLOEXEC } else { 0 });
+            let open = d.open.borrow();
+            entries[fd as usize] = Some(open.flags | if d.cloexec { O_CLOEXEC } else { 0 });
+            direct[fd as usize] = DirectFd::snapshot(&open);
         }
         let snapshot = FdFlags(entries.into());
         *cached = Some((revision, snapshot.clone()));
+        *self.fds.identity.direct.borrow_mut() = Some((revision, DirectFds(direct.into())));
         snapshot
     }
     fn ordinary_stream(o: &OpenDescription) -> bool {
@@ -650,7 +697,7 @@ impl Vfs {
             return socket.readable_bytes().map(Some);
         }
         if let Some(end) = &open.pipe {
-            return Ok(Some(end.pipe.borrow().bytes.len()));
+            return Ok(Some(end.pipe.borrow().data.lock().unwrap().bytes.len()));
         }
         Ok(match &open.anonymous {
             Some(events::Anonymous::Inotify(i)) => Some(i.borrow().available()),
@@ -687,7 +734,8 @@ impl Vfs {
         }
         let mut ready = events & 5;
         if let Some(end) = &o.pipe {
-            let p = end.pipe.borrow();
+            let pipe = end.pipe.borrow();
+            let p = pipe.data.lock().unwrap();
             ready = 0;
             if end.read {
                 if !p.bytes.is_empty() {
@@ -724,6 +772,7 @@ impl Vfs {
                         kind: FdKind::Terminal,
                         flags: 2,
                         position: 0,
+                        file_position: Arc::default(),
                         node: None,
                         pipe: None,
                         socket: None,
@@ -1698,6 +1747,10 @@ impl Vfs {
                     },
                     flags: flags & !O_CLOEXEC,
                     position,
+                    file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
+                        value: position,
+                        pending: 0,
+                    })),
                     node: Some(node),
                     mount: p.mount,
                     pipe,
@@ -1730,7 +1783,8 @@ impl Vfs {
         let Some(epoch) = end.waiting.get() else {
             return Ok(true);
         };
-        let p = end.pipe.borrow();
+        let pipe = end.pipe.borrow();
+        let p = pipe.data.lock().unwrap();
         let ready = if end.read {
             p.writers != 0 || p.write_epoch != epoch
         } else {
@@ -1874,6 +1928,7 @@ impl Vfs {
                         kind,
                         flags: (flags & O_NONBLOCK) | access,
                         position: 0,
+                        file_position: Arc::default(),
                         node: None,
                         pipe: Some(end),
                         socket: None,
@@ -1957,7 +2012,8 @@ impl Vfs {
         }
         if let Some((pipe, _)) = source_pipe {
             let bytes = {
-                let p = pipe.borrow();
+                let pipe = pipe.borrow();
+                let p = pipe.data.lock().unwrap();
                 if p.bytes.is_empty() && p.writers != 0 {
                     return Err(Errno(11));
                 }
@@ -1971,7 +2027,8 @@ impl Vfs {
                 return Ok(0);
             }
             let n = if let Some((target, _)) = &dest_pipe {
-                let mut p = target.borrow_mut();
+                let pipe = target.borrow();
+                let mut p = pipe.data.lock().unwrap();
                 if p.readers == 0 {
                     return Err(Errno(32));
                 }
@@ -1987,7 +2044,8 @@ impl Vfs {
             } else {
                 self.write(output, &bytes)?
             };
-            let mut p = pipe.borrow_mut();
+            let pipe = pipe.borrow();
+            let mut p = pipe.data.lock().unwrap();
             p.bytes.drain(..n);
             if n != 0 {
                 p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
@@ -1997,6 +2055,7 @@ impl Vfs {
         let (pipe, _) = dest_pipe.unwrap();
         let room = {
             let p = pipe.borrow();
+            let p = p.data.lock().unwrap();
             if p.readers == 0 {
                 return Err(Errno(32));
             }
@@ -2010,7 +2069,8 @@ impl Vfs {
         } else {
             self.read(input, count.min(room))?
         };
-        let mut p = pipe.borrow_mut();
+        let pipe = pipe.borrow();
+        let mut p = pipe.data.lock().unwrap();
         p.bytes.extend(&bytes);
         if !bytes.is_empty() {
             p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
@@ -2064,23 +2124,23 @@ impl Vfs {
             if !end.read {
                 return Err(Errno(9));
             }
-            let mut p = end.pipe.borrow_mut();
-            if p.bytes.is_empty() && p.writers != 0 {
-                return Err(Errno(11));
-            }
-            let n = count.min(p.bytes.len());
-            if n != 0 {
-                p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
-            }
-            return Ok(p.bytes.drain(..n).collect());
+            let pipe = end.pipe.borrow();
+            return pipe.data.lock().unwrap().read(count);
         }
         let node = o.data_node().ok_or(Errno(9))?;
         let n = node.borrow();
         let result = match &n.content {
             Content::File(b) => {
-                let out = b.read_at(o.position, count)?;
-                o.position += out.len() as u64;
-                Ok(out)
+                if n.volatile {
+                    let out = b.read_at(o.position, count)?;
+                    o.position += out.len() as u64;
+                    Ok(out)
+                } else {
+                    let mut position = o.file_position.lock().unwrap();
+                    let out = b.read_at(position.value, count)?;
+                    position.value += out.len() as u64;
+                    Ok(out)
+                }
             }
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
@@ -2129,21 +2189,8 @@ impl Vfs {
             if !end.write {
                 return Err(Errno(9));
             }
-            let mut p = end.pipe.borrow_mut();
-            if p.readers == 0 {
-                return Err(Errno(32));
-            }
-            if bytes.is_empty() {
-                return Ok(0);
-            }
-            let room = PIPE_CAPACITY - p.bytes.len();
-            if room == 0 || (bytes.len() <= 4096 && room < bytes.len()) {
-                return Err(Errno(11));
-            }
-            let n = room.min(bytes.len());
-            p.bytes.extend(&bytes[..n]);
-            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
-            return Ok(n);
+            let pipe = end.pipe.borrow();
+            return pipe.data.lock().unwrap().write(bytes);
         }
         drop(o);
         self.file_write(fd, bytes, None)
@@ -2203,10 +2250,11 @@ impl Vfs {
                 if bytes.is_empty() {
                     return Ok(0);
                 }
+                let mut file_position = o.file_position.lock().unwrap();
                 let position = if o.flags & 0x400 != 0 {
                     b.len()
                 } else {
-                    offset.unwrap_or(o.position)
+                    offset.unwrap_or(file_position.value)
                 };
                 if position >= self.file_size_limit {
                     self.file_size_signal.set(true);
@@ -2232,22 +2280,31 @@ impl Vfs {
                 }
                 let written = b.write_at(position, bytes)?;
                 if offset.is_none() {
-                    o.position = position + written as u64;
+                    file_position.value = position + written as u64;
                 }
                 Ok(written)
             }
         };
         if result.is_ok_and(|n| n != 0) {
-            if !self.credentials.has_cap(capabilities::FSETID)
-                && matches!(n.content, Content::File(_))
-            {
-                n.mode &= !0o4000;
-                if n.mode & 0o10 != 0 {
-                    n.mode &= !0o2000;
+            let clear_setid = !self.credentials.has_cap(capabilities::FSETID);
+            let shared = if let Content::File(storage::FileData::Plain(data)) = &n.content {
+                data.modified(clear_setid)
+            } else {
+                None
+            };
+            if let Some(meta) = shared {
+                n.mode = meta.mode;
+                n.times = meta.times;
+            } else {
+                if clear_setid && matches!(n.content, Content::File(_)) {
+                    n.mode &= !0o4000;
+                    if n.mode & 0o10 != 0 {
+                        n.mode &= !0o2000;
+                    }
                 }
+                n.times[1] = storage::Timestamp::now();
+                n.times[2] = n.times[1];
             }
-            n.times[1] = storage::Timestamp::now();
-            n.times[2] = n.times[1];
         }
         let synchronous = o.flags & 0x1000 != 0;
         drop(n);
@@ -2405,9 +2462,17 @@ impl Vfs {
                 Content::Terminal | Content::Fifo(_) => return Err(Errno(29)),
             }
         };
+        let mut file_position = o.file_position.lock().unwrap();
+        let regular = matches!(n.content, Content::File(_)) && !n.volatile;
         let base = match whence {
             0 => 0,
-            1 => o.position as i64,
+            1 => {
+                if regular {
+                    file_position.value as i64
+                } else {
+                    o.position as i64
+                }
+            }
             2 => length as i64,
             _ => return Err(Errno(22)),
         };
@@ -2415,17 +2480,36 @@ impl Vfs {
             .checked_add(offset)
             .filter(|&n| n >= 0)
             .ok_or(Errno(22))?;
-        o.position = new as u64;
+        if regular {
+            file_position.value = new as u64;
+        }
+        drop(file_position);
+        if !regular {
+            o.position = new as u64;
+        }
         Ok(new as u64)
     }
     fn stat_node(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
+        let mut out = self.stat_node_fields(node, mount)?;
+        let blocks = match &node.content {
+            Content::File(data) if !node.volatile => data.blocks()?,
+            _ => 0,
+        };
+        out[64..72].copy_from_slice(&blocks.to_le_bytes());
+        Ok(out)
+    }
+    // Freeze only virtual fields when publishing worker capabilities. Actual
+    // stat calls obtain live allocation/blocks; cohort setup must not stat every
+    // host disk object even when no task will query it.
+    fn stat_node_fields(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
         let mut out = [0; 128];
         let device = mount
             .filter(|m| m.kind == mounts::Kind::Overlay)
             .map_or(node.device, |m| m.device());
         out[..8].copy_from_slice(&device.to_le_bytes());
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
-        out[16..20].copy_from_slice(&node.mode.to_le_bytes());
+        let metadata = node.file_metadata();
+        out[16..20].copy_from_slice(&metadata.mode.to_le_bytes());
         let mut links = node.links;
         if links != 0 && matches!(node.content, Content::Directory) {
             // Persistent links count path owners; stat counts . and children's .. too.
@@ -2490,17 +2574,7 @@ impl Vfs {
         };
         out[48..56].copy_from_slice(&size.to_le_bytes());
         out[56..60].copy_from_slice(&4096u32.to_le_bytes());
-        let blocks = if let Content::File(data) = &node.content {
-            if node.volatile {
-                0
-            } else {
-                data.blocks()?
-            }
-        } else {
-            0
-        };
-        out[64..72].copy_from_slice(&blocks.to_le_bytes());
-        for (offset, t) in [72, 88, 104].into_iter().zip(node.times) {
+        for (offset, t) in [72, 88, 104].into_iter().zip(metadata.times) {
             out[offset..offset + 8].copy_from_slice(&t.seconds.to_le_bytes());
             out[offset + 8..offset + 16].copy_from_slice(&(t.nanos as u64).to_le_bytes());
         }

@@ -3,10 +3,11 @@
 //! effects. Never pass guest structs, flags, descriptors or pointers to the OS.
 use super::Linux;
 use std::net::SocketAddr;
-use trames_memory::{Access, Memory};
+use trames_memory::{Access, CpuMemory, Memory};
 use trames_net::{encode_address, NetError, MSG_TRUNC};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
+pub(crate) mod local;
 fn net(error: NetError) -> Errno {
     Errno(error.0)
 }
@@ -70,12 +71,12 @@ fn push_control(out: &mut Vec<u8>, level: u32, kind: u32, payload: &[u8]) {
     out[at + 12..at + 16].copy_from_slice(&kind.to_le_bytes());
     out[at + 16..at + size].copy_from_slice(payload);
 }
-fn u32_at(memory: &Memory, address: u64) -> Result<u32> {
+fn u32_at(memory: &impl CpuMemory, address: u64) -> Result<u32> {
     let mut bytes = [0; 4];
     memory.read(address, &mut bytes).map_err(|_| Errno(14))?;
     Ok(u32::from_le_bytes(bytes))
 }
-fn u64_at(memory: &Memory, address: u64) -> Result<u64> {
+fn u64_at(memory: &impl CpuMemory, address: u64) -> Result<u64> {
     memory.read_u64(address).map_err(|_| Errno(14))
 }
 fn address(memory: &Memory, pointer: u64, length: u64) -> Result<Vec<u8>> {
@@ -94,7 +95,7 @@ struct AddressOutput {
 }
 impl AddressOutput {
     fn prepare(
-        memory: &Memory,
+        memory: &impl CpuMemory,
         pointer: u64,
         length_pointer: u64,
         size: usize,
@@ -123,7 +124,7 @@ impl AddressOutput {
         let bytes = address.map_or_else(Vec::new, encode_address);
         self.write_bytes(memory, &bytes)
     }
-    fn write_bytes(self, memory: &mut Memory, bytes: &[u8]) -> Result<()> {
+    fn write_bytes(self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
         memory
             .write(self.pointer, &bytes[..bytes.len().min(self.capacity)])
             .map_err(|_| Errno(14))?;
@@ -137,7 +138,7 @@ struct Vectors {
     size: usize,
 }
 impl Vectors {
-    fn prepare(memory: &Memory, pointer: u64, count: u64, access: Access) -> Result<Self> {
+    fn prepare(memory: &impl CpuMemory, pointer: u64, count: u64, access: Access) -> Result<Self> {
         if count > 1024 {
             return Err(Errno(90));
         }
@@ -169,7 +170,7 @@ impl Vectors {
         }
         Ok(bytes)
     }
-    fn write(&self, memory: &mut Memory, bytes: &[u8]) -> Result<()> {
+    fn write(&self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
         let mut offset = 0;
         for &(pointer, size) in &self.parts {
             let take = size.min(bytes.len() - offset);
@@ -671,17 +672,18 @@ impl Linux {
                 output.write_bytes(memory, &name)?;
                 Ok(0)
             }
-            206 => {
-                if a[4] != 0 {
-                    return Err(Errno(106));
-                }
-                let count = a[2].min(super::MAX_WRITE as u64) as usize;
-                Self::check(memory, a[1], count, Access::Read)?;
-                let mut bytes = vec![0; count];
-                memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(socket.send(&bytes, a[3] as u32)? as u64)
-            }
+            206 => local::send(a, memory, &mut Vec::new(), |bytes| {
+                socket.send(bytes, a[3] as u32).map(|n| n as u64)
+            }),
             207 => {
+                if socket.kind() == 1 {
+                    return local::recv(a, memory, |count| {
+                        socket
+                            .recv(count, a[3] as u32 | nonblocking)
+                            .map(|r| r.data)
+                    });
+                }
+
                 let count = a[2].min(super::MAX_WRITE as u64) as usize;
                 Self::check(memory, a[1], count, Access::Write)?;
                 let output = AddressOutput::prepare(memory, a[4], a[5], 2)?;
@@ -757,38 +759,12 @@ impl Linux {
             }
             211 | 212 => {
                 let receive = number == 212;
-                Self::check(memory, a[1], 56, Access::Read)?;
-                if receive {
-                    Self::check(memory, a[1], 56, Access::Write)?;
-                }
-                let name = u64_at(memory, a[1])?;
-                let control = u64_at(memory, a[1] + 32)?;
-                let control_size = u64_at(memory, a[1] + 40)?;
-                if !receive && name != 0 {
-                    return Err(Errno(106));
-                }
-                if control_size != 0 {
-                    if control_size > super::MAX_WRITE as u64 {
-                        return Err(Errno(22));
-                    }
-                    Self::check(
-                        memory,
-                        control,
-                        control_size as usize,
-                        if receive { Access::Write } else { Access::Read },
-                    )?;
-                }
-                let output = if receive {
-                    AddressOutput::prepare(memory, name, a[1] + 8, 2)?
-                } else {
-                    None
-                };
-                let vectors = Vectors::prepare(
-                    memory,
-                    u64_at(memory, a[1] + 16)?,
-                    u64_at(memory, a[1] + 24)?,
-                    if receive { Access::Write } else { Access::Read },
-                )?;
+                let local::Message {
+                    control,
+                    control_size,
+                    output,
+                    vectors,
+                } = local::Message::prepare(memory, a[1], receive)?;
                 if receive {
                     let received = socket.recv(vectors.size, a[2] as u32 | nonblocking)?;
                     vectors.write(memory, &received.data)?;

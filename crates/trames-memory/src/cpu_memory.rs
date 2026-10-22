@@ -53,6 +53,38 @@ pub trait CpuMemory {
     ) -> Result<(), MemoryError> {
         self.write(address, &bytes)
     }
+    /// Checked page-fragment borrow for an external/native consumer. The
+    /// callback is synchronous and cannot retain guest pointers or page guards.
+    /// Implementations without resident borrowing use bounded staging.
+    fn cpu_read_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if len > (crate::PAGE_SIZE - address % crate::PAGE_SIZE) as usize {
+            return Err(MemoryError::InvalidRange);
+        }
+        let mut bytes = vec![0; len];
+        self.read(address, &mut bytes)?;
+        Ok((operation(&bytes), false))
+    }
+    fn cpu_write_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if len > (crate::PAGE_SIZE - address % crate::PAGE_SIZE) as usize {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.check(address, len, Access::Write)?;
+        let mut bytes = vec![0; len];
+        self.read(address, &mut bytes)?;
+        let result = operation(&mut bytes);
+        self.write(address, &bytes)?;
+        Ok((result, false))
+    }
     fn read_u64(&self, address: u64) -> Result<u64, MemoryError> {
         Ok(u64::from_le_bytes(self.read_array(address)?))
     }
@@ -76,6 +108,22 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn cpu_read_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.with_read_chunk(address, len, operation)
+    }
+    fn cpu_write_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        self.with_write_chunk(address, len, operation)
+    }
     #[inline]
     fn cpu_slice(&mut self) -> CpuSlice<'_, Self> {
         if self
@@ -292,6 +340,35 @@ mod tests {
         cell::RefCell,
         rc::{Rc, Weak},
     };
+    #[test]
+    fn external_chunks_share_worker_reservations_permissions_and_dirty_publication() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x1000, 7u64.to_le_bytes()).unwrap();
+        memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+        let mut old = [0; 8];
+        let token = view.exclusive_read(0x1000, &mut old).unwrap();
+        assert!(
+            view.cpu_write_chunk(0x1000, 8, |b| b.copy_from_slice(&9u64.to_le_bytes()))
+                .unwrap()
+                .1
+        );
+        assert!(!view.exclusive_write(0x1000, &[3; 8], Some(token)).unwrap());
+        assert_eq!(
+            view.cpu_read_chunk(0x1000, 8, |b| b.to_vec()).unwrap(),
+            (9u64.to_le_bytes().to_vec(), true)
+        );
+        assert!(view
+            .cpu_write_chunk(0x2000, 1, |_| panic!("read-only callback"))
+            .is_err());
+        assert!(view
+            .cpu_read_chunk(0x1fff, 2, |_| panic!("cross-page callback"))
+            .is_err());
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<8>(0x1000).unwrap(), 9u64.to_le_bytes());
+    }
 
     #[test]
     fn serial_reservations_track_granules_aba_native_writes_and_fork_cow() {

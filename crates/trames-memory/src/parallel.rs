@@ -757,6 +757,41 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn cpu_read_chunk<T>(
+        &self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&[u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if len == 0 {
+            return Ok((operation(&[]), true));
+        }
+        let (frame, offset) = self.reached(address & 0x00ffffffffffffff, len, Access::Read)?;
+        let value = if let Some(bytes) = &frame.bytes.constant {
+            operation(&bytes[offset..offset + len])
+        } else {
+            let guard = self.frame_guard(frame, offset, len);
+            operation(guard.read(offset, len))
+        };
+        Ok((value, true))
+    }
+    fn cpu_write_chunk<T>(
+        &mut self,
+        address: u64,
+        len: usize,
+        operation: impl FnOnce(&mut [u8]) -> T,
+    ) -> Result<(T, bool), MemoryError> {
+        if len == 0 {
+            return Ok((operation(&mut []), true));
+        }
+        let (frame, offset) = self.reached(address & 0x00ffffffffffffff, len, Access::Write)?;
+        self.ensure_resident(frame)?;
+        let mut guard = self.frame_guard(frame, offset, len);
+        // Match native/CPU writes: invalidate reservations and code even when
+        // the external callback unwinds. No borrow escapes this call.
+        self.changed(frame, &mut guard, offset, len);
+        Ok((operation(guard.write(offset, len)), true))
+    }
     fn check(&self, address: u64, len: usize, access: Access) -> Result<(), MemoryError> {
         let address = address & 0x00ffffffffffffff;
         Memory::end(address, len as u64)?;

@@ -108,6 +108,7 @@ impl Vfs {
                     kind: FdKind::Node(target),
                     flags: 2,
                     position: 0,
+                    file_position: Arc::default(),
                     node: Some(node),
                     pipe: None,
                     socket: None,

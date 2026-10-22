@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded guest AF_UNIX endpoints. No guest pathname reaches host sockets.
 use super::*;
+pub(super) mod channel;
 mod native;
 pub(crate) use native::Services as NativeServices;
+pub use native::WaylandAuth;
 
 #[derive(Clone, Default)]
 pub struct LocalRights(pub(super) Vec<Rc<RefCell<OpenDescription>>>);
@@ -42,19 +44,16 @@ impl LocalRights {
         self.0.is_empty()
     }
 }
-struct Packet {
-    data: Vec<u8>,
-    rights: LocalRights,
-}
 struct Channel {
-    queues: [VecDeque<Packet>; 2],
+    resource: Arc<channel::Resource>,
     ends: [Weak<LocalSocket>; 2],
-    epochs: [[u64; 2]; 2],
+    rights: RefCell<BTreeMap<u64, LocalRights>>,
+    next_right: Cell<u64>,
 }
 pub struct LocalSocket {
     namespace: Rc<RefCell<LocalNamespace>>,
     network: Rc<linux_namespace::RootNetwork>,
-    channel: RefCell<Rc<RefCell<Channel>>>,
+    channel: RefCell<Rc<Channel>>,
     side: Cell<usize>,
     connected: Cell<bool>,
     name: RefCell<Vec<u8>>,
@@ -65,8 +64,6 @@ pub struct LocalSocket {
     listen_epoch: Cell<u64>,
     kind: u32,
     reuse: Cell<[u32; 2]>,
-    read_closed: Cell<bool>,
-    write_closed: Cell<bool>,
 }
 struct Listener {
     backlog: usize,
@@ -89,16 +86,10 @@ impl LocalSocket {
             return Err(Errno(22));
         }
         let binding = self.channel.borrow();
-        let channel = binding.borrow();
-        let queue = &channel.queues[self.side.get()];
         // Linux AF_UNIX reports one datagram, but all queued bytes for stream
         // and seqpacket. Do not recv/peek here: rights and zero-length packets
         // must remain queued, including after shutdown(SHUT_RD).
-        Ok(if self.kind == 2 {
-            queue.front().map_or(0, |packet| packet.data.len())
-        } else {
-            queue.iter().map(|packet| packet.data.len()).sum()
-        })
+        Ok(binding.resource.readable_bytes(self.side.get()))
     }
     fn new(
         kind: u32,
@@ -108,11 +99,12 @@ impl LocalSocket {
         Rc::new(Self {
             namespace: network.local.clone(),
             network,
-            channel: RefCell::new(Rc::new(RefCell::new(Channel {
-                queues: [VecDeque::new(), VecDeque::new()],
+            channel: RefCell::new(Rc::new(Channel {
+                resource: channel::Resource::new(kind, false),
                 ends: [Weak::new(), Weak::new()],
-                epochs: [[0; 2]; 2],
-            }))),
+                rights: RefCell::default(),
+                next_right: Cell::new(0),
+            })),
             side: Cell::new(0),
             connected: Cell::new(false),
             name: RefCell::new(vec![1, 0]),
@@ -123,16 +115,15 @@ impl LocalSocket {
             listen_epoch: Cell::new(0),
             kind,
             reuse: Cell::new([0; 2]),
-            read_closed: Cell::new(false),
-            write_closed: Cell::new(false),
         })
     }
     fn pair(a: &Rc<Self>, b: &Rc<Self>) {
-        let channel = Rc::new(RefCell::new(Channel {
-            queues: [VecDeque::new(), VecDeque::new()],
+        let channel = Rc::new(Channel {
+            resource: channel::Resource::new(a.kind, true),
             ends: [Rc::downgrade(a), Rc::downgrade(b)],
-            epochs: [[0; 2]; 2],
-        }));
+            rights: RefCell::default(),
+            next_right: Cell::new(0),
+        });
         for (side, (end, peer)) in [(a, b), (b, a)].into_iter().enumerate() {
             *end.channel.borrow_mut() = channel.clone();
             end.side.set(side);
@@ -140,6 +131,9 @@ impl LocalSocket {
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
         }
+        // Connect changes direct-resource eligibility without changing the FD
+        // table; another forked table may already have cached this description.
+        FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
     }
     pub fn name(&self, peer: bool) -> Result<Vec<u8>> {
         if peer && !self.connected.get() {
@@ -193,7 +187,7 @@ impl LocalSocket {
         if self.listening() {
             return [self.listen_epoch.get(), 0];
         }
-        self.channel.borrow().borrow().epochs[self.side.get()]
+        self.channel.borrow().resource.poll(self.side.get(), 0).1
     }
 
     pub fn set_reuse(&self, option: u32, value: u32) -> Result<()> {
@@ -213,51 +207,38 @@ impl LocalSocket {
     pub fn kind(&self) -> u32 {
         self.kind
     }
+    pub(super) fn direct(&self) -> Option<(Arc<channel::Resource>, usize)> {
+        (self.kind == 1 && self.connected.get() && !self.listening())
+            .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
+    }
     pub fn shutdown(&self, how: u32) -> Result<()> {
-        if how > 2 {
-            return Err(Errno(22));
-        }
-        if how != 1 {
-            self.read_closed.set(true);
-        }
-        if how != 0 {
-            self.write_closed.set(true);
-        }
-        let binding = self.channel.borrow();
-        let mut channel = binding.borrow_mut();
-        for epoch in &mut channel.epochs {
-            for counter in epoch {
-                *counter = counter.wrapping_add(1);
-            }
-        }
-        Ok(())
+        self.channel
+            .borrow()
+            .resource
+            .shutdown(self.side.get(), how)
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
         self.send_rights(bytes, flags, LocalRights::default())
     }
     pub fn send_rights(&self, bytes: &[u8], flags: u32, rights: LocalRights) -> Result<usize> {
-        // Linux ignores the receive-only MSG_CMSG_CLOEXEC on sendmsg/sendto.
-        // Firefox's Wayland proxy reuses this flag for both directions.
+        // Preserve the original flags/connection/state checks before rights
+        // graph traversal. Pure bytes need no owner rights-map operation.
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
         if !self.connected.get() {
             return Err(Errno(if self.kind == 2 { 89 } else { 107 }));
         }
-        if self.write_closed.get() {
-            return Err(Errno(32));
-        }
         let binding = self.channel.borrow();
-        let peer = binding.borrow().ends[1 - self.side.get()]
+        if rights.is_empty() {
+            return binding.resource.send(self.side.get(), bytes, flags, None);
+        }
+        binding.resource.send_check(self.side.get(), flags)?;
+        let peer = binding.ends[1 - self.side.get()]
             .upgrade()
             .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
-        if peer.read_closed.get() {
-            return Err(Errno(32));
-        }
-        // Queued rights own their open descriptions. Permit Unix FD handoff
-        // between independent channels, but reject a new owning cycle before
-        // enqueue (Linux has a collector for cyclic SCM_RIGHTS; we do not).
-        // Ordinary messages/rights without local sockets avoid this traversal.
+        // Keep the existing no-owning-cycle rule. The shared queues only carry
+        // IDs; their Rc rights ledger is touched/dropped on this owner thread.
         let mut pending: Vec<_> = rights
             .0
             .iter()
@@ -272,146 +253,68 @@ impl LocalSocket {
                 continue;
             }
             let channel = socket.channel.borrow();
-            for packet in &channel.borrow().queues[socket.side.get()] {
-                for open in &packet.rights.0 {
+            let ids = channel.resource.right_ids(socket.side.get());
+            let ledger = channel.rights.borrow();
+            for id in ids {
+                for open in &ledger.get(&id).expect("queued rights").0 {
                     if let Some(socket) = &open.borrow().local {
                         pending.push(socket.clone());
                     }
                 }
             }
         }
-        let mut channel = binding.borrow_mut();
         if self.kind == 1 && bytes.is_empty() {
             return Ok(0);
         }
-        let queue = &mut channel.queues[1 - self.side.get()];
-        let used: usize = queue.iter().map(|p| p.data.len()).sum();
-        if self.kind != 1 && bytes.len() > PIPE_CAPACITY {
-            return Err(Errno(90));
+        let id = binding.next_right.get();
+        binding.next_right.set(id.checked_add(1).ok_or(Errno(75))?);
+        binding.rights.borrow_mut().insert(id, rights);
+        let result = binding
+            .resource
+            .send(self.side.get(), bytes, flags, Some(id));
+        if result.is_err() {
+            let unused = binding.rights.borrow_mut().remove(&id);
+            drop(unused); // Never destroy rights while borrowing their ledger.
         }
-        let room = PIPE_CAPACITY - used;
-        if (self.kind != 1 && (room < bytes.len() || queue.len() >= 128))
-            || (self.kind == 1 && room == 0 && !bytes.is_empty())
-        {
-            return Err(Errno(11));
-        }
-        let count = room.min(bytes.len());
-        let merge = self.kind == 1
-            && rights.is_empty()
-            && queue.back().is_some_and(|p| p.rights.is_empty());
-        if !merge && queue.len() >= 128 {
-            return Err(Errno(11));
-        }
-        if merge && count != 0 {
-            queue
-                .back_mut()
-                .expect("stream queue")
-                .data
-                .extend_from_slice(&bytes[..count]);
-        } else if count != 0 || self.kind != 1 {
-            queue.push_back(Packet {
-                data: bytes[..count].to_vec(),
-                rights,
-            });
-        }
-        channel.epochs[1 - self.side.get()][0] =
-            channel.epochs[1 - self.side.get()][0].wrapping_add(1);
-        Ok(count)
+        result
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
-        // MSG_NOSIGNAL is accepted but has no effect on Linux receives.
         if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
-            // Larger blocking records need a scheduler continuation that
-            // consumes partial data; never wait forever on a bounded queue.
             return Err(Errno(95));
         }
         if !self.connected.get() {
             return Err(Errno(if self.kind == 2 { 11 } else { 22 }));
         }
         let binding = self.channel.borrow();
-        let mut channel = binding.borrow_mut();
-        let eof = self.read_closed.get()
-            || channel.ends[1 - self.side.get()]
-                .upgrade()
-                .is_none_or(|s| s.write_closed.get());
-        let queue = &mut channel.queues[self.side.get()];
-        if (self.kind == 1 && count == 0) || (eof && queue.is_empty() && self.kind != 2) {
-            return Ok(LocalReceived {
-                data: Vec::new(),
-                length: 0,
-                truncated: false,
-                rights: LocalRights::default(),
-            });
-        }
-        if queue.is_empty() {
-            return Err(Errno(11));
-        }
-        if self.kind != 1 {
-            let packet = queue.front().expect("packet");
-            let length = packet.data.len();
-            let data = packet.data[..count.min(length)].to_vec();
-            let rights = packet.rights.clone();
-            if flags & 2 == 0 {
-                queue.pop_front();
-                channel.epochs[1 - self.side.get()][1] =
-                    channel.epochs[1 - self.side.get()][1].wrapping_add(1);
+        let received = binding
+            .resource
+            .recv(self.side.get(), count, flags, true)
+            .expect("owner may receive rights")?;
+        let rights = if let Some(id) = received.rights {
+            if flags & 2 != 0 {
+                binding
+                    .rights
+                    .borrow()
+                    .get(&id)
+                    .expect("peek rights")
+                    .clone()
+            } else {
+                binding
+                    .rights
+                    .borrow_mut()
+                    .remove(&id)
+                    .expect("received rights")
             }
-            return Ok(LocalReceived {
-                data,
-                length,
-                truncated: count < length,
-                rights,
-            });
-        }
-        let mut data = Vec::new();
-        let mut rights = LocalRights::default();
-        for packet in queue.iter() {
-            let n = (count - data.len()).min(packet.data.len());
-            data.extend_from_slice(&packet.data[..n]);
-            if !packet.rights.is_empty() {
-                rights = packet.rights.clone();
-                break;
-            }
-            if data.len() == count {
-                break;
-            }
-        }
-        if flags & 2 == 0 {
-            // MSG_WAITALL waits for the requested stream bytes unless EOF or
-            // nonblocking mode permits a short read. Do not consume a prefix
-            // before a blocked syscall is retried by the guest scheduler.
-            if flags & 0x100 != 0
-                && flags & 0x40 == 0
-                && !eof
-                && data.len() < count
-                && rights.is_empty()
-            {
-                return Err(Errno(11));
-            }
-            let mut remaining = data.len();
-            while remaining != 0 {
-                let packet = queue.front_mut().expect("stream bytes");
-                let n = remaining.min(packet.data.len());
-                packet.data.drain(..n);
-                packet.rights = LocalRights::default();
-                remaining -= n;
-                if packet.data.is_empty() {
-                    queue.pop_front();
-                }
-            }
-        }
-        if flags & 2 == 0 && !data.is_empty() {
-            channel.epochs[1 - self.side.get()][1] =
-                channel.epochs[1 - self.side.get()][1].wrapping_add(1);
-        }
-        let length = data.len();
+        } else {
+            LocalRights::default()
+        };
         Ok(LocalReceived {
-            data,
-            length,
-            truncated: false,
+            data: received.data,
+            length: received.length,
+            truncated: received.truncated,
             rights,
         })
     }
@@ -426,49 +329,29 @@ impl LocalSocket {
         if !self.connected.get() {
             return (events & 4) | if self.kind == 2 { 0 } else { 16 };
         }
-        let binding = self.channel.borrow();
-        let channel = binding.borrow();
-        let peer = channel.ends[1 - self.side.get()].upgrade();
-        let eof = self.read_closed.get() || peer.as_ref().is_none_or(|s| s.write_closed.get());
-        let queue = &channel.queues[self.side.get()];
-        let send_queue = &channel.queues[1 - self.side.get()];
-        let room = PIPE_CAPACITY - send_queue.iter().map(|p| p.data.len()).sum::<usize>();
-        (if !queue.is_empty() || (eof && self.kind != 2) {
-            events & 1
-        } else {
-            0
-        }) | (if room != 0
-            && (send_queue.len() < 128
-                || self.kind == 1 && send_queue.back().is_some_and(|p| p.rights.is_empty()))
-        {
-            events & 4
-        } else {
-            0
-        }) | (if eof && self.kind != 2 {
-            events & 0x2000
-        } else {
-            0
-        }) | (if peer.is_none() || (eof && self.write_closed.get()) {
-            16
-        } else {
-            0
-        })
+        self.channel
+            .borrow()
+            .resource
+            .poll(self.side.get(), events)
+            .0
     }
 }
 impl Drop for LocalSocket {
     fn drop(&mut self) {
-        // Rights queued for a closed receiver must release their open files.
         let binding = self.channel.borrow();
-        let mut channel = binding.borrow_mut();
-        let queued = std::mem::take(&mut channel.queues[self.side.get()]);
-        for counter in &mut channel.epochs[1 - self.side.get()] {
-            *counter = counter.wrapping_add(1);
-        }
-        drop(channel);
-        // A queued FD can refer to the opposite endpoint of this channel.
-        drop(queued);
+        let ids = binding.resource.close(self.side.get());
+        let rights: Vec<_> = {
+            let mut ledger = binding.rights.borrow_mut();
+            ids.into_iter()
+                .filter_map(|id| ledger.remove(&id))
+                .collect()
+        };
+        // Nested endpoint destruction must happen with neither byte lock nor
+        // rights-map borrow held; LocalRights retains its bounded-stack drain.
+        drop(rights);
     }
 }
+
 impl Vfs {
     fn new_local(&self, kind: u32) -> Result<Rc<LocalSocket>> {
         self.new_local_in(kind, &self.root_network)
@@ -507,6 +390,7 @@ impl Vfs {
                     kind: FdKind::Socket,
                     flags: 2 | (flags & O_NONBLOCK),
                     position: 0,
+                    file_position: Arc::default(),
                     node: None,
                     pipe: None,
                     socket: None,

@@ -148,9 +148,16 @@ impl Linux {
     ) -> Result<u64> {
         let fd = a[0] as u32;
         self.vfs.fd_kind(fd)?;
+        Self::read_transport(a, memory, |count| self.read_bytes(fd, count, io))
+    }
+    pub(crate) fn read_transport(
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        read: impl FnOnce(usize) -> Result<Vec<u8>>,
+    ) -> Result<u64> {
         let count = a[2].min(MAX_WRITE as u64) as usize;
         Self::check(memory, a[1], count, Access::Write)?;
-        let bytes = self.read_bytes(fd, count, io)?;
+        let bytes = read(count)?;
         memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
         Ok(bytes.len() as u64)
     }
@@ -226,11 +233,40 @@ impl Linux {
         memory: &mut impl CpuMemory,
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
+        let records = self.vfs.is_eventfd(a[0] as u32)?;
+        Self::readv_transport_mode(a, memory, records, |count| {
+            self.read_bytes(a[0] as u32, count, io)
+        })
+    }
+    pub(crate) fn readv_transport_mode(
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        records: bool,
+        mut read: impl FnMut(usize) -> Result<Vec<u8>>,
+    ) -> Result<u64> {
         let (parts, count) = Self::readv_parts(memory, a)?;
-        let bytes = self.read_bytes(a[0] as u32, count, io)?;
-        Self::scatter(memory, &parts, &bytes)?;
-        Ok(bytes.len() as u64)
+        if !records {
+            let bytes = read(count)?;
+            Self::scatter(memory, &parts, &bytes)?;
+            return Ok(bytes.len() as u64);
+        }
+        let mut total = 0;
+        for (pointer, count) in parts {
+            if count == 0 {
+                continue;
+            }
+            let bytes = match read(count) {
+                Ok(bytes) => bytes,
+                Err(error) if total == 0 => return Err(error),
+                Err(_) => break,
+            };
+            memory.write(pointer, &bytes).map_err(|_| Errno(14))?;
+            total += bytes.len() as u64;
+            if bytes.len() < count {
+                break;
+            }
+        }
+        Ok(total)
     }
     pub fn write(
         &mut self,
@@ -248,11 +284,21 @@ impl Linux {
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
+        Self::write_transport(a, memory, bytes, |bytes| {
+            self.write_bytes(a[0] as u32, bytes, io)
+        })
+    }
+    pub(crate) fn write_transport(
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        bytes: &mut Vec<u8>,
+        write: impl FnOnce(&[u8]) -> Result<u64>,
+    ) -> Result<u64> {
         let count = a[2].min(MAX_WRITE as u64) as usize;
         Self::check(memory, a[1], count, Access::Read)?;
         bytes.resize(count, 0);
         memory.read(a[1], bytes).map_err(|_| Errno(14))?;
-        self.write_bytes(a[0] as u32, bytes, io)
+        write(bytes)
     }
     /// ARM64 positioned scalar I/O, shared by joined and in-epoch dispatch.
     pub fn positioned(
@@ -323,7 +369,18 @@ impl Linux {
         io: &mut impl GuestOutput,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
+        let records = self.vfs.is_eventfd(a[0] as u32)?;
+        Self::writev_transport_mode(a, memory, bytes, records, |bytes| {
+            self.write_bytes(a[0] as u32, bytes, io)
+        })
+    }
+    pub(crate) fn writev_transport_mode(
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        bytes: &mut Vec<u8>,
+        records: bool,
+        mut write: impl FnMut(&[u8]) -> Result<u64>,
+    ) -> Result<u64> {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
@@ -345,13 +402,33 @@ impl Linux {
         }
         bytes.resize(total, 0);
         let mut position = 0;
-        for (address, count) in vectors {
+        for &(address, count) in &vectors {
             memory
                 .read(address, &mut bytes[position..position + count])
                 .map_err(|_| Errno(14))?;
             position += count;
         }
-        self.write_bytes(a[0] as u32, bytes, io)
+        if !records {
+            return write(bytes);
+        }
+        let mut position = 0;
+        let mut total = 0;
+        for (_, count) in vectors {
+            if count == 0 {
+                continue;
+            }
+            let written = match write(&bytes[position..position + count]) {
+                Ok(written) => written,
+                Err(error) if total == 0 => return Err(error),
+                Err(_) => break,
+            };
+            total += written;
+            if written < count as u64 {
+                break;
+            }
+            position += count;
+        }
+        Ok(total)
     }
     pub fn positioned_vector(
         &mut self,
@@ -361,17 +438,12 @@ impl Linux {
     ) -> Result<u64> {
         self.positioned_vector_scratch(a, memory, write, &mut Vec::new())
     }
-    pub fn positioned_vector_scratch(
-        &mut self,
+    pub(crate) fn positioned_vector_parts(
+        memory: &impl CpuMemory,
         a: [u64; 6],
-        memory: &mut impl CpuMemory,
         write: bool,
-        bytes: &mut Vec<u8>,
-    ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
-        // Native arm64 uses the full 64-bit offset in pos_l (x3), not a 32-bit split.
-        let offset = a[3];
-        if offset > i64::MAX as u64 {
+    ) -> Result<(Vec<(u64, usize)>, usize)> {
+        if a[3] > i64::MAX as u64 {
             return Err(Errno(22));
         }
         if a[2] > 1024 {
@@ -400,17 +472,38 @@ impl Linux {
             parts.push((pointer, take));
             total += take;
         }
-        if write {
-            bytes.resize(total, 0);
-            let mut cursor = 0;
-            for (pointer, take) in parts {
-                if take != 0 {
-                    memory
-                        .read(pointer, &mut bytes[cursor..cursor + take])
-                        .map_err(|_| Errno(14))?;
-                }
-                cursor += take;
+        Ok((parts, total))
+    }
+    pub(crate) fn gather_parts(
+        memory: &impl CpuMemory,
+        parts: &[(u64, usize)],
+        total: usize,
+        bytes: &mut Vec<u8>,
+    ) -> Result<()> {
+        bytes.resize(total, 0);
+        let mut cursor = 0;
+        for &(pointer, take) in parts {
+            if take != 0 {
+                memory
+                    .read(pointer, &mut bytes[cursor..cursor + take])
+                    .map_err(|_| Errno(14))?;
             }
+            cursor += take;
+        }
+        Ok(())
+    }
+    pub fn positioned_vector_scratch(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        write: bool,
+        bytes: &mut Vec<u8>,
+    ) -> Result<u64> {
+        self.vfs.fd_kind(a[0] as u32)?;
+        let offset = a[3];
+        let (parts, total) = Self::positioned_vector_parts(memory, a, write)?;
+        if write {
+            Self::gather_parts(memory, &parts, total, bytes)?;
             Ok(self.vfs.pwrite(a[0] as u32, bytes, offset)? as u64)
         } else {
             let bytes = self.vfs.pread(a[0] as u32, total, offset)?;

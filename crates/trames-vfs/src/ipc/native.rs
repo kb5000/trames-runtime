@@ -9,6 +9,38 @@ use std::{
 use trames_shared::{NativeSocket, SharedFile, MAX_BYTES_OUT, MAX_FDS_OUT};
 use trames_wayland::Server;
 
+enum Grant {
+    Connection(u64),
+    Shared(SharedFile),
+}
+struct Grants {
+    server: Server,
+    fds: BTreeMap<u32, Grant>,
+}
+/// Authenticated capabilities of a frozen FD table, never VFS Rc or raw FDs.
+/// The caller must end this snapshot before mutating/reusing that table.
+#[derive(Clone, Default)]
+pub struct WaylandAuth(Option<Arc<Grants>>);
+impl WaylandAuth {
+    pub fn resolve(&self, fd: u32) -> Option<(Server, u64)> {
+        let grants = self.0.as_ref()?;
+        let token = match grants.fds.get(&fd)? {
+            Grant::Connection(token) => *token,
+            // Resolve compositor registration live, keeping its original
+            // inode identity lease; copied bytes cannot manufacture a grant.
+            Grant::Shared(file) => {
+                grants
+                    .server
+                    .snapshot()
+                    .wsi_connections
+                    .get(&file.key())?
+                    .connection
+            }
+        };
+        Some((grants.server.clone(), token))
+    }
+}
+
 struct Outgoing {
     bytes: Vec<u8>,
     fds: Vec<OwnedFd>,
@@ -40,7 +72,8 @@ struct PipeRelay {
 }
 impl PipeRelay {
     fn pump(&mut self) -> bool {
-        let mut pipe = self.guest.pipe.borrow_mut();
+        let pipe_ref = self.guest.pipe.borrow();
+        let mut pipe = pipe_ref.data.lock().unwrap();
         if self.to_native {
             if pipe.bytes.is_empty() {
                 return pipe.writers != 0;
@@ -102,6 +135,7 @@ impl OpenDescription {
             },
             flags: if write { 1 } else { 0 },
             position: 0,
+            file_position: Arc::default(),
             pipe: Some(PipeEnd::new(pipe, !write, write, false)),
             node: None,
             socket: None,
@@ -184,9 +218,10 @@ impl Connection {
     fn pump(&mut self, vfs: &Vfs, server: &Server) -> Result<bool> {
         let mut progress = false;
         self.relays.retain_mut(|relay| {
-            let before = relay.guest.pipe.borrow().bytes.len();
+            let before = relay.guest.pipe.borrow().data.lock().unwrap().bytes.len();
             let alive = relay.pump();
-            progress |= !alive || relay.guest.pipe.borrow().bytes.len() != before;
+            progress |=
+                !alive || relay.guest.pipe.borrow().data.lock().unwrap().bytes.len() != before;
             alive
         });
         self.exports.retain(|lease| !lease.claimed());
@@ -493,6 +528,39 @@ impl Vfs {
         };
         Ok((services.server.clone(), token))
     }
+    pub fn wayland_auth_snapshot(&self) -> WaylandAuth {
+        let services = self.native_services.borrow();
+        let Some(services) = services.as_ref() else {
+            return WaylandAuth::default();
+        };
+        let services = services.borrow();
+        if services.connections.is_empty() {
+            return WaylandAuth::default();
+        }
+        let mut fds = BTreeMap::new();
+        for (&fd, descriptor) in self.fds.iter() {
+            let description = descriptor.open.borrow();
+            let grant = if let Some(socket) = &description.local {
+                services
+                    .connections
+                    .iter()
+                    .find(|c| {
+                        !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
+                    })
+                    .map(|c| Grant::Connection(c.token))
+            } else {
+                drop(description);
+                self.shared_file(fd).ok().map(Grant::Shared)
+            };
+            if let Some(grant) = grant {
+                fds.insert(fd, grant);
+            }
+        }
+        WaylandAuth(Some(Arc::new(Grants {
+            server: services.server.clone(),
+            fds,
+        })))
+    }
     fn native_file_description(
         &self,
         fd: OwnedFd,
@@ -530,6 +598,7 @@ impl Vfs {
             kind: FdKind::Node(b"/memfd:wayland-resource".to_vec()),
             flags: 0,
             position: 0,
+            file_position: Arc::default(),
             node: Some(node),
             pipe: None,
             socket: None,
@@ -603,6 +672,39 @@ mod tests {
         assert!(!relay.pump());
         drop(relay);
         assert_eq!(reader.read(&mut bytes).unwrap(), 0);
+    }
+    #[test]
+    fn frozen_wayland_auth_carries_only_actual_connection_or_registered_inode_capabilities() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<WaylandAuth>();
+        let mut vfs = Vfs::default();
+        let _server = vfs.enable_wayland(b"/run/user/0").unwrap();
+        let fd = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
+        assert!(vfs.wayland_auth_snapshot().resolve(fd).is_none());
+        let socket = vfs.local_socket(fd).unwrap().unwrap();
+        let mut address = vec![1, 0];
+        address.extend_from_slice(b"/run/user/0/wayland-0\0");
+        vfs.local_connect(&socket, &address).unwrap();
+        let token = vfs.wayland_connection(fd).unwrap().1;
+        let alias = vfs.dup(fd, 0, false).unwrap();
+        let pair = vfs.socketpair(1, 1, 0).unwrap();
+        let copied = vfs.memfd_create(b"unregistered-wayland", 0).unwrap();
+        vfs.write(copied, b"copied capability bytes").unwrap();
+        let snapshot = vfs.wayland_auth_snapshot();
+        assert!(snapshot.resolve(copied).is_none());
+        assert!(snapshot.resolve(pair[0]).is_none());
+        assert!(snapshot.resolve(u32::MAX).is_none());
+        std::thread::spawn(move || {
+            assert_eq!(snapshot.resolve(fd).unwrap().1, token);
+            assert_eq!(snapshot.resolve(alias).unwrap().1, token);
+        })
+        .join()
+        .unwrap();
+        vfs.close(fd).unwrap();
+        let replacement = vfs.local_create(1, 0).unwrap();
+        assert_eq!(replacement, fd);
+        assert!(vfs.wayland_auth_snapshot().resolve(fd).is_none());
+        assert_eq!(vfs.wayland_auth_snapshot().resolve(alias).unwrap().1, token);
     }
     #[test]
     fn guest_unix_stream_reaches_the_native_wayland_server_with_standard_wire_messages() {

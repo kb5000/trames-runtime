@@ -599,7 +599,7 @@ impl Vfs {
             return Err(Errno(19));
         };
         if !matches!(data, FileData::Mapped(_)) {
-            let original = std::mem::replace(data, FileData::Memory(Vec::new()));
+            let original = std::mem::replace(data, FileData::memory(Vec::new()));
             *data = FileData::Mapped(Box::new(MappedData::new(original)));
         }
         offset.checked_add(len).ok_or(Errno(22))?;
@@ -866,7 +866,7 @@ mod tests {
     }
     #[test]
     fn eof_placeholders_stay_zero_and_growth_updates_existing_mappings() {
-        let data = MappedData::new(FileData::Memory(vec![17; 10]));
+        let data = MappedData::new(FileData::memory(vec![17; 10]));
         let pages = data.batch(0, 32 * PAGE_SIZE).unwrap();
         assert!(matches!(*pages[0].bytes.borrow(), PageStorage::Heap(_)));
         assert!(pages[1..]

@@ -1784,6 +1784,16 @@ pub(super) fn accessed(node: &mut Node, mount: Option<&Rc<Mount>>) {
     if node.volatile || mount.is_some_and(|m| m.readonly()) {
         return;
     }
+    if let Content::File(storage::FileData::Plain(data)) = &node.content {
+        if let Some(meta) = data.accessed(
+            false,
+            mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0),
+        ) {
+            node.mode = meta.mode;
+            node.times = meta.times;
+            return;
+        }
+    }
     let now = storage::Timestamp::now();
     let atime = node.times[0];
     if mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0)

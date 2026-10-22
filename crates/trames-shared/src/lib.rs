@@ -16,6 +16,8 @@ use std::{
     },
 };
 
+mod readiness;
+pub use readiness::{IoSignal, IoSubscription, IoWake, Readiness};
 mod pipe;
 pub use pipe::NativePipe;
 pub const MAX_SHARED_BYTES: usize = 128 * 1024 * 1024;

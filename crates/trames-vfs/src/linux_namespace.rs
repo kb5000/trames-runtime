@@ -421,6 +421,7 @@ impl Vfs {
             kind: FdKind::Anonymous,
             flags: 0,
             position: 0,
+            file_position: Arc::default(),
             node: None,
             pipe: None,
             socket: None,
