@@ -3,6 +3,67 @@ use super::*;
 use std::{os::unix::process::ExitStatusExt, process::Command};
 
 #[test]
+fn software_zero_publication_keeps_coordinator_reads_coherent() {
+    let mut memory = Memory::default();
+    let base = 0x40000;
+    memory.map(base, 65536, Permissions::RW).unwrap();
+    // Warm the coordinator before a worker materializes independent software
+    // storage; its old zero-filled CPU arena must never hide the real bytes.
+    assert_eq!(memory.read_array::<8>(base).unwrap(), [0; 8]);
+    let mut registry = crate::parallel::Registry::default();
+    let mut view = memory.parallel_view(&mut registry).unwrap();
+    view.write_array(base, [42u8; 8]).unwrap();
+    assert_eq!(view.read_array::<8>(base).unwrap(), [42; 8]);
+    drop(view);
+    memory.commit_parallel().unwrap();
+    assert_eq!(memory.read_array::<8>(base).unwrap(), [42; 8]);
+    memory.write_array(base + 8, [17u8; 8]).unwrap();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    assert_eq!(view.read_array::<8>(base).unwrap(), [42; 8]);
+    assert_eq!(view.read_array::<8>(base + 8).unwrap(), [17; 8]);
+    assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+}
+
+#[test]
+fn untouched_worker_pages_release_physical_va_on_fork() {
+    let base = 0x400000;
+    let mut parent = Memory::default();
+    parent.mmu.granule = 16384;
+    parent
+        .map(base, 4 * WINDOW as u64, Permissions::RW)
+        .unwrap();
+    let physical: Vec<_> = parent
+        .mmu
+        .windows
+        .borrow()
+        .values()
+        .map(|window| Arc::downgrade(window.mapping.as_ref().unwrap()))
+        .collect();
+    assert!(!physical.is_empty());
+    let mut registry = crate::parallel::Registry::default();
+    let view = parent.parallel_view(&mut registry).unwrap();
+    assert_eq!(view.read_array::<8>(base).unwrap(), [0; 8]);
+    drop(view);
+    parent.commit_parallel().unwrap();
+    let mut child = parent.clone();
+    assert!(
+        physical.iter().all(|owner| owner.upgrade().is_none()),
+        "unwritten worker pages must not pin retired physical windows across fork"
+    );
+    assert_eq!(parent.resident_bytes(), 0);
+    assert_eq!(child.resident_bytes(), 0);
+    let mut view = child.parallel_view(&mut registry).unwrap();
+    view.write_array(base + PAGE_SIZE, [42u8; 8]).unwrap();
+    drop(view);
+    child.commit_parallel().unwrap();
+    assert_eq!(child.resident_bytes(), PAGE_SIZE as usize);
+    assert_eq!(child.read_array::<8>(base + PAGE_SIZE).unwrap(), [42; 8]);
+    assert_eq!(parent.read_array::<8>(base + PAGE_SIZE).unwrap(), [0; 8]);
+    parent.write_array(base + PAGE_SIZE, [17u8; 8]).unwrap();
+    assert_eq!(child.read_array::<8>(base + PAGE_SIZE).unwrap(), [42; 8]);
+}
+
+#[test]
 fn forked_untouched_parallel_pages_stay_sparse_when_host_groups_relocate() {
     let base = 0x40000;
     let len = 16 * PAGE_SIZE;
@@ -268,12 +329,18 @@ fn fork_remap_discard_and_native_calls_never_leave_stale_hardware_aliases() {
 fn worker_cpu_aliases_native_bytes_and_dirty_publication_share_one_region_protocol() {
     let mut memory = Memory::default();
     memory.map(0x40000, 65536, Permissions::RW).unwrap();
+    // This case specifically exercises physical CPU aliases. Unwritten sparse
+    // zeros now keep software storage until real writes; materialize the host
+    // groups before freezing their physical addresses for this view.
+    for address in (0x40000..0x50000).step_by(PAGE_SIZE as usize) {
+        memory.write_array(address, [0u8]).unwrap();
+    }
     let mut registry = parallel::Registry::default();
     let mut worker = memory.parallel_view(&mut registry).unwrap();
     let peer = worker.clone();
-    assert_eq!(worker.mmu_read::<8>(0x40000), None);
+    assert_eq!(worker.mmu_read::<8>(0x40000), Some([0; 8]));
     assert_eq!(worker.read_array::<8>(0x40000), Ok([0; 8]));
-    assert_eq!(memory.resident_bytes(), 0);
+    assert_eq!(memory.resident_bytes(), 65536);
     worker.write_array(0x40000, [7; 8]).unwrap();
     assert_eq!(worker.mmu_read::<8>(0x40000), Some([7; 8]));
     assert_eq!(peer.mmu_read::<8>(0x40000), Some([7; 8]));

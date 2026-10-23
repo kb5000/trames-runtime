@@ -4,17 +4,17 @@ use super::*;
 
 impl Snapshot {
     pub(super) fn refresh_mmu_all(&mut self) {
-        let addresses: Vec<_> = self.pages.keys().copied().collect();
-        self.refresh_mmu(&addresses);
+        let addresses: Slots<_> = self.pages.keys().copied().collect();
+        self.refresh_mmu(addresses);
     }
-    pub(super) fn refresh_mmu(&mut self, changed: &[u64]) {
+    pub(super) fn refresh_mmu(&mut self, changed: impl IntoIterator<Item = u64>) {
         let granule = self.mmu.granule();
         if granule == 0 {
             return;
         }
         let groups: BTreeSet<_> = changed
-            .iter()
-            .map(|&address| address & !(granule as u64 - 1))
+            .into_iter()
+            .map(|address| address & !(granule as u64 - 1))
             .collect();
         for base in groups {
             let mut permissions = None;

@@ -500,19 +500,11 @@ impl Memory {
                     bytes.copy_within(si..si + count, di);
                 }
             } else {
-                let (d, s) = if df < sf {
-                    let (left, right) = self.frames.split_at_mut(sf);
-                    (
-                        left[df].as_mut().expect("destination"),
-                        right[0].as_ref().expect("source"),
-                    )
-                } else {
-                    let (left, right) = self.frames.split_at_mut(df);
-                    (
-                        right[0].as_mut().expect("destination"),
-                        left[sf].as_ref().expect("source"),
-                    )
-                };
+                let (destination, source) = self.frames.pair_mut(df, sf);
+                let (d, s) = (
+                    destination.as_mut().expect("destination"),
+                    source.as_ref().expect("source"),
+                );
                 let destination = Rc::make_mut(&mut d.bytes);
                 // Distinct private source pages cannot alias: a fork detaches
                 // the destination before taking either byte guard.

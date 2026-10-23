@@ -342,11 +342,18 @@ impl Arena {
     }
     /// Cached only in the owning Memory's page TLB. Mapping edits and arena
     /// retirement flush that TLB before any alias can be replaced or unmapped.
-    pub fn page_alias(&self, base: u64) -> usize {
+    pub fn page_alias(&self, base: u64, bytes: &PageBytes) -> usize {
         let Some(window) = self.reached(base) else {
             return 0;
         };
         let offset = (base - window.base) as usize;
+        // A logical zero may have acquired software shared storage on its
+        // first worker write. The old coordinator window still contains zeros;
+        // only expose an alias when it addresses this page's actual bytes.
+        // This runs on TLB fill, never on a warmed ordinary operand.
+        if !bytes.belongs(window.mapping.as_ref().unwrap(), offset) {
+            return 0;
+        }
         if window.flags[offset >> window.shift].load(Ordering::Relaxed) & ELIGIBLE == 0 {
             return 0;
         }

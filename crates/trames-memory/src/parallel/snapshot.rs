@@ -199,7 +199,7 @@ impl Memory {
             .iter()
             .filter_map(|&base| snapshot.remove_frame(base).map(|frame| (base, frame)))
             .collect();
-        let mmu_changed: Vec<_> = changed.iter().copied().collect();
+        let mmu_changed: Slots<_> = changed.iter().copied().collect();
         for base in changed {
             let Some(&root_frame) = self.pages.get(&base) else {
                 continue;
@@ -225,7 +225,7 @@ impl Memory {
             )?;
             snapshot.insert_frame(frame, page.backing.is_some(), shared_futex_page_key(page));
         }
-        snapshot.refresh_mmu(&mmu_changed);
+        snapshot.refresh_mmu(mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
         snapshot.identity = self.identity;

@@ -291,8 +291,7 @@ fn prepare_frame(
                 }
                 (*old).clone()
             });
-            let slot = owned
-                .is_zero()
+            let slot = (owned.is_zero() && page.charge.resident())
                 .then(|| registry.mmu.slot(space, base))
                 .flatten();
             let shared = Arc::new(SharedPage::from_owned(owned, slot));
@@ -425,12 +424,12 @@ pub(super) struct Snapshot {
     alias_count: usize,
     backed_pages: BTreeSet<u64>,
     backings: snapshot::BackingIndex,
-    positions: Vec<Option<usize>>,
+    positions: Slots<Option<usize>>,
     backing_revision: u64,
     identity: u64,
     code_revision: u64,
     pages: BTreeMap<u64, usize>,
-    frames: Vec<Frame>,
+    frames: Slots<Frame>,
     // One bit per virtual frame, independent of the physical dirty fragments.
     // Workers mark reached frames; only the joined coordinator clears bits.
     dirty_pages: Arc<[AtomicU64]>,
@@ -1026,7 +1025,11 @@ impl Memory {
         registry: &mut Registry,
     ) {
         let page = self.frames[frame].as_ref().expect("mapped frame");
-        if page.backing.is_some() {
+        // Untouched anonymous zeros need neither RAM nor a physical VA owner.
+        // Publishing them into mapped storage would retain whole windows over
+        // fork even though no guest store has ever charged these bytes. The
+        // existing SharedPage::zero path allocates only on its first write.
+        if page.backing.is_some() || !page.charge.resident() {
             return;
         }
         let forked = Rc::strong_count(&page.bytes) > 1;
@@ -1169,14 +1172,14 @@ impl Memory {
                 u64::from(cache.snapshot.code_revision != self.code_revision);
         }
         let old = self.parallel_cache.take();
-        let mut frames = Vec::with_capacity(self.pages.len());
-        let mut positions = vec![None; self.frames.len()];
+        let mut frames = Slots::new();
+        let mut positions: Slots<_> = (0..self.frames.len()).map(|_| None).collect();
         let mut pages = BTreeMap::new();
         let mut identities = BTreeMap::new();
         let mut alias_count = 0usize;
         let mut backed_pages = BTreeSet::new();
         let mut backings = snapshot::BackingIndex::default();
-        let mapped: Vec<_> = self
+        let mapped: Slots<_> = self
             .pages
             .iter()
             .map(|(&base, &frame)| (base, frame))
@@ -1199,11 +1202,12 @@ impl Memory {
             positions[root_frame] = Some(frames.len());
             frames.push(frame);
         }
+        let dynamic_code_pages = frames.iter().filter(|frame| frame.dynamic_code).count();
         let mut snapshot = Snapshot {
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
-            dynamic_code: frames.iter().any(|frame| frame.dynamic_code),
-            dynamic_code_pages: frames.iter().filter(|frame| frame.dynamic_code).count(),
+            dynamic_code: dynamic_code_pages != 0,
+            dynamic_code_pages,
             identities,
             alias_count,
             backed_pages,

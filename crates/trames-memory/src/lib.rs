@@ -11,12 +11,14 @@ mod pinned;
 pub use pinned::PinnedBuffer;
 mod reservations;
 mod residency;
+mod slots;
 use backing::Backed;
 pub use backing::{backing_changed, PageBacking};
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use residency::{Account, Charge};
+use slots::Slots;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -208,8 +210,8 @@ pub struct Memory {
     pages: BTreeMap<u64, usize>,
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
-    frames: Vec<Option<Page>>,
-    free_frames: Vec<usize>,
+    frames: Slots<Option<Page>>,
+    free_frames: Slots<usize>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     limit: usize,
     account: std::sync::Arc<Account>,
@@ -336,8 +338,8 @@ impl Memory {
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
-            frames: Vec::new(),
-            free_frames: Vec::new(),
+            frames: Slots::new(),
+            free_frames: Slots::new(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit,
             account: Account::new(limit),
@@ -418,7 +420,7 @@ impl Memory {
             frame,
             page.permissions,
             page.backing.is_some(),
-            self.mmu.page_alias(base),
+            self.mmu.page_alias(base, &page.bytes),
         );
         if page.charge.resident() {
             entry.tag |= Translation::RESIDENT;
