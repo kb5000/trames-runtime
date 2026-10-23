@@ -233,6 +233,50 @@ fn retained_readonly_fork_storage_is_not_mistaken_for_unique_bytes() {
 }
 
 #[test]
+fn pin_registration_invalidates_cached_private_ownership_without_rebuilding_other_pages() {
+    let mut memory = owned();
+    // A former registration leaves stable heap storage behind. Registering it
+    // again changes ownership without changing its allocation or permissions.
+    drop(memory.pin_rw(0x40000, 8).unwrap());
+    let mut registry = Registry::default();
+    let mut before = memory.parallel_view(&mut registry).unwrap();
+    admit(&mut before);
+    assert!(before
+        .frame_guard(before.frame(0x40000, Access::Read).unwrap(), 0, 8)
+        .is_exclusive());
+    drop(before);
+
+    let pin = memory.pin_rw(0x40000, 8).unwrap();
+    let mut view = memory.parallel_view(&mut registry).unwrap();
+    admit(&mut view);
+    let frame = view.frame(0x40000, Access::Read).unwrap();
+    assert_eq!(frame.private_access, 0);
+    assert!(!view.frame_guard(frame, 0, 8).is_exclusive());
+    let neighbor = view.frame(0x41000, Access::Write).unwrap();
+    assert!(view.frame_guard(neighbor, 0, 8).is_exclusive());
+    pin.write(0, &[42; 8]).unwrap();
+    assert_eq!(view.read_array::<8>(0x40000).unwrap(), [42; 8]);
+    assert_eq!(registry.metrics.full_rebuilds, 1);
+    assert_eq!(registry.metrics.incremental_pages, 1);
+    drop(view);
+
+    // A protected VA is still writable through its registration. Read-only
+    // epoch admission must not expose an unlocked Rust read beside that pin.
+    memory.protect(0x40000, PAGE_SIZE, Permissions::R).unwrap();
+    let mut a = memory.parallel_view(&mut registry).unwrap();
+    let mut b = a.clone();
+    // SAFETY: these are every View of this VM; its source stays quiescent.
+    assert!(unsafe { View::try_private_epoch(&mut [&mut a, &mut b]) });
+    let frame = a.frame(0x40000, Access::Read).unwrap();
+    assert_eq!(frame.private_access, 0);
+    assert!(!a.frame_guard(frame, 0, 8).is_exclusive());
+    std::thread::spawn(move || pin.write(0, &[73; 8]).unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(a.read_array::<8>(0x40000).unwrap(), [73; 8]);
+}
+
+#[test]
 fn native_unwind_ends_private_borrows_and_keeps_dirty_and_monitor_effects() {
     let mut memory = owned();
     let mut registry = Registry::default();

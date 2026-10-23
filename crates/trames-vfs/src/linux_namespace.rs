@@ -76,34 +76,37 @@ impl Drop for CgroupNamespace {
 
 struct Uts {
     inode: u64,
-    names: RefCell<[Vec<u8>; 2]>,
-    live: Rc<Cell<usize>>,
+    names: std::sync::Mutex<[Vec<u8>; 2]>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Drop for Uts {
     fn drop(&mut self) {
-        self.live.set(self.live.get() - 1);
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 #[derive(Clone)]
-pub struct UtsNamespace(Rc<Uts>);
+pub struct UtsNamespace(Arc<Uts>);
 impl Default for UtsNamespace {
     fn default() -> Self {
-        Self::new([b"trames".to_vec(), b"(none)".to_vec()], Rc::default())
+        Self::new([b"trames".to_vec(), b"(none)".to_vec()], Arc::default())
             .expect("initial UTS namespace")
     }
 }
 impl UtsNamespace {
-    fn new(names: [Vec<u8>; 2], live: Rc<Cell<usize>>) -> Result<Self> {
-        if live.get() >= MAX_NAMESPACES {
-            return Err(Errno(28));
-        }
+    fn new(names: [Vec<u8>; 2], live: Arc<std::sync::atomic::AtomicUsize>) -> Result<Self> {
+        live.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < MAX_NAMESPACES).then_some(n + 1)
+        })
+        .map_err(|_| Errno(28))?;
         let inode = NEXT_INODE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Errno(28))?;
-        live.set(live.get() + 1);
-        Ok(Self(Rc::new(Uts {
+            .map_err(|_| {
+                live.fetch_sub(1, Ordering::Relaxed);
+                Errno(28)
+            })?;
+        Ok(Self(Arc::new(Uts {
             inode,
-            names: RefCell::new(names),
+            names: std::sync::Mutex::new(names),
             live,
         })))
     }
@@ -111,13 +114,35 @@ impl UtsNamespace {
         self.0.inode
     }
     pub fn name(&self, domain: bool) -> Vec<u8> {
-        self.0.names.borrow()[usize::from(domain)].clone()
+        self.0.names.lock().unwrap()[usize::from(domain)].clone()
     }
     fn copy(&self) -> Result<Self> {
-        Self::new(self.0.names.borrow().clone(), self.0.live.clone())
+        Self::new(self.0.names.lock().unwrap().clone(), self.0.live.clone())
     }
     pub(super) fn label(&self) -> Vec<u8> {
         format!("uts:[{}]", self.id()).into_bytes()
+    }
+}
+/// The UTS object is live and shared; only mutation authority is frozen for
+/// a worker epoch. Credentials/unshare/setns still commit at the task boundary.
+#[derive(Clone)]
+pub struct UtsAccess {
+    namespace: UtsNamespace,
+    authorized: bool,
+}
+impl UtsAccess {
+    pub fn names(&self) -> [Vec<u8>; 2] {
+        self.namespace.0.names.lock().unwrap().clone()
+    }
+    pub fn set(&self, domain: bool, name: &[u8]) -> Result<()> {
+        if !self.authorized {
+            return Err(Errno(1));
+        }
+        if name.len() > 64 {
+            return Err(Errno(22));
+        }
+        self.namespace.0.names.lock().unwrap()[usize::from(domain)] = name.to_vec();
+        Ok(())
     }
 }
 
@@ -165,33 +190,34 @@ impl NamespaceHandle {
 
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
-    uts: Weak<Uts>,
+    uts: std::sync::Weak<Uts>,
     pub(super) net: Weak<RootNetwork>,
     ipc: Weak<IpcNamespace>,
     cgroup: Weak<CgroupNamespace>,
-    pub(super) pid: Weak<pid_namespace::PidSpace>,
-    pub(super) pid_children: Weak<pid_namespace::PidSpace>,
+    pub(super) pid: std::sync::Weak<pid_namespace::PidSpace>,
+    pub(super) pid_children: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
     pub(super) root: Option<(Weak<Mount>, Weak<RefCell<Node>>)>,
 }
 
 impl Vfs {
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
+        let paths = self.context.paths.borrow();
         NamespaceSnapshot {
-            uts: Rc::downgrade(&self.uts.0),
+            uts: Arc::downgrade(&self.uts.0),
             net: Rc::downgrade(&self.root_network),
             ipc: Rc::downgrade(&self.ipc_namespace),
             cgroup: Rc::downgrade(&self.cgroup_namespace),
-            pid: Rc::downgrade(&self.pid_ns.0),
-            pid_children: Rc::downgrade(&self.pid_children.0),
+            pid: Arc::downgrade(&self.pid_ns.0),
+            pid_children: Arc::downgrade(&self.pid_children.0),
             mount: self
                 .mounts
                 .as_ref()
                 .map_or_else(Weak::new, |n| Rc::downgrade(&n.0)),
-            root: self.root_mount.as_ref().map(|m| {
+            root: paths.root_mount.as_ref().map(|m| {
                 (
                     Rc::downgrade(m),
-                    Rc::downgrade(self.root_node.as_ref().unwrap_or(&m.root)),
+                    Rc::downgrade(paths.root_node.as_ref().unwrap_or(&m.root)),
                 )
             }),
         }
@@ -291,14 +317,13 @@ impl Vfs {
         Ok(())
     }
     pub fn set_uts_name(&mut self, domain: bool, name: &[u8]) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
-            return Err(Errno(1));
+        self.uts_capability().set(domain, name)
+    }
+    pub fn uts_capability(&self) -> UtsAccess {
+        UtsAccess {
+            namespace: self.uts.clone(),
+            authorized: self.credentials.has_cap(capabilities::SYS_ADMIN),
         }
-        if name.len() > 64 {
-            return Err(Errno(22));
-        }
-        self.uts.0.names.borrow_mut()[usize::from(domain)] = name.to_vec();
-        Ok(())
     }
     pub fn uts_name(&self, domain: bool) -> Vec<u8> {
         self.uts.name(domain)
@@ -334,10 +359,11 @@ impl Vfs {
             NamespaceHandle::Mount(ns) => {
                 let root = ns.0.borrow().root.clone();
                 self.mounts = Some(ns);
-                self.root_node = Some(root.root.clone());
-                self.cwd_node = Some(root.root.clone());
-                self.root_mount = Some(root.clone());
-                self.cwd_mount = Some(root);
+                let mut paths = self.context.paths.borrow_mut();
+                paths.root_node = Some(root.root.clone());
+                paths.cwd_node = Some(root.root.clone());
+                paths.root_mount = Some(root.clone());
+                paths.cwd_mount = Some(root);
             }
         }
         Ok(())
@@ -419,9 +445,10 @@ impl Vfs {
             id: ns.id(),
             owner: (0, 0),
             kind: FdKind::Anonymous,
-            flags: 0,
+            flags: (0).into(),
             position: 0,
             file_position: Arc::default(),
+            flock: OnceCell::new(),
             node: None,
             pipe: None,
             socket: None,
@@ -450,8 +477,9 @@ impl Vfs {
         if !self.allowed(&node.borrow(), 1) {
             return Err(Errno(13));
         }
-        self.root_mount = path.mount;
-        self.root_node = Some(node);
+        let mut paths = self.context.paths.borrow_mut();
+        paths.root_mount = path.mount;
+        paths.root_node = Some(node);
         Ok(())
     }
 }
@@ -706,6 +734,70 @@ mod tests {
         assert!(v.stat_at(AT_FDCWD, b"/private-cgroup/outer").is_err());
         v.setns(root, CLONE_NEWCGROUP).unwrap();
         assert_eq!(v.cgroup_view_path(b"/outer"), b"/outer");
+    }
+    #[test]
+    fn worker_uts_names_and_last_namespace_reference_share_real_state() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<UtsNamespace>();
+        send_sync::<UtsAccess>();
+        let mut v = Vfs::default();
+        let root = v.uts_capability();
+        let old = v.namespace_snapshot().uts;
+        let quota = v.uts.0.live.clone();
+        v.unshare_uts().unwrap();
+        let isolated = v.uts_capability();
+        std::thread::scope(|scope| {
+            scope.spawn(|| root.set(false, b"original-worker").unwrap());
+            scope.spawn(|| isolated.set(false, b"private-worker").unwrap());
+        });
+        assert_eq!(v.uts_name(false), b"private-worker");
+        assert_eq!(root.names()[0], b"original-worker");
+        assert_eq!(quota.load(Ordering::Relaxed), 2);
+        v.credentials = Credentials::user(1000, 1000);
+        let denied = v.uts_capability();
+        std::thread::spawn(move || {
+            assert_eq!(denied.set(false, b"denied"), Err(Errno(1)));
+            drop(root);
+        })
+        .join()
+        .unwrap();
+        assert!(old.upgrade().is_none());
+        assert_eq!(quota.load(Ordering::Relaxed), 1);
+        drop(v);
+        std::thread::spawn(move || drop(isolated)).join().unwrap();
+        assert_eq!(quota.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn concurrent_namespace_reservations_do_not_exceed_quota() {
+        let ns = UtsNamespace::default();
+        let mut retained = Vec::new();
+        for _ in 1..MAX_NAMESPACES - 1 {
+            retained.push(ns.copy().unwrap());
+        }
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let results = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                let ns = ns.clone();
+                let gate = gate.clone();
+                threads.push(scope.spawn(move || {
+                    gate.wait();
+                    ns.copy()
+                }));
+            }
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| *e == Errno(28)));
+        assert_eq!(ns.0.live.load(Ordering::Relaxed), MAX_NAMESPACES);
+        std::thread::spawn(move || drop(results)).join().unwrap();
+        assert!(ns.copy().is_ok());
     }
     #[test]
     fn namespace_fd_pins_identity_across_unshare_and_setns() {

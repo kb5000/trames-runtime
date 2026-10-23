@@ -170,14 +170,27 @@ impl Drop for PipeGuard<'_> {
     }
 }
 
+/// A frozen poll-only capability; no FD table, Rc or guest memory is retained.
+pub trait DirectPoll: Send + Sync {
+    fn identity(&self) -> usize;
+    fn poll(&self, events: u16) -> (u16, [u64; 2]);
+    fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription;
+}
 #[derive(Clone)]
 enum ByteResource {
+    Kmsg(Arc<kernel_log::Kmsg>),
+    PollOnly(Arc<dyn DirectPoll>),
     Event(Arc<EventCounter>),
     Timer(Arc<TimerFd>),
+    Inotify(inotify::Capability),
     Epoll(Arc<DirectEpoll>),
     Unix {
         data: Arc<ipc::channel::Resource>,
         side: usize,
+    },
+    Pty {
+        data: Arc<pty::PtyIo>,
+        master: bool,
     },
     Pipe {
         data: Arc<PipeResource>,
@@ -191,20 +204,52 @@ struct DirectEpoll {
     watches: Vec<DirectWatch>,
     cursor: Arc<Mutex<Option<(u32, u64)>>>,
 }
-/// A retained resource with flags frozen by the current FD mutation boundary.
+/// Retained byte authority with immutable access bits and live OFD status.
 /// It is Send + Sync by composition; no unsafe Rc/RefCell conversion is used.
 #[derive(Clone)]
 pub struct DirectFd {
     resource: ByteResource,
     flags: u32,
+    status: StatusFlags,
 }
 impl DirectFd {
+    // A conservative scheduling hint, never an access/FD authority check.
+    // Watches share their underlying byte resources; nested epoll is rejected
+    // at registration, so this traversal cannot cycle.
+    fn shares_resource(&self, other: &Self) -> bool {
+        match (&self.resource, &other.resource) {
+            (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
+            (ByteResource::Epoll(a), _) => {
+                a.watches.iter().any(|(_, _, fd)| fd.shares_resource(other))
+            }
+            (_, ByteResource::Epoll(b)) => {
+                b.watches.iter().any(|(_, _, fd)| self.shares_resource(fd))
+            }
+            (ByteResource::Event(a), ByteResource::Event(b)) => Arc::ptr_eq(a, b),
+            (ByteResource::Timer(a), ByteResource::Timer(b)) => Arc::ptr_eq(a, b),
+            (ByteResource::Inotify(a), ByteResource::Inotify(b)) => Arc::ptr_eq(&a.queue, &b.queue),
+            (ByteResource::Pipe { data: a, .. }, ByteResource::Pipe { data: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (ByteResource::Unix { data: a, .. }, ByteResource::Unix { data: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (ByteResource::Pty { data: a, .. }, ByteResource::Pty { data: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
+            ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => vec![timer.readiness.subscribe(signal)],
+            ByteResource::Inotify(queue) => vec![queue.readiness.subscribe(signal)],
             ByteResource::Pipe { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Unix { data, .. } => vec![data.readiness.subscribe(signal)],
+            ByteResource::Pty { data, .. } => vec![data.subscribe(signal)],
             ByteResource::Epoll(epoll) => epoll
                 .watches
                 .iter()
@@ -214,10 +259,14 @@ impl DirectFd {
         }
     }
     pub(super) fn snapshot(open: &OpenDescription) -> Option<Self> {
-        let resource = if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
+        let resource = if let Some(log) = &open.kernel_log {
+            ByteResource::Kmsg(log.clone())
+        } else if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
             ByteResource::Event(counter.clone())
         } else if let Some(events::Anonymous::Timer(timer)) = &open.anonymous {
             ByteResource::Timer(timer.clone())
+        } else if let Some(events::Anonymous::Inotify(instance)) = &open.anonymous {
+            ByteResource::Inotify(instance.capability())
         } else if let Some(events::Anonymous::Epoll { watches, cursor }) = &open.anonymous {
             let mut direct = Vec::new();
             for (&key, watch) in watches {
@@ -233,26 +282,141 @@ impl DirectFd {
         } else if matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
             let end = open.pipe.as_ref()?;
             ByteResource::Pipe {
-                data: end.pipe.borrow().data.clone(),
+                data: end.data.clone(),
                 read: end.read,
                 write: end.write,
                 initial_write_epoch: end.initial_write_epoch,
             }
         } else if let Some((data, side)) = open.local.as_ref().and_then(|s| s.direct()) {
             ByteResource::Unix { data, side }
+        } else if let Some(end) = &open.pty {
+            ByteResource::Pty {
+                data: end.pair.io.clone(),
+                master: end.master,
+            }
         } else {
             return None;
         };
         Some(Self {
             resource,
-            flags: open.flags,
+            flags: open.flags.get(),
+            status: open.flags.clone(),
         })
+    }
+    /// Ring RECV has an explicit copied/reported length ABI. Keep the general
+    /// scalar syscall snapshot's existing admission unchanged.
+    pub(super) fn snapshot_uring(open: &OpenDescription) -> Option<Self> {
+        Self::snapshot(open).or_else(|| {
+            let (data, side) = open.local.as_ref()?.direct_message()?;
+            Some(Self {
+                resource: ByteResource::Unix { data, side },
+                flags: open.flags.get(),
+                status: open.flags.clone(),
+            })
+        })
+    }
+    fn snapshot_poll(
+        open: &OpenDescription,
+        polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
+    ) -> Option<Self> {
+        let resource = match &open.anonymous {
+            Some(events::Anonymous::Uring(ring)) => {
+                ByteResource::PollOnly(polls.get(&(Rc::as_ptr(ring) as usize))?.clone())
+            }
+            Some(events::Anonymous::Epoll { watches, cursor }) => {
+                let mut direct = Vec::new();
+                for (&key, watch) in watches {
+                    if let Some(target) = watch.open.upgrade() {
+                        direct.push((
+                            key,
+                            watch.state.clone(),
+                            Self::snapshot_poll(&target.borrow(), polls)?,
+                        ));
+                    }
+                }
+                ByteResource::Epoll(Arc::new(DirectEpoll {
+                    watches: direct,
+                    cursor: cursor.clone(),
+                }))
+            }
+            _ => return Self::snapshot(open),
+        };
+        Some(Self {
+            resource,
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+        })
+    }
+    pub fn is_poll_only(&self) -> bool {
+        matches!(self.resource, ByteResource::PollOnly(_))
+    }
+    pub fn poll_identities(&self) -> Vec<usize> {
+        match &self.resource {
+            ByteResource::PollOnly(poll) => vec![poll.identity()],
+            ByteResource::Epoll(epoll) => epoll
+                .watches
+                .iter()
+                .filter(|(_, state, _)| state.lock().unwrap().armed)
+                .flat_map(|(_, _, fd)| fd.poll_identities())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
     pub fn is_epoll(&self) -> bool {
         matches!(self.resource, ByteResource::Epoll(_))
     }
     pub fn is_unix(&self) -> bool {
         matches!(self.resource, ByteResource::Unix { .. })
+    }
+    pub fn is_pty(&self) -> bool {
+        matches!(self.resource, ByteResource::Pty { .. })
+    }
+    pub fn is_inotify(&self) -> bool {
+        matches!(self.resource, ByteResource::Inotify(_))
+    }
+    pub fn inotify_remove(&self, wd: i32) -> Result<u64> {
+        let ByteResource::Inotify(queue) = &self.resource else {
+            return Err(Errno(22));
+        };
+        if self.flags & O_PATH != 0 {
+            return Err(Errno(22));
+        }
+        queue.remove_watch(wd).map(|()| 0)
+    }
+    pub fn terminal_query(&self, request: u32) -> Option<Vec<u8>> {
+        if self.flags & O_PATH != 0 {
+            return None;
+        }
+        match &self.resource {
+            ByteResource::Pty { data, .. } => data.query(request),
+            _ => None,
+        }
+    }
+    pub fn terminal_read(
+        &self,
+        count: usize,
+        access: Option<pty::TerminalAccess>,
+    ) -> Option<Result<Vec<u8>>> {
+        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+            return Some(Err(Errno(9)));
+        }
+        match &self.resource {
+            ByteResource::Pty { data, master } => data.read(*master, count, access),
+            _ => None,
+        }
+    }
+    pub fn terminal_write(
+        &self,
+        bytes: &[u8],
+        access: Option<pty::TerminalAccess>,
+    ) -> Option<Result<usize>> {
+        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+            return Some(Err(Errno(9)));
+        }
+        match &self.resource {
+            ByteResource::Pty { data, master } => data.write(*master, bytes, access),
+            _ => None,
+        }
     }
     pub fn timer(&self) -> Option<&TimerFd> {
         if let ByteResource::Timer(timer) = &self.resource {
@@ -263,6 +427,10 @@ impl DirectFd {
     }
     pub fn poll_ready(&self, events: u16) -> Option<u16> {
         (!self.is_epoll()).then(|| self.poll(events).0)
+    }
+    /// Preserve the original poll epoch for worker multishot edge detection.
+    pub fn poll_state(&self, events: u16) -> Option<(u16, [u64; 2])> {
+        (!self.is_epoll()).then(|| self.poll(events))
     }
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         match &self.resource {
@@ -283,13 +451,18 @@ impl DirectFd {
     pub fn has_readable_bytes(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::Unix { .. } | ByteResource::Pipe { .. }
+            ByteResource::Unix { .. }
+                | ByteResource::Pipe { .. }
+                | ByteResource::Pty { .. }
+                | ByteResource::Inotify(_)
         )
     }
     pub fn readable_bytes(&self) -> usize {
         match &self.resource {
             ByteResource::Unix { data, side } => data.readable_bytes(*side),
             ByteResource::Pipe { data, .. } => data.lock().unwrap().bytes.len(),
+            ByteResource::Pty { data, master } => data.readable_bytes(*master),
+            ByteResource::Inotify(queue) => queue.available(),
             _ => unreachable!("readable byte resource"),
         }
     }
@@ -301,9 +474,13 @@ impl DirectFd {
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
+            ByteResource::Kmsg(log) => log.poll(events),
+            ByteResource::PollOnly(poll) => poll.poll(events),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
             ByteResource::Timer(timer) => timer.poll(events),
+            ByteResource::Inotify(queue) => queue.poll(events),
             ByteResource::Unix { data, side } => data.poll(*side, events),
+            ByteResource::Pty { data, master } => data.poll_state(*master, events),
             ByteResource::Pipe {
                 data,
                 read,
@@ -360,8 +537,26 @@ impl DirectFd {
     pub fn is_eventfd(&self) -> bool {
         matches!(self.resource, ByteResource::Event(_))
     }
+    pub fn is_kmsg(&self) -> bool {
+        matches!(self.resource, ByteResource::Kmsg(_))
+    }
+    pub fn kmsg_seek(&self, offset: i64, whence: u32) -> Result<u64> {
+        if self.flags & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        let ByteResource::Kmsg(log) = &self.resource else {
+            return Err(Errno(29));
+        };
+        log.seek(offset, whence)
+    }
+    pub fn readv_records(&self) -> bool {
+        matches!(
+            self.resource,
+            ByteResource::Event(_) | ByteResource::Inotify(_)
+        )
+    }
     pub fn nonblocking(&self) -> bool {
-        self.flags & O_NONBLOCK != 0
+        self.status.get() & O_NONBLOCK != 0
     }
     pub fn read(&self, count: usize) -> Result<Vec<u8>> {
         self.read_attempt(count).unwrap_or(Err(Errno(95)))
@@ -375,9 +570,11 @@ impl DirectFd {
             return Some(Err(Errno(9)));
         }
         Some(match &self.resource {
+            ByteResource::Kmsg(log) => log.read(count),
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Timer(timer) => timer.read(count),
-            ByteResource::Epoll(_) => Err(Errno(22)),
+            ByteResource::Inotify(queue) => queue.read(count),
+            ByteResource::Epoll(_) | ByteResource::PollOnly(_) => Err(Errno(22)),
             ByteResource::Pipe { data, read, .. } => {
                 if !read {
                     return Some(Err(Errno(9)));
@@ -385,17 +582,32 @@ impl DirectFd {
                 data.lock().unwrap().read(count)
             }
             ByteResource::Unix { .. } => unreachable!("handled Unix receive"),
+            ByteResource::Pty { .. } => return self.terminal_read(count, None),
         })
     }
     pub fn recv(&self, count: usize, flags: u32) -> Option<Result<Vec<u8>>> {
+        self.recv_counted(count, flags)
+            .map(|r| r.map(|(bytes, _)| bytes))
+    }
+    /// MSG_TRUNC reports the original packet length without extending the
+    /// copied data. Both paths use the original Unix byte/rights algorithm.
+    pub fn recv_counted(&self, count: usize, flags: u32) -> Option<Result<(Vec<u8>, usize)>> {
         if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
             return Some(Err(Errno(9)));
         }
         let ByteResource::Unix { data, side } = &self.resource else {
             return None;
         };
-        data.recv(*side, count, flags, false)
-            .map(|r| r.map(|r| r.data))
+        data.recv(*side, count, flags, false).map(|r| {
+            r.map(|r| {
+                let length = if flags & 0x20 != 0 {
+                    r.length
+                } else {
+                    r.data.len()
+                };
+                (r.data, length)
+            })
+        })
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
         if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
@@ -411,9 +623,14 @@ impl DirectFd {
             return Err(Errno(9));
         }
         match &self.resource {
+            ByteResource::Kmsg(log) => log.write(bytes),
             ByteResource::Event(counter) => counter.write(bytes),
-            ByteResource::Epoll(_) | ByteResource::Timer(_) => Err(Errno(22)),
+            ByteResource::Epoll(_)
+            | ByteResource::PollOnly(_)
+            | ByteResource::Timer(_)
+            | ByteResource::Inotify(_) => Err(Errno(22)),
             ByteResource::Unix { .. } => self.send(bytes, 0),
+            ByteResource::Pty { .. } => self.terminal_write(bytes, None).unwrap_or(Err(Errno(95))),
             ByteResource::Pipe { data, write, .. } => {
                 if !write {
                     return Err(Errno(9));
@@ -430,17 +647,50 @@ impl DirectFds {
     pub fn get(&self, fd: u32) -> Option<&DirectFd> {
         self.0.get(fd as usize)?.as_ref()
     }
+    /// Related retained resources can justify admitting a blocked I/O peer
+    /// alongside one runnable task. Unrelated idle terminals/control pipes
+    /// alone must not force a CPU-only process off the serial MMU path.
+    pub fn shares_resources(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .any(|a| other.0.iter().flatten().any(|b| a.shares_resource(b)))
+    }
 }
 impl Vfs {
+    /// Legacy record readers consume each nonempty iovec independently.
+    /// A single inotify event cannot be split across two short destinations.
+    pub fn readv_records(&self, fd: u32) -> Result<bool> {
+        Ok(matches!(
+            self.descriptor(fd)?.open.borrow().anonymous,
+            Some(events::Anonymous::Event(_) | events::Anonymous::Inotify(_))
+        ))
+    }
     pub fn is_eventfd(&self, fd: u32) -> Result<bool> {
         Ok(matches!(
             self.descriptor(fd)?.open.borrow().anonymous,
             Some(events::Anonymous::Event(_))
         ))
     }
+    pub fn direct_descriptors_with_polls(
+        &self,
+        polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
+    ) -> DirectFds {
+        let mut entries = vec![
+            None;
+            self.fds
+                .entries()
+                .last_key_value()
+                .map_or(0, |(&fd, _)| fd as usize + 1)
+        ];
+        for (&fd, descriptor) in self.fds.entries().iter() {
+            entries[fd as usize] = DirectFd::snapshot_poll(&descriptor.open.borrow(), polls);
+        }
+        DirectFds(entries.into())
+    }
     pub fn direct_descriptors(&self) -> DirectFds {
         let revision = FD_FLAGS_REVISION.load(Ordering::Relaxed);
-        if let Some((old, snapshot)) = &*self.fds.identity.direct.borrow() {
+        if let Some((old, snapshot)) = &*self.fds.identity().direct.borrow() {
             if *old == revision {
                 return snapshot.clone();
             }
@@ -448,7 +698,7 @@ impl Vfs {
         // Flags and resources are built together with ONE descriptor scan.
         self.fd_flags_snapshot();
         self.fds
-            .identity
+            .identity()
             .direct
             .borrow()
             .as_ref()
@@ -462,6 +712,43 @@ impl Vfs {
 mod tests {
     use super::*;
     use std::{thread, time::Duration};
+    #[test]
+    fn cohort_resource_hint_follows_aliases_peer_ends_and_epoll_watches() {
+        let mut sender = Vfs::default();
+        let [read, write] = sender.pipe(0).unwrap();
+        let mut receiver = sender.clone();
+        sender.close(read).unwrap();
+        receiver.close(write).unwrap();
+        let epoll = receiver.epoll_create(0).unwrap();
+        receiver.epoll_ctl(epoll, 1, read, 1, 42).unwrap();
+        assert!(sender
+            .direct_descriptors()
+            .shares_resources(&receiver.direct_descriptors()));
+        let mut other = Vfs::default();
+        other.pipe(0).unwrap();
+        assert!(!sender
+            .direct_descriptors()
+            .shares_resources(&other.direct_descriptors()));
+        let [a, b] = sender.socketpair(1, 1, 0).unwrap();
+        let mut peer = sender.clone();
+        sender.close(b).unwrap();
+        peer.close(a).unwrap();
+        peer.close(write).unwrap();
+        assert!(sender
+            .direct_descriptors()
+            .shares_resources(&peer.direct_descriptors()));
+        assert!(
+            DirectFd::snapshot(&receiver.descriptor(epoll).unwrap().open.borrow())
+                .unwrap()
+                .shares_resource(sender.direct_descriptors().get(write).unwrap())
+        );
+        // A snapshot comparison may retain bytes but cannot keep the endpoint
+        // open or authorize an I/O operation through an epoll watch.
+        sender.close(write).unwrap();
+        assert!(!sender
+            .direct_descriptors()
+            .shares_resources(&receiver.direct_descriptors()));
+    }
 
     #[test]
     fn last_close_in_a_different_fd_table_invalidates_epoll_resource_snapshot() {
@@ -671,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn fd_reuse_and_fork_status_changes_rebuild_shared_handles() {
+    fn fd_reuse_keeps_handles_distinct_and_fork_status_is_live() {
         let mut vfs = Vfs::default();
         let fd = vfs.eventfd(1, 0).unwrap();
         let old = vfs.direct_descriptors();
@@ -679,7 +966,7 @@ mod tests {
         let mut child = vfs.clone();
         child.set_status_flags(fd, O_NONBLOCK).unwrap();
         assert!(vfs.direct_descriptors().get(alias).unwrap().nonblocking());
-        assert!(!old.get(fd).unwrap().nonblocking());
+        assert!(old.get(fd).unwrap().nonblocking());
         vfs.close(fd).unwrap();
         let new_fd = vfs.eventfd(7, 0).unwrap();
         assert_eq!(fd, new_fd);

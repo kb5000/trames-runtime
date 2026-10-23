@@ -2,17 +2,26 @@
 //! Guest OOM preferences. Allocation limits still return ENOMEM; there is no
 //! guest OOM victim selector. Never changes the host process's OOM policy.
 use crate::*;
+use std::sync::atomic::AtomicU32;
 
 /// Task lifetime and signal-group preference are distinct: an open proc file
 /// must not keep a dead task alive, even while another thread survives.
 #[derive(Default)]
 pub struct OomTask {
-    score: Rc<Cell<(i32, i32)>>,
+    // Score and the privileged floor form one invariant. Both fit in i16;
+    // update the pair atomically, without a task/global lock or byte barriers.
+    score: Arc<AtomicU32>,
+}
+fn pack(value: i32, minimum: i32) -> u32 {
+    u32::from(value as i16 as u16) | (u32::from(minimum as i16 as u16) << 16)
+}
+fn unpack(pair: u32) -> (i32, i32) {
+    (pair as u16 as i16 as i32, (pair >> 16) as u16 as i16 as i32)
 }
 impl OomTask {
     pub fn fork(&self) -> Self {
         Self {
-            score: Rc::new(Cell::new(self.score.get())),
+            score: Arc::new(AtomicU32::new(self.score.load(Ordering::Relaxed))),
         }
     }
     pub fn thread(&self) -> Self {
@@ -21,7 +30,7 @@ impl OomTask {
         }
     }
     fn read(&self, offset: u64, count: usize) -> Vec<u8> {
-        let value = format!("{}\n", self.score.get().0).into_bytes();
+        let value = format!("{}\n", unpack(self.score.load(Ordering::Relaxed)).0).into_bytes();
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(value.len());
@@ -59,18 +68,24 @@ impl OomTask {
         if !(-1000..=1000).contains(&value) {
             return Err(Errno(22));
         }
-        let (_, minimum) = self.score.get();
-        if value < minimum && !privileged {
-            return Err(Errno(13));
+        if privileged {
+            self.score.store(pack(value, value), Ordering::Relaxed);
+        } else {
+            // Retest the floor if another writer changes it before commit.
+            // A stale permission check must not overwrite a newer floor.
+            self.score
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |pair| {
+                    let (_, minimum) = unpack(pair);
+                    (value >= minimum).then(|| pack(value, minimum))
+                })
+                .map_err(|_| Errno(13))?;
         }
-        self.score
-            .set((value, if privileged { value } else { minimum }));
         Ok(count)
     }
 }
 
 impl Vfs {
-    pub(super) fn oom_for_path(&self, at: &ResolvedPath) -> Option<Weak<OomTask>> {
+    pub(super) fn oom_for_path(&self, at: &ResolvedPath) -> Option<std::sync::Weak<OomTask>> {
         if !self.uses_pseudo(at) || !self.pseudo.borrow().enabled {
             return None;
         }
@@ -120,6 +135,59 @@ impl Vfs {
 mod tests {
     use super::*;
     #[test]
+    fn concurrent_score_and_privilege_floor_updates_remain_one_atomic_state() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<OomTask>();
+        let task = OomTask::default();
+        let gate = Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            for rank in 0..4 {
+                let task = task.thread();
+                let gate = gate.clone();
+                scope.spawn(move || {
+                    gate.wait();
+                    for i in 0..4096 {
+                        if rank == 0 {
+                            let values: [&[u8]; 3] = [b"500", b"-300", b"100"];
+                            task.write(values[i % 3], true).unwrap();
+                        } else {
+                            let values: [&[u8]; 3] = [b"-299", b"499", b"1000"];
+                            let result = task.write(values[(i + rank) % 3], false);
+                            assert!(result.is_ok() || result == Err(Errno(13)));
+                        }
+                        let (score, minimum) = unpack(task.score.load(Ordering::Relaxed));
+                        assert!(score >= minimum);
+                        assert!((-1000..=1000).contains(&score));
+                        // Fork snapshots the pair, not two racing scalar loads.
+                        let child = task.fork();
+                        let (score, minimum) = unpack(child.score.load(Ordering::Relaxed));
+                        assert!(score >= minimum);
+                    }
+                });
+            }
+        });
+        task.write(b"500", true).unwrap();
+        assert_eq!(task.thread().write(b"499", false), Err(Errno(13)));
+        assert_eq!(task.read(0, 32), b"500\n");
+    }
+    #[test]
+    fn worker_final_task_release_does_not_wait_for_surviving_group_member() {
+        let task = Arc::new(OomTask::default());
+        let observer = Arc::downgrade(&task);
+        let sibling = task.thread();
+        std::thread::spawn(move || {
+            task.write(b"-100", true).unwrap();
+            // Actual final task identity dies on this worker; shared group
+            // preference remains independently usable by another live task.
+            drop(task);
+        })
+        .join()
+        .unwrap();
+        assert!(observer.upgrade().is_none());
+        assert_eq!(sibling.read(0, 32), b"-100\n");
+        assert_eq!(sibling.write(b"-101", false), Err(Errno(13)));
+    }
+    #[test]
     fn privilege_floor_fork_sharing_and_invalid_writes_are_atomic() {
         let parent = OomTask::default();
         assert_eq!(parent.write(b"-400", true), Ok(4));
@@ -140,14 +208,14 @@ mod tests {
     #[test]
     fn proc_control_checks_dac_mount_and_retains_only_weak_task_identity() {
         let mut v = Vfs::default();
-        let task = Rc::new(OomTask::default());
+        let task = Arc::new(OomTask::default());
         v.set_runtime_info(
             1,
             RuntimeInfo {
                 processes: vec![ProcessInfo {
                     pid: 1,
                     tgid: 1,
-                    oom: Rc::downgrade(&task),
+                    oom: Arc::downgrade(&task),
                     credentials: Credentials::user(1000, 1000),
                     ..Default::default()
                 }],
@@ -197,8 +265,8 @@ mod tests {
     #[test]
     fn task_paths_use_thread_credentials_and_thread_lifetime() {
         let mut v = Vfs::default();
-        let leader = Rc::new(OomTask::default());
-        let thread = Rc::new(leader.thread());
+        let leader = Arc::new(OomTask::default());
+        let thread = Arc::new(leader.thread());
         v.set_runtime_info(
             1,
             RuntimeInfo {
@@ -206,14 +274,14 @@ mod tests {
                     ProcessInfo {
                         pid: 1,
                         tgid: 1,
-                        oom: Rc::downgrade(&leader),
+                        oom: Arc::downgrade(&leader),
                         credentials: Credentials::user(1000, 1000),
                         ..Default::default()
                     },
                     ProcessInfo {
                         pid: 2,
                         tgid: 1,
-                        oom: Rc::downgrade(&thread),
+                        oom: Arc::downgrade(&thread),
                         credentials: Credentials::user(2000, 2000),
                         ..Default::default()
                     },

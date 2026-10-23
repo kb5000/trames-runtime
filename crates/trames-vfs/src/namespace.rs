@@ -1,46 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Vfs {
-    pub fn flock(&mut self, fd: u32, operation: u32) -> Result<()> {
-        if operation & !15 != 0 || !matches!(operation & !4, 1 | 2 | 8) {
-            return Err(Errno(22));
-        }
-        let open = self.descriptor(fd)?.open.clone();
-        let inode = open.borrow().node.as_ref().ok_or(Errno(9))?.borrow().inode;
-        let mut fs = self.fs.borrow_mut();
-        fs.flock.retain(|_, owners| {
-            owners.retain(|(owner, _)| owner.strong_count() != 0);
-            !owners.is_empty()
-        });
-        let owners = fs.flock.entry(inode).or_default();
-        let kind = operation & !4;
-        // Linux conversion drops this description's old lock before competing
-        // for the new one; it is not an atomic lock upgrade.
-        owners.retain(|(owner, _)| {
-            !owner
-                .upgrade()
-                .is_some_and(|other| Rc::ptr_eq(&other, &open))
-        });
-        if kind != 8
-            && owners.iter().any(|(owner, lock)| {
-                owner
-                    .upgrade()
-                    .is_some_and(|other| !Rc::ptr_eq(&other, &open) && (kind == 2 || *lock == 2))
-            })
-        {
-            return Err(Errno(11));
-        }
-        owners.retain(|(owner, _)| {
-            !owner
-                .upgrade()
-                .is_some_and(|other| Rc::ptr_eq(&other, &open))
-        });
-        if kind != 8 {
-            owners.push((Rc::downgrade(&open), kind));
-        }
-        Ok(())
-    }
-
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
         let source = self.resolve_final(oldfd, old, false)?;
         let dest = self.resolve_final(newfd, new, false)?;
@@ -234,7 +194,8 @@ impl Vfs {
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
         self.fd_writable(fd)?;
-        let open = self.descriptor(fd)?.open.borrow();
+        let open_descriptor = self.descriptor(fd)?;
+        let open = open_descriptor.open.borrow();
         let n = open.metadata_node().ok_or(Errno(22))?;
         if matches!(n.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));

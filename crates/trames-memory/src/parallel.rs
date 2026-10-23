@@ -192,6 +192,12 @@ struct Frame {
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
     private_access: u8,
 }
+fn shared_futex_page_key(page: &Page) -> Option<(u64, u64)> {
+    page.backing
+        .as_ref()
+        .filter(|b| b.shared)
+        .and_then(|b| b.object.parallel_key())
+}
 fn direct_matches(page: &Page, frame: &Frame) -> bool {
     let storage = page
         .backing
@@ -757,6 +763,16 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
+        let address = address & 0x00ff_ffff_ffff_ffff;
+        self.reached(address, 4, Access::Read)?;
+        Ok(self
+            .snapshot
+            .backings
+            .futex
+            .get(&(address - address % PAGE_SIZE))
+            .map(|&(identity, offset)| (identity, offset, address % PAGE_SIZE)))
+    }
     fn cpu_read_chunk<T>(
         &self,
         address: u64,
@@ -1043,11 +1059,7 @@ impl Memory {
             return shared.borrow().shared_futex_key(address);
         }
         let page = self.page_for_access(address, 4, Access::Read)?;
-        Ok(page
-            .backing
-            .as_ref()
-            .filter(|b| b.shared)
-            .and_then(|b| b.object.parallel_key())
+        Ok(shared_futex_page_key(page)
             .map(|(identity, offset)| (identity, offset, address % PAGE_SIZE)))
     }
     /// Freeze mapping metadata while retaining coherent shared bytes. The host
@@ -1181,7 +1193,7 @@ impl Memory {
             *count += 1;
             if page.backing.is_some() {
                 backed_pages.insert(base);
-                backings.insert(base, frame.backing_domain);
+                backings.insert(base, frame.backing_domain, shared_futex_page_key(page));
             }
             pages.insert(base, frames.len());
             positions[root_frame] = Some(frames.len());

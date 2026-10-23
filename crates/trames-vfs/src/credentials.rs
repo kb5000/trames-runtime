@@ -342,7 +342,8 @@ impl Vfs {
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
         self.fd_writable(fd)?;
-        let open = self.descriptor(fd)?.open.borrow();
+        let open_descriptor = self.descriptor(fd)?;
+        let open = open_descriptor.open.borrow();
         let node = open.metadata_node().ok_or(Errno(22))?;
         self.chown_node(node, uid, gid, open.node.is_some())
     }

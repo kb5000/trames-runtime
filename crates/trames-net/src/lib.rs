@@ -13,8 +13,8 @@ mod rtnetlink;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
 pub use native::{
-    decode_address, encode_address, NetError, NetworkMode, Received, MAX_BUFFER, MAX_SOCKETS,
-    MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
+    decode_address, encode_address, DirectTcp, NetError, NetworkMode, Received, TcpLease,
+    MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
 };
 use std::{cell::Cell, net::SocketAddr, rc::Rc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
@@ -269,6 +269,15 @@ impl Socket {
     fn wrap(backend: SocketBackend, namespace: Rc<netlink::Namespace>) -> Rc<Self> {
         namespace.socket_count.set(namespace.socket_count.get() + 1);
         Rc::new(Self(backend, namespace, [Cell::new(None), Cell::new(None)]))
+    }
+    /// Frozen connected-native transport capability, rebuilt each cohort.
+    /// Descriptor/namespace/policy mutation still requires all workers joined.
+    pub fn direct_tcp(&self) -> Option<DirectTcp> {
+        match &self.0 {
+            SocketBackend::Native(s) => s.direct_tcp(),
+            SocketBackend::Hybrid(s) => s.direct_tcp(),
+            _ => None,
+        }
     }
     /// Guest socket timeouts are enforced by the virtual task scheduler; host
     /// sockets remain nonblocking. The shared socket owns them across dup/fork.

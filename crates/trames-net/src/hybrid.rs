@@ -169,6 +169,12 @@ impl Socket {
                 })
                 .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
     }
+    pub fn direct_tcp(&self) -> Option<DirectTcp> {
+        if self.path.get() != Path::Native {
+            return None;
+        }
+        self.native.borrow().as_ref()?.direct_tcp()
+    }
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
         let mut epoch = if self.path.get() != Path::Guest {
             self.native().ok()?.poll_epoch()?

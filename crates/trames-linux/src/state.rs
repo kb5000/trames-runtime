@@ -5,9 +5,14 @@ use trames_memory::{
     Access, CpuMemory, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE,
 };
 use trames_vfs::capabilities;
-use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH, O_NONBLOCK};
+use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH};
 
 type Result<T> = std::result::Result<T, Errno>;
+pub(crate) struct VectorImport {
+    pub parts: Vec<(u64, usize)>,
+    pub total: usize,
+    pub requested: u64,
+}
 
 // Keep anonymous PROT_NONE cages/stacks away from the ordinary mmap cursor.
 // Otherwise a large virtual-only reservation scatters subsequent small heap
@@ -15,8 +20,9 @@ type Result<T> = std::result::Result<T, Errno>;
 // Memory's sparse reservation table finds/reuses holes without committing RAM.
 const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 
-#[derive(Clone)]
 pub struct Linux {
+    pub(crate) uring_clock: std::time::Instant,
+    pub(crate) uring_active: Vec<std::rc::Weak<trames_vfs::Uring>>,
     pub vfs: Vfs,
     pub trace: bool,
     pub arguments: Vec<Vec<u8>>,
@@ -26,22 +32,55 @@ pub struct Linux {
     pub command_name: Vec<u8>,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
-    brk_base: u64,
-    brk: u64,
-    mmap_next: u64,
+    heap: crate::heap::Heap,
     clear_child_tid: u64,
+}
+impl Clone for Linux {
+    fn clone(&self) -> Self {
+        self.clone_with_files(false)
+    }
+}
+impl Linux {
+    /// Clone task context while choosing Files, FS and VM allocation domains.
+    /// CLONE_FILES never allocates a temporary private FD map or flag cells.
+    pub fn clone_with_files(&self, shared: bool) -> Self {
+        self.clone_with_resources(shared, false, false)
+    }
+    pub fn clone_with_resources(
+        &self,
+        shared_files: bool,
+        shared_fs: bool,
+        shared_vm: bool,
+    ) -> Self {
+        Self {
+            uring_clock: self.uring_clock,
+            uring_active: self.uring_active.clone(),
+            vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
+            trace: self.trace,
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
+            executable_path: self.executable_path.clone(),
+            executable_file: self.executable_file.clone(),
+            command_name: self.command_name.clone(),
+            argument_pointers: self.argument_pointers.clone(),
+            auxiliary: self.auxiliary.clone(),
+            heap: if shared_vm {
+                self.heap.shared()
+            } else {
+                self.heap.clone()
+            },
+            clear_child_tid: self.clear_child_tid,
+        }
+    }
 }
 
 impl Linux {
-    /// Scalar CLONE_VM allocation context; the bytes/page tables are already
-    /// shared by Memory. Used only at joined syscall boundaries.
+    /// Diagnostic snapshot only; normal syscalls do not compare or propagate it.
     pub fn heap_context(&self) -> (u64, u64, u64) {
-        (self.brk_base, self.brk, self.mmap_next)
+        (self.heap.base(), self.heap.current(), self.heap.cursor())
     }
-    pub fn share_heap_from(&mut self, other: &Self) {
-        self.brk_base = other.brk_base;
-        self.brk = other.brk;
-        self.mmap_next = other.mmap_next;
+    pub fn program_break(&self) -> crate::ProgramBreak {
+        self.heap.break_capability()
     }
     pub fn clear_tid_address(&self) -> u64 {
         self.clear_child_tid
@@ -56,6 +95,8 @@ impl Linux {
     }
     pub fn new(brk_base: u64) -> Self {
         Self {
+            uring_clock: std::time::Instant::now(),
+            uring_active: Vec::new(),
             vfs: Vfs::default(),
             trace: false,
             arguments: Vec::new(),
@@ -65,9 +106,7 @@ impl Linux {
             command_name: Vec::new(),
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
-            brk_base,
-            brk: brk_base,
-            mmap_next: 0x1000_0000,
+            heap: crate::heap::Heap::new(brk_base),
             clear_child_tid: 0,
         }
     }
@@ -233,7 +272,7 @@ impl Linux {
         memory: &mut impl CpuMemory,
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
-        let records = self.vfs.is_eventfd(a[0] as u32)?;
+        let records = self.vfs.readv_records(a[0] as u32)?;
         Self::readv_transport_mode(a, memory, records, |count| {
             self.read_bytes(a[0] as u32, count, io)
         })
@@ -443,6 +482,15 @@ impl Linux {
         a: [u64; 6],
         write: bool,
     ) -> Result<(Vec<(u64, usize)>, usize)> {
+        Self::positioned_vector_import(memory, a, write).map(|v| (v.parts, v.total))
+    }
+    /// Import each iovec once. Keep the uncapped length for io_uring link
+    /// short-transfer rules without re-reading a mutable guest vector table.
+    pub(crate) fn positioned_vector_import(
+        memory: &impl CpuMemory,
+        a: [u64; 6],
+        write: bool,
+    ) -> Result<VectorImport> {
         if a[3] > i64::MAX as u64 {
             return Err(Errno(22));
         }
@@ -454,8 +502,11 @@ impl Linux {
         let mut total = 0usize;
         let mut requested = 0u64;
         for i in 0..a[2] {
-            let pointer = memory.read_u64(a[1] + i * 16).map_err(|_| Errno(14))?;
-            let length = memory.read_u64(a[1] + i * 16 + 8).map_err(|_| Errno(14))?;
+            let vector = memory
+                .read_array::<16>(a[1] + i * 16)
+                .map_err(|_| Errno(14))?;
+            let pointer = u64::from_le_bytes(vector[..8].try_into().unwrap());
+            let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
             requested = requested
                 .checked_add(length)
                 .filter(|n| *n <= i64::MAX as u64)
@@ -472,7 +523,11 @@ impl Linux {
             parts.push((pointer, take));
             total += take;
         }
-        Ok((parts, total))
+        Ok(VectorImport {
+            parts,
+            total,
+            requested,
+        })
     }
     pub(crate) fn gather_parts(
         memory: &impl CpuMemory,
@@ -522,15 +577,27 @@ impl Linux {
         } else {
             Self::path(memory, a[1])?
         };
+        Self::statx_path(&self.vfs, a, &path, memory)
+    }
+    pub(crate) fn statx_path(
+        vfs: &Vfs,
+        a: [u64; 6],
+        path: &[u8],
+        memory: &mut Memory,
+    ) -> Result<u64> {
+        let flags = a[2] as u32;
+        if flags & !0x7900 != 0 || flags & 0x6000 == 0x6000 || a[3] as u32 & 0x80000000 != 0 {
+            return Err(Errno(22));
+        }
+        Self::check(memory, a[4], 256, Access::Write)?;
         let stat = if path.is_empty() && flags & 0x1000 != 0 {
             if a[0] as i32 == -100 {
-                self.vfs.stat_at(-100, b".")?
+                vfs.stat_at(-100, b".")?
             } else {
-                self.vfs.stat_fd(a[0] as u32)?
+                vfs.stat_fd(a[0] as u32)?
             }
         } else {
-            self.vfs
-                .stat_at_flags(a[0] as i32, &path, flags & 0x100 != 0)?
+            vfs.stat_at_flags(a[0] as i32, path, flags & 0x100 != 0)?
         };
         let mut out = [0u8; 256];
         out[..4].copy_from_slice(&0x17ffu32.to_le_bytes()); // BASIC_STATS and MNT_ID; no birth time.
@@ -556,13 +623,12 @@ impl Linux {
         }
         let mount = if path.is_empty() && flags & 0x1000 != 0 {
             if a[0] as i32 == -100 {
-                self.vfs.mount_id_at(-100, b".", false)?
+                vfs.mount_id_at(-100, b".", false)?
             } else {
-                self.vfs.mount_id_fd(a[0] as u32)?
+                vfs.mount_id_fd(a[0] as u32)?
             }
         } else {
-            self.vfs
-                .mount_id_at(a[0] as i32, &path, flags & 0x100 != 0)?
+            vfs.mount_id_at(a[0] as i32, path, flags & 0x100 != 0)?
         };
         out[144..152].copy_from_slice(&mount.to_le_bytes());
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
@@ -577,27 +643,28 @@ impl Linux {
             .ok_or(Errno(22))
     }
     fn brk(&mut self, address: u64, memory: &mut Memory) -> u64 {
-        if address == 0 || address < self.brk_base || address >= ADDRESS_LIMIT {
-            return self.brk;
+        let current = self.heap.current();
+        if address == 0 || address < self.heap.base() || address >= ADDRESS_LIMIT {
+            return current;
         }
         let Some(new_end) = address
             .checked_add(PAGE_SIZE - 1)
             .map(|n| n & !(PAGE_SIZE - 1))
         else {
-            return self.brk;
+            return current;
         };
-        let old_end = (self.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let old_end = (current + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if new_end > old_end
             && memory
                 .map(old_end, new_end - old_end, Permissions::RW)
                 .is_err()
         {
-            return self.brk;
+            return current;
         }
         if new_end < old_end && memory.unmap(new_end, old_end - new_end).is_err() {
-            return self.brk;
+            return current;
         }
-        self.brk = address;
+        self.heap.set_current(address);
         address
     }
     fn memory_errno(e: MemoryError) -> Errno {
@@ -645,7 +712,7 @@ impl Linux {
             let start = if reservation {
                 RESERVATION_BASE
             } else {
-                self.mmap_next
+                self.heap.cursor()
             };
             memory.find_free(start, len).ok_or(Errno(12))?
         };
@@ -696,7 +763,7 @@ impl Linux {
         // cursor. Scudo deliberately probes randomized high addresses; moving
         // every later allocation there creates enormous sparse region spans.
         if !fixed && !hinted && !reservation {
-            self.mmap_next = address + len;
+            self.heap.set_cursor(address + len);
         }
         Ok(address)
     }
@@ -724,7 +791,7 @@ impl Linux {
             let start = if reservation {
                 RESERVATION_BASE
             } else {
-                self.mmap_next
+                self.heap.cursor()
             };
             memory.find_free(start, new_len).ok_or(Errno(12))?
         } else {
@@ -734,7 +801,7 @@ impl Linux {
             .remap(a[0], old_len, address, new_len, fixed)
             .map_err(Self::memory_errno)?;
         if address != a[0] && !fixed && !reservation {
-            self.mmap_next = address + new_len;
+            self.heap.set_cursor(address + new_len);
         }
         Ok(address)
     }
@@ -790,6 +857,17 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            425 => self.uring_setup(a, memory),
+            426 => self
+                .uring_enter(a, memory, None, 0)
+                .and_then(|(count, ready)| {
+                    if ready {
+                        Ok(count as u64)
+                    } else {
+                        Err(Errno(11))
+                    }
+                }),
+            427 => self.uring_register(a, memory),
             280 => self.bpf_syscall(a, memory),
             5..=16 => self.xattr_syscall(number, a, memory),
             51 => {
@@ -797,14 +875,8 @@ impl Linux {
                 self.vfs.chroot(&path)?;
                 Ok(0)
             }
-            161 | 162 => {
-                if a[1] > 64 {
-                    return Err(Errno(22));
-                }
-                let mut name = vec![0; a[1] as usize];
-                memory.read(a[0], &mut name).map_err(|_| Errno(14))?;
-                self.vfs.set_uts_name(number == 162, &name)?;
-                Ok(0)
+            number @ 160..=162 => {
+                crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
             }
             71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
                 self.file_syscall(number, a, memory, io)
@@ -820,27 +892,7 @@ impl Linux {
                     .close_range(a[0] as u32, a[1] as u32, a[2] as u32)?;
                 Ok(0)
             }
-            116 => {
-                let action = a[0] as u32;
-                if matches!(action, 9 | 10) {
-                    return self.vfs.syslog_size(action);
-                }
-                let count = if matches!(action, 2..=4) {
-                    if (a[2] as u32 as i32) < 0 {
-                        return Err(Errno(22));
-                    }
-                    let count = (a[2] as u32 as usize).min(trames_vfs::kernel_log_capacity());
-                    Self::check(memory, a[1], count, Access::Write)?;
-                    count
-                } else {
-                    0
-                };
-                let bytes = self.vfs.syslog(action, count)?;
-                if !bytes.is_empty() {
-                    memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
-                }
-                Ok(bytes.len() as u64)
-            }
+            116 => crate::syslog(&self.vfs.kernel_log_capability(), a, memory),
             19 => Ok(self.vfs.eventfd(a[0] as u32, a[1] as u32)? as u64),
             20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
             21 => {
@@ -1100,53 +1152,21 @@ impl Linux {
                         self.vfs.set_status_flags(a[0] as u32, a[2] as u32)?;
                         Ok(0)
                     }
-                    5..=7 => {
-                        Self::check(memory, a[2], 32, Access::Read)?;
-                        if a[1] == 5 {
-                            Self::check(memory, a[2], 32, Access::Write)?;
-                        }
-                        let mut bytes = [0; 32];
-                        memory.read(a[2], &mut bytes).map_err(|_| Errno(14))?;
-                        let kind = u16::from_le_bytes(bytes[..2].try_into().expect("flock type"));
-                        let whence =
-                            u16::from_le_bytes(bytes[2..4].try_into().expect("flock whence"));
-                        let start =
-                            i64::from_le_bytes(bytes[8..16].try_into().expect("flock start"));
-                        let length =
-                            i64::from_le_bytes(bytes[16..24].try_into().expect("flock length"));
-                        let requested =
-                            self.vfs
-                                .normalize_lock(a[0] as u32, kind, whence, start, length)?;
-                        if a[1] == 5 {
-                            if kind == 2 {
-                                return Err(Errno(22));
-                            }
-                            if let Some(conflict) =
-                                self.vfs.record_lock_conflict(a[0] as u32, requested)?
-                            {
-                                bytes[..2].copy_from_slice(&conflict.kind.to_le_bytes());
-                                bytes[2..4].copy_from_slice(&0u16.to_le_bytes());
-                                bytes[8..16].copy_from_slice(&conflict.start.to_le_bytes());
-                                bytes[16..24].copy_from_slice(
-                                    &(if conflict.end == u64::MAX {
-                                        0
-                                    } else {
-                                        conflict.end - conflict.start
-                                    })
-                                    .to_le_bytes(),
-                                );
-                                bytes[24..28].copy_from_slice(
-                                    &self.vfs.visible_pid(conflict.owner).to_le_bytes(),
-                                );
-                            } else {
-                                bytes[..2].copy_from_slice(&2u16.to_le_bytes());
-                            }
-                            memory.write(a[2], &bytes).map_err(|_| Errno(14))?;
-                        } else {
-                            self.vfs.record_lock_set(a[0] as u32, requested)?;
-                        }
-                        Ok(0)
-                    }
+                    5..=7 => crate::record_locks::call(
+                        memory,
+                        a[1],
+                        a[2],
+                        |kind, whence, start, length| {
+                            Some(
+                                self.vfs
+                                    .normalize_lock(a[0] as u32, kind, whence, start, length),
+                            )
+                        },
+                        |requested| self.vfs.record_lock_conflict(a[0] as u32, requested),
+                        |requested| self.vfs.record_lock_set(a[0] as u32, requested),
+                        |owner| self.vfs.visible_pid(owner),
+                    )
+                    .expect("owner lock normalization cannot defer"),
                     _ => Err(Errno(22)),
                 }
             }
@@ -1163,18 +1183,10 @@ impl Linux {
                     }
                 }
                 if a[1] as u32 == 0x5421 {
-                    let flags = self.vfs.flags(a[0] as u32)? & (3 | 0x400 | O_NONBLOCK);
                     let mut value = [0; 4];
                     memory.read(a[2], &mut value).map_err(|_| Errno(14))?;
-                    let nonblock = u32::from_le_bytes(value) != 0;
-                    self.vfs.set_status_flags(
-                        a[0] as u32,
-                        if nonblock {
-                            flags | O_NONBLOCK
-                        } else {
-                            flags & !O_NONBLOCK
-                        },
-                    )?;
+                    self.vfs
+                        .set_nonblocking(a[0] as u32, u32::from_le_bytes(value) != 0)?;
                     Ok(0)
                 } else if let Some(kind) = self.vfs.namespace_type(a[0] as u32)? {
                     match a[1] as u32 {
@@ -1284,27 +1296,6 @@ impl Linux {
                     176 => c.gid,
                     _ => c.egid,
                 } as u64)
-            }
-            160 => {
-                Self::check(memory, a[0], 390, Access::Write)?;
-                let hostname = self.vfs.uts_name(false);
-                let domainname = self.vfs.uts_name(true);
-                let mut fields = [0; 390];
-                for (i, text) in [
-                    b"Linux".as_slice(),
-                    hostname.as_slice(),
-                    b"6.0.0-trames",
-                    b"#1 Trames compatibility runtime",
-                    b"aarch64",
-                    domainname.as_slice(),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    fields[i * 65..i * 65 + text.len()].copy_from_slice(text);
-                }
-                memory.write(a[0], &fields).map_err(|_| Errno(14))?;
-                Ok(0)
             }
             167 if matches!(a[0], 15 | 16) => {
                 if a[0] == 15 {
@@ -1463,8 +1454,7 @@ impl Linux {
                 }
             }
             166 => {
-                let previous = self.vfs.umask;
-                self.vfs.umask = a[0] as u32 & 0o777;
+                let previous = self.vfs.set_umask(a[0] as u32);
                 Ok(previous as u64)
             }
             216 => self.mremap(a, memory),
@@ -1556,6 +1546,7 @@ impl Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trames_vfs::O_NONBLOCK;
     #[test]
     fn first_touch_output_quota_failure_does_not_consume_file_input() {
         let mut l = Linux::new(0);
@@ -2056,6 +2047,44 @@ mod tests {
             Ok(1)
         );
         assert_eq!(out.0, 1);
+    }
+
+    #[test]
+    fn allocation_context_shares_only_with_vm_and_commits_after_mapping_success() {
+        let mut parent = Linux::new(0x1000);
+        let mut memory = Memory::new(8 * PAGE_SIZE as usize);
+        let mut shared = parent.clone_with_resources(false, false, true);
+        let independent = parent.clone_with_resources(true, true, false);
+        let shared_query = shared.program_break();
+        let private_query = independent.program_break();
+        assert_eq!(parent.brk(0x2000, &mut memory), 0x2000);
+        assert_eq!(shared_query.get(), 0x2000);
+        assert_eq!(private_query.get(), 0x1000);
+        assert_eq!(shared.brk(0x100000, &mut memory), 0x2000);
+        assert_eq!(shared_query.get(), 0x2000);
+
+        let first = parent
+            .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut memory)
+            .unwrap();
+        assert_eq!(parent.heap_context(), shared.heap_context());
+        let second = shared
+            .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut memory)
+            .unwrap();
+        assert_eq!(second, first + PAGE_SIZE);
+        let before = parent.heap_context();
+        assert_eq!(
+            shared.mmap([0, 9 * PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut memory),
+            Err(Errno(12))
+        );
+        assert_eq!(parent.heap_context(), before);
+        assert_eq!(shared.heap_context(), before);
+        let moved = shared
+            .mremap([first, PAGE_SIZE, 2 * PAGE_SIZE, 1, 0, 0], &mut memory)
+            .unwrap();
+        assert_eq!(moved, second + PAGE_SIZE);
+        assert_eq!(parent.heap_context(), shared.heap_context());
+        assert_eq!(parent.heap_context().2, moved + 2 * PAGE_SIZE);
+        assert_eq!(independent.heap_context(), (0x1000, 0x1000, 0x1000_0000));
     }
 
     #[test]

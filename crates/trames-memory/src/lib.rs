@@ -7,6 +7,8 @@ use mmu::PageBytes;
 mod native_access;
 pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;
+mod pinned;
+pub use pinned::PinnedBuffer;
 mod reservations;
 mod residency;
 use backing::Backed;
@@ -218,6 +220,7 @@ pub struct Memory {
     has_backings: bool,
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
+    pinned: BTreeMap<u64, std::sync::Weak<pinned::PinnedPage>>,
     fork_epoch: Cell<u64>,
     parallel_users: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     parallel_dirty: Vec<usize>,
@@ -241,10 +244,11 @@ impl Clone for Memory {
             frames: self
                 .frames
                 .iter()
-                .map(|page| {
-                    page.as_ref().map(|page| {
-                        let mut page = page.clone();
-                        if self.has_parallel_users() && page.bytes.shared().is_some() {
+                .map(|source| {
+                    source.as_ref().map(|source| {
+                        let pinned = !self.pinned.is_empty() && self.page_pinned(source);
+                        let mut page = source.clone();
+                        if (self.has_parallel_users() || pinned) && page.bytes.shared().is_some() {
                             page.bytes = Rc::new(if page.charge.resident() {
                                 (*page.bytes).clone()
                             } else {
@@ -272,6 +276,7 @@ impl Clone for Memory {
             has_backings: self.has_backings,
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
+            pinned: BTreeMap::new(),
             fork_epoch: Cell::new(0),
             parallel_users: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             parallel_dirty: Vec::new(),
@@ -343,6 +348,7 @@ impl Memory {
             has_backings: false,
             cpu_borrow_safe: true,
             parallel_cache: None,
+            pinned: BTreeMap::new(),
             fork_epoch: Cell::new(0),
             parallel_users: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             parallel_dirty: Vec::new(),

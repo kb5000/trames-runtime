@@ -5,6 +5,48 @@ use trames_memory::{Access, Memory};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
 impl Linux {
+    pub(crate) fn decode_open_how(
+        memory: &Memory,
+        address: u64,
+        size: u64,
+    ) -> Result<(u32, u32, u64)> {
+        if size < 24 {
+            return Err(Errno(22));
+        }
+        if size > 4096 {
+            return Err(Errno(7));
+        }
+        Self::check(memory, address, size as usize, Access::Read)?;
+        let flags = memory.read_u64(address).map_err(|_| Errno(14))?;
+        let mode = memory.read_u64(address + 8).map_err(|_| Errno(14))?;
+        let resolve = memory.read_u64(address + 16).map_err(|_| Errno(14))?;
+        let mut tail = vec![0; (size - 24) as usize];
+        memory
+            .read(address + 24, &mut tail)
+            .map_err(|_| Errno(14))?;
+        if tail.iter().any(|b| *b != 0) {
+            return Err(Errno(7));
+        }
+        if flags > u32::MAX as u64
+            || mode & !0o7777 != 0
+            || mode != 0 && flags & 0x40 == 0
+            || resolve & !63 != 0
+        {
+            return Err(Errno(22));
+        }
+        if flags & trames_vfs::O_PATH as u64 != 0
+            && flags
+                & !((trames_vfs::O_PATH
+                    | trames_vfs::O_NOFOLLOW
+                    | trames_vfs::O_DIRECTORY
+                    | trames_vfs::O_CLOEXEC) as u64)
+                != 0
+        {
+            return Err(Errno(22));
+        }
+        Ok((flags as u32, mode as u32, resolve))
+    }
+
     fn regular_file(&self, fd: u32) -> Result<[u8; 128]> {
         let stat = self.vfs.stat_fd(fd)?;
         if u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000 != 0o100000 {
@@ -67,46 +109,12 @@ impl Linux {
                 Ok(0)
             }
             437 => {
-                if a[3] < 24 {
-                    return Err(Errno(22));
-                }
-                if a[3] > 4096 {
-                    return Err(Errno(7));
-                }
-                Self::check(memory, a[2], a[3] as usize, Access::Read)?;
-                let flags = memory.read_u64(a[2]).map_err(|_| Errno(14))?;
-                let mode = memory.read_u64(a[2] + 8).map_err(|_| Errno(14))?;
-                let resolve = memory.read_u64(a[2] + 16).map_err(|_| Errno(14))?;
-                let mut tail = vec![0; (a[3] - 24) as usize];
-                memory.read(a[2] + 24, &mut tail).map_err(|_| Errno(14))?;
-                if tail.iter().any(|b| *b != 0) {
-                    return Err(Errno(7));
-                }
-                if flags > u32::MAX as u64
-                    || mode & !0o7777 != 0
-                    || mode != 0 && flags & 0x40 == 0
-                    || resolve & !63 != 0
-                {
-                    return Err(Errno(22));
-                }
-                if flags & trames_vfs::O_PATH as u64 != 0
-                    && flags
-                        & !((trames_vfs::O_PATH
-                            | trames_vfs::O_NOFOLLOW
-                            | trames_vfs::O_DIRECTORY
-                            | trames_vfs::O_CLOEXEC) as u64)
-                        != 0
-                {
-                    return Err(Errno(22));
-                }
+                let (flags, mode, resolve) = Self::decode_open_how(memory, a[2], a[3])?;
                 let path = Self::path(memory, a[1])?;
-                Ok(self.vfs.open_at_resolve(
-                    a[0] as i32,
-                    &path,
-                    flags as u32,
-                    mode as u32,
-                    resolve,
-                )? as u64)
+                Ok(self
+                    .vfs
+                    .open_at_resolve(a[0] as i32, &path, flags, mode, resolve)?
+                    as u64)
             }
             286 | 287 => {
                 if a[5] & !6 != 0 {

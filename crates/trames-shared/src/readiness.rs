@@ -8,6 +8,9 @@ use std::sync::{
 
 pub trait IoWake: Send + Sync {
     fn wake_io(&self, signal: &Arc<IoSignal>);
+    fn host_events(&self) -> Option<Arc<crate::HostEvents>> {
+        None
+    }
 }
 pub struct IoSignal {
     pub pid: u32,
@@ -32,7 +35,7 @@ impl IoSignal {
         // both the notification and the counter update on ARM.
         self.fired.swap(false, Ordering::Acquire);
     }
-    fn fire(self: &Arc<Self>) {
+    pub(crate) fn fire(self: &Arc<Self>) {
         if !self.fired.swap(true, Ordering::Release) {
             if let Some(target) = self.target.upgrade() {
                 target.wake_io(self);

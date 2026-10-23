@@ -5,12 +5,23 @@ use trames_cpu::Cpu;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
 mod direct;
-pub use direct::{epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo};
+pub use direct::{
+    epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo, UringEpoch,
+    UringSnapshot,
+};
 mod file_calls;
+mod heap;
+pub use heap::ProgramBreak;
 mod network;
 mod poll;
+mod record_locks;
 mod state;
+mod syslog;
+mod uts;
+pub use uts::uts_call;
 mod timer;
+pub use syslog::syslog;
+mod uring;
 pub use timer::timerfd_control;
 mod xattr;
 pub use state::Linux;

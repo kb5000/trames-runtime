@@ -19,6 +19,8 @@ enum Reg {
     Scalar,
     Context,
 }
+// Verified immutable instructions are shared by FDs, cgroup attachments and
+// executing workers. The weak registry never prolongs a program's lifetime.
 pub(super) struct Program {
     pub id: u32,
     code: Vec<Insn>,
@@ -26,19 +28,19 @@ pub(super) struct Program {
 #[derive(Default)]
 pub(super) struct Registry {
     next: u32,
-    programs: BTreeMap<u32, Weak<Program>>,
+    programs: BTreeMap<u32, std::sync::Weak<Program>>,
 }
 impl Registry {
-    fn load(&mut self, bytes: &[u8]) -> Result<Rc<Program>> {
+    fn load(&mut self, bytes: &[u8]) -> Result<Arc<Program>> {
         let code = verify(bytes)?;
         self.programs.retain(|_, p| p.strong_count() != 0);
         if self.programs.len() >= MAX_PROGRAMS {
             return Err(Errno(28));
         }
         let id = self.next.checked_add(1).ok_or(Errno(28))?;
-        let p = Rc::new(Program { id, code });
+        let p = Arc::new(Program { id, code });
         self.next = id;
-        self.programs.insert(id, Rc::downgrade(&p));
+        self.programs.insert(id, Arc::downgrade(&p));
         Ok(p)
     }
 }
@@ -187,14 +189,15 @@ impl Vfs {
             .bpf
             .programs
             .get(&id)
-            .and_then(Weak::upgrade)
+            .and_then(std::sync::Weak::upgrade)
             .ok_or(Errno(2))?;
         self.anonymous(O_CLOEXEC, events::Anonymous::Bpf(program))
     }
-    pub(super) fn bpf_program(&self, fd: u32) -> Result<Rc<Program>> {
-        let o = self.descriptor(fd)?.open.borrow();
+    pub(super) fn bpf_program(&self, fd: u32) -> Result<Arc<Program>> {
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         match &o.anonymous {
-            Some(events::Anonymous::Bpf(p)) if o.flags & O_PATH == 0 => Ok(p.clone()),
+            Some(events::Anonymous::Bpf(p)) if o.flags.get() & O_PATH == 0 => Ok(p.clone()),
             _ => Err(Errno(22)),
         }
     }
@@ -353,5 +356,39 @@ mod tests {
         assert!(matches!(registry.load(&constant(1)), Err(Errno(28))));
         programs.pop();
         assert!(registry.load(&constant(1)).is_ok());
+    }
+    #[test]
+    fn worker_program_lease_keeps_identity_and_releases_registry_quota() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Program>();
+        let mut v = Vfs::default();
+        let fd = v.bpf_load_device(&constant(1)).unwrap();
+        let program = v.bpf_program(fd).unwrap();
+        let id = program.id;
+        let weak = Arc::downgrade(&program);
+        let (released, release) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for context in [[1, 1, 3], [2, 8, 0], [u32::MAX; 3]] {
+                assert!(program.allows(context));
+            }
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(program);
+        });
+        v.close(fd).unwrap();
+        let reopened = v.bpf_get_fd(id).unwrap();
+        assert_eq!(v.bpf_program(reopened).unwrap().id, id);
+        v.close(reopened).unwrap();
+        let mut others = Vec::new();
+        for _ in 1..MAX_PROGRAMS {
+            others.push(v.bpf_load_device(&constant(0)).unwrap());
+        }
+        assert_eq!(v.bpf_load_device(&constant(0)), Err(Errno(28)));
+        released.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(v.bpf_get_fd(id), Err(Errno(2)));
+        assert!(v.bpf_load_device(&constant(0)).is_ok());
     }
 }

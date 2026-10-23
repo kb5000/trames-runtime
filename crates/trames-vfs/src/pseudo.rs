@@ -446,7 +446,7 @@ pub struct ProcessInfo {
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
-    pub oom: Weak<OomTask>,
+    pub oom: std::sync::Weak<OomTask>,
     pub pending: u64,
     pub shared_pending: u64,
     pub blocked: u64,
@@ -499,6 +499,8 @@ impl PseudoFs {
         }
         self.next_inode = self.next_inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             content,
@@ -680,8 +682,12 @@ impl Vfs {
     pub fn set_process_context(&mut self, pid: u32) {
         self.pid = pid;
     }
+    pub fn process_context(&self) -> u32 {
+        self.pid
+    }
     pub fn fd_snapshot(&self) -> Vec<FdInfo> {
         self.fds
+            .entries()
             .iter()
             .filter(|(fd, _)| self.descriptor(**fd).is_ok())
             .map(|(&fd, d)| {
@@ -696,7 +702,7 @@ impl Vfs {
                 let inode = node.as_ref().map_or_else(
                     || {
                         o.namespace.as_ref().map_or_else(
-                            || o.pipe.as_ref().map_or(o.id, |p| p.pipe.borrow().inode),
+                            || o.pipe.as_ref().map_or(o.id, |p| p.pipe.inode),
                             linux_namespace::NamespaceHandle::id,
                         )
                     },
@@ -754,7 +760,7 @@ impl Vfs {
                     fd,
                     target,
                     position: o.current_position(),
-                    flags: o.flags | if d.cloexec { O_CLOEXEC } else { 0 },
+                    flags: o.flags.get() | if d.cloexec.get() { O_CLOEXEC } else { 0 },
                     inode,
                     mount_id: o.mount.as_ref().map_or(
                         if o.namespace.is_some() {
@@ -843,9 +849,10 @@ impl Vfs {
             id: self.open_id(),
             owner,
             kind: FdKind::Node(label),
-            flags: 0,
+            flags: (0).into(),
             position: 0,
             file_position: Arc::default(),
+            flock: OnceCell::new(),
             node: Some(node),
             pipe: None,
             socket: None,
@@ -1001,8 +1008,8 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
-        } else if (flags & 3 != 1 && original.flags & 3 == 1)
-            || (flags & 3 != 0 && original.flags & 3 == 0)
+        } else if (flags & 3 != 1 && original.flags.get() & 3 == 1)
+            || (flags & 3 != 0 && original.flags.get() & 3 == 0)
         {
             return Err(Errno(13));
         }
@@ -1031,10 +1038,9 @@ impl Vfs {
         } else {
             original.pipe.clone()
         };
-        let notification = original
-            .node
-            .as_ref()
-            .and_then(|node| inotify::Close::reopen(node, flags, original.notification.as_ref()));
+        let notification = original.node.as_ref().and_then(|node| {
+            inotify::FileClose::reopen(node, flags, original.notification.as_ref())
+        });
         // Reopening a proc magic link is a fresh device open, not dup(). In
         // particular, runc reopens an O_PATH ptmx handle to allocate a new PTY.
         let pty = if flags & O_PATH != 0 {
@@ -1056,7 +1062,9 @@ impl Vfs {
                 }
                 Content::Device(Device::Pts(id, _)) if id != 0 => {
                     let pair = self.pty_by_id(id).ok_or(Errno(5))?;
-                    if pair.locked.get() || !pair.master_alive.get() {
+                    if pair.locked.get()
+                        || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         return Err(Errno(5));
                     }
                     Some(pty::PtyEnd::new(pair, false))
@@ -1085,9 +1093,10 @@ impl Vfs {
             } else {
                 original.kind.clone()
             },
-            flags: flags & !O_CLOEXEC,
+            flags: (flags & !O_CLOEXEC).into(),
             position: 0,
             file_position: Arc::default(),
+            flock: OnceCell::new(),
             node: original.node.clone(),
             pipe,
             socket: None,
@@ -1107,7 +1116,7 @@ impl Vfs {
             fd,
             Descriptor {
                 open: Rc::new(RefCell::new(descriptor)),
-                cloexec: flags & O_CLOEXEC != 0,
+                cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
         if flags & 0x200 != 0
@@ -1134,7 +1143,8 @@ impl Vfs {
         Ok(self.mount_statfs(path.mount.as_ref()))
     }
     pub fn statfs_fd(&self, fd: u32) -> Result<[u8; 120]> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         let mut out = self.mount_statfs(o.mount.as_ref());
         if o.namespace.is_some()
             || o.socket.is_some()
@@ -1158,7 +1168,8 @@ impl Vfs {
         Ok(out)
     }
     pub(super) fn refresh_pseudo_fd(&self, fd: u32) -> Result<()> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         if o.oom.is_some() || o.network_control.is_some() {
             return Ok(());
         }
@@ -1251,9 +1262,9 @@ impl Vfs {
                 .and_then(|s| s.parse::<u32>().ok())
             {
                 if id == 0 && self.embedding_terminal.get()
-                    || self
-                        .pty_by_id(id)
-                        .is_some_and(|p| !p.private() && p.master_alive.get())
+                    || self.pty_by_id(id).is_some_and(|p| {
+                        !p.private() && p.master_alive.load(std::sync::atomic::Ordering::Relaxed)
+                    })
                 {
                     return Ok(Some((Content::Device(Device::Pts(id, id)), 0o20620)));
                 }
@@ -2107,7 +2118,9 @@ impl Vfs {
             names.extend(
                 self.live_ptys()
                     .iter()
-                    .filter(|p| !p.private() && p.master_alive.get())
+                    .filter(|p| {
+                        !p.private() && p.master_alive.load(std::sync::atomic::Ordering::Relaxed)
+                    })
                     .map(|p| p.id.to_string().into_bytes()),
             );
         }

@@ -6,13 +6,24 @@ use super::*;
 pub(super) struct BackingIndex {
     domains: BTreeMap<u64, BackingDomain>,
     unscoped: BTreeSet<u64>,
+    /// Only MAP_SHARED pages need entries. No larger per-page CPU descriptor,
+    /// backing Rc, or work on ordinary instruction/data translations.
+    pub(super) futex: BTreeMap<u64, (u64, u64)>,
 }
 struct BackingDomain {
     generation: u64,
     pages: BTreeSet<u64>,
 }
 impl BackingIndex {
-    pub(super) fn insert(&mut self, base: u64, domain: Option<(u64, u64)>) {
+    pub(super) fn insert(
+        &mut self,
+        base: u64,
+        domain: Option<(u64, u64)>,
+        futex: Option<(u64, u64)>,
+    ) {
+        if let Some(key) = futex {
+            self.futex.insert(base, key);
+        }
         if let Some((identity, generation)) = domain {
             // Adding one new mapping cannot acknowledge changes to old pages.
             self.domains
@@ -28,6 +39,7 @@ impl BackingIndex {
         }
     }
     fn remove(&mut self, base: u64, domain: Option<(u64, u64)>) {
+        self.futex.remove(&base);
         if let Some((identity, _)) = domain {
             let group = self.domains.get_mut(&identity).expect("indexed domain");
             group.pages.remove(&base);
@@ -64,14 +76,15 @@ impl Snapshot {
         self.dynamic_code_pages -= usize::from(frame.dynamic_code);
         Some(frame)
     }
-    fn insert_frame(&mut self, frame: Frame, backed: bool) {
+    fn insert_frame(&mut self, frame: Frame, backed: bool, futex: Option<(u64, u64)>) {
         let count = self.identities.entry(frame.bytes.identity).or_insert(0);
         self.alias_count += usize::from(*count == 1);
         *count += 1;
         self.dynamic_code_pages += usize::from(frame.dynamic_code);
         if backed {
             self.backed_pages.insert(frame.base);
-            self.backings.insert(frame.base, frame.backing_domain);
+            self.backings
+                .insert(frame.base, frame.backing_domain, futex);
         }
         self.pages.insert(frame.base, self.frames.len());
         self.positions[frame.root_frame] = Some(self.frames.len());
@@ -210,7 +223,7 @@ impl Memory {
                 previous.get(&base),
                 registry,
             )?;
-            snapshot.insert_frame(frame, page.backing.is_some());
+            snapshot.insert_frame(frame, page.backing.is_some(), shared_futex_page_key(page));
         }
         snapshot.refresh_mmu(&mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;

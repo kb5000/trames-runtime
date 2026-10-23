@@ -403,3 +403,29 @@ fn native_root_input_and_output_policy_enforces_real_socket_io() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[test]
+fn connected_native_tcp_capability_is_rebuilt_after_firewall_changes() {
+    let root = Network::new(NetworkMode::Loopback);
+    let listener = root.socket(2, 1, 0).unwrap();
+    listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let _host = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    assert!(accepted.direct_tcp().is_some());
+    assert_eq!(
+        errno(&batch(
+            &root.1,
+            &[
+                table("tcp-guard"),
+                chain("tcp-guard", "input", Some(1), 0, 1)
+            ]
+        )),
+        0
+    );
+    assert!(accepted.direct_tcp().is_none()); // Even an ACCEPT chain needs accounting.
+    let mut attrs = vec![];
+    string(&mut attrs, 1, "tcp-guard");
+    assert_eq!(errno(&batch(&root.1, &[req(2, 2, 0, &attrs)])), 0);
+    assert!(accepted.direct_tcp().is_some());
+}

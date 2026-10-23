@@ -64,16 +64,30 @@ struct Connection {
     exports: Vec<trames_shared::ExportLease>,
     relays: Vec<PipeRelay>,
 }
-// Coordinator-owned pipe ends; native threads never see guest Rc/RefCell state.
+// Endpoint ownership is shared; inode metadata remains an owner projection.
+// Keeping that anchor preserves the original unlink/inotify/node lifetime.
 struct PipeRelay {
     host: trames_shared::NativePipe,
-    guest: Rc<PipeEnd>,
+    guest: Arc<PipeEndpoint>,
+    _metadata: Option<Rc<RefCell<Node>>>,
     to_native: bool,
 }
 impl PipeRelay {
+    fn new(
+        host: trames_shared::NativePipe,
+        pipe: Pipe,
+        to_native: bool,
+        metadata: Option<Rc<RefCell<Node>>>,
+    ) -> Self {
+        Self {
+            host,
+            guest: PipeEndpoint::anonymous(pipe.data, to_native, !to_native),
+            _metadata: metadata,
+            to_native,
+        }
+    }
     fn pump(&mut self) -> bool {
-        let pipe_ref = self.guest.pipe.borrow();
-        let mut pipe = pipe_ref.data.lock().unwrap();
+        let mut pipe = self.guest.data.lock().unwrap();
         if self.to_native {
             if pipe.bytes.is_empty() {
                 return pipe.writers != 0;
@@ -123,7 +137,7 @@ fn io_errno(e: io::Error) -> Errno {
     }
 }
 impl OpenDescription {
-    fn pipe_description(id: u64, owner: (u32, u32), pipe: Rc<RefCell<Pipe>>, write: bool) -> Self {
+    fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Self {
         Self {
             read_node: None,
             id,
@@ -133,10 +147,11 @@ impl OpenDescription {
             } else {
                 FdKind::PipeRead
             },
-            flags: if write { 1 } else { 0 },
+            flags: (if write { 1 } else { 0 }).into(),
             position: 0,
             file_position: Arc::default(),
-            pipe: Some(PipeEnd::new(pipe, !write, write, false)),
+            flock: OnceCell::new(),
+            pipe: Some(PipeEnd::new(pipe, !write, write, None)),
             node: None,
             socket: None,
             bridge: None,
@@ -218,10 +233,9 @@ impl Connection {
     fn pump(&mut self, vfs: &Vfs, server: &Server) -> Result<bool> {
         let mut progress = false;
         self.relays.retain_mut(|relay| {
-            let before = relay.guest.pipe.borrow().data.lock().unwrap().bytes.len();
+            let before = relay.guest.data.lock().unwrap().bytes.len();
             let alive = relay.pump();
-            progress |=
-                !alive || relay.guest.pipe.borrow().data.lock().unwrap().bytes.len() != before;
+            progress |= !alive || relay.guest.data.lock().unwrap().bytes.len() != before;
             alive
         });
         self.exports.retain(|lease| !lease.claimed());
@@ -242,7 +256,7 @@ impl Connection {
                             .iter()
                             .map(|open| {
                                 let open = open.borrow();
-                                if open.flags & O_PATH != 0 {
+                                if open.flags.get() & O_PATH != 0 {
                                     return Err(Errno(9));
                                 }
                                 if let Some(end) = &open.pipe {
@@ -254,14 +268,15 @@ impl Connection {
                                     }
                                     let (reader, writer) =
                                         trames_shared::NativePipe::pair().map_err(io_errno)?;
-                                    self.relays.push(PipeRelay {
-                                        host: reader,
-                                        guest: PipeEnd::new(end.pipe.clone(), false, true, false),
-                                        to_native: false,
-                                    });
+                                    self.relays.push(PipeRelay::new(
+                                        reader,
+                                        end.pipe.clone(),
+                                        false,
+                                        end.metadata.clone(),
+                                    ));
                                     return Ok((writer.into_fd(), None));
                                 }
-                                if open.flags & 3 == 1 {
+                                if open.flags.get() & 3 == 1 {
                                     return Err(Errno(9));
                                 }
                                 let node = open.node.as_ref().ok_or(Errno(95))?.borrow();
@@ -343,13 +358,9 @@ impl Connection {
                                     pipe.clone(),
                                     true,
                                 );
-                                open.flags = 1;
+                                open.flags = 1.into();
                                 rights.push(Rc::new(RefCell::new(open)));
-                                self.relays.push(PipeRelay {
-                                    host,
-                                    guest: PipeEnd::new(pipe, true, false, false),
-                                    to_native: true,
-                                });
+                                self.relays.push(PipeRelay::new(host, pipe, true, None));
                             } else {
                                 rights.push(vfs.native_file_description(fd, self.owner)?);
                             }
@@ -390,13 +401,14 @@ impl Vfs {
         let Ok(directory) = self.resolve_final(AT_FDCWD, b"/tmp/.X11-unix", false) else {
             return;
         };
-        let names = {
-            let fs = directory.mount().map_or(&self.fs, |m| &m.fs).borrow();
-            crate::directory::children(&fs.paths,directory.key()).filter(|(name,node)| {
+        let names =
+            {
+                let fs = directory.mount().map_or(&self.fs, |m| &m.fs).borrow();
+                crate::directory::children(&fs.paths,directory.key()).filter(|(name,node)| {
                 name.starts_with(b"X") && name.len()>1 && name[1..].iter().all(u8::is_ascii_digit)
-                 && matches!(&node.borrow().content,Content::Socket(peer) if peer.strong_count()==0)
+                 && matches!(&node.borrow().content,Content::Socket(peer) if !peer.is_live())
             }).map(|(name,_)|name.to_vec()).collect::<Vec<_>>()
-        };
+            };
         for name in names {
             let mut socket = b"/tmp/.X11-unix/".to_vec();
             socket.extend_from_slice(&name);
@@ -467,7 +479,8 @@ impl Vfs {
             // Replace only such a stale socket; never replace an ordinary user file.
             if let Ok(resolved) = self.resolve_final(AT_FDCWD, &path, false) {
                 if let Ok(node) = self.node(&resolved) {
-                    let stale = matches!(&node.borrow().content,Content::Socket(peer)if peer.strong_count()==0);
+                    let stale =
+                        matches!(&node.borrow().content,Content::Socket(peer)if !peer.is_live());
                     if stale {
                         self.unlink_at(AT_FDCWD, &path, false)?;
                     }
@@ -538,7 +551,7 @@ impl Vfs {
             return WaylandAuth::default();
         }
         let mut fds = BTreeMap::new();
-        for (&fd, descriptor) in self.fds.iter() {
+        for (&fd, descriptor) in self.fds.entries().iter() {
             let description = descriptor.open.borrow();
             let grant = if let Some(socket) = &description.local {
                 services
@@ -575,6 +588,8 @@ impl Vfs {
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             device: 16,
@@ -596,9 +611,10 @@ impl Vfs {
             id: self.open_id(),
             owner,
             kind: FdKind::Node(b"/memfd:wayland-resource".to_vec()),
-            flags: 0,
+            flags: (0).into(),
             position: 0,
             file_position: Arc::default(),
+            flock: OnceCell::new(),
             node: Some(node),
             pipe: None,
             socket: None,
@@ -632,11 +648,7 @@ mod tests {
             .clone()
             .unwrap();
         let (reader, mut writer) = trames_shared::NativePipe::pair().unwrap();
-        let mut relay = PipeRelay {
-            host: reader,
-            guest: PipeEnd::new(end.pipe.clone(), false, true, false),
-            to_native: false,
-        };
+        let mut relay = PipeRelay::new(reader, end.pipe.clone(), false, end.metadata.clone());
         drop(end);
         vfs.close(write).unwrap();
         assert_eq!(vfs.read(read, 10), Err(Errno(11)));
@@ -658,11 +670,7 @@ mod tests {
         )));
         let (fds, truncated) = vfs.receive_rights(LocalRights(vec![open]), 1, false);
         assert!(!truncated);
-        let mut relay = PipeRelay {
-            host: writer,
-            guest: PipeEnd::new(pipe, true, false, false),
-            to_native: true,
-        };
+        let mut relay = PipeRelay::new(writer, pipe, true, None);
         vfs.write(fds[0], b"guest text").unwrap();
         vfs.close(fds[0]).unwrap();
         assert!(relay.pump());

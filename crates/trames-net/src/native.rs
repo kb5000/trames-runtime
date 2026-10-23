@@ -2,6 +2,13 @@
 //! Bounded native sockets. All host operations are nonblocking; guest ABI
 //! addresses, flags and errno numbers are translated explicitly.
 use crate::direct_dns;
+mod direct;
+mod endpoint;
+pub use direct::DirectTcp;
+use direct::Links;
+pub use endpoint::TcpLease;
+use endpoint::{Endpoint, Quota, Reservation};
+use std::sync::Arc;
 #[path = "native_events.rs"]
 mod edge;
 #[path = "native_pktinfo.rs"]
@@ -16,7 +23,7 @@ use nix::{
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket as RawNativeSocket, TcpKeepalive, Type};
 use std::{
     cell::{Cell, RefCell},
-    io::{self, Read},
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpStream, UdpSocket},
     os::fd::{AsFd, BorrowedFd},
     rc::Rc,
@@ -104,10 +111,10 @@ fn unmapped(a: SocketAddr) -> SocketAddr {
 }
 struct Namespace {
     mode: NetworkMode,
-    sockets: Cell<usize>,
+    sockets: Arc<Quota>,
     dns: Rc<direct_dns::Service>,
     interfaces: RefCell<Option<(Instant, Option<crate::NetworkInfo>)>>,
-    links: RefCell<[crate::LinkStats; 2]>,
+    links: Arc<Links>,
 }
 #[derive(Clone)]
 pub struct Network(Rc<Namespace>);
@@ -123,10 +130,10 @@ impl Network {
     pub fn new(mode: NetworkMode) -> Self {
         Self(Rc::new(Namespace {
             mode,
-            sockets: Cell::new(0),
+            sockets: Arc::default(),
             dns: direct_dns::Service::new(mode),
             interfaces: RefCell::new(None),
-            links: RefCell::default(),
+            links: Arc::default(),
         }))
     }
     pub fn info(&self) -> Option<crate::NetworkInfo> {
@@ -143,22 +150,14 @@ impl Network {
         cached.as_ref().and_then(|(_, info)| *info)
     }
     pub fn links(&self) -> [crate::LinkStats; 2] {
-        *self.0.links.borrow()
+        self.0.links.snapshot()
     }
     fn account(&self, ip: Option<IpAddr>, count: usize, transmit: bool) {
-        let index = usize::from(!ip.is_some_and(loopback));
-        let mut links = self.0.links.borrow_mut();
-        let link = &mut links[index];
-        if transmit {
-            link.tx_packets = link.tx_packets.saturating_add(1);
-            link.tx_bytes = link.tx_bytes.saturating_add(count as u64);
-        } else {
-            link.rx_packets = link.rx_packets.saturating_add(1);
-            link.rx_bytes = link.rx_bytes.saturating_add(count as u64);
-        }
+        self.0.links.account(ip, count, transmit);
     }
+    #[cfg(test)]
     pub fn live_sockets(&self) -> usize {
-        self.0.sockets.get()
+        self.0.sockets.live()
     }
     pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
         let domain = match family {
@@ -174,7 +173,7 @@ impl Network {
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
-        self.reserve()?;
+        let reservation = self.reserve()?;
         let native = RawNativeSocket::new(domain, ty, Some(native_protocol)).map_err(from_io)?;
         configure(&native)?;
         if kind == 3 {
@@ -189,6 +188,7 @@ impl Network {
         }
         Ok(self.wrap(
             native,
+            reservation,
             family,
             if kind == 3 {
                 4
@@ -200,29 +200,23 @@ impl Network {
             Connection::Idle,
         ))
     }
-    fn reserve(&self) -> Result<()> {
+    fn reserve(&self) -> Result<Reservation> {
         if self.0.mode == NetworkMode::Off {
             Err(NetError(13))
-        } else if self.live_sockets() >= MAX_SOCKETS {
-            Err(NetError(24))
         } else {
-            Ok(())
+            self.0.sockets.reserve()
         }
     }
     fn wrap(
         &self,
         native: RawNativeSocket,
+        reservation: Reservation,
         family: u32,
         kind: u32,
         connection: Connection,
     ) -> Rc<Socket> {
-        self.0.sockets.set(self.live_sockets() + 1);
         Rc::new(Socket {
-            native: if kind == 1 {
-                NativeSocket::Tcp(native.into())
-            } else {
-                NativeSocket::Udp(native.into())
-            },
+            native: Endpoint::new(native, kind, reservation),
             network: self.clone(),
             family,
             kind,
@@ -234,7 +228,6 @@ impl Network {
             dns_peer: Cell::new(false),
             echo: RefCell::default(),
             policy: RefCell::default(),
-            events: RefCell::default(),
             receive_packet_info: Cell::new(false),
             policy_forward: RefCell::default(),
         })
@@ -321,7 +314,7 @@ impl AsFd for NativeSocket {
     }
 }
 pub struct Socket {
-    native: NativeSocket,
+    native: Arc<Endpoint>,
     network: Network,
     family: u32,
     kind: u32,
@@ -332,7 +325,6 @@ pub struct Socket {
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
     echo: RefCell<icmp::Echo>,
-    events: RefCell<Option<edge::Events>>,
     receive_packet_info: Cell<bool>,
     policy: RefCell<Option<Rc<crate::netlink::Namespace>>>,
     policy_forward: RefCell<
@@ -341,11 +333,6 @@ pub struct Socket {
             (crate::netdev::NativeForward, Instant),
         >,
     >,
-}
-impl Drop for Socket {
-    fn drop(&mut self) {
-        self.network.0.sockets.set(self.network.live_sockets() - 1);
-    }
 }
 pub struct Received {
     /// Non-IP source identity, retained with the individual netlink datagram.
@@ -358,11 +345,7 @@ pub struct Received {
 }
 impl Socket {
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
-        let mut events = self.events.borrow_mut();
-        if events.is_none() {
-            *events = Some(edge::Events::new(self.native.as_fd().as_raw_fd())?);
-        }
-        let mut epoch = events.as_mut().unwrap().sample();
+        let mut epoch = self.native.poll_epoch()?;
         for dns in self.dns.borrow().values() {
             epoch[0] = epoch[0].wrapping_add(dns.epoch());
         }
@@ -597,13 +580,13 @@ impl Socket {
         if self.connection.get() != Connection::Listening {
             return Err(NetError(22));
         }
-        self.network.reserve()?;
+        let reservation = self.network.reserve()?;
         let (native, peer) = self.native.control().accept().map_err(from_io)?;
         configure(&native)?;
         let peer = peer.as_socket().ok_or(NetError(5))?;
-        let accepted = self
-            .network
-            .wrap(native, self.family, 1, Connection::Connected);
+        let accepted =
+            self.network
+                .wrap(native, reservation, self.family, 1, Connection::Connected);
         if let Some(policy) = self.policy.borrow().as_ref() {
             accepted.attach_policy(policy.clone());
         }
@@ -812,27 +795,15 @@ impl Socket {
         } else {
             None
         };
-        let native_flags;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            native_flags = nix::libc::MSG_NOSIGNAL;
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            native_flags = 0;
-        }
         let result = if let Some(address) = address {
             let address_native = self.address(address)?;
             self.network.destination(address)?;
             self.native
                 .control()
-                .send_to_with_flags(bytes, &address_native, native_flags)
+                .send_to_with_flags(bytes, &address_native, direct::send_flags())
                 .map_err(from_io)
         } else {
-            self.native
-                .control()
-                .send_with_flags(bytes, native_flags)
-                .map_err(from_io)
+            direct::send_connected(&self.native, bytes)
         };
         if result.is_ok() {
             if let Some(id) = echo_id {
@@ -949,15 +920,9 @@ impl Socket {
         // for a zero-sized guest buffer. This preserves MSG_TRUNC and datagrams.
         let mut data = vec![0; if self.kind != 1 { 65536 } else { count }];
         let mut packet_info = None;
-        let (length, address) = match &self.native {
+        let (length, address) = match &self.native.socket {
             NativeSocket::Tcp(socket) => {
-                let length = if flags & MSG_PEEK != 0 {
-                    socket.peek(&mut data)
-                } else {
-                    let mut socket = socket;
-                    socket.read(&mut data)
-                }
-                .map_err(from_io)?;
+                let length = direct::read_tcp(socket, &mut data, flags)?;
                 (length, None)
             }
             NativeSocket::Udp(socket) => {

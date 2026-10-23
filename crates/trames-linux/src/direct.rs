@@ -10,6 +10,13 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+mod uring;
+pub use uring::{UringEpoch, UringSnapshot};
+
+fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
+    let (fd, lease) = tcp.readiness_fd()?;
+    Ok(trames_vfs::HostFd::retained(fd, lease.into_keepalive()))
+}
 
 /// A stopped syscall, not a re-executed SVC. Subscriptions do not retain guest
 /// FD table entries or count as additional pipe endpoints.
@@ -18,11 +25,21 @@ pub struct PendingIo {
     pub args: [u64; 6],
     pub deadline: Option<Instant>,
     pub signal: Arc<IoSignal>,
+    pub flock: Option<trames_vfs::FlockRequest>,
     resource_deadline: Option<Instant>,
     poll: Option<crate::poll::Poll>,
     _subscriptions: Vec<IoSubscription>,
+    host_subscription: Option<trames_vfs::HostSubscription>,
+    uring: Option<Box<uring::Wait>>,
+    poll_uring: Option<Box<uring::PollWait>>,
+    target: Weak<dyn IoWake>,
 }
 impl PendingIo {
+    pub fn external_wait(&self) -> bool {
+        self.host_subscription.is_some()
+            || self.uring.as_ref().is_some_and(|w| w.external())
+            || self.poll_uring.as_ref().is_some_and(|w| w.external())
+    }
     pub fn wake_deadline(&self) -> Option<Instant> {
         [self.deadline, self.resource_deadline]
             .into_iter()
@@ -82,13 +99,19 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    urings: UringSnapshot,
     descriptors: DirectFds,
+    network: trames_vfs::DirectNetwork,
+    terminal: Option<trames_vfs::TerminalAccess>,
+    kernel_log: Option<trames_vfs::KernelLogAccess>,
     files: trames_vfs::DirectFiles,
+    lock_context: Option<trames_vfs::RecordLockContext>,
     disk_cache: RefCell<trames_vfs::DiskReadCache>,
     file_completed: Cell<u64>,
     socket_completed: Cell<u64>,
     timer_completed: Cell<u64>,
     poll_completed: Cell<u64>,
+    fd_control_completed: Cell<u64>,
     started: Option<Instant>,
     scratch: RefCell<Vec<u8>>,
     completed: Cell<u64>,
@@ -96,21 +119,53 @@ pub struct DirectSyscalls {
 impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
         Self {
+            urings: Default::default(),
             descriptors,
+            network: Default::default(),
+            terminal: None,
+            kernel_log: None,
             files: Default::default(),
+            lock_context: None,
             disk_cache: Default::default(),
             file_completed: Cell::new(0),
             socket_completed: Cell::new(0),
             timer_completed: Cell::new(0),
             poll_completed: Cell::new(0),
+            fd_control_completed: Cell::new(0),
             started: None,
             scratch: RefCell::new(Vec::new()),
             completed: Cell::new(0),
         }
     }
+    pub fn with_lock_context(mut self, context: trames_vfs::RecordLockContext) -> Self {
+        self.lock_context = Some(context);
+        self
+    }
     pub fn with_files(mut self, files: trames_vfs::DirectFiles) -> Self {
         self.files = files;
         self
+    }
+    pub fn with_terminal(mut self, access: trames_vfs::TerminalAccess) -> Self {
+        self.terminal = Some(access);
+        self
+    }
+    pub fn with_kernel_log(mut self, log: trames_vfs::KernelLogAccess) -> Self {
+        self.kernel_log = Some(log);
+        self
+    }
+    pub fn with_network(mut self, network: trames_vfs::DirectNetwork) -> Self {
+        self.network = network;
+        self
+    }
+    pub fn with_urings(mut self, snapshot: UringSnapshot) -> Self {
+        if let Some(descriptors) = &snapshot.descriptors {
+            self.descriptors = descriptors.clone();
+        }
+        self.urings = snapshot;
+        self
+    }
+    pub fn uring_completed(&self) -> u64 {
+        self.urings.completed()
     }
     pub fn file_completed(&self) -> u64 {
         self.file_completed.get()
@@ -124,8 +179,16 @@ impl DirectSyscalls {
     pub fn poll_completed(&self) -> u64 {
         self.poll_completed.get()
     }
+    pub fn fd_control_completed(&self) -> u64 {
+        self.fd_control_completed.get()
+    }
+    pub fn record_fd_control(&self) {
+        self.fd_control_completed
+            .set(self.fd_control_completed.get() + 1);
+    }
     pub fn with_clock(mut self, started: Instant) -> Self {
         self.started = Some(started);
+        self.urings.clock = Some(started);
         self
     }
     /// File deferral is before effects and uses the ordinary owner service.
@@ -136,6 +199,35 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        // Legacy dispatch defers blocking flock before effects. In particular,
+        // a failed conversion may already have released the old lock: it must
+        // not be attempted speculatively and then replayed on fallback.
+        if number == 32 && (a[1] as u32 & 4 != 0 || a[1] as u32 == 8) {
+            let result = self.files.get(a[0] as u32)?.flock(a[1] as u32).map(|()| 0);
+            self.record_fd_control();
+            return Some(result);
+        }
+        if number == 25 && matches!(a[1], 5 | 6) {
+            let context = self.lock_context.as_ref()?;
+            let file = self.files.get(a[0] as u32)?;
+            let result = if !file.allows_record_locks() {
+                Err(Errno(9))
+            } else {
+                crate::record_locks::call(
+                    memory,
+                    a[1],
+                    a[2],
+                    |kind, whence, start, length| {
+                        file.normalize_lock(kind, whence, start, length, context.owner)
+                    },
+                    |requested| Ok(file.record_lock_conflict(requested)),
+                    |requested| file.record_lock_set(requested),
+                    |owner| context.visible_pid(owner),
+                )?
+            };
+            self.record_fd_control();
+            return Some(result);
+        }
         if !matches!(number, 62..=70 | 80) {
             return None;
         }
@@ -202,17 +294,24 @@ impl DirectSyscalls {
         Some(result)
     }
     pub fn supports(&self, number: u32, fd: u32) -> bool {
+        if self.network.get(fd).is_some() {
+            return matches!(number, 63..=66);
+        }
         self.descriptors.get(fd).is_some_and(|fd| {
-            if matches!(number, 22 | 441) {
+            if number == 62 {
+                fd.is_kmsg()
+            } else if matches!(number, 22 | 441) {
                 fd.is_epoll()
             } else if matches!(number, 86 | 87) {
                 fd.timer().is_some()
+            } else if number == 28 {
+                fd.is_inotify()
             } else if matches!(number, 206 | 207 | 210..=212) {
                 fd.is_unix()
             } else if number == 29 {
                 fd.has_readable_bytes()
             } else {
-                matches!(number, 63..=66) && !fd.is_epoll()
+                matches!(number, 63..=66) && !fd.is_epoll() && !fd.is_poll_only()
             }
         })
     }
@@ -220,7 +319,7 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.disk_cache.borrow_mut(), cache);
     }
     pub fn completed(&self) -> u64 {
-        self.completed.get()
+        self.completed.get() + self.urings.completed()
     }
     /// Move the persistent worker's bounded byte buffer into/out of a dispatch.
     /// No borrow or partially executed operation survives this ownership swap.
@@ -228,12 +327,30 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if number == 116 {
+            return self.kernel_log.is_some();
+        }
+        if number == 32 {
+            return self.files.get(args[0] as u32).is_some();
+        }
+        if number == 426 {
+            return self.urings.contains(args[0] as u32);
+        }
+        if number == 427 {
+            return self.urings.supports_register(args);
+        }
         if number == 73 {
             return args[3] == 0;
         }
         self.supports(number, args[0] as u32)
             && (!matches!(number, 22 | 441) || args[4] == 0)
-            && (number != 29 || args[1] as u32 == 0x541b)
+            && (number != 29
+                || args[1] as u32 == 0x541b
+                || self
+                    .descriptors
+                    .get(args[0] as u32)
+                    .is_some_and(|fd| fd.is_pty())
+                    && matches!(args[1] as u32, 0x5401 | 0x5413))
     }
     fn transfer(
         &self,
@@ -241,6 +358,39 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if number == 116 {
+            return Some(crate::syslog(self.kernel_log.as_ref()?, args, memory));
+        }
+        if let Some(fd) = self.network.get(args[0] as u32) {
+            let read = |count| {
+                if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 1 {
+                    return Err(Errno(9));
+                }
+                fd.tcp.recv(count, 0).map_err(|e| Errno(e.0))
+            };
+            let write = |bytes: &[u8]| {
+                if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 0 {
+                    return Err(Errno(9));
+                }
+                fd.tcp
+                    .send(bytes, 0)
+                    .map(|n| n as u64)
+                    .map_err(|e| Errno(e.0))
+            };
+            return Some(match number {
+                63 => Linux::read_transport(args, memory, read),
+                64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
+                65 => Linux::readv_transport_mode(args, memory, false, read),
+                66 => Linux::writev_transport_mode(
+                    args,
+                    memory,
+                    &mut self.scratch.borrow_mut(),
+                    false,
+                    write,
+                ),
+                _ => unreachable!("native TCP byte call"),
+            });
+        }
         let fd = self
             .descriptors
             .get(args[0] as u32)
@@ -248,7 +398,9 @@ impl DirectSyscalls {
         let deferred = Cell::new(false);
         let flags = socket_flags(number, args);
         let read = |count| {
-            let result = if matches!(number, 207 | 212) {
+            let result = if fd.is_pty() {
+                fd.terminal_read(count, self.terminal)
+            } else if matches!(number, 207 | 212) {
                 fd.recv(count, flags | if fd.nonblocking() { 0x40 } else { 0 })
             } else {
                 fd.read_attempt(count)
@@ -259,14 +411,23 @@ impl DirectSyscalls {
             })
         };
         let write = |bytes: &[u8]| {
-            if matches!(number, 206 | 211) {
-                fd.send(bytes, flags)
+            let result = if fd.is_pty() {
+                fd.terminal_write(bytes, self.terminal)
+            } else if matches!(number, 206 | 211) {
+                Some(fd.send(bytes, flags))
             } else {
-                fd.write(bytes)
-            }
-            .map(|n| n as u64)
+                Some(fd.write(bytes))
+            };
+            result
+                .unwrap_or_else(|| {
+                    deferred.set(true);
+                    Err(Errno(11))
+                })
+                .map(|n| n as u64)
         };
         let result = match number {
+            62 => fd.kmsg_seek(args[1] as i64, args[2] as u32),
+            28 => fd.inotify_remove(args[1] as i32),
             86 | 87 => crate::timerfd_control(
                 fd.timer().expect("timerfd resource"),
                 number,
@@ -275,6 +436,12 @@ impl DirectSyscalls {
                 self.started.unwrap_or_else(Instant::now),
             ),
             29 => (|| {
+                if args[1] as u32 != 0x541b {
+                    let bytes = fd.terminal_query(args[1] as u32).expect("terminal query");
+                    Linux::check(memory, args[2], bytes.len(), Access::Write)?;
+                    memory.write(args[2], &bytes).map_err(|_| Errno(14))?;
+                    return Ok(0);
+                }
                 Linux::check(memory, args[2], 4, Access::Write)?;
                 memory
                     .write_array(
@@ -288,7 +455,7 @@ impl DirectSyscalls {
             64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), |bytes| {
                 write(bytes)
             }),
-            65 => Linux::readv_transport_mode(args, memory, fd.is_eventfd(), read),
+            65 => Linux::readv_transport_mode(args, memory, fd.readv_records(), read),
             66 => Linux::writev_transport_mode(
                 args,
                 memory,
@@ -316,12 +483,24 @@ impl DirectSyscalls {
         }
     }
     fn nonblocking(&self, number: u32, args: [u64; 6]) -> bool {
+        if number == 116 {
+            return false;
+        }
+        if let Some(fd) = self.network.get(args[0] as u32) {
+            return fd.nonblocking();
+        }
         self.descriptors.get(args[0] as u32).unwrap().nonblocking()
             || socket_flags(number, args) & 0x40 != 0
     }
     fn complete(&self, number: u32, args: [u64; 6], result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
-        if number == 73 {
+        if matches!(number, 28 | 32) {
+            self.record_fd_control();
+        }
+        if matches!(number, 32 | 116) {
+            return IoAttempt::Complete(result);
+        }
+        if matches!(number, 22 | 73 | 441) {
             self.poll_completed.set(self.poll_completed.get() + 1);
             return IoAttempt::Complete(result);
         }
@@ -336,6 +515,7 @@ impl DirectSyscalls {
             .descriptors
             .get(args[0] as u32)
             .is_some_and(|fd| fd.is_unix())
+            || self.network.get(args[0] as u32).is_some()
         {
             self.socket_completed.set(self.socket_completed.get() + 1);
         }
@@ -352,6 +532,24 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if number == 32 {
+            let request = match self
+                .files
+                .get(args[0] as u32)?
+                .flock_request(args[1] as u32)
+            {
+                Ok(request) => request,
+                Err(error) => return Some(self.complete(number, args, Err(error))),
+            };
+            return Some(self.start_flock(request, args, memory, pid, target));
+        }
+        if number == 427 {
+            return self.urings.register(args, memory, pid);
+        }
+        if number == 426 {
+            let attempt = self.urings.start(args, memory, pid, target)?;
+            return Some(attempt);
+        }
         if !self.supports_call(number, args) {
             return None;
         }
@@ -366,6 +564,9 @@ impl DirectSyscalls {
                 Some(Err(error)) => return Some(self.complete(number, args, Err(error))),
                 None => return Some(IoAttempt::Checkpoint),
             };
+            if !self.urings.poll_pump(&prepared.poll_identities(), memory) {
+                return Some(IoAttempt::Checkpoint);
+            }
             match prepared.check(memory, deadline) {
                 Err(Errno(11)) => {}
                 result => return Some(self.complete(number, args, result)),
@@ -383,6 +584,16 @@ impl DirectSyscalls {
                 }
             }) {
                 Ok(deadline) => {
+                    if !self.urings.poll_pump(
+                        &self
+                            .descriptors
+                            .get(args[0] as u32)
+                            .unwrap()
+                            .poll_identities(),
+                        memory,
+                    ) {
+                        return Some(IoAttempt::Checkpoint);
+                    }
                     match self.epoll_once(args, deadline, memory) {
                         Err(Errno(11)) => {}
                         result => return Some(self.complete(number, args, result)),
@@ -400,10 +611,42 @@ impl DirectSyscalls {
                 Err(Errno(32)) if signals_pipe(number, args) => return Some(IoAttempt::Checkpoint),
                 result => return Some(self.complete(number, args, result)),
             }
-            None
+            if number == 116 {
+                None
+            } else {
+                saved_deadline.or_else(|| {
+                    self.network
+                        .get(args[0] as u32)
+                        .and_then(|fd| fd.timeouts[usize::from(matches!(number, 63 | 65))])
+                        .and_then(|d| Instant::now().checked_add(d))
+                })
+            }
         };
         let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = if let Some(poll) = &poll {
+        let mut host_subscription = None;
+        let subscriptions = if number == 116 {
+            vec![self.kernel_log.as_ref().unwrap().subscribe(&signal)]
+        } else if let Some(fd) = self
+            .network
+            .get(args[0] as u32)
+            .filter(|_| matches!(number, 63..=66))
+        {
+            let subscription = (|| {
+                let events = target.upgrade()?.host_events()?;
+                events
+                    .subscribe(
+                        tcp_wait_fd(&fd.tcp).ok()?,
+                        matches!(number, 64 | 66),
+                        &signal,
+                    )
+                    .ok()
+            })();
+            let Some(subscription) = subscription else {
+                return Some(IoAttempt::Checkpoint);
+            };
+            host_subscription = Some(subscription);
+            Vec::new()
+        } else if let Some(poll) = &poll {
             poll.subscribe(&signal)
         } else {
             self.descriptors
@@ -419,10 +662,49 @@ impl DirectSyscalls {
                 signal,
                 poll,
                 resource_deadline: None,
+                flock: None,
                 _subscriptions: subscriptions,
+                host_subscription,
+                uring: None,
+                poll_uring: None,
+                target: target.clone(),
             },
             memory,
         ))
+    }
+    /// Retry the retained request, never the numeric FD. Subscribe only after
+    /// contention, then recheck so unlock-before-park cannot be lost.
+    pub fn start_flock(
+        &self,
+        request: trames_vfs::FlockRequest,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        match request.try_lock() {
+            Err(Errno(11)) if !request.nonblocking() => {}
+            result => return self.complete(32, args, result.map(|()| 0)),
+        }
+        let signal = IoSignal::new(pid, target.clone());
+        let subscriptions = vec![request.subscribe(&signal)];
+        self.resume(
+            PendingIo {
+                number: 32,
+                args,
+                deadline: None,
+                signal,
+                flock: Some(request),
+                resource_deadline: None,
+                poll: None,
+                _subscriptions: subscriptions,
+                host_subscription: None,
+                uring: None,
+                poll_uring: None,
+                target: target.clone(),
+            },
+            memory,
+        )
     }
     fn epoll_once(
         &self,
@@ -441,7 +723,44 @@ impl DirectSyscalls {
         epoll_scatter(memory, args[1], &events)
     }
     pub fn resume(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+        if pending.uring.is_some() {
+            return self.urings.resume(pending, memory);
+        }
         pending.signal.reset();
+        if let Some(request) = &pending.flock {
+            return match request.try_lock() {
+                Err(Errno(11)) => IoAttempt::Blocked(pending),
+                result => self.complete(32, pending.args, result.map(|()| 0)),
+            };
+        }
+        if pending.poll_uring.is_none() {
+            let ids = if let Some(poll) = &pending.poll {
+                poll.poll_identities()
+            } else if matches!(pending.number, 22 | 441) {
+                self.descriptors
+                    .get(pending.args[0] as u32)
+                    .unwrap()
+                    .poll_identities()
+            } else {
+                Vec::new()
+            };
+            pending.poll_uring = self
+                .urings
+                .poll_wait(ids, pending.target.clone())
+                .map(Box::new);
+        }
+        if let Some(wait) = &mut pending.poll_uring {
+            if !wait.refresh(&pending.signal, memory) {
+                return IoAttempt::Checkpoint;
+            }
+        }
+        if pending
+            .host_subscription
+            .as_ref()
+            .is_some_and(|s| s.rearm().is_err())
+        {
+            return IoAttempt::Checkpoint;
+        }
         let result = if let Some(poll) = &pending.poll {
             poll.check(memory, pending.deadline)
         } else if matches!(pending.number, 22 | 441) {
@@ -455,14 +774,29 @@ impl DirectSyscalls {
         };
         match result {
             Err(Errno(11)) => {
-                pending.resource_deadline = if let Some(poll) = &pending.poll {
+                if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212)
+                    && self.nonblocking(pending.number, pending.args))
+                    || pending.external_wait()
+                        && pending.deadline.is_some_and(|d| Instant::now() >= d)
+                {
+                    return self.complete(pending.number, pending.args, Err(Errno(11)));
+                }
+                let resource_deadline = if pending.number == 116 {
+                    None
+                } else if let Some(poll) = &pending.poll {
                     poll.next_deadline()
                 } else {
                     self.descriptors
                         .get(pending.args[0] as u32)
-                        .unwrap()
-                        .next_deadline()
+                        .and_then(|fd| fd.next_deadline())
                 };
+                pending.resource_deadline = [
+                    resource_deadline,
+                    pending.poll_uring.as_ref().and_then(|w| w.deadline),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 IoAttempt::Blocked(pending)
             }
             Err(Errno(32)) if signals_pipe(pending.number, pending.args) => IoAttempt::Checkpoint,
@@ -477,13 +811,18 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if matches!(number, 22 | 441) || !self.supports_call(number, args) {
+        if matches!(number, 22 | 32 | 441) || !self.supports_call(number, args) {
             return None;
         }
         if number == 73 {
             let result = match poll_deadline(memory, args[2], None) {
-                Ok(deadline) => crate::poll::Poll::prepare(&self.descriptors, memory, args)?
-                    .and_then(|p| p.check(memory, deadline)),
+                Ok(deadline) => {
+                    let poll = crate::poll::Poll::prepare(&self.descriptors, memory, args)?;
+                    if poll.as_ref().is_ok_and(|p| !p.poll_identities().is_empty()) {
+                        return None;
+                    }
+                    poll.and_then(|p| p.check(memory, deadline))
+                }
                 Err(error) => Err(error),
             };
             if result == Err(Errno(11)) {
@@ -539,10 +878,230 @@ mod tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     use trames_vfs::{Vfs, O_NONBLOCK};
+    #[test]
+    fn syslog_subscription_retries_without_lost_wake_and_cancel_drops_listener() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Wake {
+            log: trames_vfs::KernelLogAccess,
+            count: AtomicU64,
+        }
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                // Callback must run outside the log lock.
+                assert!(self.log.size(9).unwrap() > 0);
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        let fd = v.open_at(-100, b"/dev/kmsg", 1, 0).unwrap();
+        let direct =
+            DirectSyscalls::new(v.direct_descriptors()).with_kernel_log(v.kernel_log_capability());
+        let target = Arc::new(Wake {
+            log: v.kernel_log_capability(),
+            count: AtomicU64::new(0),
+        });
+        let wake: Arc<dyn IoWake> = target.clone();
+        let mut m = memory();
+        let args = [2, 0x1000, 1024, 0, 0, 0];
+        for _ in 0..3 {
+            let pending = pending(
+                direct
+                    .start(116, args, &mut m, 1, &Arc::downgrade(&wake), None)
+                    .unwrap(),
+            );
+            assert!(!pending.signal.ready());
+            assert_eq!(
+                direct.descriptors.get(fd).unwrap().write(b"wake-reader"),
+                Ok(11)
+            );
+            assert!(pending.signal.ready());
+            assert!(matches!(direct.resume(pending, &mut m), IoAttempt::Complete(Ok(n)) if n > 0));
+        }
+        assert_eq!(target.count.load(Ordering::Relaxed), 3);
+        let cancelled = pending(
+            direct
+                .start(116, args, &mut m, 1, &Arc::downgrade(&wake), None)
+                .unwrap(),
+        );
+        drop(cancelled);
+        v.log(4, "cancelled waiter");
+        assert_eq!(target.count.load(Ordering::Relaxed), 3);
+        assert!(
+            matches!(direct.start(116, args, &mut m, 1, &Arc::downgrade(&wake), None), Some(IoAttempt::Complete(Ok(n))) if n > 0)
+        );
+        assert!(matches!(
+            direct.start(
+                116,
+                [2, 0x1fff, 2, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&wake),
+                None
+            ),
+            Some(IoAttempt::Complete(Err(Errno(14))))
+        ));
+    }
     fn memory() -> Memory {
         let mut m = Memory::default();
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         m
+    }
+    #[test]
+    fn native_tcp_vectors_faults_and_blocking_checkpoint_preserve_stream_bytes() {
+        use std::{
+            io::{Read, Write},
+            net::{Ipv4Addr, TcpListener},
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut v = Vfs::default();
+        v.configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        let direct = DirectSyscalls::new(v.direct_descriptors()).with_network(v.direct_network());
+        let mut m = memory();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        assert!(matches!(
+            direct.start(
+                63,
+                [fd as u64, 0x1100, 4, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+                None
+            ),
+            Some(IoAttempt::Checkpoint)
+        ));
+        assert_eq!(direct.completed(), 0);
+        assert_eq!(
+            direct.invoke(64, [fd as u64, 0x1fff, 2, 0, 0, 0], &mut m),
+            Some(Err(Errno(14)))
+        );
+        m.write(0x1100, b"abcd").unwrap();
+        for (address, value) in [
+            (0x1200, 0x1100u64),
+            (0x1208, 1),
+            (0x1210, 0x1101),
+            (0x1218, 3),
+        ] {
+            m.write_array(address, value.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            direct.invoke(66, [fd as u64, 0x1200, 2, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        let mut actual = [0; 4];
+        peer.read_exact(&mut actual).unwrap();
+        assert_eq!(&actual, b"abcd");
+        peer.write_all(b"wxyz").unwrap();
+        trames_net::wait(&[(socket.clone(), 1)], Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1fff, 4, 0, 0, 0], &mut m),
+            Some(Err(Errno(14)))
+        );
+        assert_eq!(
+            direct.invoke(65, [fd as u64, 0x1200, 2, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        assert_eq!(m.read_array::<4>(0x1100).unwrap(), *b"wxyz");
+        assert!(!direct.supports(22, fd));
+        assert!(!direct.supports(206, fd));
+        let before = direct.socket_completed();
+        v.set_status_flags(fd, v.flags(fd).unwrap() | O_NONBLOCK)
+            .unwrap();
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1100, 1, 0, 0, 0], &mut m),
+            Some(Err(Errno(11)))
+        );
+        assert_eq!(direct.socket_completed(), before + 1);
+    }
+    #[test]
+    fn pty_vectors_queries_and_faults_preserve_bytes_and_original_abi() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let master = v
+            .open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2 | O_NONBLOCK, 0)
+            .unwrap();
+        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        let slave = v.open_pty_peer(master, 2 | O_NONBLOCK).unwrap();
+        let direct =
+            DirectSyscalls::new(v.direct_descriptors()).with_terminal(trames_vfs::TerminalAccess {
+                session: 0,
+                group: 0,
+                controlling: None,
+                ignore_ttou: false,
+            });
+        let mut m = memory();
+        m.write(0x1100, b"ab\nc").unwrap();
+        for (at, value) in [
+            (0x1200, 0x1100u64),
+            (0x1208, 2),
+            (0x1210, 0x1102),
+            (0x1218, 2),
+        ] {
+            m.write_array(at, value.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            direct.invoke(66, [slave as u64, 0x1200, 2, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        assert_eq!(
+            direct.invoke(29, [master as u64, 0x541b, 0x1300, 0, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        assert_eq!(m.read_array::<4>(0x1300).unwrap(), 5u32.to_le_bytes());
+        assert_eq!(
+            direct.invoke(63, [master as u64, 0x1ffe, 5, 0, 0, 0], &mut m),
+            Some(Err(Errno(14)))
+        );
+        assert_eq!(
+            direct.invoke(65, [master as u64, 0x1200, 2, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        assert_eq!(m.read_array::<4>(0x1100).unwrap(), *b"ab\r\n");
+        assert_eq!(
+            direct.invoke(63, [master as u64, 0x1100, 1, 0, 0, 0], &mut m),
+            Some(Ok(1))
+        );
+        assert_eq!(m.read_array::<1>(0x1100).unwrap(), *b"c");
+        let queries = {
+            let end = v.pty(slave).unwrap().unwrap();
+            let tty = end.pair.terminal.borrow();
+            [
+                (0x5401, tty.attributes.to_vec()),
+                (0x5413, tty.window.to_vec()),
+            ]
+        };
+        for (request, expected) in queries {
+            assert_eq!(
+                direct.invoke(29, [slave as u64, request, 0x1fff, 0, 0, 0], &mut m),
+                Some(Err(Errno(14)))
+            );
+            assert_eq!(
+                direct.invoke(29, [slave as u64, request, 0x1400, 0, 0, 0], &mut m),
+                Some(Ok(0))
+            );
+            let mut out = vec![0; expected.len()];
+            m.read(0x1400, &mut out).unwrap();
+            assert_eq!(out, expected);
+        }
+        assert!(!direct.supports_call(29, [slave as u64, 0x5402, 0, 0, 0, 0]));
+        m.write(0x1100, b"safe\x03").unwrap();
+        assert_eq!(
+            direct.invoke(64, [master as u64, 0x1100, 5, 0, 0, 0], &mut m),
+            None
+        );
+        assert_eq!(
+            direct.invoke(63, [slave as u64, 0x1100, 1, 0, 0, 0], &mut m),
+            Some(Err(Errno(11)))
+        );
     }
     #[test]
     fn timer_control_preflights_outputs_and_keeps_relative_and_absolute_state() {
@@ -922,9 +1481,93 @@ mod tests {
         );
         epoch.finish();
     }
+    #[test]
+    fn blocking_flock_notification_and_retry_keep_original_lease_after_fd_reuse() {
+        let mut v = Vfs::default();
+        let a = v.open_at(-100, b"/lock", 0x42, 0o600).unwrap();
+        let b = v.open_at(-100, b"/lock", 2, 0).unwrap();
+        v.flock(a, 5).unwrap();
+        v.flock(b, 5).unwrap();
+        let mut files = trames_vfs::FileEpoch::default();
+        let direct =
+            DirectSyscalls::new(v.direct_descriptors()).with_files(files.capture(&v, true));
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        let args = [a as u64, 2, 0, 0, 0, 0];
+        // Legacy dispatch cannot speculatively release a conversion's old SH.
+        assert!(direct.invoke_file(32, args, &mut m).is_none());
+        assert_eq!(v.flock(b, 6), Err(Errno(11)));
+        v.flock(b, 5).unwrap();
+        let wait = pending(
+            direct
+                .start(32, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap(),
+        );
+        assert!(!wait.signal.ready());
+        // The failed EX conversion released a's SH, allowing b to convert.
+        v.flock(b, 6).unwrap();
+        let request = wait.flock.as_ref().unwrap().clone();
+        let (_, retained) = v.retain_flock(a, 2).unwrap();
+        v.close(a).unwrap();
+        let reused = v.open_at(-100, b"/new", 0x42, 0o600).unwrap();
+        assert_eq!(reused, a);
+        v.flock(reused, 6).unwrap();
+        v.flock(b, 8).unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(0));
+        assert_eq!(v.flock(b, 6), Err(Errno(11)));
+        assert_eq!(direct.fd_control_completed(), 1);
+        drop(retained);
+        drop(request); // last original reference unlocks /lock.
+        assert_eq!(v.flock(b, 6), Ok(()));
+        files.finish();
+    }
+
     struct Target;
     impl IoWake for Target {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+
+    #[test]
+    fn parked_byte_retry_reads_live_nonblock_but_poll_ignores_status_flags() {
+        let mut vfs = Vfs::default();
+        let [read, _write] = vfs.pipe(0).unwrap();
+        let alias = vfs.dup(read, 0, false).unwrap();
+        let direct = DirectSyscalls::new(vfs.direct_descriptors());
+        let flags = vfs.fd_flags_snapshot();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        let wait = pending(
+            direct
+                .start(
+                    63,
+                    [read as u64, 0x1100, 1, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        flags.set_nonblocking(alias, true).unwrap();
+        assert!(!wait.signal.ready(), "FIONBIO is not a resource wake");
+        assert_eq!(complete(direct.resume(wait, &mut m)), Err(Errno(11)));
+        m.write_array(0x1200, [0u8; 8]).unwrap();
+        m.write_array(0x1200, read.to_le_bytes()).unwrap();
+        m.write_array(0x1204, 1u16.to_le_bytes()).unwrap();
+        let wait = pending(
+            direct
+                .start(
+                    73,
+                    [0x1200, 1, 0, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        drop(pending(direct.resume(wait, &mut m)));
     }
     fn pending(attempt: IoAttempt) -> PendingIo {
         match attempt {
@@ -1159,6 +1802,106 @@ mod tests {
             direct.invoke(63, [read as u64, 0x1100, 8, 0, 0, 0], &mut m),
             Some(Err(Errno(11)))
         );
+    }
+    #[test]
+    fn inotify_read_vectors_queries_and_waits_use_the_shared_queue_without_replay() {
+        let mut vfs = Vfs::default();
+        let fd = vfs.inotify_init(0).unwrap();
+        let wd = vfs.inotify_add(fd, b"/", 0x100).unwrap();
+        let direct = DirectSyscalls::new(vfs.direct_descriptors());
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        let wait = pending(
+            direct
+                .start(
+                    63,
+                    [fd as u64, 0x1100, 32, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        vfs.mkdir_at(-100, b"/a", 0o700).unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(32));
+        assert_eq!(
+            u32::from_le_bytes(m.read_array::<4>(0x1100).unwrap()) as i32,
+            wd
+        );
+        assert_eq!(
+            u32::from_le_bytes(m.read_array::<4>(0x1104).unwrap()),
+            0x40000100
+        );
+        assert_eq!(vfs.inotify_available(fd).unwrap(), Some(0));
+        vfs.mkdir_at(-100, b"/b", 0o700).unwrap();
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1ff0, 32, 0, 0, 0], &mut m),
+            Some(Err(Errno(14)))
+        );
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1100, 31, 0, 0, 0], &mut m),
+            Some(Err(Errno(22)))
+        );
+        assert_eq!(
+            direct.invoke(29, [fd as u64, 0x541b, 0x1200, 0, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        assert_eq!(u32::from_le_bytes(m.read_array::<4>(0x1200).unwrap()), 32);
+        for (address, value) in [
+            (0x1000, 0x1100u64),
+            (0x1008, 7),
+            (0x1010, 0x1107),
+            (0x1018, 25),
+        ] {
+            m.write_array(address, value.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            direct.invoke(65, [fd as u64, 0x1000, 2, 0, 0, 0], &mut m),
+            Some(Err(Errno(22)))
+        );
+        assert_eq!(vfs.inotify_available(fd).unwrap(), Some(32));
+        vfs.mkdir_at(-100, b"/c", 0o700).unwrap();
+        m.write_array(0x1008, 32u64.to_le_bytes()).unwrap();
+        m.write_array(0x1010, 0x1180u64.to_le_bytes()).unwrap();
+        m.write_array(0x1018, 8u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            direct.invoke(65, [fd as u64, 0x1000, 2, 0, 0, 0], &mut m),
+            Some(Ok(32))
+        );
+        assert_eq!(m.read_array::<2>(0x1110).unwrap(), *b"b\0");
+        assert_eq!(vfs.inotify_available(fd).unwrap(), Some(32));
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1100, 32, 0, 0, 0], &mut m),
+            Some(Ok(32))
+        );
+        assert_eq!(m.read_array::<2>(0x1110).unwrap(), *b"c\0");
+        assert_eq!(vfs.inotify_available(fd).unwrap(), Some(0));
+        assert_eq!(
+            direct.invoke(64, [fd as u64, 0x1100, 1, 0, 0, 0], &mut m),
+            Some(Err(Errno(9)))
+        );
+        assert_eq!(
+            direct.invoke(28, [fd as u64, wd as u64, 0, 0, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        assert_eq!(
+            direct.invoke(28, [fd as u64, wd as u64, 0, 0, 0, 0], &mut m),
+            Some(Err(Errno(22)))
+        );
+        assert_eq!(direct.fd_control_completed(), 2);
+        assert_eq!(
+            direct.invoke(63, [fd as u64, 0x1100, 16, 0, 0, 0], &mut m),
+            Some(Ok(16))
+        );
+        assert_eq!(
+            u32::from_le_bytes(m.read_array::<4>(0x1104).unwrap()),
+            0x8000
+        );
+        assert_eq!(vfs.inotify_remove(fd, wd), Err(Errno(22)));
+        let replacement = vfs.inotify_add(fd, b"/", 0x100).unwrap();
+        assert_ne!(replacement, wd);
     }
     #[test]
     fn vector_eventfd_obeys_record_sizes_and_commits_partial_progress_once() {

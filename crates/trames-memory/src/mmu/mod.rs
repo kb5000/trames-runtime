@@ -561,7 +561,12 @@ impl Memory {
                         break;
                     };
                     let page = self.frames[frame].as_ref().expect("mapped page");
-                    if page.backing.is_some() || permissions.is_some_and(|p| p != page.permissions)
+                    // Physical pins must survive regrouping, mprotect and
+                    // arena retirement. Keep only affected host groups on the
+                    // software path instead of rehoming pinned byte owners.
+                    if page.backing.is_some()
+                        || (!self.pinned.is_empty() && self.page_pinned(page))
+                        || permissions.is_some_and(|p| p != page.permissions)
                     {
                         break;
                     }

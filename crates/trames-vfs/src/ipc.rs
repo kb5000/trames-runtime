@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded guest AF_UNIX endpoints. No guest pathname reaches host sockets.
 use super::*;
+mod binding;
+pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
 mod native;
 pub(crate) use native::Services as NativeServices;
@@ -53,6 +55,7 @@ struct Channel {
 pub struct LocalSocket {
     namespace: Rc<RefCell<LocalNamespace>>,
     network: Rc<linux_namespace::RootNetwork>,
+    pathname_binding: OnceCell<binding::OwnedBinding>,
     channel: RefCell<Rc<Channel>>,
     side: Cell<usize>,
     connected: Cell<bool>,
@@ -99,6 +102,7 @@ impl LocalSocket {
         Rc::new(Self {
             namespace: network.local.clone(),
             network,
+            pathname_binding: OnceCell::new(),
             channel: RefCell::new(Rc::new(Channel {
                 resource: channel::Resource::new(kind, false),
                 ends: [Weak::new(), Weak::new()],
@@ -209,6 +213,10 @@ impl LocalSocket {
     }
     pub(super) fn direct(&self) -> Option<(Arc<channel::Resource>, usize)> {
         (self.kind == 1 && self.connected.get() && !self.listening())
+            .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
+    }
+    pub(super) fn direct_message(&self) -> Option<(Arc<channel::Resource>, usize)> {
+        (matches!(self.kind, 2 | 5) && self.connected.get() && !self.listening())
             .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
     }
     pub fn shutdown(&self, how: u32) -> Result<()> {
@@ -338,6 +346,9 @@ impl LocalSocket {
 }
 impl Drop for LocalSocket {
     fn drop(&mut self) {
+        // Invalidate the path before resource notifications or nested rights
+        // destruction can observe it. Inodes never own the socket lifetime.
+        drop(self.pathname_binding.take());
         let binding = self.channel.borrow();
         let ids = binding.resource.close(self.side.get());
         let rights: Vec<_> = {
@@ -388,9 +399,10 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Socket,
-                    flags: 2 | (flags & O_NONBLOCK),
+                    flags: (2 | (flags & O_NONBLOCK)).into(),
                     position: 0,
                     file_position: Arc::default(),
+                    flock: OnceCell::new(),
                     node: None,
                     pipe: None,
                     socket: None,
@@ -405,7 +417,7 @@ impl Vfs {
                     oom: None,
                     mount: None,
                 })),
-                cloexec: flags & O_CLOEXEC != 0,
+                cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
     }
@@ -477,11 +489,14 @@ impl Vfs {
                 Err(e) => return Err(e),
             }
             self.check_parent_write(&p)?;
+            let binding = self.path_bindings.bind(socket);
             self.insert(
                 p,
-                Content::Socket(Rc::downgrade(socket)),
-                0o140000 | (0o777 & !self.umask),
+                Content::Socket(binding.path()),
+                0o140000 | (0o777 & !self.umask()),
             )?;
+            // A failed insert drops the unpublished binding and its route.
+            let _ = socket.pathname_binding.set(binding);
         }
         *socket.name.borrow_mut() = name;
         Ok(())
@@ -516,7 +531,7 @@ impl Vfs {
             let Content::Socket(peer) = &n.content else {
                 return Err(Errno(111));
             };
-            peer.upgrade().ok_or(Errno(111))?
+            self.path_bindings.resolve(peer).ok_or(Errno(111))?
         };
         if peer.kind != socket.kind {
             return Err(Errno(91));
@@ -581,7 +596,13 @@ impl Vfs {
             .collect();
         let truncated = free.len() < rights.0.len();
         for (&fd, open) in free.iter().zip(rights.0.drain(..free.len())) {
-            self.fds.insert(fd, Descriptor { open, cloexec });
+            self.fds.insert(
+                fd,
+                Descriptor {
+                    open,
+                    cloexec: cloexec.into(),
+                },
+            );
         }
         (free, truncated)
     }

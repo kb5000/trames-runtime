@@ -27,8 +27,9 @@ impl Vfs {
             }
             Ok((self.node(&at)?, at.filesystem(self)))
         } else {
-            let open = self.descriptor(fd as u32)?.open.borrow();
-            if open.flags & O_PATH != 0 {
+            let open_descriptor = self.descriptor(fd as u32)?;
+            let open = open_descriptor.open.borrow();
+            if open.flags.get() & O_PATH != 0 {
                 return Err(Errno(9));
             }
             if write

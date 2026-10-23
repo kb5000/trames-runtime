@@ -41,6 +41,11 @@ pub trait CpuMemory {
     fn fetch_u32(&self, address: u64) -> Result<u32, MemoryError>;
     fn instruction_identity(&self) -> (u64, u64, u64);
     fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64, u64), MemoryError>;
+    /// Immutable shared-backing identity for futexes. Ordinary anonymous/private
+    /// memory falls back to the caller's VM + virtual address, without a fence.
+    fn shared_futex_key(&self, _address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
+        Ok(None)
+    }
     fn read_array<const N: usize>(&self, address: u64) -> Result<[u8; N], MemoryError> {
         let mut bytes = [0; N];
         self.read(address, &mut bytes)?;
@@ -108,6 +113,9 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
+        Memory::shared_futex_key(self, address)
+    }
     fn cpu_read_chunk<T>(
         &self,
         address: u64,

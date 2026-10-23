@@ -439,6 +439,8 @@ fn fifo_inode_persists_but_live_channel_does_not() {
     let dir = Temp::new();
     let mut v = dir.open();
     v.mknod_at(AT_FDCWD, b"/fifo", 0o10640, 0).unwrap();
+    v.link_at(AT_FDCWD, b"/fifo", AT_FDCWD, b"/fifo-alias")
+        .unwrap();
     let fd = v.open_at(AT_FDCWD, b"/fifo", 2 | O_NONBLOCK, 0).unwrap();
     v.write(fd, b"unpersisted").unwrap();
     let stat = v.stat_fd(fd).unwrap();
@@ -447,9 +449,13 @@ fn fifo_inode_persists_but_live_channel_does_not() {
     let mut v = dir.open();
     let reopened = v.stat_at(AT_FDCWD, b"/fifo").unwrap();
     assert_eq!(&stat[..32], &reopened[..32]);
+    assert_eq!(v.stat_at(AT_FDCWD, b"/fifo-alias").unwrap(), reopened);
     let fd = v.open_at(AT_FDCWD, b"/fifo", 2 | O_NONBLOCK, 0).unwrap();
     assert_eq!(v.read(fd, 32), Err(Errno(11)));
-    v.write(fd, b"live").unwrap();
+    let writer = v
+        .open_at(AT_FDCWD, b"/fifo-alias", 1 | O_NONBLOCK, 0)
+        .unwrap();
+    v.write(writer, b"live").unwrap();
     assert_eq!(v.read(fd, 32).unwrap(), b"live");
 }
 #[test]

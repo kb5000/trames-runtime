@@ -318,6 +318,8 @@ impl Overlay {
                 let inode = backing.next_inode;
                 backing.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
                 let n = Rc::new(RefCell::new(Node {
+                    record_locks: OnceCell::new(),
+                    whole_locks: OnceCell::new(),
                     notifications: inotify::Marks::default(),
                     path_hint: RefCell::default(),
                     device: upper.fs_device(),
@@ -640,6 +642,8 @@ impl Vfs {
                     Content::Socket(s) => Content::Socket(s.clone()),
                 };
                 let copy = Rc::new(RefCell::new(Node {
+                    record_locks: OnceCell::new(),
+                    whole_locks: OnceCell::new(),
                     notifications: inotify::Marks::default(),
                     path_hint: RefCell::default(),
                     device: n.device,
@@ -694,8 +698,6 @@ impl Vfs {
             paths,
             inodes: unique.into_values().collect(),
             next_inode: next,
-            flock: BTreeMap::new(),
-            record_locks: BTreeMap::new(),
             limits: budget,
             disk: None,
             volume: None,

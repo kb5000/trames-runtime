@@ -105,6 +105,30 @@ impl Terminal {
         self.window[0..2].copy_from_slice(&rows.to_le_bytes());
         self.window[2..4].copy_from_slice(&columns.to_le_bytes());
     }
+    /// Same CR/flow-control precedence used by input; no state is modified.
+    pub fn input_signal(&self, raw: u8) -> Option<u32> {
+        if self.lflag() & 1 == 0 {
+            return None;
+        }
+        let c = if raw == b'\r' && self.attributes[1] & 1 != 0 {
+            b'\n'
+        } else {
+            raw
+        };
+        let cc = &self.attributes[17..];
+        if self.attributes[1] & 4 != 0 && (c == cc[8] || c == cc[9]) {
+            return None;
+        }
+        if c != 0 && c == cc[0] {
+            Some(2)
+        } else if c != 0 && c == cc[1] {
+            Some(3)
+        } else if c != 0 && c == cc[10] {
+            Some(20)
+        } else {
+            None
+        }
+    }
     /// Input is bounded to 64 KiB; returns terminal-generated signals for the foreground group.
     pub fn input(&mut self, bytes: &[u8]) -> Vec<u32> {
         let before = (self.packets.len(), self.queued_charge);
@@ -131,15 +155,7 @@ impl Terminal {
                 }
             }
             if local & 1 != 0 {
-                let sig = if c == cc[0] && c != 0 {
-                    Some(2)
-                } else if c == cc[1] && c != 0 {
-                    Some(3)
-                } else if c == cc[10] && c != 0 {
-                    Some(20)
-                } else {
-                    None
-                };
+                let sig = self.input_signal(raw);
                 if let Some(sig) = sig {
                     self.edit.clear();
                     self.packets.clear();

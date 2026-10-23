@@ -17,8 +17,9 @@ impl Vfs {
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(Errno(27))?;
         let (old, shared) = {
-            let o = self.descriptor(fd)?.open.borrow();
-            if o.flags & O_PATH != 0 || o.flags & 3 == 0 {
+            let o_descriptor = self.descriptor(fd)?;
+            let o = o_descriptor.open.borrow();
+            if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 0 {
                 return Err(Errno(9));
             }
             if o.pipe.is_some() {
@@ -77,6 +78,8 @@ impl Vfs {
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             device: 16,
@@ -106,9 +109,10 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Node(target),
-                    flags: 2,
+                    flags: (2).into(),
                     position: 0,
                     file_position: Arc::default(),
+                    flock: OnceCell::new(),
                     node: Some(node),
                     pipe: None,
                     socket: None,
@@ -123,7 +127,7 @@ impl Vfs {
                     oom: None,
                     mount: None,
                 })),
-                cloexec: flags & 1 != 0,
+                cloexec: (flags & 1 != 0).into(),
             },
         );
         Ok(fd)
@@ -131,8 +135,9 @@ impl Vfs {
     /// A managed shared inode capability for native protocol FD translation.
     /// Guest descriptor numbers and guest-selected host paths never cross here.
     pub fn shared_file(&self, fd: u32) -> Result<trames_shared::SharedFile> {
-        let open = self.descriptor(fd)?.open.borrow();
-        if open.flags & O_PATH != 0 || open.flags & 3 == 1 {
+        let open_descriptor = self.descriptor(fd)?;
+        let open = open_descriptor.open.borrow();
+        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }
         let node = open.node.as_ref().ok_or(Errno(19))?.borrow();
@@ -142,7 +147,8 @@ impl Vfs {
         data.shared_file().ok_or(Errno(95))
     }
     pub fn seals(&self, fd: u32, add: Option<u32>) -> Result<u32> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         let node = o.node.as_ref().ok_or(Errno(22))?;
         let mut n = node.borrow_mut();
         let current = n.seals.ok_or(Errno(22))?;
@@ -150,7 +156,7 @@ impl Vfs {
         if add & !15 != 0 {
             return Err(Errno(22));
         }
-        if o.flags & 3 != 2 || current & 1 != 0 {
+        if o.flags.get() & 3 != 2 || current & 1 != 0 {
             return Err(Errno(1));
         }
         if add & 8 != 0 {

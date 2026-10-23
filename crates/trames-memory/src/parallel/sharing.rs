@@ -4,6 +4,79 @@ use super::*;
 use std::sync::Barrier;
 
 #[test]
+fn futex_keys_match_owner_aliases_and_forks_and_follow_incremental_mapping_changes() {
+    let mut memory = Memory::default();
+    memory
+        .map_shared_anonymous(0x10000, 2 * PAGE_SIZE, Permissions::RW, false)
+        .unwrap();
+    let objects: Vec<_> = [0x10000, 0x10000 + PAGE_SIZE]
+        .into_iter()
+        .map(|at| {
+            memory.frames[memory.pages[&at]]
+                .as_ref()
+                .unwrap()
+                .backing
+                .as_ref()
+                .unwrap()
+                .object
+                .clone()
+        })
+        .collect();
+    memory
+        .map_backed(0x20000, objects.clone(), true, Permissions::RW, false)
+        .unwrap();
+    memory
+        .map_backed(0x30000, objects, false, Permissions::RW, false)
+        .unwrap();
+    memory.map(0x40000, PAGE_SIZE, Permissions::RW).unwrap();
+    let expected = memory.shared_futex_key(0x10004).unwrap();
+    assert!(expected.is_some());
+    let mut fork = memory.clone();
+    let mut registry = Registry::default();
+    let before = memory.resident_bytes();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    let peer = fork.parallel_view(&mut registry).unwrap();
+    assert_eq!(view.snapshot.backings.futex.len(), 4);
+    for view in [&view, &peer] {
+        assert_eq!(view.shared_futex_key(0x10004).unwrap(), expected);
+        assert_eq!(
+            view.shared_futex_key(0xab00_0000_0002_0004).unwrap(),
+            expected
+        );
+        assert_ne!(view.shared_futex_key(0x10008).unwrap(), expected);
+        assert_ne!(
+            view.shared_futex_key(0x10000 + PAGE_SIZE + 4).unwrap(),
+            expected
+        );
+        assert_eq!(view.shared_futex_key(0x30004).unwrap(), None);
+        assert_eq!(view.shared_futex_key(0x40004).unwrap(), None);
+    }
+    assert_eq!(memory.resident_bytes(), before);
+    drop((view, peer));
+    memory.unmap(0x20000, PAGE_SIZE).unwrap();
+    memory
+        .map_shared_anonymous(0x20000, PAGE_SIZE, Permissions::RW, false)
+        .unwrap();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    assert_ne!(view.shared_futex_key(0x20004).unwrap(), expected);
+    assert_eq!(view.shared_futex_key(0x10004).unwrap(), expected);
+    assert_eq!(view.snapshot.backings.futex.len(), 4);
+    drop(view);
+    memory.unmap(0x20000, PAGE_SIZE).unwrap();
+    memory.map(0x20000, PAGE_SIZE, Permissions::RW).unwrap();
+    memory
+        .protect(0x10000, PAGE_SIZE, Permissions::NONE)
+        .unwrap();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    assert_eq!(view.shared_futex_key(0x20004).unwrap(), None);
+    assert!(matches!(
+        view.shared_futex_key(0x10004),
+        Err(MemoryError::Permission { .. })
+    ));
+    assert!(registry.metrics.incremental_updates >= 2);
+}
+
+#[test]
 fn coordinator_and_four_workers_share_one_allocation_and_atomic_domain() {
     let mut memory = Memory::default();
     memory.map(0x40000, 4 * PAGE_SIZE, Permissions::RW).unwrap();

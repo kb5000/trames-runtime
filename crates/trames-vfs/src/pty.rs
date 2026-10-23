@@ -2,19 +2,15 @@
 //! Guest-owned PTYs. Descriptor aliases share an endpoint; the last close hangs up.
 use super::*;
 use terminal::Terminal;
+mod shared;
+pub use shared::{PtyIo, PtySlaveEndpoint, TerminalAccess};
 
 pub struct Pty {
-    pub id: u32,
     pub number: u32,
     pub(super) mount: Option<Rc<Mount>>,
     slave: Rc<RefCell<Node>>,
-    pub terminal: RefCell<Terminal>,
+    pub(super) io: Arc<PtyIo>,
     pub locked: Cell<bool>,
-    pub master_alive: Cell<bool>,
-    pub slaves: Cell<u32>,
-    slave_opened: Cell<bool>,
-    pub packet: Cell<bool>,
-    pub packet_status: Cell<u8>,
     pub hangup_notified: Cell<bool>,
     pub host_resize_pending: Cell<bool>,
     pub host_signals: Cell<u64>,
@@ -22,20 +18,28 @@ pub struct Pty {
 pub struct PtyEnd {
     pub pair: Rc<Pty>,
     pub master: bool,
+    slave: Option<Arc<PtySlaveEndpoint>>,
 }
 impl PtyEnd {
     pub(super) fn new(pair: Rc<Pty>, master: bool) -> Rc<Self> {
-        if !master {
-            pair.slaves.set(pair.slaves.get() + 1);
-            pair.slave_opened.set(true);
-        }
-        Rc::new(Self { pair, master })
+        let slave = (!master).then(|| PtySlaveEndpoint::open(pair.io.clone()));
+        Rc::new(Self {
+            pair,
+            master,
+            slave,
+        })
+    }
+    /// Capture only for an accepted operation. The master still requires its
+    /// devpts and task/job-control close effects and has no shared lease yet.
+    pub fn slave_endpoint(&self) -> Option<Arc<PtySlaveEndpoint>> {
+        self.slave.clone()
     }
 }
 impl Drop for PtyEnd {
     fn drop(&mut self) {
         if self.master {
-            self.pair.master_alive.set(false);
+            self.pair.master_alive.store(false, Ordering::Relaxed);
+            self.pair.notify();
             if let Some(mount) = self.pair.mount.as_ref().filter(|m| m.devpts.is_some()) {
                 let key = format!("/{}", self.pair.number).into_bytes();
                 let mut fs = mount.fs.borrow_mut();
@@ -48,9 +52,16 @@ impl Drop for PtyEnd {
                     self.pair.slave.borrow_mut().links = 0;
                 }
             }
-        } else {
-            self.pair.slaves.set(self.pair.slaves.get() - 1);
         }
+        // Preserve the metadata projection through ordinary final-close
+        // callbacks; an explicitly retained slave may finish on a worker later.
+        drop(self.slave.take());
+    }
+}
+impl std::ops::Deref for Pty {
+    type Target = PtyIo;
+    fn deref(&self) -> &PtyIo {
+        &self.io
     }
 }
 impl Pty {
@@ -64,75 +75,6 @@ impl Pty {
     }
     pub(super) fn private(&self) -> bool {
         self.mount.as_ref().is_some_and(|m| m.devpts.is_some())
-    }
-    pub fn master_read(&self, count: usize) -> Result<Vec<u8>> {
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        if self.packet.get() && self.packet_status.get() != 0 {
-            return Ok(vec![self.packet_status.replace(0)]);
-        }
-        let mut tty = self.terminal.borrow_mut();
-        if tty.output_queue.is_empty() {
-            return Err(Errno(
-                if self.slave_opened.get() && self.slaves.get() == 0 {
-                    5
-                } else {
-                    11
-                },
-            ));
-        }
-        let mut bytes = Vec::new();
-        if self.packet.get() {
-            bytes.push(0);
-        }
-        let take = (count - bytes.len()).min(tty.output_queue.len());
-        bytes.extend(tty.drain_output(take));
-        Ok(bytes)
-    }
-    pub fn poll(&self, master: bool, events: u16) -> u16 {
-        let tty = self.terminal.borrow();
-        if master {
-            let read = !tty.output_queue.is_empty()
-                || (self.packet.get() && self.packet_status.get() != 0);
-            let hungup = self.slave_opened.get() && self.slaves.get() == 0;
-            (if read { events & 1 } else { 0 })
-                | (if self.packet.get() && self.packet_status.get() != 0 {
-                    events & 2
-                } else {
-                    0
-                })
-                | (if tty.input_capacity() != 0 {
-                    events & 4
-                } else {
-                    0
-                })
-                | (if hungup { 16 } else { 0 })
-        } else {
-            (if tty.readable() || !self.master_alive.get() {
-                events & 1
-            } else {
-                0
-            }) | (if tty.output_queue.len() < PIPE_CAPACITY && self.master_alive.get() {
-                events & 4
-            } else {
-                0
-            }) | (if !self.master_alive.get() { 16 | 8 } else { 0 })
-        }
-    }
-    pub(super) fn poll_epoch(&self, master: bool) -> [u64; 2] {
-        let tty = self.terminal.borrow();
-        if master {
-            [tty.output_epoch, tty.input_space_epoch]
-        } else {
-            [tty.input_epoch, tty.output_space_epoch]
-        }
-    }
-    pub fn flush_echo(&self) {
-        let mut tty = self.terminal.borrow_mut();
-        let echo = std::mem::take(&mut tty.echo);
-        let count = tty.queue_output(&echo).unwrap_or(0);
-        tty.echo = echo[count..].to_vec();
     }
 }
 impl Vfs {
@@ -211,17 +153,11 @@ impl Vfs {
             (id, node)
         };
         let pair = Rc::new(Pty {
-            id,
             number,
             mount,
             slave,
-            terminal: RefCell::new(tty),
+            io: Arc::new(PtyIo::new(id, tty)),
             locked: Cell::new(true),
-            master_alive: Cell::new(true),
-            slaves: Cell::new(0),
-            slave_opened: Cell::new(false),
-            packet: Cell::new(false),
-            packet_status: Cell::new(0),
             hangup_notified: Cell::new(false),
             host_resize_pending: Cell::new(false),
             host_signals: Cell::new(0),
@@ -253,9 +189,10 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Terminal,
-                    flags: flags & !O_CLOEXEC,
+                    flags: (flags & !O_CLOEXEC).into(),
                     position: 0,
                     file_position: Arc::default(),
+                    flock: OnceCell::new(),
                     node: Some(node),
                     pipe: None,
                     socket: None,
@@ -270,7 +207,7 @@ impl Vfs {
                     mount: end.pair.mount.clone(),
                     pty: Some(PtyEnd::new(end.pair.clone(), false)),
                 })),
-                cloexec: flags & O_CLOEXEC != 0,
+                cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
         Ok(fd)
@@ -323,8 +260,6 @@ impl Devpts {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: 1,
-                flock: BTreeMap::new(),
-                record_locks: BTreeMap::new(),
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
@@ -363,6 +298,8 @@ impl Devpts {
             _ => unreachable!("devpts only contains its root, ptmx and slaves"),
         };
         let node = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             inode,
@@ -397,6 +334,170 @@ mod tests {
             Some(b"newinstance,mode=0620,ptmxmode=0666,gid=5,max=2"),
         )
         .unwrap();
+    }
+    #[test]
+    fn retained_pty_bytes_do_not_keep_guest_endpoints_open() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let direct = v.direct_descriptors();
+        let read = direct.get(master).unwrap();
+        let write = direct.get(slave).unwrap();
+        let access = Some(TerminalAccess {
+            session: 0,
+            group: 0,
+            controlling: None,
+            ignore_ttou: false,
+        });
+        assert_eq!(write.terminal_write(b"buffered\n", access), Some(Ok(9)));
+        v.close(slave).unwrap();
+        assert_eq!(read.poll_ready(1).unwrap() & 17, 17);
+        assert_eq!(read.read(32), Ok(b"buffered\r\n".to_vec()));
+        assert_eq!(read.read(1), Err(Errno(5)));
+        v.close(master).unwrap();
+        assert_eq!(write.terminal_write(b"closed", access), Some(Err(Errno(5))));
+        assert_eq!(write.terminal_read(1, access), Some(Ok(vec![])));
+        assert_eq!(write.poll_ready(5), Some(25));
+    }
+    #[test]
+    fn accepted_slave_survives_alias_close_and_fd_reuse_then_worker_notifies_hup() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<PtySlaveEndpoint>();
+        struct Wake {
+            master: DirectFd,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                // Reenter terminal locking from the final-close callback.
+                assert_eq!(self.master.poll_ready(1), Some(16));
+                assert_eq!(self.master.read(1), Err(Errno(5)));
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked.set(false);
+        assert!(v.pty(master).unwrap().unwrap().slave_endpoint().is_none());
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let lease = v.pty(slave).unwrap().unwrap().slave_endpoint().unwrap();
+        let alias = v.dup(slave, 0, false).unwrap();
+        let mut child = v.clone();
+        let bytes = v.direct_descriptors();
+        v.close(slave).unwrap();
+        v.close(alias).unwrap();
+        child.close_all();
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/replacement", 0x42, 0o600).unwrap(),
+            slave
+        );
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes.get(master).unwrap().read(1), Err(Errno(11)));
+        let wake = Arc::new(Wake {
+            master: bytes.get(master).unwrap().clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let target: Arc<dyn IoWake> = wake.clone();
+        let signal = IoSignal::new(1, Arc::downgrade(&target));
+        let subscription = bytes.get(master).unwrap().subscribe(&signal);
+        std::thread::spawn(move || drop(lease)).join().unwrap();
+        assert!(signal.ready());
+        assert_eq!(wake.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 0);
+        drop(subscription);
+        // Closing the last slave does not delete the master's devpts entry;
+        // reopening it creates a real new endpoint and clears master HUP.
+        assert!(v.stat_at(AT_FDCWD, b"/pts/0").is_ok());
+        let reopened = v.open_at(AT_FDCWD, b"/pts/0", 2, 0).unwrap();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes.get(master).unwrap().poll_ready(1), Some(0));
+        v.close(reopened).unwrap();
+        assert_eq!(bytes.get(master).unwrap().poll_ready(1), Some(16));
+    }
+    #[test]
+    fn independent_slave_opens_and_parallel_alias_drops_preserve_buffered_output() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked.set(false);
+        let first = v.open_pty_peer(master, 2).unwrap();
+        let second = v.open_at(AT_FDCWD, b"/pts/0", 2, 0).unwrap();
+        let one = v.pty(first).unwrap().unwrap().slave_endpoint().unwrap();
+        let two = v.pty(second).unwrap().unwrap().slave_endpoint().unwrap();
+        assert!(!Arc::ptr_eq(&one, &two));
+        let aliases: Vec<_> = (0..8).map(|_| one.clone()).collect();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 2);
+        let bytes = v.direct_descriptors();
+        let access = Some(TerminalAccess {
+            session: 0,
+            group: 0,
+            controlling: None,
+            ignore_ttou: false,
+        });
+        assert_eq!(
+            bytes
+                .get(second)
+                .unwrap()
+                .terminal_write(b"buffered\n", access),
+            Some(Ok(9))
+        );
+        v.close(first).unwrap();
+        v.close(second).unwrap();
+        std::thread::scope(|s| {
+            for alias in aliases {
+                s.spawn(move || drop(alias));
+            }
+            s.spawn(move || drop(one));
+        });
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes.get(master).unwrap().poll_ready(1), Some(1));
+        std::thread::spawn(move || drop(two)).join().unwrap();
+        assert_eq!(bytes.get(master).unwrap().poll_ready(1), Some(17));
+        assert_eq!(
+            bytes.get(master).unwrap().read(32),
+            Ok(b"buffered\r\n".to_vec())
+        );
+        assert_eq!(bytes.get(master).unwrap().read(1), Err(Errno(5)));
+    }
+    #[test]
+    fn master_close_removes_devpts_while_retained_slave_sees_eof_and_write_error() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked.set(false);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let lease = v.pty(slave).unwrap().unwrap().slave_endpoint().unwrap();
+        let bytes = v.direct_descriptors();
+        v.close(slave).unwrap();
+        v.close(master).unwrap();
+        assert!(matches!(v.stat_at(AT_FDCWD, b"/pts/0"), Err(Errno(2))));
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        let slave = bytes.get(slave).unwrap().clone();
+        std::thread::spawn(move || {
+            let access = Some(TerminalAccess {
+                session: 0,
+                group: 0,
+                controlling: None,
+                ignore_ttou: false,
+            });
+            assert_eq!(slave.terminal_read(1, access), Some(Ok(vec![])));
+            assert_eq!(slave.terminal_write(b"closed", access), Some(Err(Errno(5))));
+            assert_eq!(slave.poll_ready(5), Some(25));
+            drop(lease);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn devpts_linux_inode_identity_survives_bind_and_path_handles() {
@@ -477,9 +578,9 @@ mod tests {
         a.pair.locked.set(false);
         let slave = v.open_at(AT_FDCWD, slave_link.as_bytes(), 2, 0).unwrap();
         assert!(!v.pty(slave).unwrap().unwrap().master);
-        assert_eq!(a.pair.slaves.get(), 1);
+        assert_eq!(a.pair.slaves.load(std::sync::atomic::Ordering::Relaxed), 1);
         v.close(slave).unwrap();
-        assert_eq!(a.pair.slaves.get(), 0);
+        assert_eq!(a.pair.slaves.load(std::sync::atomic::Ordering::Relaxed), 0);
         v.close(second).unwrap();
         v.umount(b"/pts", 2).unwrap();
         let detached = v.open_at(AT_FDCWD, link.as_bytes(), 2, 0).unwrap();
@@ -526,7 +627,13 @@ mod tests {
         assert_eq!(v.stat_at(AT_FDCWD, b"/pts-a/0"), Err(Errno(2)));
         let again = v.open_at(AT_FDCWD, b"/pts-a/ptmx", 2, 0).unwrap();
         assert_eq!(v.pty(again).unwrap().unwrap().pair.number, 0);
-        assert!(!v.pty(sa).unwrap().unwrap().pair.master_alive.get());
+        assert!(!v
+            .pty(sa)
+            .unwrap()
+            .unwrap()
+            .pair
+            .master_alive
+            .load(std::sync::atomic::Ordering::Relaxed));
         // Linux reuses the slave inode with its local number. Retained FDs
         // still refer to the old, unlinked object, never the replacement PTY.
         assert_eq!(v.stat_fd(sa).unwrap()[8..16], 3u64.to_le_bytes());

@@ -30,7 +30,7 @@ const FILES: &[(&str, u32)] = &[
     ("io.max", 0o644),
 ];
 struct Group {
-    device_programs: Vec<Rc<bpf::Program>>,
+    device_programs: Vec<Arc<bpf::Program>>,
     device_attach_flags: u32,
     path: Vec<u8>,
     parent: Option<u64>,
@@ -74,8 +74,6 @@ impl Default for Cgroups {
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
                 next_inode: ROOT,
-                flock: BTreeMap::new(),
-                record_locks: BTreeMap::new(),
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
@@ -95,6 +93,8 @@ impl Cgroups {
         let inode = fs.next_inode;
         fs.next_inode += 1;
         let node = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             device: 5,
@@ -217,7 +217,8 @@ impl Cgroups {
 }
 impl Vfs {
     fn bpf_group(&self, fd: u32) -> Result<u64> {
-        let open = self.descriptor(fd)?.open.borrow();
+        let open_descriptor = self.descriptor(fd)?;
+        let open = open_descriptor.open.borrow();
         if !open
             .mount
             .as_ref()
@@ -442,7 +443,7 @@ impl Vfs {
         if cg.groups.len() + cg.dying.len() >= MAX_GROUPS || cg.ancestors(id).len() > MAX_DEPTH {
             return Err(Errno(28));
         }
-        cg.add_group(path.key.clone(), Some(id), mode & 0o777 & !self.umask);
+        cg.add_group(path.key.clone(), Some(id), mode & 0o777 & !self.umask());
         Ok(())
     }
     pub(super) fn cgroup_rmdir(&self, path: &ResolvedPath) -> Result<()> {

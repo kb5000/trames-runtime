@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
-    Bpf(Rc<bpf::Program>),
-    Inotify(Rc<RefCell<inotify::Instance>>),
+    Uring(Rc<Uring>),
+    Bpf(Arc<bpf::Program>),
+    Inotify(Arc<inotify::InotifyInstance>),
     Signal {
         mask: u64,
     },
@@ -57,6 +58,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Uring(_) => b"anon_inode:[io_uring]",
             Self::Bpf(_) => b"anon_inode:bpf-prog",
             Self::Inotify(_) => b"anon_inode:inotify",
             Self::Signal { .. } => b"anon_inode:[signalfd]",
@@ -67,9 +69,16 @@ impl Anonymous {
     }
     pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
         match self {
+            Self::Uring(ring) => {
+                if ring.cq_ready() != 0 {
+                    events & 1
+                } else {
+                    0
+                }
+            }
             Self::Bpf(_) => 0,
             Self::Inotify(i) => {
-                if i.borrow().available() != 0 {
+                if i.queue.available() != 0 {
                     events & 1
                 } else {
                     0
@@ -103,7 +112,7 @@ impl Anonymous {
     }
     pub(super) fn read(&mut self, count: usize) -> Result<Vec<u8>> {
         if let Self::Inotify(i) = self {
-            return i.borrow_mut().read(count);
+            return i.queue.read(count);
         }
         if count < 8 {
             return Err(Errno(22));
@@ -111,9 +120,11 @@ impl Anonymous {
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::Bpf(_) | Self::Signal { .. } | Self::Epoll { .. } | Self::Inotify(_) => {
-                Err(Errno(22))
-            }
+            Self::Bpf(_)
+            | Self::Signal { .. }
+            | Self::Epoll { .. }
+            | Self::Inotify(_)
+            | Self::Uring(_) => Err(Errno(22)),
         }
     }
     pub(super) fn write(&mut self, bytes: &[u8]) -> Result<usize> {
@@ -134,7 +145,8 @@ impl Vfs {
         if fd == -1 {
             return self.anonymous(flags, Anonymous::Signal { mask });
         }
-        let mut open = self.descriptor(fd as u32)?.open.borrow_mut();
+        let open_descriptor = self.descriptor(fd as u32)?;
+        let mut open = open_descriptor.open.borrow_mut();
         let Some(Anonymous::Signal { mask: current }) = open.anonymous.as_mut() else {
             return Err(Errno(22));
         };
@@ -162,9 +174,10 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (0, 0),
                     kind: FdKind::Anonymous,
-                    flags: access | (flags & O_NONBLOCK),
+                    flags: (access | (flags & O_NONBLOCK)).into(),
                     position: 0,
                     file_position: Arc::default(),
+                    flock: OnceCell::new(),
                     node: None,
                     pipe: None,
                     socket: None,
@@ -179,7 +192,7 @@ impl Vfs {
                     oom: None,
                     mount: None,
                 })),
-                cloexec: flags & O_CLOEXEC != 0,
+                cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
         Ok(fd)
@@ -226,6 +239,7 @@ impl Vfs {
     }
     pub fn next_timerfd_deadline(&self) -> Option<Instant> {
         self.fds
+            .entries()
             .values()
             .filter_map(|d| match &d.open.borrow().anonymous {
                 Some(Anonymous::Timer(timer)) => timer.deadline(),
@@ -254,7 +268,10 @@ impl Vfs {
         }
         let t = target.borrow();
         if t.namespace.is_some()
-            || matches!(t.kind, FdKind::Node(_)) && t.bridge.is_none() && t.pipe.is_none()
+            || matches!(t.kind, FdKind::Node(_))
+                && t.bridge.is_none()
+                && t.pipe.is_none()
+                && t.kernel_log.is_none()
         {
             return Err(Errno(1));
         }
@@ -264,10 +281,16 @@ impl Vfs {
             && !matches!(t.kind, FdKind::Terminal)
             && t.local.is_none()
             && t.pipe.is_none()
+            && t.kernel_log.is_none()
             && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
             && !matches!(
                 t.anonymous,
-                Some(Anonymous::Event(_) | Anonymous::Timer(_) | Anonymous::Inotify(_))
+                Some(
+                    Anonymous::Event(_)
+                        | Anonymous::Timer(_)
+                        | Anonymous::Inotify(_)
+                        | Anonymous::Uring(_)
+                )
             )
         {
             return Err(Errno(95));
@@ -344,18 +367,24 @@ impl Vfs {
             special(kind, events).map(|r| r.map(|r| (r, [0; 2])))
         })
     }
-    fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+    pub(super) fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+        if let Some(log) = &o.kernel_log {
+            return log.poll(0).1;
+        }
+        if let Some(Anonymous::Uring(ring)) = &o.anonymous {
+            return ring.cq_epoch();
+        }
         if let Some(epoch) = o.socket.as_ref().and_then(|s| s.poll_epoch()) {
             return epoch;
         }
         if let Some(end) = &o.pipe {
-            return end.pipe.borrow().data.lock().unwrap().io_epoch;
+            return end.data.lock().unwrap().io_epoch;
         }
         if let Some(local) = &o.local {
             return local.poll_epoch();
         }
         if let Some(Anonymous::Inotify(i)) = &o.anonymous {
-            return [i.borrow().epoch, 0];
+            return i.queue.poll(0).1;
         }
         if let Some(Anonymous::Event(counter)) = &o.anonymous {
             return counter.epoch();
@@ -374,7 +403,8 @@ impl Vfs {
         pending: u64,
         mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
     ) -> Result<Vec<(u32, u64)>> {
-        let mut e = self.descriptor(fd)?.open.borrow_mut();
+        let e_descriptor = self.descriptor(fd)?;
+        let mut e = e_descriptor.open.borrow_mut();
         let Some(Anonymous::Epoll { watches, cursor }) = e.anonymous.as_mut() else {
             return Err(Errno(22));
         };

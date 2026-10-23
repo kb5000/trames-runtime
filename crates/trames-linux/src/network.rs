@@ -323,13 +323,7 @@ impl Linux {
             return Ok(0);
         }
         let enabled = u32_at(memory, a[2])? != 0;
-        let mut flags = self.vfs.flags(a[0] as u32)? & !trames_vfs::O_CLOEXEC;
-        if enabled {
-            flags |= trames_vfs::O_NONBLOCK;
-        } else {
-            flags &= !trames_vfs::O_NONBLOCK;
-        }
-        self.vfs.set_status_flags(a[0] as u32, flags)?;
+        self.vfs.set_nonblocking(a[0] as u32, enabled)?;
         Ok(0)
     }
     pub fn resume_connect(&self, fd: u32) -> Result<bool> {
@@ -341,20 +335,28 @@ impl Linux {
         a: [u64; 6],
         memory: &mut Memory,
     ) -> Result<u64> {
+        Self::network_vfs(&mut self.vfs, number, a, memory)
+    }
+    pub(crate) fn network_vfs(
+        vfs: &mut trames_vfs::Vfs,
+        number: u64,
+        a: [u64; 6],
+        memory: &mut Memory,
+    ) -> Result<u64> {
         if number == 198 {
-            return Ok(self.vfs.socket(a[0] as u32, a[1] as u32, a[2] as u32)? as u64);
+            return Ok(vfs.socket(a[0] as u32, a[1] as u32, a[2] as u32)? as u64);
         }
         if number == 199 {
             Self::check(memory, a[3], 8, Access::Write)?;
-            let fds = self.vfs.socketpair(a[0] as u32, a[1] as u32, a[2] as u32)?;
+            let fds = vfs.socketpair(a[0] as u32, a[1] as u32, a[2] as u32)?;
             let bytes: Vec<_> = fds.into_iter().flat_map(u32::to_le_bytes).collect();
             memory.write(a[3], &bytes).map_err(|_| Errno(14))?;
             return Ok(0);
         }
-        if let Some(socket) = self.vfs.local_socket(a[0] as u32)? {
-            return self.local_network_syscall(&socket, number, a, memory);
+        if let Some(socket) = vfs.local_socket(a[0] as u32)? {
+            return Self::local_network_vfs(vfs, &socket, number, a, memory);
         }
-        let socket = self.vfs.socket_fd(a[0] as u32)?;
+        let socket = vfs.socket_fd(a[0] as u32)?;
         match number {
             200 | 203 => {
                 let peer = address(memory, a[1], a[2])?;
@@ -362,8 +364,7 @@ impl Linux {
                     socket
                         .bind_authorized(
                             &peer,
-                            self.vfs
-                                .credentials
+                            vfs.credentials
                                 .has_cap(trames_vfs::capabilities::NET_BIND_SERVICE),
                         )
                         .map_err(net)?;
@@ -378,9 +379,8 @@ impl Linux {
             }
             202 | 242 => {
                 let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?;
-                let (fd, peer) = self
-                    .vfs
-                    .accept(a[0] as u32, if number == 242 { a[3] as u32 } else { 0 })?;
+                let (fd, peer) =
+                    vfs.accept(a[0] as u32, if number == 242 { a[3] as u32 } else { 0 })?;
                 if let Some(output) = output {
                     output.write(memory, Some(peer))?;
                 }
@@ -410,10 +410,7 @@ impl Linux {
                 };
                 let mut bytes = vec![0; a[2] as usize];
                 memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(self
-                    .vfs
-                    .socket_send_bytes(&socket, &bytes, a[3] as u32, peer.as_deref())?
-                    as u64)
+                Ok(vfs.socket_send_bytes(&socket, &bytes, a[3] as u32, peer.as_deref())? as u64)
             }
             207 => {
                 let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
@@ -616,26 +613,24 @@ impl Linux {
                             .send_packet(&bytes, a[2] as u32, peer, info)
                             .map_err(net)? as u64)
                     } else {
-                        Ok(self.vfs.socket_send_bytes(
-                            &socket,
-                            &bytes,
-                            a[2] as u32,
-                            peer.as_deref(),
-                        )? as u64)
+                        Ok(
+                            vfs.socket_send_bytes(&socket, &bytes, a[2] as u32, peer.as_deref())?
+                                as u64,
+                        )
                     }
                 }
             }
             _ => Err(Errno(38)),
         }
     }
-    fn local_network_syscall(
-        &mut self,
+    fn local_network_vfs(
+        vfs: &mut trames_vfs::Vfs,
         socket: &std::rc::Rc<trames_vfs::LocalSocket>,
         number: u64,
         a: [u64; 6],
         memory: &mut Memory,
     ) -> Result<u64> {
-        let nonblocking = if self.vfs.flags(a[0] as u32)? & trames_vfs::O_NONBLOCK != 0 {
+        let nonblocking = if vfs.flags(a[0] as u32)? & trames_vfs::O_NONBLOCK != 0 {
             0x40
         } else {
             0
@@ -644,22 +639,21 @@ impl Linux {
             200 | 203 => {
                 let bytes = address(memory, a[1], a[2])?;
                 if number == 200 {
-                    self.vfs.local_bind(socket, &bytes)?;
+                    vfs.local_bind(socket, &bytes)?;
                 } else {
-                    self.vfs.local_connect(socket, &bytes)?;
+                    vfs.local_connect(socket, &bytes)?;
                 }
                 Ok(0)
             }
             201 => {
-                self.vfs.local_listen(socket, a[1] as u32)?;
+                vfs.local_listen(socket, a[1] as u32)?;
                 Ok(0)
             }
             202 | 242 => {
                 let output =
                     AddressOutput::prepare(memory, a[1], a[2], socket.accept_address_size()?)?;
-                let (fd, peer) = self
-                    .vfs
-                    .local_accept(socket, if number == 242 { a[3] as u32 } else { 0 })?;
+                let (fd, peer) =
+                    vfs.local_accept(socket, if number == 242 { a[3] as u32 } else { 0 })?;
                 if let Some(output) = output {
                     output.write_bytes(memory, &peer)?;
                 }
@@ -714,7 +708,7 @@ impl Linux {
                 }
                 if a[2] == 17 {
                     let mut credentials = socket.peer_credentials();
-                    credentials[0] = self.vfs.pid_namespace().local(credentials[0]);
+                    credentials[0] = vfs.pid_namespace().local(credentials[0]);
                     let value: Vec<_> =
                         credentials.into_iter().flat_map(u32::to_le_bytes).collect();
                     let size = u32_at(memory, a[4])? as usize;
@@ -770,8 +764,7 @@ impl Linux {
                     vectors.write(memory, &received.data)?;
                     let capacity = control_size.saturating_sub(16) as usize / 4;
                     let (fds, truncated) =
-                        self.vfs
-                            .receive_rights(received.rights, capacity, a[2] & 0x40000000 != 0);
+                        vfs.receive_rights(received.rights, capacity, a[2] & 0x40000000 != 0);
                     let control_count = if fds.is_empty() {
                         0
                     } else {
@@ -839,7 +832,7 @@ impl Linux {
                     if control_size != 0 && control_size < 16 {
                         return Err(Errno(22));
                     }
-                    let rights = self.vfs.send_rights(&fds)?;
+                    let rights = vfs.send_rights(&fds)?;
                     Ok(socket.send_rights(&vectors.read(memory)?, a[2] as u32, rights)? as u64)
                 }
             }

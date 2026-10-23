@@ -641,7 +641,7 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             3 => (Content::Terminal, 0o20000),
             4 => (Content::Symlink(target), 0o120000),
             5 => (Content::Fifo(Pipe::new(ino)), 0o10000),
-            8 => (Content::Socket(Weak::new()), 0o140000),
+            8 => (Content::Socket(ipc::PathBinding::default()), 0o140000),
             6 | 7 => (
                 pseudo::Device::node(
                     u32::from_le_bytes(target.try_into().map_err(|_| Errno(22))?),
@@ -663,6 +663,8 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         nodes.insert(
             ino,
             Rc::new(RefCell::new(Node {
+                record_locks: OnceCell::new(),
+                whole_locks: OnceCell::new(),
                 notifications: inotify::Marks::default(),
                 path_hint: RefCell::default(),
                 device: 0xfd01,
@@ -791,8 +793,6 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
     Ok(Filesystem {
         overlay: None,
         shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-        flock: BTreeMap::new(),
-        record_locks: BTreeMap::new(),
         paths,
         inodes: nodes.values().map(Rc::downgrade).collect(),
         next_inode,
@@ -865,6 +865,8 @@ impl Vfs {
         }
         let links = old.borrow().links;
         let new = Rc::new(RefCell::new(Node {
+            record_locks: OnceCell::new(),
+            whole_locks: OnceCell::new(),
             notifications: inotify::Marks::default(),
             path_hint: RefCell::default(),
             device: 0xfd01,
@@ -927,7 +929,7 @@ impl Vfs {
             fs.disk = Some(disk);
             fs.limits = StorageLimits::disk();
         }
-        v.cwd_node = Some(v.node(b"/")?);
+        v.context.paths.borrow_mut().cwd_node = Some(v.node(b"/")?);
         v.initialize_mounts()?;
         if let Some(limits) = options.limits {
             v.set_storage_limits(limits)?;
@@ -1072,7 +1074,8 @@ impl Vfs {
         Ok(())
     }
     pub fn sync_fd(&self, fd: u32, data_only: bool) -> Result<()> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         let n = o.node.as_ref().ok_or(Errno(22))?.borrow();
         if let Content::File(data) = &n.content {
             data.sync(data_only)?;

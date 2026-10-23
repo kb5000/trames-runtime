@@ -61,7 +61,7 @@ pub(super) struct Mount {
     pub pid_namespace: Option<PidNamespace>,
     pub devpts: Option<Rc<pty::Devpts>>,
     pub flags: Cell<u64>,
-    pub writers: Cell<usize>,
+    pub writers: Arc<mapped::Writers>,
     pub parent: RefCell<Option<Attachment>>,
 }
 impl Mount {
@@ -237,7 +237,7 @@ impl Vfs {
             pid_namespace: None,
             devpts: None,
             flags: Cell::new(MS_RELATIME),
-            writers: Cell::new(0),
+            writers: Arc::default(),
             parent: RefCell::new(None),
         });
         let mut mounts = vec![root.clone()];
@@ -259,7 +259,7 @@ impl Vfs {
                 pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
                 devpts: None,
                 flags: Cell::new(flags),
-                writers: Cell::new(0),
+                writers: Arc::default(),
                 parent: RefCell::new(Some(Attachment {
                     parent: root.clone(),
                     node,
@@ -280,7 +280,7 @@ impl Vfs {
             pid_namespace: None,
             devpts: None,
             flags: Cell::new(14),
-            writers: Cell::new(0),
+            writers: Arc::default(),
             parent: RefCell::new(Some(Attachment {
                 parent: mounts[2].clone(),
                 node: point,
@@ -288,8 +288,11 @@ impl Vfs {
             })),
         }));
         self.pseudo.borrow_mut().enabled = enabled;
-        self.cwd_mount = Some(root.clone());
-        self.root_mount = Some(root.clone());
+        {
+            let mut paths = self.context.paths.borrow_mut();
+            paths.cwd_mount = Some(root.clone());
+            paths.root_mount = Some(root.clone());
+        }
         self.register_mounts(&mounts)?;
         self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
             id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
@@ -326,8 +329,9 @@ impl Vfs {
         })
     }
     pub(super) fn root_location(&self) -> Result<ResolvedPath> {
-        if let Some(n) = &self.root_node {
-            self.location(n, &self.root_mount)
+        let paths = self.context.paths.borrow();
+        if let Some(n) = &paths.root_node {
+            self.location(n, &paths.root_mount)
         } else {
             let root = self
                 .mounts
@@ -455,7 +459,7 @@ impl Vfs {
                     pid_namespace: m.pid_namespace.clone(),
                     devpts: m.devpts.clone(),
                     flags: Cell::new(m.flags.get()),
-                    writers: Cell::new(0),
+                    writers: Arc::default(),
                     parent: RefCell::new(None),
                 }),
             );
@@ -478,8 +482,16 @@ impl Vfs {
         let mounts: Vec<_> = old.mounts.iter().map(|m| copies[&m.id].clone()).collect();
         drop(old);
         self.register_mounts(&mounts)?;
-        remap(&mut self.cwd_mount);
-        remap(&mut self.root_mount);
+        // CLONE_NEWNS/unshare also detaches fs_struct. Keep the VFS API correct
+        // when called directly with a shared context, not only through Kernel.
+        if Rc::strong_count(&self.context.paths) > 1 {
+            self.unshare_context();
+        }
+        {
+            let mut paths = self.context.paths.borrow_mut();
+            remap(&mut paths.cwd_mount);
+            remap(&mut paths.root_mount);
+        }
         self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
             id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
@@ -522,13 +534,17 @@ impl Vfs {
             .map_or(Ok(()), |m| m.writable())
     }
     pub(super) fn fd_available_bytes(&self, fd: u32) -> Result<u64> {
-        let open = self.descriptor(fd)?.open.borrow();
+        let open_descriptor = self.descriptor(fd)?;
+        let open = open_descriptor.open.borrow();
         let bytes =
             Self::filesystem_capacity(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow())
                 .available_bytes;
         Ok(bytes)
     }
     pub fn mapping_executable(&self, fd: u32) -> Result<bool> {
+        if self.uring(fd).is_ok() {
+            return Ok(false);
+        }
         Ok(self
             .descriptor(fd)?
             .open
@@ -631,7 +647,7 @@ impl Vfs {
             {
                 return Err(Errno(30));
             }
-            if flags & MS_RDONLY != 0 && parent.writers.get() != 0 {
+            if flags & MS_RDONLY != 0 && parent.writers.active() {
                 return Err(Errno(16));
             }
             parent.flags.set(flags & ATTRS);
@@ -662,6 +678,8 @@ impl Vfs {
                 return Err(Errno(20));
             }
             let root = Rc::new(RefCell::new(Node {
+                record_locks: OnceCell::new(),
+                whole_locks: OnceCell::new(),
                 notifications: inotify::Marks::default(),
                 path_hint: RefCell::default(),
                 device: 17,
@@ -682,8 +700,6 @@ impl Vfs {
                 paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                 inodes: vec![Rc::downgrade(&root)],
                 next_inode: handle.id() + 1,
-                flock: BTreeMap::new(),
-                record_locks: BTreeMap::new(),
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
@@ -765,6 +781,8 @@ impl Vfs {
                     let id = new_mount_id()?;
                     let inode = id << 32;
                     let root = Rc::new(RefCell::new(Node {
+                        record_locks: OnceCell::new(),
+                        whole_locks: OnceCell::new(),
                         notifications: inotify::Marks::default(),
                         path_hint: RefCell::default(),
                         device: id,
@@ -787,8 +805,6 @@ impl Vfs {
                         paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                         inodes: vec![Rc::downgrade(&root)],
                         next_inode: inode + 1,
-                        flock: BTreeMap::new(),
-                        record_locks: BTreeMap::new(),
                         limits: StorageLimits {
                             file_bytes: limit,
                             nodes,
@@ -876,7 +892,7 @@ impl Vfs {
             pid_namespace: proc_ns,
             devpts,
             flags: Cell::new(attrs),
-            writers: Cell::new(0),
+            writers: Arc::default(),
             parent: RefCell::new(Some(Attachment {
                 parent,
                 node: target_node,
@@ -942,7 +958,9 @@ impl Vfs {
                 break;
             }
         }
-        if flags & 2 == 0 && (ids.len() > 1 || Rc::strong_count(mount) > 2) {
+        if flags & 2 == 0
+            && (ids.len() > 1 || Rc::strong_count(mount) > 2 || mount.writers.active())
+        {
             return Err(Errno(16));
         }
         let detached: Vec<_> = table
@@ -1003,35 +1021,36 @@ impl Vfs {
         Ok(())
     }
     fn rebase_pivot_context(&mut self, previous: &Rc<Mount>, new: &Rc<Mount>) {
-        if self
+        let mut paths = self.context.paths.borrow_mut();
+        if paths
             .cwd_mount
             .as_ref()
             .is_some_and(|m| Rc::ptr_eq(m, previous))
-            && self
+            && paths
                 .cwd_node
                 .as_ref()
                 .is_some_and(|n| Rc::ptr_eq(n, &previous.root))
         {
-            self.cwd_mount = Some(new.clone());
-            self.cwd_node = Some(new.root.clone());
+            paths.cwd_mount = Some(new.clone());
+            paths.cwd_node = Some(new.root.clone());
         }
-        if self.root_node.is_none()
-            || self
+        if paths.root_node.is_none()
+            || paths
                 .root_mount
                 .as_ref()
                 .is_some_and(|m| Rc::ptr_eq(m, previous))
-                && self
+                && paths
                     .root_node
                     .as_ref()
                     .is_some_and(|n| Rc::ptr_eq(n, &previous.root))
         {
-            self.root_mount = Some(new.clone());
-            self.root_node = Some(new.root.clone());
+            paths.root_mount = Some(new.clone());
+            paths.root_node = Some(new.root.clone());
         }
     }
     pub fn sync_pivot_from(&mut self, before: &Vfs, after: &Vfs) {
-        if let (Some(ours), Some(theirs), Some(previous)) =
-            (&self.mounts, &after.mounts, &before.root_mount)
+        let previous = before.context.paths.borrow().root_mount.clone();
+        if let (Some(ours), Some(theirs), Some(previous)) = (&self.mounts, &after.mounts, &previous)
         {
             if Rc::ptr_eq(&ours.0, &theirs.0) {
                 let new = theirs.0.borrow().root.clone();
@@ -1052,7 +1071,8 @@ impl Vfs {
             .map_or(1, |m| m.id))
     }
     pub fn mount_id_fd(&self, fd: u32) -> Result<u64> {
-        let o = self.descriptor(fd)?.open.borrow();
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
         Ok(o.mount.as_ref().map_or(
             if o.namespace.is_some() {
                 17
@@ -1095,7 +1115,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         pid_namespace: m.pid_namespace.clone(),
         devpts: m.devpts.clone(),
         flags: Cell::new(m.flags.get()),
-        writers: Cell::new(0),
+        writers: Arc::default(),
         parent: RefCell::new(None),
     }))
 }
@@ -1529,7 +1549,7 @@ impl Vfs {
                             .is_some_and(|a| Rc::ptr_eq(&a.parent, m))
                     })
                     .count();
-                Rc::strong_count(m) > internal
+                Rc::strong_count(m) > internal || m.writers.active()
             })
         });
     }
@@ -1762,7 +1782,8 @@ mod boundary_tests {
             &v.stat_at(AT_FDCWD, b"/b").unwrap()[..16]
         );
         let fd = v.open_at(AT_FDCWD, b"/a", O_DIRECTORY, 0).unwrap();
-        let open = v.descriptor(fd).unwrap().open.borrow();
+        let descriptor = v.descriptor(fd).unwrap();
+        let open = descriptor.open.borrow();
         let fs = v.mount_statfs(open.mount.as_ref());
         assert_eq!(u64::from_le_bytes(fs[..8].try_into().unwrap()), 0x19800202);
         drop(open);

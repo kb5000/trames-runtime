@@ -28,7 +28,8 @@ impl Vfs {
             if dirfd == AT_FDCWD {
                 return Err(Errno(13));
             }
-            let open = self.descriptor(dirfd as u32)?.open.borrow();
+            let open_descriptor = self.descriptor(dirfd as u32)?;
+            let open = open_descriptor.open.borrow();
             let node = open.node.clone().ok_or(Errno(13))?;
             let label = match &open.kind {
                 FdKind::Node(path) => path.clone(),

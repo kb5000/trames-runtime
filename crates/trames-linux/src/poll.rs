@@ -74,6 +74,13 @@ impl Poll {
             .flat_map(|fd| fd.subscribe(signal))
             .collect()
     }
+    pub fn poll_identities(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .filter_map(|(_, _, fd)| fd.as_ref())
+            .flat_map(|fd| fd.poll_identities())
+            .collect()
+    }
     pub fn next_deadline(&self) -> Option<Instant> {
         self.entries
             .iter()

@@ -237,9 +237,10 @@ impl Vfs {
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
                     kind: FdKind::Socket,
-                    flags: 2 | (flags & O_NONBLOCK),
+                    flags: (2 | (flags & O_NONBLOCK)).into(),
                     position: 0,
                     file_position: Arc::default(),
+                    flock: OnceCell::new(),
                     node: None,
                     pipe: None,
                     socket: Some(socket),
@@ -254,7 +255,7 @@ impl Vfs {
                     oom: None,
                     mount: None,
                 })),
-                cloexec: flags & O_CLOEXEC != 0,
+                cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
     }

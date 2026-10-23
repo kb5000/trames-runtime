@@ -8,9 +8,12 @@ use std::sync::Mutex;
 pub struct DirectFile {
     data: Arc<PlainFile>,
     position: Arc<Mutex<FilePosition>>,
+    locks: Arc<locks::Records>,
+    flock: std::sync::Weak<flock::Owner>,
     stat: [u8; 128],
     flags: u32,
-    io: bool,
+    status: StatusFlags,
+    notifications: inotify::Notifications,
     write_error: Option<Errno>,
     unlimited: bool,
     clear_setid: bool,
@@ -37,7 +40,7 @@ impl FileEpoch {
         }
         let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
         let key = (
-            Rc::as_ptr(&vfs.fds.identity) as usize,
+            Rc::as_ptr(&vfs.fds.identity()) as usize,
             clear_setid,
             unlimited,
             FD_FLAGS_REVISION.load(Ordering::Relaxed),
@@ -48,62 +51,94 @@ impl FileEpoch {
         let mut entries = vec![
             None;
             vfs.fds
+                .entries()
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        for (&fd, descriptor) in vfs.fds.iter() {
+        for (&fd, descriptor) in vfs.fds.entries().iter() {
             if mask[fd as usize / 64] & (1 << (fd % 64)) == 0 {
                 continue;
             }
-            let o = descriptor.open.borrow();
-            if o.read_node.is_some() {
-                continue;
-            }
-            let Some(node) = Vfs::ordinary_file(&o, false) else {
-                continue;
-            };
-            let n = node.borrow();
-            let Content::File(storage::FileData::Plain(data)) = &n.content else {
-                continue;
-            };
-            if n.seals.is_some() {
-                continue;
-            }
-            let data = data.clone();
-            let key = Rc::as_ptr(&node) as usize;
-            if let std::collections::btree_map::Entry::Vacant(entry) = self.nodes.entry(key) {
-                data.activate(n.mode, n.times);
-                entry.insert((Rc::downgrade(&node), data.clone()));
-            }
-            let io =
-                !inotify::observed(&node, o.notification.as_ref().and_then(|c| c.link.as_ref()));
-            let stat = match vfs.stat_node_fields(&n, o.mount.as_ref()) {
-                Ok(stat) => stat,
-                Err(_) => continue,
-            };
-            let write_error = vfs
-                .fd_writable(fd)
-                .and_then(|()| vfs.pseudo_immutable(&node))
-                .err();
-            entries[fd as usize] = Some(DirectFile {
-                data,
-                position: o.file_position.clone(),
-                stat,
-                flags: o.flags,
-                io,
-                write_error,
-                unlimited,
-                clear_setid: !vfs.credentials.has_cap(capabilities::FSETID),
-                readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
-                relatime: o
-                    .mount
-                    .as_ref()
-                    .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
-            });
+            entries[fd as usize] = self.capture_open(vfs, &descriptor.open.borrow(), unlimited);
         }
         let capture = DirectFiles(entries.into());
         self.captures.insert(key, capture.clone());
         capture
+    }
+    /// Snapshot retained io_uring OFDs even after their numeric descriptors
+    /// were closed/reused. Use the same file authority/algorithms as normal FDs.
+    pub fn capture_uring(&mut self, vfs: &Vfs, unlimited: bool) -> BTreeMap<usize, DirectFile> {
+        let mut files = BTreeMap::new();
+        for ring in vfs.urings() {
+            let state = ring.state.borrow();
+            let retained = state
+                .files
+                .iter()
+                .flatten()
+                .flatten()
+                .chain(state.pending.iter().filter_map(|r| r.file.as_ref()));
+            for file in retained {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    files.entry(file.identity())
+                {
+                    if let Some(cap) = self.capture_open(vfs, &file.0.open.borrow(), unlimited) {
+                        slot.insert(cap);
+                    }
+                }
+            }
+        }
+        files
+    }
+    fn capture_open(
+        &mut self,
+        vfs: &Vfs,
+        o: &OpenDescription,
+        unlimited: bool,
+    ) -> Option<DirectFile> {
+        if o.read_node.is_some() {
+            return None;
+        }
+        let node = Vfs::ordinary_file(o, false)?;
+        let n = node.borrow();
+        let Content::File(storage::FileData::Plain(data)) = &n.content else {
+            return None;
+        };
+        if n.seals.is_some() {
+            return None;
+        }
+        let data = data.clone();
+        let key = Rc::as_ptr(&node) as usize;
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.nodes.entry(key) {
+            data.activate(n.mode, n.times);
+            entry.insert((Rc::downgrade(&node), data.clone()));
+        }
+        let notifications =
+            inotify::capture(&node, o.notification.as_ref().and_then(|c| c.link.as_ref()));
+        let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
+        let write_error = o
+            .mount
+            .as_ref()
+            .map_or(Ok(()), |m| m.writable())
+            .and_then(|()| vfs.pseudo_immutable(&node))
+            .err();
+        Some(DirectFile {
+            data,
+            position: o.file_position.clone(),
+            locks: vfs.inode_record_locks(&n),
+            flock: o.flock_capability(),
+            stat,
+            flags: o.flags.get(),
+            status: o.flags.clone(),
+            notifications,
+            write_error,
+            unlimited,
+            clear_setid: !vfs.credentials.has_cap(capabilities::FSETID),
+            readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
+            relatime: o
+                .mount
+                .as_ref()
+                .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
+        })
     }
     /// All workers/requests must have returned first. This touches only the
     /// captured inodes, never scans the filesystem or adds a compute fast-path lock.
@@ -118,6 +153,57 @@ impl FileEpoch {
     }
 }
 impl DirectFile {
+    /// A capability is weak: a cached file snapshot cannot keep a flock alive.
+    pub fn flock(&self, operation: u32) -> Result<()> {
+        self.flock_request(operation)?.try_lock()
+    }
+    pub fn flock_request(&self, operation: u32) -> Result<FlockRequest> {
+        flock::validate(operation)?;
+        Ok(FlockRequest::new(
+            self.flock.upgrade().ok_or(Errno(9))?,
+            operation,
+        ))
+    }
+
+    pub fn allows_record_locks(&self) -> bool {
+        self.flags & O_PATH == 0
+    }
+    pub fn normalize_lock(
+        &self,
+        kind: u16,
+        whence: u16,
+        start: i64,
+        length: i64,
+        owner: u32,
+    ) -> Option<Result<RecordLock>> {
+        if kind > 2 {
+            return Some(Err(Errno(22)));
+        }
+        let base = match whence {
+            0 => 0,
+            1 => {
+                let position = self.position.lock().unwrap();
+                if position.pending != 0 {
+                    return None;
+                }
+                position.value
+            }
+            2 => self.data.len(),
+            _ => return Some(Err(Errno(22))),
+        };
+        Some(locks::normalize(kind, start, length, base, owner))
+    }
+    pub fn record_lock_conflict(&self, requested: RecordLock) -> Option<RecordLock> {
+        self.locks.conflict(requested)
+    }
+    pub fn record_lock_set(&self, requested: RecordLock) -> Result<()> {
+        if (requested.kind == 0 && self.flags & 3 == 1)
+            || (requested.kind == 1 && self.flags & 3 == 0)
+        {
+            return Err(Errno(9));
+        }
+        self.locks.set(requested)
+    }
     pub fn read(
         &self,
         count: usize,
@@ -133,7 +219,7 @@ impl DirectFile {
         if count == 0 {
             return Some(Ok(Vec::new()));
         }
-        if !self.io || count >= 16 * 1024 && self.data.disk_backed() {
+        if count >= 16 * 1024 && self.data.disk_backed() {
             return None;
         }
         let result = if let Some(offset) = offset {
@@ -151,6 +237,9 @@ impl DirectFile {
         };
         if result.is_ok() && count != 0 {
             self.data.accessed(self.readonly, self.relatime);
+        }
+        if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
+            self.notifications.send(inotify::ACCESS);
         }
         Some(result)
     }
@@ -177,12 +266,12 @@ impl DirectFile {
         if bytes.is_empty() {
             return Some(Ok(0));
         }
-        if !self.io || !self.unlimited || self.flags & 0x1000 != 0 {
+        if !self.unlimited || self.flags & 0x1000 != 0 {
             return None;
         }
         // Append growth/quotas/manifest retain the original owner path. No
         // partial vector or append transfer is performed before deferring.
-        if self.flags & 0x400 != 0 {
+        if self.status.get() & 0x400 != 0 {
             return None;
         }
         let result = if let Some(offset) = offset {
@@ -200,6 +289,7 @@ impl DirectFile {
         };
         if result.is_ok_and(|n| n != 0) {
             self.data.modified(self.clear_setid);
+            self.notifications.send(inotify::MODIFY);
         }
         Some(result)
     }
@@ -436,7 +526,7 @@ mod tests {
         }
     }
     #[test]
-    fn inode_and_parent_notifications_keep_the_original_delivery_path() {
+    fn worker_file_io_delivers_inode_and_parent_notifications_without_owner_handoff() {
         for path in [b"/data".as_slice(), b"/".as_slice()] {
             let (mut vfs, fd) = memory_file(b"abcdefgh".to_vec());
             let notify = vfs.inotify_init(O_NONBLOCK).unwrap();
@@ -445,13 +535,31 @@ mod tests {
             let mut epoch = FileEpoch::default();
             let files = epoch.capture(&vfs, true);
             let file = files.get(fd).unwrap();
-            let mut cache = DiskReadCache::default();
-            assert_eq!(file.read(1, None, &mut cache), None);
-            assert_eq!(file.write(b"X", None, &mut cache), None);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let mut cache = DiskReadCache::default();
+                        assert_eq!(file.read(1, None, &mut cache), Some(Ok(b"a".to_vec())));
+                        assert_eq!(file.write(b"X", None, &mut cache), Some(Ok(1)));
+                        assert_eq!(file.read(1, Some(99), &mut cache), Some(Ok(Vec::new())));
+                        assert_eq!(file.read(0, None, &mut cache), Some(Ok(Vec::new())));
+                        assert_eq!(file.write(b"", None, &mut cache), Some(Ok(0)));
+                        assert_eq!(file.write(b"grow", Some(99), &mut cache), None);
+                    })
+                    .join()
+                    .unwrap();
+            });
             assert!(file.stat().is_ok());
-            assert_eq!(vfs.read(fd, 1).unwrap(), b"a");
-            vfs.write(fd, b"X").unwrap();
-            assert!(!vfs.read(notify, 1024).unwrap().is_empty());
+            let bytes = vfs.read(notify, 1024).unwrap();
+            let length = if path == b"/" { 32 } else { 16 };
+            assert_eq!(bytes.len(), length * 2);
+            for (event, mask) in bytes.chunks(length).zip([inotify::ACCESS, inotify::MODIFY]) {
+                assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), mask);
+                if path == b"/" {
+                    assert_eq!(&event[16..21], b"data\0");
+                }
+            }
+            assert_eq!(vfs.read(notify, 1024), Err(Errno(11)));
             epoch.finish();
         }
     }

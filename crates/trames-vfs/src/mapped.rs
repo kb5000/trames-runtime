@@ -2,13 +2,15 @@
 //! Coherent mapped pages retained by mappings, not by the inode's weak cache.
 use super::*;
 use std::sync::Arc;
+mod writers;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
+use writers::WriteLease;
+pub(super) use writers::Writers;
 pub(super) struct FilePage {
     identity: u64,
     bytes: RefCell<PageStorage>,
     dirty: Cell<bool>,
-    writers: Cell<u32>,
     version: Cell<u64>,
 }
 enum PageStorage {
@@ -101,39 +103,81 @@ impl PageStorage {
         }
     }
 }
-pub(super) struct MappedData {
+// The live length is a capability to the actual storage, never a cached length
+// sampled at mmap. PlainFile and SharedFile already publish it atomically.
+// Overlay Lower must follow the retained inode, so it keeps the owner fallback
+// until that inode's content/identity is itself shared.
+enum LiveLength {
+    Plain(Arc<file_data::PlainFile>),
+    Shared(trames_shared::SharedFile),
+    Owner,
+}
+struct MappingState {
     identity: u64,
-    generation: Cell<u64>,
+    generation: AtomicU64,
+    length: LiveLength,
+}
+impl MappingState {
+    fn new(data: &FileData, stable: bool) -> Arc<Self> {
+        Arc::new(Self {
+            identity: trames_memory::new_backing_identity(),
+            generation: AtomicU64::new(0),
+            length: match data {
+                _ if !stable => LiveLength::Owner,
+                FileData::Plain(data) => LiveLength::Plain(data.clone()),
+                FileData::Shared(file) => LiveLength::Shared(file.clone()),
+                _ => LiveLength::Owner,
+            },
+        })
+    }
+    fn len(&self) -> Option<u64> {
+        match &self.length {
+            LiveLength::Plain(data) => Some(data.len()),
+            LiveLength::Shared(file) => Some(file.len() as u64),
+            LiveLength::Owner => None,
+        }
+    }
+    fn domain(&self) -> (u64, u64) {
+        (self.identity, self.generation.load(Ordering::Relaxed))
+    }
+    fn changed(&self) {
+        // These counters invalidate caches; byte/VM ownership supplies ordering.
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        trames_memory::backing_changed();
+    }
+}
+pub(super) struct MappedData {
+    state: Arc<MappingState>,
     data: RefCell<Box<FileData>>,
     pages: RefCell<BTreeMap<u64, Weak<FilePage>>>,
-    writers_cached: Cell<Option<bool>>,
+    writers: Arc<Writers>,
 }
 impl MappedData {
-    pub(super) fn new(data: FileData) -> Self {
+    pub(super) fn new(data: FileData, stable: bool) -> Self {
         Self {
-            identity: trames_memory::new_backing_identity(),
-            generation: Cell::new(0),
+            state: MappingState::new(&data, stable),
             data: RefCell::new(Box::new(data)),
             pages: RefCell::new(BTreeMap::new()),
-            writers_cached: Cell::new(None),
+            writers: Arc::default(),
         }
     }
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
     }
     fn changed(&self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
-        trames_memory::backing_changed();
+        self.state.changed();
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
         // open descriptions. Bytes are shared with workers; dirty metadata and
         // persistence hooks still require a joined checkpoint.
         let conflict = if write {
-            self.pages
-                .borrow()
-                .values()
-                .any(|page| page.strong_count() != 0)
+            self.has_writers()
+                || self
+                    .pages
+                    .borrow()
+                    .values()
+                    .any(|page| page.strong_count() != 0)
         } else {
             // Private COW never publishes to FileMapping; read-only mappings
             // cannot dirty the inode. Only possible shared writers conflict.
@@ -192,7 +236,6 @@ impl MappedData {
             identity: trames_memory::new_backing_identity(),
             bytes: RefCell::new(bytes),
             dirty: Cell::new(false),
-            writers: Cell::new(0),
             version: Cell::new(0),
         });
         let mut pages = self.pages.borrow_mut();
@@ -233,7 +276,6 @@ impl MappedData {
                         identity: trames_memory::new_backing_identity(),
                         bytes: RefCell::new(storage),
                         dirty: Cell::new(false),
-                        writers: Cell::new(0),
                         version: Cell::new(0),
                     });
                     self.pages.borrow_mut().insert(at, Rc::downgrade(&page));
@@ -309,17 +351,7 @@ impl MappedData {
         Ok(())
     }
     pub(super) fn has_writers(&self) -> bool {
-        if let Some(value) = self.writers_cached.get() {
-            return value;
-        }
-        let value = self
-            .pages
-            .borrow()
-            .values()
-            .filter_map(Weak::upgrade)
-            .any(|p| p.writers.get() != 0);
-        self.writers_cached.set(Some(value));
-        value
+        self.writers.active()
     }
     pub(super) fn sync(&self, data_only: bool) -> Result<()> {
         for (&base, page) in self.pages.borrow().iter() {
@@ -361,17 +393,26 @@ struct FileMapping {
     mount: Option<Rc<Mount>>,
     node: Rc<RefCell<Node>>,
     page: Rc<FilePage>,
+    state: Arc<MappingState>,
     offset: u64,
     writable: bool,
+    writer: Option<WriteLease>,
     executable: bool,
 }
 impl FileMapping {
     fn changed(&self) {
-        let mut node = self.node.borrow_mut();
-        node.times[1] = storage::Timestamp::now();
-        if let Content::File(FileData::Mapped(data)) = &node.content {
-            data.changed();
+        // Like the first writable fault of a dirty mmap interval, update mtime
+        // once until writeback/truncate cleans this page. Repeated CPU/native
+        // stores must not acquire inode metadata or read the host clock. Page
+        // and backing generations still change on EVERY write, for executable
+        // aliases, exclusive monitors and incremental worker snapshots.
+        if !self.page.dirty.replace(true) {
+            self.node.borrow_mut().times[1] = storage::Timestamp::now();
         }
+        self.page
+            .version
+            .set(self.page.version.get().wrapping_add(1));
+        self.state.changed();
     }
     fn create(
         node: Rc<RefCell<Node>>,
@@ -379,25 +420,23 @@ impl FileMapping {
         offset: u64,
         writable: bool,
         executable: bool,
-    ) -> Result<Rc<dyn PageBacking>> {
-        let page = if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
-            data.writers_cached.set(None);
-            data.page(offset)?
-        } else {
-            return Err(Errno(19));
-        };
-        if writable {
-            page.writers.set(page.writers.get() + 1);
-            if let Some(m) = &mount {
-                m.writers.set(m.writers.get() + 1);
-            }
-        }
+    ) -> Result<Rc<Self>> {
+        let (page, state, writers) =
+            if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
+                (data.page(offset)?, data.state.clone(), data.writers.clone())
+            } else {
+                return Err(Errno(19));
+            };
+        let writer =
+            writable.then(|| WriteLease::new(&writers, mount.as_ref().map(|m| &m.writers)));
         Ok(Rc::new(Self {
             mount,
             node,
             page,
+            state,
             offset,
             writable,
+            writer,
             executable,
         }))
     }
@@ -407,11 +446,15 @@ impl PageBacking for FileMapping {
         true
     }
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
-        if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
-            Some((data.identity, data.generation.get()))
-        } else {
-            None
+        // Pseudo inodes can replace their entire content when refreshed. Lower
+        // projections also retain their original owner-based change domain.
+        if matches!(self.state.length, LiveLength::Owner) {
+            return match &self.node.borrow().content {
+                Content::File(FileData::Mapped(data)) => Some(data.state.domain()),
+                _ => None,
+            };
         }
+        Some(self.state.domain())
     }
     fn cpu_borrow_safe(&self) -> bool {
         // CPU and native-span methods inspect resident file bytes/metadata
@@ -432,19 +475,20 @@ impl PageBacking for FileMapping {
         if !self.writable {
             return Err(MemoryError::BackingIo(13));
         }
-        self.page.dirty.set(true);
-        self.page
-            .version
-            .set(self.page.version.get().wrapping_add(1));
         self.changed();
         Ok(())
     }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
-        let n = self.node.borrow();
-        let Content::File(data) = &n.content else {
-            return Err(MemoryError::Bus(address));
+        let length = if let Some(length) = self.state.len() {
+            length
+        } else {
+            let n = self.node.borrow();
+            let Content::File(data) = &n.content else {
+                return Err(MemoryError::Bus(address));
+            };
+            data.len()
         };
-        if self.offset >= data.len().div_ceil(PAGE_SIZE) * PAGE_SIZE {
+        if self.offset / PAGE_SIZE >= length.div_ceil(PAGE_SIZE) {
             return Err(MemoryError::Bus(address));
         }
         Ok(())
@@ -464,10 +508,6 @@ impl PageBacking for FileMapping {
             .bytes
             .borrow_mut()
             .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
-        self.page.dirty.set(true);
-        self.page
-            .version
-            .set(self.page.version.get().wrapping_add(1));
         self.changed();
         Ok(())
     }
@@ -490,10 +530,6 @@ impl PageBacking for FileMapping {
             return Err(MemoryError::BackingIo(13));
         }
         let mut bytes = self.page.bytes.borrow_mut();
-        self.page.dirty.set(true);
-        self.page
-            .version
-            .set(self.page.version.get().wrapping_add(1));
         self.changed();
         bytes.with_write(offset, len, f);
         Ok(true)
@@ -536,25 +572,21 @@ impl PageBacking for FileMapping {
             self.writable,
             self.executable,
         )
+        .map(|page| page as Rc<dyn PageBacking>)
         .map_err(|e| MemoryError::BackingIo(e.0))
     }
 }
 impl Drop for FileMapping {
     fn drop(&mut self) {
-        if self.writable {
-            self.page.writers.set(self.page.writers.get() - 1);
-            if let Some(m) = &self.mount {
-                m.writers.set(m.writers.get() - 1);
-            }
-        }
         // Closing the descriptor/unlinking the path never invalidates this inode.
         if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
-            data.writers_cached.set(None);
             let _ = data.flush(self.offset, &self.page);
             if Rc::strong_count(&self.page) == 1 {
                 data.pages.borrow_mut().remove(&self.offset);
             }
         }
+        // Release only after the existing writeback/cleanup attempt.
+        drop(self.writer.take());
     }
 }
 impl Vfs {
@@ -566,14 +598,20 @@ impl Vfs {
         shared: bool,
         writable: bool,
     ) -> Result<Vec<Rc<dyn PageBacking>>> {
-        let o = self.descriptor(fd)?.open.borrow();
-        if o.flags & O_PATH != 0 {
+        let o_descriptor = self.descriptor(fd)?;
+        let o = o_descriptor.open.borrow();
+        let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
+            ring.mapping_offset(offset, len, shared)?
+        } else {
+            offset
+        };
+        if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
-        if o.flags & 3 == 1 {
+        if o.flags.get() & 3 == 1 {
             return Err(Errno(13));
         }
-        if shared && writable && o.flags & 3 != 2 {
+        if shared && writable && o.flags.get() & 3 != 2 {
             return Err(Errno(13));
         }
         if o.oom.is_some()
@@ -593,42 +631,45 @@ impl Vfs {
             return Err(Errno(1));
         }
         let may_write =
-            !readonly && shared && o.flags & 3 == 2 && !sealed && !node.borrow().volatile;
+            !readonly && shared && o.flags.get() & 3 == 2 && !sealed && !node.borrow().volatile;
         let mut n = node.borrow_mut();
+        let stable = !n.volatile;
         let Content::File(data) = &mut n.content else {
             return Err(Errno(19));
         };
         if !matches!(data, FileData::Mapped(_)) {
             let original = std::mem::replace(data, FileData::memory(Vec::new()));
-            *data = FileData::Mapped(Box::new(MappedData::new(original)));
+            *data = FileData::Mapped(Box::new(MappedData::new(original, stable)));
         }
         offset.checked_add(len).ok_or(Errno(22))?;
-        let buffers = if let FileData::Mapped(data) = data {
-            data.writers_cached.set(None);
-            data.batch(offset, len)?
+        let (buffers, state, writers) = if let FileData::Mapped(data) = data {
+            (
+                data.batch(offset, len)?,
+                data.state.clone(),
+                data.writers.clone(),
+            )
         } else {
             unreachable!("mapped data")
         };
         drop(n);
         let mount = o.mount.clone();
-        let executable = mount
-            .as_ref()
-            .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
+        let executable = !matches!(o.anonymous, Some(events::Anonymous::Uring(_)))
+            && mount
+                .as_ref()
+                .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
         drop(o);
         let mut pages: Vec<Rc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
-            if may_write {
-                page.writers.set(page.writers.get() + 1);
-                if let Some(m) = &mount {
-                    m.writers.set(m.writers.get() + 1);
-                }
-            }
+            let writer =
+                may_write.then(|| WriteLease::new(&writers, mount.as_ref().map(|m| &m.writers)));
             pages.push(Rc::new(FileMapping {
                 mount: mount.clone(),
                 node: node.clone(),
                 page,
+                state: state.clone(),
                 offset: offset + i as u64 * PAGE_SIZE,
                 writable: may_write,
+                writer,
                 executable,
             }));
         }
@@ -640,6 +681,266 @@ impl Vfs {
 mod tests {
     use super::*;
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn live_mapping_state_is_shared_without_sampling_or_retaining_inode() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<MappingState>();
+        for shared in [false, true] {
+            let mut v = Vfs::default();
+            let fd = if shared {
+                v.memfd_create(b"mapping-state", 0).unwrap()
+            } else {
+                v.open_at(AT_FDCWD, b"/mapping-state", 0x42, 0o600).unwrap()
+            };
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            let maps = v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap();
+            let node = v
+                .descriptor(fd)
+                .unwrap()
+                .open
+                .borrow()
+                .node
+                .clone()
+                .unwrap();
+            let state = match &node.borrow().content {
+                Content::File(FileData::Mapped(data)) => data.state.clone(),
+                _ => unreachable!(),
+            };
+            let weak_node = Rc::downgrade(&node);
+            let domain = state.domain();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (answer, result) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                for () in rx {
+                    answer.send((state.len(), state.domain())).unwrap();
+                }
+                state
+            });
+            for length in [PAGE_SIZE * 2, 0, PAGE_SIZE + 1] {
+                v.truncate_fd(fd, length).unwrap();
+                tx.send(()).unwrap();
+                let (live, changed) = result
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(live, Some(length));
+                assert_eq!(changed.0, domain.0);
+                assert_ne!(changed.1, domain.1);
+            }
+            drop(node);
+            if !shared {
+                v.unlink_at(AT_FDCWD, b"/mapping-state", false).unwrap();
+            }
+            v.close(fd).unwrap();
+            drop(maps);
+            assert!(weak_node.upgrade().is_none());
+            drop(tx);
+            let state = worker.join().unwrap();
+            assert_eq!(state.len(), Some(PAGE_SIZE + 1));
+        }
+    }
+    #[test]
+    fn dirty_mapping_access_avoids_inode_and_clock_but_versions_every_write() {
+        for shared in [false, true] {
+            let mut v = Vfs::default();
+            let fd = if shared {
+                v.memfd_create(b"mapping-hot", 0).unwrap()
+            } else {
+                v.open_at(AT_FDCWD, b"/mapping-hot", 0x42, 0o600).unwrap()
+            };
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            let maps = v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap();
+            let node = v
+                .descriptor(fd)
+                .unwrap()
+                .open
+                .borrow()
+                .node
+                .clone()
+                .unwrap();
+            node.borrow_mut().times[1] = storage::Timestamp::default();
+            maps[0].write(0, b"first").unwrap();
+            let first = node.borrow().times[1];
+            assert_ne!(first, storage::Timestamp::default());
+            let mut version = maps[0].version();
+            let mut domain = maps[0].parallel_change_domain().unwrap();
+            // A real outstanding exclusive inode borrow makes any accidental
+            // metadata access panic, without adding instrumentation to hot code.
+            let guard = node.borrow_mut();
+            for native in [false, true] {
+                maps[0].check(0x1000).unwrap();
+                if native {
+                    assert!(maps[0]
+                        .with_write(0, 5, &mut |b| b.copy_from_slice(b"again"))
+                        .unwrap());
+                } else {
+                    maps[0].write(0, b"again").unwrap();
+                }
+                let mut bytes = [0; 5];
+                maps[0].read(0, &mut bytes).unwrap();
+                assert_eq!(&bytes, b"again");
+                assert_ne!(maps[0].version(), version);
+                assert_ne!(maps[0].parallel_change_domain().unwrap(), domain);
+                version = maps[0].version();
+                domain = maps[0].parallel_change_domain().unwrap();
+            }
+            maps[0].publish_write(0, 5).unwrap();
+            assert_ne!(maps[0].version(), version);
+            assert_eq!(guard.times[1], first);
+            drop(guard);
+            // Successful sync starts a new dirty interval. Explicit timestamps
+            // are not used as a cache key; the next dirtying updates them again.
+            maps[0].sync().unwrap();
+            v.set_times(fd as i32, None, Some([[1, 0], [2, 0]]))
+                .unwrap();
+            maps[0]
+                .with_write(0, 5, &mut |b| b.copy_from_slice(b"after"))
+                .unwrap();
+            assert_ne!(node.borrow().times[1].seconds, 2);
+            assert_eq!(v.read(fd, 5).unwrap(), b"after");
+        }
+    }
+    #[test]
+    fn lower_mapping_length_keeps_live_owner_fallback() {
+        let mut v = Vfs::default();
+        let lower = v.open_at(AT_FDCWD, b"/lower-state", 0x42, 0o600).unwrap();
+        let alias = v.open_at(AT_FDCWD, b"/alias-state", 0x42, 0o600).unwrap();
+        v.truncate_fd(lower, PAGE_SIZE).unwrap();
+        let source = v
+            .descriptor(lower)
+            .unwrap()
+            .open
+            .borrow()
+            .node
+            .clone()
+            .unwrap();
+        let node = v
+            .descriptor(alias)
+            .unwrap()
+            .open
+            .borrow()
+            .node
+            .clone()
+            .unwrap();
+        node.borrow_mut().content = Content::File(FileData::Lower(source));
+        let maps = v.mapping_pages(alias, 0, PAGE_SIZE, false, false).unwrap();
+        let guard = node.borrow();
+        let Content::File(FileData::Mapped(data)) = &guard.content else {
+            unreachable!()
+        };
+        assert!(data.state.len().is_none());
+        drop(guard);
+        maps[0].check(0x9000).unwrap();
+        v.truncate_fd(lower, 0).unwrap();
+        assert_eq!(maps[0].check(0x9000), Err(MemoryError::Bus(0x9000)));
+        v.truncate_fd(lower, 1).unwrap();
+        maps[0].check(0x9000).unwrap();
+    }
+    #[test]
+    fn volatile_mapping_refresh_keeps_live_eof_and_change_domain() {
+        let mut v = Vfs::default();
+        let fd = v
+            .open_at(AT_FDCWD, b"/volatile-state", 0x42, 0o600)
+            .unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let node = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .node
+            .clone()
+            .unwrap();
+        node.borrow_mut().volatile = true;
+        let maps = v.mapping_pages(fd, 0, PAGE_SIZE, false, false).unwrap();
+        maps[0].check(0x1000).unwrap();
+        assert!(maps[0].parallel_change_domain().is_some());
+        // The same replacement used by PseudoFs::cache. A saved PlainFile
+        // capability here would incorrectly continue to allow the old EOF.
+        node.borrow_mut().content = Content::File(FileData::memory(Vec::new()));
+        assert_eq!(maps[0].check(0x1000), Err(MemoryError::Bus(0x1000)));
+        assert_eq!(maps[0].parallel_change_domain(), None);
+    }
+    #[test]
+    fn retained_writer_blocks_file_io_and_readonly_remount_without_owner_cache_updates() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/mapped-mount", 0o755).unwrap();
+        v.mount(Some(b"tmpfs"), b"/mapped-mount", Some(b"tmpfs"), 0, None)
+            .unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/mapped-mount/file", 0x42, 0o600)
+            .unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let maps = v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap();
+        let (node, mount) = {
+            let descriptor = v.descriptor(fd).unwrap();
+            let open = descriptor.open.borrow();
+            (open.node.clone().unwrap(), open.mount.clone())
+        };
+        drop(maps);
+        assert!(v.epoch_file_io(fd, false));
+        let mapping = FileMapping::create(node, mount, 0, true, false).unwrap();
+        mapping.write(0, b"written").unwrap();
+        let retained = mapping.writer.as_ref().unwrap().clone();
+        let alias = mapping.clone();
+        drop(mapping);
+        assert!(!v.epoch_file_io(fd, false));
+        drop(alias);
+        assert_eq!(v.pread(fd, 7, 0).unwrap(), b"written");
+        // The page cache is empty now, but an accepted writable operation still
+        // owns this inode/mount. No owner scan may report it as read-only-safe.
+        assert!(!v.epoch_file_io(fd, false));
+        assert!(!v.epoch_file_io(fd, true));
+        assert_eq!(
+            v.mount(None, b"/mapped-mount", None, 32 | mounts::MS_RDONLY, None),
+            Err(Errno(16))
+        );
+        std::thread::spawn(move || drop(retained)).join().unwrap();
+        assert!(v.epoch_file_io(fd, false));
+        assert!(v.epoch_file_io(fd, true));
+        v.mount(None, b"/mapped-mount", None, 32 | mounts::MS_RDONLY, None)
+            .unwrap();
+        assert!(matches!(
+            v.mapping_pages(fd, 0, PAGE_SIZE, true, true),
+            Err(Errno(30))
+        ));
+    }
+    #[test]
+    fn retained_writer_pins_unmount_and_detached_tree_until_worker_release() {
+        for lazy in [false, true] {
+            let mut v = Vfs::default();
+            v.mkdir_at(AT_FDCWD, b"/pinned-mount", 0o755).unwrap();
+            v.mount(Some(b"tmpfs"), b"/pinned-mount", Some(b"tmpfs"), 0, None)
+                .unwrap();
+            let fd = v
+                .open_at(AT_FDCWD, b"/pinned-mount/file", 0x42, 0o600)
+                .unwrap();
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
+            let (node, mount) = {
+                let descriptor = v.descriptor(fd).unwrap();
+                let open = descriptor.open.borrow();
+                (open.node.clone().unwrap(), open.mount.clone())
+            };
+            let weak = Rc::downgrade(mount.as_ref().unwrap());
+            let mapping = FileMapping::create(node, mount, 0, true, false).unwrap();
+            let retained = mapping.writer.as_ref().unwrap().clone();
+            v.close(fd).unwrap();
+            drop(mapping);
+            assert_eq!(v.umount(b"/pinned-mount", 0), Err(Errno(16)));
+            if lazy {
+                v.umount(b"/pinned-mount", 2).unwrap();
+                v.reap_detached_mounts();
+                assert!(weak.upgrade().is_some());
+            }
+            std::thread::spawn(move || drop(retained)).join().unwrap();
+            if lazy {
+                v.reap_detached_mounts();
+            } else {
+                v.umount(b"/pinned-mount", 0).unwrap();
+            }
+            assert!(weak.upgrade().is_none());
+        }
+    }
     #[test]
     fn serial_private_file_atomics_detach_without_modifying_file_or_peer() {
         use trames_memory::CpuMemory;
@@ -866,7 +1167,7 @@ mod tests {
     }
     #[test]
     fn eof_placeholders_stay_zero_and_growth_updates_existing_mappings() {
-        let data = MappedData::new(FileData::memory(vec![17; 10]));
+        let data = MappedData::new(FileData::memory(vec![17; 10]), true);
         let pages = data.batch(0, 32 * PAGE_SIZE).unwrap();
         assert!(matches!(*pages[0].bytes.borrow(), PageStorage::Heap(_)));
         assert!(pages[1..]
