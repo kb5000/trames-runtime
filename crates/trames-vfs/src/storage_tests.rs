@@ -738,6 +738,32 @@ fn disk_store_lock_lasts_until_the_last_process_clone_is_dropped() {
     let _v = dir.open();
 }
 #[test]
+fn app_private_owner_lock_retains_exclusivity_without_locking_shared_store() {
+    let dir = Temp::new();
+    let private = Temp::new();
+    let lock = private.0.join("environment-owner.lock");
+    let v = Vfs::open_disk_with_owner_lock(&dir.0, DiskOptions::default(), &lock).unwrap();
+    let child = v.clone();
+    drop(v);
+    assert!(!dir.0.join(".lock").exists());
+    assert_eq!(
+        Vfs::open_disk_with_owner_lock(&dir.0, DiskOptions::default(), &lock).err(),
+        Some(Errno(16))
+    );
+    assert_eq!(
+        Vfs::reset_disk_with_owner_lock(&dir.0, &lock),
+        Err(Errno(16))
+    );
+    drop(child);
+    let mut v = Vfs::open_disk_with_owner_lock(&dir.0, DiskOptions::default(), &lock).unwrap();
+    v.import_file(b"/retained", b"data".to_vec()).unwrap();
+    drop(v);
+    let v = Vfs::open_disk_with_owner_lock(&dir.0, DiskOptions::default(), &lock).unwrap();
+    assert!(v.stat_at(AT_FDCWD, b"/retained").is_ok());
+    drop(v);
+    Vfs::reset_disk_with_owner_lock(&dir.0, &lock).unwrap();
+}
+#[test]
 fn volume_snapshots_bound_growth_and_refresh_independently_of_budget() {
     let dir = Temp::new();
     let mut v = dir.open();

@@ -313,7 +313,7 @@ fn regular(path: &Path) -> Result<()> {
     Ok(())
 }
 impl DiskStore {
-    fn open(path: &Path) -> Result<Arc<Self>> {
+    fn open(path: &Path, owner_lock: Option<&Path>) -> Result<Arc<Self>> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -330,7 +330,12 @@ impl DiskStore {
                 return Err(Errno(22));
             }
         }
-        let lock_path = root.join(".lock");
+        let lock_path = owner_lock
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.join(".lock"));
+        if !lock_path.is_absolute() {
+            return Err(Errno(22));
+        }
         match fs::symlink_metadata(&lock_path) {
             Ok(_) => regular(&lock_path)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -812,7 +817,16 @@ impl Vfs {
     /// must serialize reset with new opens. A live worker/orphan keeps the lock
     /// and returns EBUSY; unsupported/corrupt manifests need not be decoded.
     pub fn reset_disk(path: impl AsRef<Path>) -> Result<()> {
-        let disk = DiskStore::open(path.as_ref())?;
+        Self::reset_disk_locked(path.as_ref(), None)
+    }
+    /// The native adapter must use the same owner lock for every open/reset.
+    /// iOS keeps it in the containing app's private container, outside the shared
+    /// data container whose file locks cannot survive application suspension.
+    pub fn reset_disk_with_owner_lock(path: impl AsRef<Path>, owner_lock: &Path) -> Result<()> {
+        Self::reset_disk_locked(path.as_ref(), Some(owner_lock))
+    }
+    fn reset_disk_locked(path: &Path, owner_lock: Option<&Path>) -> Result<()> {
+        let disk = DiskStore::open(path, owner_lock)?;
         fs::remove_dir_all(&disk.root).map_err(host_errno)
     }
     /// Explicit application installer: replace every alias of this executable in
@@ -908,7 +922,24 @@ impl Vfs {
     }
     /// Open an app-owned store. Guest path bytes never become host file names.
     pub fn open_disk(path: impl AsRef<Path>, options: DiskOptions) -> Result<Self> {
-        let disk = DiskStore::open(path.as_ref())?;
+        Self::open_disk_locked(path.as_ref(), options, None)
+    }
+    /// Native single-writer embedding with an app-private owner lock. All opens
+    /// and resets of this store must supply the same lock path. Read-only file
+    /// providers must read the manifest/objects without opening another VFS.
+    pub fn open_disk_with_owner_lock(
+        path: impl AsRef<Path>,
+        options: DiskOptions,
+        owner_lock: &Path,
+    ) -> Result<Self> {
+        Self::open_disk_locked(path.as_ref(), options, Some(owner_lock))
+    }
+    fn open_disk_locked(
+        path: &Path,
+        options: DiskOptions,
+        owner_lock: Option<&Path>,
+    ) -> Result<Self> {
+        let disk = DiskStore::open(path, owner_lock)?;
         let manifest = disk.root.join("manifest");
         let mut v = Vfs::default();
         if manifest.try_exists().map_err(host_errno)? {

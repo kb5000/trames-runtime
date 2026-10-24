@@ -711,6 +711,7 @@ version = "1.3.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "trames-bridge",
  "trames-core",
  "trames-distro",
