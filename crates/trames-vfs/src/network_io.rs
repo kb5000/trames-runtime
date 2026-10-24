@@ -29,25 +29,51 @@ impl DirectNetwork {
         })
     }
 }
+/// Reuse TCP capabilities while preparing one stopped execution cohort.
+/// Discard before running guests: connect, timeout and policy changes need not
+/// change FD membership. Keeping the identity alive also prevents pointer reuse.
+#[derive(Default)]
+pub struct NetworkEpoch {
+    captures: BTreeMap<usize, (Rc<fd_table::DescriptorVersion>, DirectNetwork)>,
+}
+impl NetworkEpoch {
+    pub fn capture(&mut self, vfs: &Vfs) -> DirectNetwork {
+        let identity = vfs.fds.identity();
+        self.captures
+            .entry(Rc::as_ptr(&identity) as usize)
+            .or_insert_with(|| (identity, vfs.direct_network()))
+            .1
+            .clone()
+    }
+}
 impl Vfs {
+    /// Inspect only the requested FD when deciding whether byte I/O can run
+    /// on a worker. Unrelated sockets do not affect this capability.
+    pub fn direct_tcp_fd(&self, fd: u32) -> Option<DirectTcpFd> {
+        let descriptor = self.fds.get(&fd)?;
+        Self::direct_tcp_descriptor(&descriptor)
+    }
+    fn direct_tcp_descriptor(descriptor: &fd_table::Descriptor) -> Option<DirectTcpFd> {
+        let open = descriptor.open.borrow();
+        let socket = open.socket.as_ref()?;
+        Some(DirectTcpFd {
+            tcp: socket.direct_tcp()?,
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            timeouts: [false, true].map(|receive| socket.io_timeout(receive)),
+        })
+    }
     pub fn direct_network(&self) -> DirectNetwork {
         if self.network.live_sockets() == 0 {
             return DirectNetwork::default();
         }
         let mut entries = Vec::new();
         for (&fd, descriptor) in self.fds.entries().iter() {
-            let open = descriptor.open.borrow();
-            let Some(tcp) = open.socket.as_ref().and_then(|socket| socket.direct_tcp()) else {
+            let Some(tcp) = Self::direct_tcp_descriptor(descriptor) else {
                 continue;
             };
             entries.resize_with(fd as usize + 1, || None);
-            entries[fd as usize] = Some(DirectTcpFd {
-                tcp,
-                flags: open.flags.get(),
-                status: open.flags.clone(),
-                timeouts: [false, true]
-                    .map(|receive| open.socket.as_ref().unwrap().io_timeout(receive)),
-            });
+            entries[fd as usize] = Some(tcp);
         }
         DirectNetwork(entries.into())
     }
@@ -70,6 +96,9 @@ mod tests {
         let socket = v.socket_fd(fd).unwrap();
         let flags = v.fd_flags_snapshot().get(fd).unwrap();
         assert!(v.direct_network().get(fd).is_none());
+        let mut before_connect = NetworkEpoch::default();
+        assert!(before_connect.capture(&v).get(fd).is_none());
+        drop(before_connect);
         assert!(matches!(
             socket.connect(listener.local_addr().unwrap()),
             Ok(()) | Err(trames_net::NetError(115))
@@ -77,8 +106,18 @@ mod tests {
         let (mut peer, _) = listener.accept().unwrap();
         assert_eq!(socket.connect_complete(), Ok(true));
         assert_eq!(v.fd_flags_snapshot().get(fd).unwrap(), flags);
-        let capability = v.direct_network();
+        // Connection completion has not changed FD membership. A new cohort
+        // must still discover it, then share that one capture across threads.
+        let shared = v.clone_with_resources(true, true);
+        let mut epoch = NetworkEpoch::default();
+        let capability = epoch.capture(&v);
+        let sibling = epoch.capture(&shared);
+        assert!(Arc::ptr_eq(&capability.0, &sibling.0));
         assert!(capability.get(fd).is_some());
+        assert!(v.direct_tcp_fd(fd).is_some());
+        assert!(v.direct_tcp_fd(u32::MAX).is_none());
+        drop(epoch);
+        drop(shared);
         drop(socket);
         v.close(fd).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -88,6 +127,7 @@ mod tests {
             Err(trames_net::NetError(9))
         );
         assert!(v.direct_network().get(fd).is_none());
+        assert!(NetworkEpoch::default().capture(&v).get(fd).is_none());
     }
     #[test]
     fn accepted_tcp_lease_survives_alias_close_and_fd_reuse_until_worker_release() {

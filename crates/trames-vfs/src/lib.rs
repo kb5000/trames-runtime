@@ -63,7 +63,7 @@ pub use linux_namespace::{
 };
 mod network;
 mod network_io;
-pub use network_io::{DirectNetwork, DirectTcpFd};
+pub use network_io::{DirectNetwork, DirectTcpFd, NetworkEpoch};
 mod oom;
 mod overlay;
 mod pseudo;
