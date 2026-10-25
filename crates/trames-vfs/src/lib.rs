@@ -4,8 +4,10 @@ mod bpf;
 pub mod capabilities;
 mod cgroup;
 mod fs_context;
+mod fs_data;
 use fs_context::FsContext;
 pub use fs_context::Umask;
+use fs_data::{FsBorrow, FsHandle};
 mod credentials;
 mod fd_status;
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
@@ -364,7 +366,6 @@ impl Node {
 type ResolvedInode = (NodeRef, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
 struct Filesystem {
-    overlay: Option<Rc<overlay::Overlay>>,
     shared_budget: trames_shared::SharedBudget,
     paths: BTreeMap<Vec<u8>, NodeRef>,
     inodes: Vec<std::sync::Weak<Inode>>,
@@ -376,7 +377,7 @@ struct Filesystem {
 pub struct Vfs {
     network: trames_net::Network,
     native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
-    fs: Rc<RefCell<Filesystem>>,
+    fs: FsHandle,
     fds: DescriptorTable,
     context: FsContext,
     uts: UtsNamespace,
@@ -475,8 +476,7 @@ impl Default for Vfs {
         let mut v = Self {
             network,
             native_services: Rc::default(),
-            fs: Rc::new(RefCell::new(Filesystem {
-                overlay: None,
+            fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -484,7 +484,7 @@ impl Default for Vfs {
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
-            })),
+            }),
             fds: DescriptorTable::default(),
             context: FsContext::default(),
             uts: UtsNamespace::default(),

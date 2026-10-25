@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded inode attributes. File capabilities and ACLs require separate policy.
 use super::*;
-type AttributeNode = (NodeRef, Rc<RefCell<Filesystem>>);
+type AttributeNode = (NodeRef, FsHandle);
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
 pub(super) fn overlay_attribute(name: &[u8]) -> bool {
     matches!(

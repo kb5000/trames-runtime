@@ -35,7 +35,7 @@ impl Drop for RootNetwork {
 }
 pub(super) struct IpcNamespace {
     inode: u64,
-    pub mqueue: RefCell<Option<Rc<RefCell<Filesystem>>>>,
+    pub mqueue: RefCell<Option<FsHandle>>,
     live: Rc<Cell<usize>>,
 }
 impl Default for IpcNamespace {

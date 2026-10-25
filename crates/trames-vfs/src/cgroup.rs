@@ -47,7 +47,7 @@ struct Dying {
 }
 pub(super) struct Cgroups {
     pub bpf: bpf::Registry,
-    pub fs: Rc<RefCell<Filesystem>>,
+    pub fs: FsHandle,
     groups: BTreeMap<u64, Group>,
     tasks: BTreeMap<u32, (u32, u64)>, // global TID -> (global TGID, group inode)
     dying: Vec<Dying>,
@@ -68,8 +68,7 @@ impl Default for Cgroups {
     fn default() -> Self {
         let mut out = Self {
             bpf: bpf::Registry::default(),
-            fs: Rc::new(RefCell::new(Filesystem {
-                overlay: None,
+            fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -77,7 +76,7 @@ impl Default for Cgroups {
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
-            })),
+            }),
             groups: BTreeMap::new(),
             tasks: BTreeMap::from([(1, (1, ROOT))]),
             dying: Vec::new(),

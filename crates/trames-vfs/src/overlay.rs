@@ -10,7 +10,7 @@ static NEXT_DEVICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[derive(Clone)]
 struct Layer {
     at: ResolvedPath,
-    fs: Rc<RefCell<Filesystem>>,
+    fs: FsHandle,
 }
 impl Layer {
     fn key(&self, relative: &[u8]) -> Vec<u8> {
@@ -480,7 +480,7 @@ impl Vfs {
         &mut self,
         data: &[u8],
         readonly: bool,
-    ) -> Result<(Rc<RefCell<Filesystem>>, bool)> {
+    ) -> Result<(FsHandle, bool)> {
         self.reap_detached_mounts();
         let mut lower = None;
         let mut upper = None;
@@ -540,10 +540,10 @@ impl Vfs {
         let upper = upper.as_deref().map(layer).transpose()?;
         let work = work.as_deref().map(layer).transpose()?;
         let overlaps = |a: &Layer, b: &Layer| {
-            Rc::ptr_eq(&a.fs, &b.fs) && (below(&a.at, &b.at) || below(&b.at, &a.at))
+            a.fs.same_data(&b.fs) && (below(&a.at, &b.at) || below(&b.at, &a.at))
         };
         if let (Some(u), Some(w)) = (&upper, &work) {
-            if !Rc::ptr_eq(&u.fs, &w.fs) {
+            if !u.fs.same_data(&w.fs) {
                 return Err(Errno(18));
             }
             u.at.writable()?;
@@ -694,7 +694,6 @@ impl Vfs {
         }
         let ro = readonly || o.upper.is_none();
         let fs = Filesystem {
-            overlay: Some(o),
             shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
             paths,
             inodes: unique.into_values().collect(),
@@ -703,7 +702,7 @@ impl Vfs {
             disk: None,
             volume: None,
         };
-        Ok((Rc::new(RefCell::new(fs)), ro))
+        Ok((FsHandle::with_overlay(fs, o), ro))
     }
     pub(super) fn overlay_prepare(
         &self,

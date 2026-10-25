@@ -470,8 +470,8 @@ impl DiskStore {
 }
 
 impl Filesystem {
-    pub(super) fn checkpoint(&self) -> Result<()> {
-        if let Some(overlay) = &self.overlay {
+    pub(super) fn checkpoint(&self, overlay: Option<&overlay::Overlay>) -> Result<()> {
+        if let Some(overlay) = overlay {
             return overlay.checkpoint(self);
         }
         let Some(disk) = &self.disk else {
@@ -805,7 +805,6 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         }
     }
     Ok(Filesystem {
-        overlay: None,
         shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
         paths,
         inodes: nodes.values().map(Arc::downgrade).collect(),
@@ -963,7 +962,7 @@ impl Vfs {
             if bytes.len() as u64 > MAX_MANIFEST {
                 return Err(Errno(22));
             }
-            v.fs = Rc::new(RefCell::new(decode(&disk, &bytes)?));
+            v.fs = FsHandle::new(decode(&disk, &bytes)?);
         } else {
             disk.recover(&BTreeMap::new())?;
             let mut fs = v.fs.borrow_mut();
@@ -1019,7 +1018,9 @@ impl Vfs {
     pub fn capacity(&self) -> StorageCapacity {
         Self::filesystem_capacity(&self.fs.borrow())
     }
-    pub(super) fn filesystem_capacity(fs: &Filesystem) -> StorageCapacity {
+    pub(super) fn filesystem_capacity(
+        fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
+    ) -> StorageCapacity {
         if let Some(overlay) = &fs.overlay {
             return overlay.capacity();
         }
@@ -1076,7 +1077,9 @@ impl Vfs {
     pub(super) fn empty_data(&self) -> Result<FileData> {
         Self::filesystem_empty_data(&mut self.fs.borrow_mut())
     }
-    pub(super) fn filesystem_empty_data(fs: &mut Filesystem) -> Result<FileData> {
+    pub(super) fn filesystem_empty_data(
+        fs: &mut FsBorrow<'_, impl std::ops::DerefMut<Target = Filesystem>>,
+    ) -> Result<FileData> {
         if let Some(overlay) = &fs.overlay {
             return overlay.empty_data();
         }
@@ -1097,7 +1100,7 @@ impl Vfs {
             .iter()
             .filter_map(Weak::upgrade)
         {
-            if seen.insert(Rc::as_ptr(&mount.fs)) && mount.fs.borrow().overlay.is_some() {
+            if seen.insert(mount.fs.identity()) && mount.fs.borrow().overlay.is_some() {
                 mount.fs.borrow().checkpoint()?;
             }
         }

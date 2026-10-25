@@ -53,7 +53,7 @@ impl Attachment {
 }
 pub(super) struct Mount {
     pub id: u64,
-    pub fs: Rc<RefCell<Filesystem>>,
+    pub fs: FsHandle,
     pub root: NodeRef,
     pub root_key: Vec<u8>,
     pub kind: Kind,
@@ -173,7 +173,7 @@ impl ResolvedPath {
     pub fn into_bytes(self) -> Vec<u8> {
         self.key
     }
-    pub(super) fn filesystem(&self, vfs: &Vfs) -> Rc<RefCell<Filesystem>> {
+    pub(super) fn filesystem(&self, vfs: &Vfs) -> FsHandle {
         self.mount
             .as_ref()
             .map_or_else(|| vfs.fs.clone(), |m| m.fs.clone())
@@ -695,8 +695,7 @@ impl Vfs {
                 xattrs: BTreeMap::new(),
                 seals: None,
             }));
-            let fs = Rc::new(RefCell::new(Filesystem {
-                overlay: None,
+            let fs = FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
                 inodes: vec![Arc::downgrade(&root)],
@@ -704,7 +703,7 @@ impl Vfs {
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
-            }));
+            });
             (
                 fs,
                 root,
@@ -799,8 +798,7 @@ impl Vfs {
                         xattrs: BTreeMap::new(),
                         seals: None,
                     }));
-                    let fs = Rc::new(RefCell::new(Filesystem {
-                        overlay: None,
+                    let fs = FsHandle::new(Filesystem {
                         shared_budget: trames_shared::SharedBudget::new(
                             memfd::MEMFD_BYTES as usize,
                         ),
@@ -813,7 +811,7 @@ impl Vfs {
                         },
                         disk: None,
                         volume: None,
-                    }));
+                    });
                     if mqueue {
                         *self.ipc_namespace.mqueue.borrow_mut() = Some(fs.clone());
                     }

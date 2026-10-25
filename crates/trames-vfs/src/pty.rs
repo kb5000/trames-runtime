@@ -219,7 +219,7 @@ impl Vfs {
 /// A mount-owned devpts filesystem. Slave numbers are local; scheduler IDs
 /// remain guest-wide so controlling terminals cannot alias across containers.
 pub(super) struct Devpts {
-    pub fs: Rc<RefCell<Filesystem>>,
+    pub fs: FsHandle,
     uid: Option<u32>,
     gid: Option<u32>,
     mode: u32,
@@ -256,8 +256,7 @@ impl Devpts {
             }
         }
         let out = Self {
-            fs: Rc::new(RefCell::new(Filesystem {
-                overlay: None,
+            fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
                 inodes: Vec::new(),
@@ -265,7 +264,7 @@ impl Devpts {
                 limits: StorageLimits::memory(),
                 disk: None,
                 volume: None,
-            })),
+            }),
             uid,
             gid,
             mode,
