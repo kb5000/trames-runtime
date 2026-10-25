@@ -139,6 +139,49 @@ impl MutablePage {
         self.changed(&mut guard, offset, len);
         f(guard.write(offset, len))
     }
+    /// Read an allocation before its first publication to concurrent actors.
+    ///
+    /// # Safety
+    /// The caller owns all byte accesses until the callback ends. No concurrent
+    /// accessor or exclusive monitor may exist. Publication must invalidate any
+    /// cached unpublished capability before another actor can access the page.
+    #[inline]
+    pub unsafe fn with_unpublished_read<T>(
+        &self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> T {
+        assert!(offset <= PAGE && len <= PAGE - offset);
+        // SAFETY: complete bounded allocation, caller-owned unpublished bytes;
+        // this callback is the entire lifetime of the exclusive byte borrow.
+        f(
+            unsafe {
+                std::slice::from_raw_parts(self.bytes.as_ptr().cast::<u8>().add(offset), len)
+            },
+        )
+    }
+    /// Write under the unpublished ownership contract above. The provider must
+    /// maintain its own byte/version/dirty hooks, as for its original heap page.
+    ///
+    /// # Safety
+    /// Same as with_unpublished_read, with exclusive writable byte ownership.
+    #[inline]
+    pub unsafe fn with_unpublished_write<T>(
+        &self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> T,
+    ) -> T {
+        assert!(offset <= PAGE && len <= PAGE - offset);
+        // SAFETY: no external actor/monitor exists. UnsafeCell permits this
+        // bounded mutation, and no slice survives the synchronous callback.
+        f(unsafe { std::slice::from_raw_parts_mut(self.bytes.write_ptr().add(offset), len) })
+    }
+    /// Whether this logical zero page still has no allocated byte storage.
+    pub fn unmaterialized_zero(&self) -> bool {
+        matches!(&self.bytes, Bytes::Zero(bytes) if bytes.get().is_none())
+    }
     pub(crate) fn changed(&self, guard: &mut Guard<'_>, offset: usize, len: usize) {
         let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
         guard.invalidate(offset, len, version);
@@ -434,6 +477,31 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unpublished_bytes_keep_one_allocation_and_switch_to_guarded_publication() {
+        let page = MutablePage::zero();
+        assert!(page.unmaterialized_zero());
+        // SAFETY: this test owns the only page and has not exported a handle.
+        unsafe { page.with_unpublished_write(7, 4, |b| b.copy_from_slice(b"warm")) };
+        assert!(!page.unmaterialized_zero());
+        // SAFETY: still the sole unpublished actor, with no active monitors.
+        let pointer = unsafe { page.with_unpublished_read(7, 4, |b| b.as_ptr() as usize) };
+        assert_eq!(page.acquisitions(), 0);
+        assert_eq!(page.revision(), 0);
+        let page = std::sync::Arc::new(page);
+        let worker = page.clone();
+        std::thread::spawn(move || {
+            worker.with_write(7, 4, |b| b.copy_from_slice(b"live"));
+        })
+        .join()
+        .unwrap();
+        page.with_read(7, 4, |b| {
+            assert_eq!(b, b"live");
+            assert_eq!(b.as_ptr() as usize, pointer);
+        });
+        assert!(page.acquisitions() > 0);
+        assert!(page.revision() > 0);
+    }
     #[test]
     fn readonly_guard_keeps_region_ownership_and_the_compact_layout() {
         let page = MutablePage::new([37; PAGE]);
