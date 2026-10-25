@@ -40,7 +40,16 @@ impl RetainedFd {
             .as_ref()
             .map(|end| end.endpoint.clone())
     }
+    pub fn shared_file(&self) -> Option<SharedFd> {
+        match &self.0.open {
+            OpenHandle::Shared(open) => Some(SharedFd::new(open.clone())),
+            OpenHandle::Owner(_) => None,
+        }
+    }
     pub fn direct_byte(&self) -> Option<DirectFd> {
+        if let Some(file) = self.shared_file() {
+            return file.direct_byte();
+        }
         DirectFd::snapshot_uring(&self.0.open.borrow()).filter(|fd| !fd.is_epoll() && !fd.is_pty())
     }
     /// Real connected native transport lease; never capture for all FD snapshots.

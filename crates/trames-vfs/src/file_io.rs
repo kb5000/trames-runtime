@@ -65,12 +65,26 @@ pub struct DirectFiles(
 impl DirectFiles {
     pub fn get(&self, fd: u32) -> Option<DirectFile> {
         if let Some(result) = self.2.as_ref().and_then(|files| files.lookup(fd)) {
-            let file = result.ok()?;
-            let prepared = self.1.get(&file.identity())?;
-            debug_assert!(prepared.0.origin == file.ofd_identity());
-            return prepared.accept(Some(file));
+            return self.accept(result.ok()?);
         }
         self.0.get(fd as usize)?.as_ref()?.accept(None)
+    }
+    /// Resolve prepared authority for an already accepted shared lookup.
+    /// Do not look up its numeric FD again while constructing a request.
+    pub fn accept(&self, file: SharedFd) -> Option<DirectFile> {
+        let prepared = self.1.get(&file.identity())?;
+        debug_assert!(prepared.0.origin == file.ofd_identity());
+        prepared.accept(Some(file))
+    }
+    /// Cold preparation of fixed or already-accepted io_uring descriptions.
+    pub fn retain(&self, file: &RetainedFd) -> Option<DirectFile> {
+        if let Some(shared) = file.shared_file() {
+            return self.accept(shared);
+        }
+        self.0
+            .iter()
+            .flatten()
+            .find_map(|prepared| prepared.retain(file))
     }
 }
 #[derive(Default)]
@@ -220,6 +234,9 @@ impl FileEpoch {
     }
 }
 impl DirectFile {
+    pub fn shared_file(&self) -> Option<SharedFd> {
+        self.file.clone()
+    }
     /// Accepted flock keeps the same full OFD as this file operation.
     pub fn flock(&self, operation: u32) -> Result<()> {
         self.flock_request(operation)?.try_lock()

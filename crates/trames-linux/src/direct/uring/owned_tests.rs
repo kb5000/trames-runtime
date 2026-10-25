@@ -43,6 +43,200 @@ fn register_files(l: &mut Linux, m: &mut Memory, fd: u32, files: &[i32]) {
         .unwrap();
 }
 #[test]
+fn numeric_shared_uring_caches_do_not_retain_closed_files_or_pipe_endpoints() {
+    let (mut l, m, fd, _r) = setup(8);
+    l.vfs.import_file(b"/original", b"abc".to_vec()).unwrap();
+    let file = l.vfs.open_at(-100, b"/original", 2, 0).unwrap();
+    let close = Arc::downgrade(
+        &l.vfs
+            .retain_uring_fd(file)
+            .unwrap()
+            .close_notification()
+            .unwrap(),
+    );
+    let notify = l.vfs.inotify_init(trames_vfs::O_NONBLOCK).unwrap();
+    l.vfs.inotify_add(notify, b"/", 8).unwrap();
+    let [reader, writer] = l.vfs.pipe(0).unwrap();
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let snapshot = epoch.capture_with_files(&l.vfs, m.instruction_identity().0, 7, &caps);
+    assert!(snapshot.contains(fd));
+    l.vfs.unlink_at(-100, b"/original", false).unwrap();
+    let membership = l.vfs.shared_files();
+    std::thread::spawn(move || {
+        membership.close(file, 1).unwrap().unwrap();
+        membership.close(reader, 1).unwrap().unwrap();
+    })
+    .join()
+    .unwrap();
+    assert!(close.upgrade().is_none());
+    assert_eq!(l.vfs.allocated_bytes(), 0);
+    assert_eq!(l.vfs.write(writer, b"x"), Err(Errno(32)));
+    let event = l.vfs.read(notify, 1024).unwrap();
+    assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+    assert_eq!(l.vfs.read(notify, 1024), Err(Errno(11)));
+    assert!(epoch.finish().is_empty());
+    files.finish();
+}
+#[test]
+fn shared_sqe_acceptance_resolves_new_file_aliases_replacement_and_missing_slots() {
+    let (mut l, mut m, fd, r) = setup(8);
+    l.vfs.import_file(b"/original", b"old".to_vec()).unwrap();
+    l.vfs.import_file(b"/other", b"new".to_vec()).unwrap();
+    let file = l.vfs.open_at(-100, b"/original", 2, 0).unwrap();
+    let other = l.vfs.open_at(-100, b"/other", 2, 0).unwrap();
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let snapshot = epoch.capture_with_files(&l.vfs, m.instruction_identity().0, 7, &caps);
+    let membership = l.vfs.shared_files();
+    let alias = membership.duplicate(file, 200, false).unwrap().unwrap();
+    membership.duplicate_to(other, file, 0, 1).unwrap().unwrap();
+    add(&mut m, &r, data(22, alias, 0x2000, 3, 1, 0));
+    add(&mut m, &r, data(22, file, 0x2100, 3, 2, 0));
+    complete(start(&snapshot, fd, 2, 2, &mut m), 2);
+    assert_eq!(cq(&mut m, &r), (1, 3));
+    assert_eq!(cq(&mut m, &r), (2, 3));
+    assert_eq!(m.read_array::<3>(0x2000).unwrap(), *b"old");
+    assert_eq!(m.read_array::<3>(0x2100).unwrap(), *b"new");
+    membership.close(alias, 1).unwrap().unwrap();
+    add(&mut m, &r, data(22, alias, 0x2000, 3, 3, 0));
+    complete(start(&snapshot, fd, 1, 1, &mut m), 1);
+    assert_eq!(cq(&mut m, &r), (3, -9));
+    assert!(epoch.finish().is_empty());
+    files.finish();
+}
+#[test]
+fn shared_pending_pipe_keeps_original_across_handoff_and_releases_at_completion() {
+    let (mut l, mut m, fd, r) = setup(8);
+    let [reader, writer] = l.vfs.pipe(0).unwrap();
+    let [new_reader, new_writer] = l.vfs.pipe(0).unwrap();
+    let owner = m.instruction_identity().0;
+    let mut epoch = UringEpoch::default();
+    let snapshot = epoch.capture(&l.vfs, owner, 7);
+    add(&mut m, &r, data(22, reader, 0x2000, 1, 1, 0));
+    let IoAttempt::Blocked(wait) = start(&snapshot, fd, 1, 1, &mut m) else {
+        panic!("pipe wait")
+    };
+    l.vfs
+        .shared_files()
+        .duplicate_to(new_reader, reader, 0, 1)
+        .unwrap()
+        .unwrap();
+    l.vfs.write(new_writer, b"new").unwrap();
+    drop(wait);
+    drop(snapshot);
+    let handoff = epoch.finish();
+    assert_eq!(handoff.len(), 1);
+    assert_eq!(handoff[0].submitted, Some(1));
+    let mut epoch = UringEpoch::default();
+    let snapshot = epoch.capture(&l.vfs, owner, 7);
+    assert!(epoch.adopt_wait(7, &r, 1, None));
+    l.vfs.write(writer, b"o").unwrap();
+    complete(start(&snapshot, fd, 0, 1, &mut m), 1);
+    assert_eq!(cq(&mut m, &r), (1, 1));
+    assert_eq!(m.read_array::<1>(0x2000).unwrap(), *b"o");
+    assert_eq!(l.vfs.write(writer, b"x"), Err(Errno(32))); // before epoch.finish
+    assert_eq!(l.vfs.read(reader, 3).unwrap(), b"new");
+    assert!(epoch.finish().is_empty());
+}
+struct CloseWake {
+    ring: Weak<Ring>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl IoWake for CloseWake {
+    fn wake_io(&self, _: &Arc<IoSignal>) {
+        let ring = self.ring.upgrade().unwrap();
+        // Synchronous resource notifications can re-enter the ring. Check
+        // without blocking so a regression fails instead of hanging the suite.
+        let guard = ring
+            .state
+            .try_lock()
+            .expect("final close callback outside ring lock");
+        drop(guard);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+#[test]
+fn accepted_shared_file_releases_at_completion_or_cancel_after_handoff_and_reuse() {
+    for cancel in [false, true] {
+        let (mut l, mut m, fd, r) = setup(8);
+        l.vfs.import_file(b"/original", b"old".to_vec()).unwrap();
+        l.vfs.import_file(b"/other", b"new".to_vec()).unwrap();
+        let file = l.vfs.open_at(-100, b"/original", 2, 0).unwrap();
+        let other = l.vfs.open_at(-100, b"/other", 2, 0).unwrap();
+        let close = Arc::downgrade(
+            &l.vfs
+                .retain_uring_fd(file)
+                .unwrap()
+                .close_notification()
+                .unwrap(),
+        );
+        let notify = l.vfs.inotify_init(trames_vfs::O_NONBLOCK).unwrap();
+        l.vfs.inotify_add(notify, b"/", 8).unwrap();
+        let [reader, writer] = l.vfs.pipe(0).unwrap();
+        let owner = m.instruction_identity().0;
+        let mut files = trames_vfs::FileEpoch::default();
+        let caps = files.capture(&l.vfs, true);
+        let mut epoch = UringEpoch::default();
+        let snapshot = epoch.capture_with_files(&l.vfs, owner, 7, &caps);
+        add(&mut m, &r, data(22, reader, 0x2200, 1, 10, 4));
+        add(&mut m, &r, data(22, file, 0x2000, 3, 11, 0));
+        complete(start(&snapshot, fd, 2, 0, &mut m), 2);
+        l.vfs.unlink_at(-100, b"/original", false).unwrap();
+        l.vfs
+            .shared_files()
+            .duplicate_to(other, file, 0, 1)
+            .unwrap()
+            .unwrap();
+        assert!(close.upgrade().is_some());
+        assert_eq!(l.vfs.read(notify, 1024), Err(Errno(11)));
+        drop(snapshot);
+        assert_eq!(epoch.finish().len(), 1);
+        files.finish();
+        let mut files = trames_vfs::FileEpoch::default();
+        let caps = files.capture(&l.vfs, true);
+        let retained = files.capture_uring(&l.vfs, true);
+        let mut epoch = UringEpoch::default();
+        let snapshot = epoch.capture_all(&l.vfs, owner, 7, &caps, &retained);
+        let wake = Arc::new(CloseWake {
+            ring: Arc::downgrade(&snapshot.rings[&fd]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let callback: Arc<dyn IoWake> = wake.clone();
+        let signal = IoSignal::new(99, Arc::downgrade(&callback));
+        let subscriptions = l
+            .vfs
+            .direct_descriptors()
+            .get(notify)
+            .unwrap()
+            .subscribe(&signal);
+        if cancel {
+            add(&mut m, &r, data(14, 0, 11, 0, 12, 0));
+            complete(start(&snapshot, fd, 1, 0, &mut m), 1);
+            assert_eq!(cq(&mut m, &r), (11, -125));
+            assert_eq!(cq(&mut m, &r), (12, 0));
+        } else {
+            l.vfs.write(writer, b"o").unwrap();
+            complete(start(&snapshot, fd, 0, 0, &mut m), 0);
+            assert_eq!(cq(&mut m, &r), (10, 1));
+            assert_eq!(cq(&mut m, &r), (11, 3));
+            assert_eq!(m.read_array::<3>(0x2000).unwrap(), *b"old");
+        }
+        assert!(close.upgrade().is_none()); // no completed/cancelled owner pin
+        assert_eq!(wake.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(signal.ready());
+        drop(subscriptions);
+        let event = l.vfs.read(notify, 1024).unwrap();
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+        assert_eq!(l.vfs.pread(file, 3, 0).unwrap(), b"new");
+        epoch.finish();
+        files.finish();
+    }
+}
+#[test]
 fn fixed_request_keeps_pin_and_ofd_across_unmap_unregister_and_epoch_handoff() {
     let (mut l, mut m, fd, r) = setup(8);
     let owner = m.instruction_identity().0;
@@ -263,7 +457,16 @@ fn ring_fd_aliases_share_one_fixed_table_per_task_and_execute_same_queue() {
     assert!(!Arc::ptr_eq(&a.fixed[&fd], &b.fixed[&fd]));
     let entry = &epoch.owners[&(Rc::as_ptr(&r) as usize)];
     assert_eq!(entry.tasks.len(), 2);
-    assert_eq!(entry.fixed.len(), 2);
+    // Shared fixed resources already own their actual registration in the
+    // ring and fixed capabilities; no extra owner lease is needed at a join.
+    assert_eq!(entry.fixed.len(), 0);
+    assert!(a.fixed[&fd][0]
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .shared_file()
+        .is_some());
     l.vfs.write(writer, b"q").unwrap();
     add(&mut m, &r, data(22, 0, 0x2000, 1, 22, 1));
     complete(start(&a, alias, 1, 1, &mut m), 1);

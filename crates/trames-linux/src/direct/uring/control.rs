@@ -71,7 +71,11 @@ impl Request {
 impl State {
     /// Metadata-only operations run under this ring's lock. No guest byte I/O,
     /// file/socket operation or another VM's memory is executed here.
-    pub(super) fn control(&mut self, r: &mut Request) -> Option<Result<(i32, bool)>> {
+    pub(super) fn control(
+        &mut self,
+        r: &mut Request,
+        retired: &mut Vec<Request>,
+    ) -> Option<Result<(i32, bool)>> {
         if let Some(e) = r.error {
             return Some(Err(e));
         }
@@ -138,6 +142,7 @@ impl State {
                         {
                             let target = self.pending.remove(i).unwrap();
                             self.terminal(&target, Err(Errno(125)));
+                            retired.push(target);
                         }
                         if s.op_flags() & 32 != 0 {
                             Ok((0, true))
@@ -149,12 +154,12 @@ impl State {
                     }
                 }
             }
-            7 | 12 | 14 => self.cancel_or_update(r),
+            7 | 12 | 14 => self.cancel_or_update(r, retired),
             _ => return None,
         };
         Some(result)
     }
-    fn cancel_or_update(&mut self, r: &Request) -> Result<(i32, bool)> {
+    fn cancel_or_update(&mut self, r: &Request, retired: &mut Vec<Request>) -> Result<(i32, bool)> {
         let s = &r.sqe;
         let flags = s.op_flags();
         if s.opcode() == 7 && s.length() != 0 {
@@ -236,6 +241,7 @@ impl State {
             if matches(&self.pending[i].running()) && (all || cancelled == 0) {
                 let target = self.pending.remove(i).unwrap();
                 self.terminal(&target, Err(Errno(125)));
+                retired.push(target);
                 cancelled += 1;
             } else {
                 i += 1;

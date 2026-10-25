@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Frozen io_uring capabilities. No Rc, VFS table or namespace crosses threads.
+//! Worker io_uring capabilities. No owner Rc graph or namespace crosses threads.
 //! A ring lock arbitrates kernel cursors, not unrelated rings or byte resources.
 use super::*;
 use std::{
@@ -44,6 +44,13 @@ impl Resource {
             object: Object::File(cap),
             identity: file.identity(),
             datagram: false,
+        }
+    }
+    fn shared_file(&self) -> Option<trames_vfs::SharedFd> {
+        match &self.object {
+            Object::Byte(file) => file.shared_file(),
+            Object::File(file) => file.shared_file(),
+            Object::Tcp(_) => None,
         }
     }
     fn next_deadline(&self) -> Option<Instant> {
@@ -434,7 +441,12 @@ impl State {
                     .is_none_or(|(id, _)| self.completed.contains_key(&id)))
     }
 
-    fn finish_request(&mut self, mut r: Request, result: Result<(i32, bool)>, flags: u32) -> bool {
+    fn finish_request(
+        &mut self,
+        mut r: Request,
+        result: Result<(i32, bool)>,
+        flags: u32,
+    ) -> (bool, Option<Request>) {
         let (value, success) = result.unwrap_or_else(|e| (-(e.0 as i32), false));
         r.shots = r.shots.saturating_add(1);
         let repeating = r.sqe.opcode() == 11
@@ -463,8 +475,11 @@ impl State {
                     .and_then(|d| Instant::now().checked_add(d));
             }
             self.pending.push_back(r);
+            (true, None)
+        } else {
+            // Actual OFD final-close callbacks run after the ring lock drops.
+            (false, Some(r))
         }
-        more
     }
 
     fn terminal(&mut self, r: &Request, result: Result<i32>) {
@@ -536,6 +551,9 @@ impl Ring {
         };
         let mut deferred = false;
         let mut attempted = BTreeSet::new();
+        // Allocates only for cancellation/linked-timeout batches. Ordinary
+        // completed requests return their one retired value without a Vec push.
+        let mut cancelled = Vec::new();
         let mut budget = 64;
         loop {
             let mut state = self.state.lock().unwrap();
@@ -587,17 +605,20 @@ impl Ring {
                 attempted.clear();
                 continue;
             }
-            if let Some(result) = state.control(&mut r) {
+            if let Some(result) = state.control(&mut r, &mut cancelled) {
                 if result == Err(Errno(11)) && r.error.is_none() && !r.nowait() {
                     attempted.insert(r.sequence);
                     state.pending.push_back(r);
                     continue;
                 }
-                if state.finish_request(r, result, 0) {
+                let (more, retired) = state.finish_request(r, result, 0);
+                if more {
                     budget -= 1;
                 }
                 attempted.clear();
                 drop(state);
+                drop(retired);
+                cancelled.clear();
                 self.readiness.notify_locked();
                 continue;
             }
@@ -671,6 +692,7 @@ impl Ring {
                 state.busy_groups.remove(&r.sqe.buffer_group());
                 notify |= state.contended_groups.remove(&r.sqe.buffer_group());
             }
+            let mut retired = None;
             match result {
                 None => {
                     deferred = true;
@@ -682,14 +704,17 @@ impl Ring {
                     state.pending.push_back(r);
                 }
                 Some(result) => {
-                    if state.finish_request(r, result, flags) {
+                    let (more, completed) = state.finish_request(r, result, flags);
+                    if more {
                         budget -= 1;
                     }
+                    retired = completed;
                     attempted.clear();
                     notify = true;
                 }
             }
             drop(state);
+            drop(retired);
             if notify {
                 self.readiness.notify_locked();
             }
@@ -702,7 +727,11 @@ impl Ring {
 #[derive(Default)]
 pub struct UringSnapshot {
     rings: BTreeMap<u32, Arc<Ring>>,
+    // Only excluded owner controls are frozen. Shared slots resolve live at
+    // SQE acceptance and the request owns the resulting original OFD.
     resources: BTreeMap<u32, Resource>,
+    membership: Option<trames_vfs::SharedFiles>,
+    files: trames_vfs::DirectFiles,
     valid_fds: BTreeSet<u32>,
     fixed: BTreeMap<u32, FixedFiles>,
     owner: u64,
@@ -713,6 +742,27 @@ pub struct UringSnapshot {
     poll_rings: BTreeMap<usize, Arc<Ring>>,
 }
 impl UringSnapshot {
+    fn resource(&self, fd: u32) -> Result<Option<Resource>> {
+        if let Some(file) = self.membership.as_ref().and_then(|files| files.lookup(fd)) {
+            let file = file?;
+            let identity = file.identity();
+            let object = file
+                .clone()
+                .direct_byte()
+                .map(Object::Byte)
+                .or_else(|| self.files.accept(file).map(Object::File));
+            return Ok(object.map(|object| Resource {
+                object,
+                identity,
+                datagram: false,
+            }));
+        }
+        if self.valid_fds.contains(&fd) {
+            Ok(self.resources.get(&fd).cloned())
+        } else {
+            Err(Errno(9))
+        }
+    }
     pub fn contains(&self, fd: u32) -> bool {
         self.rings.contains_key(&fd)
     }
@@ -858,13 +908,13 @@ impl UringSnapshot {
                         }
                     }
                 } else {
-                    match self.resources.get(&(s.fd() as u32)) {
-                        Some(f) => Some(f.clone()),
-                        None if !self.valid_fds.contains(&(s.fd() as u32)) => {
-                            error = Some(Errno(9));
+                    match self.resource(s.fd() as u32) {
+                        Ok(Some(file)) => Some(file),
+                        Err(e) => {
+                            error = Some(e);
                             None
                         }
-                        None => {
+                        Ok(None) => {
                             state.disabled = true;
                             return Some(IoAttempt::Checkpoint);
                         }
@@ -1233,6 +1283,8 @@ impl UringEpoch {
         let mut snapshot = UringSnapshot {
             owner,
             task,
+            membership: Some(vfs.shared_files()),
+            files: files.clone(),
             ..Default::default()
         };
         let mut retained = BTreeMap::new();
@@ -1241,6 +1293,9 @@ impl UringEpoch {
                 snapshot.valid_fds.insert(fd);
             }
             if let Ok(file) = vfs.retain_uring_fd(fd) {
+                if file.shared_file().is_some() {
+                    continue;
+                }
                 if let Some(resource) = Resource::capture(&file)
                     .or_else(|| files.get(fd).map(|cap| Resource::regular(&file, cap)))
                 {
@@ -1251,6 +1306,7 @@ impl UringEpoch {
         }
         let capture_pending = |file: &RetainedFd| {
             Resource::capture(file)
+                .or_else(|| files.retain(file).map(|cap| Resource::regular(file, cap)))
                 .or_else(|| {
                     retained_files
                         .get(&file.identity())
@@ -1299,7 +1355,9 @@ impl UringEpoch {
                     .drain(..)
                     .map(|r| {
                         if let Some(f) = &r.file {
-                            originals.insert((r.task, r.sequence), f.clone());
+                            if f.shared_file().is_none() {
+                                originals.insert((r.task, r.sequence), f.clone());
+                            }
                         }
                         Request {
                             owner: r.owner,
@@ -1380,7 +1438,9 @@ impl UringEpoch {
                         .enumerate()
                         .map(|(index, file)| match file {
                             Some(file) => {
-                                entry.fixed.insert((task, index as u32), file.clone());
+                                if file.shared_file().is_none() {
+                                    entry.fixed.insert((task, index as u32), file.clone());
+                                }
                                 capture_pending(file).map(Some).ok_or(Errno(95))
                             }
                             None => Ok(None),
@@ -1428,18 +1488,23 @@ impl UringEpoch {
             let mut pending = direct.pending.drain(..).collect::<Vec<_>>();
             pending.sort_unstable_by_key(|r| r.sequence);
             for r in pending {
-                let file = r.resource.as_ref().and_then(|_| {
-                    entry
-                        .originals
-                        .get(&(r.task, r.sequence))
+                let file = r.resource.as_ref().and_then(|resource| {
+                    resource
+                        .shared_file()
+                        .map(trames_vfs::SharedFd::retained)
                         .or_else(|| {
-                            if r.sqe.flags() & 1 != 0 {
-                                entry.fixed.get(&(r.task, r.sqe.fd() as u32))
-                            } else {
-                                entry.descriptors.get(&(r.task, r.sqe.fd() as u32))
-                            }
+                            entry
+                                .originals
+                                .get(&(r.task, r.sequence))
+                                .or_else(|| {
+                                    if r.sqe.flags() & 1 != 0 {
+                                        entry.fixed.get(&(r.task, r.sqe.fd() as u32))
+                                    } else {
+                                        entry.descriptors.get(&(r.task, r.sqe.fd() as u32))
+                                    }
+                                })
+                                .cloned()
                         })
-                        .cloned()
                 });
                 state.pending.push_back(UringRequest {
                     owner: r.owner,

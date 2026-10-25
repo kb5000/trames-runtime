@@ -70,6 +70,13 @@ impl SharedFd {
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.open) as usize
     }
+    /// Reconstruct the joined control view of this same accepted OFD.
+    pub fn retained(self) -> RetainedFd {
+        RetainedFd(Descriptor {
+            open: OpenHandle::Shared(self.open),
+            cloexec: false.into(),
+        })
+    }
     pub fn direct_byte(self) -> Option<DirectFd> {
         let fd = DirectFd::shared_byte(&self.open)?;
         Some(fd.with_ofd(self))

@@ -251,6 +251,9 @@ impl DirectFd {
             SharedFd::ofd_identity,
         )
     }
+    pub fn shared_file(&self) -> Option<SharedFd> {
+        self._file.clone()
+    }
     pub fn retains_ofd(&self) -> bool {
         self._file.is_some()
     }
