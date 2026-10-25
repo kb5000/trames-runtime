@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared filesystem data, separated from owner-only overlay orchestration.
+//! Shared filesystem and overlay resources, independent of namespace topology.
 use super::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
@@ -7,11 +7,11 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 #[derive(Clone)]
 pub(super) struct FsHandle {
     pub shared: Arc<SharedCell<Filesystem>>,
-    overlay: Option<Rc<overlay::Overlay>>,
+    overlay: Option<Arc<overlay::Overlay>>,
 }
 pub(super) struct FsBorrow<'a, G> {
     guard: G,
-    pub overlay: &'a Option<Rc<overlay::Overlay>>,
+    pub overlay: &'a Option<Arc<overlay::Overlay>>,
 }
 impl FsHandle {
     pub fn new(data: Filesystem) -> Self {
@@ -20,7 +20,7 @@ impl FsHandle {
             overlay: None,
         }
     }
-    pub fn with_overlay(data: Filesystem, overlay: Rc<overlay::Overlay>) -> Self {
+    pub fn with_overlay(data: Filesystem, overlay: Arc<overlay::Overlay>) -> Self {
         Self {
             shared: Arc::new(SharedCell::new(data)),
             overlay: Some(overlay),
@@ -44,7 +44,7 @@ impl FsHandle {
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }
-    pub fn has_owner_overlay(&self) -> bool {
+    pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
     }
 }

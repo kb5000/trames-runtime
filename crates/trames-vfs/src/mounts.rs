@@ -58,7 +58,7 @@ pub(super) struct MountInit {
     pub kind: Kind,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
     pub pid_namespace: Option<PidNamespace>,
-    pub devpts: Option<Rc<pty::Devpts>>,
+    pub devpts: Option<Arc<pty::Devpts>>,
     pub flags: Cell<u64>,
     pub writers: Arc<mapped::Writers>,
     pub parent: RefCell<Option<Attachment>>,
@@ -67,19 +67,20 @@ pub(super) struct MountInit {
 // retain this identity rather than the old root's parent chain after pivot.
 pub(super) struct MountIdentity {
     pub id: u64,
-    _filesystem: Arc<SharedCell<Filesystem>>,
+    pub fs: FsHandle,
     pub root: NodeRef,
     pub root_key: Vec<u8>,
     pub kind: Kind,
     pub pid_namespace: Option<PidNamespace>,
+    pub devpts: Option<Arc<pty::Devpts>>,
     pub flags: MountFlags,
     pub writers: Arc<mapped::Writers>,
 }
 pub(super) struct MountData {
     pub identity: Arc<MountIdentity>,
     parent: Arc<SharedCell<Option<SharedAttachment>>>,
-    // A shared metadata reference is not authority for these owner resources.
-    // Full pathname OFD admission still excludes them and their ancestors.
+    // Namespace descriptors remain owner controls; their topology must not be
+    // projected as a complete shared mount capability.
     _owner_control: bool,
 }
 impl std::ops::Deref for MountData {
@@ -150,9 +151,7 @@ impl Drop for ParentWrite<'_> {
 }
 pub(super) struct Mount {
     pub shared: Arc<MountData>,
-    pub fs: FsHandle,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
-    pub devpts: Option<Rc<pty::Devpts>>,
     pub parent: MountParent,
 }
 impl std::ops::Deref for Mount {
@@ -169,34 +168,49 @@ impl Mount {
                 .as_ref()
                 .map(SharedAttachment::from_owner),
         ));
+        let owner_control = init.namespace.is_some();
         let identity = Arc::new(MountIdentity {
             id: init.id,
-            _filesystem: init.fs.shared.clone(),
+            fs: init.fs,
             root: init.root,
             root_key: init.root_key,
             kind: init.kind,
             pid_namespace: init.pid_namespace,
+            devpts: init.devpts,
             flags: MountFlags(AtomicU64::new(init.flags.get())),
             writers: init.writers,
         });
         let shared = Arc::new(MountData {
             identity,
             parent: parent.clone(),
-            _owner_control: init.namespace.is_some()
-                || init.devpts.is_some()
-                || init.fs.has_owner_overlay(),
+            _owner_control: owner_control,
         });
         let parent = shared.parent.clone();
         Self {
             shared,
-            fs: init.fs,
             namespace: init.namespace,
-            devpts: init.devpts,
             parent: MountParent {
                 owner: init.parent,
                 shared: parent,
             },
         }
+    }
+    // Overlay sources are validated Root/Tmpfs directory capabilities. Their
+    // byte/storage identity is independent of the current namespace ancestry.
+    pub(super) fn layer_projection(identity: Arc<MountIdentity>) -> Rc<Self> {
+        let parent = Arc::new(SharedCell::new(None));
+        Rc::new(Self {
+            shared: Arc::new(MountData {
+                identity,
+                parent: parent.clone(),
+                _owner_control: false,
+            }),
+            namespace: None,
+            parent: MountParent {
+                owner: RefCell::new(None),
+                shared: parent,
+            },
+        })
     }
     pub(super) fn device(&self) -> u64 {
         self.fs
@@ -979,7 +993,7 @@ impl Vfs {
                     let pts = pty::Devpts::new(new_mount_id()?, data.unwrap_or_default())?;
                     let fs = pts.fs.clone();
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
-                    devpts = Some(Rc::new(pts));
+                    devpts = Some(Arc::new(pts));
                     (fs, root, b"/".to_vec(), Kind::Devpts, flags & ATTRS)
                 }
                 b"proc" | b"sysfs" => {
@@ -1092,7 +1106,10 @@ impl Vfs {
             }
         }
         if flags & 2 == 0
-            && (ids.len() > 1 || Rc::strong_count(mount) > 2 || mount.writers.active())
+            && (ids.len() > 1
+                || Rc::strong_count(mount) > 2
+                || Arc::strong_count(&mount.identity) > 1
+                || mount.writers.active())
         {
             return Err(Errno(16));
         }
@@ -1520,7 +1537,7 @@ mod tests {
         let shared = mount.shared.clone();
         assert!(!shared._owner_control);
         assert_eq!(shared.parent.borrow().as_ref().unwrap()._parent.id, 1);
-        let filesystem = Arc::downgrade(&shared._filesystem);
+        let filesystem = Arc::downgrade(&shared.fs.shared);
         let root = Arc::downgrade(&shared.root);
         v.mount(None, b"/dst", None, 32 | MS_RDONLY, None).unwrap();
         assert_eq!(v.write(fd, b"x"), Err(Errno(30)));
@@ -1692,11 +1709,14 @@ mod tests {
 impl Vfs {
     fn register_mounts(&self, mounts: &[Rc<Mount>]) -> Result<()> {
         self.reap_detached_mounts();
-        let mut registry = self.mount_registry.borrow_mut();
-        registry.retain(|m| m.strong_count() != 0);
-        if registry.len() + mounts.len() > MAX_MOUNTS {
+        let mut resources = self.mount_resources.borrow_mut();
+        resources.retain(|m| m.strong_count() != 0);
+        if resources.len() + mounts.len() > MAX_MOUNTS {
             return Err(Errno(28));
         }
+        let mut registry = self.mount_registry.borrow_mut();
+        registry.retain(|m| m.strong_count() != 0);
+        resources.extend(mounts.iter().map(|m| Arc::downgrade(&m.identity)));
         registry.extend(mounts.iter().map(Rc::downgrade));
         Ok(())
     }

@@ -1095,10 +1095,10 @@ impl Vfs {
     pub fn checkpoint(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for mount in self
-            .mount_registry
+            .mount_resources
             .borrow()
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
         {
             if seen.insert(mount.fs.identity()) && mount.fs.borrow().overlay.is_some() {
                 mount.fs.borrow().checkpoint()?;

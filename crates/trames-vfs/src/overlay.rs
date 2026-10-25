@@ -9,8 +9,34 @@ type Tree = BTreeMap<Vec<u8>, NodeRef>;
 static NEXT_DEVICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x6f00_0000);
 #[derive(Clone)]
 struct Layer {
-    at: ResolvedPath,
+    at: LayerPath,
     fs: FsHandle,
+}
+#[derive(Clone)]
+struct LayerPath {
+    key: Vec<u8>,
+    identity: Arc<mounts::MountIdentity>,
+}
+impl std::ops::Deref for LayerPath {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+impl LayerPath {
+    fn resolved(&self) -> ResolvedPath {
+        ResolvedPath {
+            key: self.key.clone(),
+            mount: Some(Mount::layer_projection(self.identity.clone())),
+        }
+    }
+    fn writable(&self) -> Result<()> {
+        if self.identity.flags.get() & mounts::MS_RDONLY != 0 {
+            Err(Errno(30))
+        } else {
+            Ok(())
+        }
+    }
 }
 impl Layer {
     fn key(&self, relative: &[u8]) -> Vec<u8> {
@@ -90,9 +116,9 @@ pub(super) struct Overlay {
     upper: Option<Layer>,
     work: Option<Layer>,
     lower: Tree,
-    baseline: RefCell<BTreeMap<Vec<u8>, Entry>>,
-    uncopied: RefCell<BTreeSet<usize>>,
-    dirty: RefCell<BTreeSet<usize>>,
+    baseline: SharedCell<BTreeMap<Vec<u8>, Entry>>,
+    uncopied: SharedCell<BTreeSet<usize>>,
+    dirty: SharedCell<BTreeSet<usize>>,
     userxattr: bool,
     options: Vec<u8>,
 }
@@ -437,12 +463,9 @@ impl Overlay {
 }
 impl Layer {
     fn fs_device(&self) -> u64 {
-        // Caller may hold a mutable filesystem borrow; the retained mount root
-        // has a separate RefCell and provides the storage device identity.
-        self.at
-            .mount
-            .as_ref()
-            .map_or(0xfd01, |m| m.root.borrow().device)
+        // Caller may hold the filesystem write guard; inode metadata has a
+        // separate lock and provides the retained storage device identity.
+        self.at.identity.root.borrow().device
     }
 }
 // Keep escaping until the final path split: lowerdir itself contains ':' while
@@ -519,7 +542,7 @@ impl Vfs {
         let layer = |path: &[u8]| -> Result<Layer> {
             let at = self.mount_location(path, true)?;
             let fs = at.filesystem(self);
-            if fs.borrow().overlay.is_some()
+            if fs.has_overlay()
                 || !matches!(
                     at.mount.as_ref().map(|m| m.kind),
                     Some(mounts::Kind::Root | mounts::Kind::Tmpfs)
@@ -534,7 +557,14 @@ impl Vfs {
             if !self.allowed(&n.borrow(), 5) {
                 return Err(Errno(13));
             }
-            Ok(Layer { at, fs })
+            let identity = at.mount.as_ref().ok_or(Errno(22))?.identity.clone();
+            Ok(Layer {
+                at: LayerPath {
+                    key: at.key,
+                    identity,
+                },
+                fs,
+            })
         };
         let lowers = lower.iter().map(|p| layer(p)).collect::<Result<Vec<_>>>()?;
         let upper = upper.as_deref().map(layer).transpose()?;
@@ -557,10 +587,10 @@ impl Vfs {
                 return Err(Errno(39));
             }
             for m in self
-                .mount_registry
+                .mount_resources
                 .borrow()
                 .iter()
-                .filter_map(Weak::upgrade)
+                .filter_map(std::sync::Weak::upgrade)
             {
                 if let Some(o) = &m.fs.borrow().overlay {
                     if [&o.upper, &o.work]
@@ -572,14 +602,14 @@ impl Vfs {
                     }
                 }
             }
-            if !self.allowed(&self.node(&u.at)?.borrow(), 3)
-                || !self.allowed(&self.node(&w.at)?.borrow(), 3)
+            if !self.allowed(&self.node(&u.at.resolved())?.borrow(), 3)
+                || !self.allowed(&self.node(&w.at.resolved())?.borrow(), 3)
             {
                 return Err(Errno(13));
             }
             let at = ResolvedPath {
                 key: w.key(b"/work"),
-                mount: w.at.mount.clone(),
+                mount: w.at.resolved().mount,
             };
             if !w.fs.borrow().paths.contains_key(&at.key) {
                 // Moby adjusts ownership of the kernel-created work/work
@@ -596,15 +626,15 @@ impl Vfs {
         if merged.len() > budget.nodes {
             return Err(Errno(28));
         }
-        let o = Rc::new(Overlay {
+        let o = Arc::new(Overlay {
             device: NEXT_DEVICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             lowers,
             upper,
             work,
             lower,
-            baseline: RefCell::default(),
-            uncopied: RefCell::default(),
-            dirty: RefCell::default(),
+            baseline: SharedCell::default(),
+            uncopied: SharedCell::default(),
+            dirty: SharedCell::default(),
             userxattr,
             options: data.to_vec(),
         });
@@ -743,6 +773,90 @@ mod tests {
             Some(b"lowerdir=/lower:/lower2,upperdir=/upper,workdir=/work,index=off"),
         )
         .unwrap();
+    }
+    #[test]
+    fn pivot_root_overlay_layers_do_not_retain_parent_topology_cycle() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        v.import_file(b"/lower/file", b"lower".to_vec()).unwrap();
+        mount(&mut v);
+        let backing = Arc::downgrade(&v.fs.shared);
+        let merged = {
+            let at = v.mount_location(b"/merged", true).unwrap();
+            Arc::downgrade(&at.mount.as_ref().unwrap().fs.shared)
+        };
+        v.mkdir_at(AT_FDCWD, b"/merged/old", 0o755).unwrap();
+        v.pivot_root(b"/merged", b"/merged/old").unwrap();
+        assert_eq!(read(&mut v, b"/file"), b"lower");
+        drop(v);
+        assert!(
+            merged.upgrade().is_none(),
+            "overlay root survived its last owner"
+        );
+        assert!(
+            backing.upgrade().is_none(),
+            "backing retained through pivot parent cycle"
+        );
+    }
+    #[test]
+    fn retained_overlay_filesystem_owns_real_layers_until_final_worker_release() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Overlay>();
+        send_sync::<FsHandle>();
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        v.import_file(b"/lower/file", b"lower".to_vec()).unwrap();
+        mount(&mut v);
+        let backing = Arc::downgrade(&v.fs.shared);
+        let fs = v.mount_location(b"/merged", true).unwrap().filesystem(&v);
+        let merged = Arc::downgrade(&fs.shared);
+        drop(v);
+        assert!(backing.upgrade().is_some());
+        std::thread::spawn(move || {
+            let node = fs.borrow().paths[b"/file".as_slice()].clone();
+            let node = node.borrow();
+            let Content::File(data) = &node.content else {
+                panic!("file")
+            };
+            assert_eq!(data.read_at(0, 5).unwrap(), b"lower");
+            drop(node);
+            drop(fs);
+        })
+        .join()
+        .unwrap();
+        assert!(merged.upgrade().is_none());
+        assert!(backing.upgrade().is_none());
+    }
+    #[test]
+    fn layer_identity_pins_unmount_and_quota_without_retaining_detached_topology() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        v.mount(None, b"/lower", Some(b"tmpfs"), 0, None).unwrap();
+        write(&mut v, b"/lower/file", b"lower");
+        let (owner, resource, id) = {
+            let at = v.mount_location(b"/lower", true).unwrap();
+            let mount = at.mount.as_ref().unwrap();
+            (
+                Rc::downgrade(mount),
+                Arc::downgrade(&mount.identity),
+                mount.id,
+            )
+        };
+        mount(&mut v);
+        assert_eq!(v.umount(b"/lower", 0), Err(Errno(16)));
+        v.umount(b"/lower", 2).unwrap();
+        v.reap_detached_mounts();
+        assert!(owner.upgrade().is_none());
+        assert!(resource.upgrade().is_some());
+        assert!(v
+            .mount_resources
+            .borrow()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|m| m.id == id));
+        assert_eq!(read(&mut v, b"/merged/file"), b"lower");
+        v.umount(b"/merged", 0).unwrap();
+        assert!(resource.upgrade().is_none());
     }
     fn write(v: &mut Vfs, path: &[u8], data: &[u8]) {
         let fd = v.open_at(AT_FDCWD, path, 0x242, 0o644).unwrap();
