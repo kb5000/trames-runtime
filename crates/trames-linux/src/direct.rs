@@ -167,13 +167,21 @@ impl DirectSyscalls {
         self.membership = Some(files);
         self
     }
-    /// Only additions are admitted here. Removal/replacement waits for retained
-    /// byte/poll requests and checkpoint handoff to preserve original OFDs.
+    /// Shared operations use actual membership. Retained calls/mappings own
+    /// their original OFDs; excluded owner controls checkpoint before effects.
     pub fn invoke_membership(&self, number: u32, args: [u64; 6]) -> Option<Result<u64, Errno>> {
         let files = self.membership.as_ref()?;
         let result = match number {
             23 => files.duplicate(args[0] as u32, 0, false),
-            24 => files.duplicate_to_empty(args[0] as u32, args[1] as u32, args[2] as u32),
+            24 => files.duplicate_to(
+                args[0] as u32,
+                args[1] as u32,
+                args[2] as u32,
+                self.lock_context.as_ref()?.owner,
+            ),
+            57 => files
+                .close(args[0] as u32, self.lock_context.as_ref()?.owner)
+                .map(|r| r.map(|()| 0)),
             25 if matches!(args[1], 0 | 1030) => {
                 files.duplicate(args[0] as u32, args[2] as u32, args[1] == 1030)
             }
@@ -1071,10 +1079,11 @@ mod tests {
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     use trames_vfs::{Vfs, O_NONBLOCK};
     #[test]
-    fn membership_additions_use_the_actual_table_and_defer_replacement_without_effects() {
+    fn membership_changes_resolve_live_slots_and_final_close_before_owner_handoff() {
         let mut v = Vfs::default();
         let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
-        let direct = DirectSyscalls::default().with_membership(v.shared_files());
+        let direct =
+            DirectSyscalls::new(v.direct_descriptors()).with_lock_context(v.record_lock_context(1));
         assert_eq!(
             direct.invoke_membership(25, [writer as u64, 1030, 160, 0, 0, 0]),
             Some(Ok(160))
@@ -1085,15 +1094,105 @@ mod tests {
         );
         assert_ne!(v.flags(160).unwrap() & trames_vfs::O_CLOEXEC, 0);
         assert_eq!(v.flags(200).unwrap() & trames_vfs::O_CLOEXEC, 0);
-        assert!(direct
-            .invoke_membership(24, [writer as u64, reader as u64, 0, 0, 0, 0])
-            .is_none());
-        assert!(direct
-            .invoke_membership(57, [writer as u64, 0, 0, 0, 0, 0])
-            .is_none());
-        assert_eq!(direct.fd_control_completed(), 2);
         v.write(200, b"live").unwrap();
         assert_eq!(v.read(reader, 4).unwrap(), b"live");
+        assert_eq!(
+            direct.invoke_membership(24, [writer as u64, reader as u64, 0, 0, 0, 0]),
+            Some(Ok(reader as u64))
+        );
+        assert_eq!(v.write(200, b"x"), Err(Errno(32))); // cached DirectFds did not pin reader
+        assert_eq!(
+            direct.invoke_membership(57, [writer as u64, 0, 0, 0, 0, 0]),
+            Some(Ok(0))
+        );
+        assert_eq!(v.flags(writer), Err(Errno(9)));
+        assert_eq!(direct.fd_control_completed(), 4);
+        let owner = v.eventfd(7, O_NONBLOCK).unwrap();
+        assert!(direct
+            .invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0])
+            .is_none());
+        assert!(direct
+            .invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0])
+            .is_none());
+        assert_eq!(v.read(owner, 8).unwrap(), 7u64.to_le_bytes());
+        assert_eq!(direct.fd_control_completed(), 4); // owner fallback had no effects
+    }
+    #[test]
+    fn worker_close_releases_process_locks_then_final_flock_and_close_notification() {
+        let mut v = Vfs::default();
+        v.set_lock_owner(11);
+        let file = v.open_at(-100, b"/file", 0x42, 0o600).unwrap();
+        let alias = v.dup(file, 0, false).unwrap();
+        let contender = v.open_at(-100, b"/file", 2, 0).unwrap();
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        v.inotify_add(notify, b"/file", 8).unwrap();
+        let close = Arc::downgrade(
+            &v.retain_uring_fd(file)
+                .unwrap()
+                .close_notification()
+                .unwrap(),
+        );
+        let requested = v.normalize_lock(file, 1, 0, 0, 8).unwrap();
+        v.record_lock_set(file, requested).unwrap();
+        let mut other = requested;
+        other.owner = 22;
+        assert!(v.record_lock_conflict(contender, other).unwrap().is_some());
+        v.flock(file, 6).unwrap();
+        let mut epoch = trames_vfs::FileEpoch::default();
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_files(epoch.capture(&v, true))
+            .with_lock_context(v.record_lock_context(11));
+        assert_eq!(
+            direct.invoke_membership(57, [alias as u64, 0, 0, 0, 0, 0]),
+            Some(Ok(0))
+        );
+        assert_eq!(v.record_lock_conflict(contender, other).unwrap(), None);
+        assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+        assert_eq!(v.read(notify, 1024), Err(Errno(11)));
+        assert_eq!(
+            direct.invoke_membership(57, [file as u64, 0, 0, 0, 0, 0]),
+            Some(Ok(0))
+        );
+        assert!(close.upgrade().is_none());
+        assert_eq!(v.flock(contender, 6), Ok(()));
+        let event = v.read(notify, 1024).unwrap();
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+        assert_eq!(v.read(notify, 1024), Err(Errno(11)));
+        epoch.finish();
+    }
+    #[test]
+    fn shared_named_fifo_ppoll_waits_for_real_data_then_reports_the_original_hangup() {
+        let mut v = Vfs::default();
+        v.mknod_at(-100, b"/fifo", 0o10666, 0).unwrap();
+        let reader = v.open_at(-100, b"/fifo", O_NONBLOCK, 0).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        m.write_array(0x1000, reader.to_le_bytes()).unwrap();
+        m.write_array(0x1004, 1u32.to_le_bytes()).unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let args = [0x1000, 1, 0, 0, 0, 0];
+        let wait = pending(
+            direct
+                .start(73, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap(),
+        );
+        assert!(!wait.signal.ready());
+        let writer = v.open_at(-100, b"/fifo", 1 | O_NONBLOCK, 0).unwrap();
+        v.write(writer, b"x").unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<2>(0x1006).unwrap(), 1u16.to_le_bytes());
+        assert_eq!(v.read(reader, 1).unwrap(), b"x");
+        v.close(writer).unwrap();
+        assert_eq!(
+            complete(
+                direct
+                    .start(73, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap()
+            ),
+            Ok(1)
+        );
+        assert_eq!(m.read_array::<2>(0x1006).unwrap(), 16u16.to_le_bytes());
     }
     #[test]
     fn syslog_subscription_retries_without_lost_wake_and_cancel_drops_listener() {

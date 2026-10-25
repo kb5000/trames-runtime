@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared byte resources. No namespace, descriptor-table Rc or guest memory lives
-//! behind these handles. Descriptor mutation still requires its owner boundary.
+//! behind these handles. Admitted mutations use actual shared Files/OFD ownership.
 use super::*;
 use crate::readiness::Readiness;
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
@@ -270,6 +270,9 @@ impl DirectFd {
         if !matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
             return None;
         }
+        Self::shared_pipe(open)
+    }
+    pub(super) fn shared_pipe(open: &SharedOpenDescription) -> Option<Self> {
         let end = open.pipe.as_ref()?;
         Some(Self {
             resource: ByteResource::Pipe {

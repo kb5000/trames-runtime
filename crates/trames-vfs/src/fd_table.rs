@@ -82,7 +82,9 @@ impl SharedFd {
         Some(fd.with_ofd(self))
     }
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
-        let fd = DirectFd::shared_byte(&self.open).or_else(|| {
+        // Named FIFO descriptions keep their pathname kind, but their poll
+        // state and subscriptions still belong to the real pipe resource.
+        let fd = DirectFd::shared_pipe(&self.open).or_else(|| {
             matches!(self.open.kind, FdKind::Node(_)).then(|| DirectFd::regular_poll(&self.open))
         })?;
         Some(fd.with_ofd(self))
@@ -214,36 +216,6 @@ impl SharedFiles {
         {
             open.release_record_locks(lock_owner);
         }
-        Some(Ok(new))
-    }
-    /// Initial execution-loop admission never retires an existing slot. This
-    /// keeps old frozen byte capabilities valid until retained I/O is wired.
-    pub fn duplicate_to_empty(&self, old: u32, new: u32, flags: u32) -> Option<Result<u32>> {
-        if old == new || flags & !O_CLOEXEC != 0 {
-            return Some(Err(Errno(22)));
-        }
-        if new >= MAX_FDS {
-            return Some(Err(Errno(9)));
-        }
-        let mut entries = self.0.entries.lock().unwrap();
-        let Some(slot) = entries.get(&old) else {
-            return Some(Err(Errno(9)));
-        };
-        let open = match slot.shared_open()? {
-            Ok(open) => open.clone(),
-            Err(error) => return Some(Err(error)),
-        };
-        if entries.contains_key(&new) {
-            return None;
-        }
-        entries.insert(
-            new,
-            Slot {
-                open: SlotOpen::Shared(open),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
-        self.changed();
         Some(Ok(new))
     }
     pub fn close(&self, fd: u32, lock_owner: u32) -> Option<Result<()>> {

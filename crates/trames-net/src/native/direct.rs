@@ -277,6 +277,9 @@ mod tests {
             assert_eq!(network.live_sockets(), 1);
         }
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Darwin may complete connect before the nonblocking listener's accept
+        // queue is readable. Preserve the assertion after its real readiness.
+        wait(&[(listener.clone(), 1)], Duration::from_secs(2)).unwrap();
         let (accepted, _) = listener.accept().unwrap();
         let direct = accepted.direct_tcp().unwrap();
         let lease = direct.retain().unwrap();

@@ -167,6 +167,28 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn shared_named_fifo_poll_uses_pipe_data_and_hangup_instead_of_regular_file_readiness() {
+        let mut v = Vfs::default();
+        v.mknod_at(AT_FDCWD, b"/fifo", 0o10666, 0).unwrap();
+        let reader = v.open_at(AT_FDCWD, b"/fifo", O_NONBLOCK, 0).unwrap();
+        let poll = v
+            .shared_files()
+            .lookup(reader)
+            .unwrap()
+            .unwrap()
+            .direct_poll()
+            .unwrap();
+        assert_eq!(v.poll(reader, 1), 0);
+        assert_eq!(poll.poll_ready(1), Some(0));
+        let writer = v.open_at(AT_FDCWD, b"/fifo", 1 | O_NONBLOCK, 0).unwrap();
+        v.write(writer, b"x").unwrap();
+        assert_eq!(poll.poll_ready(1), Some(1));
+        v.close(writer).unwrap();
+        assert_eq!(poll.poll_ready(1), Some(17));
+        assert_eq!(v.read(reader, 1).unwrap(), b"x");
+        assert_eq!(poll.poll_ready(1), Some(16));
+    }
+    #[test]
     fn complete_pipe_end_releases_inode_and_eof_on_the_last_worker() {
         fn shared<T: Send + Sync>() {}
         shared::<PipeEnd>();

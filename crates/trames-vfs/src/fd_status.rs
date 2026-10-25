@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared OFD status and per-descriptor metadata; membership stays owner-local.
+//! Shared OFD status and per-descriptor bits resolved through live membership.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
