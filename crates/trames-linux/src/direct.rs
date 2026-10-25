@@ -28,7 +28,7 @@ pub struct PendingIo {
     pub flock: Option<trames_vfs::FlockRequest>,
     pub retained_byte: Option<RetainedByte>,
     resource_deadline: Option<Instant>,
-    poll: Option<crate::poll::Poll>,
+    pub retained_poll: Option<crate::poll::RetainedPoll>,
     _subscriptions: Vec<IoSubscription>,
     host_subscription: Option<trames_vfs::HostSubscription>,
     uring: Option<Box<uring::Wait>>,
@@ -40,6 +40,11 @@ pub struct PendingIo {
 #[derive(Clone)]
 pub struct RetainedByte {
     fd: trames_vfs::DirectFd,
+}
+impl RetainedByte {
+    pub fn shares_resources(&self, fds: &DirectFds) -> bool {
+        fds.shares_with(std::iter::once(&self.fd))
+    }
 }
 impl PendingIo {
     pub fn external_wait(&self) -> bool {
@@ -621,7 +626,7 @@ impl DirectSyscalls {
                 Err(Errno(11)) => {}
                 result => return Some(self.complete(number, args, result)),
             }
-            poll = Some(prepared);
+            poll = Some(prepared.retain());
             deadline
         } else if matches!(number, 22 | 441) {
             match epoll_parameters(memory, number, args).and_then(|timeout| {
@@ -710,7 +715,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 signal,
-                poll,
+                retained_poll: poll,
                 resource_deadline: None,
                 flock: None,
                 retained_byte: None,
@@ -733,6 +738,39 @@ impl DirectSyscalls {
         };
         let fd = file.direct_byte()?;
         Some(Ok(RetainedByte { fd }))
+    }
+    pub fn start_retained_poll(
+        &self,
+        poll: crate::poll::RetainedPoll,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+        deadline: Option<Instant>,
+    ) -> IoAttempt {
+        let Some(poll) = poll.rearm(&self.descriptors) else {
+            return IoAttempt::Checkpoint;
+        };
+        let signal = IoSignal::new(pid, target.clone());
+        let subscriptions = poll.subscribe(&signal);
+        self.resume(
+            PendingIo {
+                number: 73,
+                args,
+                deadline,
+                signal,
+                retained_poll: Some(poll),
+                retained_byte: None,
+                flock: None,
+                resource_deadline: None,
+                _subscriptions: subscriptions,
+                host_subscription: None,
+                uring: None,
+                poll_uring: None,
+                target: target.clone(),
+            },
+            memory,
+        )
     }
     /// Joined execution uses the same ABI and resource wait, but owns SIGPIPE
     /// delivery itself. Only complete shared byte OFDs (currently pipes) enter.
@@ -792,7 +830,7 @@ impl DirectSyscalls {
                 flock: None,
                 retained_byte: Some(file),
                 resource_deadline: None,
-                poll: None,
+                retained_poll: None,
                 _subscriptions: subscriptions,
                 host_subscription: None,
                 uring: None,
@@ -828,7 +866,7 @@ impl DirectSyscalls {
                 flock: Some(request),
                 retained_byte: None,
                 resource_deadline: None,
-                poll: None,
+                retained_poll: None,
                 _subscriptions: subscriptions,
                 host_subscription: None,
                 uring: None,
@@ -878,7 +916,7 @@ impl DirectSyscalls {
             };
         }
         if pending.poll_uring.is_none() {
-            let ids = if let Some(poll) = &pending.poll {
+            let ids = if let Some(poll) = &pending.retained_poll {
                 poll.poll_identities()
             } else if matches!(pending.number, 22 | 441) {
                 self.descriptors
@@ -908,7 +946,7 @@ impl DirectSyscalls {
         let result = if let Some(file) = &pending.retained_byte {
             self.transfer_fd(&file.fd, pending.number, pending.args, memory)
                 .expect("shared pipe byte operation")
-        } else if let Some(poll) = &pending.poll {
+        } else if let Some(poll) = &pending.retained_poll {
             poll.check(memory, pending.deadline)
         } else if matches!(pending.number, 22 | 441) {
             epoll_buffer(memory, pending.args)
@@ -935,7 +973,7 @@ impl DirectSyscalls {
                     file.fd.next_deadline()
                 } else if pending.number == 116 {
                     None
-                } else if let Some(poll) = &pending.poll {
+                } else if let Some(poll) = &pending.retained_poll {
                     poll.next_deadline()
                 } else {
                     self.descriptors
@@ -1432,6 +1470,86 @@ mod tests {
         assert_eq!(m.read_array::<2>(0x1106).unwrap(), 1u16.to_le_bytes());
         assert_eq!(v.write(writer, b"x"), Err(Errno(32)));
         assert_eq!(v.read(replacement, 3).unwrap(), b"new");
+    }
+    #[test]
+    fn ppoll_checkpoint_rearms_original_set_without_reimporting_changed_guest_buffers() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(0).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        m.map(0x3000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write_array(0x3000, 60u64.to_le_bytes()).unwrap();
+        m.write_array(0x3008, 0u64.to_le_bytes()).unwrap();
+        m.write_array(0x1100, reader.to_le_bytes()).unwrap();
+        m.write_array(0x1104, 1u32.to_le_bytes()).unwrap();
+        let args = [0x1100, 1, 0x3000, 0, 0, 0];
+        let first: Arc<dyn IoWake> = Arc::new(Target);
+        let wait = pending(
+            direct
+                .start(73, args, &mut m, 1, &Arc::downgrade(&first), None)
+                .unwrap(),
+        );
+        let original_signal = wait.signal.clone();
+        let deadline = wait.deadline;
+        let accepted = wait.retained_poll.clone().unwrap();
+        drop(wait);
+        v.close(reader).unwrap();
+        let [replacement, new_writer] = v.pipe(0).unwrap();
+        assert_eq!(replacement, reader);
+        v.write(new_writer, b"new").unwrap();
+        m.write_array(0x1100, writer.to_le_bytes()).unwrap();
+        m.write_array(0x1104, 4u32.to_le_bytes()).unwrap();
+        m.unmap(0x3000, PAGE_SIZE).unwrap();
+        let fresh = DirectSyscalls::new(v.direct_descriptors());
+        let next: Arc<dyn IoWake> = Arc::new(Target);
+        let wait = pending(fresh.start_retained_poll(
+            accepted,
+            args,
+            &mut m,
+            1,
+            &Arc::downgrade(&next),
+            deadline,
+        ));
+        assert_eq!(wait.deadline, deadline);
+        assert!(!wait.signal.ready());
+        v.write(writer, b"old").unwrap();
+        assert!(wait.signal.ready());
+        assert!(!original_signal.ready());
+        assert_eq!(complete(fresh.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<4>(0x1100).unwrap(), writer.to_le_bytes());
+        assert_eq!(m.read_array::<2>(0x1104).unwrap(), 4u16.to_le_bytes());
+        assert_eq!(m.read_array::<2>(0x1106).unwrap(), 1u16.to_le_bytes());
+        assert_eq!(v.write(writer, b"x"), Err(Errno(32)));
+        assert_eq!(v.read(replacement, 3).unwrap(), b"new");
+    }
+
+    #[test]
+    fn eventless_regular_file_poll_retains_the_complete_accepted_ofd_until_cancel() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(-100, b"/poll-file", 0x42, 0o600).unwrap();
+        let contender = v.open_at(-100, b"/poll-file", 2, 0).unwrap();
+        v.flock(fd, 6).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        m.write_array(0x1100, fd.to_le_bytes()).unwrap();
+        m.write_array(0x1104, 0u32.to_le_bytes()).unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let wait = pending(
+            direct
+                .start(
+                    73,
+                    [0x1100, 1, 0, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        v.close(fd).unwrap();
+        assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+        drop(wait);
+        v.flock(contender, 6).unwrap();
     }
     fn unix_message(memory: &mut Memory, control_size: u64) {
         for (address, value) in [

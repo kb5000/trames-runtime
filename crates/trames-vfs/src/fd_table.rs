@@ -71,8 +71,17 @@ impl SharedFd {
         Arc::as_ptr(&self.open) as usize
     }
     pub fn direct_byte(self) -> Option<DirectFd> {
-        let fd = DirectFd::snapshot(&OpenDescription::shared_projection(self.open.clone()))?;
+        let fd = DirectFd::shared_byte(&self.open)?;
         Some(fd.with_ofd(self))
+    }
+    pub(super) fn direct_poll(self) -> Option<DirectFd> {
+        let fd = DirectFd::shared_byte(&self.open).or_else(|| {
+            matches!(self.open.kind, FdKind::Node(_)).then(|| DirectFd::regular_poll(&self.open))
+        })?;
+        Some(fd.with_ofd(self))
+    }
+    pub(super) fn ofd_identity(&self) -> OfdIdentity {
+        OfdIdentity::new(&self.open)
     }
 }
 impl SharedFiles {

@@ -16,6 +16,7 @@ pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 mod fd_table;
 mod open_handle;
+pub use open_handle::OfdIdentity;
 use open_handle::{OpenHandle, OpenMount, OpenWeak};
 mod shared_cell;
 use shared_cell::SharedCell;
@@ -1008,6 +1009,14 @@ impl Vfs {
     }
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
         Ok(self.descriptor(fd)?.open.borrow().kind.clone())
+    }
+    /// Internal OFD identity for retained owner-side wait validation.
+    pub fn open_description_identity(&self, fd: u32) -> Result<OfdIdentity> {
+        Ok(OfdIdentity::new(&self.descriptor(fd)?.open.borrow().shared))
+    }
+    pub fn matches_open_description(&self, fd: u32, identity: &OfdIdentity) -> bool {
+        self.descriptor(fd)
+            .is_ok_and(|d| identity.matches(&d.open.borrow().shared))
     }
     fn is_directory<P: PathArg + ?Sized>(&self, path: &P) -> bool {
         self.node(path)

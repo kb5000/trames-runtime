@@ -14,6 +14,7 @@ mod heap;
 pub use heap::ProgramBreak;
 mod network;
 mod poll;
+pub use poll::{RetainedPoll, RetainedSelect};
 mod record_locks;
 mod state;
 mod syslog;

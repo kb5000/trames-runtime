@@ -2,6 +2,26 @@
 //! Actual shared OFDs for admitted resources, with explicit owner-only control.
 use super::*;
 
+/// A prepared descriptor's weak identity, without retaining its resources.
+/// The weak allocation prevents address reuse while an accepted wait compares
+/// owner bindings. Capture only after the OFD's constructor has completed.
+#[derive(Clone)]
+pub struct OfdIdentity(std::sync::Weak<SharedOpenDescription>);
+impl OfdIdentity {
+    pub(super) fn new(open: &Arc<SharedOpenDescription>) -> Self {
+        Self(Arc::downgrade(open))
+    }
+    pub(super) fn matches(&self, open: &Arc<SharedOpenDescription>) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(open))
+    }
+}
+impl PartialEq for OfdIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+impl Eq for OfdIdentity {}
+
 #[derive(Clone)]
 pub(super) enum OpenMount {
     Owner(Rc<Mount>),

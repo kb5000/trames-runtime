@@ -178,6 +178,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Regular,
     Kmsg(Arc<kernel_log::Kmsg>),
     PollOnly(Arc<dyn DirectPoll>),
     Event(Arc<EventCounter>),
@@ -241,8 +242,45 @@ pub struct DirectFd {
     flags: u32,
     status: StatusFlags,
     _file: Option<SharedFd>,
+    origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    pub fn ofd_identity(&self) -> OfdIdentity {
+        self._file.as_ref().map_or_else(
+            || self.origin.as_ref().expect("prepared OFD identity").clone(),
+            SharedFd::ofd_identity,
+        )
+    }
+    pub fn retains_ofd(&self) -> bool {
+        self._file.is_some()
+    }
+    pub(super) fn regular_poll(open: &SharedOpenDescription) -> Self {
+        Self {
+            resource: ByteResource::Regular,
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            _file: None,
+            origin: None,
+        }
+    }
+    pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
+        if !matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
+            return None;
+        }
+        let end = open.pipe.as_ref()?;
+        Some(Self {
+            resource: ByteResource::Pipe {
+                data: end.data.clone(),
+                read: end.read,
+                write: end.write,
+                initial_write_epoch: end.initial_write_epoch,
+            },
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            _file: None,
+            origin: None,
+        })
+    }
     pub(super) fn with_ofd(mut self, file: SharedFd) -> Self {
         self._file = Some(file);
         self
@@ -278,6 +316,7 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::Regular => Vec::new(),
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
@@ -345,6 +384,7 @@ impl DirectFd {
             flags: open.flags.get(),
             status: open.flags.clone(),
             _file: None,
+            origin: Some(OfdIdentity::new(&open.shared)),
         })
     }
     /// Ring RECV has an explicit copied/reported length ABI. Keep the general
@@ -357,6 +397,7 @@ impl DirectFd {
                 flags: open.flags.get(),
                 status: open.flags.clone(),
                 _file: None,
+                origin: Some(OfdIdentity::new(&open.shared)),
             })
         })
     }
@@ -391,10 +432,14 @@ impl DirectFd {
             flags: open.flags.get(),
             status: open.flags.clone(),
             _file: None,
+            origin: Some(OfdIdentity::new(&open.shared)),
         })
     }
     pub fn is_poll_only(&self) -> bool {
-        matches!(self.resource, ByteResource::PollOnly(_))
+        matches!(
+            self.resource,
+            ByteResource::PollOnly(_) | ByteResource::Regular
+        )
     }
     pub fn poll_identities(&self) -> Vec<usize> {
         match &self.resource {
@@ -525,6 +570,7 @@ impl DirectFd {
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
+            ByteResource::Regular => (events & 5, [0; 2]),
             ByteResource::Kmsg(log) => log.poll(events),
             ByteResource::PollOnly(poll) => poll.poll(events),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
@@ -626,7 +672,9 @@ impl DirectFd {
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Timer(timer) => timer.read(count),
             ByteResource::Inotify(queue) => queue.read(count),
-            ByteResource::Epoll(_) | ByteResource::PollOnly(_) => Err(Errno(22)),
+            ByteResource::Epoll(_) | ByteResource::PollOnly(_) | ByteResource::Regular => {
+                Err(Errno(22))
+            }
             ByteResource::Pipe { data, read, .. } => {
                 if !read {
                     return Some(Err(Errno(9)));
@@ -679,6 +727,7 @@ impl DirectFd {
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
             | ByteResource::PollOnly(_)
+            | ByteResource::Regular
             | ByteResource::Timer(_)
             | ByteResource::Inotify(_) => Err(Errno(22)),
             ByteResource::Unix { .. } => self.send(bytes, 0),
@@ -704,7 +753,7 @@ impl DirectFds {
     }
     pub fn get(&self, fd: u32) -> Option<DirectFd> {
         if let Some(result) = self.1.as_ref().and_then(|files| files.lookup(fd)) {
-            return result.ok()?.direct_byte();
+            return result.ok()?.direct_poll();
         }
         self.0.get(fd as usize)?.clone()
     }
@@ -720,6 +769,14 @@ impl DirectFds {
                     .filter_map(SharedFd::direct_byte),
             )
             .collect()
+    }
+    pub fn shares_with<'a>(&self, resources: impl Iterator<Item = &'a DirectFd>) -> bool {
+        let candidates = self.candidates();
+        resources.into_iter().any(|fd| {
+            candidates
+                .iter()
+                .any(|candidate| candidate.shares_resource(fd))
+        })
     }
     /// Related retained resources can justify admitting a blocked I/O peer
     /// alongside one runnable task. Unrelated idle terminals/control pipes

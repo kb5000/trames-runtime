@@ -1010,7 +1010,7 @@ impl UringSnapshot {
                 resource_deadline: None,
                 flock: None,
                 retained_byte: None,
-                poll: None,
+                retained_poll: None,
                 _subscriptions: Vec::new(),
                 host_subscription: None,
                 poll_uring: None,
