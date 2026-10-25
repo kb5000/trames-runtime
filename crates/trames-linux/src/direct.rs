@@ -26,6 +26,7 @@ pub struct PendingIo {
     pub deadline: Option<Instant>,
     pub signal: Arc<IoSignal>,
     pub flock: Option<trames_vfs::FlockRequest>,
+    pub retained_byte: Option<RetainedByte>,
     resource_deadline: Option<Instant>,
     poll: Option<crate::poll::Poll>,
     _subscriptions: Vec<IoSubscription>,
@@ -33,6 +34,13 @@ pub struct PendingIo {
     uring: Option<Box<uring::Wait>>,
     poll_uring: Option<Box<uring::PollWait>>,
     target: Weak<dyn IoWake>,
+}
+/// Authority accepted for one byte syscall. The complete OFD lease, rather
+/// than its numeric table slot or a copied pipe counter, owns the endpoint.
+#[derive(Clone)]
+pub struct RetainedByte {
+    _file: trames_vfs::SharedFd,
+    fd: trames_vfs::DirectFd,
 }
 impl PendingIo {
     pub fn external_wait(&self) -> bool {
@@ -47,6 +55,9 @@ impl PendingIo {
             .min()
     }
 }
+// Ready attempts must remain allocation-free. A parked PendingIo moves into an
+// existing boxed task/job; boxing this variant would add a separate wait allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum IoAttempt {
     Complete(Result<u64, Errno>),
     Blocked(PendingIo),
@@ -416,6 +427,15 @@ impl DirectSyscalls {
             .descriptors
             .get(args[0] as u32)
             .expect("retained resource");
+        self.transfer_fd(fd, number, args, memory)
+    }
+    fn transfer_fd(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
         let deferred = Cell::new(false);
         let flags = socket_flags(number, args);
         let read = |count| {
@@ -553,6 +573,12 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if let Some(file) = self.retain_byte(number, args) {
+            return Some(match file {
+                Ok(file) => self.start_retained_byte(file, number, args, memory, pid, target),
+                Err(error) => self.complete(number, args, Err(error)),
+            });
+        }
         if number == 32 {
             let request = match self
                 .files
@@ -684,6 +710,7 @@ impl DirectSyscalls {
                 poll,
                 resource_deadline: None,
                 flock: None,
+                retained_byte: None,
                 _subscriptions: subscriptions,
                 host_subscription,
                 uring: None,
@@ -692,6 +719,86 @@ impl DirectSyscalls {
             },
             memory,
         ))
+    }
+    fn retain_byte(&self, number: u32, args: [u64; 6]) -> Option<Result<RetainedByte, Errno>> {
+        if !matches!(number, 63..=66) {
+            return None;
+        }
+        let file = match self.membership.as_ref()?.lookup(args[0] as u32)? {
+            Ok(file) => file,
+            Err(error) => return Some(Err(error)),
+        };
+        let fd = file.direct_byte()?;
+        Some(Ok(RetainedByte { _file: file, fd }))
+    }
+    /// Joined execution uses the same ABI and resource wait, but owns SIGPIPE
+    /// delivery itself. Only complete shared byte OFDs (currently pipes) enter.
+    pub fn start_owned_byte(
+        &self,
+        retained: Option<RetainedByte>,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<IoAttempt> {
+        let retained = retained
+            .map(Ok)
+            .or_else(|| self.retain_byte(number, args))?;
+        Some(match retained {
+            Ok(file) => self.start_byte(file, number, args, memory, pid, target, false),
+            Err(error) => self.complete(number, args, Err(error)),
+        })
+    }
+    pub fn start_retained_byte(
+        &self,
+        file: RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        self.start_byte(file, number, args, memory, pid, target, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_byte(
+        &self,
+        file: RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+        checkpoint_pipe: bool,
+    ) -> IoAttempt {
+        match self.transfer_fd(&file.fd, number, args, memory) {
+            Some(Err(Errno(11))) if !file.fd.nonblocking() => {}
+            Some(Err(Errno(32))) if checkpoint_pipe => return IoAttempt::Checkpoint,
+            Some(result) => return self.complete(number, args, result),
+            None => return IoAttempt::Checkpoint,
+        }
+        let signal = IoSignal::new(pid, target.clone());
+        let subscriptions = file.fd.subscribe(&signal);
+        self.resume_inner(
+            PendingIo {
+                number,
+                args,
+                deadline: None,
+                signal,
+                flock: None,
+                retained_byte: Some(file),
+                resource_deadline: None,
+                poll: None,
+                _subscriptions: subscriptions,
+                host_subscription: None,
+                uring: None,
+                poll_uring: None,
+                target: target.clone(),
+            },
+            memory,
+            checkpoint_pipe,
+        )
     }
     /// Retry the retained request, never the numeric FD. Subscribe only after
     /// contention, then recheck so unlock-before-park cannot be lost.
@@ -716,6 +823,7 @@ impl DirectSyscalls {
                 deadline: None,
                 signal,
                 flock: Some(request),
+                retained_byte: None,
                 resource_deadline: None,
                 poll: None,
                 _subscriptions: subscriptions,
@@ -743,7 +851,19 @@ impl DirectSyscalls {
         }
         epoll_scatter(memory, args[1], &events)
     }
-    pub fn resume(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+    pub fn resume(&self, pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+        self.resume_inner(pending, memory, true)
+    }
+    pub fn resume_owned_byte(&self, pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+        assert!(pending.retained_byte.is_some());
+        self.resume_inner(pending, memory, false)
+    }
+    fn resume_inner(
+        &self,
+        mut pending: PendingIo,
+        memory: &mut impl CpuMemory,
+        checkpoint_pipe: bool,
+    ) -> IoAttempt {
         if pending.uring.is_some() {
             return self.urings.resume(pending, memory);
         }
@@ -782,7 +902,10 @@ impl DirectSyscalls {
         {
             return IoAttempt::Checkpoint;
         }
-        let result = if let Some(poll) = &pending.poll {
+        let result = if let Some(file) = &pending.retained_byte {
+            self.transfer_fd(&file.fd, pending.number, pending.args, memory)
+                .expect("shared pipe byte operation")
+        } else if let Some(poll) = &pending.poll {
             poll.check(memory, pending.deadline)
         } else if matches!(pending.number, 22 | 441) {
             epoll_buffer(memory, pending.args)
@@ -796,13 +919,18 @@ impl DirectSyscalls {
         match result {
             Err(Errno(11)) => {
                 if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212)
-                    && self.nonblocking(pending.number, pending.args))
+                    && pending.retained_byte.as_ref().map_or_else(
+                        || self.nonblocking(pending.number, pending.args),
+                        |file| file.fd.nonblocking(),
+                    ))
                     || pending.external_wait()
                         && pending.deadline.is_some_and(|d| Instant::now() >= d)
                 {
                     return self.complete(pending.number, pending.args, Err(Errno(11)));
                 }
-                let resource_deadline = if pending.number == 116 {
+                let resource_deadline = if let Some(file) = &pending.retained_byte {
+                    file.fd.next_deadline()
+                } else if pending.number == 116 {
                     None
                 } else if let Some(poll) = &pending.poll {
                     poll.next_deadline()
@@ -820,7 +948,9 @@ impl DirectSyscalls {
                 .min();
                 IoAttempt::Blocked(pending)
             }
-            Err(Errno(32)) if signals_pipe(pending.number, pending.args) => IoAttempt::Checkpoint,
+            Err(Errno(32)) if checkpoint_pipe && signals_pipe(pending.number, pending.args) => {
+                IoAttempt::Checkpoint
+            }
             result => self.complete(pending.number, pending.args, result),
         }
     }
@@ -1572,6 +1702,71 @@ mod tests {
     struct Target;
     impl IoWake for Target {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+
+    #[test]
+    fn shared_byte_wait_and_fresh_dispatch_keep_original_ofd_after_close_and_reuse() {
+        let mut vfs = Vfs::default();
+        let [reader, writer] = vfs.pipe(0).unwrap();
+        let direct = DirectSyscalls::default().with_membership(vfs.shared_files());
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        let args = [reader as u64, 0x1100, 1, 0, 0, 0];
+        let wait = pending(
+            direct
+                .start(63, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap(),
+        );
+        assert!(wait.retained_byte.is_some());
+        assert!(!wait.signal.ready());
+        vfs.close(reader).unwrap();
+        let [replacement, replacement_writer] = vfs.pipe(0).unwrap();
+        assert_eq!(replacement, reader);
+        vfs.write(replacement_writer, b"n").unwrap();
+        assert!(!wait.signal.ready());
+        let retained = wait.retained_byte.clone().unwrap();
+        drop(wait); // checkpoint drops subscriptions, not accepted authority.
+        let fresh = DirectSyscalls::default();
+        let wait = pending(fresh.start_retained_byte(
+            retained,
+            63,
+            args,
+            &mut m,
+            1,
+            &Arc::downgrade(&target),
+        ));
+        vfs.write(writer, b"o").unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(complete(fresh.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<1>(0x1100).unwrap(), *b"o");
+        assert_eq!(vfs.read(replacement, 1).unwrap(), b"n");
+        assert_eq!(vfs.write(writer, b"x"), Err(Errno(32))); // completed lease released.
+    }
+
+    #[test]
+    fn shared_blocked_writer_keeps_original_endpoint_and_reports_epipe_to_owner() {
+        let mut vfs = Vfs::default();
+        let [reader, writer] = vfs.pipe(0).unwrap();
+        vfs.write(writer, &vec![0; 65536]).unwrap();
+        let direct = DirectSyscalls::default().with_membership(vfs.shared_files());
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        m.write(0x1100, b"x").unwrap();
+        let args = [writer as u64, 0x1100, 1, 0, 0, 0];
+        let wait = pending(
+            direct
+                .start_owned_byte(None, 64, args, &mut m, 1, &Arc::downgrade(&target))
+                .unwrap(),
+        );
+        vfs.close(writer).unwrap();
+        let [replacement, _] = vfs.pipe(0).unwrap();
+        assert_eq!(replacement, writer);
+        vfs.close(reader).unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(
+            complete(direct.resume_owned_byte(wait, &mut m)),
+            Err(Errno(32))
+        );
     }
 
     #[test]

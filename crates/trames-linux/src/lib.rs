@@ -6,8 +6,8 @@ use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
 mod direct;
 pub use direct::{
-    epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo, UringEpoch,
-    UringSnapshot,
+    epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo, RetainedByte,
+    UringEpoch, UringSnapshot,
 };
 mod file_calls;
 mod heap;
