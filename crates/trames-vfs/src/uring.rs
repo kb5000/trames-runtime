@@ -28,7 +28,7 @@ impl RetainedFd {
     }
     /// Opaque owner-side OFD key; never exposed as a guest address.
     pub fn identity(&self) -> usize {
-        Rc::as_ptr(&self.0.open) as usize
+        self.0.open.identity()
     }
     /// An accepted request can hold the real pipe end on its executing worker.
     /// Poll/byte snapshots by themselves remain non-owning endpoint capabilities.
@@ -61,7 +61,7 @@ impl RetainedFd {
         self.0.open.borrow().kind.clone()
     }
     pub fn same_file(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0.open, &other.0.open)
+        OpenHandle::ptr_eq(&self.0.open, &other.0.open)
     }
     pub fn stream(&self) -> bool {
         let o = self.0.open.borrow();
@@ -448,7 +448,9 @@ impl Vfs {
             }
             let open_descriptor = self.descriptor(fd)?;
             let mut open = open_descriptor.open.borrow_mut();
-            open.kind = FdKind::Anonymous;
+            Arc::get_mut(&mut open.shared)
+                .expect("owner-local io_uring setup")
+                .kind = FdKind::Anonymous;
             open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
             Ok((fd, ring))
         })();

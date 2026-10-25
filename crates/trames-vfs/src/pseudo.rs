@@ -34,7 +34,7 @@ pub struct FdInfo {
     pub mount_id: u64,
     pub socket: Option<trames_net::SocketInfo>,
     pub signal_mask: Option<u64>,
-    open: Weak<RefCell<OpenDescription>>,
+    open: OpenWeak,
 }
 
 #[cfg(test)]
@@ -774,7 +774,7 @@ impl Vfs {
                         |m| m.id,
                     ),
                     socket: o.socket.as_ref().and_then(|s| s.info()),
-                    open: Rc::downgrade(&d.open),
+                    open: d.open.downgrade(),
                 }
             })
             .collect()
@@ -800,7 +800,7 @@ impl Vfs {
         &self,
         dirfd: i32,
         path: &[u8],
-    ) -> Result<Option<Rc<RefCell<OpenDescription>>>> {
+    ) -> Result<Option<OpenHandle>> {
         if !self.pseudo.borrow().enabled {
             return Ok(None);
         }
@@ -850,34 +850,33 @@ impl Vfs {
             let metadata = node.borrow();
             (metadata.uid, metadata.gid)
         };
-        Ok(Some(Rc::new(RefCell::new(OpenDescription {
-            read_node: None,
-            id: self.open_id(),
-            owner,
-            kind: FdKind::Node(label),
-            flags: (0).into(),
+        Ok(Some(OpenHandle::new(OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                read_node: None,
+                id: self.open_id(),
+                owner,
+                kind: FdKind::Node(label),
+                flags: (0).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                node: Some(node),
+                pipe: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
             position: 0,
-            file_position: Arc::default(),
-            flock: OnceCell::new(),
-            node: Some(node),
-            pipe: None,
             socket: None,
-            bridge: None,
-            kernel_log: None,
             anonymous: None,
-            notification: None,
             local: None,
             pty: None,
             namespace: None,
             network_control: None,
             oom: None,
             mount,
-        }))))
+        })))
     }
-    fn proc_fd_description_normalized(
-        &self,
-        actual: &ResolvedPath,
-    ) -> Result<Option<Rc<RefCell<OpenDescription>>>> {
+    fn proc_fd_description_normalized(&self, actual: &ResolvedPath) -> Result<Option<OpenHandle>> {
         let Some(rest) = actual.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
@@ -1081,35 +1080,37 @@ impl Vfs {
             original.pty.clone()
         };
         let descriptor = OpenDescription {
-            read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
-                original
-                    .node
-                    .as_ref()
-                    .and_then(|node| match &node.borrow().content {
-                        Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
-                        _ => None,
-                    })
-            } else {
-                None
-            },
-            id: self.open_id(),
-            owner: original.owner,
-            kind: if pty.is_some() {
-                FdKind::Terminal
-            } else {
-                original.kind.clone()
-            },
-            flags: (flags & !O_CLOEXEC).into(),
+            shared: Arc::new(SharedOpenDescription {
+                read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
+                    original
+                        .node
+                        .as_ref()
+                        .and_then(|node| match &node.borrow().content {
+                            Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
+                            _ => None,
+                        })
+                } else {
+                    None
+                },
+                id: self.open_id(),
+                owner: original.owner,
+                kind: if pty.is_some() {
+                    FdKind::Terminal
+                } else {
+                    original.kind.clone()
+                },
+                flags: (flags & !O_CLOEXEC).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                node: original.node.clone(),
+                pipe,
+                bridge: original.bridge.clone(),
+                kernel_log: None,
+                notification,
+            }),
             position: 0,
-            file_position: Arc::default(),
-            flock: OnceCell::new(),
-            node: original.node.clone(),
-            pipe,
             socket: None,
-            bridge: original.bridge.clone(),
-            kernel_log: None,
             anonymous: None,
-            notification,
             local: None,
             pty,
             namespace: original.namespace.clone(),
@@ -1121,7 +1122,7 @@ impl Vfs {
         self.fds.insert(
             fd,
             Descriptor {
-                open: Rc::new(RefCell::new(descriptor)),
+                open: OpenHandle::new(descriptor),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );

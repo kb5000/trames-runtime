@@ -13,10 +13,13 @@ mod pipe;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 mod fd_table;
+mod open_handle;
+use open_handle::{OpenHandle, OpenWeak};
 mod shared_cell;
 use shared_cell::SharedCell;
 mod flock;
 use fd_table::{Descriptor, DescriptorTable};
+pub use fd_table::{SharedFd, SharedFiles};
 pub use flock::FlockRequest;
 mod directory;
 mod disk_io;
@@ -92,7 +95,7 @@ use std::{
 // Mutable OFD status is shared separately and needs no cache invalidation.
 static FD_FLAGS_REVISION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Default)]
-pub struct FdFlags(Arc<[Option<DescriptorFlags>]>);
+pub struct FdFlags(Arc<[Option<DescriptorFlags>]>, Option<SharedFiles>);
 pub enum EpochIo {
     Stream,
     File,
@@ -146,22 +149,10 @@ pub enum FdKind {
     Anonymous,
 }
 struct OpenDescription {
-    id: u64,
-    owner: (u32, u32),
-    kind: FdKind,
-    flags: StatusFlags,
+    shared: Arc<SharedOpenDescription>,
     position: u64,
-    file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
-    flock: OnceCell<Arc<flock::Owner>>,
-    node: Option<NodeRef>,
-    // Overlay read descriptions retain the real lower file selected at open.
-    read_node: Option<NodeRef>,
-    pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
-    bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
-    kernel_log: Option<Arc<kernel_log::Kmsg>>,
     anonymous: Option<events::Anonymous>,
-    notification: Option<Arc<FileClose>>,
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
@@ -169,14 +160,35 @@ struct OpenDescription {
     network_control: Option<network::Control>,
     mount: Option<Rc<Mount>>,
 }
+// The actual file, pipe and lock/notification lifetimes share one allocation.
+// Endpoint/namespace control projections above still retain owner ownership.
+struct SharedOpenDescription {
+    id: u64,
+    owner: (u32, u32),
+    kind: FdKind,
+    flags: StatusFlags,
+    file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
+    flock: std::sync::OnceLock<Arc<flock::Owner>>,
+    node: Option<NodeRef>,
+    // Overlay read descriptions retain the real lower file selected at open.
+    read_node: Option<NodeRef>,
+    pipe: Option<Arc<PipeEnd>>,
+    bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
+    kernel_log: Option<Arc<kernel_log::Kmsg>>,
+    notification: Option<Arc<FileClose>>,
+}
+impl std::ops::Deref for OpenDescription {
+    type Target = SharedOpenDescription;
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
 impl Drop for OpenDescription {
     fn drop(&mut self) {
         // Epoll snapshots in another forked FD table may retain this resource
         // without retaining the open description. Last-close must invalidate
         // those tables too, so their next snapshot removes the dead watch.
-        if self.pipe.is_some()
-            || self.local.is_some()
-            || self.kernel_log.is_some()
+        if self.local.is_some()
             || matches!(
                 self.anonymous,
                 Some(
@@ -186,6 +198,13 @@ impl Drop for OpenDescription {
                 )
             )
         {
+            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for SharedOpenDescription {
+    fn drop(&mut self) {
+        if self.pipe.is_some() || self.kernel_log.is_some() {
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
         drop(self.notification.take());
@@ -394,6 +413,9 @@ impl Clone for Vfs {
     }
 }
 impl Vfs {
+    pub fn shared_files(&self) -> SharedFiles {
+        self.fds.worker_membership()
+    }
     /// Clone task context while choosing the Linux FD ownership domain.
     /// CLONE_FILES never allocates a temporary private FD map or flag cells.
     pub fn clone_with_files(&self, shared: bool) -> Self {
@@ -508,29 +530,31 @@ impl Default for Vfs {
             v.fds.insert(
                 fd,
                 Descriptor {
-                    open: Rc::new(RefCell::new(OpenDescription {
-                        read_node: None,
-                        id: v.open_id(),
-                        owner: (v.credentials.fsuid, v.credentials.fsgid),
-                        kind,
-                        flags: flags.into(),
+                    open: OpenHandle::new(OpenDescription {
+                        shared: Arc::new(SharedOpenDescription {
+                            read_node: None,
+                            id: v.open_id(),
+                            owner: (v.credentials.fsuid, v.credentials.fsgid),
+                            kind,
+                            flags: flags.into(),
+                            file_position: Arc::default(),
+                            flock: std::sync::OnceLock::new(),
+                            node: None,
+                            pipe: None,
+                            bridge: None,
+                            kernel_log: None,
+                            notification: None,
+                        }),
                         position: 0,
-                        file_position: Arc::default(),
-                        flock: OnceCell::new(),
-                        node: None,
-                        pipe: None,
                         socket: None,
-                        bridge: None,
-                        kernel_log: None,
                         anonymous: None,
-                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
                         network_control: None,
                         oom: None,
                         mount: None,
-                    })),
+                    }),
                     cloexec: (false).into(),
                 },
             );
@@ -575,48 +599,46 @@ impl Vfs {
     pub fn stream_descriptors(&self) -> FdMask {
         self.descriptor_io_masks().0
     }
-    /// Frozen descriptor membership and live status/CLOEXEC. No VFS Rc crosses
-    /// threads; bit changes do not invalidate structural resource caches.
+    /// Live admitted membership/status/CLOEXEC. Excluded owner controls keep
+    /// their frozen epoch capabilities; those structural edits still join.
     pub fn fd_flags_snapshot(&self) -> FdFlags {
+        self.descriptor_snapshots().0
+    }
+    fn descriptor_snapshots(&self) -> (FdFlags, DirectFds) {
+        let identity = self.fds.identity();
         let revision = FD_FLAGS_REVISION.load(Ordering::Relaxed);
         let metadata = self.fds.metadata();
         let mut cached = metadata.flags.borrow_mut();
         if let Some((old, snapshot)) = &*cached {
             if *old == revision {
-                return snapshot.clone();
+                if let Some((direct_revision, direct)) = &*identity.direct.borrow() {
+                    if *direct_revision == revision {
+                        return (snapshot.clone(), direct.clone());
+                    }
+                }
             }
         }
+        let descriptors = self.fds.entries();
         let mut entries = vec![
             None;
-            self.fds
-                .entries()
+            descriptors
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        let reuse = self
-            .fds
-            .identity()
-            .direct
-            .borrow()
-            .as_ref()
-            .is_some_and(|(old, _)| *old == revision);
-        let mut direct = (!reuse).then(|| vec![None; entries.len()]);
-        for (&fd, d) in self.fds.entries().iter() {
+        let mut direct = vec![None; entries.len()];
+        for (&fd, d) in &descriptors {
             let open = d.open.borrow();
             entries[fd as usize] = Some(DescriptorFlags {
                 status: open.flags.clone(),
                 cloexec: d.cloexec.clone(),
             });
-            if let Some(direct) = &mut direct {
-                direct[fd as usize] = DirectFd::snapshot(&open);
-            }
+            direct[fd as usize] = DirectFd::snapshot(&open);
         }
-        let snapshot = FdFlags(entries.into());
+        let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
         *cached = Some((revision, snapshot.clone()));
-        if let Some(direct) = direct {
-            *self.fds.identity().direct.borrow_mut() = Some((revision, DirectFds(direct.into())));
-        }
-        snapshot
+        let direct = DirectFds(direct.into());
+        *identity.direct.borrow_mut() = Some((revision, direct.clone()));
+        (snapshot, direct)
     }
     fn ordinary_stream(o: &OpenDescription) -> bool {
         matches!(
@@ -794,29 +816,31 @@ impl Vfs {
             self.fds.insert(
                 fd,
                 Descriptor {
-                    open: Rc::new(RefCell::new(OpenDescription {
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: FdKind::Terminal,
-                        flags: (2).into(),
+                    open: OpenHandle::new(OpenDescription {
+                        shared: Arc::new(SharedOpenDescription {
+                            read_node: None,
+                            id: self.open_id(),
+                            owner: (self.credentials.fsuid, self.credentials.fsgid),
+                            kind: FdKind::Terminal,
+                            flags: (2).into(),
+                            file_position: Arc::default(),
+                            flock: std::sync::OnceLock::new(),
+                            node: None,
+                            pipe: None,
+                            bridge: None,
+                            kernel_log: None,
+                            notification: None,
+                        }),
                         position: 0,
-                        file_position: Arc::default(),
-                        flock: OnceCell::new(),
-                        node: None,
-                        pipe: None,
                         socket: None,
-                        bridge: None,
-                        kernel_log: None,
                         anonymous: None,
-                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
                         network_control: None,
                         oom: None,
                         mount: None,
-                    })),
+                    }),
                     cloexec: (false).into(),
                 },
             );
@@ -1766,42 +1790,44 @@ impl Vfs {
         self.fds.insert(
             fd,
             Descriptor {
-                open: Rc::new(RefCell::new(OpenDescription {
-                    read_node,
-                    id: self.open_id(),
-                    owner: (self.credentials.fsuid, self.credentials.fsgid),
-                    kind: if flags & O_PATH == 0
-                        && (pty.is_some()
-                            || matches!(
-                                node.borrow().content,
-                                Content::Terminal | Content::Device(pseudo::Device::Pts(_, _))
-                            ))
-                    {
-                        FdKind::Terminal
-                    } else {
-                        FdKind::Node(p.key.clone())
-                    },
-                    flags: (flags & !O_CLOEXEC).into(),
+                open: OpenHandle::new(OpenDescription {
+                    shared: Arc::new(SharedOpenDescription {
+                        read_node,
+                        id: self.open_id(),
+                        owner: (self.credentials.fsuid, self.credentials.fsgid),
+                        kind: if flags & O_PATH == 0
+                            && (pty.is_some()
+                                || matches!(
+                                    node.borrow().content,
+                                    Content::Terminal | Content::Device(pseudo::Device::Pts(_, _))
+                                ))
+                        {
+                            FdKind::Terminal
+                        } else {
+                            FdKind::Node(p.key.clone())
+                        },
+                        flags: (flags & !O_CLOEXEC).into(),
+                        file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
+                            value: 0,
+                            pending: 0,
+                        })),
+                        flock: std::sync::OnceLock::new(),
+                        node: Some(node),
+                        pipe,
+                        bridge,
+                        kernel_log,
+                        notification,
+                    }),
                     position: 0,
-                    file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
-                        value: 0,
-                        pending: 0,
-                    })),
-                    flock: OnceCell::new(),
-                    node: Some(node),
                     mount: p.mount,
-                    pipe,
                     socket: None,
-                    bridge,
-                    kernel_log,
                     anonymous: None,
-                    notification,
                     local: None,
                     pty,
                     namespace: None,
                     network_control,
                     oom,
-                })),
+                }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
@@ -1943,29 +1969,31 @@ impl Vfs {
             self.fds.insert(
                 fd,
                 Descriptor {
-                    open: Rc::new(RefCell::new(OpenDescription {
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind,
-                        flags: ((flags & O_NONBLOCK) | access).into(),
+                    open: OpenHandle::new(OpenDescription {
+                        shared: Arc::new(SharedOpenDescription {
+                            read_node: None,
+                            id: self.open_id(),
+                            owner: (self.credentials.fsuid, self.credentials.fsgid),
+                            kind,
+                            flags: ((flags & O_NONBLOCK) | access).into(),
+                            file_position: Arc::default(),
+                            flock: std::sync::OnceLock::new(),
+                            node: None,
+                            pipe: Some(end),
+                            bridge: None,
+                            kernel_log: None,
+                            notification: None,
+                        }),
                         position: 0,
-                        file_position: Arc::default(),
-                        flock: OnceCell::new(),
-                        node: None,
-                        pipe: Some(end),
                         socket: None,
-                        bridge: None,
-                        kernel_log: None,
                         anonymous: None,
-                        notification: None,
                         local: None,
                         pty: None,
                         namespace: None,
                         network_control: None,
                         oom: None,
                         mount: None,
-                    })),
+                    }),
                     cloexec: (flags & O_CLOEXEC != 0).into(),
                 },
             );
@@ -1984,7 +2012,7 @@ impl Vfs {
     ) -> Result<usize> {
         let source = self.descriptor(input)?.open.clone();
         let dest = self.descriptor(output)?.open.clone();
-        if Rc::ptr_eq(&source, &dest) {
+        if OpenHandle::ptr_eq(&source, &dest) {
             return Err(Errno(22));
         }
         let source_pipe = {
@@ -3118,6 +3146,7 @@ mod permission_tests {
         fn shared<T: Send + Sync>() {}
         shared::<Inode>();
         shared::<mapped::MappedData>();
+        shared::<SharedOpenDescription>();
     }
     #[test]
     fn inode_metadata_and_last_lease_survive_owner_drop_on_another_worker() {

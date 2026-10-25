@@ -139,25 +139,27 @@ fn io_errno(e: io::Error) -> Errno {
 impl OpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Self {
         Self {
-            read_node: None,
-            id,
-            owner,
-            kind: if write {
-                FdKind::PipeWrite
-            } else {
-                FdKind::PipeRead
-            },
-            flags: (if write { 1 } else { 0 }).into(),
+            shared: Arc::new(SharedOpenDescription {
+                read_node: None,
+                id,
+                owner,
+                kind: if write {
+                    FdKind::PipeWrite
+                } else {
+                    FdKind::PipeRead
+                },
+                flags: (if write { 1 } else { 0 }).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                pipe: Some(PipeEnd::new(pipe, !write, write, None)),
+                node: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
             position: 0,
-            file_position: Arc::default(),
-            flock: OnceCell::new(),
-            pipe: Some(PipeEnd::new(pipe, !write, write, None)),
-            node: None,
             socket: None,
-            bridge: None,
-            kernel_log: None,
             anonymous: None,
-            notification: None,
             local: None,
             pty: None,
             namespace: None,
@@ -352,14 +354,13 @@ impl Connection {
                                     return Err(Errno(95));
                                 }
                                 let pipe = Pipe::new(vfs.open_id());
-                                let mut open = OpenDescription::pipe_description(
+                                let open = OpenDescription::pipe_description(
                                     vfs.open_id(),
                                     self.owner,
                                     pipe.clone(),
                                     true,
                                 );
-                                open.flags = 1.into();
-                                rights.push(Rc::new(RefCell::new(open)));
+                                rights.push(OpenHandle::new(open));
                                 self.relays.push(PipeRelay::new(host, pipe, true, None));
                             } else {
                                 rights.push(vfs.native_file_description(fd, self.owner)?);
@@ -574,11 +575,7 @@ impl Vfs {
             fds,
         })))
     }
-    fn native_file_description(
-        &self,
-        fd: OwnedFd,
-        owner: (u32, u32),
-    ) -> Result<Rc<RefCell<OpenDescription>>> {
+    fn native_file_description(&self, fd: OwnedFd, owner: (u32, u32)) -> Result<OpenHandle> {
         let file = SharedFile::import(fd).map_err(io_errno)?;
         let mut fs = self.fs.borrow_mut();
         fs.inodes.retain(|n| n.strong_count() != 0);
@@ -607,29 +604,31 @@ impl Vfs {
         }));
         fs.inodes.push(Arc::downgrade(&node));
         drop(fs);
-        Ok(Rc::new(RefCell::new(OpenDescription {
-            read_node: None,
-            id: self.open_id(),
-            owner,
-            kind: FdKind::Node(b"/memfd:wayland-resource".to_vec()),
-            flags: (0).into(),
+        Ok(OpenHandle::new(OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                read_node: None,
+                id: self.open_id(),
+                owner,
+                kind: FdKind::Node(b"/memfd:wayland-resource".to_vec()),
+                flags: (0).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                node: Some(node),
+                pipe: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
             position: 0,
-            file_position: Arc::default(),
-            flock: OnceCell::new(),
-            node: Some(node),
-            pipe: None,
             socket: None,
-            bridge: None,
-            kernel_log: None,
             anonymous: None,
-            notification: None,
             local: None,
             pty: None,
             namespace: None,
             network_control: None,
             oom: None,
             mount: None,
-        })))
+        }))
     }
 }
 
@@ -663,12 +662,12 @@ mod tests {
         assert!(vfs.read(read, 1).unwrap().is_empty());
         let (mut reader, writer) = trames_shared::NativePipe::pair().unwrap();
         let pipe = Pipe::new(vfs.open_id());
-        let open = Rc::new(RefCell::new(OpenDescription::pipe_description(
+        let open = OpenHandle::new(OpenDescription::pipe_description(
             vfs.open_id(),
             (0, 0),
             pipe.clone(),
             true,
-        )));
+        ));
         let (fds, truncated) = vfs.receive_rights(LocalRights(vec![open]), 1, false);
         assert!(!truncated);
         let mut relay = PipeRelay::new(writer, pipe, true, None);

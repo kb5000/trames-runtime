@@ -86,10 +86,14 @@ pub(super) struct DescriptorFlags {
     pub(super) cloexec: CloseOnExec,
 }
 impl FdFlags {
-    fn entry(&self, fd: u32) -> Result<&DescriptorFlags> {
+    fn entry(&self, fd: u32) -> Result<DescriptorFlags> {
+        if let Some(result) = self.1.as_ref().and_then(|files| files.descriptor_flags(fd)) {
+            return result;
+        }
         self.0
             .get(fd as usize)
             .and_then(Option::as_ref)
+            .cloned()
             .ok_or(Errno(9))
     }
     pub fn get(&self, fd: u32) -> Result<u32> {
@@ -116,6 +120,9 @@ impl FdFlags {
         Ok(0)
     }
     pub fn cloexec_range(&self, first: u32, last: u32) -> Result<u64> {
+        if let Some(files) = &self.1 {
+            return files.cloexec_range(first, last);
+        }
         mark_cloexec_range(
             first,
             last,
@@ -192,7 +199,7 @@ mod tests {
         });
     }
     #[test]
-    fn stale_epoch_flags_do_not_rebind_reused_fd_or_keep_pipe_endpoints_alive() {
+    fn live_flags_resolve_reused_fd_without_retaining_old_pipe_endpoints() {
         let mut v = Vfs::default();
         let [reader, writer] = v.pipe(0).unwrap();
         let retained = v.fd_flags_snapshot();
@@ -201,8 +208,8 @@ mod tests {
         let [replacement, _] = v.pipe(0).unwrap();
         assert_eq!(replacement, reader);
         retained.set_nonblocking(reader, true).unwrap();
-        assert_eq!(v.flags(alias).unwrap(), O_NONBLOCK);
-        assert_eq!(v.flags(replacement).unwrap(), 0);
+        assert_eq!(v.flags(alias).unwrap(), 0);
+        assert_eq!(v.flags(replacement).unwrap(), O_NONBLOCK);
         v.close(writer).unwrap();
         assert!(v.read(alias, 1).unwrap().is_empty());
     }

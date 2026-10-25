@@ -122,8 +122,8 @@ impl Drop for PipeEndpoint {
     }
 }
 
-/// Owner metadata anchor. Dropping this projection is no longer the endpoint's
-/// only possible last-close path; a retained shared request can outlive it.
+/// Shared endpoint and inode ownership. Metadata and endpoint last release can
+/// both occur on a worker; snapshots still do not open another pipe end.
 pub(super) struct PipeEnd {
     pub(super) endpoint: Arc<PipeEndpoint>,
     pub(super) pipe: Pipe,
@@ -132,22 +132,22 @@ pub(super) struct PipeEnd {
     pub(super) metadata: Option<NodeRef>,
 }
 impl PipeEnd {
-    pub(super) fn open(pipe: &Pipe, flags: u32) -> Result<Option<Rc<Self>>> {
+    pub(super) fn open(pipe: &Pipe, flags: u32) -> Result<Option<Arc<Self>>> {
         if flags & O_PATH != 0 {
             return Ok(None);
         }
         let data = pipe.data.clone();
         let endpoint = PipeEndpoint::open(data, flags, true)?;
-        Ok(Some(Rc::new(Self {
+        Ok(Some(Arc::new(Self {
             pipe: pipe.clone(),
             endpoint,
             metadata: None,
         })))
     }
-    pub(super) fn new(pipe: Pipe, read: bool, write: bool, metadata: Option<NodeRef>) -> Rc<Self> {
+    pub(super) fn new(pipe: Pipe, read: bool, write: bool, metadata: Option<NodeRef>) -> Arc<Self> {
         let data = pipe.data.clone();
         let endpoint = PipeEndpoint::anonymous(data, read, write);
-        Rc::new(Self {
+        Arc::new(Self {
             pipe,
             endpoint,
             metadata,
@@ -165,6 +165,36 @@ impl std::ops::Deref for PipeEnd {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn complete_pipe_end_releases_inode_and_eof_on_the_last_worker() {
+        fn shared<T: Send + Sync>() {}
+        shared::<PipeEnd>();
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(0).unwrap();
+        let end = v
+            .descriptor(writer)
+            .unwrap()
+            .open
+            .borrow()
+            .pipe
+            .clone()
+            .unwrap();
+        let inode = Arc::downgrade(end.metadata.as_ref().unwrap());
+        let data = end.data.clone();
+        v.close(reader).unwrap();
+        v.close(writer).unwrap();
+        drop(v);
+        assert!(inode.upgrade().is_some());
+        assert_eq!(data.lock().unwrap().writers, 1);
+        let copy = end.clone();
+        std::thread::spawn(move || drop(end)).join().unwrap();
+        assert_eq!(data.lock().unwrap().writers, 1);
+        std::thread::spawn(move || drop(copy)).join().unwrap();
+        assert_eq!(data.lock().unwrap().writers, 0);
+        assert_eq!(data.lock().unwrap().read(1).unwrap(), b"");
+        assert!(inode.upgrade().is_none());
+    }
 
     fn identity(v: &Vfs, path: &[u8]) -> Pipe {
         let path = v.resolve_final(AT_FDCWD, path, true).unwrap();
@@ -363,7 +393,7 @@ mod tests {
         let subscription = fd.get(reader).unwrap().subscribe(&signal);
         v.close(writer).unwrap();
         assert!(signal.ready());
-        assert_eq!(flags.fcntl(writer, 3, 0), Ok((1 | O_NONBLOCK) as u64));
+        assert_eq!(flags.fcntl(writer, 3, 0), Err(Errno(9)));
         assert!(fd.get(reader).unwrap().read(1).unwrap().is_empty());
         assert_eq!(
             polls.get(epoll).unwrap().epoll_wait(1).unwrap(),

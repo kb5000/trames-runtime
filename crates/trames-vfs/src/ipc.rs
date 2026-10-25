@@ -9,11 +9,11 @@ pub(crate) use native::Services as NativeServices;
 pub use native::WaylandAuth;
 
 #[derive(Clone, Default)]
-pub struct LocalRights(pub(super) Vec<Rc<RefCell<OpenDescription>>>);
+pub struct LocalRights(pub(super) Vec<OpenHandle>);
 thread_local! {
     // Releasing a queued socket may release another queue. Drain ownership
     // iteratively so an acyclic FD chain cannot exhaust the host thread stack.
-    static RIGHTS_DROP: RefCell<Option<Vec<Rc<RefCell<OpenDescription>>>>> = const { RefCell::new(None) };
+    static RIGHTS_DROP: RefCell<Option<Vec<OpenHandle>>> = const { RefCell::new(None) };
 }
 impl Drop for LocalRights {
     fn drop(&mut self) {
@@ -394,29 +394,31 @@ impl Vfs {
         self.fds.insert(
             fd,
             Descriptor {
-                open: Rc::new(RefCell::new(OpenDescription {
-                    read_node: None,
-                    id: self.open_id(),
-                    owner: (self.credentials.fsuid, self.credentials.fsgid),
-                    kind: FdKind::Socket,
-                    flags: (2 | (flags & O_NONBLOCK)).into(),
+                open: OpenHandle::new(OpenDescription {
+                    shared: Arc::new(SharedOpenDescription {
+                        read_node: None,
+                        id: self.open_id(),
+                        owner: (self.credentials.fsuid, self.credentials.fsgid),
+                        kind: FdKind::Socket,
+                        flags: (2 | (flags & O_NONBLOCK)).into(),
+                        file_position: Arc::default(),
+                        flock: std::sync::OnceLock::new(),
+                        node: None,
+                        pipe: None,
+                        bridge: None,
+                        kernel_log: None,
+                        notification: None,
+                    }),
                     position: 0,
-                    file_position: Arc::default(),
-                    flock: OnceCell::new(),
-                    node: None,
-                    pipe: None,
                     socket: None,
-                    bridge: None,
-                    kernel_log: None,
                     anonymous: None,
-                    notification: None,
                     local: Some(local),
                     pty: None,
                     namespace: None,
                     network_control: None,
                     oom: None,
                     mount: None,
-                })),
+                }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );

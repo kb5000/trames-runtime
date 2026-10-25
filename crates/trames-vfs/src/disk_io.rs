@@ -38,7 +38,7 @@ impl DiskReadCache {
 
 /// Retained only by the coordinator until the submitted read is completed.
 pub struct DiskRead {
-    open: Rc<RefCell<OpenDescription>>,
+    open: OpenHandle,
     node: NodeRef,
     backing: Arc<storage::DiskBacking>,
     positioned: bool,
@@ -92,7 +92,8 @@ impl DiskRead {
         let Ok(d) = vfs.descriptor(fd) else {
             return false;
         };
-        if !self.positioned && Rc::ptr_eq(&self.open, &d.open) && matches!(number, 62..=66) {
+        if !self.positioned && OpenHandle::ptr_eq(&self.open, &d.open) && matches!(number, 62..=66)
+        {
             return true;
         }
         if !matches!(number, 64 | 66 | 68 | 70 | 82 | 83) {

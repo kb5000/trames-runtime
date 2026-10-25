@@ -676,35 +676,20 @@ impl Vfs {
         &self,
         polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
     ) -> DirectFds {
+        let descriptors = self.fds.entries();
         let mut entries = vec![
             None;
-            self.fds
-                .entries()
+            descriptors
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        for (&fd, descriptor) in self.fds.entries().iter() {
+        for (&fd, descriptor) in &descriptors {
             entries[fd as usize] = DirectFd::snapshot_poll(&descriptor.open.borrow(), polls);
         }
         DirectFds(entries.into())
     }
     pub fn direct_descriptors(&self) -> DirectFds {
-        let revision = FD_FLAGS_REVISION.load(Ordering::Relaxed);
-        if let Some((old, snapshot)) = &*self.fds.identity().direct.borrow() {
-            if *old == revision {
-                return snapshot.clone();
-            }
-        }
-        // Flags and resources are built together with ONE descriptor scan.
-        self.fd_flags_snapshot();
-        self.fds
-            .identity()
-            .direct
-            .borrow()
-            .as_ref()
-            .expect("FD snapshot pair")
-            .1
-            .clone()
+        self.descriptor_snapshots().1
     }
 }
 

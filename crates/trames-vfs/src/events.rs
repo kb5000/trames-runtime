@@ -20,7 +20,7 @@ pub(super) enum Anonymous {
 }
 
 pub(super) struct Watch {
-    pub(super) open: Weak<RefCell<OpenDescription>>,
+    pub(super) open: OpenWeak,
     pub(super) state: Arc<Mutex<WatchState>>,
 }
 pub(super) struct WatchState {
@@ -169,29 +169,31 @@ impl Vfs {
         self.fds.insert(
             fd,
             Descriptor {
-                open: Rc::new(RefCell::new(OpenDescription {
-                    read_node: None,
-                    id: self.open_id(),
-                    owner: (0, 0),
-                    kind: FdKind::Anonymous,
-                    flags: (access | (flags & O_NONBLOCK)).into(),
+                open: OpenHandle::new(OpenDescription {
+                    shared: Arc::new(SharedOpenDescription {
+                        read_node: None,
+                        id: self.open_id(),
+                        owner: (0, 0),
+                        kind: FdKind::Anonymous,
+                        flags: (access | (flags & O_NONBLOCK)).into(),
+                        file_position: Arc::default(),
+                        flock: std::sync::OnceLock::new(),
+                        node: None,
+                        pipe: None,
+                        bridge: None,
+                        kernel_log: None,
+                        notification: None,
+                    }),
                     position: 0,
-                    file_position: Arc::default(),
-                    flock: OnceCell::new(),
-                    node: None,
-                    pipe: None,
                     socket: None,
-                    bridge: None,
-                    kernel_log: None,
                     anonymous: Some(anonymous),
-                    notification: None,
                     local: None,
                     pty: None,
                     namespace: None,
                     network_control: None,
                     oom: None,
                     mount: None,
-                })),
+                }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
         );
@@ -263,7 +265,7 @@ impl Vfs {
         let epoll = self.descriptor(fd)?.open.clone();
         let target_number = target;
         let target = self.descriptor(target)?.open.clone();
-        if Rc::ptr_eq(&epoll, &target) {
+        if OpenHandle::ptr_eq(&epoll, &target) {
             return Err(Errno(22));
         }
         let t = target.borrow();
@@ -311,8 +313,8 @@ impl Vfs {
     }
     fn epoll_ctl_key(
         &self,
-        epoll: Rc<RefCell<OpenDescription>>,
-        target: Rc<RefCell<OpenDescription>>,
+        epoll: OpenHandle,
+        target: OpenHandle,
         key: (u32, u64),
         op: u32,
         events: u32,
@@ -343,7 +345,7 @@ impl Vfs {
                 watches.insert(
                     key,
                     Watch {
-                        open: Rc::downgrade(&target),
+                        open: target.downgrade(),
                         state: Arc::new(Mutex::new(WatchState {
                             events,
                             data,

@@ -436,33 +436,32 @@ impl Vfs {
             )),
         }))
     }
-    pub(super) fn namespace_description(
-        &self,
-        ns: NamespaceHandle,
-    ) -> Rc<RefCell<OpenDescription>> {
-        Rc::new(RefCell::new(OpenDescription {
-            read_node: None,
-            id: ns.id(),
-            owner: (0, 0),
-            kind: FdKind::Anonymous,
-            flags: (0).into(),
+    pub(super) fn namespace_description(&self, ns: NamespaceHandle) -> OpenHandle {
+        OpenHandle::new(OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                read_node: None,
+                id: ns.id(),
+                owner: (0, 0),
+                kind: FdKind::Anonymous,
+                flags: (0).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                node: None,
+                pipe: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
             position: 0,
-            file_position: Arc::default(),
-            flock: OnceCell::new(),
-            node: None,
-            pipe: None,
             socket: None,
-            bridge: None,
-            kernel_log: None,
             anonymous: None,
-            notification: None,
             local: None,
             pty: None,
             namespace: Some(ns),
             network_control: None,
             oom: None,
             mount: None,
-        }))
+        })
     }
     /// Linux chroot changes only fs.root. Existing cwd/dirfds remain capabilities.
     pub fn chroot(&mut self, path: &[u8]) -> Result<()> {

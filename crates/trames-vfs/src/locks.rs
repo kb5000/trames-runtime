@@ -201,15 +201,26 @@ impl Vfs {
         self.record_locks.release(self.lock_owner);
     }
     pub(super) fn release_record_locks(&self, descriptor: &Descriptor) {
-        if let Some(node) = &descriptor.open.borrow().node {
+        descriptor
+            .open
+            .borrow()
+            .shared
+            .release_record_locks(self.lock_owner);
+    }
+}
+impl SharedOpenDescription {
+    pub(super) fn release_record_locks(&self, owner: u32) {
+        if let Some(node) = &self.node {
             // Do not allocate or lock a registry for an inode that has never
             // acquired a lock object. Close releases this process's locks even
             // when dup/another process retains the open description.
             if let Some(records) = node.borrow().record_locks.get() {
-                records.release(self.lock_owner);
+                records.release(owner);
             }
         }
     }
+}
+impl Vfs {
     pub fn normalize_lock(
         &self,
         fd: u32,

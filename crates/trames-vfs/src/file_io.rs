@@ -48,14 +48,14 @@ impl FileEpoch {
         if let Some(capture) = self.captures.get(&key) {
             return capture.clone();
         }
+        let descriptors = vfs.fds.entries();
         let mut entries = vec![
             None;
-            vfs.fds
-                .entries()
+            descriptors
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        for (&fd, descriptor) in vfs.fds.entries().iter() {
+        for (&fd, descriptor) in &descriptors {
             if mask[fd as usize / 64] & (1 << (fd % 64)) == 0 {
                 continue;
             }
