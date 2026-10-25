@@ -51,6 +51,9 @@ pub struct SharedFd {
     open: Arc<SharedOpenDescription>,
 }
 impl SharedFd {
+    pub(super) fn new(open: Arc<SharedOpenDescription>) -> Self {
+        Self { open }
+    }
     fn from_slot(slot: &Slot) -> Option<Self> {
         let SlotOpen::Shared(open) = &slot.open else {
             return None;
@@ -67,11 +70,20 @@ impl SharedFd {
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.open) as usize
     }
-    pub fn direct_byte(&self) -> Option<DirectFd> {
-        DirectFd::snapshot(&OpenDescription::shared_projection(self.open.clone()))
+    pub fn direct_byte(self) -> Option<DirectFd> {
+        let fd = DirectFd::snapshot(&OpenDescription::shared_projection(self.open.clone()))?;
+        Some(fd.with_ofd(self))
     }
 }
 impl SharedFiles {
+    pub(super) fn byte_descriptions(&self) -> Vec<SharedFd> {
+        let entries = self.0.entries.lock().unwrap();
+        entries
+            .values()
+            .filter_map(SharedFd::from_slot)
+            .filter(|file| file.ready().is_ok())
+            .collect()
+    }
     pub(super) fn with_flags<T>(
         &self,
         fd: u32,
@@ -607,7 +619,7 @@ mod tests {
             accepted.identity(),
             files.lookup(replacement).unwrap().unwrap().identity()
         );
-        assert_eq!(accepted.direct_byte().unwrap().write(b"old"), Ok(3));
+        assert_eq!(accepted.clone().direct_byte().unwrap().write(b"old"), Ok(3));
         assert_eq!(v.read(reader, 3).unwrap(), b"old");
         assert_eq!(files.close(alias, 0), Some(Ok(())));
         assert_eq!(v.read(reader, 1), Err(Errno(11)));
@@ -800,8 +812,10 @@ mod tests {
         assert_eq!(v.flags(reader), Err(Errno(9)));
         assert!(peer.flags(writer).is_ok());
         assert_eq!(bytes.get(reader).unwrap().read(1), Err(Errno(11)));
+        let accepted = bytes.get(reader).unwrap();
         peer.close_all();
-        assert!(bytes.get(reader).unwrap().read(1).unwrap().is_empty());
+        assert!(bytes.get(reader).is_none());
+        assert!(accepted.read(1).unwrap().is_empty());
     }
     #[test]
     fn shared_table_bits_are_live_but_fork_and_dup_have_independent_cloexec() {

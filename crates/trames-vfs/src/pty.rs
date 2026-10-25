@@ -474,11 +474,13 @@ mod tests {
         let slave = v.open_pty_peer(master, 2).unwrap();
         let lease = v.pty(slave).unwrap().unwrap().slave_endpoint().unwrap();
         let bytes = v.direct_descriptors();
+        let slave_bytes = bytes.get(slave).unwrap();
         v.close(slave).unwrap();
         v.close(master).unwrap();
         assert!(matches!(v.stat_at(AT_FDCWD, b"/pts/0"), Err(Errno(2))));
         assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
-        let slave = bytes.get(slave).unwrap().clone();
+        assert!(bytes.get(slave).is_none());
+        let slave = slave_bytes;
         std::thread::spawn(move || {
             let access = Some(TerminalAccess {
                 session: 0,

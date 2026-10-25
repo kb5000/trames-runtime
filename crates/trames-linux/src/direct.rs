@@ -39,7 +39,6 @@ pub struct PendingIo {
 /// than its numeric table slot or a copied pipe counter, owns the endpoint.
 #[derive(Clone)]
 pub struct RetainedByte {
-    _file: trames_vfs::SharedFd,
     fd: trames_vfs::DirectFd,
 }
 impl PendingIo {
@@ -130,6 +129,7 @@ pub struct DirectSyscalls {
 }
 impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
+        let membership = descriptors.shared_files();
         Self {
             urings: Default::default(),
             descriptors,
@@ -137,7 +137,7 @@ impl DirectSyscalls {
             terminal: None,
             kernel_log: None,
             files: Default::default(),
-            membership: None,
+            membership,
             lock_context: None,
             disk_cache: Default::default(),
             file_completed: Cell::new(0),
@@ -423,11 +423,8 @@ impl DirectSyscalls {
                 _ => unreachable!("native TCP byte call"),
             });
         }
-        let fd = self
-            .descriptors
-            .get(args[0] as u32)
-            .expect("retained resource");
-        self.transfer_fd(fd, number, args, memory)
+        let fd = self.descriptors.get(args[0] as u32)?;
+        self.transfer_fd(&fd, number, args, memory)
     }
     fn transfer_fd(
         &self,
@@ -545,22 +542,28 @@ impl DirectSyscalls {
             self.poll_completed.set(self.poll_completed.get() + 1);
             return IoAttempt::Complete(result);
         }
-        if self
-            .descriptors
-            .get(args[0] as u32)
-            .is_some_and(|fd| fd.timer().is_some())
-        {
+        let fd = self.descriptors.get(args[0] as u32);
+        if fd.as_ref().is_some_and(|fd| fd.timer().is_some()) {
             self.timer_completed.set(self.timer_completed.get() + 1);
         }
-        if self
-            .descriptors
-            .get(args[0] as u32)
-            .is_some_and(|fd| fd.is_unix())
-            || self.network.get(args[0] as u32).is_some()
+        if fd.as_ref().is_some_and(|fd| fd.is_unix()) || self.network.get(args[0] as u32).is_some()
         {
             self.socket_completed.set(self.socket_completed.get() + 1);
         }
         IoAttempt::Complete(result)
+    }
+    fn complete_byte(&self, result: Result<u64, Errno>) -> IoAttempt {
+        // Accepted shared pipe calls already own their complete authority.
+        // Accounting must not re-resolve the numeric FD after close/reuse.
+        self.completed.set(self.completed.get() + 1);
+        IoAttempt::Complete(result)
+    }
+    fn complete_pending(&self, pending: &PendingIo, result: Result<u64, Errno>) -> IoAttempt {
+        if pending.retained_byte.is_some() {
+            self.complete_byte(result)
+        } else {
+            self.complete(pending.number, pending.args, result)
+        }
     }
     /// Subscribe before the deciding resource check. No notification can be lost
     /// between an EAGAIN result and publishing the parked task to its run queue.
@@ -729,7 +732,7 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         let fd = file.direct_byte()?;
-        Some(Ok(RetainedByte { _file: file, fd }))
+        Some(Ok(RetainedByte { fd }))
     }
     /// Joined execution uses the same ABI and resource wait, but owns SIGPIPE
     /// delivery itself. Only complete shared byte OFDs (currently pipes) enter.
@@ -775,7 +778,7 @@ impl DirectSyscalls {
         match self.transfer_fd(&file.fd, number, args, memory) {
             Some(Err(Errno(11))) if !file.fd.nonblocking() => {}
             Some(Err(Errno(32))) if checkpoint_pipe => return IoAttempt::Checkpoint,
-            Some(result) => return self.complete(number, args, result),
+            Some(result) => return self.complete_byte(result),
             None => return IoAttempt::Checkpoint,
         }
         let signal = IoSignal::new(pid, target.clone());
@@ -926,7 +929,7 @@ impl DirectSyscalls {
                     || pending.external_wait()
                         && pending.deadline.is_some_and(|d| Instant::now() >= d)
                 {
-                    return self.complete(pending.number, pending.args, Err(Errno(11)));
+                    return self.complete_pending(&pending, Err(Errno(11)));
                 }
                 let resource_deadline = if let Some(file) = &pending.retained_byte {
                     file.fd.next_deadline()
@@ -951,7 +954,7 @@ impl DirectSyscalls {
             Err(Errno(32)) if checkpoint_pipe && signals_pipe(pending.number, pending.args) => {
                 IoAttempt::Checkpoint
             }
-            result => self.complete(pending.number, pending.args, result),
+            result => self.complete_pending(&pending, result),
         }
     }
     /// Legacy single-assignment entry. None means no effects and the caller must
@@ -1396,6 +1399,39 @@ mod tests {
         );
         assert_eq!(v.read(r, 1).unwrap(), b"p");
         assert_eq!(v.read(a, 1).unwrap(), b"s");
+    }
+    #[test]
+    fn accepted_ppoll_keeps_original_pipe_after_close_and_numeric_reuse() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(0).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        m.write_array(0x1100, reader.to_le_bytes()).unwrap();
+        m.write_array(0x1104, 1u32.to_le_bytes()).unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let wait = pending(
+            direct
+                .start(
+                    73,
+                    [0x1100, 1, 0, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        v.close(reader).unwrap();
+        let [replacement, new_writer] = v.pipe(0).unwrap();
+        assert_eq!(replacement, reader);
+        v.write(new_writer, b"new").unwrap();
+        let wait = pending(direct.resume(wait, &mut m));
+        v.write(writer, b"old").unwrap();
+        assert!(wait.signal.ready());
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<2>(0x1106).unwrap(), 1u16.to_le_bytes());
+        assert_eq!(v.write(writer, b"x"), Err(Errno(32)));
+        assert_eq!(v.read(replacement, 3).unwrap(), b"new");
     }
     fn unix_message(memory: &mut Memory, control_size: u64) {
         for (address, value) in [

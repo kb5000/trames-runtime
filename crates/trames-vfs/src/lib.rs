@@ -637,11 +637,13 @@ impl Vfs {
                 status: open.flags.clone(),
                 cloexec: d.cloexec.clone(),
             });
-            direct[fd as usize] = DirectFd::snapshot(&open);
+            if matches!(d.open, open_handle::OpenView::Owner(_)) {
+                direct[fd as usize] = DirectFd::snapshot(&open);
+            }
         }
         let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
         *cached = Some((revision, snapshot.clone()));
-        let direct = DirectFds(direct.into());
+        let direct = DirectFds(direct.into(), Some(self.shared_files()));
         *identity.direct.borrow_mut() = Some((revision, direct.clone()));
         (snapshot, direct)
     }

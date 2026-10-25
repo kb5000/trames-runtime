@@ -37,7 +37,7 @@ impl Poll {
                 if resource.is_epoll() {
                     return None;
                 }
-                Some(resource.clone())
+                Some(resource)
             };
             entries.push((address + 6, events, resource));
         }

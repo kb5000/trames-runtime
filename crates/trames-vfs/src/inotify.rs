@@ -709,6 +709,7 @@ mod tests {
         v.inotify_add(excluded, b"/", CLOSE_WRITE | 0x04000000)
             .unwrap();
         let caps = v.direct_descriptors();
+        let closed_queue = caps.get(notify).unwrap();
         let close = v.retain_uring_fd(fd).unwrap().close_notification().unwrap();
         v.unlink_at(AT_FDCWD, b"/gone", false).unwrap();
         v.close(fd).unwrap();
@@ -721,7 +722,8 @@ mod tests {
         v.close(excluded).unwrap();
         v.close(fd).unwrap();
         std::thread::spawn(move || drop(close)).join().unwrap();
-        assert_eq!(caps.get(notify).unwrap().read(4096), Err(Errno(11)));
+        assert!(caps.get(notify).is_none());
+        assert_eq!(closed_queue.read(4096), Err(Errno(11)));
     }
 
     #[test]
@@ -929,12 +931,14 @@ mod tests {
         let mut epoch = FileEpoch::default();
         let files = epoch.capture(&v, true);
         let bytes = v.direct_descriptors();
+        let closed_queue = bytes.get(fd).unwrap();
         v.close(fd).unwrap();
         assert_eq!(
             files.get(data).unwrap().write(b"c", Some(0), &mut cache),
             Some(Ok(1))
         );
-        assert_eq!(bytes.get(fd).unwrap().read(1024), Err(Errno(11)));
+        assert!(bytes.get(fd).is_none());
+        assert_eq!(closed_queue.read(1024), Err(Errno(11)));
         epoch.finish();
     }
     #[test]
