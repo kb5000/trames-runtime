@@ -342,23 +342,51 @@ impl DirectSyscalls {
         if self.network.get(fd).is_some() {
             return matches!(number, 63..=66);
         }
-        self.descriptors.get(fd).is_some_and(|fd| {
-            if number == 62 {
-                fd.is_kmsg()
-            } else if matches!(number, 22 | 441) {
-                fd.is_epoll()
-            } else if matches!(number, 86 | 87) {
-                fd.timer().is_some()
-            } else if number == 28 {
-                fd.is_inotify()
-            } else if matches!(number, 206 | 207 | 210..=212) {
-                fd.is_unix()
-            } else if number == 29 {
-                fd.has_readable_bytes()
-            } else {
-                matches!(number, 63..=66) && !fd.is_epoll() && !fd.is_poll_only()
-            }
-        })
+        self.descriptors
+            .get(fd)
+            .is_some_and(|fd| Self::supports_fd(number, &fd))
+    }
+    fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
+        if number == 62 {
+            fd.is_kmsg()
+        } else if matches!(number, 22 | 441) {
+            fd.is_epoll()
+        } else if matches!(number, 86 | 87) {
+            fd.timer().is_some()
+        } else if number == 28 {
+            fd.is_inotify()
+        } else if matches!(number, 206 | 207 | 210..=212) {
+            fd.is_unix()
+        } else if number == 29 {
+            fd.has_readable_bytes()
+        } else {
+            matches!(number, 63..=66) && !fd.is_epoll() && !fd.is_poll_only()
+        }
+    }
+    fn supports_fd_call(number: u32, args: [u64; 6], fd: &trames_vfs::DirectFd) -> bool {
+        Self::supports_fd(number, fd)
+            && (number != 29
+                || args[1] as u32 == 0x541b
+                || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413))
+    }
+    fn invoke_control(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        // Acceptance, type validation, execution and accounting use one OFD.
+        // Another CLONE_FILES task may close or replace its numeric slot.
+        let fd = self.descriptors.get(args[0] as u32)?;
+        let result = self.transfer_fd(&fd, number, args, memory)?;
+        self.completed.set(self.completed.get() + 1);
+        if number == 28 {
+            self.record_fd_control();
+        }
+        if fd.timer().is_some() {
+            self.timer_completed.set(self.timer_completed.get() + 1);
+        }
+        Some(result)
     }
     pub fn swap_disk_cache(&self, cache: &mut trames_vfs::DiskReadCache) {
         std::mem::swap(&mut *self.disk_cache.borrow_mut(), cache);
@@ -446,6 +474,9 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if !Self::supports_fd_call(number, args, fd) {
+            return None;
+        }
         let deferred = Cell::new(false);
         let flags = socket_flags(number, args);
         let read = |count| {
@@ -565,15 +596,18 @@ impl DirectSyscalls {
         }
         IoAttempt::Complete(result)
     }
-    fn complete_byte(&self, result: Result<u64, Errno>) -> IoAttempt {
-        // Accepted shared pipe calls already own their complete authority.
+    fn complete_byte(&self, file: &RetainedByte, result: Result<u64, Errno>) -> IoAttempt {
+        // Accepted shared byte calls already own their complete authority.
         // Accounting must not re-resolve the numeric FD after close/reuse.
         self.completed.set(self.completed.get() + 1);
+        if file.fd.timer().is_some() {
+            self.timer_completed.set(self.timer_completed.get() + 1);
+        }
         IoAttempt::Complete(result)
     }
     fn complete_pending(&self, pending: &PendingIo, result: Result<u64, Errno>) -> IoAttempt {
-        if pending.retained_byte.is_some() {
-            self.complete_byte(result)
+        if let Some(file) = &pending.retained_byte {
+            self.complete_byte(file, result)
         } else {
             self.complete(pending.number, pending.args, result)
         }
@@ -594,6 +628,11 @@ impl DirectSyscalls {
                 Ok(file) => self.start_retained_byte(file, number, args, memory, pid, target),
                 Err(error) => self.complete(number, args, Err(error)),
             });
+        }
+        if matches!(number, 28 | 86 | 87) {
+            return self
+                .invoke_control(number, args, memory)
+                .map(IoAttempt::Complete);
         }
         if number == 32 {
             let request = match self
@@ -781,7 +820,7 @@ impl DirectSyscalls {
         )
     }
     /// Joined execution uses the same ABI and resource wait, but owns SIGPIPE
-    /// delivery itself. Only complete shared byte OFDs (currently pipes) enter.
+    /// delivery itself. Only complete shared byte OFDs enter.
     pub fn start_owned_byte(
         &self,
         retained: Option<RetainedByte>,
@@ -824,7 +863,7 @@ impl DirectSyscalls {
         match self.transfer_fd(&file.fd, number, args, memory) {
             Some(Err(Errno(11))) if !file.fd.nonblocking() => {}
             Some(Err(Errno(32))) if checkpoint_pipe => return IoAttempt::Checkpoint,
-            Some(result) => return self.complete_byte(result),
+            Some(result) => return self.complete_byte(&file, result),
             None => return IoAttempt::Checkpoint,
         }
         let signal = IoSignal::new(pid, target.clone());
@@ -953,7 +992,7 @@ impl DirectSyscalls {
         }
         let result = if let Some(file) = &pending.retained_byte {
             self.transfer_fd(&file.fd, pending.number, pending.args, memory)
-                .expect("shared pipe byte operation")
+                .expect("shared byte operation")
         } else if let Some(poll) = &pending.retained_poll {
             poll.check(memory, pending.deadline)
         } else if matches!(pending.number, 22 | 441) {
@@ -1011,6 +1050,26 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if matches!(number, 28 | 86 | 87) {
+            return self.invoke_control(number, args, memory);
+        }
+        if let Some(file) = self.retain_byte(number, args) {
+            let file = match file {
+                Ok(file) => file,
+                Err(error) => {
+                    self.complete(number, args, Err(error));
+                    return Some(Err(error));
+                }
+            };
+            return match self.transfer_fd(&file.fd, number, args, memory)? {
+                Err(Errno(11)) if !file.fd.nonblocking() => None,
+                Err(Errno(32)) if signals_pipe(number, args) => None,
+                result => {
+                    self.complete_byte(&file, result);
+                    Some(result)
+                }
+            };
+        }
         if matches!(number, 22 | 32 | 441) || !self.supports_call(number, args) {
             return None;
         }
@@ -1107,15 +1166,145 @@ mod tests {
         );
         assert_eq!(v.flags(writer), Err(Errno(9)));
         assert_eq!(direct.fd_control_completed(), 4);
-        let owner = v.eventfd(7, O_NONBLOCK).unwrap();
+        let owner = v.signalfd(-1, 1, O_NONBLOCK).unwrap();
         assert!(direct
             .invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0])
             .is_none());
         assert!(direct
             .invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0])
             .is_none());
-        assert_eq!(v.read(owner, 8).unwrap(), 7u64.to_le_bytes());
+        assert_eq!(v.signalfd_mask(owner), Ok(Some(1)));
         assert_eq!(direct.fd_control_completed(), 4); // owner fallback had no effects
+    }
+    #[test]
+    fn shared_anonymous_waits_keep_original_event_timer_and_inotify_after_fd_reuse() {
+        for kind in 0..3 {
+            let mut v = Vfs::default();
+            let fd = match kind {
+                0 => v.eventfd(0, 0).unwrap(),
+                1 => v.timerfd(1, 0).unwrap(),
+                _ => {
+                    let fd = v.inotify_init(0).unwrap();
+                    v.inotify_add(fd, b"/", 0x100).unwrap();
+                    fd
+                }
+            };
+            let alias = v.dup(fd, 0, false).unwrap();
+            let direct = DirectSyscalls::new(v.direct_descriptors());
+            let mut m = memory();
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let wait = pending(
+                direct
+                    .start(
+                        63,
+                        [fd as u64, 0x1100, 128, 0, 0, 0],
+                        &mut m,
+                        1,
+                        &Arc::downgrade(&target),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            assert!(wait.retained_byte.is_some());
+            assert_eq!(v.shared_files().close(fd, 1), Some(Ok(())));
+            assert_eq!(v.eventfd(9, O_NONBLOCK).unwrap(), fd);
+            match kind {
+                0 => assert_eq!(v.write(alias, &5u64.to_le_bytes()), Ok(8)),
+                1 => {
+                    v.timerfd_set(alias, Duration::ZERO, Some(Instant::now()))
+                        .unwrap();
+                }
+                _ => v.mkdir_at(-100, b"/new", 0o700).unwrap(),
+            }
+            assert_eq!(v.shared_files().close(alias, 1), Some(Ok(())));
+            assert!(wait.signal.ready());
+            let bytes = complete(direct.resume(wait, &mut m)).unwrap();
+            if kind == 2 {
+                assert!(bytes >= 16);
+                assert_eq!(
+                    m.read_array::<4>(0x1104).unwrap(),
+                    0x40000100u32.to_le_bytes()
+                );
+            } else {
+                assert_eq!(bytes, 8);
+                assert_eq!(m.read_u64(0x1100).unwrap(), if kind == 0 { 5 } else { 1 });
+            }
+            assert_eq!(v.read(fd, 8).unwrap(), 9u64.to_le_bytes());
+            assert_eq!(direct.completed(), 1);
+            assert_eq!(direct.timer_completed(), u64::from(kind == 1));
+        }
+    }
+    #[test]
+    fn shared_anonymous_completion_uses_accepted_type_when_callbacks_replace_the_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Replace {
+            files: trames_vfs::SharedFiles,
+            fd: u32,
+            replacement: u32,
+            called: AtomicBool,
+        }
+        impl IoWake for Replace {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                if !self.called.swap(true, Ordering::Relaxed) {
+                    assert_eq!(
+                        self.files.duplicate_to(self.replacement, self.fd, 0, 1),
+                        Some(Ok(self.fd))
+                    );
+                }
+            }
+        }
+        for worker in [false, true] {
+            for kind in 0..3 {
+                let mut v = Vfs::default();
+                let fd = match kind {
+                    0 => v.eventfd(0, 0).unwrap(),
+                    1 => v.timerfd(1, 0).unwrap(),
+                    _ => v.inotify_init(0).unwrap(),
+                };
+                let wd = (kind == 2).then(|| v.inotify_add(fd, b"/", 0x100).unwrap());
+                let replacement = v.eventfd(9, O_NONBLOCK).unwrap();
+                let direct = DirectSyscalls::new(v.direct_descriptors());
+                let target = Arc::new(Replace {
+                    files: v.shared_files(),
+                    fd,
+                    replacement,
+                    called: AtomicBool::new(false),
+                });
+                let wake: Arc<dyn IoWake> = target.clone();
+                let signal = IoSignal::new(1, Arc::downgrade(&wake));
+                let _subscriptions = direct.descriptors.get(fd).unwrap().subscribe(&signal);
+                let mut m = memory();
+                let (number, args, expected) = match kind {
+                    0 => {
+                        m.write_array(0x1100, 5u64.to_le_bytes()).unwrap();
+                        (64, [fd as u64, 0x1100, 8, 0, 0, 0], 8)
+                    }
+                    1 => (86, [fd as u64, 0, 0x1100, 0, 0, 0], 0),
+                    _ => (28, [fd as u64, wd.unwrap() as u64, 0, 0, 0, 0], 0),
+                };
+                let result = if worker {
+                    complete(
+                        direct
+                            .start(number, args, &mut m, 1, &Arc::downgrade(&wake), None)
+                            .unwrap(),
+                    )
+                } else {
+                    direct.invoke(number, args, &mut m).unwrap()
+                };
+                assert_eq!(result, Ok(expected));
+                assert!(target.called.load(Ordering::Relaxed));
+                assert_eq!(v.read(fd, 8).unwrap(), 9u64.to_le_bytes());
+                assert_eq!(direct.completed(), 1);
+                assert_eq!(direct.timer_completed(), u64::from(kind == 1));
+                assert_eq!(direct.fd_control_completed(), u64::from(kind == 2));
+                // A stale scheduling hint must defer before effects when the
+                // actual replacement no longer supports this control syscall.
+                if kind != 0 {
+                    assert!(direct.invoke(number, args, &mut m).is_none());
+                    assert_eq!(direct.completed(), 1);
+                }
+            }
+        }
     }
     #[test]
     fn worker_close_releases_process_locks_then_final_flock_and_close_notification() {
@@ -1159,6 +1348,40 @@ mod tests {
         assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
         assert_eq!(v.read(notify, 1024), Err(Errno(11)));
         epoch.finish();
+    }
+    #[test]
+    fn shared_named_fifo_read_keeps_original_ofd_when_replaced_during_the_wait() {
+        let mut v = Vfs::default();
+        v.mknod_at(-100, b"/fifo", 0o10666, 0).unwrap();
+        let reader = v.open_at(-100, b"/fifo", O_NONBLOCK, 0).unwrap();
+        let writer = v.open_at(-100, b"/fifo", 1 | O_NONBLOCK, 0).unwrap();
+        v.set_status_flags(reader, 0).unwrap();
+        let [new_reader, new_writer] = v.pipe(0).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let wait = pending(
+            direct
+                .start(
+                    63,
+                    [reader as u64, 0x1100, 1, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        v.shared_files()
+            .duplicate_to(new_reader, reader, 0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.write(writer, b"o"), Ok(1));
+        v.write(new_writer, b"n").unwrap();
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<1>(0x1100).unwrap(), *b"o");
+        assert_eq!(v.read(reader, 1).unwrap(), b"n");
+        assert_eq!(v.write(writer, b"x"), Err(Errno(32)));
     }
     #[test]
     fn shared_named_fifo_ppoll_waits_for_real_data_then_reports_the_original_hangup() {

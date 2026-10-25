@@ -65,8 +65,8 @@ impl Queue {
         self.change(|state| state.remove(wd))
     }
     pub(super) fn close(&self) {
-        // Byte/poll snapshots are not inotify OFDs. They may retain the queue,
-        // but must not keep registrations active after the last owner closes.
+        // Final OFD release retires registrations. Weak prepared caches and
+        // queue-only capabilities cannot keep the instance active.
         self.state.lock().unwrap().watches.clear();
     }
     pub(super) fn send(

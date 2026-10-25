@@ -853,6 +853,7 @@ impl Vfs {
         Ok(Some(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 mount_resource: std::sync::OnceLock::new(),
+                control: None,
                 read_node: None,
                 id: self.open_id(),
                 owner,
@@ -1083,6 +1084,7 @@ impl Vfs {
         let descriptor = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 mount_resource: std::sync::OnceLock::new(),
+                control: None,
                 read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
                     original
                         .node

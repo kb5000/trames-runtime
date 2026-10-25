@@ -167,6 +167,7 @@ struct OpenDescription {
 // Endpoint/namespace control projections above still retain owner ownership.
 struct SharedOpenDescription {
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
+    control: Option<events::SharedControl>,
     id: u64,
     owner: (u32, u32),
     kind: FdKind,
@@ -193,14 +194,15 @@ impl Drop for OpenDescription {
         // without retaining the open description. Last-close must invalidate
         // those tables too, so their next snapshot removes the dead watch.
         if self.local.is_some()
-            || matches!(
-                self.anonymous,
-                Some(
-                    events::Anonymous::Event(_)
-                        | events::Anonymous::Timer(_)
-                        | events::Anonymous::Inotify(_)
+            || self.control.is_none()
+                && matches!(
+                    self.anonymous,
+                    Some(
+                        events::Anonymous::Event(_)
+                            | events::Anonymous::Timer(_)
+                            | events::Anonymous::Inotify(_)
+                    )
                 )
-            )
         {
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
@@ -208,7 +210,7 @@ impl Drop for OpenDescription {
 }
 impl Drop for SharedOpenDescription {
     fn drop(&mut self) {
-        if self.pipe.is_some() || self.kernel_log.is_some() {
+        if self.pipe.is_some() || self.kernel_log.is_some() || self.control.is_some() {
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
         drop(self.notification.take());
@@ -538,6 +540,7 @@ impl Default for Vfs {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
                             mount_resource: std::sync::OnceLock::new(),
+                            control: None,
                             read_node: None,
                             id: v.open_id(),
                             owner: (v.credentials.fsuid, v.credentials.fsgid),
@@ -830,6 +833,7 @@ impl Vfs {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
                             mount_resource: std::sync::OnceLock::new(),
+                            control: None,
                             read_node: None,
                             id: self.open_id(),
                             owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -1813,6 +1817,7 @@ impl Vfs {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
                         mount_resource: std::sync::OnceLock::new(),
+                        control: None,
                         read_node,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -2012,6 +2017,7 @@ impl Vfs {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
                             mount_resource: std::sync::OnceLock::new(),
+                            control: None,
                             read_node: None,
                             id: self.open_id(),
                             owner: (self.credentials.fsuid, self.credentials.fsgid),

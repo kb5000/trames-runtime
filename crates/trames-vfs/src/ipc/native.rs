@@ -141,6 +141,7 @@ impl OpenDescription {
         Self {
             shared: Arc::new(SharedOpenDescription {
                 mount_resource: std::sync::OnceLock::new(),
+                control: None,
                 read_node: None,
                 id,
                 owner,
@@ -607,6 +608,7 @@ impl Vfs {
         Ok(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 mount_resource: std::sync::OnceLock::new(),
+                control: None,
                 read_node: None,
                 id: self.open_id(),
                 owner,

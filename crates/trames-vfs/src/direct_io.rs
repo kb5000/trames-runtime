@@ -267,20 +267,24 @@ impl DirectFd {
         }
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        if !matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
-            return None;
-        }
-        Self::shared_pipe(open)
-    }
-    pub(super) fn shared_pipe(open: &SharedOpenDescription) -> Option<Self> {
-        let end = open.pipe.as_ref()?;
+        let resource = match &open.control {
+            Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
+            Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
+            Some(events::SharedControl::Inotify(instance)) => {
+                ByteResource::Inotify(instance.capability())
+            }
+            None => {
+                let end = open.pipe.as_ref()?;
+                ByteResource::Pipe {
+                    data: end.data.clone(),
+                    read: end.read,
+                    write: end.write,
+                    initial_write_epoch: end.initial_write_epoch,
+                }
+            }
+        };
         Some(Self {
-            resource: ByteResource::Pipe {
-                data: end.data.clone(),
-                read: end.read,
-                write: end.write,
-                initial_write_epoch: end.initial_write_epoch,
-            },
+            resource,
             flags: open.flags.get(),
             status: open.flags.clone(),
             _file: None,
@@ -1164,13 +1168,12 @@ mod tests {
         child.set_status_flags(fd, O_NONBLOCK).unwrap();
         assert!(vfs.direct_descriptors().get(alias).unwrap().nonblocking());
         assert!(old.get(fd).unwrap().nonblocking());
+        let accepted = old.get(fd).unwrap();
         vfs.close(fd).unwrap();
         let new_fd = vfs.eventfd(7, 0).unwrap();
         assert_eq!(fd, new_fd);
-        assert_eq!(
-            vfs.direct_descriptors().get(fd).unwrap().read(8).unwrap(),
-            7u64.to_le_bytes()
-        );
-        assert_eq!(old.get(fd).unwrap().read(8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(old.get(fd).unwrap().read(8).unwrap(), 7u64.to_le_bytes());
+        assert_eq!(old.get(fd).unwrap().read(8), Err(Errno(11)));
+        assert_eq!(accepted.read(8).unwrap(), 1u64.to_le_bytes());
     }
 }

@@ -440,6 +440,7 @@ impl Vfs {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 mount_resource: std::sync::OnceLock::new(),
+                control: None,
                 read_node: None,
                 id: ns.id(),
                 owner: (0, 0),

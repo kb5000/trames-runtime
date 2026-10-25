@@ -513,6 +513,7 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::Anonymous;
     fn masks(bytes: &[u8]) -> Vec<u32> {
         let mut out = Vec::new();
         let mut at = 0;
@@ -533,7 +534,7 @@ mod tests {
         v.inotify_add(fd, b"/", CREATE).unwrap();
         let lease = v.retain_uring_fd(fd).unwrap().inotify_instance().unwrap();
         let caps = v.direct_descriptors();
-        let cap = caps.get(fd).unwrap();
+        let cap = lease.capability();
         let alias = v.dup(fd, 0, false).unwrap();
         let mut child = v.clone();
         v.close(fd).unwrap();
@@ -544,7 +545,8 @@ mod tests {
         std::thread::spawn(move || drop(lease)).join().unwrap();
         v.mkdir_at(AT_FDCWD, b"/after-last", 0o755).unwrap();
         assert_eq!(cap.read(4096), Err(Errno(11)));
-        assert_eq!(cap.inotify_remove(1), Err(Errno(9)));
+        assert_eq!(cap.remove_watch(1), Err(Errno(9)));
+        assert!(caps.get(fd).is_none());
     }
 
     #[test]
@@ -700,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_close_respects_unlink_and_does_not_retain_closed_watch_instances() {
+    fn shared_close_respects_unlink_and_an_accepted_watch_keeps_its_ofd() {
         let mut v = Vfs::default();
         let fd = v.open_at(AT_FDCWD, b"/gone", 0x42, 0o600).unwrap();
         let notify = v.inotify_init(O_NONBLOCK).unwrap();
@@ -710,6 +712,10 @@ mod tests {
             .unwrap();
         let caps = v.direct_descriptors();
         let closed_queue = caps.get(notify).unwrap();
+        let instance = match &v.descriptor(notify).unwrap().open.borrow().anonymous {
+            Some(Anonymous::Inotify(instance)) => Arc::downgrade(instance),
+            _ => unreachable!(),
+        };
         let close = v.retain_uring_fd(fd).unwrap().close_notification().unwrap();
         v.unlink_at(AT_FDCWD, b"/gone", false).unwrap();
         v.close(fd).unwrap();
@@ -723,7 +729,10 @@ mod tests {
         v.close(fd).unwrap();
         std::thread::spawn(move || drop(close)).join().unwrap();
         assert!(caps.get(notify).is_none());
-        assert_eq!(closed_queue.read(4096), Err(Errno(11)));
+        assert_eq!(masks(&closed_queue.read(4096).unwrap()), vec![CLOSE_WRITE]);
+        assert!(instance.upgrade().is_some());
+        drop(closed_queue);
+        assert!(instance.upgrade().is_none()); // the prepared cache owns no OFD
     }
 
     #[test]
@@ -904,7 +913,7 @@ mod tests {
         assert!(v.epoll_wait(epoll, 1, |_, _| Ok(None)).unwrap().is_empty());
     }
     #[test]
-    fn consumed_watch_generation_and_closed_instance_are_not_retained_by_capabilities() {
+    fn consumed_watch_generation_is_stale_and_only_accepted_calls_retain_the_instance() {
         let mut v = Vfs::default();
         v.import_file(b"/data", vec![0; 8]).unwrap();
         let data = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
@@ -932,13 +941,24 @@ mod tests {
         let files = epoch.capture(&v, true);
         let bytes = v.direct_descriptors();
         let closed_queue = bytes.get(fd).unwrap();
+        let instance = match &v.descriptor(fd).unwrap().open.borrow().anonymous {
+            Some(Anonymous::Inotify(instance)) => Arc::downgrade(instance),
+            _ => unreachable!(),
+        };
         v.close(fd).unwrap();
         assert_eq!(
             files.get(data).unwrap().write(b"c", Some(0), &mut cache),
             Some(Ok(1))
         );
         assert!(bytes.get(fd).is_none());
-        assert_eq!(closed_queue.read(1024), Err(Errno(11)));
+        assert_eq!(masks(&closed_queue.read(1024).unwrap()), vec![MODIFY]);
+        assert!(instance.upgrade().is_some());
+        drop(closed_queue);
+        assert!(instance.upgrade().is_none());
+        assert_eq!(
+            files.get(data).unwrap().write(b"d", Some(0), &mut cache),
+            Some(Ok(1))
+        );
         epoch.finish();
     }
     #[test]

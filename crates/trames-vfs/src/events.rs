@@ -19,6 +19,31 @@ pub(super) enum Anonymous {
     },
 }
 
+/// Actual anonymous resources whose complete control lifetime is thread-safe.
+/// Owner-only signal, epoll and ring controls stay in Anonymous above.
+pub(super) enum SharedControl {
+    Event(Arc<direct_io::EventCounter>),
+    Timer(Arc<TimerFd>),
+    Inotify(Arc<inotify::InotifyInstance>),
+}
+impl SharedControl {
+    fn capture(control: &Anonymous) -> Option<Self> {
+        Some(match control {
+            Anonymous::Event(counter) => Self::Event(counter.clone()),
+            Anonymous::Timer(timer) => Self::Timer(timer.clone()),
+            Anonymous::Inotify(instance) => Self::Inotify(instance.clone()),
+            _ => return None,
+        })
+    }
+    pub(super) fn owner_projection(&self) -> Anonymous {
+        match self {
+            Self::Event(counter) => Anonymous::Event(counter.clone()),
+            Self::Timer(timer) => Anonymous::Timer(timer.clone()),
+            Self::Inotify(instance) => Anonymous::Inotify(instance.clone()),
+        }
+    }
+}
+
 pub(super) struct Watch {
     pub(super) open: OpenWeak,
     pub(super) state: Arc<Mutex<WatchState>>,
@@ -172,6 +197,7 @@ impl Vfs {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
                         mount_resource: std::sync::OnceLock::new(),
+                        control: SharedControl::capture(&anonymous),
                         read_node: None,
                         id: self.open_id(),
                         owner: (0, 0),

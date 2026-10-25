@@ -92,11 +92,15 @@ pub(super) enum OpenWrite<'a> {
 impl OpenDescription {
     pub(super) fn shared_projection(shared: Arc<SharedOpenDescription>) -> Self {
         let mount = shared.mount_resource.get().cloned().map(OpenMount::Shared);
+        let anonymous = shared
+            .control
+            .as_ref()
+            .map(events::SharedControl::owner_projection);
         Self {
             shared,
             position: 0,
             socket: None,
-            anonymous: None,
+            anonymous,
             local: None,
             pty: None,
             namespace: None,
@@ -107,7 +111,7 @@ impl OpenDescription {
     }
     fn shareable(&self) -> bool {
         if self.socket.is_some()
-            || self.anonymous.is_some()
+            || self.anonymous.is_some() && self.control.is_none()
             || self.local.is_some()
             || self.pty.is_some()
             || self.namespace.is_some()
@@ -118,7 +122,8 @@ impl OpenDescription {
         {
             return false;
         }
-        self.pipe.is_some()
+        self.control.is_some()
+            || self.pipe.is_some()
             || self.node.as_ref().is_some_and(|node| {
                 let node = node.borrow();
                 !node.volatile && node.seals.is_none() && matches!(node.content, Content::File(_))

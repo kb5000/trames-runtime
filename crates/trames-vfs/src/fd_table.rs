@@ -84,7 +84,7 @@ impl SharedFd {
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
         // Named FIFO descriptions keep their pathname kind, but their poll
         // state and subscriptions still belong to the real pipe resource.
-        let fd = DirectFd::shared_pipe(&self.open).or_else(|| {
+        let fd = DirectFd::shared_byte(&self.open).or_else(|| {
             matches!(self.open.kind, FdKind::Node(_)).then(|| DirectFd::regular_poll(&self.open))
         })?;
         Some(fd.with_ofd(self))
@@ -648,13 +648,51 @@ mod tests {
     fn owner_control_slots_are_excluded_before_structural_effects() {
         let mut v = Vfs::default();
         let [_, writer] = v.pipe(O_NONBLOCK).unwrap();
-        let owner = v.eventfd(0, 0).unwrap();
+        let owner = v.signalfd(-1, 1, 0).unwrap();
         let files = v.shared_files();
         assert!(files.close(owner, 0).is_none());
         assert!(files.duplicate(owner, 160, false).is_none());
         assert!(files.duplicate_to(writer, owner, 0, 0).is_none());
         assert!(v.flags(owner).is_ok());
         assert_eq!(v.flags(160), Err(Errno(9)));
+    }
+    #[test]
+    fn shared_anonymous_ofds_release_at_the_last_actual_lease_not_cache_refresh() {
+        let mut v = Vfs::default();
+        let event = v.eventfd(7, O_NONBLOCK).unwrap();
+        let timer = v.timerfd(1, O_NONBLOCK).unwrap();
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        let files = v.shared_files();
+        let cache = v.direct_descriptors();
+        for fd in [event, timer, notify] {
+            let accepted = files.lookup(fd).unwrap().unwrap();
+            let lifetime = Arc::downgrade(&accepted.open);
+            let cap = accepted.direct_byte().unwrap();
+            let alias = files.duplicate(fd, 160, true).unwrap().unwrap();
+            assert_eq!(alias, 160);
+            assert_ne!(v.flags(alias).unwrap() & O_CLOEXEC, 0);
+            assert_eq!(files.close(fd, 0), Some(Ok(())));
+            assert!(cache.get(fd).is_none());
+            assert_eq!(files.close(alias, 0), Some(Ok(())));
+            assert!(lifetime.upgrade().is_some());
+            // A real accepted operation is the only remaining complete OFD.
+            let worker = std::thread::spawn(move || {
+                if cap.is_eventfd() {
+                    assert_eq!(cap.read(8).unwrap(), 7u64.to_le_bytes());
+                } else {
+                    assert_eq!(cap.read(8), Err(Errno(11)));
+                }
+            });
+            worker.join().unwrap();
+            assert!(lifetime.upgrade().is_none());
+        }
+        // The same prepared map sees additions without a joined recapture.
+        let reused = v.eventfd(11, O_NONBLOCK).unwrap();
+        assert_eq!(reused, event);
+        assert_eq!(
+            cache.get(reused).unwrap().read(8).unwrap(),
+            11u64.to_le_bytes()
+        );
     }
     #[test]
     fn execution_map_does_not_keep_table_membership_after_last_owner_exit() {
