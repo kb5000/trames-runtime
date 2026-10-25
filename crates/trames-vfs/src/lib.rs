@@ -31,7 +31,7 @@ mod direct_io;
 mod file_data;
 mod file_io;
 use direct_io::PipeResource;
-pub use file_io::{DirectFile, DirectFiles, FileEpoch};
+pub use file_io::{DirectFile, DirectFiles, FileEpoch, PreparedFile};
 mod readiness;
 mod timer_io;
 pub use direct_io::{DirectFd, DirectFds, DirectPoll};
@@ -634,11 +634,11 @@ impl Vfs {
         let mut direct = vec![None; entries.len()];
         for (&fd, d) in descriptors.iter() {
             let open = d.open.borrow();
-            entries[fd as usize] = Some(DescriptorFlags {
-                status: open.flags.clone(),
-                cloexec: d.cloexec.clone(),
-            });
             if matches!(d.open, open_handle::OpenView::Owner(_)) {
+                entries[fd as usize] = Some(DescriptorFlags {
+                    status: open.flags.clone(),
+                    cloexec: d.cloexec.clone(),
+                });
                 direct[fd as usize] = DirectFd::snapshot(&open);
             }
         }

@@ -1224,7 +1224,7 @@ impl UringEpoch {
         owner: u64,
         task: u32,
         files: &trames_vfs::DirectFiles,
-        retained_files: &BTreeMap<usize, trames_vfs::DirectFile>,
+        retained_files: &BTreeMap<usize, trames_vfs::PreparedFile>,
     ) -> UringSnapshot {
         let descriptors = vfs.uring_descriptors();
         if descriptors.is_empty() {
@@ -1241,12 +1241,9 @@ impl UringEpoch {
                 snapshot.valid_fds.insert(fd);
             }
             if let Ok(file) = vfs.retain_uring_fd(fd) {
-                if let Some(resource) = Resource::capture(&file).or_else(|| {
-                    files
-                        .get(fd)
-                        .cloned()
-                        .map(|cap| Resource::regular(&file, cap))
-                }) {
+                if let Some(resource) = Resource::capture(&file)
+                    .or_else(|| files.get(fd).map(|cap| Resource::regular(&file, cap)))
+                {
                     snapshot.resources.insert(fd, resource);
                     retained.insert(fd, file);
                 }
@@ -1257,7 +1254,7 @@ impl UringEpoch {
                 .or_else(|| {
                     retained_files
                         .get(&file.identity())
-                        .cloned()
+                        .and_then(|prepared| prepared.retain(file))
                         .map(|cap| Resource::regular(file, cap))
                 })
                 .or_else(|| {

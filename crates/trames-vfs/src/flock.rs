@@ -19,16 +19,28 @@ pub(super) fn validate(operation: u32) -> Result<u32> {
         Ok(operation & !4)
     }
 }
-/// Accepted lock request. Only the lock lease crosses workers; the complete
-/// OFD remains retained by the frozen table or by the parked Process at joins.
+/// An accepted shared request owns its complete original OFD. Excluded owner
+/// controls retain their separate joined lease in Process.
 #[derive(Clone)]
 pub struct FlockRequest {
     owner: Arc<Owner>,
     operation: u32,
+    file: Option<SharedFd>,
 }
 impl FlockRequest {
     pub(super) fn new(owner: Arc<Owner>, operation: u32) -> Self {
-        Self { owner, operation }
+        Self {
+            owner,
+            operation,
+            file: None,
+        }
+    }
+    pub(super) fn with_file(mut self, file: Option<SharedFd>) -> Self {
+        self.file = file;
+        self
+    }
+    pub fn retains_file(&self) -> bool {
+        self.file.is_some()
     }
     pub fn try_lock(&self) -> Result<()> {
         self.owner.apply(self.operation)
@@ -46,10 +58,14 @@ impl FlockRequest {
 impl RetainedFd {
     pub fn flock_request(&self, operation: u32) -> Result<FlockRequest> {
         validate(operation)?;
-        Ok(FlockRequest::new(
-            self.0.open.borrow().flock_owner()?.clone(),
-            operation,
-        ))
+        let shared = match &self.0.open {
+            OpenHandle::Shared(open) => Some(SharedFd::new(open.clone())),
+            OpenHandle::Owner(_) => None,
+        };
+        Ok(
+            FlockRequest::new(self.0.open.borrow().flock_owner()?.clone(), operation)
+                .with_file(shared),
+        )
     }
 }
 impl Owner {
@@ -104,10 +120,16 @@ impl OpenDescription {
     }
 }
 impl Vfs {
-    pub fn retain_flock(&self, fd: u32, operation: u32) -> Result<(FlockRequest, RetainedFd)> {
+    pub fn retain_flock(
+        &self,
+        fd: u32,
+        operation: u32,
+    ) -> Result<(FlockRequest, Option<RetainedFd>)> {
         validate(operation)?;
         let file = RetainedFd(self.descriptor(fd)?);
-        Ok((file.flock_request(operation)?, file))
+        let request = file.flock_request(operation)?;
+        let owner = (!request.retains_file()).then_some(file);
+        Ok((request, owner))
     }
     /// Cold cohort admission only: an unrelated idle waiter must not divert
     /// solo compute off the direct Memory path. No inode/object allocation.
@@ -218,7 +240,7 @@ mod tests {
         std::thread::spawn(move || drop(lease)).join().unwrap();
         assert_eq!(wake.calls.load(Ordering::Relaxed), 1);
         assert!(signal.ready());
-        assert_eq!(files.get(a).unwrap().flock(2 | 4), Err(Errno(9)));
+        assert!(files.get(a).is_none());
         assert_eq!(v.flock(b, 2 | 4), Ok(()));
         drop(subscription);
         epoch.finish();

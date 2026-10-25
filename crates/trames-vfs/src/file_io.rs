@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Frozen file capabilities. Only bytes, offsets and metadata mirrors cross threads.
+//! Prepared file authority is weak; accepted operations retain the original OFD.
 use super::*;
 use file_data::{FilePosition, PlainFile};
 use std::sync::Mutex;
 
+/// One accepted operation. Prepared caches carry no inode, data or OFD lease.
 #[derive(Clone)]
 pub struct DirectFile {
     data: Arc<PlainFile>,
     position: Arc<Mutex<FilePosition>>,
     locks: Arc<locks::Records>,
+    prepared: PreparedFile,
+    file: Option<SharedFd>,
+}
+/// Joined admission records policy and weak resource identities once. Promoting
+/// this capability never borrows an inode or repeats a pathname/stat lookup.
+#[derive(Clone)]
+pub struct PreparedFile(Arc<FileAuthority>);
+struct FileAuthority {
+    data: std::sync::Weak<PlainFile>,
+    position: std::sync::Weak<Mutex<FilePosition>>,
+    locks: std::sync::Weak<locks::Records>,
+    origin: OfdIdentity,
     flock: std::sync::Weak<flock::Owner>,
     stat: [u8; 128],
     flags: u32,
@@ -20,16 +33,50 @@ pub struct DirectFile {
     readonly: bool,
     relatime: bool,
 }
+impl PreparedFile {
+    fn accept(&self, file: Option<SharedFd>) -> Option<DirectFile> {
+        Some(DirectFile {
+            data: self.0.data.upgrade()?,
+            position: self.0.position.upgrade()?,
+            locks: self.0.locks.upgrade()?,
+            prepared: self.clone(),
+            file,
+        })
+    }
+    /// io_uring's accepted/fixed file may outlive its original numeric slot.
+    pub fn retain(&self, file: &RetainedFd) -> Option<DirectFile> {
+        let open = file.0.open.borrow();
+        if !self.0.origin.matches(&open.shared) {
+            return None;
+        }
+        let shared = match &file.0.open {
+            OpenHandle::Shared(open) => Some(SharedFd::new(open.clone())),
+            OpenHandle::Owner(_) => None,
+        };
+        self.accept(shared)
+    }
+}
 #[derive(Clone, Default)]
-pub struct DirectFiles(Arc<[Option<DirectFile>]>);
+pub struct DirectFiles(
+    Arc<[Option<PreparedFile>]>,
+    Arc<BTreeMap<usize, PreparedFile>>,
+    Option<SharedFiles>,
+);
 impl DirectFiles {
-    pub fn get(&self, fd: u32) -> Option<&DirectFile> {
-        self.0.get(fd as usize)?.as_ref()
+    pub fn get(&self, fd: u32) -> Option<DirectFile> {
+        if let Some(result) = self.2.as_ref().and_then(|files| files.lookup(fd)) {
+            let file = result.ok()?;
+            let prepared = self.1.get(&file.identity())?;
+            debug_assert!(prepared.0.origin == file.ofd_identity());
+            return prepared.accept(Some(file));
+        }
+        self.0.get(fd as usize)?.as_ref()?.accept(None)
     }
 }
 #[derive(Default)]
 pub struct FileEpoch {
-    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, Arc<PlainFile>)>,
+    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>)>,
+    prepared: BTreeMap<(usize, bool, bool), PreparedFile>,
     captures: BTreeMap<(usize, bool, bool, u64), DirectFiles>,
 }
 impl FileEpoch {
@@ -55,19 +102,28 @@ impl FileEpoch {
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
+        let mut shared = BTreeMap::new();
         for (&fd, descriptor) in descriptors.iter() {
             if mask[fd as usize / 64] & (1 << (fd % 64)) == 0 {
                 continue;
             }
-            entries[fd as usize] = self.capture_open(vfs, &descriptor.open.borrow(), unlimited);
+            let open = descriptor.open.borrow();
+            let Some(prepared) = self.capture_open(vfs, &open, unlimited) else {
+                continue;
+            };
+            if matches!(descriptor.open, open_handle::OpenView::Shared(_)) {
+                shared.insert(Arc::as_ptr(&open.shared) as usize, prepared);
+            } else {
+                entries[fd as usize] = Some(prepared);
+            }
         }
-        let capture = DirectFiles(entries.into());
+        let capture = DirectFiles(entries.into(), Arc::new(shared), Some(vfs.shared_files()));
         self.captures.insert(key, capture.clone());
         capture
     }
     /// Snapshot retained io_uring OFDs even after their numeric descriptors
     /// were closed/reused. Use the same file authority/algorithms as normal FDs.
-    pub fn capture_uring(&mut self, vfs: &Vfs, unlimited: bool) -> BTreeMap<usize, DirectFile> {
+    pub fn capture_uring(&mut self, vfs: &Vfs, unlimited: bool) -> BTreeMap<usize, PreparedFile> {
         let mut files = BTreeMap::new();
         for ring in vfs.urings() {
             let state = ring.state.borrow();
@@ -94,7 +150,12 @@ impl FileEpoch {
         vfs: &Vfs,
         o: &OpenDescription,
         unlimited: bool,
-    ) -> Option<DirectFile> {
+    ) -> Option<PreparedFile> {
+        let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
+        let prepared_key = (Arc::as_ptr(&o.shared) as usize, clear_setid, unlimited);
+        if let Some(prepared) = self.prepared.get(&prepared_key) {
+            return Some(prepared.clone());
+        }
         if o.read_node.is_some() {
             return None;
         }
@@ -110,7 +171,7 @@ impl FileEpoch {
         let key = Arc::as_ptr(&node) as usize;
         if let std::collections::btree_map::Entry::Vacant(entry) = self.nodes.entry(key) {
             data.activate(n.mode, n.times);
-            entry.insert((Arc::downgrade(&node), data.clone()));
+            entry.insert((Arc::downgrade(&node), Arc::downgrade(&data)));
         }
         let notifications =
             inotify::capture_node(&n, o.notification.as_ref().and_then(|c| c.link.as_ref()));
@@ -121,10 +182,11 @@ impl FileEpoch {
             .map_or(Ok(()), |m| m.writable())
             .and_then(|()| Vfs::pseudo_immutable_node(&n))
             .err();
-        Some(DirectFile {
-            data,
-            position: o.file_position.clone(),
-            locks: vfs.inode_record_locks(&n),
+        let prepared = PreparedFile(Arc::new(FileAuthority {
+            data: Arc::downgrade(&data),
+            position: Arc::downgrade(&o.file_position),
+            locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
+            origin: OfdIdentity::new(&o.shared),
             flock: o.flock_capability(),
             stat,
             flags: o.flags.get(),
@@ -132,19 +194,24 @@ impl FileEpoch {
             notifications,
             write_error,
             unlimited,
-            clear_setid: !vfs.credentials.has_cap(capabilities::FSETID),
+            clear_setid,
             readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
             relatime: o
                 .mount
                 .as_ref()
                 .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
-        })
+        }));
+        self.prepared.insert(prepared_key, prepared.clone());
+        Some(prepared)
     }
     /// All workers/requests must have returned first. This touches only the
     /// captured inodes, never scans the filesystem or adds a compute fast-path lock.
     pub fn finish(self) {
         for (_, (node, data)) in self.nodes {
-            if let (Some(node), Some(meta)) = (node.upgrade(), data.finish_metadata()) {
+            if let (Some(node), Some(data)) = (node.upgrade(), data.upgrade()) {
+                let Some(meta) = data.finish_metadata() else {
+                    continue;
+                };
                 let mut node = node.borrow_mut();
                 node.mode = meta.mode;
                 node.times = meta.times;
@@ -153,20 +220,20 @@ impl FileEpoch {
     }
 }
 impl DirectFile {
-    /// A capability is weak: a cached file snapshot cannot keep a flock alive.
+    /// Accepted flock keeps the same full OFD as this file operation.
     pub fn flock(&self, operation: u32) -> Result<()> {
         self.flock_request(operation)?.try_lock()
     }
     pub fn flock_request(&self, operation: u32) -> Result<FlockRequest> {
         flock::validate(operation)?;
-        Ok(FlockRequest::new(
-            self.flock.upgrade().ok_or(Errno(9))?,
-            operation,
-        ))
+        Ok(
+            FlockRequest::new(self.prepared.0.flock.upgrade().ok_or(Errno(9))?, operation)
+                .with_file(self.file.clone()),
+        )
     }
 
     pub fn allows_record_locks(&self) -> bool {
-        self.flags & O_PATH == 0
+        self.prepared.0.flags & O_PATH == 0
     }
     pub fn normalize_lock(
         &self,
@@ -197,8 +264,8 @@ impl DirectFile {
         self.locks.conflict(requested)
     }
     pub fn record_lock_set(&self, requested: RecordLock) -> Result<()> {
-        if (requested.kind == 0 && self.flags & 3 == 1)
-            || (requested.kind == 1 && self.flags & 3 == 0)
+        if (requested.kind == 0 && self.prepared.0.flags & 3 == 1)
+            || (requested.kind == 1 && self.prepared.0.flags & 3 == 0)
         {
             return Err(Errno(9));
         }
@@ -213,7 +280,7 @@ impl DirectFile {
         if offset.is_some_and(|n| n > i64::MAX as u64) {
             return Some(Err(Errno(22)));
         }
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 1 {
             return Some(Err(Errno(9)));
         }
         if count == 0 {
@@ -236,10 +303,11 @@ impl DirectFile {
             result
         };
         if result.is_ok() && count != 0 {
-            self.data.accessed(self.readonly, self.relatime);
+            self.data
+                .accessed(self.prepared.0.readonly, self.prepared.0.relatime);
         }
         if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
-            self.notifications.send(inotify::ACCESS);
+            self.prepared.0.notifications.send(inotify::ACCESS);
         }
         Some(result)
     }
@@ -253,25 +321,25 @@ impl DirectFile {
             return Some(Err(Errno(22)));
         }
         if offset.is_some() {
-            if let Some(error) = self.write_error {
+            if let Some(error) = self.prepared.0.write_error {
                 return Some(Err(error));
             }
         }
-        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+        if self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 0 {
             return Some(Err(Errno(9)));
         }
-        if let Some(error) = self.write_error {
+        if let Some(error) = self.prepared.0.write_error {
             return Some(Err(error));
         }
         if bytes.is_empty() {
             return Some(Ok(0));
         }
-        if !self.unlimited || self.flags & 0x1000 != 0 {
+        if !self.prepared.0.unlimited || self.prepared.0.flags & 0x1000 != 0 {
             return None;
         }
         // Append growth/quotas/manifest retain the original owner path. No
         // partial vector or append transfer is performed before deferring.
-        if self.status.get() & 0x400 != 0 {
+        if self.prepared.0.status.get() & 0x400 != 0 {
             return None;
         }
         let result = if let Some(offset) = offset {
@@ -288,13 +356,13 @@ impl DirectFile {
             result
         };
         if result.is_ok_and(|n| n != 0) {
-            self.data.modified(self.clear_setid);
-            self.notifications.send(inotify::MODIFY);
+            self.data.modified(self.prepared.0.clear_setid);
+            self.prepared.0.notifications.send(inotify::MODIFY);
         }
         Some(result)
     }
     pub fn seek(&self, offset: i64, whence: u32) -> Option<Result<u64>> {
-        if self.flags & O_PATH != 0 {
+        if self.prepared.0.flags & O_PATH != 0 {
             return Some(Err(Errno(9)));
         }
         let mut position = self.position.lock().unwrap();
@@ -317,7 +385,7 @@ impl DirectFile {
         }))
     }
     pub fn stat(&self) -> Result<[u8; 128]> {
-        let mut out = self.stat;
+        let mut out = self.prepared.0.stat;
         out[48..56].copy_from_slice(&self.data.len().to_le_bytes());
         out[64..72].copy_from_slice(&self.data.blocks()?.to_le_bytes());
         if let Some(meta) = self.data.metadata() {
@@ -339,6 +407,117 @@ mod tests {
         vfs.import_file(b"/data", bytes).unwrap();
         let fd = vfs.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
         (vfs, fd)
+    }
+    #[test]
+    fn live_file_membership_resolves_new_aliases_and_reuse_but_accepted_io_stays_original() {
+        let (mut v, fd) = memory_file(b"old".to_vec());
+        v.import_file(b"/other", b"new".to_vec()).unwrap();
+        let other = v.open_at(AT_FDCWD, b"/other", 2, 0).unwrap();
+        for _ in 0..96 {
+            v.dup(fd, 0, false).unwrap();
+        }
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        assert_eq!(files.1.len(), 2); // one policy per OFD, not per alias
+        assert!(files.0.iter().all(Option::is_none));
+        let accepted = files.get(fd).unwrap();
+        let membership = v.shared_files();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let alias = membership.duplicate(fd, 200, false).unwrap().unwrap();
+                    assert_eq!(alias, 200);
+                    membership.duplicate_to(other, fd, 0, 1).unwrap().unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        let mut cache = DiskReadCache::default();
+        assert_eq!(
+            files.get(200).unwrap().read(3, None, &mut cache),
+            Some(Ok(b"old".to_vec()))
+        );
+        assert_eq!(accepted.seek(0, 1), Some(Ok(3)));
+        assert_eq!(
+            files.get(fd).unwrap().read(3, None, &mut cache),
+            Some(Ok(b"new".to_vec()))
+        );
+        assert_eq!(
+            accepted.read(3, Some(0), &mut cache),
+            Some(Ok(b"old".to_vec()))
+        );
+        membership.close(fd, 1).unwrap().unwrap();
+        assert!(files.get(fd).is_none());
+        let [replacement, _] = v.pipe(0).unwrap();
+        assert_eq!(replacement, fd);
+        assert!(files.get(fd).is_none()); // no stale ordinary-file authority
+        epoch.finish();
+    }
+    fn weak_file(v: &Vfs, fd: u32) -> (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>) {
+        let descriptor = v.descriptor(fd).unwrap();
+        let node = descriptor.open.borrow().node.clone().unwrap();
+        let n = node.borrow();
+        let Content::File(storage::FileData::Plain(data)) = &n.content else {
+            panic!("plain file")
+        };
+        (Arc::downgrade(&node), Arc::downgrade(data))
+    }
+    #[test]
+    fn prepared_file_caches_release_actual_unlinked_storage_at_last_close_without_a_join() {
+        let (mut v, fd) = memory_file(b"old".to_vec());
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        v.inotify_add(notify, b"/", 8).unwrap();
+        let (node, data) = weak_file(&v, fd);
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let flags = v.fd_flags_snapshot();
+        v.unlink_at(AT_FDCWD, b"/data", false).unwrap();
+        let membership = v.shared_files();
+        std::thread::spawn(move || membership.close(fd, 1).unwrap().unwrap())
+            .join()
+            .unwrap();
+        assert!(node.upgrade().is_none());
+        assert!(data.upgrade().is_none()); // actual bytes, not only accounting
+        assert_eq!(v.allocated_bytes(), 0);
+        assert!(files.get(fd).is_none());
+        assert_eq!(flags.get(fd), Err(Errno(9)));
+        let event = v.read(notify, 1024).unwrap();
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+        assert_eq!(v.read(notify, 1024), Err(Errno(11)));
+        epoch.finish();
+    }
+    #[test]
+    fn accepted_file_and_flock_keep_complete_original_ofd_until_last_worker_release() {
+        let (mut v, fd) = memory_file(b"old".to_vec());
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        v.inotify_add(notify, b"/", 8).unwrap();
+        let (node, data) = weak_file(&v, fd);
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let accepted = files.get(fd).unwrap();
+        let request = accepted.flock_request(6).unwrap();
+        assert!(request.retains_file());
+        request.try_lock().unwrap();
+        v.unlink_at(AT_FDCWD, b"/data", false).unwrap();
+        v.close(fd).unwrap();
+        assert!(files.get(fd).is_none());
+        assert_eq!(v.read(notify, 1024), Err(Errno(11)));
+        let mut cache = DiskReadCache::default();
+        assert_eq!(
+            accepted.read(3, None, &mut cache),
+            Some(Ok(b"old".to_vec()))
+        );
+        std::thread::spawn(move || drop(accepted)).join().unwrap();
+        assert!(node.upgrade().is_some());
+        assert!(data.upgrade().is_some());
+        assert_eq!(v.read(notify, 1024), Err(Errno(11)));
+        std::thread::spawn(move || drop(request)).join().unwrap();
+        assert!(node.upgrade().is_none());
+        assert!(data.upgrade().is_none());
+        assert_eq!(v.allocated_bytes(), 0);
+        let event = v.read(notify, 1024).unwrap();
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+        epoch.finish();
     }
     #[test]
     fn readonly_bind_and_policy_changes_are_separate_capabilities() {
@@ -483,6 +662,7 @@ mod tests {
         let expected = vfs.stat_fd(fd).unwrap();
         epoch.finish();
         assert_eq!(vfs.stat_fd(fd).unwrap(), expected);
+        drop(file); // accepted operation also retains the real disk filesystem
         drop(files);
         drop(cache);
         drop(node);
