@@ -18,6 +18,7 @@ struct TcpFlow {
     write_shutdown: bool,
     last: Instant,
 }
+
 struct UdpFlow {
     node: u64,
     tuple: Tuple,
@@ -331,13 +332,11 @@ impl Gateway {
         let mut gone = Vec::new();
         let mut failures = Vec::new();
         for (index, flow) in self.tcp.iter_mut().enumerate() {
+            // A live guest socket may be idle or hold a closed receive window
+            // while unpacking a large response. Its lifetime belongs to the
+            // socket/protocol, not a gateway activity timer. Bound only orphans.
             if !nodes.contains_key(&flow.node)
-                || flow.last.elapsed()
-                    > Duration::from_secs(if flow.owner.strong_count() == 0 {
-                        30
-                    } else {
-                        120
-                    })
+                || (flow.owner.strong_count() == 0 && flow.last.elapsed() > Duration::from_secs(30))
             {
                 gone.push(index);
                 continue;
@@ -840,5 +839,111 @@ impl Gateway {
             }
             self.dns_reply(&p.to, dns::answer(&p.question, &[], 2, 512));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn until<T>(socket: &Rc<crate::Socket>, mut operation: impl FnMut() -> Result<T>) -> T {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match operation() {
+                Ok(value) => return value,
+                Err(NetError(11)) => {}
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < end, "gateway test timed out");
+            crate::wait(&[(socket.clone(), 1 | 4)], Duration::from_millis(2)).unwrap();
+        }
+    }
+
+    #[test]
+    fn live_tcp_backpressure_survives_idle_sweep_and_orphan_is_reaped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload: Vec<_> = (0..3 * BUFFER + 17).map(|i| (i % 251) as u8).collect();
+        let (release, released) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let bytes = &payload;
+            scope.spawn(move || {
+                let (mut peer, _) = listener.accept().unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                peer.write_all(bytes).unwrap();
+                if released.recv_timeout(Duration::from_secs(5)).is_ok() {
+                    peer.write_all(b"tail").unwrap();
+                }
+            });
+            let fabric = Fabric::new().unwrap();
+            fabric
+                .map_host_ip("198.18.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .unwrap();
+            let network =
+                crate::Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+            let client = network.socket(2, 1, 0).unwrap();
+            assert_eq!(
+                client.connect(SocketAddr::new("198.18.0.1".parse().unwrap(), port)),
+                Err(NetError(115))
+            );
+            until(&client, || {
+                if client.connect_complete()? {
+                    Ok(())
+                } else {
+                    Err(NetError(11))
+                }
+            });
+            // Do not consume guest bytes until both receive and gateway send
+            // buffers are full. This exercises real TCP zero-window pressure.
+            until(&client, || {
+                let mut inner = fabric.0.borrow_mut();
+                inner.tick();
+                let flow = &inner.gateway.tcp[0];
+                let tcp = inner
+                    .gateway
+                    .node
+                    .sockets
+                    .get::<tcp::Socket>(flow.handle.unwrap());
+                if tcp.send_queue() == tcp.send_capacity() {
+                    Ok(())
+                } else {
+                    Err(NetError(11))
+                }
+            });
+            {
+                let mut inner = fabric.0.borrow_mut();
+                assert_eq!(inner.gateway.tcp.len(), 1);
+                assert!(inner.gateway.tcp[0].owner.strong_count() > 0);
+                // Age only the sweep clock, without sleeping or changing the
+                // protocol clock/sequence state of either real endpoint.
+                inner.gateway.tcp[0].last -= Duration::from_secs(121);
+                inner.tick();
+                assert_eq!(
+                    inner.gateway.tcp.len(),
+                    1,
+                    "live TCP flow expired under backpressure"
+                );
+            }
+            release.send(()).unwrap();
+            let mut received = Vec::new();
+            loop {
+                let chunk = until(&client, || client.recv(BUFFER, 0));
+                if chunk.data.is_empty() {
+                    break;
+                }
+                received.extend_from_slice(&chunk.data);
+            }
+            assert_eq!(&received[..payload.len()], &payload);
+            assert_eq!(&received[payload.len()..], b"tail");
+            drop(client);
+            let mut inner = fabric.0.borrow_mut();
+            for flow in &mut inner.gateway.tcp {
+                flow.last -= Duration::from_secs(31);
+            }
+            inner.tick();
+            assert!(inner.gateway.tcp.is_empty(), "orphaned TCP flow leaked");
+        });
     }
 }
