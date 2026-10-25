@@ -134,6 +134,7 @@ fn native_wait_retains_transport_and_releases_it_on_worker_cancellation() {
         Ok(()) | Err(trames_net::NetError(115))
     ));
     let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(socket.connect_complete(), Ok(true));
     let tcp = vfs.direct_network().get(fd).unwrap().tcp.clone();
     let (t, hub) = target();
@@ -155,7 +156,6 @@ fn native_wait_retains_transport_and_releases_it_on_worker_cancellation() {
     assert!(signal.ready());
     assert_eq!(tcp.recv(1, 0).unwrap(), b"b");
     std::thread::spawn(move || drop(sources)).join().unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     assert_eq!(tcp.send(b"stale", 0), Err(trames_net::NetError(9)));
 }
@@ -181,6 +181,9 @@ fn native_ring_aliases_share_one_interest_and_survive_retry_partial_read_and_eof
         Ok(()) | Err(trames_net::NetError(115))
     ));
     let mut peer = listener.accept().unwrap().0;
+    // Arm the bounded EOF assertion while connected. Darwin can reject a
+    // timeout option change after the other endpoint has already closed.
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(original.connect_complete(), Ok(true));
     let alias = l.vfs.dup(socket, 0, false).unwrap();
     add(&mut m, &ring, read(socket, 0x2200, 1));
@@ -222,7 +225,6 @@ fn native_ring_aliases_share_one_interest_and_survive_retry_partial_read_and_eof
     drop(original);
     l.vfs.close(socket).unwrap();
     l.vfs.close(alias).unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 
