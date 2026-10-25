@@ -44,6 +44,9 @@ impl FsHandle {
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }
+    pub fn has_owner_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
 }
 impl<G: Deref<Target = Filesystem>> Deref for FsBorrow<'_, G> {
     type Target = Filesystem;

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Mount identity is separate from storage inode identity. All objects are
-//! scheduler-owned; this adds no CPU-memory or host worker synchronization.
+//! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,7 +50,7 @@ impl Attachment {
             .unwrap_or_else(|| self.fallback.clone())
     }
 }
-pub(super) struct Mount {
+pub(super) struct MountInit {
     pub id: u64,
     pub fs: FsHandle,
     pub root: NodeRef,
@@ -64,7 +63,141 @@ pub(super) struct Mount {
     pub writers: Arc<mapped::Writers>,
     pub parent: RefCell<Option<Attachment>>,
 }
+// Resource identity is independent of parent topology. Overlay layers must
+// retain this identity rather than the old root's parent chain after pivot.
+pub(super) struct MountIdentity {
+    pub id: u64,
+    _filesystem: Arc<SharedCell<Filesystem>>,
+    pub root: NodeRef,
+    pub root_key: Vec<u8>,
+    pub kind: Kind,
+    pub pid_namespace: Option<PidNamespace>,
+    pub flags: MountFlags,
+    pub writers: Arc<mapped::Writers>,
+}
+pub(super) struct MountData {
+    pub identity: Arc<MountIdentity>,
+    parent: Arc<SharedCell<Option<SharedAttachment>>>,
+    // A shared metadata reference is not authority for these owner resources.
+    // Full pathname OFD admission still excludes them and their ancestors.
+    _owner_control: bool,
+}
+impl std::ops::Deref for MountData {
+    type Target = MountIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+struct SharedAttachment {
+    _parent: Arc<MountData>,
+    _node: NodeRef,
+    _fallback: Vec<u8>,
+}
+pub(super) struct MountFlags(AtomicU64);
+impl MountFlags {
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, flags: u64) {
+        self.0.store(flags, Ordering::Relaxed);
+    }
+}
+pub(super) struct MountParent {
+    owner: RefCell<Option<Attachment>>,
+    shared: Arc<SharedCell<Option<SharedAttachment>>>,
+}
+pub(super) struct ParentWrite<'a> {
+    owner: std::cell::RefMut<'a, Option<Attachment>>,
+    shared: &'a SharedCell<Option<SharedAttachment>>,
+}
+impl MountParent {
+    pub fn borrow(&self) -> std::cell::Ref<'_, Option<Attachment>> {
+        self.owner.borrow()
+    }
+    pub fn borrow_mut(&self) -> ParentWrite<'_> {
+        ParentWrite {
+            owner: self.owner.borrow_mut(),
+            shared: &self.shared,
+        }
+    }
+}
+impl std::ops::Deref for ParentWrite<'_> {
+    type Target = Option<Attachment>;
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+impl std::ops::DerefMut for ParentWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.owner
+    }
+}
+impl SharedAttachment {
+    fn from_owner(a: &Attachment) -> Self {
+        Self {
+            _parent: a.parent.shared.clone(),
+            _node: a.node.clone(),
+            _fallback: a.fallback.clone(),
+        }
+    }
+}
+impl Drop for ParentWrite<'_> {
+    fn drop(&mut self) {
+        let parent = self.owner.as_ref().map(SharedAttachment::from_owner);
+        let old = std::mem::replace(&mut *self.shared.borrow_mut(), parent);
+        drop(old);
+    }
+}
+pub(super) struct Mount {
+    pub shared: Arc<MountData>,
+    pub fs: FsHandle,
+    pub namespace: Option<linux_namespace::NamespaceHandle>,
+    pub devpts: Option<Rc<pty::Devpts>>,
+    pub parent: MountParent,
+}
+impl std::ops::Deref for Mount {
+    type Target = MountData;
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
 impl Mount {
+    fn new(init: MountInit) -> Self {
+        let parent = Arc::new(SharedCell::new(
+            init.parent
+                .borrow()
+                .as_ref()
+                .map(SharedAttachment::from_owner),
+        ));
+        let identity = Arc::new(MountIdentity {
+            id: init.id,
+            _filesystem: init.fs.shared.clone(),
+            root: init.root,
+            root_key: init.root_key,
+            kind: init.kind,
+            pid_namespace: init.pid_namespace,
+            flags: MountFlags(AtomicU64::new(init.flags.get())),
+            writers: init.writers,
+        });
+        let shared = Arc::new(MountData {
+            identity,
+            parent: parent.clone(),
+            _owner_control: init.namespace.is_some()
+                || init.devpts.is_some()
+                || init.fs.has_owner_overlay(),
+        });
+        let parent = shared.parent.clone();
+        Self {
+            shared,
+            fs: init.fs,
+            namespace: init.namespace,
+            devpts: init.devpts,
+            parent: MountParent {
+                owner: init.parent,
+                shared: parent,
+            },
+        }
+    }
     pub(super) fn device(&self) -> u64 {
         self.fs
             .borrow()
@@ -227,7 +360,7 @@ impl Vfs {
             .get(b"/".as_slice())
             .cloned()
             .ok_or(Errno(2))?;
-        let root = Rc::new(Mount {
+        let root = Rc::new(Mount::new(MountInit {
             id: 1,
             fs: self.fs.clone(),
             root,
@@ -239,7 +372,7 @@ impl Vfs {
             flags: Cell::new(MS_RELATIME),
             writers: Arc::default(),
             parent: RefCell::new(None),
-        });
+        }));
         let mut mounts = vec![root.clone()];
         let enabled = self.pseudo.borrow().enabled;
         self.pseudo.borrow_mut().enabled = true;
@@ -249,7 +382,7 @@ impl Vfs {
             (4, b"/dev/pts".as_slice(), Kind::Devpts, 10),
         ] {
             let node = self.pseudo_node(path)?.ok_or(Errno(2))?;
-            mounts.push(Rc::new(Mount {
+            mounts.push(Rc::new(Mount::new(MountInit {
                 id,
                 fs: self.fs.clone(),
                 root: node.clone(),
@@ -265,12 +398,12 @@ impl Vfs {
                     node,
                     fallback: path.to_vec(),
                 })),
-            }));
+            })));
         }
         let point = self.pseudo_node(b"/sys/fs/cgroup")?.ok_or(Errno(2))?;
         let fs = self.cgroups.borrow().fs.clone();
         let cgroup_root = fs.borrow().paths[b"/".as_slice()].clone();
-        mounts.push(Rc::new(Mount {
+        mounts.push(Rc::new(Mount::new(MountInit {
             id: 5,
             fs,
             root: cgroup_root,
@@ -286,7 +419,7 @@ impl Vfs {
                 node: point,
                 fallback: b"/sys/fs/cgroup".to_vec(),
             })),
-        }));
+        })));
         self.pseudo.borrow_mut().enabled = enabled;
         {
             let mut paths = self.context.paths.borrow_mut();
@@ -449,7 +582,7 @@ impl Vfs {
         for m in &old.mounts {
             copies.insert(
                 m.id,
-                Rc::new(Mount {
+                Rc::new(Mount::new(MountInit {
                     id: new_mount_id()?,
                     fs: m.fs.clone(),
                     root: m.root.clone(),
@@ -461,7 +594,7 @@ impl Vfs {
                     flags: Cell::new(m.flags.get()),
                     writers: Arc::default(),
                     parent: RefCell::new(None),
-                }),
+                })),
             );
         }
         for m in &old.mounts {
@@ -882,7 +1015,7 @@ impl Vfs {
         } else {
             (mount_kind == Kind::Proc).then(|| self.pid_ns.clone())
         };
-        let root = Rc::new(Mount {
+        let root = Rc::new(Mount::new(MountInit {
             id: new_mount_id()?,
             fs,
             root,
@@ -898,7 +1031,7 @@ impl Vfs {
                 node: target_node,
                 fallback: target.key,
             })),
-        });
+        }));
         let mut copies = BTreeMap::new();
         if !additions.is_empty() {
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
@@ -1105,7 +1238,7 @@ fn new_mount_id() -> Result<u64> {
         .map_err(|_| Errno(28))
 }
 fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
-    Ok(Rc::new(Mount {
+    Ok(Rc::new(Mount::new(MountInit {
         id: new_mount_id()?,
         fs: m.fs.clone(),
         root: m.root.clone(),
@@ -1117,7 +1250,7 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
         flags: Cell::new(m.flags.get()),
         writers: Arc::default(),
         parent: RefCell::new(None),
-    }))
+    })))
 }
 pub(super) fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
@@ -1373,6 +1506,39 @@ mod tests {
         }
         v.import_file(b"/src/file", b"shared".to_vec()).unwrap();
         v
+    }
+    #[test]
+    fn shared_mount_data_observes_remount_detach_and_releases_filesystem_on_worker() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<MountData>();
+        send_sync::<MountIdentity>();
+        let mut v = setup();
+        v.mount(None, b"/dst", Some(b"tmpfs"), 0, None).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/dst/file", 0x42, 0o600).unwrap();
+        let at = v.mount_location(b"/dst", true).unwrap();
+        let mount = at.mount.as_ref().unwrap();
+        let shared = mount.shared.clone();
+        assert!(!shared._owner_control);
+        assert_eq!(shared.parent.borrow().as_ref().unwrap()._parent.id, 1);
+        let filesystem = Arc::downgrade(&shared._filesystem);
+        let root = Arc::downgrade(&shared.root);
+        v.mount(None, b"/dst", None, 32 | MS_RDONLY, None).unwrap();
+        assert_eq!(v.write(fd, b"x"), Err(Errno(30)));
+        let reader = shared.clone();
+        assert!(
+            std::thread::spawn(move || reader.flags.get() & MS_RDONLY != 0)
+                .join()
+                .unwrap()
+        );
+        v.close(fd).unwrap();
+        drop(at);
+        v.umount(b"/dst", 2).unwrap();
+        assert!(shared.parent.borrow().is_none());
+        v.reap_detached_mounts();
+        assert!(filesystem.upgrade().is_some());
+        std::thread::spawn(move || drop(shared)).join().unwrap();
+        assert!(filesystem.upgrade().is_none());
+        assert!(root.upgrade().is_none());
     }
     fn bind(v: &mut Vfs, source: &[u8], target: &[u8]) {
         v.mount(Some(source), target, None, 4096, None).unwrap();
