@@ -717,7 +717,7 @@ impl Vfs {
                             .node
                             .as_ref()
                             .and_then(|n| {
-                                self.location(n, &o.mount)
+                                self.location(n, &self.mount_for_path(o.mount.as_ref()))
                                     .map(|p| self.path_visible(&p).unwrap_or(p.key))
                                     .ok()
                             })
@@ -807,7 +807,7 @@ impl Vfs {
         let link_path = self.resolve_final(dirfd, path, false)?;
         if let Some(ns) = link_path.mount.as_ref().and_then(|m| m.namespace.clone()) {
             let description = self.namespace_description(ns);
-            description.borrow_mut().mount = link_path.mount;
+            description.borrow_mut().mount = link_path.mount.map(OpenMount::Owner);
             return Ok(Some(description));
         }
         if !self.uses_pseudo(&link_path) {
@@ -852,6 +852,7 @@ impl Vfs {
         };
         Ok(Some(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                mount_resource: std::sync::OnceLock::new(),
                 read_node: None,
                 id: self.open_id(),
                 owner,
@@ -873,7 +874,7 @@ impl Vfs {
             namespace: None,
             network_control: None,
             oom: None,
-            mount,
+            mount: mount.map(OpenMount::Owner),
         })))
     }
     fn proc_fd_description_normalized(&self, actual: &ResolvedPath) -> Result<Option<OpenHandle>> {
@@ -939,7 +940,7 @@ impl Vfs {
                 FdKind::Node(label) => label.clone(),
                 _ => path.to_vec(),
             };
-            return Ok(Some((node, label, o.mount.clone())));
+            return Ok(Some((node, label, self.mount_for_path(o.mount.as_ref()))));
         }
         self.proc_exe_node_normalized(path)
     }
@@ -1026,7 +1027,7 @@ impl Vfs {
                 self.overlay_prepare(
                     &ResolvedPath {
                         key: Vec::new(),
-                        mount: original.mount.clone(),
+                        mount: self.mount_for_path(original.mount.as_ref()),
                     },
                     node,
                     flags & 0x200 != 0,
@@ -1062,7 +1063,7 @@ impl Vfs {
                     };
                     Some(self.allocate_pty(&ResolvedPath {
                         key,
-                        mount: original.mount.clone(),
+                        mount: self.mount_for_path(original.mount.as_ref()),
                     })?)
                 }
                 Content::Device(Device::Pts(id, _)) if id != 0 => {
@@ -1081,6 +1082,7 @@ impl Vfs {
         };
         let descriptor = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                mount_resource: std::sync::OnceLock::new(),
                 read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
                     original
                         .node
@@ -1147,12 +1149,12 @@ impl Vfs {
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
         let path = self.resolve(AT_FDCWD, path)?;
         self.node(&path)?;
-        Ok(self.mount_statfs(path.mount.as_ref()))
+        Ok(self.mount_statfs(path.mount.as_ref().map(|m| &*m.shared)))
     }
     pub fn statfs_fd(&self, fd: u32) -> Result<[u8; 120]> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
-        let mut out = self.mount_statfs(o.mount.as_ref());
+        let mut out = self.mount_statfs(o.mount.as_deref());
         if o.namespace.is_some()
             || o.socket.is_some()
             || o.local.is_some()
@@ -1183,7 +1185,7 @@ impl Vfs {
         if let FdKind::Node(key) = &o.kind {
             let path = ResolvedPath {
                 key: key.clone(),
-                mount: o.mount.clone(),
+                mount: self.mount_for_path(o.mount.as_ref()),
             };
             if self.uses_pseudo(&path) && self.pseudo_readonly(&path) {
                 self.pseudo_node(&path)?;

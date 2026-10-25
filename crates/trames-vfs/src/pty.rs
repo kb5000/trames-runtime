@@ -186,6 +186,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        mount_resource: std::sync::OnceLock::new(),
                         read_node: None,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -206,7 +207,7 @@ impl Vfs {
                     namespace: None,
                     network_control: None,
                     oom: None,
-                    mount: end.pair.mount.clone(),
+                    mount: end.pair.mount.clone().map(OpenMount::Owner),
                     pty: Some(PtyEnd::new(end.pair.clone(), false)),
                 }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),

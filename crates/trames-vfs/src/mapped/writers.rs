@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Real writable-mapping references, independent of owner inode/mount anchors.
-use super::super::{mounts::MountIdentity, NodeRef};
+use super::super::{mounts::MountIdentity, NodeRef, SharedOpenDescription};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -25,12 +25,14 @@ struct Lease {
     _node: NodeRef,
     inode: Arc<Writers>,
     mount: Option<Arc<MountIdentity>>,
+    _open: Option<Arc<SharedOpenDescription>>,
 }
 impl WriteLease {
     pub(super) fn new(
         node: &NodeRef,
         inode: &Arc<Writers>,
         mount: Option<&Arc<MountIdentity>>,
+        open: Option<&Arc<SharedOpenDescription>>,
     ) -> Self {
         // Lifetime accounting does not publish file bytes. Dirty/writeback and
         // VM mapping commits retain their existing synchronization boundaries.
@@ -43,6 +45,7 @@ impl WriteLease {
                 _node: node.clone(),
                 inode: inode.clone(),
                 mount: mount.cloned(),
+                _open: open.cloned(),
             }),
         }
     }
@@ -87,8 +90,8 @@ mod tests {
             .unwrap();
         let mount = v.mounts.as_ref().unwrap().0.borrow().root.identity.clone();
         let private_mount = Arc::new(Writers::default());
-        let first = WriteLease::new(&anode, &a, Some(&mount));
-        let second = WriteLease::new(&bnode, &b, Some(&mount));
+        let first = WriteLease::new(&anode, &a, Some(&mount), None);
+        let second = WriteLease::new(&bnode, &b, Some(&mount), None);
         let aliases: Vec<_> = (0..8).map(|_| first.clone()).collect();
         drop(first);
         assert!(a.active() && b.active() && mount.writers.active());
@@ -102,7 +105,7 @@ mod tests {
         assert!(b.active() && mount.writers.active());
         std::thread::spawn(move || drop(second)).join().unwrap();
         assert!(!b.active() && !mount.writers.active());
-        let detached = WriteLease::new(&anode, &a, None);
+        let detached = WriteLease::new(&anode, &a, None, None);
         assert!(a.active() && !mount.writers.active());
         drop(detached);
         assert!(!a.active());

@@ -234,6 +234,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        mount_resource: std::sync::OnceLock::new(),
                         read_node: None,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),

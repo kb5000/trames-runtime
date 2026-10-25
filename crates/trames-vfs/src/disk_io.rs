@@ -194,11 +194,11 @@ impl Vfs {
         access: bool,
     ) {
         if access && result.is_ok() {
-            mounts::accessed(&mut node.borrow_mut(), o.mount.as_ref());
+            mounts::accessed(&mut node.borrow_mut(), o.mount.as_deref());
         }
         let notification_node = o.node.as_ref().unwrap_or(node);
         if !Arc::ptr_eq(notification_node, node) && result.is_ok() {
-            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
+            mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_deref());
         }
         if result.as_ref().is_ok_and(|b| !b.is_empty())
             && !(node.borrow().seals.is_some() && o.notification.is_none())

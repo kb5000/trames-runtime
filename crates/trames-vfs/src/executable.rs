@@ -35,7 +35,7 @@ impl Vfs {
                 FdKind::Node(path) => path.clone(),
                 _ => Vec::new(),
             };
-            (node, label, open.mount.clone())
+            (node, label, self.mount_for_path(open.mount.as_ref()))
         } else {
             let (resolved, magic) = self.resolve_entry(dirfd, path, flags & 0x100 == 0, true)?;
             match magic {

@@ -439,6 +439,7 @@ impl Vfs {
     pub(super) fn namespace_description(&self, ns: NamespaceHandle) -> OpenHandle {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                mount_resource: std::sync::OnceLock::new(),
                 read_node: None,
                 id: ns.id(),
                 owner: (0, 0),

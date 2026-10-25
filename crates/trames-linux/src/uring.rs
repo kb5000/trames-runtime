@@ -1508,15 +1508,32 @@ pub(crate) mod tests {
         assert!(l.vfs.shares_descriptors_with(&before));
     }
     #[test]
-    fn cached_ring_discovery_does_not_keep_closed_rings_or_requests_alive() {
-        let (mut l, m, fd, r) = setup(2);
+    fn cached_ring_discovery_is_weak_and_mappings_retain_the_original_registered_files() {
+        let (mut l, mut m, fd, r) = setup(2);
+        let (ring_bytes, sqe_bytes) = (r.ring_bytes, r.sqe_bytes);
+        let file = l
+            .vfs
+            .open_at(-100, b"/registered-mmap", 0x42, 0o600)
+            .unwrap();
+        let contender = l.vfs.open_at(-100, b"/registered-mmap", 2, 0).unwrap();
+        l.vfs.flock(file, 6).unwrap();
+        m.write_array(0x2000, file.to_le_bytes()).unwrap();
+        l.uring_register([fd as u64, 2, 0x2000, 1, 0, 0], &mut m)
+            .unwrap();
+        l.vfs.close(file).unwrap();
         let weak = Rc::downgrade(&r);
         assert_eq!(l.vfs.urings().len(), 1);
         drop(r);
         l.vfs.close(fd).unwrap();
         assert!(l.vfs.urings().is_empty());
-        assert!(weak.upgrade().is_none());
+        assert!(weak.upgrade().is_some());
         assert_eq!(m.read_array::<4>(QUEUE + 12).unwrap(), 2u32.to_le_bytes());
+        assert_eq!(l.vfs.flock(contender, 6), Err(Errno(11)));
+        m.unmap(SQES, sqe_bytes).unwrap();
+        assert!(weak.upgrade().is_some());
+        m.unmap(QUEUE, ring_bytes).unwrap();
+        assert!(weak.upgrade().is_none());
+        l.vfs.flock(contender, 6).unwrap();
     }
     #[test]
     fn imported_vector_metadata_is_bounded_and_partial_submissions_are_not_lost() {

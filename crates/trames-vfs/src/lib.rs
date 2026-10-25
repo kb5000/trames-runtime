@@ -16,7 +16,7 @@ pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 mod fd_table;
 mod open_handle;
-use open_handle::{OpenHandle, OpenWeak};
+use open_handle::{OpenHandle, OpenMount, OpenWeak};
 mod shared_cell;
 use shared_cell::SharedCell;
 mod flock;
@@ -160,11 +160,12 @@ struct OpenDescription {
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<std::sync::Weak<OomTask>>,
     network_control: Option<network::Control>,
-    mount: Option<Rc<Mount>>,
+    mount: Option<OpenMount>,
 }
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Endpoint/namespace control projections above still retain owner ownership.
 struct SharedOpenDescription {
+    mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
     id: u64,
     owner: (u32, u32),
     kind: FdKind,
@@ -535,6 +536,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            mount_resource: std::sync::OnceLock::new(),
                             read_node: None,
                             id: v.open_id(),
                             owner: (v.credentials.fsuid, v.credentials.fsgid),
@@ -821,6 +823,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            mount_resource: std::sync::OnceLock::new(),
                             read_node: None,
                             id: self.open_id(),
                             owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -1019,7 +1022,7 @@ impl Vfs {
         if !matches!(n.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        self.location(n, &o.mount)
+        self.location(n, &self.mount_for_path(o.mount.as_ref()))
     }
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<ResolvedPath> {
         self.resolve_final(dirfd, path, true)
@@ -1283,7 +1286,7 @@ impl Vfs {
                 self.check_proc_inspection(
                     &ResolvedPath {
                         key: path.clone(),
-                        mount: description.borrow().mount.clone(),
+                        mount: self.mount_for_path(description.borrow().mount.as_ref()),
                     },
                     true,
                 )?;
@@ -1795,6 +1798,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        mount_resource: std::sync::OnceLock::new(),
                         read_node,
                         id: self.open_id(),
                         owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -1822,7 +1826,7 @@ impl Vfs {
                         notification,
                     }),
                     position: 0,
-                    mount: p.mount,
+                    mount: p.mount.map(OpenMount::Owner),
                     socket: None,
                     anonymous: None,
                     local: None,
@@ -1993,6 +1997,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            mount_resource: std::sync::OnceLock::new(),
                             read_node: None,
                             id: self.open_id(),
                             owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -2553,7 +2558,7 @@ impl Vfs {
         }
         Ok(new as u64)
     }
-    fn stat_node(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
+    fn stat_node(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
         let mut out = self.stat_node_fields(node, mount)?;
         let blocks = match &node.content {
             Content::File(data) if !node.volatile => data.blocks()?,
@@ -2565,7 +2570,7 @@ impl Vfs {
     // Freeze only virtual fields when publishing worker capabilities. Actual
     // stat calls obtain live allocation/blocks; cohort setup must not stat every
     // host disk object even when no task will query it.
-    fn stat_node_fields(&self, node: &Node, mount: Option<&Rc<Mount>>) -> Result<[u8; 128]> {
+    fn stat_node_fields(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
         let mut out = [0; 128];
         let device = mount
             .filter(|m| m.kind == mounts::Kind::Overlay)
@@ -2599,7 +2604,7 @@ impl Vfs {
                 }
                 let at = ResolvedPath {
                     key: path.clone(),
-                    mount: mount.cloned(),
+                    mount: self.mount_for_path(mount),
                 };
                 for name in self.mounted_pseudo_children(&at)? {
                     let mut child = prefix.clone();
@@ -2652,7 +2657,8 @@ impl Vfs {
         }
         let p = self.resolve_final(dirfd, path, !nofollow)?;
         let n = self.node(&p)?;
-        let out = self.stat_node(&n.borrow(), p.mount.as_ref());
+        let mount = p.mount.map(OpenMount::Owner);
+        let out = self.stat_node(&n.borrow(), mount.as_ref());
         out
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
@@ -2737,7 +2743,7 @@ impl Vfs {
         if !self.allowed(&node.borrow(), 1) {
             return Err(Errno(13));
         }
-        let mount = self.descriptor(fd)?.open.borrow().mount.clone();
+        let mount = self.mount_for_path(self.descriptor(fd)?.open.borrow().mount.as_ref());
         let mut paths = self.context.paths.borrow_mut();
         paths.cwd_mount = mount;
         paths.cwd_node = Some(node);
@@ -2764,7 +2770,7 @@ impl Vfs {
         if !matches!(node.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        let p = self.location(node, &o.mount)?;
+        let p = self.location(node, &self.mount_for_path(o.mount.as_ref()))?;
         let filesystem = p.filesystem(self);
         let fs = filesystem.borrow();
         let inode = node.borrow().inode;

@@ -439,11 +439,12 @@ enum MappingMount {
     Owner(Rc<Mount>),
 }
 impl MappingMount {
-    fn new(mount: &Rc<Mount>) -> Self {
-        if mount.shared_resources().is_some() {
-            Self::Shared(mount.identity.clone())
-        } else {
-            Self::Owner(mount.clone())
+    fn new(mount: &OpenMount) -> Self {
+        match mount {
+            OpenMount::Owner(owner) if owner.shared_resources().is_none() => {
+                Self::Owner(owner.clone())
+            }
+            _ => Self::Shared(mount.identity.clone()),
         }
     }
     fn identity(&self) -> &Arc<mounts::MountIdentity> {
@@ -456,16 +457,22 @@ impl MappingMount {
 #[derive(Clone)]
 struct MappingWriter {
     _lease: WriteLease,
-    _owner: Option<Rc<Mount>>,
+    _owner: Option<Rc<RefCell<OpenDescription>>>,
 }
 impl MappingWriter {
-    fn new(node: &NodeRef, writers: &Arc<Writers>, mount: Option<&MappingMount>) -> Self {
+    fn new(
+        open: &OpenHandle,
+        node: &NodeRef,
+        writers: &Arc<Writers>,
+        mount: Option<&MappingMount>,
+    ) -> Self {
+        let (shared, owner) = match open {
+            OpenHandle::Shared(open) => (Some(open), None),
+            OpenHandle::Owner(open) => (None, Some(open.clone())),
+        };
         Self {
-            _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity)),
-            _owner: mount.and_then(|m| match m {
-                MappingMount::Owner(owner) => Some(owner.clone()),
-                MappingMount::Shared(_) => None,
-            }),
+            _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity), shared),
+            _owner: owner,
         }
     }
     #[cfg(test)]
@@ -474,6 +481,9 @@ impl MappingWriter {
     }
 }
 struct FileMapping {
+    // The VMA pins its original OFD even after private COW. Page bytes alone
+    // cannot preserve flock, close notification or owner-control lifetime.
+    open: OpenHandle,
     // Normal mappings need resource/flag identity. Namespace-control ancestry
     // stays explicitly owner-only rather than escaping in a shared byte lease.
     mount: Option<MappingMount>,
@@ -508,6 +518,7 @@ impl FileMapping {
         self.state.changed();
     }
     fn create(
+        open: OpenHandle,
         node: NodeRef,
         mount: Option<MappingMount>,
         offset: u64,
@@ -520,8 +531,9 @@ impl FileMapping {
             } else {
                 return Err(Errno(19));
             };
-        let writer = writable.then(|| MappingWriter::new(&node, &writers, mount.as_ref()));
+        let writer = writable.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
         Ok(Rc::new(Self {
+            open,
             mount,
             node,
             cached: RefCell::new(page.cached()),
@@ -648,6 +660,7 @@ impl PageBacking for FileMapping {
             )
             .ok_or(MemoryError::InvalidRange)?;
         Self::create(
+            self.open.clone(),
             self.node.clone(),
             self.mount.clone(),
             offset,
@@ -745,10 +758,12 @@ impl Vfs {
                 .as_ref()
                 .is_none_or(|m| m.identity().flags.get() & mounts::MS_NOEXEC == 0);
         drop(o);
-        let writer = may_write.then(|| MappingWriter::new(&node, &writers, mount.as_ref()));
+        let open = o_descriptor.open;
+        let writer = may_write.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
         let mut pages: Vec<Rc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
             pages.push(Rc::new(FileMapping {
+                open: open.clone(),
                 mount: mount.clone(),
                 node: node.clone(),
                 cached: RefCell::new(page.cached()),
@@ -810,6 +825,60 @@ mod tests {
         assert_eq!(v.read(fd, 8).unwrap(), b"after!!!");
     }
     use trames_memory::{Access, Memory, Permissions};
+    #[test]
+    fn mappings_keep_original_ofd_through_cow_fork_discard_remap_and_final_unmap() {
+        use trames_memory::parallel::Registry;
+        for (shared, permissions) in [
+            (false, Permissions::RW),
+            (true, Permissions::RW),
+            (false, Permissions::R),
+        ] {
+            let mut v = Vfs::default();
+            let fd = v.open_at(AT_FDCWD, b"/mapped-ofd", 0x42, 0o600).unwrap();
+            v.truncate_fd(fd, PAGE_SIZE * 4).unwrap();
+            let contender = v.open_at(AT_FDCWD, b"/mapped-ofd", 2, 0).unwrap();
+            v.flock(fd, 6).unwrap();
+            let notify = v.inotify_init(O_NONBLOCK).unwrap();
+            v.inotify_add(notify, b"/mapped-ofd", 8).unwrap();
+            let mut m = Memory::default();
+            mapped(&v, &mut m, fd, 0x40000, PAGE_SIZE * 2, shared, permissions);
+            if permissions.write {
+                m.write_array(0x40000, [7; 8]).unwrap();
+            }
+            let mut child = m.clone();
+            if permissions.write {
+                child.write_array(0x41000, [9; 8]).unwrap();
+            }
+            v.close(fd).unwrap();
+            assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+            assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+            m.discard(0x40000, PAGE_SIZE * 2).unwrap();
+            assert_eq!(
+                m.read_array::<8>(0x40000).unwrap(),
+                [if shared { 7 } else { 0 }; 8]
+            );
+            m.unmap(0x40000, PAGE_SIZE).unwrap();
+            m.remap(0x41000, PAGE_SIZE, 0x80000, PAGE_SIZE * 2, false)
+                .unwrap();
+            assert_eq!(m.read_array::<8>(0x81000).unwrap(), [0; 8]);
+            m.protect(0x80000, PAGE_SIZE * 2, Permissions::R).unwrap();
+            let mut registry = Registry::default();
+            drop(m.parallel_view(&mut registry).unwrap());
+            drop(child);
+            assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+            m.map_fixed(0x80000, PAGE_SIZE, Permissions::RW).unwrap();
+            assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+            assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+            // The cached parallel byte snapshot can outlive the provider. It
+            // must neither discard an active VMA pin nor delay final OFD close.
+            m.unmap(0x81000, PAGE_SIZE).unwrap();
+            v.flock(contender, 6).unwrap();
+            let event = v.read(notify, 4096).unwrap();
+            assert_eq!(event.len(), 16);
+            assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+            assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+        }
+    }
     #[test]
     fn live_mapping_state_is_shared_without_sampling_or_retaining_inode() {
         fn send_sync<T: Send + Sync>() {}
@@ -1024,7 +1093,9 @@ mod tests {
         };
         drop(maps);
         assert!(v.epoch_file_io(fd, false));
-        let mapping = FileMapping::create(node, mount, 0, true, false).unwrap();
+        let mapping =
+            FileMapping::create(v.descriptor(fd).unwrap().open, node, mount, 0, true, false)
+                .unwrap();
         mapping.write(0, b"written").unwrap();
         let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
         let alias = mapping.clone();
@@ -1051,6 +1122,39 @@ mod tests {
         ));
     }
     #[test]
+    fn retained_writer_keeps_original_ofd_after_last_mapping_provider_is_retired() {
+        let mut v = Vfs::default();
+        let fd = v
+            .open_at(AT_FDCWD, b"/retained-write-ofd", 0x42, 0o600)
+            .unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let contender = v.open_at(AT_FDCWD, b"/retained-write-ofd", 2, 0).unwrap();
+        v.flock(fd, 6).unwrap();
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        v.inotify_add(notify, b"/retained-write-ofd", 8).unwrap();
+        drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
+        let descriptor = v.descriptor(fd).unwrap();
+        let (node, mount) = {
+            let open = descriptor.open.borrow();
+            (
+                open.node.clone().unwrap(),
+                open.mount.as_ref().map(MappingMount::new),
+            )
+        };
+        let mapping = FileMapping::create(descriptor.open, node, mount, 0, true, false).unwrap();
+        let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
+        v.close(fd).unwrap();
+        drop(mapping);
+        assert_eq!(v.flock(contender, 6), Err(Errno(11)));
+        assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+        std::thread::spawn(move || drop(retained)).join().unwrap();
+        v.flock(contender, 6).unwrap();
+        let event = v.read(notify, 4096).unwrap();
+        assert_eq!(event.len(), 16);
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 8);
+        assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+    }
+    #[test]
     fn retained_writer_pins_resources_without_retaining_detached_owner_topology() {
         for lazy in [false, true] {
             let mut v = Vfs::default();
@@ -1067,11 +1171,17 @@ mod tests {
                 let open = descriptor.open.borrow();
                 (open.node.clone().unwrap(), open.mount.clone())
             };
-            let weak = Rc::downgrade(mount.as_ref().unwrap());
+            let weak = Rc::downgrade(&v.mount_for_path(mount.as_ref()).unwrap());
             let resource = Arc::downgrade(&mount.as_ref().unwrap().identity);
-            let mapping =
-                FileMapping::create(node, mount.as_ref().map(MappingMount::new), 0, true, false)
-                    .unwrap();
+            let mapping = FileMapping::create(
+                v.descriptor(fd).unwrap().open,
+                node,
+                mount.as_ref().map(MappingMount::new),
+                0,
+                true,
+                false,
+            )
+            .unwrap();
             drop(mount);
             let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
             v.close(fd).unwrap();
@@ -1113,8 +1223,15 @@ mod tests {
         let inode = Arc::downgrade(&node);
         let filesystem = Arc::downgrade(&mount.fs.shared);
         let resource = Arc::downgrade(&mount);
-        let mapping =
-            FileMapping::create(node, Some(MappingMount::Shared(mount)), 0, true, false).unwrap();
+        let mapping = FileMapping::create(
+            v.descriptor(fd).unwrap().open,
+            node,
+            Some(MappingMount::Shared(mount)),
+            0,
+            true,
+            false,
+        )
+        .unwrap();
         mapping.write(0, b"retained bytes").unwrap();
         let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
         let aliases: Vec<_> = (0..8).map(|_| retained.clone()).collect();
@@ -1167,6 +1284,7 @@ mod tests {
         v.mount(Some(b"/data"), b"/namespace", None, 4096, None)
             .unwrap();
         let fd = v.open_at(AT_FDCWD, b"/namespace", 2, 0).unwrap();
+        assert!(v.shared_files().lookup(fd).is_none());
         drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
         let (node, mount) = {
             let descriptor = v.descriptor(fd).unwrap();
@@ -1177,7 +1295,15 @@ mod tests {
             )
         };
         assert!(matches!(mount, MappingMount::Owner(_)));
-        let mapping = FileMapping::create(node, Some(mount), 0, true, false).unwrap();
+        let mapping = FileMapping::create(
+            v.descriptor(fd).unwrap().open,
+            node,
+            Some(mount),
+            0,
+            true,
+            false,
+        )
+        .unwrap();
         assert!(mapping.writer.as_ref().unwrap().shared().is_none());
         v.close(fd).unwrap();
         drop(v);

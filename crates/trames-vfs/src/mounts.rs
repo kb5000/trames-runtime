@@ -228,6 +228,24 @@ impl Mount {
             },
         })
     }
+    pub(super) fn resource_projection(shared: Arc<MountData>) -> Rc<Self> {
+        debug_assert!(!shared._owner_control);
+        let parent = shared.parent.borrow().as_ref().map(|a| Attachment {
+            parent: Self::resource_projection(a._parent.clone()),
+            node: a._node.clone(),
+            fallback: a._fallback.clone(),
+        });
+        Rc::new(Self {
+            parent: MountParent {
+                owner: RefCell::new(parent),
+                shared: shared.parent.clone(),
+            },
+            shared,
+            namespace: None,
+        })
+    }
+}
+impl MountData {
     pub(super) fn device(&self) -> u64 {
         self.fs
             .borrow()
@@ -463,6 +481,20 @@ impl Vfs {
             mounts,
         }))));
         Ok(())
+    }
+    // Resolve owner topology only for pathname/namespace operations. Ordinary
+    // OFD data/flag access uses shared mount resources without Rc projections.
+    pub(super) fn mount_for_path(&self, mount: Option<&OpenMount>) -> Option<Rc<Mount>> {
+        mount.map(|mount| match mount {
+            OpenMount::Owner(owner) => owner.clone(),
+            OpenMount::Shared(shared) => self
+                .mount_registry
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|owner| Arc::ptr_eq(&owner.shared, shared))
+                .unwrap_or_else(|| Mount::resource_projection(shared.clone())),
+        })
     }
     pub(super) fn location(
         &self,
@@ -1124,6 +1156,7 @@ impl Vfs {
         if flags & 2 == 0
             && (ids.len() > 1
                 || Rc::strong_count(mount) > 2
+                || Arc::strong_count(&mount.shared) > 1
                 || Arc::strong_count(&mount.identity) > 1
                 || mount.writers.active())
         {
@@ -1468,7 +1501,7 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
     text.into_bytes()
 }
 impl Vfs {
-    pub(super) fn mount_statfs(&self, mount: Option<&Rc<Mount>>) -> [u8; 120] {
+    pub(super) fn mount_statfs(&self, mount: Option<&MountData>) -> [u8; 120] {
         let Some(m) = mount else {
             return self.storage_stat();
         };
@@ -1999,7 +2032,7 @@ mod boundary_tests {
         let fd = v.open_at(AT_FDCWD, b"/a", O_DIRECTORY, 0).unwrap();
         let descriptor = v.descriptor(fd).unwrap();
         let open = descriptor.open.borrow();
-        let fs = v.mount_statfs(open.mount.as_ref());
+        let fs = v.mount_statfs(open.mount.as_deref());
         assert_eq!(u64::from_le_bytes(fs[..8].try_into().unwrap()), 0x19800202);
         drop(open);
         assert_eq!(v.open_at(AT_FDCWD, b"/a/queue", 0x42, 0o600), Err(Errno(1)));
@@ -2016,7 +2049,7 @@ mod boundary_tests {
     }
 }
 
-pub(super) fn accessed(node: &mut Node, mount: Option<&Rc<Mount>>) {
+pub(super) fn accessed(node: &mut Node, mount: Option<&MountData>) {
     if node.volatile || mount.is_some_and(|m| m.readonly()) {
         return;
     }
