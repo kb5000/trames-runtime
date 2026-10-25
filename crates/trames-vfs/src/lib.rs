@@ -1842,6 +1842,8 @@ impl Vfs {
         }
         let descriptor = self.fds.close(fd)?;
         self.release_record_locks(&descriptor);
+        drop(descriptor);
+        self.reap_detached_mounts();
         Ok(())
     }
     pub fn fifo_open_ready(&self, fd: u32) -> Result<bool> {
@@ -1852,6 +1854,7 @@ impl Vfs {
     }
     pub fn cancel_fifo_open(&mut self, fd: u32) {
         self.fds.remove(&fd);
+        self.reap_detached_mounts();
     }
     pub fn close_range(&mut self, first: u32, last: u32, flags: u32) -> Result<()> {
         if first > last || flags & !6 != 0 {
@@ -1881,6 +1884,8 @@ impl Vfs {
         for d in descriptors.values() {
             self.release_record_locks(d);
         }
+        drop(descriptors);
+        self.reap_detached_mounts();
     }
     /// Detach a task's view while another task retains the shared file table.
     /// No descriptor has actually closed, so POSIX process locks stay held.
@@ -1924,6 +1929,7 @@ impl Vfs {
         if let Some(replaced) = self.fds.duplicate_to(old, new, flags)? {
             self.release_record_locks(&replaced);
         }
+        self.reap_detached_mounts();
         Ok(new)
     }
     pub fn flags(&self, fd: u32) -> Result<u32> {

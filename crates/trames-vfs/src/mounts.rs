@@ -161,6 +161,22 @@ impl std::ops::Deref for Mount {
     }
 }
 impl Mount {
+    // Namespace controls cannot cross a worker boundary. Metadata/resource
+    // ancestry is complete only when every retained parent is shared too.
+    pub(super) fn shared_resources(&self) -> Option<Arc<MountData>> {
+        let mut at = self.shared.clone();
+        for _ in 0..MAX_MOUNTS {
+            if at._owner_control {
+                return None;
+            }
+            let parent = at.parent.borrow().as_ref().map(|a| a._parent.clone());
+            let Some(parent) = parent else {
+                return Some(self.shared.clone());
+            };
+            at = parent;
+        }
+        None
+    }
     fn new(init: MountInit) -> Self {
         let parent = Arc::new(SharedCell::new(
             init.parent
@@ -1124,6 +1140,9 @@ impl Vfs {
             self.detached_mounts.borrow_mut().push(detached);
         }
         *mount.parent.borrow_mut() = None;
+        drop(table);
+        drop(target);
+        self.reap_detached_mounts();
         Ok(())
     }
     pub fn pivot_root(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
@@ -1735,7 +1754,7 @@ impl Vfs {
                             .is_some_and(|a| Rc::ptr_eq(&a.parent, m))
                     })
                     .count();
-                Rc::strong_count(m) > internal || m.writers.active()
+                Rc::strong_count(m) > internal
             })
         });
     }
@@ -1821,21 +1840,31 @@ mod boundary_tests {
     }
     #[test]
     fn detached_subtree_remains_traversable_and_releases_its_quota() {
-        let mut v = vfs();
-        v.mount(None, b"/a/sub", Some(b"tmpfs"), 0, None).unwrap();
-        let fd = v.open_at(-100, b"/a/sub/data", 0x42, 0o600).unwrap();
-        v.write(fd, b"live").unwrap();
-        v.close(fd).unwrap();
-        v.mount(Some(b"/a"), b"/b", None, 4096 | 16384, None)
-            .unwrap();
-        let dir = v.open_at(-100, b"/b", O_DIRECTORY, 0).unwrap();
-        v.umount(b"/b", 2).unwrap();
-        let fd = v.open_at(dir as i32, b"sub/data", 0, 0).unwrap();
-        assert_eq!(v.read(fd, 4).unwrap(), b"live");
-        v.close(fd).unwrap();
-        v.close(dir).unwrap();
-        v.reap_detached_mounts();
-        assert!(v.detached_mounts.borrow().is_empty());
+        for retirement in 0..4 {
+            let mut v = vfs();
+            v.mount(None, b"/a/sub", Some(b"tmpfs"), 0, None).unwrap();
+            let fd = v.open_at(-100, b"/a/sub/data", 0x42, 0o600).unwrap();
+            v.write(fd, b"live").unwrap();
+            v.close(fd).unwrap();
+            v.mount(Some(b"/a"), b"/b", None, 4096 | 16384, None)
+                .unwrap();
+            let dir = v.open_at(-100, b"/b", O_DIRECTORY | O_CLOEXEC, 0).unwrap();
+            v.umount(b"/b", 2).unwrap();
+            assert!(!v.detached_mounts.borrow().is_empty());
+            let fd = v.open_at(dir as i32, b"sub/data", 0, 0).unwrap();
+            assert_eq!(v.read(fd, 4).unwrap(), b"live");
+            v.close(fd).unwrap();
+            match retirement {
+                0 => v.close(dir).unwrap(),
+                1 => {
+                    let replacement = v.memfd_create(b"replacement", 0).unwrap();
+                    v.dup3(replacement, dir, 0).unwrap();
+                }
+                2 => v.close_all(),
+                _ => v.close_exec(),
+            }
+            assert!(v.detached_mounts.borrow().is_empty());
+        }
     }
     #[test]
     fn namespace_limit_failure_is_atomic_and_recoverable() {

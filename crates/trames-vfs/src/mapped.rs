@@ -433,15 +433,57 @@ impl MappedData {
         Ok(())
     }
 }
+#[derive(Clone)]
+enum MappingMount {
+    Shared(Arc<mounts::MountIdentity>),
+    Owner(Rc<Mount>),
+}
+impl MappingMount {
+    fn new(mount: &Rc<Mount>) -> Self {
+        if mount.shared_resources().is_some() {
+            Self::Shared(mount.identity.clone())
+        } else {
+            Self::Owner(mount.clone())
+        }
+    }
+    fn identity(&self) -> &Arc<mounts::MountIdentity> {
+        match self {
+            Self::Shared(identity) => identity,
+            Self::Owner(mount) => &mount.identity,
+        }
+    }
+}
+#[derive(Clone)]
+struct MappingWriter {
+    _lease: WriteLease,
+    _owner: Option<Rc<Mount>>,
+}
+impl MappingWriter {
+    fn new(node: &NodeRef, writers: &Arc<Writers>, mount: Option<&MappingMount>) -> Self {
+        Self {
+            _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity)),
+            _owner: mount.and_then(|m| match m {
+                MappingMount::Owner(owner) => Some(owner.clone()),
+                MappingMount::Shared(_) => None,
+            }),
+        }
+    }
+    #[cfg(test)]
+    fn shared(&self) -> Option<WriteLease> {
+        self._owner.is_none().then(|| self._lease.clone())
+    }
+}
 struct FileMapping {
-    mount: Option<Rc<Mount>>,
+    // Normal mappings need resource/flag identity. Namespace-control ancestry
+    // stays explicitly owner-only rather than escaping in a shared byte lease.
+    mount: Option<MappingMount>,
     node: NodeRef,
     page: Arc<FilePage>,
     cached: RefCell<CachedPage>,
     state: Arc<MappingState>,
     offset: u64,
     writable: bool,
-    writer: Option<WriteLease>,
+    writer: Option<MappingWriter>,
     executable: bool,
 }
 impl FileMapping {
@@ -467,7 +509,7 @@ impl FileMapping {
     }
     fn create(
         node: NodeRef,
-        mount: Option<Rc<Mount>>,
+        mount: Option<MappingMount>,
         offset: u64,
         writable: bool,
         executable: bool,
@@ -478,8 +520,7 @@ impl FileMapping {
             } else {
                 return Err(Errno(19));
             };
-        let writer =
-            writable.then(|| WriteLease::new(&writers, mount.as_ref().map(|m| &m.writers)));
+        let writer = writable.then(|| MappingWriter::new(&node, &writers, mount.as_ref()));
         Ok(Rc::new(Self {
             mount,
             node,
@@ -698,16 +739,15 @@ impl Vfs {
             unreachable!("mapped data")
         };
         drop(n);
-        let mount = o.mount.clone();
+        let mount = o.mount.as_ref().map(MappingMount::new);
         let executable = !matches!(o.anonymous, Some(events::Anonymous::Uring(_)))
             && mount
                 .as_ref()
-                .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
+                .is_none_or(|m| m.identity().flags.get() & mounts::MS_NOEXEC == 0);
         drop(o);
+        let writer = may_write.then(|| MappingWriter::new(&node, &writers, mount.as_ref()));
         let mut pages: Vec<Rc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
-            let writer =
-                may_write.then(|| WriteLease::new(&writers, mount.as_ref().map(|m| &m.writers)));
             pages.push(Rc::new(FileMapping {
                 mount: mount.clone(),
                 node: node.clone(),
@@ -716,7 +756,7 @@ impl Vfs {
                 state: state.clone(),
                 offset: offset + i as u64 * PAGE_SIZE,
                 writable: may_write,
-                writer,
+                writer: writer.clone(),
                 executable,
             }));
         }
@@ -977,13 +1017,16 @@ mod tests {
         let (node, mount) = {
             let descriptor = v.descriptor(fd).unwrap();
             let open = descriptor.open.borrow();
-            (open.node.clone().unwrap(), open.mount.clone())
+            (
+                open.node.clone().unwrap(),
+                open.mount.as_ref().map(MappingMount::new),
+            )
         };
         drop(maps);
         assert!(v.epoch_file_io(fd, false));
         let mapping = FileMapping::create(node, mount, 0, true, false).unwrap();
         mapping.write(0, b"written").unwrap();
-        let retained = mapping.writer.as_ref().unwrap().clone();
+        let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
         let alias = mapping.clone();
         drop(mapping);
         assert!(!v.epoch_file_io(fd, false));
@@ -1008,7 +1051,7 @@ mod tests {
         ));
     }
     #[test]
-    fn retained_writer_pins_unmount_and_detached_tree_until_worker_release() {
+    fn retained_writer_pins_resources_without_retaining_detached_owner_topology() {
         for lazy in [false, true] {
             let mut v = Vfs::default();
             v.mkdir_at(AT_FDCWD, b"/pinned-mount", 0o755).unwrap();
@@ -1025,24 +1068,126 @@ mod tests {
                 (open.node.clone().unwrap(), open.mount.clone())
             };
             let weak = Rc::downgrade(mount.as_ref().unwrap());
-            let mapping = FileMapping::create(node, mount, 0, true, false).unwrap();
-            let retained = mapping.writer.as_ref().unwrap().clone();
+            let resource = Arc::downgrade(&mount.as_ref().unwrap().identity);
+            let mapping =
+                FileMapping::create(node, mount.as_ref().map(MappingMount::new), 0, true, false)
+                    .unwrap();
+            drop(mount);
+            let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
             v.close(fd).unwrap();
             drop(mapping);
             assert_eq!(v.umount(b"/pinned-mount", 0), Err(Errno(16)));
             if lazy {
                 v.umount(b"/pinned-mount", 2).unwrap();
-                v.reap_detached_mounts();
-                assert!(weak.upgrade().is_some());
+                assert!(v.detached_mounts.borrow().is_empty());
+                assert!(weak.upgrade().is_none());
+                assert!(resource.upgrade().is_some());
             }
             std::thread::spawn(move || drop(retained)).join().unwrap();
-            if lazy {
-                v.reap_detached_mounts();
-            } else {
+            if !lazy {
                 v.umount(b"/pinned-mount", 0).unwrap();
             }
             assert!(weak.upgrade().is_none());
+            assert!(resource.upgrade().is_none());
         }
+    }
+    #[test]
+    fn retained_writer_releases_real_inode_filesystem_and_mount_on_last_worker_drop() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/writer-lifetime", 0o755).unwrap();
+        v.mount(Some(b"tmpfs"), b"/writer-lifetime", Some(b"tmpfs"), 0, None)
+            .unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/writer-lifetime/file", 0x42, 0o600)
+            .unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
+        let (node, mount) = {
+            let descriptor = v.descriptor(fd).unwrap();
+            let open = descriptor.open.borrow();
+            (
+                open.node.clone().unwrap(),
+                open.mount.as_ref().unwrap().identity.clone(),
+            )
+        };
+        let inode = Arc::downgrade(&node);
+        let filesystem = Arc::downgrade(&mount.fs.shared);
+        let resource = Arc::downgrade(&mount);
+        let mapping =
+            FileMapping::create(node, Some(MappingMount::Shared(mount)), 0, true, false).unwrap();
+        mapping.write(0, b"retained bytes").unwrap();
+        let retained = mapping.writer.as_ref().unwrap().shared().unwrap();
+        let aliases: Vec<_> = (0..8).map(|_| retained.clone()).collect();
+        v.close(fd).unwrap();
+        drop(mapping);
+        v.umount(b"/writer-lifetime", 2).unwrap();
+        assert!(v.detached_mounts.borrow().is_empty());
+        drop(v);
+        assert!(resource.upgrade().is_some());
+        assert!(filesystem.upgrade().is_some());
+        std::thread::spawn(move || {
+            drop(aliases);
+            let node = inode.upgrade().unwrap();
+            let n = node.borrow();
+            let Content::File(data) = &n.content else {
+                panic!("retained file")
+            };
+            assert_eq!(data.read_at(0, 14).unwrap(), b"retained bytes");
+            drop(n);
+            drop(node);
+            drop(retained);
+            assert!(inode.upgrade().is_none());
+        })
+        .join()
+        .unwrap();
+        assert!(filesystem.upgrade().is_none());
+        assert!(resource.upgrade().is_none());
+    }
+    #[test]
+    fn mapping_under_namespace_control_retains_owner_and_has_no_worker_lease() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    namespaces: v.namespace_snapshot(),
+                    ..ProcessInfo::default()
+                }],
+                ..RuntimeInfo::default()
+            },
+        );
+        let control = Rc::downgrade(&v.root_network);
+        v.import_file(b"/namespace", vec![]).unwrap();
+        v.import_file(b"/data", vec![0; PAGE_SIZE as usize])
+            .unwrap();
+        v.mount(Some(b"/proc/self/ns/net"), b"/namespace", None, 4096, None)
+            .unwrap();
+        v.mount(Some(b"/data"), b"/namespace", None, 4096, None)
+            .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/namespace", 2, 0).unwrap();
+        drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
+        let (node, mount) = {
+            let descriptor = v.descriptor(fd).unwrap();
+            let open = descriptor.open.borrow();
+            (
+                open.node.clone().unwrap(),
+                MappingMount::new(open.mount.as_ref().unwrap()),
+            )
+        };
+        assert!(matches!(mount, MappingMount::Owner(_)));
+        let mapping = FileMapping::create(node, Some(mount), 0, true, false).unwrap();
+        assert!(mapping.writer.as_ref().unwrap().shared().is_none());
+        v.close(fd).unwrap();
+        drop(v);
+        assert!(control.upgrade().is_some());
+        mapping.write(0, b"owner-bound").unwrap();
+        let mut bytes = [0; 11];
+        mapping.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"owner-bound");
+        drop(mapping);
+        assert!(control.upgrade().is_none());
     }
     #[test]
     fn serial_private_file_atomics_detach_without_modifying_file_or_peer() {
