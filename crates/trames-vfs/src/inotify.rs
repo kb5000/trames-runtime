@@ -25,7 +25,7 @@ const MAX_EVENTS: usize = 16384;
 pub(super) struct Marks {
     // Allocate shared event identity only when watched, opened or used as a
     // link's parent; untouched inode metadata keeps its allocation-free default.
-    source: OnceCell<Arc<Source>>,
+    source: std::sync::OnceLock<Arc<Source>>,
     links: Vec<Arc<Link>>,
 }
 #[derive(Default)]
@@ -124,7 +124,7 @@ impl Notifications {
         }
     }
 }
-pub(crate) fn capture(node: &Rc<RefCell<Node>>, at: Option<&Arc<Link>>) -> Notifications {
+pub(super) fn capture_node(n: &Node, at: Option<&Arc<Link>>) -> Notifications {
     let mut out = Notifications::default();
     let mut add = |source: &Source, name: &[u8], unlinked| {
         for (weak, wd) in source.snapshot() {
@@ -138,7 +138,6 @@ pub(crate) fn capture(node: &Rc<RefCell<Node>>, at: Option<&Arc<Link>>) -> Notif
             }
         }
     };
-    let n = node.borrow();
     if let Some(source) = n.notifications.source.get() {
         add(source, b"", false);
     }
@@ -179,7 +178,7 @@ impl FileClose {
         })
     }
     pub(super) fn reopen(
-        node: &Rc<RefCell<Node>>,
+        node: &NodeRef,
         flags: u32,
         original: Option<&Arc<FileClose>>,
     ) -> Option<Arc<Self>> {
@@ -323,7 +322,7 @@ impl Drop for InotifyInstance {
     }
 }
 
-pub(super) fn link(node: &Rc<RefCell<Node>>, parent: &Rc<RefCell<Node>>, name: &[u8]) {
+pub(super) fn link(node: &NodeRef, parent: &NodeRef, name: &[u8]) {
     let parent = parent.borrow().notifications.source().clone();
     let mut n = node.borrow_mut();
     n.notifications
@@ -344,7 +343,7 @@ pub(super) fn link(node: &Rc<RefCell<Node>>, parent: &Rc<RefCell<Node>>, name: &
             linked: true,
         }))));
 }
-pub(super) fn unlink(node: &Rc<RefCell<Node>>, parent: &Rc<RefCell<Node>>, name: &[u8]) {
+pub(super) fn unlink(node: &NodeRef, parent: &NodeRef, name: &[u8]) {
     let parent = parent.borrow().notifications.source().clone();
     node.borrow_mut().notifications.links.retain(|l| {
         let mut state = l.0.lock().unwrap();
@@ -357,10 +356,10 @@ pub(super) fn unlink(node: &Rc<RefCell<Node>>, parent: &Rc<RefCell<Node>>, name:
     });
 }
 pub(super) fn move_link(
-    node: &Rc<RefCell<Node>>,
-    old: &Rc<RefCell<Node>>,
+    node: &NodeRef,
+    old: &NodeRef,
     old_name: &[u8],
-    new: &Rc<RefCell<Node>>,
+    new: &NodeRef,
     name: &[u8],
 ) {
     let old = old.borrow().notifications.source().clone();
@@ -376,7 +375,7 @@ pub(super) fn move_link(
         }
     }
 }
-pub(super) fn notify(node: &Rc<RefCell<Node>>, mask: u32, at: Option<&Arc<Link>>) {
+pub(super) fn notify(node: &NodeRef, mask: u32, at: Option<&Arc<Link>>) {
     let n = node.borrow();
     let mask = mask
         | if matches!(n.content, Content::Directory) {
@@ -449,10 +448,7 @@ impl Vfs {
             _ => None,
         })
     }
-    pub(super) fn notification_parent(
-        &self,
-        path: &ResolvedPath,
-    ) -> Option<(Rc<RefCell<Node>>, Vec<u8>)> {
+    pub(super) fn notification_parent(&self, path: &ResolvedPath) -> Option<(NodeRef, Vec<u8>)> {
         let i = path.iter().rposition(|b| *b == b'/')?;
         if path.key == b"/" {
             return None;
@@ -482,12 +478,7 @@ impl Vfs {
             );
         }
     }
-    pub(super) fn notification_link(
-        &self,
-        path: &ResolvedPath,
-        node: &Rc<RefCell<Node>>,
-        add: bool,
-    ) {
+    pub(super) fn notification_link(&self, path: &ResolvedPath, node: &NodeRef, add: bool) {
         if let Some((parent, name)) = self.notification_parent(path) {
             if add {
                 link(node, &parent, &name);
@@ -499,7 +490,7 @@ impl Vfs {
     pub(super) fn notification_open(
         &self,
         path: &ResolvedPath,
-        node: &Rc<RefCell<Node>>,
+        node: &NodeRef,
         flags: u32,
     ) -> Option<Arc<FileClose>> {
         if flags & O_PATH != 0 {

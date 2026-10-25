@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded inode attributes. File capabilities and ACLs require separate policy.
 use super::*;
-type AttributeNode = (Rc<RefCell<Node>>, Rc<RefCell<Filesystem>>);
+type AttributeNode = (NodeRef, Rc<RefCell<Filesystem>>);
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
 pub(super) fn overlay_attribute(name: &[u8]) -> bool {
     matches!(
@@ -152,7 +152,7 @@ impl Vfs {
             .borrow()
             .inodes
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
             .map(|n| xattr_size(&n.borrow().xattrs))
             .sum();
         let result = if invalid || used > XATTR_BUDGET {

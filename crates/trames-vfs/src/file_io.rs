@@ -29,7 +29,7 @@ impl DirectFiles {
 }
 #[derive(Default)]
 pub struct FileEpoch {
-    nodes: BTreeMap<usize, (Weak<RefCell<Node>>, Arc<PlainFile>)>,
+    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, Arc<PlainFile>)>,
     captures: BTreeMap<(usize, bool, bool, u64), DirectFiles>,
 }
 impl FileEpoch {
@@ -107,19 +107,19 @@ impl FileEpoch {
             return None;
         }
         let data = data.clone();
-        let key = Rc::as_ptr(&node) as usize;
+        let key = Arc::as_ptr(&node) as usize;
         if let std::collections::btree_map::Entry::Vacant(entry) = self.nodes.entry(key) {
             data.activate(n.mode, n.times);
-            entry.insert((Rc::downgrade(&node), data.clone()));
+            entry.insert((Arc::downgrade(&node), data.clone()));
         }
         let notifications =
-            inotify::capture(&node, o.notification.as_ref().and_then(|c| c.link.as_ref()));
+            inotify::capture_node(&n, o.notification.as_ref().and_then(|c| c.link.as_ref()));
         let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
         let write_error = o
             .mount
             .as_ref()
             .map_or(Ok(()), |m| m.writable())
-            .and_then(|()| vfs.pseudo_immutable(&node))
+            .and_then(|()| Vfs::pseudo_immutable_node(&n))
             .err();
         Some(DirectFile {
             data,

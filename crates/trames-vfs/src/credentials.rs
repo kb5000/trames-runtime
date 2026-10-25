@@ -280,13 +280,7 @@ impl Vfs {
                 && bits & 2 == 0
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
-    fn chown_node(
-        &self,
-        node: Rc<RefCell<Node>>,
-        uid: u32,
-        gid: u32,
-        persistent: bool,
-    ) -> Result<()> {
+    fn chown_node(&self, node: NodeRef, uid: u32, gid: u32, persistent: bool) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;

@@ -40,7 +40,7 @@ impl Vfs {
         if target.is_some() && flags == 1 {
             return Err(Errno(17));
         }
-        if target.as_ref().is_some_and(|n| Rc::ptr_eq(n, &src)) {
+        if target.as_ref().is_some_and(|n| Arc::ptr_eq(n, &src)) {
             return Ok(());
         }
         let is_dir = matches!(src.borrow().content, Content::Directory);
@@ -139,7 +139,7 @@ impl Vfs {
             .send(inotify::MOVE_SELF, 0, b"", false);
         Ok(())
     }
-    fn chmod_node(&self, node: Rc<RefCell<Node>>, mode: u32, persistent: bool) -> Result<()> {
+    fn chmod_node(&self, node: NodeRef, mode: u32, persistent: bool) -> Result<()> {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {

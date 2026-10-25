@@ -129,7 +129,7 @@ pub(super) struct PipeEnd {
     pub(super) pipe: Pipe,
     // Anonymous pipe inode; named FIFO descriptions already hold their Node.
     // Metadata does not define the shared resource or its last-close point.
-    pub(super) metadata: Option<Rc<RefCell<Node>>>,
+    pub(super) metadata: Option<NodeRef>,
 }
 impl PipeEnd {
     pub(super) fn open(pipe: &Pipe, flags: u32) -> Result<Option<Rc<Self>>> {
@@ -144,12 +144,7 @@ impl PipeEnd {
             metadata: None,
         })))
     }
-    pub(super) fn new(
-        pipe: Pipe,
-        read: bool,
-        write: bool,
-        metadata: Option<Rc<RefCell<Node>>>,
-    ) -> Rc<Self> {
+    pub(super) fn new(pipe: Pipe, read: bool, write: bool, metadata: Option<NodeRef>) -> Rc<Self> {
         let data = pipe.data.clone();
         let endpoint = PipeEndpoint::anonymous(data, read, write);
         Rc::new(Self {
@@ -214,7 +209,7 @@ mod tests {
         v.mknod_at(AT_FDCWD, b"/fifo", 0o10666, 0).unwrap();
         v.link_at(AT_FDCWD, b"/fifo", AT_FDCWD, b"/alias").unwrap();
         let old = identity(&v, b"/fifo");
-        let old_node = Rc::downgrade(&v.node(b"/fifo").unwrap());
+        let old_node = Arc::downgrade(&v.node(b"/fifo").unwrap());
         assert!(Arc::ptr_eq(&old.data, &identity(&v, b"/alias").data));
         let reader = v.open_at(AT_FDCWD, b"/alias", O_NONBLOCK, 0).unwrap();
         let writer = v.open_at(AT_FDCWD, b"/fifo", 1 | O_NONBLOCK, 0).unwrap();

@@ -13,6 +13,7 @@ pub(super) enum Bytes {
 pub(super) struct PlainFile {
     bytes: RwLock<Bytes>,
     length: AtomicU64,
+    logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
     backing: Option<Arc<storage::DiskBacking>>,
     pending: AtomicUsize,
     meta: Mutex<Option<FileMeta>>,
@@ -45,6 +46,7 @@ impl PlainFile {
         Arc::new(Self {
             bytes: RwLock::new(bytes),
             length: AtomicU64::new(length),
+            logical_size: std::sync::OnceLock::new(),
             backing,
             pending: AtomicUsize::new(0),
             meta: Mutex::new(None),
@@ -100,6 +102,25 @@ impl PlainFile {
     pub fn len(&self) -> u64 {
         self.length.load(Ordering::Relaxed)
     }
+    pub fn logical_size(&self) -> trames_shared::LogicalSize {
+        if let Some(size) = self.logical_size.get() {
+            return size.clone();
+        }
+        let _bytes = self.bytes.read().unwrap();
+        self.logical_size
+            .get_or_init(|| trames_shared::LogicalSize::new(self.len()))
+            .clone()
+    }
+    fn publish_length(&self, length: u64) {
+        self.length.store(length, Ordering::Relaxed);
+        if let Some(size) = self
+            .logical_size
+            .get()
+            .filter(|s| s.load(Ordering::Relaxed) != length)
+        {
+            size.store(length, Ordering::Relaxed);
+        }
+    }
     pub fn disk_backed(&self) -> bool {
         self.backing.is_some()
     }
@@ -131,7 +152,7 @@ impl PlainFile {
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let mut data = self.bytes.write().unwrap();
         let result = data.write_at(offset, bytes, None);
-        self.length.store(data.len(), Ordering::Relaxed);
+        self.publish_length(data.len());
         result
     }
     /// None is strictly before effects: growth, host blocking bulk writes and
@@ -177,7 +198,7 @@ impl PlainFile {
                 d.length = length;
             }
         }
-        self.length.store(length, Ordering::Relaxed);
+        self.publish_length(length);
         Ok(())
     }
     pub fn sync(&self, data_only: bool) -> Result<()> {

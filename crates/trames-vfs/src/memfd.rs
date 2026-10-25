@@ -77,11 +77,12 @@ impl Vfs {
         }
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: 16,
             content: Content::File(storage::FileData::Shared(
                 trames_shared::SharedFile::anonymous_in(fs.shared_budget.clone())
@@ -97,7 +98,7 @@ impl Vfs {
             xattrs: BTreeMap::new(),
             seals: Some(if flags & 2 != 0 { 0 } else { 1 }),
         }));
-        fs.inodes.push(Rc::downgrade(&node));
+        fs.inodes.push(Arc::downgrade(&node));
         drop(fs);
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);

@@ -69,7 +69,7 @@ struct Connection {
 struct PipeRelay {
     host: trames_shared::NativePipe,
     guest: Arc<PipeEndpoint>,
-    _metadata: Option<Rc<RefCell<Node>>>,
+    _metadata: Option<NodeRef>,
     to_native: bool,
 }
 impl PipeRelay {
@@ -77,7 +77,7 @@ impl PipeRelay {
         host: trames_shared::NativePipe,
         pipe: Pipe,
         to_native: bool,
-        metadata: Option<Rc<RefCell<Node>>>,
+        metadata: Option<NodeRef>,
     ) -> Self {
         Self {
             host,
@@ -587,11 +587,12 @@ impl Vfs {
         }
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: 16,
             content: Content::File(storage::FileData::Shared(file)),
             mode: 0o100400,
@@ -604,7 +605,7 @@ impl Vfs {
             xattrs: BTreeMap::new(),
             seals: Some(15),
         }));
-        fs.inodes.push(Rc::downgrade(&node));
+        fs.inodes.push(Arc::downgrade(&node));
         drop(fs);
         Ok(Rc::new(RefCell::new(OpenDescription {
             read_node: None,

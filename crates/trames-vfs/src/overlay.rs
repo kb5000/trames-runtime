@@ -5,7 +5,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-type Tree = BTreeMap<Vec<u8>, Rc<RefCell<Node>>>;
+type Tree = BTreeMap<Vec<u8>, NodeRef>;
 static NEXT_DEVICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x6f00_0000);
 #[derive(Clone)]
 struct Layer {
@@ -66,7 +66,7 @@ impl Metadata {
     }
 }
 struct Entry {
-    node: Weak<RefCell<Node>>,
+    node: std::sync::Weak<Inode>,
     metadata: Metadata,
 }
 fn snapshot(paths: &Tree) -> BTreeMap<Vec<u8>, Entry> {
@@ -76,7 +76,7 @@ fn snapshot(paths: &Tree) -> BTreeMap<Vec<u8>, Entry> {
             (
                 p.clone(),
                 Entry {
-                    node: Rc::downgrade(n),
+                    node: Arc::downgrade(n),
                     metadata: Metadata::of(&n.borrow()),
                 },
             )
@@ -99,8 +99,8 @@ pub(super) struct Overlay {
 fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
 }
-fn pointer(n: &Rc<RefCell<Node>>) -> usize {
-    Rc::as_ptr(n) as usize
+fn pointer(n: &NodeRef) -> usize {
+    Arc::as_ptr(n) as usize
 }
 fn attribute(node: &Node, tail: &[u8], userxattr: bool) -> bool {
     [if userxattr {
@@ -161,7 +161,7 @@ impl Overlay {
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
         Vfs::filesystem_empty_data(&mut upper.fs.borrow_mut())
     }
-    fn copy_up(&self, node: &Rc<RefCell<Node>>, truncate: bool) -> Result<()> {
+    fn copy_up(&self, node: &NodeRef, truncate: bool) -> Result<()> {
         let id = pointer(node);
         if !self.uncopied.borrow().contains(&id) {
             return Ok(());
@@ -208,12 +208,7 @@ impl Overlay {
         self.dirty.borrow_mut().insert(id);
         Ok(())
     }
-    pub(super) fn prepare(
-        &self,
-        fs: &Filesystem,
-        node: &Rc<RefCell<Node>>,
-        truncate: bool,
-    ) -> Result<()> {
+    pub(super) fn prepare(&self, fs: &Filesystem, node: &NodeRef, truncate: bool) -> Result<()> {
         self.copy_up(node, truncate)?;
         self.checkpoint(fs)
     }
@@ -249,7 +244,7 @@ impl Overlay {
         let mut changed = BTreeSet::new();
         for (p, n) in &fs.paths {
             let modified = baseline.get(p).is_none_or(|e| {
-                e.node.upgrade().is_none_or(|old| !Rc::ptr_eq(&old, n))
+                e.node.upgrade().is_none_or(|old| !Arc::ptr_eq(&old, n))
                     || e.metadata != Metadata::of(&n.borrow())
             });
             if modified || self.dirty.borrow().contains(&pointer(n)) {
@@ -317,11 +312,12 @@ impl Overlay {
             if self.lower.contains_key(p) {
                 let inode = backing.next_inode;
                 backing.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
-                let n = Rc::new(RefCell::new(Node {
-                    record_locks: OnceCell::new(),
-                    whole_locks: OnceCell::new(),
+                let n = Arc::new(Inode::new(Node {
+                    identity: 0,
+                    record_locks: std::sync::OnceLock::new(),
+                    whole_locks: std::sync::OnceLock::new(),
                     notifications: inotify::Marks::default(),
-                    path_hint: RefCell::default(),
+                    path_hint: SharedCell::default(),
                     device: upper.fs_device(),
                     content: pseudo::Device::node(0, false),
                     mode: 0o20000,
@@ -341,7 +337,7 @@ impl Overlay {
             let n = fs.paths.get(p).ok_or(Errno(5))?;
             if baseline.get(p).is_some_and(|e| {
                 e.node.upgrade().is_some_and(|old| {
-                    !Rc::ptr_eq(&old, n) && matches!(old.borrow().content, Content::Directory)
+                    !Arc::ptr_eq(&old, n) && matches!(old.borrow().content, Content::Directory)
                 })
             }) {
                 let key = upper.key(p);
@@ -353,7 +349,7 @@ impl Overlay {
                 && self.lower.contains_key(p)
                 && baseline
                     .get(p)
-                    .is_none_or(|e| e.node.upgrade().is_none_or(|old| !Rc::ptr_eq(&old, n)))
+                    .is_none_or(|e| e.node.upgrade().is_none_or(|old| !Arc::ptr_eq(&old, n)))
             {
                 let name = self.attr_name(b"opaque");
                 let old = n.borrow_mut().xattrs.insert(name.clone(), b"y".to_vec());
@@ -376,23 +372,27 @@ impl Overlay {
         let mut known: BTreeSet<_> = backing
             .inodes
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
             .map(|n| pointer(&n))
             .collect();
         for (id, (n, _)) in &all {
             if n.borrow().links != 0 && known.insert(*id) {
-                backing.inodes.push(Rc::downgrade(n));
+                backing.inodes.push(Arc::downgrade(n));
             }
         }
         backing.inodes.retain(|n| n.strong_count() != 0);
         let capacity = Vfs::filesystem_capacity(&backing);
         let mut attr_bytes = 0usize;
-        let invalid_attrs = backing.inodes.iter().filter_map(Weak::upgrade).any(|n| {
-            let n = n.borrow();
-            let bytes = xattr::xattr_size(&n.xattrs);
-            attr_bytes = attr_bytes.saturating_add(bytes);
-            n.xattrs.len() > 128 || bytes > 65536 || attr_bytes > xattr::XATTR_BUDGET
-        });
+        let invalid_attrs = backing
+            .inodes
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|n| {
+                let n = n.borrow();
+                let bytes = xattr::xattr_size(&n.xattrs);
+                attr_bytes = attr_bytes.saturating_add(bytes);
+                n.xattrs.len() > 128 || bytes > 65536 || attr_bytes > xattr::XATTR_BUDGET
+            });
         let result = if capacity.used_bytes > capacity.budget_bytes
             || capacity.nodes_used > capacity.node_limit
             || invalid_attrs
@@ -621,7 +621,7 @@ impl Vfs {
             let n = if upper_nodes.contains(&id) {
                 source
             } else if let Some(n) = clones.get(&id) {
-                Rc::clone(n)
+                Arc::clone(n)
             } else {
                 let inode = if o.upper.is_some() {
                     o.allocate_inode()?
@@ -641,11 +641,12 @@ impl Vfs {
                     Content::Fifo(p) => Content::Fifo(p.clone()),
                     Content::Socket(s) => Content::Socket(s.clone()),
                 };
-                let copy = Rc::new(RefCell::new(Node {
-                    record_locks: OnceCell::new(),
-                    whole_locks: OnceCell::new(),
+                let copy = Arc::new(Inode::new(Node {
+                    identity: 0,
+                    record_locks: std::sync::OnceLock::new(),
+                    whole_locks: std::sync::OnceLock::new(),
                     notifications: inotify::Marks::default(),
-                    path_hint: RefCell::default(),
+                    path_hint: SharedCell::default(),
                     device: n.device,
                     content,
                     mode: n.mode,
@@ -689,7 +690,7 @@ impl Vfs {
         *o.baseline.borrow_mut() = snapshot(&paths);
         let mut unique = BTreeMap::new();
         for n in paths.values() {
-            unique.insert(pointer(n), Rc::downgrade(n));
+            unique.insert(pointer(n), Arc::downgrade(n));
         }
         let ro = readonly || o.upper.is_none();
         let fs = Filesystem {
@@ -707,7 +708,7 @@ impl Vfs {
     pub(super) fn overlay_prepare(
         &self,
         at: &ResolvedPath,
-        node: &Rc<RefCell<Node>>,
+        node: &NodeRef,
         truncate: bool,
     ) -> Result<()> {
         let fs = at.filesystem(self);

@@ -39,7 +39,7 @@ impl DiskReadCache {
 /// Retained only by the coordinator until the submitted read is completed.
 pub struct DiskRead {
     open: Rc<RefCell<OpenDescription>>,
-    node: Rc<RefCell<Node>>,
+    node: NodeRef,
     backing: Arc<storage::DiskBacking>,
     positioned: bool,
     position: Arc<std::sync::Mutex<file_data::FilePosition>>,
@@ -101,7 +101,7 @@ impl DiskRead {
         let o = d.open.borrow();
         let Some(node) = &o.node else { return false };
         // Retained inode identity also covers a mapped wrapper, if present.
-        Rc::ptr_eq(&self.node, node)
+        Arc::ptr_eq(&self.node, node)
             || matches!(&node.borrow().content, Content::File(data)
                 if data.disk_source().is_some_and(|(b,_)| Arc::ptr_eq(&b, &self.backing)))
     }
@@ -188,7 +188,7 @@ impl Vfs {
     }
     pub(super) fn complete_file_read(
         o: &OpenDescription,
-        node: &Rc<RefCell<Node>>,
+        node: &NodeRef,
         result: &Result<Vec<u8>>,
         access: bool,
     ) {
@@ -196,7 +196,7 @@ impl Vfs {
             mounts::accessed(&mut node.borrow_mut(), o.mount.as_ref());
         }
         let notification_node = o.node.as_ref().unwrap_or(node);
-        if !Rc::ptr_eq(notification_node, node) && result.is_ok() {
+        if !Arc::ptr_eq(notification_node, node) && result.is_ok() {
             mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_ref());
         }
         if result.as_ref().is_ok_and(|b| !b.is_empty())

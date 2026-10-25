@@ -473,14 +473,14 @@ pub struct RuntimeInfo {
 pub(super) struct PseudoFs {
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
-    pub(super) nodes: BTreeMap<(u64, Vec<u8>), Rc<RefCell<Node>>>,
+    pub(super) nodes: BTreeMap<(u64, Vec<u8>), NodeRef>,
     next_inode: u64,
 }
 impl PseudoFs {
-    pub(super) fn path_of(&self, node: &Rc<RefCell<Node>>) -> Option<Vec<u8>> {
+    pub(super) fn path_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
         self.nodes
             .iter()
-            .find(|(_, n)| Rc::ptr_eq(n, node))
+            .find(|(_, n)| Arc::ptr_eq(n, node))
             .map(|((_, p), _)| p.clone())
     }
     pub(super) fn cache(
@@ -489,7 +489,7 @@ impl PseudoFs {
         path: &[u8],
         content: Content,
         mode: u32,
-    ) -> Result<Rc<RefCell<Node>>> {
+    ) -> Result<NodeRef> {
         if let Some(node) = self.nodes.get(&(ns, path.to_vec())) {
             node.borrow_mut().content = content;
             return Ok(node.clone());
@@ -498,11 +498,12 @@ impl PseudoFs {
             return Err(Errno(28));
         }
         self.next_inode = self.next_inode.checked_add(1).ok_or(Errno(28))?;
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             content,
             mode,
             uid: 0,
@@ -785,8 +786,10 @@ impl Vfs {
                 || path == b"/sys"
                 || path.starts_with(b"/sys/"))
     }
-    pub(super) fn pseudo_immutable(&self, node: &Rc<RefCell<Node>>) -> Result<()> {
-        let n = node.borrow();
+    pub(super) fn pseudo_immutable(&self, node: &NodeRef) -> Result<()> {
+        Self::pseudo_immutable_node(&node.borrow())
+    }
+    pub(super) fn pseudo_immutable_node(n: &Node) -> Result<()> {
         if n.volatile && !matches!(n.content, Content::Device(_)) {
             Err(Errno(30))
         } else {
@@ -843,7 +846,10 @@ impl Vfs {
         let Some((node, label, mount)) = self.proc_exe_node_normalized(&actual)? else {
             return Ok(None);
         };
-        let owner = (node.borrow().uid, node.borrow().gid);
+        let owner = {
+            let metadata = node.borrow();
+            (metadata.uid, metadata.gid)
+        };
         Ok(Some(Rc::new(RefCell::new(OpenDescription {
             read_node: None,
             id: self.open_id(),
@@ -1184,10 +1190,7 @@ impl Vfs {
         }
         Ok(())
     }
-    pub(super) fn pseudo_node<P: PathArg + ?Sized>(
-        &self,
-        at: &P,
-    ) -> Result<Option<Rc<RefCell<Node>>>> {
+    pub(super) fn pseudo_node<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<NodeRef>> {
         let path = at.key();
         if ![b"/proc".as_slice(), b"/sys", b"/dev"].iter().any(|base| {
             path == *base

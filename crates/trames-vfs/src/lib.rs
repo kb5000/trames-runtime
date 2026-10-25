@@ -13,6 +13,8 @@ mod pipe;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 mod fd_table;
+mod shared_cell;
+use shared_cell::SharedCell;
 mod flock;
 use fd_table::{Descriptor, DescriptorTable};
 pub use flock::FlockRequest;
@@ -151,9 +153,9 @@ struct OpenDescription {
     position: u64,
     file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
     flock: OnceCell<Arc<flock::Owner>>,
-    node: Option<Rc<RefCell<Node>>>,
+    node: Option<NodeRef>,
     // Overlay read descriptions retain the real lower file selected at open.
-    read_node: Option<Rc<RefCell<Node>>>,
+    read_node: Option<NodeRef>,
     pipe: Option<Rc<PipeEnd>>,
     socket: Option<Rc<NetSocket>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
@@ -203,10 +205,10 @@ impl OpenDescription {
             self.position
         }
     }
-    fn data_node(&self) -> Option<Rc<RefCell<Node>>> {
+    fn data_node(&self) -> Option<NodeRef> {
         self.read_node.clone().or_else(|| self.node.clone())
     }
-    fn metadata_node(&self) -> Option<Rc<RefCell<Node>>> {
+    fn metadata_node(&self) -> Option<NodeRef> {
         self.node
             .clone()
             .or_else(|| self.pipe.as_ref()?.metadata.clone())
@@ -222,13 +224,85 @@ enum Content {
     Fifo(Pipe),
     Socket(ipc::PathBinding),
 }
+type NodeRef = Arc<Inode>;
+struct Inode {
+    identity: u64,
+    state: SharedCell<Node>,
+    length: std::sync::OnceLock<trames_shared::LogicalSize>,
+}
+impl Inode {
+    fn new(mut node: Node) -> Self {
+        node.identity = trames_memory::new_backing_identity();
+        Self {
+            identity: node.identity,
+            state: SharedCell::new(node),
+            length: std::sync::OnceLock::new(),
+        }
+    }
+    fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Node> {
+        self.state.borrow()
+    }
+    fn borrow_mut(&self) -> InodeWrite<'_> {
+        InodeWrite {
+            owner_cell: self,
+            state_guard: self.state.borrow_mut(),
+        }
+    }
+    fn length_for(&self, node: &Node) -> trames_shared::LogicalSize {
+        self.length
+            .get_or_init(|| {
+                let size = trames_shared::LogicalSize::new(0);
+                if let Content::File(data) = &node.content {
+                    size.follow(&data.logical_size())
+                        .expect("acyclic lower inode sizes");
+                }
+                size.on_change(trames_memory::backing_changed);
+                size
+            })
+            .clone()
+    }
+    fn logical_size(&self) -> trames_shared::LogicalSize {
+        if let Some(size) = self.length.get() {
+            return size.clone();
+        }
+        self.length_for(&self.borrow())
+    }
+}
+struct InodeWrite<'a> {
+    owner_cell: &'a Inode,
+    state_guard: std::sync::RwLockWriteGuard<'a, Node>,
+}
+impl std::ops::Deref for InodeWrite<'_> {
+    type Target = Node;
+    fn deref(&self) -> &Node {
+        &self.state_guard
+    }
+}
+impl std::ops::DerefMut for InodeWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Node {
+        &mut self.state_guard
+    }
+}
+impl Drop for InodeWrite<'_> {
+    fn drop(&mut self) {
+        if let Some(size) = self.owner_cell.length.get() {
+            if let Content::File(data) = &self.state_guard.content {
+                size.follow(&data.logical_size())
+                    .expect("acyclic lower inode sizes");
+            } else {
+                size.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
 struct Node {
-    record_locks: OnceCell<Arc<locks::Records>>,
-    whole_locks: OnceCell<Arc<flock::Whole>>,
+    identity: u64,
+    record_locks: std::sync::OnceLock<Arc<locks::Records>>,
+    whole_locks: std::sync::OnceLock<Arc<flock::Whole>>,
     notifications: inotify::Marks,
     // A validated name hint, not an authorization or lifetime cache. It follows
     // the inode and is not serialized; rename/unlink/bind-root changes miss.
-    path_hint: RefCell<Option<Vec<u8>>>,
+    path_hint: SharedCell<Option<Vec<u8>>>,
     device: u64,
     content: Content,
     mode: u32,
@@ -253,12 +327,8 @@ impl Node {
             times: self.times,
         }
     }
-    fn path_in(
-        &self,
-        paths: &BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
-        root: &[u8],
-    ) -> Option<Vec<u8>> {
-        let matches = |node: &Rc<RefCell<Node>>| std::ptr::eq(&*node.borrow(), self);
+    fn path_in(&self, paths: &BTreeMap<Vec<u8>, NodeRef>, root: &[u8]) -> Option<Vec<u8>> {
+        let matches = |node: &NodeRef| node.identity == self.identity;
         if let Some(path) = self.path_hint.borrow().as_ref() {
             if mounts::below(path, root) && paths.get(path).is_some_and(matches) {
                 return Some(path.clone());
@@ -272,13 +342,13 @@ impl Node {
         path
     }
 }
-type ResolvedInode = (Rc<RefCell<Node>>, Vec<u8>, Option<Rc<Mount>>);
+type ResolvedInode = (NodeRef, Vec<u8>, Option<Rc<Mount>>);
 type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
 struct Filesystem {
     overlay: Option<Rc<overlay::Overlay>>,
     shared_budget: trames_shared::SharedBudget,
-    paths: BTreeMap<Vec<u8>, Rc<RefCell<Node>>>,
-    inodes: Vec<Weak<RefCell<Node>>>,
+    paths: BTreeMap<Vec<u8>, NodeRef>,
+    inodes: Vec<std::sync::Weak<Inode>>,
     next_inode: u64,
     limits: StorageLimits,
     disk: Option<Arc<storage::DiskStore>>,
@@ -580,7 +650,7 @@ impl Vfs {
     pub fn file_descriptors(&self) -> FdMask {
         self.descriptor_io_masks().1
     }
-    fn ordinary_file(o: &OpenDescription, write: bool) -> Option<Rc<RefCell<Node>>> {
+    fn ordinary_file(o: &OpenDescription, write: bool) -> Option<NodeRef> {
         if !matches!(o.kind, FdKind::Node(_))
             || o.bridge.is_some()
             || o.kernel_log.is_some()
@@ -804,11 +874,12 @@ impl Vfs {
         if let Content::File(data) = &content {
             data.sync(false)?;
         }
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: path
                 .mount
                 .as_ref()
@@ -824,7 +895,7 @@ impl Vfs {
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        fs.inodes.push(Rc::downgrade(&node));
+        fs.inodes.push(Arc::downgrade(&node));
         fs.paths.insert(path.key.clone(), node.clone());
         if let Err(e) = fs.checkpoint() {
             fs.paths.remove(&path.key);
@@ -845,7 +916,7 @@ impl Vfs {
         );
         Ok(())
     }
-    fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<Rc<RefCell<Node>>> {
+    fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<NodeRef> {
         let key = path.key();
         if path
             .mount()
@@ -877,10 +948,13 @@ impl Vfs {
             .borrow()
             .inodes
             .iter()
-            .filter_map(Weak::upgrade)
-            .map(|n| match &n.borrow().content {
-                Content::File(b) if n.borrow().seals.is_none() => b.len(),
-                _ => 0,
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|n| {
+                let node = n.borrow();
+                match &node.content {
+                    Content::File(b) if node.seals.is_none() => b.len(),
+                    _ => 0,
+                }
             })
             .sum()
     }
@@ -892,7 +966,7 @@ impl Vfs {
             )
         }
     }
-    fn path_of(&self, node: &Rc<RefCell<Node>>) -> Result<Vec<u8>> {
+    fn path_of(&self, node: &NodeRef) -> Result<Vec<u8>> {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
             return Ok(path);
         }
@@ -969,7 +1043,7 @@ impl Vfs {
         dirfd: i32,
         path: &[u8],
         follow: bool,
-    ) -> Result<(ResolvedPath, Rc<RefCell<Node>>)> {
+    ) -> Result<(ResolvedPath, NodeRef)> {
         let (path, magic) = self.resolve_entry(dirfd, path, follow, true)?;
         if let Some((node, label, mount)) = magic {
             Ok((ResolvedPath { key: label, mount }, node))
@@ -1842,11 +1916,12 @@ impl Vfs {
         }
         let p = Pipe::new(self.open_id());
         let inode = p.inode;
-        let metadata = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let metadata = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: 6,
             content: Content::Null,
             mode: 0o10600,
@@ -2458,10 +2533,7 @@ impl Vfs {
                     .borrow()
                     .nodes
                     .iter()
-                    .find(|(_, n)| {
-                        let n = n.borrow();
-                        n.device == node.device && n.inode == node.inode
-                    })
+                    .find(|(_, n)| n.identity == node.identity)
                     .map(|((_, p), _)| p.clone())
             });
             if let Some(path) = path {
@@ -2556,10 +2628,11 @@ impl Vfs {
         }
         self.stat_node(
             &Node {
-                record_locks: OnceCell::new(),
-                whole_locks: OnceCell::new(),
+                identity: 0,
+                record_locks: std::sync::OnceLock::new(),
+                whole_locks: std::sync::OnceLock::new(),
                 notifications: inotify::Marks::default(),
-                path_hint: RefCell::default(),
+                path_hint: SharedCell::default(),
                 device: if o.namespace.is_some() {
                     17
                 } else if o.anonymous.is_some() {
@@ -3040,6 +3113,48 @@ mod process_tests {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+    #[test]
+    fn retained_inode_state_is_send_and_sync_without_manual_trait_overrides() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Inode>();
+        shared::<mapped::MappedData>();
+    }
+    #[test]
+    fn inode_metadata_and_last_lease_survive_owner_drop_on_another_worker() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(AT_FDCWD, b"/shared-inode", 0x42, 0o600).unwrap();
+        let inode = v
+            .descriptor(fd)
+            .unwrap()
+            .open
+            .borrow()
+            .node
+            .clone()
+            .unwrap();
+        let weak = Arc::downgrade(&inode);
+        {
+            let mut node = inode.borrow_mut();
+            node.uid = 0;
+            node.gid = !0;
+        }
+        drop(v);
+        std::thread::scope(|scope| {
+            let writer = inode.clone();
+            scope.spawn(move || {
+                for uid in 1..=2000 {
+                    let mut node = writer.borrow_mut();
+                    node.uid = uid;
+                    node.gid = !uid;
+                }
+            });
+            for _ in 0..2000 {
+                let node = inode.borrow();
+                assert_eq!(node.gid, !node.uid);
+            }
+        });
+        std::thread::spawn(move || drop(inode)).join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
     #[test]
     fn directory_mutations_require_parent_write_and_import_uses_canonical_path() {
         let mut v = Vfs::default();

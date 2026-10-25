@@ -54,7 +54,7 @@ impl Drop for IpcNamespace {
 }
 pub(super) struct CgroupNamespace {
     inode: u64,
-    pub root: Option<Rc<RefCell<Node>>>,
+    pub root: Option<NodeRef>,
     pub path: Vec<u8>,
     live: Rc<Cell<usize>>,
 }
@@ -197,7 +197,7 @@ pub struct NamespaceSnapshot {
     pub(super) pid: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) pid_children: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
-    pub(super) root: Option<(Weak<Mount>, Weak<RefCell<Node>>)>,
+    pub(super) root: Option<(Weak<Mount>, std::sync::Weak<Inode>)>,
 }
 
 impl Vfs {
@@ -217,7 +217,7 @@ impl Vfs {
             root: paths.root_mount.as_ref().map(|m| {
                 (
                     Rc::downgrade(m),
-                    Rc::downgrade(paths.root_node.as_ref().unwrap_or(&m.root)),
+                    Arc::downgrade(paths.root_node.as_ref().unwrap_or(&m.root)),
                 )
             }),
         }

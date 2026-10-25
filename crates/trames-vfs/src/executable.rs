@@ -3,7 +3,7 @@
 use super::*;
 
 pub struct ExecutableFile {
-    pub(super) node: Rc<RefCell<Node>>,
+    pub(super) node: NodeRef,
     pub(super) label: Vec<u8>,
     pub(super) mount: Option<Rc<Mount>>,
 }

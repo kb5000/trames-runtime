@@ -110,7 +110,7 @@ impl Timestamp {
 
 pub(super) enum FileData {
     /// Read-through reference; overlay copy-up replaces this before mutation.
-    Lower(Rc<RefCell<Node>>),
+    Lower(NodeRef),
     Plain(Arc<crate::file_data::PlainFile>),
     Shared(trames_shared::SharedFile),
     Mapped(Box<mapped::MappedData>),
@@ -228,6 +228,14 @@ impl FileData {
                 Content::File(data) => data.len(),
                 _ => 0,
             },
+        }
+    }
+    pub(super) fn logical_size(&self) -> trames_shared::LogicalSize {
+        match self {
+            Self::Plain(data) => data.logical_size(),
+            Self::Shared(file) => file.logical_size(),
+            Self::Lower(node) => node.logical_size(),
+            Self::Mapped(data) => data.logical_size(),
         }
     }
     pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
@@ -423,7 +431,7 @@ impl DiskStore {
             .and_then(|f| f.sync_all())
             .map_err(host_errno)
     }
-    fn recover(&self, live: &BTreeMap<u64, Rc<RefCell<Node>>>) -> Result<()> {
+    fn recover(&self, live: &BTreeMap<u64, NodeRef>) -> Result<()> {
         let mut garbage = Vec::new();
         for entry in fs::read_dir(self.root.join("objects")).map_err(host_errno)? {
             let e = entry.map_err(host_errno)?;
@@ -667,11 +675,12 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         }
         nodes.insert(
             ino,
-            Rc::new(RefCell::new(Node {
-                record_locks: OnceCell::new(),
-                whole_locks: OnceCell::new(),
+            Arc::new(Inode::new(Node {
+                identity: 0,
+                record_locks: std::sync::OnceLock::new(),
+                whole_locks: std::sync::OnceLock::new(),
                 notifications: inotify::Marks::default(),
-                path_hint: RefCell::default(),
+                path_hint: SharedCell::default(),
                 device: 0xfd01,
                 content,
                 mode,
@@ -799,7 +808,7 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
         overlay: None,
         shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
         paths,
-        inodes: nodes.values().map(Rc::downgrade).collect(),
+        inodes: nodes.values().map(Arc::downgrade).collect(),
         next_inode,
         limits,
         disk: Some(disk.clone()),
@@ -878,11 +887,12 @@ impl Vfs {
             fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
         }
         let links = old.borrow().links;
-        let new = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let new = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: 0xfd01,
             content: Content::File(data),
             mode: 0o100755,
@@ -896,15 +906,15 @@ impl Vfs {
             seals: None,
         }));
         for n in fs.paths.values_mut() {
-            if Rc::ptr_eq(n, &old) {
+            if Arc::ptr_eq(n, &old) {
                 *n = new.clone();
             }
         }
-        fs.inodes.push(Rc::downgrade(&new));
+        fs.inodes.push(Arc::downgrade(&new));
         old.borrow_mut().links = 0;
         if let Err(e) = fs.checkpoint() {
             for n in fs.paths.values_mut() {
-                if Rc::ptr_eq(n, &new) {
+                if Arc::ptr_eq(n, &new) {
                     *n = old.clone();
                 }
             }
@@ -1016,10 +1026,13 @@ impl Vfs {
         let used = fs
             .inodes
             .iter()
-            .filter_map(Weak::upgrade)
-            .map(|n| match &n.borrow().content {
-                Content::File(b) if n.borrow().seals.is_none() => b.len(),
-                _ => 0,
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|n| {
+                let node = n.borrow();
+                match &node.content {
+                    Content::File(b) if node.seals.is_none() => b.len(),
+                    _ => 0,
+                }
             })
             .sum::<u64>();
         let mut budget = fs.limits.file_bytes;
@@ -1093,7 +1106,7 @@ impl Vfs {
     /// Flush every live file, then the namespace and its directory entry.
     pub fn sync(&self) -> Result<()> {
         let fs = self.fs.borrow();
-        for node in fs.inodes.iter().filter_map(Weak::upgrade) {
+        for node in fs.inodes.iter().filter_map(std::sync::Weak::upgrade) {
             if let Content::File(data) = &node.borrow().content {
                 data.sync(false)?;
             }

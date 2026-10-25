@@ -132,12 +132,12 @@ impl FilePage {
 }
 // The live length is a capability to the actual storage, never a cached length
 // sampled at mmap. PlainFile and SharedFile already publish it atomically.
-// Overlay Lower must follow the retained inode, so it keeps the owner fallback
-// until that inode's content/identity is itself shared.
+// Overlay Lower and volatile files retain an inode's live scalar dependency,
+// including when that inode changes its storage representation.
 enum LiveLength {
     Plain(Arc<file_data::PlainFile>),
     Shared(trames_shared::SharedFile),
-    Owner,
+    Inode(trames_shared::LogicalSize),
 }
 struct MappingState {
     identity: u64,
@@ -145,27 +145,37 @@ struct MappingState {
     length: LiveLength,
 }
 impl MappingState {
-    fn new(data: &FileData, stable: bool) -> Arc<Self> {
+    fn new(data: &FileData, stable: bool, inode: Option<trames_shared::LogicalSize>) -> Arc<Self> {
         Arc::new(Self {
             identity: trames_memory::new_backing_identity(),
             generation: AtomicU64::new(0),
             length: match data {
-                _ if !stable => LiveLength::Owner,
+                _ if !stable => {
+                    LiveLength::Inode(inode.clone().unwrap_or_else(|| data.logical_size()))
+                }
                 FileData::Plain(data) => LiveLength::Plain(data.clone()),
                 FileData::Shared(file) => LiveLength::Shared(file.clone()),
-                _ => LiveLength::Owner,
+                _ => LiveLength::Inode(inode.clone().unwrap_or_else(|| data.logical_size())),
             },
         })
     }
-    fn len(&self) -> Option<u64> {
+    fn len(&self) -> u64 {
         match &self.length {
-            LiveLength::Plain(data) => Some(data.len()),
-            LiveLength::Shared(file) => Some(file.len() as u64),
-            LiveLength::Owner => None,
+            LiveLength::Plain(data) => data.len(),
+            LiveLength::Shared(file) => file.len() as u64,
+            LiveLength::Inode(size) => size.load(Ordering::Relaxed),
         }
     }
     fn domain(&self) -> (u64, u64) {
-        (self.identity, self.generation.load(Ordering::Relaxed))
+        (
+            self.identity,
+            self.generation
+                .load(Ordering::Relaxed)
+                .wrapping_add(match &self.length {
+                    LiveLength::Inode(size) => size.revision(),
+                    _ => 0,
+                }),
+        )
     }
     fn changed(&self) {
         // These counters invalidate caches; byte/VM ownership supplies ordering.
@@ -175,18 +185,25 @@ impl MappingState {
 }
 pub(super) struct MappedData {
     state: Arc<MappingState>,
-    data: RefCell<Box<FileData>>,
-    pages: RefCell<BTreeMap<u64, std::sync::Weak<FilePage>>>,
+    data: SharedCell<Box<FileData>>,
+    pages: SharedCell<BTreeMap<u64, std::sync::Weak<FilePage>>>,
     writers: Arc<Writers>,
 }
 impl MappedData {
+    #[cfg(test)]
     pub(super) fn new(data: FileData, stable: bool) -> Self {
+        Self::with_inode(data, stable, None)
+    }
+    fn with_inode(data: FileData, stable: bool, inode: Option<trames_shared::LogicalSize>) -> Self {
         Self {
-            state: MappingState::new(&data, stable),
-            data: RefCell::new(Box::new(data)),
-            pages: RefCell::new(BTreeMap::new()),
+            state: MappingState::new(&data, stable, inode),
+            data: SharedCell::new(Box::new(data)),
+            pages: SharedCell::new(BTreeMap::new()),
             writers: Arc::default(),
         }
+    }
+    pub(super) fn logical_size(&self) -> trames_shared::LogicalSize {
+        self.data.borrow().logical_size()
     }
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
@@ -418,7 +435,7 @@ impl MappedData {
 }
 struct FileMapping {
     mount: Option<Rc<Mount>>,
-    node: Rc<RefCell<Node>>,
+    node: NodeRef,
     page: Arc<FilePage>,
     cached: RefCell<CachedPage>,
     state: Arc<MappingState>,
@@ -449,7 +466,7 @@ impl FileMapping {
         self.state.changed();
     }
     fn create(
-        node: Rc<RefCell<Node>>,
+        node: NodeRef,
         mount: Option<Rc<Mount>>,
         offset: u64,
         writable: bool,
@@ -483,7 +500,7 @@ impl PageBacking for FileMapping {
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
         // Pseudo inodes can replace their entire content when refreshed. Lower
         // projections also retain their original owner-based change domain.
-        if matches!(self.state.length, LiveLength::Owner) {
+        if matches!(self.state.length, LiveLength::Inode(_)) {
             return match &self.node.borrow().content {
                 Content::File(FileData::Mapped(data)) => Some(data.state.domain()),
                 _ => None,
@@ -514,15 +531,7 @@ impl PageBacking for FileMapping {
         Ok(())
     }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
-        let length = if let Some(length) = self.state.len() {
-            length
-        } else {
-            let n = self.node.borrow();
-            let Content::File(data) = &n.content else {
-                return Err(MemoryError::Bus(address));
-            };
-            data.len()
-        };
+        let length = self.state.len();
         if self.offset / PAGE_SIZE >= length.div_ceil(PAGE_SIZE) {
             return Err(MemoryError::Bus(address));
         }
@@ -665,13 +674,18 @@ impl Vfs {
         let may_write =
             !readonly && shared && o.flags.get() & 3 == 2 && !sealed && !node.borrow().volatile;
         let mut n = node.borrow_mut();
+        let length = node.length_for(&n);
         let stable = !n.volatile;
         let Content::File(data) = &mut n.content else {
             return Err(Errno(19));
         };
         if !matches!(data, FileData::Mapped(_)) {
             let original = std::mem::replace(data, FileData::memory(Vec::new()));
-            *data = FileData::Mapped(Box::new(MappedData::new(original, stable)));
+            *data = FileData::Mapped(Box::new(MappedData::with_inode(
+                original,
+                stable,
+                Some(length),
+            )));
         }
         offset.checked_add(len).ok_or(Errno(22))?;
         let (buffers, state, writers) = if let FileData::Mapped(data) = data {
@@ -781,7 +795,7 @@ mod tests {
                 Content::File(FileData::Mapped(data)) => data.state.clone(),
                 _ => unreachable!(),
             };
-            let weak_node = Rc::downgrade(&node);
+            let weak_node = Arc::downgrade(&node);
             let domain = state.domain();
             let (tx, rx) = std::sync::mpsc::channel();
             let (answer, result) = std::sync::mpsc::channel();
@@ -797,7 +811,7 @@ mod tests {
                 let (live, changed) = result
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
-                assert_eq!(live, Some(length));
+                assert_eq!(live, length);
                 assert_eq!(changed.0, domain.0);
                 assert_ne!(changed.1, domain.1);
             }
@@ -810,7 +824,7 @@ mod tests {
             assert!(weak_node.upgrade().is_none());
             drop(tx);
             let state = worker.join().unwrap();
-            assert_eq!(state.len(), Some(PAGE_SIZE + 1));
+            assert_eq!(state.len(), PAGE_SIZE + 1);
         }
     }
     #[test]
@@ -875,7 +889,7 @@ mod tests {
         }
     }
     #[test]
-    fn lower_mapping_length_keeps_live_owner_fallback() {
+    fn lower_mapping_length_follows_shared_inode_identity() {
         let mut v = Vfs::default();
         let lower = v.open_at(AT_FDCWD, b"/lower-state", 0x42, 0o600).unwrap();
         let alias = v.open_at(AT_FDCWD, b"/alias-state", 0x42, 0o600).unwrap();
@@ -896,14 +910,28 @@ mod tests {
             .node
             .clone()
             .unwrap();
-        node.borrow_mut().content = Content::File(FileData::Lower(source));
+        node.borrow_mut().content = Content::File(FileData::Lower(source.clone()));
         let maps = v.mapping_pages(alias, 0, PAGE_SIZE, false, false).unwrap();
         let guard = node.borrow();
         let Content::File(FileData::Mapped(data)) = &guard.content else {
             unreachable!()
         };
-        assert!(data.state.len().is_none());
+        assert_eq!(data.state.len(), PAGE_SIZE);
         drop(guard);
+        // EOF admission is a scalar capability. It must neither reacquire the
+        // projection's metadata nor enter the source inode during a resize.
+        let source_guard = source.borrow_mut();
+        let alias_guard = node.borrow_mut();
+        maps[0].check(0x9000).unwrap();
+        let Content::File(FileData::Plain(bytes)) = &source_guard.content else {
+            unreachable!()
+        };
+        bytes.truncate(0).unwrap();
+        assert_eq!(maps[0].check(0x9000), Err(MemoryError::Bus(0x9000)));
+        bytes.truncate(PAGE_SIZE).unwrap();
+        maps[0].check(0x9000).unwrap();
+        drop(alias_guard);
+        drop(source_guard);
         maps[0].check(0x9000).unwrap();
         v.truncate_fd(lower, 0).unwrap();
         assert_eq!(maps[0].check(0x9000), Err(MemoryError::Bus(0x9000)));

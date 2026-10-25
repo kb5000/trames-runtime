@@ -30,7 +30,7 @@ pub(super) enum Kind {
 #[derive(Clone)]
 pub(super) struct Attachment {
     pub parent: Rc<Mount>,
-    pub node: Rc<RefCell<Node>>,
+    pub node: NodeRef,
     pub fallback: Vec<u8>,
 }
 impl Attachment {
@@ -42,7 +42,7 @@ impl Attachment {
                 .borrow()
                 .paths
                 .get(&self.fallback)
-                .is_some_and(|n| Rc::ptr_eq(n, &self.node))
+                .is_some_and(|n| Arc::ptr_eq(n, &self.node))
         {
             return self.fallback.clone();
         }
@@ -54,7 +54,7 @@ impl Attachment {
 pub(super) struct Mount {
     pub id: u64,
     pub fs: Rc<RefCell<Filesystem>>,
-    pub root: Rc<RefCell<Node>>,
+    pub root: NodeRef,
     pub root_key: Vec<u8>,
     pub kind: Kind,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
@@ -82,8 +82,8 @@ impl Mount {
             Ok(())
         }
     }
-    pub fn key_of(&self, node: &Rc<RefCell<Node>>) -> Option<Vec<u8>> {
-        if Rc::ptr_eq(node, &self.root) {
+    pub fn key_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
+        if Arc::ptr_eq(node, &self.root) {
             return Some(self.root_path());
         }
         let root = self.root_path();
@@ -99,7 +99,7 @@ impl Mount {
         if fs
             .paths
             .get(&self.root_key)
-            .is_some_and(|n| Rc::ptr_eq(n, &self.root))
+            .is_some_and(|n| Arc::ptr_eq(n, &self.root))
         {
             return self.root_key.clone();
         }
@@ -303,7 +303,7 @@ impl Vfs {
     }
     pub(super) fn location(
         &self,
-        node: &Rc<RefCell<Node>>,
+        node: &NodeRef,
         mount: &Option<Rc<Mount>>,
     ) -> Result<ResolvedPath> {
         // Pseudo endpoints are stored separately. Looking in an unrelated disk
@@ -677,11 +677,12 @@ impl Vfs {
             if matches!(target_node.borrow().content, Content::Directory) {
                 return Err(Errno(20));
             }
-            let root = Rc::new(RefCell::new(Node {
-                record_locks: OnceCell::new(),
-                whole_locks: OnceCell::new(),
+            let root = Arc::new(Inode::new(Node {
+                identity: 0,
+                record_locks: std::sync::OnceLock::new(),
+                whole_locks: std::sync::OnceLock::new(),
                 notifications: inotify::Marks::default(),
-                path_hint: RefCell::default(),
+                path_hint: SharedCell::default(),
                 device: 17,
                 inode: handle.id(),
                 content: Content::Null,
@@ -698,7 +699,7 @@ impl Vfs {
                 overlay: None,
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
-                inodes: vec![Rc::downgrade(&root)],
+                inodes: vec![Arc::downgrade(&root)],
                 next_inode: handle.id() + 1,
                 limits: StorageLimits::memory(),
                 disk: None,
@@ -780,11 +781,12 @@ impl Vfs {
                     };
                     let id = new_mount_id()?;
                     let inode = id << 32;
-                    let root = Rc::new(RefCell::new(Node {
-                        record_locks: OnceCell::new(),
-                        whole_locks: OnceCell::new(),
+                    let root = Arc::new(Inode::new(Node {
+                        identity: 0,
+                        record_locks: std::sync::OnceLock::new(),
+                        whole_locks: std::sync::OnceLock::new(),
                         notifications: inotify::Marks::default(),
-                        path_hint: RefCell::default(),
+                        path_hint: SharedCell::default(),
                         device: id,
                         content: Content::Directory,
                         mode: 0o40000 | mode,
@@ -803,7 +805,7 @@ impl Vfs {
                             memfd::MEMFD_BYTES as usize,
                         ),
                         paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
-                        inodes: vec![Rc::downgrade(&root)],
+                        inodes: vec![Arc::downgrade(&root)],
                         next_inode: inode + 1,
                         limits: StorageLimits {
                             file_bytes: limit,
@@ -833,7 +835,7 @@ impl Vfs {
                             .borrow()
                             .paths
                             .iter()
-                            .find(|(_, n)| Rc::ptr_eq(n, root))
+                            .find(|(_, n)| Arc::ptr_eq(n, root))
                             .map(|(p, _)| p.clone())
                             .ok_or(Errno(2))?;
                         (root.clone(), key)
@@ -1029,7 +1031,7 @@ impl Vfs {
             && paths
                 .cwd_node
                 .as_ref()
-                .is_some_and(|n| Rc::ptr_eq(n, &previous.root))
+                .is_some_and(|n| Arc::ptr_eq(n, &previous.root))
         {
             paths.cwd_mount = Some(new.clone());
             paths.cwd_node = Some(new.root.clone());
@@ -1042,7 +1044,7 @@ impl Vfs {
                 && paths
                     .root_node
                     .as_ref()
-                    .is_some_and(|n| Rc::ptr_eq(n, &previous.root))
+                    .is_some_and(|n| Arc::ptr_eq(n, &previous.root))
         {
             paths.root_mount = Some(new.clone());
             paths.root_node = Some(new.root.clone());

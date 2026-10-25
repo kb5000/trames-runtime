@@ -16,6 +16,8 @@ use std::{
     },
 };
 
+mod logical_size;
+pub use logical_size::{LogicalSize, SizeCycle};
 mod readiness;
 pub use readiness::{IoSignal, IoSubscription, IoWake, Readiness};
 mod host_events;
@@ -113,6 +115,7 @@ struct Inner {
     file: File,
     key: Key,
     logical: AtomicUsize,
+    logical_observer: OnceLock<LogicalSize>,
     capacity: AtomicUsize,
     charged: Mutex<BTreeSet<usize>>,
     allocated: AtomicUsize,
@@ -194,6 +197,7 @@ impl SharedFile {
             file,
             key,
             logical: AtomicUsize::new(size),
+            logical_observer: OnceLock::new(),
             capacity: AtomicUsize::new(capacity),
             charged: Mutex::default(),
             allocated: AtomicUsize::new(0),
@@ -236,6 +240,16 @@ impl SharedFile {
     }
     pub fn len(&self) -> usize {
         self.0.logical.load(Ordering::Acquire)
+    }
+    pub fn logical_size(&self) -> LogicalSize {
+        if let Some(size) = self.0.logical_observer.get() {
+            return size.clone();
+        }
+        let _resize = self.0.resize.lock().unwrap();
+        self.0
+            .logical_observer
+            .get_or_init(|| LogicalSize::new(self.len() as u64))
+            .clone()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -288,6 +302,14 @@ impl SharedFile {
             self.clear_range(length, old - length)?;
         }
         self.0.logical.store(length, Ordering::Release);
+        if let Some(size) = self
+            .0
+            .logical_observer
+            .get()
+            .filter(|s| s.load(Ordering::Relaxed) != length as u64)
+        {
+            size.store(length as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
     fn clear_range(&self, offset: usize, length: usize) -> io::Result<()> {

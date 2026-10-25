@@ -25,8 +25,8 @@ impl Umask {
 
 #[derive(Clone, Default)]
 pub(super) struct Paths {
-    pub cwd_node: Option<Rc<RefCell<Node>>>,
-    pub root_node: Option<Rc<RefCell<Node>>>,
+    pub cwd_node: Option<NodeRef>,
+    pub root_node: Option<NodeRef>,
     pub cwd_mount: Option<Rc<Mount>>,
     pub root_mount: Option<Rc<Mount>>,
 }
@@ -81,12 +81,12 @@ mod tests {
         parent.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
         parent.mkdir_at(AT_FDCWD, b"/b", 0o755).unwrap();
         let root = parent.context.paths.borrow().cwd_node.clone().unwrap();
-        let refs = Rc::strong_count(&root);
+        let refs = Arc::strong_count(&root);
         let mut shared = parent.clone_with_resources(false, true);
         let peers: Vec<_> = (0..32)
             .map(|_| parent.clone_with_resources(true, true))
             .collect();
-        assert_eq!(Rc::strong_count(&root), refs);
+        assert_eq!(Arc::strong_count(&root), refs);
         let fork = parent.clone();
         shared.chdir(b"/a").unwrap();
         assert_eq!(shared.set_umask(0o1077), 0o022);

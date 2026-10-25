@@ -8,7 +8,7 @@ pub use shared::{PtyIo, PtySlaveEndpoint, TerminalAccess};
 pub struct Pty {
     pub number: u32,
     pub(super) mount: Option<Rc<Mount>>,
-    slave: Rc<RefCell<Node>>,
+    slave: NodeRef,
     pub(super) io: Arc<PtyIo>,
     pub locked: Cell<bool>,
     pub hangup_notified: Cell<bool>,
@@ -46,7 +46,7 @@ impl Drop for PtyEnd {
                 if fs
                     .paths
                     .get(&key)
-                    .is_some_and(|node| Rc::ptr_eq(node, &self.pair.slave))
+                    .is_some_and(|node| Arc::ptr_eq(node, &self.pair.slave))
                 {
                     fs.paths.remove(&key);
                     self.pair.slave.borrow_mut().links = 0;
@@ -280,14 +280,7 @@ impl Devpts {
         );
         Ok(out)
     }
-    fn node(
-        &self,
-        path: Vec<u8>,
-        content: Content,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Rc<RefCell<Node>> {
+    fn node(&self, path: Vec<u8>, content: Content, mode: u32, uid: u32, gid: u32) -> NodeRef {
         let mut fs = self.fs.borrow_mut();
         // Linux devpts inode numbers are local to st_dev: root=1, ptmx=2,
         // slave=index+3. runc validates ptmx's inode before using the handle.
@@ -297,11 +290,12 @@ impl Devpts {
             Content::Device(pseudo::Device::Pts(_, number)) => u64::from(*number) + 3,
             _ => unreachable!("devpts only contains its root, ptmx and slaves"),
         };
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             inode,
             device: self.device,
             content,
@@ -315,7 +309,7 @@ impl Devpts {
             seals: None,
         }));
         fs.inodes.retain(|n| n.strong_count() != 0);
-        fs.inodes.push(Rc::downgrade(&node));
+        fs.inodes.push(Arc::downgrade(&node));
         fs.paths.insert(path, node.clone());
         node
     }

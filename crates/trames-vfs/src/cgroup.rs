@@ -42,7 +42,7 @@ struct Group {
     pids_events_local: u64,
 }
 struct Dying {
-    nodes: Vec<Weak<RefCell<Node>>>,
+    nodes: Vec<std::sync::Weak<Inode>>,
     ancestors: Vec<u64>,
 }
 pub(super) struct Cgroups {
@@ -92,11 +92,12 @@ impl Cgroups {
         let mut fs = self.fs.borrow_mut();
         let inode = fs.next_inode;
         fs.next_inode += 1;
-        let node = Rc::new(RefCell::new(Node {
-            record_locks: OnceCell::new(),
-            whole_locks: OnceCell::new(),
+        let node = Arc::new(Inode::new(Node {
+            identity: 0,
+            record_locks: std::sync::OnceLock::new(),
+            whole_locks: std::sync::OnceLock::new(),
             notifications: inotify::Marks::default(),
-            path_hint: RefCell::default(),
+            path_hint: SharedCell::default(),
             device: 5,
             content: if directory {
                 Content::Directory
@@ -113,7 +114,7 @@ impl Cgroups {
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        fs.inodes.push(Rc::downgrade(&node));
+        fs.inodes.push(Arc::downgrade(&node));
         fs.paths.insert(path, node);
         inode
     }
@@ -479,7 +480,7 @@ impl Vfs {
         for key in removed {
             let node = cg.fs.borrow_mut().paths.remove(&key).expect("cgroup inode");
             node.borrow_mut().links = 0;
-            nodes.push(Rc::downgrade(&node));
+            nodes.push(Arc::downgrade(&node));
         }
         cg.groups.remove(&id);
         cg.dying.push(Dying { nodes, ancestors });
@@ -525,7 +526,7 @@ impl Vfs {
         let node = o.node.as_ref().ok_or(Errno(9))?;
         let cg = self.cgroups.borrow();
         let fs = cg.fs.borrow();
-        if !fs.paths.get(key).is_some_and(|n| Rc::ptr_eq(n, node)) {
+        if !fs.paths.get(key).is_some_and(|n| Arc::ptr_eq(n, node)) {
             return Err(Errno(19));
         }
         if matches!(node.borrow().content, Content::Directory) {
