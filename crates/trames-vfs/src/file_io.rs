@@ -91,7 +91,7 @@ impl DirectFiles {
 pub struct FileEpoch {
     nodes: BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>)>,
     prepared: BTreeMap<(usize, bool, bool), PreparedFile>,
-    captures: BTreeMap<(usize, bool, bool, u64), DirectFiles>,
+    captures: BTreeMap<(usize, u64, bool, bool, u64), DirectFiles>,
 }
 impl FileEpoch {
     pub fn capture(&mut self, vfs: &Vfs, unlimited: bool) -> DirectFiles {
@@ -100,8 +100,11 @@ impl FileEpoch {
             return DirectFiles::default();
         }
         let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
+        let membership = vfs.shared_files();
+        let (identity, revision) = membership.capture_identity();
         let key = (
-            Rc::as_ptr(&vfs.fds.identity()) as usize,
+            identity,
+            revision,
             clear_setid,
             unlimited,
             FD_FLAGS_REVISION.load(Ordering::Relaxed),
@@ -131,7 +134,7 @@ impl FileEpoch {
                 entries[fd as usize] = Some(prepared);
             }
         }
-        let capture = DirectFiles(entries.into(), Arc::new(shared), Some(vfs.shared_files()));
+        let capture = DirectFiles(entries.into(), Arc::new(shared), Some(membership));
         self.captures.insert(key, capture.clone());
         capture
     }
@@ -426,6 +429,40 @@ mod tests {
         (vfs, fd)
     }
     #[test]
+    fn prepared_file_cache_keeps_fork_membership_separate_and_clone_files_shared() {
+        let (mut parent, fd) = memory_file(b"old".to_vec());
+        let mut child = parent.clone();
+        let mut shared = parent.clone();
+        shared.share_descriptors_from(&parent);
+        let mut epoch = FileEpoch::default();
+        let a = epoch.capture(&parent, true);
+        let b = epoch.capture(&child, true);
+        let c = epoch.capture(&shared, true);
+        child.close(fd).unwrap();
+        assert!(b.get(fd).is_none());
+        assert!(a.get(fd).is_some());
+        assert!(c.get(fd).is_some());
+        parent.import_file(b"/new", b"new".to_vec()).unwrap();
+        let replacement = child.open_at(AT_FDCWD, b"/new", 2, 0).unwrap();
+        assert_eq!(replacement, fd);
+        let fresh = epoch.capture(&child, true);
+        let mut cache = DiskReadCache::default();
+        assert!(b.get(fd).is_none()); // new OFD needs fresh joined admission
+        assert_eq!(
+            fresh.get(fd).unwrap().read(3, Some(0), &mut cache),
+            Some(Ok(b"new".to_vec()))
+        );
+        assert_eq!(
+            a.get(fd).unwrap().read(3, Some(0), &mut cache),
+            Some(Ok(b"old".to_vec()))
+        );
+        shared.close(fd).unwrap();
+        assert!(a.get(fd).is_none());
+        assert!(c.get(fd).is_none());
+        assert!(fresh.get(fd).is_some());
+        epoch.finish();
+    }
+    #[test]
     fn live_file_membership_resolves_new_aliases_and_reuse_but_accepted_io_stays_original() {
         let (mut v, fd) = memory_file(b"old".to_vec());
         v.import_file(b"/other", b"new".to_vec()).unwrap();
@@ -595,7 +632,11 @@ mod tests {
         let mut epoch = FileEpoch::default();
         let a = epoch.capture(&parent, true);
         let b = epoch.capture(&child, true);
-        assert!(Arc::ptr_eq(&a.0, &b.0));
+        // Fork has distinct live membership while sharing this OFD's policy.
+        assert!(Arc::ptr_eq(
+            &a.get(fd).unwrap().prepared.0,
+            &b.get(fd).unwrap().prepared.0,
+        ));
         assert_eq!(parent.read(fd, 8).unwrap(), 0u64.to_le_bytes());
         let seen = Mutex::new(Vec::new());
         std::thread::scope(|scope| {

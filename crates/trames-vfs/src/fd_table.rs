@@ -92,6 +92,14 @@ impl SharedFd {
     }
 }
 impl SharedFiles {
+    // Cold preparation key: captures retain this membership allocation, so its
+    // address cannot be reused while a matching cache entry remains alive.
+    pub(super) fn capture_identity(&self) -> (usize, u64) {
+        (
+            Arc::as_ptr(&self.0) as usize,
+            self.0.revision.load(Ordering::Relaxed),
+        )
+    }
     pub(super) fn byte_descriptions(&self) -> Vec<SharedFd> {
         let entries = self.0.entries.lock().unwrap();
         entries
@@ -373,10 +381,11 @@ struct TableState {
 pub(super) struct DescriptorMetadata {
     pub(super) flags: RefCell<Option<(u64, FdFlags)>>,
 }
+type PreparedBytes = Arc<[Option<DirectFd>]>;
 #[derive(Clone, Default)]
 pub(super) struct DescriptorVersion {
     pub(super) io: OnceCell<(FdMask, FdMask)>,
-    pub(super) direct: RefCell<Option<(u64, DirectFds)>>,
+    pub(super) direct: RefCell<Option<(u64, PreparedBytes)>>,
     pub(super) urings: OnceCell<Vec<Weak<Uring>>>,
 }
 impl DescriptorTable {
@@ -582,8 +591,9 @@ impl Clone for DescriptorTable {
             })
             .collect();
         drop(source);
-        // Structural resources/OFDs are unchanged by fork. Reuse their cache
-        // identity; only descriptor metadata gets a new ownership domain.
+        // Resource identities are unchanged by fork. Reuse prepared owner
+        // capabilities/masks, but bind live lookups to each new membership.
+        // Per-descriptor metadata also gets a new ownership domain.
         Self(
             Rc::new(RefCell::new(TableState {
                 entries: owners,
@@ -602,6 +612,26 @@ impl Clone for DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forked_byte_cache_keeps_each_actual_membership_when_reusing_owner_capabilities() {
+        let mut parent = Vfs::default();
+        let [reader, writer] = parent.pipe(0).unwrap();
+        let original = parent.direct_descriptors();
+        let mut child = parent.clone();
+        let child_bytes = child.direct_descriptors();
+        let parent_bytes = parent.direct_descriptors(); // cache hit after child capture
+        child.close(reader).unwrap();
+        assert!(child_bytes.get(reader).is_none());
+        assert!(parent_bytes.get(reader).is_some());
+        parent.write(writer, b"p").unwrap();
+        assert_eq!(original.get(reader).unwrap().read(1), Ok(b"p".to_vec()));
+        let [replacement, new_writer] = child.pipe(0).unwrap();
+        assert_eq!(replacement, reader);
+        child.write(new_writer, b"c").unwrap();
+        parent.write(writer, b"p").unwrap();
+        assert_eq!(parent_bytes.get(reader).unwrap().read(1), Ok(b"p".to_vec()));
+        assert_eq!(child_bytes.get(reader).unwrap().read(1), Ok(b"c".to_vec()));
+    }
     #[test]
     fn worker_membership_retains_original_ofd_across_close_and_numeric_reuse() {
         fn shared<T: Send + Sync>() {}

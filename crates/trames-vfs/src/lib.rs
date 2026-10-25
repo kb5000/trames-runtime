@@ -619,7 +619,10 @@ impl Vfs {
             if *old == revision {
                 if let Some((direct_revision, direct)) = &*identity.direct.borrow() {
                     if *direct_revision == revision {
-                        return (snapshot.clone(), direct.clone());
+                        return (
+                            snapshot.clone(),
+                            DirectFds(direct.clone(), Some(self.shared_files())),
+                        );
                     }
                 }
             }
@@ -645,7 +648,7 @@ impl Vfs {
         let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
         *cached = Some((revision, snapshot.clone()));
         let direct = DirectFds(direct.into(), Some(self.shared_files()));
-        *identity.direct.borrow_mut() = Some((revision, direct.clone()));
+        *identity.direct.borrow_mut() = Some((revision, direct.0.clone()));
         (snapshot, direct)
     }
     fn ordinary_stream(o: &OpenDescription) -> bool {
