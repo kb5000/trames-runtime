@@ -82,7 +82,10 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     assert!(b.refresh(&[], 0, 8, &second, &weak));
     assert!(!b.external());
     drop(socket);
-    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    // Last-close EOF is immediate on this local socketpair. A nonblocking read
+    // also fails promptly if a lease leaked; Darwin may reject SO_RCVTIMEO on
+    // the half-closed AF_UNIX socket, before the lifetime assertion runs.
+    peer.set_nonblocking(true).unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 
