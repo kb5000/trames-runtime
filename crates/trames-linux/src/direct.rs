@@ -105,6 +105,7 @@ pub struct DirectSyscalls {
     terminal: Option<trames_vfs::TerminalAccess>,
     kernel_log: Option<trames_vfs::KernelLogAccess>,
     files: trames_vfs::DirectFiles,
+    membership: Option<trames_vfs::SharedFiles>,
     lock_context: Option<trames_vfs::RecordLockContext>,
     disk_cache: RefCell<trames_vfs::DiskReadCache>,
     file_completed: Cell<u64>,
@@ -125,6 +126,7 @@ impl DirectSyscalls {
             terminal: None,
             kernel_log: None,
             files: Default::default(),
+            membership: None,
             lock_context: None,
             disk_cache: Default::default(),
             file_completed: Cell::new(0),
@@ -144,6 +146,25 @@ impl DirectSyscalls {
     pub fn with_files(mut self, files: trames_vfs::DirectFiles) -> Self {
         self.files = files;
         self
+    }
+    pub fn with_membership(mut self, files: trames_vfs::SharedFiles) -> Self {
+        self.membership = Some(files);
+        self
+    }
+    /// Only additions are admitted here. Removal/replacement waits for retained
+    /// byte/poll requests and checkpoint handoff to preserve original OFDs.
+    pub fn invoke_membership(&self, number: u32, args: [u64; 6]) -> Option<Result<u64, Errno>> {
+        let files = self.membership.as_ref()?;
+        let result = match number {
+            23 => files.duplicate(args[0] as u32, 0, false),
+            24 => files.duplicate_to_empty(args[0] as u32, args[1] as u32, args[2] as u32),
+            25 if matches!(args[1], 0 | 1030) => {
+                files.duplicate(args[0] as u32, args[2] as u32, args[1] == 1030)
+            }
+            _ => return None,
+        }?;
+        self.record_fd_control();
+        Some(result.map(u64::from))
     }
     pub fn with_terminal(mut self, access: trames_vfs::TerminalAccess) -> Self {
         self.terminal = Some(access);
@@ -878,6 +899,31 @@ mod tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     use trames_vfs::{Vfs, O_NONBLOCK};
+    #[test]
+    fn membership_additions_use_the_actual_table_and_defer_replacement_without_effects() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
+        let direct = DirectSyscalls::default().with_membership(v.shared_files());
+        assert_eq!(
+            direct.invoke_membership(25, [writer as u64, 1030, 160, 0, 0, 0]),
+            Some(Ok(160))
+        );
+        assert_eq!(
+            direct.invoke_membership(24, [160, 200, 0, 0, 0, 0]),
+            Some(Ok(200))
+        );
+        assert_ne!(v.flags(160).unwrap() & trames_vfs::O_CLOEXEC, 0);
+        assert_eq!(v.flags(200).unwrap() & trames_vfs::O_CLOEXEC, 0);
+        assert!(direct
+            .invoke_membership(24, [writer as u64, reader as u64, 0, 0, 0, 0])
+            .is_none());
+        assert!(direct
+            .invoke_membership(57, [writer as u64, 0, 0, 0, 0, 0])
+            .is_none());
+        assert_eq!(direct.fd_control_completed(), 2);
+        v.write(200, b"live").unwrap();
+        assert_eq!(v.read(reader, 4).unwrap(), b"live");
+    }
     #[test]
     fn syslog_subscription_retries_without_lost_wake_and_cancel_drops_listener() {
         use std::sync::atomic::{AtomicU64, Ordering};

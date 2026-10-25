@@ -55,7 +55,7 @@ impl FileEpoch {
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        for (&fd, descriptor) in &descriptors {
+        for (&fd, descriptor) in descriptors.iter() {
             if mask[fd as usize / 64] & (1 << (fd % 64)) == 0 {
                 continue;
             }

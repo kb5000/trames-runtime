@@ -563,8 +563,7 @@ impl Vfs {
                     })
                     .map(|c| Grant::Connection(c.token))
             } else {
-                drop(description);
-                self.shared_file(fd).ok().map(Grant::Shared)
+                Self::shared_file_open(&description).ok().map(Grant::Shared)
             };
             if let Some(grant) = grant {
                 fds.insert(fd, grant);

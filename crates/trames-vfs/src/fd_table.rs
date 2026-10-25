@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One membership object per Linux files_struct, with stable lookup leases.
+use super::open_handle::OpenView;
 use super::*;
 use std::sync::Mutex;
 
@@ -14,6 +15,18 @@ struct Slot {
     cloexec: CloseOnExec,
 }
 impl Slot {
+    fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
+        let SlotOpen::Shared(open) = &self.open else {
+            return None;
+        };
+        Some(
+            if open.pipe.as_ref().is_some_and(|pipe| pipe.has_waiter()) {
+                Err(Errno(9))
+            } else {
+                Ok(open)
+            },
+        )
+    }
     fn from_descriptor(d: &Descriptor) -> Self {
         Self {
             open: match &d.open {
@@ -36,23 +49,13 @@ pub struct SharedFiles(Arc<Membership>);
 #[derive(Clone)]
 pub struct SharedFd {
     open: Arc<SharedOpenDescription>,
-    cloexec: CloseOnExec,
 }
 impl SharedFd {
-    fn descriptor_flags(&self) -> DescriptorFlags {
-        DescriptorFlags {
-            status: self.open.flags.clone(),
-            cloexec: self.cloexec.clone(),
-        }
-    }
     fn from_slot(slot: &Slot) -> Option<Self> {
         let SlotOpen::Shared(open) = &slot.open else {
             return None;
         };
-        Some(Self {
-            open: open.clone(),
-            cloexec: slot.cloexec.clone(),
-        })
+        Some(Self { open: open.clone() })
     }
     fn ready(&self) -> Result<()> {
         if self.open.pipe.as_ref().is_some_and(|p| p.has_waiter()) {
@@ -69,9 +72,20 @@ impl SharedFd {
     }
 }
 impl SharedFiles {
-    pub(super) fn descriptor_flags(&self, fd: u32) -> Option<Result<DescriptorFlags>> {
-        self.lookup(fd)
-            .map(|result| result.map(|file| file.descriptor_flags()))
+    pub(super) fn with_flags<T>(
+        &self,
+        fd: u32,
+        access: &impl Fn(&StatusFlags, &CloseOnExec) -> Result<T>,
+    ) -> Option<Result<T>> {
+        let entries = self.0.entries.lock().unwrap();
+        let Some(slot) = entries.get(&fd) else {
+            return Some(Err(Errno(9)));
+        };
+        let open = match slot.shared_open()? {
+            Ok(open) => open,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(access(&open.flags, &slot.cloexec))
     }
     pub(super) fn cloexec_range(&self, first: u32, last: u32) -> Result<u64> {
         let entries = self.0.entries.lock().unwrap();
@@ -100,10 +114,10 @@ impl SharedFiles {
         let Some(slot) = entries.get(&old) else {
             return Some(Err(Errno(9)));
         };
-        let file = SharedFd::from_slot(slot)?;
-        if let Err(error) = file.ready() {
-            return Some(Err(error));
-        }
+        let open = match slot.shared_open()? {
+            Ok(open) => open.clone(),
+            Err(error) => return Some(Err(error)),
+        };
         if min >= MAX_FDS {
             return Some(Err(Errno(22)));
         }
@@ -113,7 +127,7 @@ impl SharedFiles {
         entries.insert(
             fd,
             Slot {
-                open: SlotOpen::Shared(file.open),
+                open: SlotOpen::Shared(open),
                 cloexec: cloexec.into(),
             },
         );
@@ -138,20 +152,19 @@ impl SharedFiles {
             let Some(slot) = entries.get(&old) else {
                 return Some(Err(Errno(9)));
             };
-            let file = SharedFd::from_slot(slot)?;
-            if let Err(error) = file.ready() {
-                return Some(Err(error));
-            }
+            let open = match slot.shared_open()? {
+                Ok(open) => open.clone(),
+                Err(error) => return Some(Err(error)),
+            };
             if let Some(target) = entries.get(&new) {
-                let target = SharedFd::from_slot(target)?;
-                if let Err(error) = target.ready() {
+                if let Err(error) = target.shared_open()? {
                     return Some(Err(error));
                 }
             }
             let old = entries.insert(
                 new,
                 Slot {
-                    open: SlotOpen::Shared(file.open),
+                    open: SlotOpen::Shared(open),
                     cloexec: (flags & O_CLOEXEC != 0).into(),
                 },
             );
@@ -167,14 +180,43 @@ impl SharedFiles {
         }
         Some(Ok(new))
     }
+    /// Initial execution-loop admission never retires an existing slot. This
+    /// keeps old frozen byte capabilities valid until retained I/O is wired.
+    pub fn duplicate_to_empty(&self, old: u32, new: u32, flags: u32) -> Option<Result<u32>> {
+        if old == new || flags & !O_CLOEXEC != 0 {
+            return Some(Err(Errno(22)));
+        }
+        if new >= MAX_FDS {
+            return Some(Err(Errno(9)));
+        }
+        let mut entries = self.0.entries.lock().unwrap();
+        let Some(slot) = entries.get(&old) else {
+            return Some(Err(Errno(9)));
+        };
+        let open = match slot.shared_open()? {
+            Ok(open) => open.clone(),
+            Err(error) => return Some(Err(error)),
+        };
+        if entries.contains_key(&new) {
+            return None;
+        }
+        entries.insert(
+            new,
+            Slot {
+                open: SlotOpen::Shared(open),
+                cloexec: (flags & O_CLOEXEC != 0).into(),
+            },
+        );
+        self.changed();
+        Some(Ok(new))
+    }
     pub fn close(&self, fd: u32, lock_owner: u32) -> Option<Result<()>> {
         let removed = {
             let mut entries = self.0.entries.lock().unwrap();
             let Some(slot) = entries.get(&fd) else {
                 return Some(Err(Errno(9)));
             };
-            let file = SharedFd::from_slot(slot)?;
-            if let Err(error) = file.ready() {
+            if let Err(error) = slot.shared_open()? {
                 return Some(Err(error));
             }
             let old = entries.remove(&fd).expect("validated membership");
@@ -192,6 +234,85 @@ impl SharedFiles {
 pub(super) struct Descriptor {
     pub(super) open: OpenHandle,
     pub(super) cloexec: CloseOnExec,
+}
+pub(super) struct Entry<'a> {
+    pub(super) open: OpenView<'a>,
+    pub(super) cloexec: &'a CloseOnExec,
+}
+impl Entry<'_> {
+    pub(super) fn ready(&self) -> Result<()> {
+        if self
+            .open
+            .borrow()
+            .pipe
+            .as_ref()
+            .is_some_and(|p| p.has_waiter())
+        {
+            Err(Errno(9))
+        } else {
+            Ok(())
+        }
+    }
+    fn owned(&self) -> Descriptor {
+        Descriptor {
+            open: self.open.owned(),
+            cloexec: self.cloexec.clone(),
+        }
+    }
+}
+/// A bounded metadata inspection, with no allocation or extra OFD ownership.
+/// Resource I/O and callbacks must use a separate retained lookup lease.
+pub(super) struct Entries<'a> {
+    membership: std::sync::MutexGuard<'a, BTreeMap<u32, Slot>>,
+    owners: std::cell::Ref<'a, TableState>,
+}
+impl Entries<'_> {
+    fn entry<'a>(&'a self, fd: u32, slot: &'a Slot) -> Entry<'a> {
+        Entry {
+            open: match &slot.open {
+                SlotOpen::Shared(open) => OpenView::Shared(open),
+                SlotOpen::Owner(identity) => {
+                    let descriptor = self
+                        .owners
+                        .entries
+                        .get(&fd)
+                        .expect("owner membership has its control");
+                    assert_eq!(descriptor.open.identity(), *identity);
+                    OpenView::Owner(&descriptor.open)
+                }
+            },
+            cloexec: &slot.cloexec,
+        }
+    }
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&u32, Entry<'_>)> {
+        self.membership
+            .iter()
+            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
+    }
+    pub(super) fn values(&self) -> impl Iterator<Item = Entry<'_>> {
+        self.iter().map(|(_, entry)| entry)
+    }
+    pub(super) fn range(
+        &self,
+        range: std::ops::RangeInclusive<u32>,
+    ) -> impl Iterator<Item = (&u32, Entry<'_>)> {
+        self.membership
+            .range(range)
+            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
+    }
+    pub(super) fn last_key_value(&self) -> Option<(&u32, Entry<'_>)> {
+        self.membership
+            .last_key_value()
+            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
+    }
+    #[cfg(test)]
+    pub(super) fn contains_key(&self, fd: &u32) -> bool {
+        self.membership.contains_key(fd)
+    }
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.membership.len()
+    }
 }
 impl Descriptor {
     fn ready(&self) -> Result<()> {
@@ -231,6 +352,9 @@ pub(super) struct DescriptorVersion {
     pub(super) urings: OnceCell<Vec<Weak<Uring>>>,
 }
 impl DescriptorTable {
+    pub(super) fn membership(&self) -> &SharedFiles {
+        &self.1
+    }
     pub(super) fn worker_membership(&self) -> SharedFiles {
         self.1.clone()
     }
@@ -261,15 +385,11 @@ impl DescriptorTable {
             cloexec: slot.cloexec.clone(),
         }
     }
-    pub(super) fn entries(&self) -> BTreeMap<u32, Descriptor> {
-        self.1
-             .0
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&fd, slot)| (fd, self.descriptor(fd, slot)))
-            .collect()
+    pub(super) fn entries(&self) -> Entries<'_> {
+        Entries {
+            membership: self.1 .0.entries.lock().unwrap(),
+            owners: self.0.borrow(),
+        }
     }
     /// Lookup retains the original OFD independently of FD removal or reuse.
     /// No table borrow survives into resource I/O or last-close callbacks.
@@ -422,8 +542,9 @@ impl Clone for DescriptorTable {
         let source = self.entries();
         let mut owners = BTreeMap::new();
         let entries = source
-            .into_iter()
-            .map(|(fd, mut descriptor)| {
+            .iter()
+            .map(|(&fd, entry)| {
+                let mut descriptor = entry.owned();
                 descriptor.cloexec = descriptor.cloexec.fork();
                 let slot = Slot::from_descriptor(&descriptor);
                 if matches!(descriptor.open, OpenHandle::Owner(_)) {
@@ -432,6 +553,7 @@ impl Clone for DescriptorTable {
                 (fd, slot)
             })
             .collect();
+        drop(source);
         // Structural resources/OFDs are unchanged by fork. Reuse their cache
         // identity; only descriptor metadata gets a new ownership domain.
         Self(

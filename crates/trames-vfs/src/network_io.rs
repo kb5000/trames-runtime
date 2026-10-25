@@ -51,10 +51,10 @@ impl Vfs {
     /// on a worker. Unrelated sockets do not affect this capability.
     pub fn direct_tcp_fd(&self, fd: u32) -> Option<DirectTcpFd> {
         let descriptor = self.fds.get(&fd)?;
-        Self::direct_tcp_descriptor(&descriptor)
+        let result = Self::direct_tcp_open(&descriptor.open.borrow());
+        result
     }
-    fn direct_tcp_descriptor(descriptor: &fd_table::Descriptor) -> Option<DirectTcpFd> {
-        let open = descriptor.open.borrow();
+    fn direct_tcp_open(open: &OpenDescription) -> Option<DirectTcpFd> {
         let socket = open.socket.as_ref()?;
         Some(DirectTcpFd {
             tcp: socket.direct_tcp()?,
@@ -69,7 +69,7 @@ impl Vfs {
         }
         let mut entries = Vec::new();
         for (&fd, descriptor) in self.fds.entries().iter() {
-            let Some(tcp) = Self::direct_tcp_descriptor(descriptor) else {
+            let Some(tcp) = Self::direct_tcp_open(&descriptor.open.borrow()) else {
                 continue;
             };
             entries.resize_with(fd as usize + 1, || None);

@@ -683,7 +683,7 @@ impl Vfs {
                 .last_key_value()
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
-        for (&fd, descriptor) in &descriptors {
+        for (&fd, descriptor) in descriptors.iter() {
             entries[fd as usize] = DirectFd::snapshot_poll(&descriptor.open.borrow(), polls);
         }
         DirectFds(entries.into())

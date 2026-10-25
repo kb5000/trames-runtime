@@ -86,38 +86,51 @@ pub(super) struct DescriptorFlags {
     pub(super) cloexec: CloseOnExec,
 }
 impl FdFlags {
-    fn entry(&self, fd: u32) -> Result<DescriptorFlags> {
-        if let Some(result) = self.1.as_ref().and_then(|files| files.descriptor_flags(fd)) {
+    fn with_flags<T>(
+        &self,
+        fd: u32,
+        access: impl Fn(&StatusFlags, &CloseOnExec) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(result) = self
+            .1
+            .as_ref()
+            .and_then(|files| files.with_flags(fd, &access))
+        {
             return result;
         }
-        self.0
+        let descriptor = self
+            .0
             .get(fd as usize)
             .and_then(Option::as_ref)
-            .cloned()
-            .ok_or(Errno(9))
+            .ok_or(Errno(9))?;
+        access(&descriptor.status, &descriptor.cloexec)
     }
     pub fn get(&self, fd: u32) -> Result<u32> {
-        let d = self.entry(fd)?;
-        Ok(d.status.get() | if d.cloexec.get() { O_CLOEXEC } else { 0 })
+        self.with_flags(fd, |status, cloexec| {
+            Ok(status.get() | if cloexec.get() { O_CLOEXEC } else { 0 })
+        })
     }
     pub fn fcntl(&self, fd: u32, command: u64, argument: u64) -> Result<u64> {
-        let d = self.entry(fd)?;
-        if command == 2 {
-            d.cloexec.set(argument & 1 != 0);
-            Ok(0)
-        } else if command == 4 {
-            if d.status.fixed & O_PATH != 0 {
-                return Err(Errno(9));
+        self.with_flags(fd, |status, cloexec| {
+            if command == 2 {
+                cloexec.set(argument & 1 != 0);
+                Ok(0)
+            } else if command == 4 {
+                if status.fixed & O_PATH != 0 {
+                    return Err(Errno(9));
+                }
+                status.set(argument as u32)?;
+                Ok(0)
+            } else {
+                query_fd_flags(
+                    status.get() | if cloexec.get() { O_CLOEXEC } else { 0 },
+                    command,
+                )
             }
-            d.status.set(argument as u32)?;
-            Ok(0)
-        } else {
-            query_fd_flags(self.get(fd)?, command)
-        }
+        })
     }
     pub fn set_nonblocking(&self, fd: u32, enabled: bool) -> Result<u64> {
-        self.entry(fd)?.status.nonblocking(enabled)?;
-        Ok(0)
+        self.with_flags(fd, |status, _| status.nonblocking(enabled).map(|()| 0))
     }
     pub fn cloexec_range(&self, first: u32, last: u32) -> Result<u64> {
         if let Some(files) = &self.1 {

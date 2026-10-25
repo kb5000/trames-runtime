@@ -690,7 +690,7 @@ impl Vfs {
         self.fds
             .entries()
             .iter()
-            .filter(|(fd, _)| self.descriptor(**fd).is_ok())
+            .filter(|(_, descriptor)| descriptor.ready().is_ok())
             .map(|(&fd, d)| {
                 let o = d.open.borrow();
                 let node = o.node.clone().or_else(|| {

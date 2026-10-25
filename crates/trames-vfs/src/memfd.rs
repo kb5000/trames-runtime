@@ -140,6 +140,9 @@ impl Vfs {
     pub fn shared_file(&self, fd: u32) -> Result<trames_shared::SharedFile> {
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
+        Self::shared_file_open(&open)
+    }
+    pub(super) fn shared_file_open(open: &OpenDescription) -> Result<trames_shared::SharedFile> {
         if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }

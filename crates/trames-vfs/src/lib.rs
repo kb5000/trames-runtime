@@ -626,7 +626,7 @@ impl Vfs {
                 .map_or(0, |(&fd, _)| fd as usize + 1)
         ];
         let mut direct = vec![None; entries.len()];
-        for (&fd, d) in &descriptors {
+        for (&fd, d) in descriptors.iter() {
             let open = d.open.borrow();
             entries[fd as usize] = Some(DescriptorFlags {
                 status: open.flags.clone(),
@@ -1834,6 +1834,9 @@ impl Vfs {
         Ok(fd)
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
+        if let Some(result) = self.fds.membership().close(fd, self.lock_owner) {
+            return result;
+        }
         let descriptor = self.fds.close(fd)?;
         self.release_record_locks(&descriptor);
         Ok(())
@@ -1856,7 +1859,7 @@ impl Vfs {
             return fd_status::mark_cloexec_range(
                 first,
                 last,
-                self.fds.entries().iter().map(|(&fd, d)| (fd, &d.cloexec)),
+                self.fds.entries().iter().map(|(&fd, d)| (fd, d.cloexec)),
             );
         }
         let fds: Vec<_> = self
@@ -1902,9 +1905,19 @@ impl Vfs {
         }
     }
     pub fn dup(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
+        if let Some(result) = self.fds.membership().duplicate(old, min, cloexec) {
+            return result;
+        }
         self.fds.duplicate(old, min, cloexec)
     }
     pub fn dup3(&mut self, old: u32, new: u32, flags: u32) -> Result<u32> {
+        if let Some(result) = self
+            .fds
+            .membership()
+            .duplicate_to(old, new, flags, self.lock_owner)
+        {
+            return result;
+        }
         if let Some(replaced) = self.fds.duplicate_to(old, new, flags)? {
             self.release_record_locks(&replaced);
         }

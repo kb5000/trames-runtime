@@ -12,6 +12,32 @@ pub(super) enum OpenWeak {
     Shared(std::sync::Weak<SharedOpenDescription>),
     Owner(Weak<RefCell<OpenDescription>>),
 }
+pub(super) enum OpenView<'a> {
+    Shared(&'a Arc<SharedOpenDescription>),
+    Owner(&'a OpenHandle),
+}
+impl OpenView<'_> {
+    pub(super) fn borrow(&self) -> OpenRead<'_> {
+        match self {
+            Self::Shared(open) => {
+                OpenRead::Shared(OpenDescription::shared_projection((*open).clone()))
+            }
+            Self::Owner(open) => open.borrow(),
+        }
+    }
+    pub(super) fn downgrade(&self) -> OpenWeak {
+        match self {
+            Self::Shared(open) => OpenWeak::Shared(Arc::downgrade(open)),
+            Self::Owner(open) => open.downgrade(),
+        }
+    }
+    pub(super) fn owned(&self) -> OpenHandle {
+        match self {
+            Self::Shared(open) => OpenHandle::Shared((*open).clone()),
+            Self::Owner(open) => (*open).clone(),
+        }
+    }
+}
 pub(super) enum OpenRead<'a> {
     Shared(OpenDescription),
     Owner(std::cell::Ref<'a, OpenDescription>),
