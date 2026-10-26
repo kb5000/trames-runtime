@@ -192,6 +192,7 @@ struct Frame {
     bytes: Arc<ConcurrentPage>,
     charge: Arc<Charge>,
     direct: bool,
+    hardware_shared_export: bool,
     dynamic_code: bool,
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
     private_access: u8,
@@ -231,6 +232,8 @@ fn prepare_frame(
         .filter(|b| b.shared || (!b.private_copy && !page.permissions.write))
         .filter(|_| error.is_none())
         .and_then(|b| b.object.shared_page());
+    let hardware_shared_export =
+        page.backing.as_ref().is_none_or(|b| !b.shared) || resident_backing.is_some();
     let key = page
         .backing
         .as_ref()
@@ -420,6 +423,7 @@ fn prepare_frame(
         },
         bytes,
         direct,
+        hardware_shared_export,
         dynamic_code: page.permissions.execute
             && (page.permissions.write
                 || page
@@ -1458,6 +1462,9 @@ impl View {
         if let Some(error) = &frame.error {
             return Err(error.clone());
         }
+        if !frame.hardware_shared_export {
+            return Err(MemoryError::BackingIo(95));
+        }
         Ok(HardwarePageInfo {
             permissions: frame.permissions,
             storage_id: frame.bytes.identity,
@@ -1498,6 +1505,9 @@ impl View {
     ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
         assert!(self.hardware_mode);
         let frame = self.frame(address, access)?;
+        if !frame.hardware_shared_export {
+            return Err(MemoryError::BackingIo(95));
+        }
         if access == Access::Write {
             self.ensure_resident(frame)?;
         }
@@ -1659,6 +1669,19 @@ mod tests {
             .map_backed(0x3000, vec![object.clone()], true, Permissions::RW, false)
             .unwrap();
         let mut registry = Registry::default();
+        let mut hardware = memory.parallel_view(&mut registry).unwrap();
+        hardware.enable_hardware();
+        // SAFETY: this isolated legacy backing has no native aliases or actors.
+        // It cannot export canonical shared bytes; no shadow may be published.
+        assert!(matches!(
+            unsafe {
+                hardware.export_hardware_page(0x1000, Access::Write, |_| {
+                    panic!("legacy shared shadow must not allocate")
+                })
+            },
+            Err(MemoryError::BackingIo(95))
+        ));
+        drop(hardware);
         let mut view = memory.parallel_view(&mut registry).unwrap();
         view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();
         drop(view);

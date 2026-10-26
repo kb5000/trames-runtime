@@ -350,6 +350,9 @@ no physical allocation. The cold `Memory::prepare_hardware` boundary retires
 native MMU aliases **and their cached translations** before any transfer. A
 hardware View never uses the former native aliases or unlocked private epochs.
 Externally pinned/GPU raw mappings remain unsupported by this export contract.
+Shared providers without a canonical `shared_page()` export are also rejected:
+conservative hardware page dirtiness must never copy clean shadow bytes over a
+concurrent backing alias. Existing interpreter fragment transport is unchanged.
 
 `HardwareStorage` is an unsafe backend contract, not extra guest permissions.
 Before exposing any Rust byte reference, its host-borrow gate must synchronously
