@@ -1446,10 +1446,29 @@ impl View {
         self.hardware_mode = true;
     }
     pub fn hardware_page_info(&self, address: u64) -> Result<HardwarePageInfo, MemoryError> {
-        let frame = self.frame(address, Access::Read)?;
+        if !address.is_multiple_of(PAGE_SIZE) {
+            return Err(MemoryError::InvalidRange);
+        }
+        let index = *self
+            .snapshot
+            .pages
+            .get(&address)
+            .ok_or(MemoryError::Unmapped(address))?;
+        let frame = &self.snapshot.frames[index];
+        if let Some(error) = &frame.error {
+            return Err(error.clone());
+        }
         Ok(HardwarePageInfo {
             permissions: frame.permissions,
             storage_id: frame.bytes.identity,
+            instruction_revision: if frame.permissions.execute {
+                (
+                    frame.code_revision,
+                    self.snapshot.code_epoch.load(Ordering::Acquire),
+                )
+            } else {
+                (0, 0)
+            },
             backing_version: frame.backing_version.load(Ordering::Relaxed),
             exclusive: false,
             writable: frame.permissions.write && frame.charge.resident(),

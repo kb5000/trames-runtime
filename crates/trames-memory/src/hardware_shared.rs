@@ -126,6 +126,62 @@ mod tests {
         assert_eq!(storage.borrows.load(Ordering::Relaxed), 0);
     }
     #[test]
+    fn hardware_metadata_does_not_require_read_access_or_hide_code_changes() {
+        use crate::{Access, CpuMemory, Memory, MemoryError, Permissions};
+        let mut memory = Memory::default();
+        memory
+            .map(
+                0x10000,
+                crate::PAGE_SIZE,
+                Permissions {
+                    read: false,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(
+            view.hardware_page_info(0x10000)
+                .unwrap()
+                .permissions
+                .execute
+        );
+        assert!(matches!(
+            view.check(0x10007, 1, Access::Read),
+            Err(MemoryError::Permission {
+                address: 0x10007,
+                ..
+            })
+        ));
+        let before = view
+            .hardware_page_info(0x10000)
+            .unwrap()
+            .instruction_revision;
+        drop(view);
+        memory
+            .protect(
+                0x10000,
+                crate::PAGE_SIZE,
+                Permissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        memory.write(0x10000, &[1]).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_ne!(
+            view.hardware_page_info(0x10000)
+                .unwrap()
+                .instruction_revision,
+            before
+        );
+    }
+    #[test]
     fn readiness_race_never_loses_or_replays_a_wakeup() {
         for _ in 0..128 {
             let wait = Arc::new(HardwareWait::default());

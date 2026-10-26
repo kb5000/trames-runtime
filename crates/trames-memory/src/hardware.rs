@@ -9,6 +9,7 @@ pub struct HardwarePageInfo {
     pub permissions: Permissions,
     pub storage_id: u64,
     pub backing_version: u64,
+    pub instruction_revision: (u64, u64),
     pub exclusive: bool,
     /// First writes must enter the existing resident/COW admission boundary.
     pub writable: bool,
@@ -31,6 +32,7 @@ impl Memory {
         }
         Ok(HardwarePageInfo {
             permissions: page.permissions,
+            instruction_revision: (page.instruction_revision, 0),
             storage_id: page.bytes.shared().map_or(0, |b| b.identity),
             backing_version: page
                 .backing
