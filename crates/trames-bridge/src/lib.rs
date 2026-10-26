@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded asynchronous NDJSON device, isolated per embedding session and open.
 //! Native effects require a host reply. Guest uid 0 never grants host authority.
+pub mod hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -73,7 +74,7 @@ struct State {
     next: u64,
     streams: BTreeMap<u64, Stream>,
     pending: BTreeMap<u64, Pending>,
-    accel: trames_accel::Registry,
+    accel: hash::Registry,
 }
 #[derive(Clone, Default)]
 pub struct Broker(Arc<Mutex<State>>);
@@ -321,7 +322,7 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
         )?;
     } else if request.method.starts_with("accel.") {
         let value = match request.method.as_str() {
-            "accel.list" => json!({"abi":trames_accel::ABI_VERSION,"sha256":s.accel}),
+            "accel.list" => json!({"abi":hash::ABI_VERSION,"sha256":s.accel}),
             "accel.enable" | "accel.disable"
                 if request.params.get("id").and_then(Value::as_str) == Some("sha256") =>
             {

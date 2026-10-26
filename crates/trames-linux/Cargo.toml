@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-trames-cpu = { path = "../trames-cpu" }
+trames-execution = { path = "../trames-execution" }
+trames-elf = { path = "../trames-elf" }
 trames-memory = { path = "../trames-memory" }
 trames-vfs = { path = "../trames-vfs" }
 trames-net = { path = "../trames-net" }

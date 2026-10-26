@@ -10,6 +10,14 @@ pub(crate) struct Slot {
     fresh: bool,
 }
 impl Slot {
+    pub fn new(owner: Arc<host::Mapping>, offset: usize, fresh: bool) -> Arc<Self> {
+        owner.retain_slot(offset);
+        Arc::new(Self {
+            owner,
+            offset,
+            fresh,
+        })
+    }
     pub fn pointer(&self) -> *mut u8 {
         self.owner.kernel.as_ptr().wrapping_add(self.offset)
     }
@@ -24,6 +32,11 @@ impl Slot {
         if !self.fresh {
             self.initialize(&[0; P]);
         }
+    }
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.owner.release_slot(self.offset);
     }
 }
 struct PhysicalWindow {
@@ -65,11 +78,7 @@ impl Pool {
                 owner
             }
         };
-        let slot = Arc::new(Slot {
-            owner,
-            offset,
-            fresh: !entry.used[offset / P],
-        });
+        let slot = Slot::new(owner, offset, !entry.used[offset / P]);
         entry.used[offset / P] = true;
         entry.slots[offset / P] = Arc::downgrade(&slot);
         Some(slot)

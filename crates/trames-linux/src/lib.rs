@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! AArch64 Linux syscall ABI. No host syscall is forwarded blindly.
 use std::io;
-use trames_cpu::Cpu;
+use trames_execution::Registers;
+pub mod image;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
 mod direct;
@@ -126,7 +127,11 @@ fn io_errno(error: io::Error) -> u64 {
     }
 }
 
-pub fn dispatch(cpu: &mut Cpu, memory: &Memory, output: &mut impl GuestOutput) -> SyscallOutcome {
+pub fn dispatch(
+    cpu: &mut impl Registers,
+    memory: &Memory,
+    output: &mut impl GuestOutput,
+) -> SyscallOutcome {
     let result = match cpu.x(8) {
         SYS_EXIT | SYS_EXIT_GROUP => return SyscallOutcome::Exit(cpu.x(0) as u8),
         SYS_WRITE => {
@@ -168,6 +173,7 @@ pub fn dispatch(cpu: &mut Cpu, memory: &Memory, output: &mut impl GuestOutput) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trames_execution::Aarch64State as Cpu;
     use trames_memory::{Permissions, PAGE_SIZE};
     fn write_cpu(fd: u64, pointer: u64, count: u64) -> Cpu {
         let mut c = Cpu::default();

@@ -1,5 +1,112 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+
+#[test]
+fn partial_unmap_reclaims_empty_host_granules_and_reuse_is_zeroed() {
+    let mut memory = Memory::default();
+    let base = 0x100000;
+    let granule = host::page_size().unwrap();
+    memory.map(base, WINDOW as u64, Permissions::RW).unwrap();
+    for offset in (0..WINDOW).step_by(P) {
+        memory.write_array(base + offset as u64, [0xa5; 8]).unwrap();
+    }
+    let owner = memory
+        .mmu
+        .window(base, false)
+        .unwrap()
+        .mapping
+        .as_ref()
+        .unwrap()
+        .clone();
+    memory.unmap(base, granule as u64).unwrap();
+    assert_eq!(owner.retired_bytes(), granule);
+    assert_eq!(
+        memory.read_array::<8>(base + granule as u64).unwrap(),
+        [0xa5; 8]
+    );
+    memory.map(base, granule as u64, Permissions::RW).unwrap();
+    for offset in (0..granule).step_by(P) {
+        assert_eq!(
+            memory.read_array::<8>(base + offset as u64).unwrap(),
+            [0; 8]
+        );
+    }
+    memory.write_array(base, [0x5a; 8]).unwrap();
+    assert_eq!(memory.read_array::<8>(base).unwrap(), [0x5a; 8]);
+    assert_eq!(
+        memory.read_array::<8>(base + granule as u64).unwrap(),
+        [0xa5; 8]
+    );
+}
+
+#[test]
+fn reclaim_waits_for_fork_byte_owners_and_not_the_whole_window() {
+    let mut memory = Memory::default();
+    let base = 0x100000;
+    let granule = host::page_size().unwrap();
+    memory.map(base, WINDOW as u64, Permissions::RW).unwrap();
+    for offset in (0..2 * granule).step_by(P) {
+        memory.write_array(base + offset as u64, [42; 8]).unwrap();
+    }
+    let owner = memory
+        .mmu
+        .window(base, false)
+        .unwrap()
+        .mapping
+        .as_ref()
+        .unwrap()
+        .clone();
+    let mut child = memory.clone();
+    memory.unmap(base, granule as u64).unwrap();
+    assert_eq!(owner.retired_bytes(), 0);
+    assert_eq!(child.read_array::<8>(base).unwrap(), [42; 8]);
+    child.unmap(base, granule as u64).unwrap();
+    assert_eq!(owner.retired_bytes(), granule);
+    assert_eq!(
+        child.read_array::<8>(base + granule as u64).unwrap(),
+        [42; 8]
+    );
+}
+
+#[test]
+fn reclaim_retires_cached_frames_after_the_last_execution_view() {
+    let mut memory = Memory::default();
+    let base = 0x100000;
+    let granule = host::page_size().unwrap();
+    memory
+        .map(base, (2 * granule) as u64, Permissions::RW)
+        .unwrap();
+    for offset in (0..2 * granule).step_by(P) {
+        memory.write_array(base + offset as u64, [17; 8]).unwrap();
+    }
+    let mut registry = parallel::Registry::default();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    let frame = memory.frame(base).unwrap();
+    let owner = memory.frames[frame]
+        .as_ref()
+        .unwrap()
+        .bytes
+        .physical()
+        .unwrap()
+        .0
+        .clone();
+    memory.unmap(base, granule as u64).unwrap();
+    assert_eq!(owner.retired_bytes(), 0);
+    assert_eq!(view.read_array::<8>(base).unwrap(), [17; 8]);
+    drop(view);
+    assert_eq!(memory.reclaim_unused(), granule / P);
+    assert_eq!(owner.retired_bytes(), granule);
+    let resumed = memory.parallel_view(&mut registry).unwrap();
+    assert!(resumed.read_array::<8>(base).is_err());
+    assert_eq!(
+        resumed.read_array::<8>(base + granule as u64).unwrap(),
+        [17; 8]
+    );
+    assert_eq!(
+        registry.metrics.full_rebuilds, 1,
+        "reclamation preserves incremental preparation"
+    );
+}
 use std::{os::unix::process::ExitStatusExt, process::Command};
 
 #[test]

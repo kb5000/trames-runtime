@@ -2,6 +2,8 @@
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod backing;
 mod cpu_memory;
+mod hardware;
+pub use hardware::HardwarePageInfo;
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -669,6 +671,7 @@ impl Memory {
         self.revision = self.revision.wrapping_add(1);
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
+        self.reclaim_unused();
         Ok(())
     }
 
@@ -696,6 +699,7 @@ impl Memory {
         self.advance_code_revision();
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
+        self.reclaim_unused();
         Ok(())
     }
 

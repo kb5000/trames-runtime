@@ -196,6 +196,7 @@ impl Window {
     }
     fn page(&self, offset: usize, zero: bool) -> Rc<PageBytes> {
         let mapping = self.mapping.as_ref().expect("coordinator physical storage");
+        let lease = Slot::new(mapping.clone(), offset, false);
         if zero
             && self.initialized[offset / P].swap(true, Ordering::Relaxed)
             && !self.zeroed[offset / P].load(Ordering::Relaxed)
@@ -212,7 +213,7 @@ impl Window {
         Rc::new(PageBytes::Mapped {
             owner: mapping.clone(),
             offset,
-            _lease: None,
+            _lease: Some(lease),
         })
     }
     fn zero_page(&self, offset: usize) {
@@ -622,6 +623,9 @@ impl Memory {
                                 continue;
                             };
                             let offset = first + index * P;
+                            // Reactivate reusable storage before writing it;
+                            // no page becomes visible until the copy finishes.
+                            let replacement = window.page(offset, false);
                             // SAFETY: private destination, all old sources were
                             // captured; no Rust references alias this write.
                             unsafe {
@@ -638,7 +642,7 @@ impl Memory {
                             if self.parallel_cache.is_some() {
                                 self.parallel_mappings.insert(at + index as u64 * PAGE_SIZE);
                             }
-                            self.frames[frame].as_mut().unwrap().bytes = window.page(offset, false);
+                            self.frames[frame].as_mut().unwrap().bytes = replacement;
                         }
                     }
                     for (index, &frame) in frames.iter().enumerate() {

@@ -104,6 +104,51 @@ impl Snapshot {
 }
 
 impl Memory {
+    /// Release obsolete cached byte owners without rebuilding the next View.
+    /// Retained Views/pins/fork peers keep their own legitimate storage leases.
+    /// The count is retired snapshot frames, not physical bytes or host RSS.
+    pub fn reclaim_unused(&mut self) -> usize {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().reclaim_unused();
+        }
+        if self.has_parallel_users() {
+            return 0;
+        }
+        let Some(cache) = &mut self.parallel_cache else {
+            return 0;
+        };
+        let Some(snapshot) = Arc::get_mut(&mut cache.snapshot) else {
+            return 0;
+        };
+        if snapshot
+            .dirty_pages
+            .iter()
+            .any(|word| word.load(Ordering::Relaxed) != 0)
+        {
+            return 0; // uncommitted worker effects still own their original frames
+        }
+        let retired: Vec<_> = self
+            .parallel_mappings
+            .iter()
+            .copied()
+            .filter(|base| {
+                self.pages.get(base).is_none_or(|&index| {
+                    let page = self.frames[index].as_ref().unwrap();
+                    page.backing.is_none() && page.bytes.is_zero() && !page.charge.resident()
+                }) && snapshot.pages.contains_key(base)
+            })
+            .collect();
+        for base in &retired {
+            drop(snapshot.remove_frame(*base));
+        }
+        snapshot.refresh_mmu(retired.iter().copied());
+        snapshot.has_aliases = snapshot.alias_count != 0;
+        snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
+        // Keep source_revision/parallel_mappings unchanged. The next normal
+        // preparation still installs new permissions/bytes/reservations once.
+        retired.len()
+    }
+
     pub(super) fn update_parallel_snapshot(
         &mut self,
         registry: &mut Registry,

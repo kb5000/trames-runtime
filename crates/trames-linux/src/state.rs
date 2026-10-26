@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{errno, io_errno, GuestOutput, OutputFd, SyscallOutcome, MAX_WRITE};
-use trames_cpu::Cpu;
+use trames_execution::Registers;
 use trames_memory::{
     Access, CpuMemory, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE,
 };
@@ -807,7 +807,7 @@ impl Linux {
     }
     pub fn dispatch(
         &mut self,
-        cpu: &mut Cpu,
+        cpu: &mut impl Registers,
         memory: &mut Memory,
         io: &mut impl GuestOutput,
     ) -> SyscallOutcome {
@@ -834,7 +834,7 @@ impl Linux {
         if raw == errno(38) || raw == errno(95) {
             self.vfs.log_syscall(
                 number,
-                cpu.pc.saturating_sub(4),
+                cpu.pc().saturating_sub(4),
                 a,
                 raw.wrapping_neg() as u32,
                 &self.command_name,

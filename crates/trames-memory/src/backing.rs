@@ -288,6 +288,7 @@ impl Memory {
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         self.revision = self.revision.wrapping_add(1);
+        self.reclaim_unused();
         Ok(())
     }
     /// Transactional page-table movement; page bytes/backing identity are retained.

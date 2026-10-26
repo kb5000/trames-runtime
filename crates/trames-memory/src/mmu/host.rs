@@ -4,6 +4,7 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
+mod reclaim;
 
 // Sparse Go heaps/libraries and retained fork slots must not reserve 32MiB
 // for every small live range. Still a power of two and >= any host granule.
@@ -45,6 +46,7 @@ impl Drop for Reservation {
 /// keep an unused CPU reservation alive.
 pub(crate) struct Mapping {
     pub kernel: NonNull<u8>,
+    slots: reclaim::Slots,
     _reservation: Reservation,
 }
 // SAFETY: immutable ownership; byte access needs the coordinator borrow or
@@ -122,8 +124,19 @@ impl Mapping {
         };
         Some(Self {
             kernel,
+            slots: reclaim::Slots::new(page_size()?),
             _reservation: reservation,
         })
+    }
+    pub fn retain_slot(&self, offset: usize) {
+        self.slots.retain(self.kernel.as_ptr(), offset);
+    }
+    pub fn release_slot(&self, offset: usize) {
+        self.slots.release(self.kernel.as_ptr(), offset);
+    }
+    #[cfg(test)]
+    pub fn retired_bytes(&self) -> usize {
+        self.slots.retired_bytes.load(Ordering::Relaxed)
     }
 }
 impl Drop for Mapping {
