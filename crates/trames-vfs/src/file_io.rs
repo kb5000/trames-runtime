@@ -310,13 +310,13 @@ impl DirectFile {
             return None;
         }
         let result = if let Some(offset) = offset {
-            self.data.read_at(offset, count, Some(cache))
+            self.data.epoch_read_at(offset, count, cache)?
         } else {
             let mut position = self.position.lock().unwrap();
             if position.pending != 0 {
                 return None;
             }
-            let result = self.data.read_at(position.value, count, Some(cache));
+            let result = self.data.epoch_read_at(position.value, count, cache)?;
             if let Ok(bytes) = &result {
                 position.value += bytes.len() as u64;
             }
@@ -622,6 +622,33 @@ mod tests {
         assert!(epoch.capture(&vfs, true).get(fd).is_none());
         epoch.finish();
         drop(pages);
+    }
+    #[test]
+    fn persistent_file_capability_defers_without_effects_after_mapping_takes_byte_authority() {
+        use trames_memory::{parallel::Registry, CpuMemory, Memory, Permissions};
+        let (mut vfs, fd) = memory_file(vec![0; 4096]);
+        let mut epoch = FileEpoch::default();
+        let file = epoch.capture(&vfs, true).get(fd).unwrap();
+        let mut cache = DiskReadCache::default();
+        assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), [0]);
+        let pages = vfs.mapping_pages(fd, 0, 4096, true, true).unwrap();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(0x1000, pages, true, Permissions::RW, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.write_array(0x1000, *b"mapped").unwrap();
+        // This capability predates mmap. Its original OFD remains valid, but
+        // touching the plain backing would bypass the live mapped page.
+        assert!(file.read(6, None, &mut cache).is_none());
+        assert!(file.write(b"stale!", None, &mut cache).is_none());
+        assert_eq!(file.seek(0, 1).unwrap().unwrap(), 0);
+        assert_eq!(view.read_array::<6>(0x1000).unwrap(), *b"mapped");
+        drop(view);
+        memory.commit_parallel().unwrap();
+        epoch.finish();
+        assert_eq!(vfs.read(fd, 6).unwrap(), b"mapped");
     }
     #[test]
     fn dup_fork_and_joined_io_use_one_atomic_offset_transaction() {

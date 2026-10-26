@@ -195,6 +195,9 @@ impl MappedData {
         Self::with_inode(data, stable, None)
     }
     fn with_inode(data: FileData, stable: bool, inode: Option<trames_shared::LogicalSize>) -> Self {
+        if let FileData::Plain(plain) = &data {
+            plain.mark_mapped();
+        }
         Self {
             state: MappingState::new(&data, stable, inode),
             data: SharedCell::new(Box::new(data)),

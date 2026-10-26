@@ -3,7 +3,10 @@
 use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::sync::{atomic::AtomicUsize, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize},
+    Mutex, RwLock,
+};
 use storage::{DiskObject, Timestamp};
 
 pub(super) enum Bytes {
@@ -16,6 +19,7 @@ pub(super) struct PlainFile {
     logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
     backing: Option<Arc<storage::DiskBacking>>,
     pending: AtomicUsize,
+    mapped: AtomicBool,
     meta: Mutex<Option<FileMeta>>,
 }
 #[derive(Clone, Copy)]
@@ -49,6 +53,7 @@ impl PlainFile {
             logical_size: std::sync::OnceLock::new(),
             backing,
             pending: AtomicUsize::new(0),
+            mapped: AtomicBool::new(false),
             meta: Mutex::new(None),
         })
     }
@@ -149,6 +154,24 @@ impl PlainFile {
     ) -> Result<Vec<u8>> {
         self.bytes.read().unwrap().read_at(offset, count, cache)
     }
+    /// Publish the change of byte authority under the same lock as direct I/O.
+    /// Existing capabilities must defer once mapped pages can own newer bytes.
+    pub fn mark_mapped(&self) {
+        let _bytes = self.bytes.write().unwrap();
+        self.mapped.store(true, Ordering::Relaxed);
+    }
+    pub fn epoch_read_at(
+        &self,
+        offset: u64,
+        count: usize,
+        cache: &mut DiskReadCache,
+    ) -> Option<Result<Vec<u8>>> {
+        let data = self.bytes.read().unwrap();
+        if self.mapped.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(data.read_at(offset, count, Some(cache)))
+    }
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let mut data = self.bytes.write().unwrap();
         let result = data.write_at(offset, bytes, None);
@@ -164,7 +187,7 @@ impl PlainFile {
         cache: &mut DiskReadCache,
     ) -> Option<Result<usize>> {
         let mut data = self.bytes.write().unwrap();
-        if self.pending.load(Ordering::Acquire) != 0 {
+        if self.mapped.load(Ordering::Relaxed) || self.pending.load(Ordering::Acquire) != 0 {
             return None;
         }
         let end = match offset.checked_add(bytes.len() as u64) {

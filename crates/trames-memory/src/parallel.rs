@@ -479,6 +479,12 @@ impl Drop for View {
     }
 }
 impl View {
+    /// Cold scheduler metadata, with no guest byte access or provider callback.
+    /// VMs sharing a mapped backing must quiesce together before consuming its
+    /// dirty publication. Private anonymous VMs remain independent.
+    pub fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
+        self.snapshot.backings.commit_domains(&self.snapshot)
+    }
     fn new(snapshot: Arc<Snapshot>) -> Self {
         snapshot.users.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -1004,6 +1010,14 @@ impl CpuMemory for View {
     }
 }
 impl Memory {
+    /// A layout checkpoint must account for retained Views from every mapping
+    /// generation, not just the scheduler's current job list.
+    pub fn parallel_views_quiescent(&self) -> bool {
+        self.shared.as_ref().map_or_else(
+            || !self.has_parallel_users(),
+            |memory| memory.borrow().parallel_views_quiescent(),
+        )
+    }
     #[inline]
     pub(super) fn note_parallel_write(&mut self, frame: usize) {
         if self.parallel_cache.is_some() {

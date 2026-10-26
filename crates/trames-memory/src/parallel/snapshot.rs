@@ -15,6 +15,17 @@ struct BackingDomain {
     pages: BTreeSet<u64>,
 }
 impl BackingIndex {
+    pub(super) fn commit_domains(&self, snapshot: &Snapshot) -> BTreeSet<(u8, u64)> {
+        let mut domains: BTreeSet<_> = self.domains.keys().map(|&id| (1, id)).collect();
+        // Ordinary private anonymous pages never share mutable storage across
+        // address spaces: writable fork storage detaches during preparation.
+        // Unversioned mapped backings still need their actual physical identity.
+        domains.extend(self.unscoped.iter().map(|base| {
+            let frame = &snapshot.frames[snapshot.pages[base]];
+            (0, frame.bytes.identity)
+        }));
+        domains
+    }
     pub(super) fn insert(
         &mut self,
         base: u64,

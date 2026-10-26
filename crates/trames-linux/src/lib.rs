@@ -48,6 +48,12 @@ pub enum TerminalEvent {
 }
 
 pub trait GuestOutput {
+    /// Poll host queues/resource metadata without touching guest bytes or
+    /// changing namespace/FD topology. True requests the stopped control hook.
+    /// Legacy adapters conservatively retain their existing joined callback.
+    fn poll_control(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<bool> {
+        Ok(true)
+    }
     /// Embedding control at each scheduler round. Returning false cancels the
     /// entire session. Host adapters may perform queued, authorized VFS work here.
     fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
@@ -79,6 +85,9 @@ pub struct CapturedOutput {
     input_position: usize,
 }
 impl GuestOutput for CapturedOutput {
+    fn poll_control(&mut self, _: &trames_vfs::Vfs) -> io::Result<bool> {
+        Ok(false)
+    }
     fn read_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.input_position = self.input_position.min(self.stdin.len());
         let count = bytes.len().min(self.stdin.len() - self.input_position);
