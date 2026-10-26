@@ -1,14 +1,4 @@
 /target/
-/.trames/
-/tests/fixtures/bin/
-*.o
 __pycache__/
 *.py[cod]
-**/.build/
-apps/ios/build/
-/apps/ios/Trames.xcodeproj/
-**/xcuserdata/
-*.xcuserstate
-
-/apps/ios/Trames/GuestMusl/
-/apps/ios/Trames/GuestVulkan/
+/tests/fixtures/bin/

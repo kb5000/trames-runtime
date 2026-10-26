@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/kb5000/trames-ipad",
+  "source_commit": "d035516132cb32c41635cc4fa9d97923b08718d7",
+  "history": "Filtered Git history retaining original authors and related commits; source code is unchanged at extraction.",
+  "role": "common Linux userspace runtime",
+  "unchanged_extracted_files": 237,
+  "extracted_content_sha256": "e99e6ada9e4e80cd18289288ed1b007fec9cfb653676b7cc15b427a9352fa25e"
+}
