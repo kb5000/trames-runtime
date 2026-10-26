@@ -3319,7 +3319,14 @@ impl<C: Cpu> Kernel<C> {
                 self.parallel_memory.metrics.cache_hits += 1;
                 views[index].2.clone()
             } else {
-                let view = Box::new(p.memory.parallel_view(&mut self.parallel_memory)?);
+                if let Err(error) =
+                    C::prepare_hardware_memory(&mut p.memory, &mut self.parallel_memory)
+                {
+                    self.backend_error = Some(error.to_string());
+                    return None;
+                }
+                let mut view = Box::new(p.memory.parallel_view(&mut self.parallel_memory)?);
+                C::prepare_hardware_view(&mut view);
                 published.insert(identity, views.len());
                 view
             };

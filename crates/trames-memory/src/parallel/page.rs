@@ -3,7 +3,7 @@
 use crate::PAGE_SIZE;
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::OnceLock,
 };
 
@@ -14,6 +14,7 @@ static ZERO: [u8; PAGE] = [0; PAGE];
 /// Byte cells are never exposed without a matching, live range guard. The Box
 /// stays at one allocation for the lifetime of every guard and borrowed slice.
 enum Bytes {
+    Hardware(std::sync::Arc<dyn crate::HardwareStorage>),
     Heap(Box<[UnsafeCell<u8>; PAGE]>),
     Zero(OnceLock<Box<[UnsafeCell<u8>; PAGE]>>),
     External {
@@ -27,10 +28,13 @@ enum Bytes {
     },
 }
 impl Bytes {
-    fn write_ptr(&self) -> *mut u8 {
+    fn write_ptr(&self, unmaterialized: &AtomicBool) -> *mut u8 {
         if let Self::Zero(bytes) = self {
             bytes
-                .get_or_init(|| Box::new(std::array::from_fn(|_| UnsafeCell::new(0))))
+                .get_or_init(|| {
+                    unmaterialized.store(false, Ordering::Relaxed);
+                    Box::new(std::array::from_fn(|_| UnsafeCell::new(0)))
+                })
                 .as_ptr()
                 .cast::<u8>()
                 .cast_mut()
@@ -40,6 +44,7 @@ impl Bytes {
     }
     fn as_ptr(&self) -> *const UnsafeCell<u8> {
         match self {
+            Self::Hardware(storage) => storage.pointer().cast(),
             Self::Heap(bytes) => bytes.as_ptr(),
             Self::Zero(bytes) => bytes
                 .get()
@@ -54,8 +59,9 @@ impl Bytes {
 pub struct MutablePage {
     pub(crate) identity: u64,
     pub(crate) version: AtomicU64,
-    bytes: Bytes,
+    bytes: UnsafeCell<Bytes>,
     held: AtomicU64,
+    unmaterialized: AtomicBool,
     #[cfg(test)]
     acquisitions: AtomicU64,
     reservations: OnceLock<Box<ReservationRows>>,
@@ -90,6 +96,55 @@ fn mask(offset: usize, len: usize) -> u64 {
 }
 
 impl MutablePage {
+    // Storage changes only under all region bits, before hardware publication;
+    // ordinary access holds its regions, and hardware storage never moves again.
+    fn storage(&self) -> &Bytes {
+        // SAFETY: callers own a byte guard, or the cold physical-export contract.
+        unsafe { &*self.bytes.get() }
+    }
+    /// Export canonical storage once; all future host borrows revoke hardware
+    /// access through its granule gate. External GPU pointers are not movable.
+    ///
+    /// # Safety
+    /// No physical/native MMU alias or unpublished accessor may survive this
+    /// operation. Every other byte actor uses this page's region guards.
+    pub unsafe fn export_hardware(
+        &self,
+        allocate: impl FnOnce(
+            Option<&[u8]>,
+        )
+            -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError>,
+    ) -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError> {
+        let mut guard = self.lock(0, PAGE);
+        if let Bytes::Hardware(storage) = self.storage() {
+            if storage.is_live() {
+                return Ok(storage.clone());
+            }
+            // The former VM is gone permanently. End its host-only gate before
+            // moving the bytes into a new VM; the full region lock stays held.
+            storage.end_host_access();
+            guard.page = guard.page.map_addr(|at| at & !3);
+        }
+        if matches!(self.storage(), Bytes::External { .. }) {
+            return Err(crate::MemoryError::BackingIo(95));
+        }
+        let storage = allocate(
+            if matches!(self.storage(), Bytes::Zero(bytes) if bytes.get().is_none()) {
+                None
+            } else {
+                Some(guard.read(0, PAGE))
+            },
+        )?;
+        assert!(!storage.pointer().is_null());
+        // SAFETY: the full byte lock excludes all readers/writers; the caller
+        // has retired cached aliases. No reference to the old Bytes survives.
+        self.unmaterialized.store(false, Ordering::Relaxed);
+        unsafe {
+            *self.bytes.get() = Bytes::Hardware(storage.clone());
+        }
+        Ok(storage)
+    }
+
     /// Retain an externally mapped page in the CPU byte domain.
     ///
     /// # Safety
@@ -155,11 +210,9 @@ impl MutablePage {
         assert!(offset <= PAGE && len <= PAGE - offset);
         // SAFETY: complete bounded allocation, caller-owned unpublished bytes;
         // this callback is the entire lifetime of the exclusive byte borrow.
-        f(
-            unsafe {
-                std::slice::from_raw_parts(self.bytes.as_ptr().cast::<u8>().add(offset), len)
-            },
-        )
+        f(unsafe {
+            std::slice::from_raw_parts(self.storage().as_ptr().cast::<u8>().add(offset), len)
+        })
     }
     /// Write under the unpublished ownership contract above. The provider must
     /// maintain its own byte/version/dirty hooks, as for its original heap page.
@@ -176,12 +229,18 @@ impl MutablePage {
         assert!(offset <= PAGE && len <= PAGE - offset);
         // SAFETY: no external actor/monitor exists. UnsafeCell permits this
         // bounded mutation, and no slice survives the synchronous callback.
-        f(unsafe { std::slice::from_raw_parts_mut(self.bytes.write_ptr().add(offset), len) })
+        f(unsafe {
+            std::slice::from_raw_parts_mut(
+                self.storage().write_ptr(&self.unmaterialized).add(offset),
+                len,
+            )
+        })
     }
     /// Whether this logical zero page still has no allocated byte storage.
     pub fn unmaterialized_zero(&self) -> bool {
-        matches!(&self.bytes, Bytes::Zero(bytes) if bytes.get().is_none())
+        self.unmaterialized.load(Ordering::Relaxed)
     }
+
     pub(crate) fn changed(&self, guard: &mut Guard<'_>, offset: usize, len: usize) {
         let version = self.version.fetch_add(1, Ordering::Release).wrapping_add(1);
         guard.invalidate(offset, len, version);
@@ -200,8 +259,10 @@ impl MutablePage {
         Self::with_storage(Bytes::Heap(Box::new(bytes.map(UnsafeCell::new))))
     }
     fn with_storage(bytes: Bytes) -> Self {
+        let unmaterialized = matches!(&bytes, Bytes::Zero(storage) if storage.get().is_none());
         Self {
-            bytes,
+            unmaterialized: AtomicBool::new(unmaterialized),
+            bytes: UnsafeCell::new(bytes),
             identity: crate::new_backing_identity(),
             version: AtomicU64::new(0),
             held: AtomicU64::new(0),
@@ -233,7 +294,7 @@ impl MutablePage {
         }
     }
     pub(crate) fn physical(&self) -> Option<(&std::sync::Arc<crate::mmu::host::Mapping>, usize)> {
-        match &self.bytes {
+        match self.storage() {
             Bytes::Mapped { owner, offset, .. } => Some((owner, *offset)),
             _ => None,
         }
@@ -307,7 +368,13 @@ pub(crate) struct Guard<'a> {
     _owner: std::marker::PhantomData<&'a MutablePage>,
 }
 impl<'a> Guard<'a> {
-    fn new(page: &'a MutablePage, mask: u64, mode: usize) -> Self {
+    fn new(page: &'a MutablePage, mask: u64, mut mode: usize) -> Self {
+        if mode == 0 {
+            if let Bytes::Hardware(storage) = page.storage() {
+                storage.begin_host_access();
+                mode = 3;
+            }
+        }
         Self {
             page: std::ptr::from_ref(page).map_addr(|at| at | mode),
             mask,
@@ -321,13 +388,13 @@ impl<'a> Guard<'a> {
         unsafe { &*self.page.map_addr(|at| at & !3) }
     }
     pub(crate) fn is_exclusive(&self) -> bool {
-        self.page.addr() & 1 != 0
+        self.page.addr() & 3 == 1
     }
     fn is_readonly(&self) -> bool {
-        self.page.addr() & 2 != 0
+        self.page.addr() & 3 == 2
     }
     fn is_locked(&self) -> bool {
-        self.page.addr() & 3 == 0
+        matches!(self.page.addr() & 3, 0 | 3)
     }
     fn covers(&self, offset: usize, len: usize) {
         assert_eq!(mask(offset, len) & !self.mask, 0, "unguarded byte range");
@@ -337,7 +404,7 @@ impl<'a> Guard<'a> {
         // SAFETY: UnsafeCell is transparent over u8; bounds and ownership of
         // every touched region were checked. The reference ends before unlock.
         unsafe {
-            std::slice::from_raw_parts(self.page().bytes.as_ptr().cast::<u8>().add(offset), len)
+            std::slice::from_raw_parts(self.page().storage().as_ptr().cast::<u8>().add(offset), len)
         }
     }
     pub fn write(&mut self, offset: usize, len: usize) -> &mut [u8] {
@@ -345,7 +412,15 @@ impl<'a> Guard<'a> {
         self.covers(offset, len);
         // SAFETY: the live exclusive region mask excludes every overlapping
         // reader/writer. &mut self also excludes another slice from this guard.
-        unsafe { std::slice::from_raw_parts_mut(self.page().bytes.write_ptr().add(offset), len) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.page()
+                    .storage()
+                    .write_ptr(&self.page().unmaterialized)
+                    .add(offset),
+                len,
+            )
+        }
     }
     pub fn copy_within(&mut self, source: usize, destination: usize, len: usize) {
         debug_assert!(!self.is_readonly(), "read-only guard cannot grant mutation");
@@ -354,7 +429,7 @@ impl<'a> Guard<'a> {
         // SAFETY: both ranges are protected by this single guard; ptr::copy
         // permits overlap. No byte reference is alive across this mutable call.
         unsafe {
-            let ptr = self.page().bytes.write_ptr();
+            let ptr = self.page().storage().write_ptr(&self.page().unmaterialized);
             std::ptr::copy(ptr.add(source), ptr.add(destination), len);
         }
     }
@@ -468,6 +543,11 @@ impl<'a> Guard<'a> {
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
+        if self.page.addr() & 3 == 3 {
+            if let Bytes::Hardware(storage) = self.page().storage() {
+                storage.end_host_access();
+            }
+        }
         if self.is_locked() {
             self.page().held.fetch_and(!self.mask, Ordering::Release);
         }
@@ -523,13 +603,13 @@ mod tests {
     fn software_zero_pages_allocate_only_on_first_write() {
         let page = MutablePage::zero();
         page.with_read(0, PAGE, |bytes| assert!(bytes.iter().all(|&b| b == 0)));
-        assert!(matches!(&page.bytes, Bytes::Zero(bytes) if bytes.get().is_none()));
+        assert!(matches!(page.storage(), Bytes::Zero(bytes) if bytes.get().is_none()));
         page.with_write(64, 8, |bytes| bytes.fill(42));
         page.with_read(0, PAGE, |bytes| {
             assert_eq!(&bytes[64..72], &[42; 8]);
             assert!(bytes[..64].iter().chain(&bytes[72..]).all(|&b| b == 0));
         });
-        assert!(matches!(&page.bytes, Bytes::Zero(bytes) if bytes.get().is_some()));
+        assert!(matches!(page.storage(), Bytes::Zero(bytes) if bytes.get().is_some()));
     }
     #[test]
     fn ordinary_writes_need_no_exclusive_table_and_late_monitors_observe_aba() {

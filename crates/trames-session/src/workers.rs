@@ -387,6 +387,7 @@ impl<C: Cpu> Pool<C> {
                     let domain = job.domain.clone();
                     let work = &mut job.work;
                     let mut parked = None;
+                    let mut parked_hardware = None;
                     let mut parked_io = None;
                     let mut parked_gpu = None;
                     let mut yielded = false;
@@ -488,7 +489,7 @@ impl<C: Cpu> Pool<C> {
                                     }
                                 }
                             }
-                            if epoch.as_ref().is_some_and(|epoch| epoch.should_yield(index, began, instructions != 0 || syscalls != 0)) {
+                            if epoch.as_ref().is_some_and(|epoch| epoch.should_yield(index, began, instructions != 0 || syscalls != 0 || (!C::EXACT_INSTRUCTIONS && chunks != 0))) {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
@@ -510,6 +511,10 @@ impl<C: Cpu> Pool<C> {
                                 .cpu
                                 .run_parallel(&mut engine, work.memory.as_deref_mut().expect("worker view"), budget);
                             chunks += 1;
+                            if let Some(wait) = C::take_hardware_wait(&mut engine) {
+                                parked_hardware = Some(wait);
+                                break result;
+                            }
                             let retired = match &result {
                                 SliceOutcome::Fault(_) => work.cpu.fault_retired(),
                                 SliceOutcome::Yield { instructions }
@@ -734,7 +739,7 @@ impl<C: Cpu> Pool<C> {
                                 }
                             }
                             if !matches!(result,
-                                SliceOutcome::Yield { instructions } if instructions == budget
+                                SliceOutcome::Yield { instructions } if !C::EXACT_INSTRUCTIONS || instructions == budget
                             ) {
                                 break result;
                             }
@@ -746,7 +751,7 @@ impl<C: Cpu> Pool<C> {
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     // Syscall, deferred native, fault and yield request a checkpoint
                     // immediately, before the coordinator receives this message.
-                    if parked.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
+                    if parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
                     let elapsed = began.elapsed().saturating_sub(service_wait);
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
@@ -796,6 +801,7 @@ impl<C: Cpu> Pool<C> {
                             assert!(done.send(Event::<C>::Service(Box::new(request))).is_ok(), "coordinator receiver");
                             continue;
                         }
+                        if let Some(wait) = parked_hardware { epoch.park_hardware(job, wait); continue; }
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
                         if parked.is_some() || yielded { epoch.park(job, parked); continue; }

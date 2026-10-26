@@ -83,6 +83,7 @@ pub(super) struct Job<C: Cpu> {
     pub waiting: Option<WaitState>,
     pub io: Option<trames_linux::PendingIo>,
     pub retry: Option<IoCall>,
+    pub hardware_wait: Option<Arc<trames_memory::HardwareWait>>,
     pub gpu_pending: Option<crate::gpu::Pending>,
     pub domain: Option<Arc<Domain>>,
     pub checkpoint: Option<SliceOutcome>,
@@ -101,6 +102,7 @@ impl<C: Cpu> Job<C> {
             waiting,
             io: None,
             retry: None,
+            hardware_wait: None,
             gpu_pending: None,
             domain: None,
             checkpoint: None,
@@ -392,7 +394,8 @@ impl<C: Cpu> Epoch<C> {
                 job.work.cpu.set_x(0, 0);
                 job.stats.resumes += 1;
             }
-            let pending = job.waiting.is_some()
+            let pending = job.hardware_wait.as_ref().is_some_and(|w| !w.ready())
+                || job.waiting.is_some()
                 || job.io.as_ref().is_some_and(|io| !io.signal.ready())
                 || job
                     .gpu_pending
@@ -604,6 +607,43 @@ impl<C: Cpu> Epoch<C> {
         }
         self.notify();
     }
+    pub fn park_hardware(
+        self: &Arc<Self>,
+        mut job: Box<Job<C>>,
+        wait: Arc<trames_memory::HardwareWait>,
+    ) {
+        let weak = Arc::downgrade(self);
+        let pid = job.work.pid;
+        wait.subscribe(move || {
+            if let Some(epoch) = weak.upgrade() {
+                let mut q = epoch.queues.lock().unwrap();
+                if q.parked
+                    .get(&pid)
+                    .is_some_and(|j| j.hardware_wait.as_ref().is_some_and(|w| w.ready()))
+                {
+                    let mut job = q.parked.remove(&pid).unwrap();
+                    job.hardware_wait = None;
+                    epoch.ready(&mut q, job);
+                    epoch.notify();
+                }
+            }
+        });
+        let mut q = self.queues.lock().unwrap();
+        q.running -= 1;
+        q.domains.returned(pid);
+        let ready = wait.ready();
+        job.hardware_wait = Some(wait);
+        if q.domains.paused(pid) {
+            q.domains.hold(job);
+            q.domains.notify_ready();
+        } else if ready {
+            job.hardware_wait = None;
+            self.ready(&mut q, job);
+        } else {
+            assert!(q.parked.insert(pid, job).is_none());
+        }
+        self.notify();
+    }
     pub fn park_io(&self, mut job: Box<Job<C>>, pending: trames_linux::PendingIo) {
         let mut q = self.queues.lock().unwrap();
         q.running -= 1;
@@ -810,6 +850,49 @@ mod tests {
             0,
             None,
         )
+    }
+    #[test]
+    fn hardware_borrow_wait_releases_slot_and_resumes_same_task() {
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1, &epoch));
+        epoch.add(job(2, &epoch));
+        let mut first = epoch.take(0).unwrap();
+        first.work.cpu.set_x(0, 47);
+        let wait = Arc::new(trames_memory::HardwareWait::default());
+        epoch.park_hardware(first, wait.clone());
+        let peer = epoch.take(0).unwrap();
+        assert_eq!(peer.work.pid, 2);
+        wait.fire();
+        epoch.park(peer, None);
+        let resumed = epoch.take(0).unwrap();
+        assert_eq!(resumed.work.pid, 1);
+        assert_eq!(resumed.work.cpu.x(0), 47);
+    }
+    #[test]
+    fn hardware_borrow_release_before_park_is_consumed_once() {
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1, &epoch));
+        let running = epoch.take(0).unwrap();
+        let wait = Arc::new(trames_memory::HardwareWait::default());
+        wait.fire();
+        epoch.park_hardware(running, wait.clone());
+        wait.fire();
+        let q = epoch.queues.lock().unwrap();
+        assert_eq!(q.ready.len(), 1);
+        assert!(q.parked.is_empty());
+        assert_eq!(q.running, 0);
+    }
+    #[test]
+    fn stopping_a_hardware_borrow_wait_drops_the_retained_view() {
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1, &epoch));
+        let running = epoch.take(0).unwrap();
+        let wait = Arc::new(trames_memory::HardwareWait::default());
+        epoch.park_hardware(running, wait.clone());
+        epoch.control.stop();
+        assert_eq!(epoch.drain().len(), 1);
+        wait.fire();
+        assert!(epoch.queues.lock().unwrap().parked.is_empty());
     }
     fn tcp() -> (trames_vfs::Vfs, u32, std::net::TcpStream) {
         use std::net::{Ipv4Addr, TcpListener};

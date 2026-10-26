@@ -8,6 +8,9 @@ impl Snapshot {
         self.refresh_mmu(addresses);
     }
     pub(super) fn refresh_mmu(&mut self, changed: impl IntoIterator<Item = u64>) {
+        if self.hardware {
+            return;
+        }
         let granule = self.mmu.granule();
         if granule == 0 {
             return;

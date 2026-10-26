@@ -94,6 +94,20 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn fault_retired(&self) -> u64;
     fn decode_stats(&self) -> DecodeStats;
     fn run(&mut self, engine: &mut Self::Engine, memory: &mut Memory, budget: u64) -> SliceOutcome;
+    fn prepare_hardware_memory(
+        _: &mut Memory,
+        _: &mut trames_memory::parallel::Registry,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn prepare_hardware_view(view: &mut View) {
+        let _ = view;
+    }
+    fn take_hardware_wait(
+        _: &mut Self::Engine,
+    ) -> Option<std::sync::Arc<trames_memory::HardwareWait>> {
+        None
+    }
     fn run_parallel(
         &mut self,
         engine: &mut Self::Engine,

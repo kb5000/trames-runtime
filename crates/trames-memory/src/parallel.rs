@@ -17,6 +17,7 @@ use std::sync::{Arc, Weak};
 
 #[derive(Default)]
 pub struct Registry {
+    hardware: bool,
     mmu: mmu::Pool,
     shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
     code_epoch: Arc<AtomicU64>,
@@ -47,6 +48,7 @@ pub struct Metrics {
 }
 struct ConcurrentPage {
     identity: u64,
+    hardware_constant: std::sync::OnceLock<Arc<SharedPage>>,
     constant: Option<Arc<PageBytes>>,
     bytes: Option<Arc<page::MutablePage>>,
     dirty: AtomicU64,
@@ -58,6 +60,7 @@ impl ConcurrentPage {
     fn shared(bytes: Arc<SharedPage>, code_epoch: Arc<AtomicU64>) -> Self {
         Self {
             identity: bytes.identity,
+            hardware_constant: Default::default(),
             bytes: Some(bytes),
             constant: None,
             dirty: AtomicU64::new(0),
@@ -107,6 +110,7 @@ impl ConcurrentPage {
         };
         Self {
             identity: new_backing_identity(),
+            hardware_constant: Default::default(),
             constant: immutable,
             bytes: mutable,
             dirty: AtomicU64::new(0),
@@ -292,7 +296,13 @@ fn prepare_frame(
                 (*old).clone()
             });
             let slot = (owned.is_zero() && page.charge.resident())
-                .then(|| registry.mmu.slot(space, base))
+                .then(|| {
+                    if registry.hardware {
+                        None
+                    } else {
+                        registry.mmu.slot(space, base)
+                    }
+                })
                 .flatten();
             let shared = Arc::new(SharedPage::from_owned(owned, slot));
             page.bytes = Rc::new(PageBytes::Concurrent(shared.clone()));
@@ -355,7 +365,11 @@ fn prepare_frame(
                 !page.permissions.write || error.is_some(),
                 registry.code_epoch.clone(),
                 if page.backing.is_none() {
-                    registry.mmu.slot(space, base)
+                    if registry.hardware {
+                        None
+                    } else {
+                        registry.mmu.slot(space, base)
+                    }
                 } else {
                     None
                 },
@@ -416,6 +430,7 @@ fn prepare_frame(
 }
 
 pub(super) struct Snapshot {
+    hardware: bool,
     mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
@@ -465,12 +480,15 @@ pub struct View {
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     mmu_cache: mmu::Cache,
     private_mode: PrivateMode,
+    hardware_mode: bool,
 }
 /// Clone a worker-local view over the same frozen address space, with its own
 /// translation cells. This is a shared-VM view, not a process fork.
 impl Clone for View {
     fn clone(&self) -> Self {
-        Self::new(self.snapshot.clone())
+        let mut view = Self::new(self.snapshot.clone());
+        view.hardware_mode = self.hardware_mode;
+        view
     }
 }
 impl Drop for View {
@@ -491,6 +509,7 @@ impl View {
             snapshot,
             mmu_cache: mmu::Cache::default(),
             private_mode: PrivateMode::Guarded,
+            hardware_mode: false,
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
     }
@@ -506,6 +525,9 @@ impl View {
     /// Shared/custom backings and physically shared fork pages never qualify.
     pub unsafe fn try_exclusive_private(&mut self) -> bool {
         self.private_mode = PrivateMode::Guarded;
+        if self.hardware_mode {
+            return false;
+        }
         if self.snapshot.users.load(Ordering::Acquire) != 1 {
             return false;
         }
@@ -533,7 +555,8 @@ impl View {
         let Some(first) = views.first() else {
             return false;
         };
-        if first.snapshot.users.load(Ordering::Acquire) != views.len()
+        if views.iter().any(|v| v.hardware_mode)
+            || first.snapshot.users.load(Ordering::Acquire) != views.len()
             || views
                 .iter()
                 .any(|v| !Arc::ptr_eq(&first.snapshot, &v.snapshot))
@@ -637,7 +660,11 @@ impl View {
             index,
             frame.permissions,
             false,
-            self.snapshot.mmu.page_alias(&self.mmu_cache, base),
+            if self.hardware_mode {
+                0
+            } else {
+                self.snapshot.mmu.page_alias(&self.mmu_cache, base)
+            },
         );
         if frame.charge.resident() {
             entry.tag |= Translation::RESIDENT;
@@ -1218,6 +1245,7 @@ impl Memory {
         }
         let dynamic_code_pages = frames.iter().filter(|frame| frame.dynamic_code).count();
         let mut snapshot = Snapshot {
+            hardware: registry.hardware,
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
             dynamic_code: dynamic_code_pages != 0,
@@ -1407,6 +1435,92 @@ impl Memory {
         }
         self.parallel_cache = Some(cache);
         result
+    }
+}
+
+impl View {
+    /// Called before dispatch; frozen CPU aliases are bypassed because physical
+    /// storage can be exported on demand under the original page region lock.
+    pub fn enable_hardware(&mut self) {
+        self.private_mode = PrivateMode::Guarded;
+        self.hardware_mode = true;
+    }
+    pub fn hardware_page_info(&self, address: u64) -> Result<HardwarePageInfo, MemoryError> {
+        let frame = self.frame(address, Access::Read)?;
+        Ok(HardwarePageInfo {
+            permissions: frame.permissions,
+            storage_id: frame.bytes.identity,
+            backing_version: frame.backing_version.load(Ordering::Relaxed),
+            exclusive: false,
+            writable: frame.permissions.write && frame.charge.resident(),
+        })
+    }
+    pub fn mark_hardware_write(&self, address: u64) -> Result<(), MemoryError> {
+        let frame = self.frame(address, Access::Write)?;
+        frame.bytes.dirty.store(u64::MAX, Ordering::Relaxed);
+        frame.bytes.version().fetch_add(1, Ordering::Relaxed);
+        self.snapshot.dirty_pages[frame.root_frame / 64]
+            .fetch_or(1 << (frame.root_frame % 64), Ordering::Relaxed);
+        if frame.permissions.execute {
+            frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+    /// Export one admitted page from the same storage used by CPU/native/VFS.
+    ///
+    /// # Safety
+    /// Every execution View of this VM uses hardware mode; coordinator mapping
+    /// mutation and unpublished/pinned actors are excluded until all Views join.
+    pub unsafe fn export_hardware_page(
+        &self,
+        address: u64,
+        access: Access,
+        allocate: impl FnOnce(Option<&[u8]>) -> Result<Arc<dyn crate::HardwareStorage>, MemoryError>,
+    ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
+        assert!(self.hardware_mode);
+        let frame = self.frame(address, access)?;
+        if access == Access::Write {
+            self.ensure_resident(frame)?;
+        }
+        let page = if let Some(page) = &frame.bytes.bytes {
+            page
+        } else {
+            frame.bytes.hardware_constant.get_or_init(|| {
+                Arc::new(SharedPage::new(
+                    frame.bytes.constant.as_ref().expect("constant frame")[..]
+                        .try_into()
+                        .unwrap(),
+                ))
+            })
+        };
+        // SAFETY: hardware mode bypasses every old protected native alias and
+        // retains only region-guarded byte actors for this frozen snapshot.
+        let storage = unsafe { page.export_hardware(allocate) }?;
+        if self.hardware_page_info(address)?.writable {
+            self.mark_hardware_write(address)?;
+        }
+        Ok((storage, self.hardware_page_info(address)?))
+    }
+}
+
+impl Registry {
+    pub fn use_hardware(&mut self) {
+        self.hardware = true;
+    }
+}
+impl Memory {
+    pub fn prepare_hardware(&mut self) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().prepare_hardware();
+        }
+        if !self.parallel_views_quiescent()
+            || self.frames.iter().flatten().any(|p| self.page_pinned(p))
+        {
+            return Err(MemoryError::BackingIo(95));
+        }
+        self.invalidate_translations();
+        self.mmu = Default::default();
+        Ok(())
     }
 }
 

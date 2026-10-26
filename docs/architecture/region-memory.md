@@ -339,3 +339,46 @@ the guest byte quota and remain further memory work.
 The [Firefox memory investigation](../validation/firefox-memory.md) records the
 original Scudo ELF, the 512MiB BSS oracle, budgets, complete/partial diagnostics
 and the remaining first-frame failure.
+
+## Hardware execution through frozen Views
+
+Hardware backends now use the same frozen `View` frames, permissions, first-write
+charges, backing identities and joined dirty publication as interpreter/native
+workers. `SharedPage::export_hardware` transfers a page into stable physical
+storage once, under all of its region bits. Untouched logical zeros still need
+no physical allocation. The cold `Memory::prepare_hardware` boundary retires
+native MMU aliases **and their cached translations** before any transfer. A
+hardware View never uses the former native aliases or unlocked private epochs.
+Externally pinned/GPU raw mappings remain unsupported by this export contract.
+
+`HardwareStorage` is an unsafe backend contract, not extra guest permissions.
+Before exposing any Rust byte reference, its host-borrow gate must synchronously
+exclude hardware accesses to the containing host physical granule. The original
+64-byte region guards continue to arbitrate overlapping host borrows. Disjoint
+host borrows can coexist; unrelated granules and CPUs continue executing. The
+last borrow restores hardware access and fires one-shot `HardwareWait` tickets.
+The existing epoch queue parks those tasks, releases their execution slots, and
+handles release-before-park, VM checkpoints and stop without a new service thread
+or a polling message bus. Normal hardware loads/stores acquire no Rust lock and
+execute with the host ARM memory model.
+
+Byte storage changes only under the complete region lock, with native aliases
+and unpublished actors excluded. Once exported, it does not move while its VM
+is live. The backend must retain the VM during a host borrow, retain canonical
+physical ownership through every executing View, and invalidate any stopped
+weak PTE cache before reuse. After the former VM has permanently ended, a joined
+export can transfer retained bytes into a replacement VM. These conditions bound
+the `UnsafeCell` storage mutation; neither a concurrent enum read nor a stale
+native pointer is allowed by the admission contract.
+
+A hardware write admission marks the existing dirty fragments conservatively;
+joined publication still invokes original file persistence/version hooks. COW
+is prepared by the existing frozen-View ownership boundary. This currently can
+copy writable fork pages before their actual first guest write. It remains a
+fork cost to optimize; it is not an additional permission or race policy.
+Instruction counters stay unavailable for hardware execution. Worker fairness
+uses completed slices as progress without inventing retired instructions.
+
+The Mac adapter owns the platform paging implementation, including preserved
+file-backed physical storage and memory-pressure events. The common runtime does
+not claim an exact process RSS limit or impose a second paging policy on iPad.

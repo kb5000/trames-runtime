@@ -411,6 +411,7 @@ fn connected_native_tcp_capability_is_rebuilt_after_firewall_changes() {
     listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     listener.listen(1).unwrap();
     let _host = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    crate::wait(&[(listener.clone(), 1)], std::time::Duration::from_secs(1)).unwrap();
     let (accepted, _) = listener.accept().unwrap();
     assert!(accepted.direct_tcp().is_some());
     assert_eq!(
