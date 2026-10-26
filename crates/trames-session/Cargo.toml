@@ -1,0 +1,30 @@
+[package]
+name = "trames-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+
+[dependencies]
+trames-execution = { path = "../trames-execution" }
+trames-kernel = { path = "../trames-kernel" }
+trames-accel = { path = "../trames-accel" }
+trames-engine = { path = "../trames-engine" }
+trames-elf = { path = "../trames-elf" }
+trames-memory = { path = "../trames-memory" }
+trames-linux = { path = "../trames-linux" }
+trames-vfs = { path = "../trames-vfs" }
+trames-net = { path = "../trames-net" }
+trames-vulkan = { path = "../trames-vulkan" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+trames-wayland = { path = "../trames-wayland" }
+
+# Process conformance is compiled with the real interpreter by trames-core's
+# kernel-conformance target; this workspace never depends on an executor.
+[lib]
+test = false

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/trames-vulkan",
+    "crates/trames-accel",
+    "crates/trames-native",
+    "crates/trames-session",
+    "crates/trames-engine",
     "crates/trames-execution",
     "crates/trames-kernel",
     "crates/trames-memory",

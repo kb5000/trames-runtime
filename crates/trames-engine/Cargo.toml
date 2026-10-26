@@ -1,0 +1,11 @@
+[package]
+name = "trames-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+trames-execution = { path = "../trames-execution" }
+trames-memory = { path = "../trames-memory" }
+[lints]
+workspace = true

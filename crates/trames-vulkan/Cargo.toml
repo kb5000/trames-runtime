@@ -1,0 +1,15 @@
+[package]
+name = "trames-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trames-shared = { path = "../trames-shared" }
+ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
+trames-wayland = { path = "../trames-wayland" }
+trames-memory = { path = "../trames-memory" }
+
+[lints]
+workspace = true

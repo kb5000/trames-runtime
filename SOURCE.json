@@ -4,5 +4,16 @@
   "history": "Filtered Git history retaining original authors and related commits; source code is unchanged at extraction.",
   "role": "common Linux userspace runtime",
   "unchanged_extracted_files": 237,
-  "extracted_content_sha256": "e99e6ada9e4e80cd18289288ed1b007fec9cfb653676b7cc15b427a9352fa25e"
+  "extracted_content_sha256": "e99e6ada9e4e80cd18289288ed1b007fec9cfb653676b7cc15b427a9352fa25e",
+  "process_kernel_migration": {
+    "source_repository": "https://github.com/kb5000/trames-ipad",
+    "source_commit": "9b4fe9799dd00d7e241ed047ca6e4171ea27b46a",
+    "source_paths": [
+      "crates/trames-core",
+      "crates/trames-accel",
+      "crates/trames-native",
+      "crates/trames-vulkan"
+    ],
+    "description": "Reuse the existing process kernel behind a statically dispatched task/engine boundary; retain backend-independent native and Vulkan services in the common repository."
+  }
 }

@@ -22,6 +22,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -317,6 +326,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -608,6 +627,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trames-accel"
+version = "1.3.0"
+dependencies = [
+ "serde",
+ "trames-bridge",
+ "trames-memory",
+ "trames-native",
+]
+
+[[package]]
 name = "trames-bridge"
 version = "1.3.0"
 dependencies = [
@@ -632,6 +661,14 @@ dependencies = [
 name = "trames-elf"
 version = "1.3.0"
 dependencies = [
+ "trames-memory",
+]
+
+[[package]]
+name = "trames-engine"
+version = "1.3.0"
+dependencies = [
+ "trames-execution",
  "trames-memory",
 ]
 
@@ -668,6 +705,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trames-native"
+version = "1.3.0"
+
+[[package]]
 name = "trames-net"
 version = "1.3.0"
 dependencies = [
@@ -675,6 +716,23 @@ dependencies = [
  "nix",
  "smoltcp",
  "socket2",
+]
+
+[[package]]
+name = "trames-session"
+version = "1.3.0"
+dependencies = [
+ "trames-accel",
+ "trames-elf",
+ "trames-engine",
+ "trames-execution",
+ "trames-kernel",
+ "trames-linux",
+ "trames-memory",
+ "trames-net",
+ "trames-vfs",
+ "trames-vulkan",
+ "trames-wayland",
 ]
 
 [[package]]
@@ -693,6 +751,16 @@ dependencies = [
  "trames-bridge",
  "trames-memory",
  "trames-net",
+ "trames-shared",
+ "trames-wayland",
+]
+
+[[package]]
+name = "trames-vulkan"
+version = "1.3.0"
+dependencies = [
+ "ash",
+ "trames-memory",
  "trames-shared",
  "trames-wayland",
 ]

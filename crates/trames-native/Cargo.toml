@@ -1,0 +1,10 @@
+[package]
+name = "trames-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Only validated host slices cross the small static-assembly boundary.
+[lints]
+workspace = true
