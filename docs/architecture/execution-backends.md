@@ -12,9 +12,16 @@ parity between the Mac bring-up runner and the iPad application.
 | Component | Responsibility |
 | --- | --- |
 | `trames-execution` | AArch64 architectural state, register access, advertised features and honest instruction-count availability. No dependencies, decoder or OS VM. |
+| `trames-kernel` | Shared task signal state/ABI, fault policy and ready-task affinity placement. No interpreter or host execution transport. |
 | `trames-linux`, `trames-elf`, `trames-memory`, VFS/network/storage | Shared Linux syscall and image ABI, virtual mappings and actual byte ownership. No interpreter/native-accelerator dependency. |
 | `trames-cpu` and current `trames-core`/iPad composition | Existing interpreter, decoded state and product integration. Core's task/signal scheduler still needs its execution dependency extracted. |
 | `trames-hvf`, `trames-mac` | Thread-affine Hypervisor transport and single-process Mac bring-up CLI. Hardware CPU execution; common Linux syscalls and process-entry stack. |
+
+Task-state integration moves signal ownership, dispositions/queues,
+alternate stacks and architectural frame entry/return into `trames-kernel`,
+used by both Core and the Mac adapter. Real hardware fault handlers now recover
+through that shared code. [Task-state boundaries](task-state.md) describes the
+completed extraction and the process/scheduler work that remains.
 
 `scripts/check-execution-boundaries.py` checks normal transitive dependencies.
 The bridge's opt-in SHA-256 service is platform-neutral host functionality;
@@ -135,8 +142,9 @@ iPad release acceptance remains a separate gate.
 
 ## Remaining integration and repository extraction
 
-The Mac runner currently covers one process and private mappings. Common task
-scheduling, signal delivery, clone/exec, shared mapping/provider export, native
+The Mac runner currently covers one process, private mappings and shared signal
+frame/state semantics. Common process scheduling and signal routing, clone/exec,
+shared mapping/provider export, native
 syscall admission and full application integration must move behind the executor
 boundary before feature-parity claims or independent repository releases.
 Hardware and interpreter capabilities/interrupt accounting remain distinct.
