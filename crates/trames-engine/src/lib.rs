@@ -94,6 +94,19 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn fault_retired(&self) -> u64;
     fn decode_stats(&self) -> DecodeStats;
     fn run(&mut self, engine: &mut Self::Engine, memory: &mut Memory, budget: u64) -> SliceOutcome;
+    /// Session-owned registration domain, shared by serial and worker dispatch.
+    /// Interpreters keep their direct Memory path; hardware backends must avoid
+    /// replacing a VM's snapshot domain when its runnable CPU count changes.
+    fn run_coordinated(
+        &mut self,
+        engine: &mut Self::Engine,
+        memory: &mut Memory,
+        registry: &mut trames_memory::parallel::Registry,
+        budget: u64,
+    ) -> SliceOutcome {
+        let _ = registry;
+        self.run(engine, memory, budget)
+    }
     fn prepare_hardware_memory(
         _: &mut Memory,
         _: &mut trames_memory::parallel::Registry,

@@ -267,13 +267,26 @@ impl Vfs {
         Ok(())
     }
     pub fn next_timerfd_deadline(&self) -> Option<Instant> {
-        self.fds
-            .entries()
-            .values()
-            .filter_map(|d| match &d.open.borrow().anonymous {
-                Some(Anonymous::Timer(timer)) => timer.deadline(),
-                _ => None,
+        // Membership changes invalidate this object index. Rearm/disarm/read
+        // stay on the original shared timer, so no FD snapshot or stale copied
+        // deadline is needed on the scheduler's ordinary polling path.
+        let version = self.fds.identity();
+        version
+            .timers
+            .get_or_init(|| {
+                let mut timers = BTreeMap::new();
+                for descriptor in self.fds.entries().values() {
+                    if let Some(Anonymous::Timer(timer)) = &descriptor.open.borrow().anonymous {
+                        timers
+                            .entry(Arc::as_ptr(timer) as usize)
+                            .or_insert_with(|| Arc::downgrade(timer));
+                    }
+                }
+                timers.into_values().collect()
             })
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter_map(|timer| timer.deadline())
             .min()
     }
     pub fn epoll_create(&mut self, flags: u32) -> Result<u32> {
@@ -555,5 +568,70 @@ mod tests {
             u32::from_le_bytes(v.stat_fd(event).unwrap()[16..20].try_into().unwrap()),
             0o600
         );
+    }
+}
+
+#[cfg(test)]
+mod timer_index_tests {
+    use super::*;
+    #[test]
+    fn timer_index_reads_live_state_and_tracks_fork_shared_close_and_fd_reuse() {
+        let mut parent = Vfs::default();
+        for _ in 0..MAX_FDS / 2 {
+            parent.eventfd(0, 0).unwrap();
+        }
+        let timer = parent.timerfd(1, 0).unwrap();
+        let resource = parent.timerfd_resource(timer).unwrap();
+        let weak = Arc::downgrade(&resource);
+        let first = Instant::now() + Duration::from_secs(60);
+        parent
+            .timerfd_set(timer, Duration::ZERO, Some(first))
+            .unwrap();
+        assert_eq!(parent.next_timerfd_deadline(), Some(first));
+        let cached = parent.fds.identity();
+        assert_eq!(cached.timers.get().unwrap().len(), 1);
+        let mut child = parent.clone();
+        let mut shared = parent.clone_with_files(true);
+        let second = first + Duration::from_secs(10);
+        resource.update(Some((Duration::ZERO, Some(second))));
+        assert_eq!(parent.next_timerfd_deadline(), Some(second));
+        assert!(
+            Rc::ptr_eq(&cached, &parent.fds.identity()),
+            "timer updates cannot rebuild the FD index"
+        );
+        child.close(timer).unwrap();
+        assert_eq!(child.next_timerfd_deadline(), None);
+        assert_eq!(parent.next_timerfd_deadline(), Some(second));
+        shared.close(timer).unwrap();
+        let reused = parent.eventfd(0, 0).unwrap();
+        assert_eq!(reused, timer);
+        assert_eq!(parent.next_timerfd_deadline(), None);
+        assert_eq!(shared.next_timerfd_deadline(), None);
+        drop(resource);
+        assert!(
+            weak.upgrade().is_none(),
+            "cached timer index cannot prolong timer lifetime"
+        );
+    }
+    #[test]
+    fn empty_timer_index_remains_empty_until_actual_membership_changes() {
+        let mut v = Vfs::default();
+        for _ in 0..MAX_FDS / 2 {
+            v.eventfd(0, 0).unwrap();
+        }
+        assert_eq!(v.next_timerfd_deadline(), None);
+        let version = v.fds.identity();
+        assert!(version.timers.get().unwrap().is_empty());
+        for _ in 0..128 {
+            assert_eq!(v.next_timerfd_deadline(), None);
+        }
+        assert!(Rc::ptr_eq(&version, &v.fds.identity()));
+        let timer = v.timerfd(1, 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        v.timerfd_set(timer, Duration::ZERO, Some(deadline))
+            .unwrap();
+        assert_eq!(v.next_timerfd_deadline(), Some(deadline));
+        v.timerfd_set(timer, Duration::ZERO, None).unwrap();
+        assert_eq!(v.next_timerfd_deadline(), None);
     }
 }

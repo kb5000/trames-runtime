@@ -153,7 +153,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(e) = if persistent {
+        if let Err(e) = if persistent && node.borrow().links != 0 {
             self.checkpoint()
         } else {
             Ok(())
@@ -265,7 +265,11 @@ impl Vfs {
         }
         n.times[2] = now;
         drop(n);
-        if let Err(e) = self.checkpoint() {
+        if let Err(e) = if node.borrow().links != 0 {
+            self.checkpoint()
+        } else {
+            Ok(())
+        } {
             node.borrow_mut().times = old;
             return Err(e);
         }

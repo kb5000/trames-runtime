@@ -181,3 +181,24 @@ A regression covers infinite ppoll, pselect, epoll_pwait and epoll_pwait2 follow
 by delayed input, mutation of an already accepted guest poll buffer, and an
 internal-pipe control. Real Mac window acceptance also verifies that closing the
 last native windows leaves the parent shell able to wait for and read new input.
+
+
+## Resource scope during interactive execution
+
+Anonymous and open-unlinked inodes have no directory-tree membership. Path
+lookup returns immediately for them, and their metadata mutations do not commit
+a persistent namespace. A memfd resize uses its shared-memory budget without
+scanning persistent disk usage. A linked resize checkpoints its owning
+filesystem, so named tmpfs buffers cannot serialize the persistent root's
+manifest. Inode admission collects expired weak handles only when the node
+limit is reached; the exact live-node quota remains enforced. Failure-injection
+tests keep the root manifest unwritable while exercising anonymous and tmpfs
+operations, and verify named persistent writes still report commit failures.
+
+Timer deadline discovery keeps a membership-versioned index of unique weak
+timer objects. Scheduler queries read current deadlines from those objects;
+rearm/disarm never copies or caches a deadline. Closing/reusing descriptors,
+fork and CLONE_FILES invalidate membership through the existing FD identity.
+An empty index avoids walking unrelated descriptors. This creates no polling
+bus, service thread or additional timer authority, and weak entries cannot keep
+a closed timer alive.

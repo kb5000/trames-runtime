@@ -1901,4 +1901,71 @@ mod tests {
             assert!(data.pages.borrow().is_empty());
         };
     }
+    #[test]
+    fn direct_content_refresh_keeps_mapping_generation_but_eof_and_cow_still_change() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"direct-refresh", 0).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        let mut memory = Memory::default();
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x10000,
+            PAGE_SIZE * 2,
+            true,
+            Permissions::RW,
+        );
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        memory.prepare_hardware().unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let original = view.hardware_view_version().0;
+        assert_eq!(view.read_array::<1>(0x10000).unwrap(), [0]);
+        drop(view);
+        for value in 1..=8u8 {
+            v.pwrite(fd, &[value], 0).unwrap();
+            let mut view = memory.parallel_view(&mut registry).unwrap();
+            view.enable_hardware();
+            assert_eq!(
+                view.hardware_view_version().0,
+                original,
+                "content publication cannot rebuild translations"
+            );
+            assert_eq!(view.read_array::<1>(0x10000).unwrap(), [value]);
+            drop(view);
+        }
+        assert!(registry.metrics.direct_frame_refreshes >= 8);
+        v.truncate_fd(fd, 0).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_ne!(view.hardware_view_version().0, original);
+        assert!(matches!(
+            view.read_array::<1>(0x10000),
+            Err(MemoryError::Bus(_))
+        ));
+        drop(view);
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x20000,
+            PAGE_SIZE,
+            false,
+            Permissions::RW,
+        );
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        assert_eq!(view.read_array::<1>(0x10000).unwrap(), [0]);
+        view.write_array(0x20000, [71]).unwrap();
+        drop(view);
+        memory.commit_parallel().unwrap();
+        v.pwrite(fd, &[99], 0).unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        assert_eq!(view.read_array::<1>(0x10000).unwrap(), [99]);
+        assert_eq!(view.read_array::<1>(0x20000).unwrap(), [71]);
+    }
 }

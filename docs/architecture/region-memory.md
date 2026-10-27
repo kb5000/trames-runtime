@@ -450,3 +450,23 @@ dirty/persistence/code hooks. Software interpreter and native View writes retain
 their existing region, monitor and dirty-fragment protocol. All execution Views
 of a hardware VM must still use hardware mode; mixed interpreter/hardware
 exclusive-monitor execution is outside this admission contract.
+
+
+### Content publication without mapping churn
+
+At a joined checkpoint, canonical direct data frames can refresh their content
+revision and native-access eligibility in place. They keep their slab position,
+alias/backing indices and hardware mapping generation. Eligibility requires the
+same physical allocation, quota owner, guest permissions and versioned backing
+domain, successful live backing validation, and non-executable data. Explicit
+mapping changes, COW, EOF/errors, executable changes and unknown providers still
+use normal frame preparation and translation invalidation. Regression coverage
+includes shared writes, truncate/grow and independent private COW mappings.
+
+The session also passes its registration domain to serial CPU dispatch through
+`Cpu::run_coordinated`. Hardware backends must use that domain for both solo and
+worker execution. Otherwise a runnable-count change switches code/alias domains
+and discards the complete cached View even when the mappings are unchanged.
+The default implementation retains the interpreter's existing direct Memory
+execution. Standalone hardware executors may own an independent registry when
+they are not participating in a session.

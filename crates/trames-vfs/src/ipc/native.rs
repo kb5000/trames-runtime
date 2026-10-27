@@ -579,10 +579,7 @@ impl Vfs {
     fn native_file_description(&self, fd: OwnedFd, owner: (u32, u32)) -> Result<OpenHandle> {
         let file = SharedFile::import(fd).map_err(io_errno)?;
         let mut fs = self.fs.borrow_mut();
-        fs.inodes.retain(|n| n.strong_count() != 0);
-        if fs.inodes.len() >= fs.limits.nodes {
-            return Err(Errno(28));
-        }
+        fs.admit_inode()?;
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Arc::new(Inode::new(Node {

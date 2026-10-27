@@ -340,6 +340,8 @@ struct Node {
     seals: Option<u32>,
     xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
 }
+#[cfg(test)]
+thread_local! {static PATH_SEARCHES: Cell<usize> = const { Cell::new(0) };}
 impl Node {
     fn file_metadata(&self) -> file_data::FileMeta {
         if let Content::File(storage::FileData::Plain(data)) = &self.content {
@@ -353,12 +355,19 @@ impl Node {
         }
     }
     fn path_in(&self, paths: &BTreeMap<Vec<u8>, NodeRef>, root: &[u8]) -> Option<Vec<u8>> {
+        // Unnamed/open-unlinked objects have no namespace entry. Their inode
+        // lifetime is independent of the directory tree, including memfd IPC.
+        if self.links == 0 {
+            return None;
+        }
         let matches = |node: &NodeRef| node.identity == self.identity;
         if let Some(path) = self.path_hint.borrow().as_ref() {
             if mounts::below(path, root) && paths.get(path).is_some_and(matches) {
                 return Some(path.clone());
             }
         }
+        #[cfg(test)]
+        PATH_SEARCHES.with(|count| count.set(count.get() + 1));
         let path = paths
             .iter()
             .find(|(path, node)| mounts::below(path, root) && matches(node))
@@ -377,6 +386,19 @@ struct Filesystem {
     limits: StorageLimits,
     disk: Option<Arc<storage::DiskStore>>,
     volume: Option<(VolumeSpace, u64)>,
+}
+impl Filesystem {
+    fn admit_inode(&mut self) -> Result<()> {
+        // Dead weak registrations cannot exhaust the live inode quota. Collect
+        // only at the allocation boundary, never scan the whole image per memfd.
+        if self.inodes.len() >= self.limits.nodes {
+            self.inodes.retain(|node| node.strong_count() != 0);
+        }
+        if self.inodes.len() >= self.limits.nodes {
+            return Err(Errno(28));
+        }
+        Ok(())
+    }
 }
 pub struct Vfs {
     network: trames_net::Network,
@@ -890,8 +912,8 @@ impl Vfs {
             mode |= 0o2000;
         }
         let mut fs = filesystem.borrow_mut();
-        fs.inodes.retain(|n| n.strong_count() != 0);
-        if fs.inodes.len() >= fs.limits.nodes || fs.paths.len() >= fs.limits.nodes {
+        fs.admit_inode()?;
+        if fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
         }
         let old_next = fs.next_inode;
@@ -2462,8 +2484,18 @@ impl Vfs {
             return Err(Errno(9));
         }
         self.fd_writable(fd)?;
-        let available = self.fd_available_bytes(fd)?;
-        let memfd_available = self.memfd_available();
+        let anonymous = self
+            .descriptor(fd)?
+            .open
+            .borrow()
+            .node
+            .as_ref()
+            .is_some_and(|node| node.borrow().seals.is_some());
+        let available = if anonymous {
+            self.memfd_available()
+        } else {
+            self.fd_available_bytes(fd)?
+        };
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
         if o.flags.get() & 3 == 0 {
@@ -2486,11 +2518,6 @@ impl Vfs {
             self.file_size_signal.set(true);
             return Err(Errno(27));
         }
-        let available = if seals.is_some() {
-            memfd_available
-        } else {
-            available
-        };
         if b.growth_charge(length) > available {
             return Err(Errno(28));
         }
@@ -2503,8 +2530,17 @@ impl Vfs {
         }
         n.times[1] = storage::Timestamp::now();
         n.times[2] = n.times[1];
+        let linked = n.links != 0;
         drop(n);
-        self.checkpoint()?;
+        if linked {
+            // Persist the owning filesystem only. A named tmpfs buffer cannot
+            // require serializing the unrelated persistent root namespace.
+            o.mount
+                .as_ref()
+                .map_or(&self.fs, |mount| &mount.fs)
+                .borrow()
+                .checkpoint()?;
+        }
         inotify::notify(
             &node,
             inotify::MODIFY,

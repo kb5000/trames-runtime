@@ -303,7 +303,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(error) = if persistent {
+        if let Err(error) = if persistent && node.borrow().links != 0 {
             self.checkpoint()
         } else {
             Ok(())

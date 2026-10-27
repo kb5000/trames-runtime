@@ -1204,3 +1204,75 @@ fn reopened_inode_watches_keep_parent_identity_and_failed_transactions_are_silen
     assert_eq!(v.read(fd, 128), Err(Errno(11)));
     fs::remove_dir(dir.0.join("manifest.new")).unwrap();
 }
+
+#[test]
+fn anonymous_inode_metadata_does_not_commit_or_search_the_disk_namespace() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let fd = v.memfd_create(b"wayland-frame", 2).unwrap();
+    let named = v.open_at(AT_FDCWD, b"/control", 0o102, 0o600).unwrap();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    // Any attempted namespace commit now fails at create_new(manifest.new).
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    for length in [0, 4096, 16384, 65536, 4096] {
+        v.truncate_fd(fd, length).unwrap();
+        assert_eq!(size(super::Vfs::stat_fd(&v, fd).unwrap()), length);
+    }
+    v.chmod_fd(fd, 0o640).unwrap();
+    v.chown_fd(fd, 1000, 1000).unwrap();
+    v.set_xattr(fd as i32, None, true, b"user.test", Some(b"memory"), 0)
+        .unwrap();
+    let _ = v.fd_snapshot(); // Warm the unrelated named control's hint.
+    let before_paths = PATH_SEARCHES.with(Cell::get);
+    for _ in 0..32 {
+        let entry = v
+            .fd_snapshot()
+            .into_iter()
+            .find(|entry| entry.fd == fd)
+            .unwrap();
+        assert_eq!(entry.target, b"/memfd:wayland-frame (deleted)");
+    }
+    assert_eq!(
+        PATH_SEARCHES.with(Cell::get),
+        before_paths,
+        "unnamed inodes cannot scan a directory tree"
+    );
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    assert!(
+        v.truncate_fd(named, 4096).is_err(),
+        "named files retain their existing namespace durability path"
+    );
+}
+#[test]
+fn deferred_weak_inode_collection_preserves_the_exact_live_quota() {
+    let mut v = Vfs::default();
+    let limit = v.fs.borrow().inodes.len() + 4;
+    v.fs.borrow_mut().limits.nodes = limit;
+    for _ in 0..128 {
+        let fd = v.memfd_create(b"reused", 0).unwrap();
+        v.close(fd).unwrap();
+        assert!(v.fs.borrow().inodes.len() <= limit);
+    }
+    let mut live = Vec::new();
+    while let Ok(fd) = v.memfd_create(b"live", 0) {
+        live.push(fd);
+    }
+    assert_eq!(live.len(), 4);
+    assert_eq!(v.memfd_create(b"over-limit", 0), Err(Errno(28)));
+    v.close(live.pop().unwrap()).unwrap();
+    v.memfd_create(b"replacement", 0).unwrap();
+}
+
+#[test]
+fn tmpfs_resize_commits_only_its_own_namespace() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/ram", 0o755).unwrap();
+    v.mount(None, b"/ram", Some(b"tmpfs"), 0, None).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/ram/buffer", 0o102, 0o600).unwrap();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    v.truncate_fd(fd, 65536).unwrap();
+    assert_eq!(size(v.stat_fd(fd).unwrap()), 65536);
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+}

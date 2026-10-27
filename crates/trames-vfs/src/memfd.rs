@@ -71,10 +71,7 @@ impl Vfs {
         }
         let fd = self.available(0)?;
         let mut fs = self.fs.borrow_mut();
-        fs.inodes.retain(|n| n.strong_count() != 0);
-        if fs.inodes.len() >= fs.limits.nodes {
-            return Err(Errno(28));
-        }
+        fs.admit_inode()?;
         let inode = fs.next_inode;
         fs.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
         let node = Arc::new(Inode::new(Node {

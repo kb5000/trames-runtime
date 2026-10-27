@@ -36,6 +36,8 @@ pub struct Metrics {
     pub code_invalidations: u64,
     pub source_page_reads: u64,
     pub incremental_updates: u64,
+    /// Content-only direct frames refreshed without rebuilding mapping metadata.
+    pub direct_frame_refreshes: u64,
     pub incremental_pages: u64,
     /// Frames sharing the coordinator allocation, without byte transport.
     pub shared_frames: u64,
@@ -197,6 +199,28 @@ struct Frame {
     dynamic_code: bool,
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
     private_access: u8,
+}
+impl Frame {
+    fn refresh_content_metadata(&self, page: &Page) {
+        self.native_retryable
+            .store(page.native_retryable(), Ordering::Relaxed);
+        self.native_one_shot
+            .store(page.native_one_shot(), Ordering::Relaxed);
+        self.native_live_private.store(
+            page.backing
+                .as_ref()
+                .is_some_and(|backing| !backing.shared && !backing.private_copy && !self.direct),
+            Ordering::Relaxed,
+        );
+        self.data_revision
+            .store(page.data_revision, Ordering::Relaxed);
+        self.backing_version.store(
+            page.backing
+                .as_ref()
+                .map_or(0, |backing| backing.object.version()),
+            Ordering::Relaxed,
+        );
+    }
 }
 fn shared_futex_page_key(page: &Page) -> Option<(u64, u64)> {
     page.backing
@@ -1189,25 +1213,7 @@ impl Memory {
                     page.read_bytes(0, &mut data).ok()?;
                     frame.bytes.refresh(&data);
                 }
-                frame
-                    .native_retryable
-                    .store(page.native_retryable(), Ordering::Relaxed);
-                frame
-                    .native_one_shot
-                    .store(page.native_one_shot(), Ordering::Relaxed);
-                frame.native_live_private.store(
-                    page.backing
-                        .as_ref()
-                        .is_some_and(|b| !b.shared && !b.private_copy && !frame.direct),
-                    Ordering::Relaxed,
-                );
-                frame
-                    .data_revision
-                    .store(page.data_revision, Ordering::Relaxed);
-                frame.backing_version.store(
-                    page.backing.as_ref().map_or(0, |b| b.object.version()),
-                    Ordering::Relaxed,
-                );
+                frame.refresh_content_metadata(page);
             }
             cache.source_revision = self.revision;
             let view = View::new(cache.snapshot.clone());

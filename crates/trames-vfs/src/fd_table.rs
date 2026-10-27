@@ -359,6 +359,7 @@ pub(super) struct DescriptorVersion {
     pub(super) io: OnceCell<(FdMask, FdMask)>,
     pub(super) direct: RefCell<Option<(u64, PreparedBytes)>>,
     pub(super) urings: OnceCell<Vec<Weak<Uring>>>,
+    pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
 }
 impl DescriptorTable {
     pub(super) fn membership(&self) -> &SharedFiles {
@@ -536,6 +537,7 @@ impl TableState {
             version.io.take();
             version.direct.get_mut().take();
             version.urings.take();
+            version.timers.take();
         } else {
             self.identity = Rc::default();
         }

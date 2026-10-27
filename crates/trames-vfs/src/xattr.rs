@@ -157,8 +157,10 @@ impl Vfs {
             .sum();
         let result = if invalid || used > XATTR_BUDGET {
             Err(Errno(28))
-        } else {
+        } else if node.borrow().links != 0 {
             fs.borrow().checkpoint()
+        } else {
+            Ok(())
         };
         if let Err(e) = result {
             let mut n = node.borrow_mut();

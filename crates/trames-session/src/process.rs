@@ -4209,9 +4209,10 @@ impl<C: Cpu> Kernel<C> {
                         let instructions_before = self.instructions;
                         let began = Instant::now();
                         let decode_before = p.cpu.decode_stats();
-                        let outcome = p.cpu.run(
+                        let outcome = p.cpu.run_coordinated(
                             &mut self.engine,
                             &mut p.memory,
+                            &mut self.parallel_memory,
                             (limit - self.instructions).min(quantum),
                         );
                         let elapsed = began.elapsed();

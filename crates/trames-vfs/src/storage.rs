@@ -877,10 +877,7 @@ impl Vfs {
         }
         data.sync(false)?;
         let mut fs = self.fs.borrow_mut();
-        fs.inodes.retain(|n| n.strong_count() != 0);
-        if fs.inodes.len() >= fs.limits.nodes {
-            return Err(Errno(28));
-        }
+        fs.admit_inode()?;
         let inode = data.inode().unwrap_or(fs.next_inode);
         if inode == fs.next_inode {
             fs.next_inode = fs.next_inode.checked_add(1).ok_or(Errno(28))?;

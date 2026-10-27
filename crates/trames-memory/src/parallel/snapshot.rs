@@ -194,7 +194,8 @@ impl Memory {
         // permission check or guest byte synchronization changes here.
         let snapshot = Arc::get_mut(&mut cache.snapshot).expect("unique joined snapshot");
         registry.metrics.incremental_updates += 1;
-        let mut changed = std::mem::take(&mut self.parallel_mappings);
+        let mapping_changes = std::mem::take(&mut self.parallel_mappings);
+        let mut changed = mapping_changes.clone();
         let dirty = std::mem::take(&mut self.parallel_dirty);
         for index in dirty {
             if let Some(Some(position)) = snapshot.positions.get(index) {
@@ -256,6 +257,43 @@ impl Memory {
         registry.metrics.code_invalidations +=
             u64::from(snapshot.code_revision != self.code_revision);
         registry.metrics.incremental_pages += changed.len() as u64;
+        // Canonical direct bytes already include file/worker writes. Content
+        // publication does not change a frame's mapping schema. Keep its slab
+        // position, alias/backing indices and hardware generation untouched.
+        // Actual mapping/admission changes and executable code remain on the
+        // normal replacement path; unknown providers keep full preparation.
+        changed.retain(|base| {
+            if mapping_changes.contains(base) {
+                return true;
+            }
+            let Some(&position) = snapshot.pages.get(base) else {
+                return true;
+            };
+            let frame = &snapshot.frames[position];
+            let Some(page) = self.frames.get(frame.root_frame).and_then(Option::as_ref) else {
+                return true;
+            };
+            let stable_domain = page.backing.as_ref().is_none_or(|backing| {
+                backing.object.parallel_versioned()
+                    && backing.object.parallel_change_domain().map(|(id, _)| id)
+                        == frame.backing_domain.map(|(id, _)| id)
+            });
+            if !frame.direct
+                || frame.permissions.execute
+                || page.permissions.execute
+                || frame.permissions != page.permissions
+                || !Arc::ptr_eq(&frame.charge, &page.charge)
+                || frame.error.is_some()
+                || page.check_backing(*base).is_err()
+                || !stable_domain
+                || !direct_matches(page, frame)
+            {
+                return true;
+            }
+            frame.refresh_content_metadata(page);
+            registry.metrics.direct_frame_refreshes += 1;
+            false
+        });
         // instruction_identity uses this token, not source_backing_revision.
         // Data-only file/SHM writes must not discard every CPU's decoded ELF
         // code. Unknown providers still enter `changed`; executable removals,
