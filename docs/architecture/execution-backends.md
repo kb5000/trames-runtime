@@ -154,3 +154,14 @@ both products run through the common task/memory model, extract the common
 runtime, iPad product and Mac product into independently buildable repositories,
 pin dependencies and preserve source pairing. Do not fork Linux semantics into
 two product copies or infer completion from a renamed crate/backend selector.
+
+## Guest and compositor clocks
+
+A Linux session with Wayland uses the server's shared monotonic origin. The
+server retains that origin across commands in its namespace. Input receipt and
+presentation acknowledgements are timestamped against it before entering the
+compositor command queue. Host uptime, UIKit event epochs and frontend timestamps
+must not be forwarded as guest monotonic milliseconds: GTK clients reconstruct
+input timestamps using their own `CLOCK_MONOTONIC`, including 32-bit wraparound.
+A standalone native compositor keeps caller-supplied timestamps until it is
+bound to a guest clock. This preserves native peer and presentation tests.

@@ -7,7 +7,7 @@ use std::{
     os::fd::{AsFd, AsRawFd},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Mutex,
+        mpsc, Mutex, OnceLock,
     },
     thread,
 };
@@ -54,6 +54,7 @@ struct Control {
     snapshot: Arc<Mutex<Snapshot>>,
     changes: Arc<trames_shared::Readiness>,
     next: AtomicU64,
+    guest_clock: OnceLock<std::time::Instant>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 impl Control {
@@ -109,6 +110,7 @@ impl Server {
             snapshot,
             changes,
             next: AtomicU64::new(1),
+            guest_clock: OnceLock::new(),
             worker: Mutex::new(Some(worker)),
         })))
     }
@@ -173,7 +175,28 @@ impl Server {
     pub fn set_mode(&self, id: u64, mode: WindowMode) -> io::Result<()> {
         self.0.send(Command::Mode(id, mode))
     }
-    pub fn input(&self, event: InputEvent) -> io::Result<()> {
+    /// Bind the compositor to the guest's CLOCK_MONOTONIC epoch. Reusing a
+    /// server keeps that clock stable across commands in the same namespace.
+    pub fn guest_clock_origin(&self) -> std::time::Instant {
+        *self.0.guest_clock.get_or_init(std::time::Instant::now)
+    }
+    fn guest_milliseconds(&self, frontend: u32) -> u32 {
+        self.0
+            .guest_clock
+            .get()
+            .map_or(frontend, |origin| origin.elapsed().as_millis() as u32)
+    }
+    pub fn input(&self, mut event: InputEvent) -> io::Result<()> {
+        // Frontends use host uptime (and can have different timestamp epochs).
+        // Timestamp receipt in the same clock as the Linux client, before the
+        // command queue, so GTK cannot interpret input as days old or future.
+        match &mut event {
+            InputEvent::Pointer { time, .. }
+            | InputEvent::Button { time, .. }
+            | InputEvent::Scroll { time, .. }
+            | InputEvent::Key { time, .. } => *time = self.guest_milliseconds(*time),
+            InputEvent::Focus { .. } => {}
+        }
         self.0.send(Command::Input(event))
     }
     pub fn edit_text(&self, edit: TextEdit) -> io::Result<()> {
@@ -193,8 +216,11 @@ impl Server {
         self.0.send(Command::Close(id))
     }
     pub fn presented(&self, window: u64, revision: u64, milliseconds: u32) -> io::Result<()> {
-        self.0
-            .send(Command::Presented(window, revision, milliseconds))
+        self.0.send(Command::Presented(
+            window,
+            revision,
+            self.guest_milliseconds(milliseconds),
+        ))
     }
 }
 fn run(
@@ -325,5 +351,93 @@ fn run(
                 Err(_) => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn guest_input_and_presentation_share_the_session_monotonic_epoch() {
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let (wake, _read) = UnixStream::pair().unwrap();
+        let origin = Instant::now() - Duration::from_secs(2);
+        let clock = OnceLock::new();
+        clock.set(origin).unwrap();
+        let server = Server(Arc::new(Control {
+            sender,
+            wake,
+            snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            changes: Arc::new(trames_shared::Readiness::default()),
+            next: AtomicU64::new(1),
+            guest_clock: clock,
+            worker: Mutex::new(None),
+        }));
+        assert_eq!(server.guest_clock_origin(), origin);
+        let events = [
+            InputEvent::Pointer {
+                window: 7,
+                x: 12.5,
+                y: 20.0,
+                time: u32::MAX,
+            },
+            InputEvent::Button {
+                button: 272,
+                pressed: true,
+                time: 200_000_000,
+            },
+            InputEvent::Scroll {
+                horizontal: 0.0,
+                vertical: 3.0,
+                time: 1,
+            },
+            InputEvent::Key {
+                key: 30,
+                pressed: true,
+                modifiers: 0,
+                time: 0,
+            },
+        ];
+        for event in events {
+            let before = origin.elapsed().as_millis() as u32;
+            server.input(event).unwrap();
+            let Command::Input(event) = receiver.recv().unwrap() else {
+                panic!("input command")
+            };
+            let time = match event {
+                InputEvent::Pointer {
+                    time,
+                    window: 7,
+                    x: 12.5,
+                    y: 20.0,
+                }
+                | InputEvent::Button {
+                    time,
+                    button: 272,
+                    pressed: true,
+                }
+                | InputEvent::Scroll {
+                    time,
+                    horizontal: 0.0,
+                    vertical: 3.0,
+                }
+                | InputEvent::Key {
+                    time,
+                    key: 30,
+                    pressed: true,
+                    modifiers: 0,
+                } => time,
+                _ => panic!("input payload changed"),
+            };
+            assert!((before..=origin.elapsed().as_millis() as u32).contains(&time));
+        }
+        let before = origin.elapsed().as_millis() as u32;
+        server.presented(7, 9, u32::MAX).unwrap();
+        let Command::Presented(7, 9, time) = receiver.recv().unwrap() else {
+            panic!("presentation command")
+        };
+        assert!((before..=origin.elapsed().as_millis() as u32).contains(&time));
     }
 }

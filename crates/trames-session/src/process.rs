@@ -4465,6 +4465,11 @@ pub(super) fn run<C: Cpu>(
         seccomp: seccomp::Seccomp::default(),
     };
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
+    let started = root
+        .linux
+        .vfs
+        .wayland_server()
+        .map_or_else(Instant::now, |server| server.guest_clock_origin());
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake),
         memory_limits: runtime.memory_limits,
@@ -4515,7 +4520,7 @@ pub(super) fn run<C: Cpu>(
         processes: BTreeMap::new(),
         next_pid: 2,
         terminal: runtime.terminal.take(),
-        started: Instant::now(),
+        started,
         instructions: 0,
         boot_time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
