@@ -1141,7 +1141,8 @@ impl Memory {
         // shared pages must join that registry's alias/code domain, not silently
         // retain an earlier one while fork peers allocate duplicate snapshots.
         if self.parallel_cache.as_ref().is_some_and(|c| {
-            !Arc::ptr_eq(&c.snapshot.code_epoch, &registry.code_epoch)
+            c.snapshot.hardware != registry.hardware
+                || !Arc::ptr_eq(&c.snapshot.code_epoch, &registry.code_epoch)
                 || c.source_fork_epoch != self.fork_epoch.get()
         }) {
             self.parallel_cache = None;

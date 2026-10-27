@@ -532,6 +532,25 @@ mod tests {
     }
 
     #[test]
+    fn entering_hardware_mode_cannot_reuse_a_software_snapshot_token() {
+        let mut memory = crate::Memory::default();
+        memory
+            .map(0x1000, PAGE_SIZE, crate::Permissions::RW)
+            .unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        let software = memory
+            .parallel_view(&mut registry)
+            .unwrap()
+            .hardware_view_version()
+            .0;
+        registry.use_hardware();
+        memory.prepare_hardware().unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_ne!(view.hardware_view_version().0, software);
+        assert!(view.hardware_mapping_changes(software).is_none());
+    }
+
+    #[test]
     fn hardware_metadata_does_not_require_read_access_or_hide_code_changes() {
         use crate::{Access, CpuMemory, Memory, MemoryError, Permissions};
         let mut memory = Memory::default();
