@@ -257,7 +257,7 @@ mod tests {
         a.cpu.set_x(0, 0x8000);
         a.cpu.set_x(1, PAGE_SIZE);
         a.cpu.set_x(8, 215);
-        let paused = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+        let mut paused = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
         let mut related = if relation == 2 {
             map(&mut a, 0x1000, paused.clone(), None);
             let memory = a.memory.share();
@@ -276,12 +276,48 @@ mod tests {
                 .protect(0x4000, PAGE_SIZE, Permissions::RX)
                 .unwrap();
             Some(b)
-        } else if relation == 1 {
+        } else if matches!(relation, 1 | 3 | 4) {
             let mut b = super::super::tests::process();
             map(&mut b, 0x1000, paused.clone(), None);
-            let shared = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
-            map(&mut a, 0x6000, shared.clone(), None);
-            map(&mut b, 0x6000, shared, None);
+            if relation >= 3 {
+                let fd = if relation == 4 {
+                    a.linux.vfs.memfd_create(b"shared-writer", 0).unwrap()
+                } else {
+                    a.linux
+                        .vfs
+                        .open_at(-100, b"/shared-library", 0x42, 0o600)
+                        .unwrap()
+                };
+                a.linux.vfs.truncate_fd(fd, PAGE_SIZE).unwrap();
+                for memory in [&mut a.memory, &mut b.memory] {
+                    memory.unmap(0x6000, PAGE_SIZE).unwrap();
+                    let pages = a
+                        .linux
+                        .vfs
+                        .mapping_pages(fd, 0, PAGE_SIZE, relation == 4, relation == 4)
+                        .unwrap();
+                    if relation == 4 {
+                        paused = pages[0].shared_page().unwrap();
+                    }
+                    memory
+                        .map_backed(
+                            0x6000,
+                            pages,
+                            relation == 4,
+                            if relation == 4 {
+                                Permissions::RW
+                            } else {
+                                Permissions::RX
+                            },
+                            false,
+                        )
+                        .unwrap();
+                }
+            } else {
+                let shared = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+                map(&mut a, 0x6000, shared.clone(), None);
+                map(&mut b, 0x6000, shared, None);
+            }
             code(&mut b, &[0xf9400020, 0x91000400, 0xf9000020, 0x17fffffd]);
             Some(b)
         } else {
@@ -292,7 +328,7 @@ mod tests {
             b.tgid = 2;
             b.vm_id = if relation == 2 { 1 } else { 2 };
             b.affinity = 2;
-            b.cpu.set_x(1, 0x1000);
+            b.cpu.set_x(1, if relation == 4 { 0x6000 } else { 0x1000 });
         }
         let mut peer = super::super::tests::process();
         let progressing = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
@@ -314,7 +350,9 @@ mod tests {
             let before = count(&progressing);
             let other_before = count(&paused);
             let deadline = Instant::now() + Duration::from_millis(100);
-            while count(&progressing) == before && Instant::now() < deadline {
+            while (count(&progressing) == before || relation >= 3 && count(&paused) == other_before)
+                && Instant::now() < deadline
+            {
                 std::thread::yield_now();
             }
             let advanced = count(&progressing) > before;
@@ -332,7 +370,11 @@ mod tests {
             advanced,
             "an unrelated VM stopped during the mapping commit"
         );
-        assert!(quiescent, "a related VM kept executing during the commit");
+        assert_eq!(
+            quiescent,
+            relation < 3,
+            "only same-mm or coupled-provider peers must stop during a local mapping commit"
+        );
         assert_eq!(k.vm_checkpoint_groups, 1);
         assert_eq!(k.vm_checkpoint_spaces, if relation == 1 { 2 } else { 1 });
         assert_eq!(k.vm_local_syscalls, 1);
@@ -350,6 +392,14 @@ mod tests {
     #[test]
     fn vm_commit_quiesces_shared_backings_but_keeps_an_unrelated_vm_running() {
         commit_while_peer_runs(1);
+    }
+    #[test]
+    fn vm_commit_keeps_a_shared_readonly_library_peer_running() {
+        commit_while_peer_runs(3);
+    }
+    #[test]
+    fn vm_commit_keeps_a_canonical_shared_file_writer_running() {
+        commit_while_peer_runs(4);
     }
     #[test]
     fn vm_commit_quiesces_all_clone_vm_cpus_and_keeps_an_unrelated_vm_running() {

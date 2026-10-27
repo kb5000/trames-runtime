@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Coherent mapped pages retained by mappings, not by the inode's weak cache.
 use super::*;
-use std::sync::{atomic::AtomicBool, Arc, RwLock};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{atomic::AtomicBool, Arc, RwLock},
+};
 mod writers;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
@@ -162,16 +166,27 @@ enum LiveLength {
     Shared(trames_shared::SharedFile),
     Inode(trames_shared::LogicalSize),
 }
+// Owner-side invalidation history, not software byte coherence. Repeated
+// identical ranges coalesce; expired history falls back to full-domain checks.
+struct RangeChange {
+    before: u64,
+    after: u64,
+    bytes: Range<u64>,
+}
 struct MappingState {
     identity: u64,
     generation: AtomicU64,
     length: LiveLength,
+    stable: bool,
+    changes: SharedCell<VecDeque<RangeChange>>,
 }
 impl MappingState {
     fn new(data: &FileData, stable: bool, inode: Option<trames_shared::LogicalSize>) -> Arc<Self> {
         Arc::new(Self {
             identity: trames_memory::new_backing_identity(),
             generation: AtomicU64::new(0),
+            stable,
+            changes: SharedCell::default(),
             length: match data {
                 _ if !stable => {
                     LiveLength::Inode(inode.clone().unwrap_or_else(|| data.logical_size()))
@@ -200,10 +215,56 @@ impl MappingState {
                 }),
         )
     }
-    fn changed(&self) {
-        // These counters invalidate caches; byte/VM ownership supplies ordering.
+    fn changed(&self, bytes: Option<Range<u64>>) {
+        // Only metadata publication uses this object lock. CPU/native ordinary
+        // stores keep their original byte-access path and hardware ordering.
+        let before = self.domain().1;
         self.generation.fetch_add(1, Ordering::Relaxed);
+        let after = self.domain().1;
+        let mut changes = self.changes.borrow_mut();
+        if let Some(bytes) = bytes.filter(|r| r.start < r.end) {
+            if let Some(last) = changes
+                .back_mut()
+                .filter(|last| last.after == before && bytes == last.bytes)
+            {
+                last.after = after;
+            } else {
+                changes.push_back(RangeChange {
+                    before,
+                    after,
+                    bytes,
+                });
+                if changes.len() > 128 {
+                    changes.pop_front();
+                }
+            }
+        } else {
+            changes.clear(); // layout/EOF/source changes never use a range hint
+        }
         trames_memory::backing_changed();
+    }
+    fn changes_since(&self, generation: u64) -> Option<Vec<Range<u64>>> {
+        let current = self.domain().1;
+        if generation == current {
+            return Some(Vec::new());
+        }
+        let changes = self.changes.borrow();
+        // A snapshot may have observed a generation inside a coalesced range.
+        // Returning that whole range is conservative. Token gaps (including
+        // inode-source changes outside this log) require a full refresh.
+        let start = changes.iter().position(|change| {
+            generation.wrapping_sub(change.before) < change.after.wrapping_sub(change.before)
+        })?;
+        let mut expected = changes[start].before;
+        let mut ranges = Vec::new();
+        for change in changes.iter().skip(start) {
+            if change.before != expected {
+                return None;
+            }
+            expected = change.after;
+            ranges.push(change.bytes.clone());
+        }
+        (expected == current).then_some(ranges)
     }
 }
 pub(super) struct MappedData {
@@ -235,7 +296,7 @@ impl MappedData {
         self.data.borrow().len()
     }
     fn changed(&self) {
-        self.state.changed();
+        self.state.changed(None);
     }
     pub(super) fn epoch_io_safe(&self, write: bool) -> bool {
         // FileMapping owns these pages across all VMs, hard links and retained
@@ -267,21 +328,24 @@ impl MappedData {
     pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
         self.data.borrow().shared_file()
     }
-    fn refresh_shared_pages(&self) {
+    fn refresh_shared_pages(&self) -> bool {
         let Some(file) = self.shared_file() else {
-            return;
+            return false;
         };
+        let mut replaced = false;
         for (&offset, page) in self.pages.borrow().iter() {
             let Some(page) = page.upgrade() else { continue };
             if !page.bytes.read().unwrap().is_shared() {
                 if let Ok(map) = file.map(offset as usize, PAGE_SIZE as usize) {
                     page.replace(PageStorage::mapped(map));
+                    replaced = true;
                     // Snapshot versions cover physical identity, including
                     // untouched pages upgraded when an inode gains SHM storage.
                     page.changed();
                 }
             }
         }
+        replaced
     }
     fn page(&self, offset: u64) -> Result<Arc<FilePage>> {
         if let Some(p) = self
@@ -371,8 +435,9 @@ impl MappedData {
         Ok(out)
     }
     pub(super) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
+        let old_len = self.len();
         let count = self.data.borrow_mut().write_at(offset, bytes)?;
-        self.refresh_shared_pages();
+        let replaced = self.refresh_shared_pages();
         let end = offset + count as u64;
         for (&base, p) in self.pages.borrow().range((offset & !(PAGE_SIZE - 1))..end) {
             if let Some(p) = p.upgrade() {
@@ -387,7 +452,8 @@ impl MappedData {
                 p.changed();
             }
         }
-        self.changed();
+        self.state
+            .changed((!replaced && old_len == self.len() && count != 0).then_some(offset..end));
         Ok(count)
     }
     fn flush(&self, offset: u64, page: &FilePage) -> Result<()> {
@@ -534,7 +600,8 @@ impl FileMapping {
             self.node.borrow_mut().times[1] = storage::Timestamp::now();
         }
         self.page.changed();
-        self.state.changed();
+        self.state
+            .changed(Some(self.offset..self.offset.saturating_add(PAGE_SIZE)));
     }
     fn create(
         open: OpenHandle,
@@ -579,6 +646,28 @@ impl PageBacking for FileMapping {
             };
         }
         Some(self.state.domain())
+    }
+    fn parallel_commit_isolated(&self) -> bool {
+        // No provider Rc crosses to workers. Published bytes retain SharedPage
+        // ownership and gates; writeback/drop use those same guards. Local VM
+        // calls cannot truncate/replace another View's allocation. Volatile
+        // inode projections keep the conservative owner boundary.
+        self.state.stable
+    }
+    fn parallel_domain_offset(&self) -> Option<u64> {
+        Some(self.offset)
+    }
+    fn parallel_changes_since(&self, generation: u64) -> Option<Vec<Range<u64>>> {
+        if matches!(self.state.length, LiveLength::Inode(_)) {
+            let node = self.node.borrow();
+            let Content::File(FileData::Mapped(data)) = &node.content else {
+                return None;
+            };
+            if !Arc::ptr_eq(&data.state, &self.state) {
+                return None;
+            }
+        }
+        self.state.changes_since(generation)
     }
     fn cpu_borrow_safe(&self) -> bool {
         // CPU and native-span methods inspect resident file bytes/metadata
@@ -1360,6 +1449,102 @@ mod tests {
             v.seek(fd, 0, 0).unwrap();
             assert_eq!(v.read(fd, 8).unwrap(), [0; 8]);
         }
+    }
+    #[test]
+    fn changed_ranges_visit_only_touched_offsets_and_all_their_aliases() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        for pages in [8, 256, 1024] {
+            let mut v = Vfs::default();
+            let fd = v.memfd_create(b"large-mapped-buffer", 0).unwrap();
+            v.truncate_fd(fd, PAGE_SIZE * pages).unwrap();
+            // A previous whole-file write must not make later single-page
+            // changes inherit its range indefinitely.
+            v.write(fd, &vec![0; (PAGE_SIZE * pages) as usize]).unwrap();
+            let mut m = Memory::default();
+            mapped(
+                &v,
+                &mut m,
+                fd,
+                0x1000000,
+                PAGE_SIZE * pages,
+                true,
+                Permissions::RW,
+            );
+            let aliases = v
+                .mapping_pages(fd, 3 * PAGE_SIZE, PAGE_SIZE, true, true)
+                .unwrap();
+            m.map_backed(0x2000000, aliases, true, Permissions::RW, false)
+                .unwrap();
+            let cow = v
+                .mapping_pages(fd, 3 * PAGE_SIZE, PAGE_SIZE, false, false)
+                .unwrap();
+            m.map_backed(0x3000000, cow, false, Permissions::RW, false)
+                .unwrap();
+            m.write_array(0x3000000, [99u8]).unwrap();
+            let mut registry = Registry::default();
+            drop(m.parallel_view(&mut registry).unwrap());
+            let before = registry.metrics.backing_page_checks;
+            v.seek(fd, (3 * PAGE_SIZE) as i64, 0).unwrap();
+            v.write(fd, &[42]).unwrap();
+            let view = m.parallel_view(&mut registry).unwrap();
+            assert_eq!(view.read_array::<1>(0x1000000 + 3 * PAGE_SIZE), Ok([42]));
+            assert_eq!(view.read_array::<1>(0x2000000), Ok([42]));
+            assert_eq!(view.read_array::<1>(0x3000000), Ok([99]));
+            assert_eq!(
+                registry.metrics.backing_page_checks - before,
+                3,
+                "mapped pages={pages}"
+            );
+            assert_eq!(registry.metrics.full_rebuilds, 1);
+            assert!(view.commit_domains().is_empty());
+            drop(view);
+            // EOF changes must revisit every alias, including detached COW.
+            v.truncate_fd(fd, PAGE_SIZE).unwrap();
+            let before = registry.metrics.backing_page_checks;
+            let view = m.parallel_view(&mut registry).unwrap();
+            assert_eq!(
+                view.read_array::<1>(0x2000000),
+                Err(MemoryError::Bus(0x2000000))
+            );
+            assert_eq!(
+                view.read_array::<1>(0x3000000),
+                Err(MemoryError::Bus(0x3000000))
+            );
+            assert_eq!(registry.metrics.backing_page_checks - before, pages + 2);
+        }
+    }
+    #[test]
+    fn range_history_coalesces_but_falls_back_on_gaps_layout_and_expiry() {
+        let data = FileData::memory(vec![0; 512 * PAGE_SIZE as usize]);
+        let state = MappingState::new(&data, true, None);
+        let initial = state.domain().1;
+        state.changed(Some(0..PAGE_SIZE));
+        let middle = state.domain().1;
+        state.changed(Some(0..PAGE_SIZE));
+        assert_eq!(
+            state.changes_since(initial),
+            Some(std::iter::once(0..PAGE_SIZE).collect())
+        );
+        assert_eq!(
+            state.changes_since(middle),
+            Some(std::iter::once(0..PAGE_SIZE).collect())
+        );
+        assert_eq!(state.changes_since(state.domain().1), Some(Vec::new()));
+        state.changed(None);
+        assert!(state.changes_since(initial).is_none());
+        let after_layout = state.domain().1;
+        for page in 0..130 {
+            state.changed(Some(page * PAGE_SIZE * 2..page * PAGE_SIZE * 2 + PAGE_SIZE));
+        }
+        assert_eq!(state.changes.borrow().len(), 128);
+        assert!(state.changes_since(after_layout).is_none());
+        let state = MappingState::new(&data, false, None);
+        let before_gap = state.domain().1;
+        if let LiveLength::Inode(size) = &state.length {
+            size.store(1, Ordering::Relaxed);
+        }
+        state.changed(Some(0..PAGE_SIZE));
+        assert!(state.changes_since(before_gap).is_none());
     }
     #[test]
     fn backing_epochs_rebuild_only_changed_file_pages_and_still_check_eof_and_cow() {

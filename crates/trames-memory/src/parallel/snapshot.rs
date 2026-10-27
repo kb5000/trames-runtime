@@ -6,54 +6,78 @@ use super::*;
 pub(super) struct BackingIndex {
     domains: BTreeMap<u64, BackingDomain>,
     unscoped: BTreeSet<u64>,
+    coupled: BTreeMap<(u8, u64), BTreeSet<u64>>,
     /// Only MAP_SHARED pages need entries. No larger per-page CPU descriptor,
     /// backing Rc, or work on ordinary instruction/data translations.
     pub(super) futex: BTreeMap<u64, (u64, u64)>,
 }
 struct BackingDomain {
     generation: u64,
-    pages: BTreeSet<u64>,
+    pages: BTreeMap<u64, Option<u64>>,
+    offsets: BTreeSet<(u64, u64)>,
+    unindexed: BTreeSet<u64>,
 }
 impl BackingIndex {
-    pub(super) fn commit_domains(&self, snapshot: &Snapshot) -> BTreeSet<(u8, u64)> {
-        let mut domains: BTreeSet<_> = self.domains.keys().map(|&id| (1, id)).collect();
-        // Ordinary private anonymous pages never share mutable storage across
-        // address spaces: writable fork storage detaches during preparation.
-        // Unversioned mapped backings still need their actual physical identity.
-        domains.extend(self.unscoped.iter().map(|base| {
-            let frame = &snapshot.frames[snapshot.pages[base]];
-            (0, frame.bytes.identity)
-        }));
-        domains
+    pub(super) fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
+        // Content-change domains are not necessarily quiescence dependencies.
+        // Stable retained providers permit local mapping commits independently;
+        // custom providers keep their original transitive pause boundary.
+        self.coupled.keys().copied().collect()
     }
     pub(super) fn insert(
         &mut self,
         base: u64,
         domain: Option<(u64, u64)>,
+        object: &dyn PageBacking,
+        physical: u64,
         futex: Option<(u64, u64)>,
     ) {
+        if !object.parallel_commit_isolated() {
+            let key = domain.map_or((0, physical), |(id, _)| (1, id));
+            self.coupled.entry(key).or_default().insert(base);
+        }
         if let Some(key) = futex {
             self.futex.insert(base, key);
         }
         if let Some((identity, generation)) = domain {
             // Adding one new mapping cannot acknowledge changes to old pages.
-            self.domains
+            let group = self
+                .domains
                 .entry(identity)
                 .or_insert_with(|| BackingDomain {
                     generation,
-                    pages: BTreeSet::new(),
-                })
-                .pages
-                .insert(base);
+                    pages: BTreeMap::new(),
+                    offsets: BTreeSet::new(),
+                    unindexed: BTreeSet::new(),
+                });
+            let offset = object.parallel_domain_offset();
+            group.pages.insert(base, offset);
+            if let Some(offset) = offset {
+                debug_assert_eq!(offset % PAGE_SIZE, 0);
+                group.offsets.insert((offset, base));
+            } else {
+                group.unindexed.insert(base);
+            }
         } else {
             self.unscoped.insert(base);
         }
     }
-    fn remove(&mut self, base: u64, domain: Option<(u64, u64)>) {
+    fn remove(&mut self, base: u64, domain: Option<(u64, u64)>, physical: u64) {
         self.futex.remove(&base);
+        let key = domain.map_or((0, physical), |(id, _)| (1, id));
+        if let Some(pages) = self.coupled.get_mut(&key) {
+            pages.remove(&base);
+            if pages.is_empty() {
+                self.coupled.remove(&key);
+            }
+        }
         if let Some((identity, _)) = domain {
             let group = self.domains.get_mut(&identity).expect("indexed domain");
-            group.pages.remove(&base);
+            if let Some(Some(offset)) = group.pages.remove(&base) {
+                group.offsets.remove(&(offset, base));
+            } else {
+                group.unindexed.remove(&base);
+            }
             if group.pages.is_empty() {
                 self.domains.remove(&identity);
             }
@@ -106,7 +130,8 @@ impl Snapshot {
         }
         self.positions[frame.root_frame] = None;
         if self.backed_pages.remove(&base) {
-            self.backings.remove(base, frame.backing_domain);
+            self.backings
+                .remove(base, frame.backing_domain, frame.bytes.identity);
         }
         let count = self
             .identities
@@ -120,15 +145,20 @@ impl Snapshot {
         self.dynamic_code_pages -= usize::from(frame.dynamic_code);
         Some(frame)
     }
-    fn insert_frame(&mut self, frame: Frame, backed: bool, futex: Option<(u64, u64)>) {
+    fn insert_frame(&mut self, frame: Frame, backing: Option<&Backed>, futex: Option<(u64, u64)>) {
         let count = self.identities.entry(frame.bytes.identity).or_insert(0);
         self.alias_count += usize::from(*count == 1);
         *count += 1;
         self.dynamic_code_pages += usize::from(frame.dynamic_code);
-        if backed {
+        if let Some(backing) = backing {
             self.backed_pages.insert(frame.base);
-            self.backings
-                .insert(frame.base, frame.backing_domain, futex);
+            self.backings.insert(
+                frame.base,
+                frame.backing_domain,
+                backing.object.as_ref(),
+                frame.bytes.identity,
+                futex,
+            );
         }
         self.pages.insert(frame.base, self.frames.len());
         self.positions[frame.root_frame] = Some(self.frames.len());
@@ -212,7 +242,7 @@ impl Memory {
             // here; dropping/unmapping a file keeps its original lifetime.
             let mut candidates = snapshot.backings.unscoped.clone();
             for (&identity, group) in &mut snapshot.backings.domains {
-                let Some(base) = group.pages.iter().find(|base| !changed.contains(base)) else {
+                let Some(base) = group.pages.keys().find(|base| !changed.contains(base)) else {
                     // All old members are already being replaced or removed.
                     continue;
                 };
@@ -222,17 +252,33 @@ impl Memory {
                     .expect("backed frame");
                 let backing = page.backing.as_ref().expect("indexed backing");
                 registry.metrics.backing_domain_checks += 1;
+                let mut ranges = None;
                 match backing.object.parallel_change_domain() {
                     Some((id, generation)) if id == identity => {
                         if generation == group.generation {
                             continue;
                         }
+                        ranges = backing.object.parallel_changes_since(group.generation);
                         group.generation = generation;
                     }
                     // A provider changing its declared domain is conservative.
                     _ => {}
                 }
-                candidates.extend(group.pages.iter().copied());
+                if let Some(ranges) = ranges {
+                    candidates.extend(group.unindexed.iter().copied());
+                    for range in ranges {
+                        if range.start < range.end {
+                            candidates.extend(
+                                group
+                                    .offsets
+                                    .range(((range.start & !(PAGE_SIZE - 1)), 0)..(range.end, 0))
+                                    .map(|&(_, base)| base),
+                            );
+                        }
+                    }
+                } else {
+                    candidates.extend(group.pages.keys().copied());
+                }
             }
             // Changed domains retain individual versions and live EOF checks.
             // Unknown providers retain the original conservative preparation.
@@ -352,7 +398,7 @@ impl Memory {
                 previous.get(&base),
                 registry,
             )?;
-            snapshot.insert_frame(frame, page.backing.is_some(), shared_futex_page_key(page));
+            snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
         }
         snapshot.refresh_mmu(mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;

@@ -496,3 +496,43 @@ write, monitor and instruction-generation paths remain unchanged. Regression
 coverage checks stable private RWX metadata across joined rounds, real guest
 IC/DC publication between two host-thread-affine vCPUs, host code writes,
 permission revocation, physical replacement and preserved page-out/page-in.
+
+## Local mapping commits and backing range history
+
+A content-change domain is separate from a quiescence dependency. Local mapping
+syscalls still join every CPU and retained service of the affected address
+space. Nonvolatile VFS file mappings opt into
+`PageBacking::parallel_commit_isolated`: their published pages retain physical
+ownership independently of coordinator mapping/provider lifetime, and all
+coordinator byte access and writeback use the existing SharedPage gates.
+Consequently a read-only library or canonical shared file does not connect
+otherwise independent mapping checkpoints. Same-mm threads remain joined;
+unknown/custom providers retain the original transitive pause closure. Truncate,
+provider storage replacement and other nonlocal operations keep their joined
+owner boundary. No provider Rc moves to a worker.
+
+An isolated commit can harvest a shared ConcurrentPage's atomic dirty mask while
+another address space runs. It only clears its own joined snapshot's publication
+bitmap; other spaces retain theirs. The provider dirty/version hooks still run,
+and canonical bytes already contain the writes. This adds no ordinary byte
+barrier or per-access permission policy.
+
+Versioned providers may expose a stable page-aligned domain offset and
+`parallel_changes_since`. Snapshot metadata indexes file offsets and every
+virtual alias, so a one-page update visits its aliases rather than all pages of
+the file. The VFS keeps at most 128 invalidation records per backing, allocated
+on demand. Repeated identical ranges coalesce; different ranges remain separate
+so an old whole-file write cannot permanently widen later small updates.
+Generation gaps, expired history, EOF/layout changes and replaced volatile inode
+sources request the original full-domain check. Unknown providers also retain
+that fallback. This journal describes metadata invalidation, not byte visibility
+or deferred durability. Executable aliases, interpreter monitors, private COW,
+EOF faults and persistence hooks retain their original semantics.
+
+Local validation covers readonly-library peers and active shared-file writers
+continuing during an unrelated local mapping commit; coupled custom providers
+and CLONE_VM peers still stop. A 1-page update checks exactly three mapped
+aliases (including a private COW alias) at 8, 256 and 1024 file pages. Truncation
+checks all aliases and preserves SIGBUS. The Mac
+[mapping-scope checkpoint](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-windows.md#local-mapping-scope-and-backing-ranges-2026-10-28)
+records the real Linux comparison and platform acceptance.

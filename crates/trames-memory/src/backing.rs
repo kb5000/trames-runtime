@@ -44,7 +44,29 @@ pub trait PageBacking {
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
         None
     }
-    /// Publish dirty metadata after workers have joined, without copying bytes.
+    /// Local mapping commits may run while other address spaces retain this
+    /// provider's exported pages. Opt-in requires retained physical owners and
+    /// guarded coordinator byte access: check/version/publish/drop and local
+    /// mapping preparation cannot invalidate another View's storage or bypass
+    /// its byte/monitor ownership. Layout-changing file operations still join.
+    /// Unknown providers retain transitive backing-domain quiescence.
+    fn parallel_commit_isolated(&self) -> bool {
+        false
+    }
+    /// Stable, page-aligned byte offset within parallel_change_domain(). Used
+    /// only to index mapping metadata, never to translate a guest byte access.
+    fn parallel_domain_offset(&self) -> Option<u64> {
+        None
+    }
+    /// Conservative changed byte ranges since a previously observed domain
+    /// generation. Some must cover EVERY version/check/storage/capability change
+    /// in that interval. None requests the existing complete domain scan (also
+    /// on layout/EOF changes or expired history). No byte-publication fence.
+    fn parallel_changes_since(&self, _generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+        None
+    }
+    /// Publish dirty metadata after this address space's workers have joined,
+    /// without copying bytes. Isolated providers may have live other-VM users.
     /// Called only for a provider that returned shared_page().
     fn publish_write(&self, _offset: usize, _len: usize) -> Result<(), MemoryError> {
         Err(MemoryError::BackingIo(95))

@@ -539,7 +539,7 @@ impl View {
     /// VMs sharing a mapped backing must quiesce together before consuming its
     /// dirty publication. Private anonymous VMs remain independent.
     pub fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
-        self.snapshot.backings.commit_domains(&self.snapshot)
+        self.snapshot.backings.commit_domains()
     }
     fn new(snapshot: Arc<Snapshot>) -> Self {
         snapshot.users.fetch_add(1, Ordering::Relaxed);
@@ -1269,9 +1269,15 @@ impl Memory {
             let count = identities.entry(frame.bytes.identity).or_insert(0usize);
             alias_count += usize::from(*count == 1);
             *count += 1;
-            if page.backing.is_some() {
+            if let Some(backing) = &page.backing {
                 backed_pages.insert(base);
-                backings.insert(base, frame.backing_domain, shared_futex_page_key(page));
+                backings.insert(
+                    base,
+                    frame.backing_domain,
+                    backing.object.as_ref(),
+                    frame.bytes.identity,
+                    shared_futex_page_key(page),
+                );
             }
             pages.insert(base, frames.len());
             positions[root_frame] = Some(frames.len());
@@ -1338,7 +1344,9 @@ impl Memory {
         }
         Some(View::new(snapshot))
     }
-    /// Joined CPUs publish dirty metadata and persistence/code hooks. Resident
+    /// This mm's joined CPUs publish dirty metadata and persistence/code hooks.
+    /// Isolated providers may retain live other-mm users of canonical storage.
+    /// Resident
     /// source pages already contain the writes; only legacy/custom backings copy
     /// dirty fragments through the provider's write method.
     pub fn commit_parallel(&mut self) -> Result<(), MemoryError> {
@@ -1350,7 +1358,9 @@ impl Memory {
         };
         let result = (|| {
             for (word_index, word) in cache.snapshot.dirty_pages.iter().enumerate() {
-                // Workers are joined; no concurrent publication can be lost.
+                // This mm's workers are joined, so its bitmap is stable. A
+                // shared ConcurrentPage's dirty mask may also include other-mm
+                // stores; swap harvests them without clearing their own bitmap.
                 let mut pending = word.load(Ordering::Relaxed);
                 while pending != 0 {
                     let bit = pending.trailing_zeros() as usize;
