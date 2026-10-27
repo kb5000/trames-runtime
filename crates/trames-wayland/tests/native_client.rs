@@ -15,6 +15,24 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
     let client = std::env::var("TRAMES_WAYLAND_C_CLIENT").expect("original C fixture path");
     for close in [false, true] {
         let server = Server::new().unwrap();
+        struct Wake {
+            server: Server,
+            sender: std::sync::mpsc::SyncSender<()>,
+        }
+        impl trames_shared::IoWake for Wake {
+            fn wake_io(&self, _: &std::sync::Arc<trames_shared::IoSignal>) {
+                // Reenter snapshot: notifications must be outside its mutex.
+                let _ = self.server.snapshot();
+                let _ = self.sender.try_send(());
+            }
+        }
+        let (sender, notifications) = std::sync::mpsc::sync_channel(1);
+        let target: std::sync::Arc<dyn trames_shared::IoWake> = std::sync::Arc::new(Wake {
+            server: server.clone(),
+            sender,
+        });
+        let signal = trames_shared::IoSignal::new(0, std::sync::Arc::downgrade(&target));
+        let _subscription = server.subscribe(&signal);
         let (_, socket) = server.connect(8, 1000, 1000).unwrap();
         let fd = socket.as_raw_fd();
         let mut command = Command::new(&client);
@@ -41,7 +59,9 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
         let mut verified = false;
         let mut closed = false;
         let mut hidden = false;
+        let mut restored = false;
         loop {
+            signal.reset();
             let snapshot = server.snapshot();
             if snapshot.windows.len() == 2 {
                 for window in &snapshot.windows {
@@ -78,10 +98,11 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                         .unwrap();
                     hidden = true;
                 }
-                if hidden && began.elapsed() > Duration::from_millis(150) {
+                if hidden && !restored && began.elapsed() > Duration::from_millis(150) {
                     server
                         .set_mode(snapshot.windows[0].id, WindowMode::Floating)
                         .unwrap();
+                    restored = true;
                 }
                 for window in &snapshot.windows {
                     if window.mode != WindowMode::Minimized {
@@ -113,7 +134,7 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            thread::sleep(Duration::from_millis(4));
+            let _ = notifications.recv_timeout(Duration::from_millis(40));
         }
         assert!(verified && resized);
     }

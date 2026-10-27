@@ -52,6 +52,7 @@ struct Control {
     sender: mpsc::SyncSender<Command>,
     wake: UnixStream,
     snapshot: Arc<Mutex<Snapshot>>,
+    changes: Arc<trames_shared::Readiness>,
     next: AtomicU64,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -97,13 +98,16 @@ impl Server {
         let (sender, receiver) = mpsc::sync_channel(1024);
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let output = snapshot.clone();
+        let changes = Arc::new(trames_shared::Readiness::default());
+        let notifications = changes.clone();
         let worker = thread::Builder::new()
             .name("trames-wayland".into())
-            .spawn(move || run(compositor, read, receiver, output))?;
+            .spawn(move || run(compositor, read, receiver, output, notifications))?;
         Ok(Self(Arc::new(Control {
             sender,
             wake,
             snapshot,
+            changes,
             next: AtomicU64::new(1),
             worker: Mutex::new(Some(worker)),
         })))
@@ -148,6 +152,14 @@ impl Server {
     pub fn clipboard_changed(&self) -> io::Result<()> {
         self.0.send(Command::ClipboardChanged)
     }
+    /// Subscribe before reading snapshot, then reset the coalesced signal before
+    /// each retry. Notifications run after publication and outside snapshot locks.
+    pub fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.0.changes.subscribe(signal)
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.0
             .snapshot
@@ -190,6 +202,7 @@ fn run(
     mut wake: UnixStream,
     receiver: mpsc::Receiver<Command>,
     output: Arc<Mutex<Snapshot>>,
+    changes: Arc<trames_shared::Readiness>,
 ) {
     let mut stopped = false;
     let mut published = u64::MAX;
@@ -274,6 +287,7 @@ fn run(
             if let Ok(mut output) = output.lock() {
                 *output = snapshot;
             }
+            changes.notify_locked();
         }
         let mut fds = [
             libc::pollfd {

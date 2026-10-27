@@ -19,7 +19,8 @@ enum Bytes {
     Zero(OnceLock<Box<[UnsafeCell<u8>; PAGE]>>),
     External {
         pointer: usize,
-        _owner: Box<dyn Send + Sync>,
+        _owner: std::sync::Arc<dyn Send + Sync>,
+        mapping: Option<(usize, usize)>,
     },
     Mapped {
         owner: std::sync::Arc<crate::mmu::host::Mapping>,
@@ -115,6 +116,28 @@ impl MutablePage {
         )
             -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError>,
     ) -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError> {
+        // SAFETY: inherited cold export contract; opaque external mappings stay refused.
+        unsafe {
+            self.export_hardware_with_mapping(allocate, |_| Err(crate::MemoryError::BackingIo(95)))
+        }
+    }
+    /// Export explicit file mappings through the same region and host-borrow gate.
+    ///
+    /// # Safety
+    /// Same as export_hardware. The importer must retain and alias the supplied
+    /// mapping; external raw display readers retain protocol frame leases and
+    /// must never turn concurrently writable bytes into Rust references.
+    pub unsafe fn export_hardware_with_mapping(
+        &self,
+        allocate: impl FnOnce(
+            Option<&[u8]>,
+        )
+            -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError>,
+        import: impl FnOnce(
+            crate::SharedMapping,
+        )
+            -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError>,
+    ) -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError> {
         let mut guard = self.lock(0, PAGE);
         if let Bytes::Hardware(storage) = self.storage() {
             if storage.is_live() {
@@ -125,16 +148,39 @@ impl MutablePage {
             storage.end_host_access();
             guard.page = guard.page.map_addr(|at| at & !3);
         }
-        if matches!(self.storage(), Bytes::External { .. }) {
-            return Err(crate::MemoryError::BackingIo(95));
-        }
-        let storage = allocate(
-            if matches!(self.storage(), Bytes::Zero(bytes) if bytes.get().is_none()) {
-                None
-            } else {
-                Some(guard.read(0, PAGE))
-            },
-        )?;
+        let mapping = match self.storage() {
+            Bytes::External {
+                pointer,
+                _owner,
+                mapping: Some((base, length)),
+            } => Some(crate::SharedMapping {
+                base: *base,
+                length: *length,
+                offset: pointer - base,
+                _owner: _owner.clone(),
+            }),
+            Bytes::External { mapping: None, .. } => return Err(crate::MemoryError::BackingIo(95)),
+            Bytes::Hardware(storage) => storage.shared_mapping(),
+            _ => None,
+        };
+        let storage = if let Some(mapping) = mapping {
+            let pointer = mapping.pointer();
+            let storage = import(mapping)?;
+            assert_eq!(
+                storage.pointer(),
+                pointer,
+                "shared hardware import must preserve byte identity"
+            );
+            storage
+        } else {
+            allocate(
+                if matches!(self.storage(), Bytes::Zero(bytes) if bytes.get().is_none()) {
+                    None
+                } else {
+                    Some(guard.read(0, PAGE))
+                },
+            )?
+        };
         assert!(!storage.pointer().is_null());
         // SAFETY: the full byte lock excludes all readers/writers; the caller
         // has retired cached aliases. No reference to the old Bytes survives.
@@ -155,7 +201,28 @@ impl MutablePage {
         assert!(!pointer.is_null());
         Self::with_storage(Bytes::External {
             pointer: pointer as usize,
-            _owner: Box::new(owner),
+            _owner: std::sync::Arc::new(owner),
+            mapping: None,
+        })
+    }
+    /// Retain a complete file-backed mapping with explicit allocation geometry.
+    ///
+    /// # Safety
+    /// The allocation is initialized RW mmap storage retained by owner; offset
+    /// covers one guest page. CPU accesses use this page's guards. External raw
+    /// display readers obey their frame leases and create no Rust byte refs.
+    pub unsafe fn from_shared_mapping(
+        base: *mut u8,
+        length: usize,
+        offset: usize,
+        owner: impl Send + Sync + 'static,
+    ) -> Self {
+        assert!(!base.is_null());
+        assert!(offset.checked_add(PAGE).is_some_and(|end| end <= length));
+        Self::with_storage(Bytes::External {
+            pointer: base as usize + offset,
+            _owner: std::sync::Arc::new(owner),
+            mapping: Some((base as usize, length)),
         })
     }
     /// Move a coordinator allocation into the shared byte domain without copying.

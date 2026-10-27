@@ -46,7 +46,14 @@ impl PageStorage {
         // access uses SharedPage guards; raw GPU access retains its existing
         // display-buffer ownership protocol.
         Self::Unpublished {
-            bytes: Arc::new(unsafe { SharedPage::from_mapping(map.pointer(), map) }),
+            bytes: Arc::new(unsafe {
+                SharedPage::from_shared_mapping(
+                    map.allocation_pointer(),
+                    map.allocation_len(),
+                    map.allocation_offset(),
+                    map,
+                )
+            }),
             shared: true,
         }
     }

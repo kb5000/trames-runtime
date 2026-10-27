@@ -5,7 +5,7 @@ mod cpu_memory;
 mod hardware;
 pub use hardware::HardwarePageInfo;
 mod hardware_shared;
-pub use hardware_shared::{HardwareStorage, HardwareWait};
+pub use hardware_shared::{HardwareStorage, HardwareWait, SharedMapping};
 mod mmu;
 use mmu::PageBytes;
 mod native_access;

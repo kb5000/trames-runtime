@@ -391,7 +391,7 @@ impl Dispatch<shell::XwaylandShellV1, ()> for State {
     ) {
         if let shell::Request::GetXwaylandSurface { id, surface } = request {
             if surface.client().as_ref() != Some(client) {
-                init.post_error(id, 0u32, "foreign surface");
+                r.post_error(0u32, "foreign surface");
                 return;
             }
             let Some(key) = surface.data::<SurfaceKey>().copied() else {

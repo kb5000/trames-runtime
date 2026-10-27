@@ -159,7 +159,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 if state.surfaces.len() >= 256 {
-                    init.post_error(id, 0u32, "surface limit reached");
+                    r.post_error(0u32, "surface limit reached");
                     return;
                 }
                 let key = SurfaceKey(state.id());
@@ -251,7 +251,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
                     + s.cached.as_ref().map_or(0, |c| c.callbacks.len())
                     >= 256
                 {
-                    init.post_error(callback, 0u32, "frame callback limit reached");
+                    r.post_error(0u32, "frame callback limit reached");
                     return;
                 }
                 s.pending_callbacks.push(init.init(callback, ()));
@@ -357,7 +357,7 @@ impl Dispatch<wl_shm::WlShm, ()> for State {
                             }),
                         );
                     }
-                    _ => init.post_error(id, 1u32, "invalid shared memory pool"),
+                    _ => r.post_error(1u32, "invalid shared memory pool"),
                 }
             }
             _ => r.post_error(1u32, "unsupported shared memory request"),
@@ -396,7 +396,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                     WEnum::Value(wl_shm::Format::Argb8888) => true,
                     WEnum::Value(wl_shm::Format::Xrgb8888) => false,
                     _ => {
-                        init.post_error(id, 0u32, "unsupported shared memory format");
+                        r.post_error(0u32, "unsupported shared memory format");
                         return;
                     }
                 };
@@ -407,7 +407,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                     && height <= 4096
                     && stride >= width * 4;
                 if !valid {
-                    init.post_error(id, 1u32, "invalid shared memory buffer extent");
+                    r.post_error(1u32, "invalid shared memory buffer extent");
                     return;
                 }
                 let bytes = (height as usize)
@@ -416,7 +416,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                     .and_then(|n| n.checked_add(width as usize * 4));
                 let end = bytes.and_then(|n| (offset as usize).checked_add(n));
                 if !valid || end.is_none_or(|end| end > pool.size || end > pool.file.len()) {
-                    init.post_error(id, 1u32, "shared memory buffer exceeds pool");
+                    r.post_error(1u32, "shared memory buffer exceeds pool");
                     return;
                 }
                 let map = pool.file.map(offset as usize, bytes.unwrap());
@@ -439,7 +439,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                             },
                         );
                     }
-                    Err(_) => init.post_error(id, 1u32, "shared memory mapping failed"),
+                    Err(_) => r.post_error(1u32, "shared memory mapping failed"),
                 }
             }
             _ => r.post_error(1u32, "unsupported pool request"),

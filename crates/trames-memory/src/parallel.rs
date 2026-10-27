@@ -1503,6 +1503,27 @@ impl View {
         access: Access,
         allocate: impl FnOnce(Option<&[u8]>) -> Result<Arc<dyn crate::HardwareStorage>, MemoryError>,
     ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
+        // SAFETY: inherited frozen-view contract; legacy callers refuse external imports.
+        unsafe {
+            self.export_hardware_page_with_mapping(address, access, allocate, |_| {
+                Err(MemoryError::BackingIo(95))
+            })
+        }
+    }
+    /// Import stable file mappings without losing external display aliases.
+    ///
+    /// # Safety
+    /// Same frozen-view contract as export_hardware_page; the importer retains
+    /// and aliases the supplied allocation through the HardwareStorage gate.
+    pub unsafe fn export_hardware_page_with_mapping(
+        &self,
+        address: u64,
+        access: Access,
+        allocate: impl FnOnce(Option<&[u8]>) -> Result<Arc<dyn crate::HardwareStorage>, MemoryError>,
+        import: impl FnOnce(
+            crate::SharedMapping,
+        ) -> Result<Arc<dyn crate::HardwareStorage>, MemoryError>,
+    ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
         assert!(self.hardware_mode);
         let frame = self.frame(address, access)?;
         if !frame.hardware_shared_export {
@@ -1524,7 +1545,7 @@ impl View {
         };
         // SAFETY: hardware mode bypasses every old protected native alias and
         // retains only region-guarded byte actors for this frozen snapshot.
-        let storage = unsafe { page.export_hardware(allocate) }?;
+        let storage = unsafe { page.export_hardware_with_mapping(allocate, import) }?;
         if self.hardware_page_info(address)?.writable {
             self.mark_hardware_write(address)?;
         }

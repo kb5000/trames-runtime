@@ -101,7 +101,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
             }
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
                 let Some(key) = surface.data::<SurfaceKey>().copied() else {
-                    init.post_error(id, 0u32, "foreign surface");
+                    r.post_error(0u32, "foreign surface");
                     return;
                 };
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
@@ -112,7 +112,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
                     || s.parent.is_some()
                     || s.current.is_some()
                 {
-                    init.post_error(id, 0u32, "surface already has a role or buffer");
+                    r.post_error(0u32, "surface already has a role or buffer");
                     return;
                 }
                 s.xdg = Some(init.init(id, key));
@@ -151,7 +151,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 };
                 if !matches!(s.role, Role::None | Role::Top) || s.top.is_some() || s.popup.is_some()
                 {
-                    init.post_error(id, 2u32, "surface already constructed");
+                    r.post_error(2u32, "surface already constructed");
                     return;
                 }
                 s.role = Role::Top;
@@ -190,7 +190,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 positioner,
             } => {
                 let Some(parent) = parent.and_then(|p| p.data::<SurfaceKey>().copied()) else {
-                    init.post_error(id, 3u32, "popup needs a parent");
+                    r.post_error(3u32, "popup needs a parent");
                     return;
                 };
                 let Some(pos) = positioner
@@ -201,11 +201,11 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                     return;
                 };
                 if !pos.complete() {
-                    init.post_error(id, 5u32, "incomplete popup positioner");
+                    r.post_error(5u32, "incomplete popup positioner");
                     return;
                 }
                 if !state.surfaces.contains_key(&parent.0) || state.is_descendant(parent.0, key.0) {
-                    init.post_error(id, 3u32, "invalid popup parent");
+                    r.post_error(3u32, "invalid popup parent");
                     return;
                 }
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
@@ -215,7 +215,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                     || s.top.is_some()
                     || s.popup.is_some()
                 {
-                    init.post_error(id, 2u32, "surface already constructed");
+                    r.post_error(2u32, "surface already constructed");
                     return;
                 }
                 s.role = Role::Popup;

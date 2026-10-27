@@ -211,6 +211,69 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
+    fn excessive_frame_requests_disconnect_only_the_bad_client_without_panicking() {
+        fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
+            [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]
+                .into_iter()
+                .chain(words.iter().copied())
+                .flat_map(u32::to_ne_bytes)
+                .collect()
+        }
+        let mut compositor = Compositor::new().unwrap();
+        let (mut client, socket) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        compositor
+            .connect(
+                socket,
+                ClientIdentity {
+                    connection: 42,
+                    pid: 7,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .unwrap();
+        client.write_all(&message(1, 1, &[2])).unwrap();
+        compositor.dispatch().unwrap();
+        let mut response = [0; 8192];
+        let _ = client.read(&mut response);
+        let mut bind = vec![1, 14];
+        bind.extend(
+            b"wl_compositor\0\0\0"
+                .chunks_exact(4)
+                .map(|s| u32::from_ne_bytes(s.try_into().unwrap())),
+        );
+        bind.extend([4, 3]);
+        client.write_all(&message(2, 0, &bind)).unwrap();
+        client.write_all(&message(3, 0, &[4])).unwrap();
+        for id in 5..262 {
+            client.write_all(&message(4, 3, &[id])).unwrap();
+        }
+        compositor.dispatch().unwrap();
+        let count = client.read(&mut response).unwrap();
+        assert!(count >= 8);
+        assert_eq!(u32::from_ne_bytes(response[..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_ne_bytes(response[4..8].try_into().unwrap()) & 0xffff,
+            0
+        );
+        let (mut healthy, socket) = UnixStream::pair().unwrap();
+        compositor
+            .connect(
+                socket,
+                ClientIdentity {
+                    connection: 43,
+                    pid: 8,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .unwrap();
+        healthy.write_all(&message(1, 1, &[2])).unwrap();
+        compositor.dispatch().unwrap();
+        assert!(healthy.read(&mut response).unwrap() > 0);
+    }
+    #[test]
     fn parent_presentation_does_not_signal_unmapped_subsurface_callbacks() {
         fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
             [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]
