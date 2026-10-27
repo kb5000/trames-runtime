@@ -61,6 +61,21 @@ pub(crate) fn globals(handle: &DisplayHandle) {
     handle.create_global::<State, wl_seat::WlSeat, _>(7, ());
 }
 impl State {
+    fn interaction_allowed(&self, window: u64, serial: u32) -> bool {
+        !self.seat.buttons.is_empty()
+            && self.seat.press_serial.is_some_and(|(token, surface)| {
+                token == serial && self.is_descendant(surface, window)
+            })
+    }
+    pub(crate) fn request_interaction(&mut self, window: u64, serial: u32, edges: u32) {
+        if !self.interaction_allowed(window, serial) {
+            return;
+        }
+        if let Some(surface) = self.surfaces.get_mut(&window).filter(|s| s.is_toplevel()) {
+            surface.interaction = Some(crate::WindowInteraction { serial, edges });
+            self.changed();
+        }
+    }
     /// Native clipboard reads can wait on an OS permission dialog which owns
     /// physical key-up delivery. End the gesture before handing off to UIKit;
     /// keep selection/text focus so the pending transfer still belongs here.
@@ -571,6 +586,18 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
     use wayland_server::protocol::{wl_buffer, wl_surface};
 
+    #[test]
+    fn native_interactions_require_a_live_press_in_the_same_window() {
+        let mut state = State::default();
+        state.seat.press_serial = Some((7, 42));
+        assert!(!state.interaction_allowed(42, 7));
+        state.seat.buttons.insert(0x110);
+        assert!(state.interaction_allowed(42, 7));
+        assert!(!state.interaction_allowed(41, 7));
+        assert!(!state.interaction_allowed(42, 8));
+        state.seat.buttons.clear();
+        assert!(!state.interaction_allowed(42, 7));
+    }
     #[test]
     fn clipboard_permission_cancels_held_keys_without_repeating_releases() {
         let mut state = State::default();

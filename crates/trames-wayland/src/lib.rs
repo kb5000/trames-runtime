@@ -22,7 +22,10 @@ mod shell;
 mod subsurface;
 mod xwayland;
 mod xwm;
-pub use scene::{BufferLease, ImageBuffer, ShmBuffer, SurfaceImage, WindowMode, WindowSnapshot};
+pub use scene::{
+    BufferLease, ImageBuffer, ShmBuffer, SurfaceImage, WindowInteraction, WindowMode,
+    WindowSnapshot,
+};
 
 /// Guest identity is attached by the VM bridge, never inferred from the host UID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

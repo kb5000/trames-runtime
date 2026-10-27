@@ -245,6 +245,20 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceKey> for State {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        match &request {
+            xdg_toplevel::Request::Move { serial, .. } => {
+                state.request_interaction(key.0, *serial, 0);
+                return;
+            }
+            xdg_toplevel::Request::Resize { serial, edges, .. } => {
+                let edges: u32 = (*edges).into();
+                if matches!(edges, 1 | 2 | 4 | 5 | 6 | 8 | 9 | 10) {
+                    state.request_interaction(key.0, *serial, edges);
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some(s) = state.surfaces.get_mut(&key.0) else {
             return;
         };

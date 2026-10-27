@@ -18,6 +18,13 @@ pub enum WindowMode {
     Minimized,
     Maximized,
 }
+/// A client-requested interactive action, authorized by the current seat press.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowInteraction {
+    pub serial: u32,
+    /// Zero means move; other values are xdg_toplevel resize edge bits.
+    pub edges: u32,
+}
 #[derive(Clone)]
 pub struct WindowSnapshot {
     pub id: u64,
@@ -27,6 +34,7 @@ pub struct WindowSnapshot {
     pub width: u32,
     pub height: u32,
     pub mode: WindowMode,
+    pub interaction: Option<WindowInteraction>,
     pub parent: Option<u64>,
     pub min_size: (u32, u32),
     pub max_size: (u32, u32),
@@ -214,6 +222,7 @@ pub(crate) struct Surface {
     pub app_id: String,
     pub size: (u32, u32),
     pub mode: WindowMode,
+    pub interaction: Option<WindowInteraction>,
     pub requested_size: (u32, u32),
     pub top_parent: Option<u64>,
     pub min_size: (u32, u32),
@@ -284,6 +293,7 @@ impl Surface {
             app_id: String::new(),
             size: (640, 480),
             mode: WindowMode::Floating,
+            interaction: None,
             requested_size: (0, 0),
             top_parent: None,
             min_size: (0, 0),
@@ -387,6 +397,7 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
                 width: s.size.0,
                 height: s.size.1,
                 mode: s.mode,
+                interaction: s.interaction,
                 parent: s.top_parent,
                 min_size: s.min_size,
                 max_size: s.max_size,
