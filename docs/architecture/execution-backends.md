@@ -165,3 +165,19 @@ must not be forwarded as guest monotonic milliseconds: GTK clients reconstruct
 input timestamps using their own `CLOCK_MONOTONIC`, including 32-bit wraparound.
 A standalone native compositor keeps caller-supplied timestamps until it is
 bound to a guest clock. This preserves native peer and presentation tests.
+
+## Host input during indefinite waits
+
+An owner-side ppoll/pselect or epoll wait can depend on host standard input even
+when no PTY or native socket remains. The scheduler queries accepted poll/select
+OFD identities and armed epoll watches before diagnosing an event-source deadlock.
+It does not re-import mutable guest fd arrays, consume edge/one-shot events, or
+assume every poll is external merely because fd 0 exists. Ordinary internal-pipe
+waits retain the original deadlock behavior. This is shared Linux/session policy
+for both interpreter/iPad and hardware/Mac adapters; it adds no platform branch,
+resource thread, or new polling mechanism.
+
+A regression covers infinite ppoll, pselect, epoll_pwait and epoll_pwait2 followed
+by delayed input, mutation of an already accepted guest poll buffer, and an
+internal-pipe control. Real Mac window acceptance also verifies that closing the
+last native windows leaves the parent shell able to wait for and read new input.

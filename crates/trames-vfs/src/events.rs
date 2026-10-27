@@ -425,6 +425,22 @@ impl Vfs {
             .as_ref()
             .map_or([0; 2], |end| end.pair.poll_epoch(end.master))
     }
+    /// Armed host-input watches can wake externally without a socket or PTY.
+    /// Inspect only existing watch metadata; do not consume readiness/one-shots.
+    pub fn epoll_waits_for_stdin(&self, fd: u32) -> Result<bool> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous else {
+            return Err(Errno(22));
+        };
+        Ok(watches.values().any(|watch| {
+            watch.state.lock().unwrap().armed
+                && watch
+                    .open
+                    .upgrade()
+                    .is_some_and(|open| open.borrow().kind == FdKind::Stdin)
+        }))
+    }
     pub fn epoll_wait_signals(
         &self,
         fd: u32,

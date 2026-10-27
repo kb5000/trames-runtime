@@ -2590,6 +2590,27 @@ impl<C: Cpu> Kernel<C> {
             self.syscall_total += began.elapsed();
         }
     }
+    fn waits_for_host_stdin(p: &Process<C>) -> bool {
+        match p.state {
+            State::Blocked(63 | 65, a) => {
+                p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Stdin)
+            }
+            State::Blocked(73, _) => p
+                .retained_poll
+                .as_ref()
+                .is_some_and(|poll| poll.waits_for_stdin(&p.linux.vfs)),
+            State::Blocked(72, _) => p
+                .retained_select
+                .as_ref()
+                .is_some_and(|select| select.waits_for_stdin(&p.linux.vfs)),
+            State::Blocked(22 | 441, a) => p
+                .linux
+                .vfs
+                .epoll_waits_for_stdin(a[0] as u32)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
     fn readiness(
         &self,
         p: &Process<C>,
@@ -4277,8 +4298,7 @@ impl<C: Cpu> Kernel<C> {
                         || p.uring_wait.as_ref().is_some_and(|(_, _, d)| d.is_some())
                         || matches!(p.state, State::Futex { deadline: Some(_), .. } | State::Sigwait { deadline: Some(_), .. })
                         || matches!(p.state, State::Sleep(..))
-                        || matches!(p.state, State::Blocked(63 | 65, a)
-                        if p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Stdin))
+                        || Self::waits_for_host_stdin(p)
                         || matches!(p.state, State::Blocked(number, a)
                         if matches!(number, 63 | 64 | 65 | 66 | 202 | 203 | 242 | 206 | 207 | 211 | 212)
                         && p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Socket))
@@ -6573,6 +6593,63 @@ mod tests {
         assert!(p.poll_deadline.is_none());
         assert!(p.poll_mask.is_none());
         assert_eq!(p.signals.mask, 0x200);
+    }
+    #[test]
+    fn indefinite_poll_waits_keep_host_stdin_as_an_external_source() {
+        struct Input(bool);
+        impl GuestOutput for Input {
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn stdin_ready(&mut self) -> std::io::Result<bool> {
+                Ok(self.0)
+            }
+        }
+        for number in [73, 72, 22, 441] {
+            let mut k = kernel();
+            let mut p = process();
+            let a = if number == 73 {
+                write_u64(&mut p.memory, 0x1000, 1u64 << 32).unwrap();
+                [0x1000, 1, 0, 0, 0, 0]
+            } else if number == 72 {
+                write_u64(&mut p.memory, 0x1000, 1).unwrap();
+                [1, 0x1000, 0, 0, 0, 0]
+            } else {
+                let epoll = p.linux.vfs.epoll_create(0).unwrap();
+                p.linux.vfs.epoll_ctl(epoll, 1, 0, 1, 42).unwrap();
+                [
+                    epoll as u64,
+                    0x1000,
+                    1,
+                    if number == 22 { u64::MAX } else { 0 },
+                    0,
+                    8,
+                ]
+            };
+            let mut input = Input(false);
+            k.call(1, &mut p, number, a, &mut input);
+            assert!(matches!(p.state, State::Blocked(n, _) if n == number));
+            assert_eq!(p.linux.vfs.live_sockets(), 0);
+            assert!(p.poll_deadline.is_none());
+            assert!(Kernel::waits_for_host_stdin(&p), "syscall={number}");
+            if number == 73 {
+                // Mutation of the guest array cannot retarget an accepted wait.
+                write_u64(&mut p.memory, 0x1000, u32::MAX as u64).unwrap();
+                assert!(Kernel::waits_for_host_stdin(&p));
+            }
+            input.0 = true;
+            k.call(1, &mut p, number, a, &mut input);
+            assert!(matches!(p.state, State::Ready));
+            assert_eq!(p.cpu.x(0), 1);
+            assert!(!Kernel::waits_for_host_stdin(&p));
+        }
+        let mut k = kernel();
+        let mut p = process();
+        let [reader, _writer] = p.linux.vfs.pipe(0).unwrap();
+        write_u64(&mut p.memory, 0x1000, reader as u64 | (1u64 << 32)).unwrap();
+        k.call(1, &mut p, 73, [0x1000, 1, 0, 0, 0, 0], &mut Input(false));
+        assert!(matches!(p.state, State::Blocked(73, _)));
+        assert!(!Kernel::waits_for_host_stdin(&p));
     }
     #[test]
     fn stdio_eagain_blocks_only_without_nonblocking_flag() {

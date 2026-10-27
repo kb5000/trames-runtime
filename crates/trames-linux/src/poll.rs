@@ -34,6 +34,11 @@ struct Entry {
     source: Source,
 }
 impl Entry {
+    fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
+        matches!(&self.source, Source::Owner(id)
+            if vfs.matches_open_description(self.fd, id)
+                && vfs.fd_kind(self.fd).ok() == Some(trames_vfs::FdKind::Stdin))
+    }
     fn ready(
         &self,
         joined: bool,
@@ -168,6 +173,13 @@ impl Poll {
     }
 }
 impl RetainedPoll {
+    /// Query accepted descriptors, never re-import the guest poll buffer.
+    pub fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
+        self.0
+            .entries
+            .iter()
+            .any(|entry| entry.waits_for_stdin(vfs))
+    }
     pub fn prepare_joined(
         vfs: &Vfs,
         memory: &impl CpuMemory,
@@ -257,6 +269,12 @@ impl RetainedPoll {
     }
 }
 impl RetainedSelect {
+    /// Host input remains an event source even with no native socket or PTY.
+    pub fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
+        self.sets
+            .iter()
+            .any(|set| set.entries.iter().any(|entry| entry.waits_for_stdin(vfs)))
+    }
     pub fn prepare_joined(
         vfs: &Vfs,
         memory: &impl CpuMemory,
