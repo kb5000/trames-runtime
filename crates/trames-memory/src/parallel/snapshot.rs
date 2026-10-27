@@ -63,7 +63,40 @@ impl BackingIndex {
     }
 }
 
+pub(super) struct HardwareChange {
+    pub(super) before: u64,
+    pub(super) addresses: Vec<u64>,
+}
 impl Snapshot {
+    fn note_hardware_changes(&mut self, addresses: impl Iterator<Item = u64>) {
+        if !self.hardware {
+            return;
+        }
+        let addresses: Vec<_> = addresses.collect();
+        if addresses.is_empty() {
+            return;
+        }
+        let before = self.hardware_generation;
+        self.hardware_generation = new_backing_identity();
+        // A lagging worker falls back to a full reconciliation, never silently
+        // skips invalidation. Bound both history length and retained addresses.
+        if addresses.len() > 4096 {
+            self.hardware_changes.clear();
+            return;
+        }
+        self.hardware_changes
+            .push_back(HardwareChange { before, addresses });
+        while self.hardware_changes.len() > 32
+            || self
+                .hardware_changes
+                .iter()
+                .map(|c| c.addresses.len())
+                .sum::<usize>()
+                > 4096
+        {
+            self.hardware_changes.pop_front();
+        }
+    }
     fn remove_frame(&mut self, base: u64) -> Option<Frame> {
         let index = self.pages.remove(&base)?;
         let frame = self.frames.swap_remove(index);
@@ -138,6 +171,7 @@ impl Memory {
                 }) && snapshot.pages.contains_key(base)
             })
             .collect();
+        snapshot.note_hardware_changes(retired.iter().copied());
         for base in &retired {
             drop(snapshot.remove_frame(*base));
         }
@@ -255,6 +289,7 @@ impl Memory {
             .iter()
             .filter_map(|&base| snapshot.remove_frame(base).map(|frame| (base, frame)))
             .collect();
+        snapshot.note_hardware_changes(changed.iter().copied());
         let mmu_changed: Slots<_> = changed.iter().copied().collect();
         for base in changed {
             let Some(&root_frame) = self.pages.get(&base) else {

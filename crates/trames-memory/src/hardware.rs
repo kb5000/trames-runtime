@@ -4,6 +4,23 @@
 use super::*;
 use std::sync::Arc;
 
+/// A checked metadata index. It owns no guest bytes and cannot pin physical RAM.
+/// Reuse verifies VM, virtual/physical identity and current frame membership.
+#[derive(Clone, Copy, Debug)]
+pub struct HardwareWriteFrame {
+    pub(crate) vm: u64,
+    pub(crate) base: u64,
+    pub(crate) root: usize,
+    pub(crate) storage: u64,
+    pub(crate) publication: bool,
+}
+impl HardwareWriteFrame {
+    /// Canonical private data needs no provider or instruction publication.
+    pub fn needs_publication(self) -> bool {
+        self.publication
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HardwarePageInfo {
     pub permissions: Permissions,

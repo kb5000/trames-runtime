@@ -143,8 +143,7 @@ impl Page {
                 return b.object.read(offset, out);
             }
         }
-        self.bytes
-            .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
+        self.bytes.copy_read(offset, out);
         Ok(())
     }
     #[inline]
@@ -153,8 +152,7 @@ impl Page {
             return b.object.write(offset, bytes);
         }
         self.detach_private()?;
-        Rc::make_mut(&mut self.bytes)
-            .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
+        Rc::make_mut(&mut self.bytes).copy_write(offset, bytes);
         Ok(())
     }
 }

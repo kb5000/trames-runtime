@@ -75,6 +75,20 @@ impl PageBytes {
             f(&mut self[offset..offset + len])
         }
     }
+    pub(crate) fn copy_read(&self, offset: usize, out: &mut [u8]) {
+        if let Some(bytes) = self.shared() {
+            bytes.copy_read(offset, out);
+        } else {
+            out.copy_from_slice(&self[offset..offset + out.len()]);
+        }
+    }
+    pub(crate) fn copy_write(&mut self, offset: usize, input: &[u8]) {
+        if let Self::Concurrent(bytes) = self {
+            bytes.copy_write(offset, input);
+        } else {
+            self[offset..offset + input.len()].copy_from_slice(input);
+        }
+    }
     pub fn is_zero(&self) -> bool {
         matches!(self, Self::Zero)
     }

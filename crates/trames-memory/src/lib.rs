@@ -3,7 +3,7 @@
 mod backing;
 mod cpu_memory;
 mod hardware;
-pub use hardware::HardwarePageInfo;
+pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
 pub use hardware_shared::{HardwareStorage, HardwareWait, SharedMapping};
 mod mmu;
@@ -13,6 +13,7 @@ pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;
 mod pinned;
 pub use pinned::PinnedBuffer;
+mod raw;
 mod reservations;
 mod residency;
 mod slots;
@@ -1056,7 +1057,7 @@ impl Memory {
                     .err()
                     .unwrap_or_else(|| self.missing_page(address, Access::Read))
             })?;
-            if matches!(N, 1 | 2 | 4 | 8 | 16) {
+            if entry.cpu != 0 && matches!(N, 1 | 2 | 4 | 8 | 16) {
                 // SAFETY: live owning TLB, page-contained operand, no callbacks
                 // or mutation before the guarded CPU load.
                 let page = self.translated_page(entry);
@@ -1100,7 +1101,7 @@ impl Memory {
         })?;
         // SAFETY: same owning-TLB/lifetime bound as read, exclusive coordinator
         // access and one guest page. Failed protected stores have no effects.
-        let stored = if matches!(N, 1 | 2 | 4 | 8 | 16) {
+        let stored = if entry.cpu != 0 && matches!(N, 1 | 2 | 4 | 8 | 16) {
             let page = self.translated_page(entry);
             let mut guard = page.bytes.shared().map(|b| b.lock(offset, N));
             let stored = unsafe { entry.write(offset, bytes) };

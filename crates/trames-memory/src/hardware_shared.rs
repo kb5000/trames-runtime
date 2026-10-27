@@ -59,6 +59,11 @@ pub unsafe trait HardwareStorage: Send + Sync {
     fn shared_mapping(&self) -> Option<SharedMapping> {
         None
     }
+    /// Publish exactly a host-written range for instruction fetch. This may
+    /// run concurrently with hardware; it must not create a guest reference.
+    /// Data-only storage needs no action. Guest IC/DC instructions retain the
+    /// architectural guest responsibility for self-modifying code.
+    fn publish_host_write(&self, _offset: usize, _len: usize) {}
     fn begin_host_access(&self);
     fn end_host_access(&self);
 }
@@ -272,6 +277,260 @@ mod tests {
         assert!(!page.unmaterialized_zero());
         assert_eq!(storage.borrows.load(Ordering::Relaxed), 0);
     }
+    #[test]
+    fn retaining_live_hardware_storage_never_borrows_its_bytes() {
+        use std::sync::mpsc;
+        struct Counted {
+            bytes: Box<UnsafeCell<[u8; PAGE_SIZE as usize]>>,
+            entries: AtomicUsize,
+            active: AtomicUsize,
+        }
+        // SAFETY: all mock byte access follows the original page region guards;
+        // metadata exports never inspect the byte allocation.
+        unsafe impl Sync for Counted {}
+        unsafe impl HardwareStorage for Counted {
+            fn pointer(&self) -> *mut u8 {
+                self.bytes.get().cast()
+            }
+            fn physical_address(&self) -> u64 {
+                0
+            }
+            fn begin_host_access(&self) {
+                self.entries.fetch_add(1, Ordering::Relaxed);
+                self.active.fetch_add(1, Ordering::Relaxed);
+            }
+            fn end_host_access(&self) {
+                assert!(self.active.fetch_sub(1, Ordering::Relaxed) > 0);
+            }
+        }
+        let page = Arc::new(SharedPage::new([19; PAGE_SIZE as usize]));
+        let storage = Arc::new(Counted {
+            bytes: Box::new(UnsafeCell::new([19; PAGE_SIZE as usize])),
+            entries: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+        });
+        // SAFETY: unpublished canonical page, no native/hardware alias yet.
+        unsafe { page.export_hardware(|_| Ok(storage.clone())) }.unwrap();
+        for _ in 0..128 {
+            // SAFETY: same canonical allocation, metadata is region-protected.
+            let retained =
+                unsafe { page.export_hardware(|_| panic!("duplicate allocation")) }.unwrap();
+            assert_eq!(retained.pointer(), storage.pointer());
+        }
+        assert_eq!(storage.entries.load(Ordering::Relaxed), 0);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = page.clone();
+        let reading = std::thread::spawn(move || {
+            reader.with_read(0, 1, |bytes| {
+                assert_eq!(bytes, [19]);
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        held_rx.recv().unwrap();
+        assert_eq!(storage.active.load(Ordering::Relaxed), 1);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let exporter = page.clone();
+        let exporting = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            // SAFETY: only retain metadata under the same complete region mask.
+            let retained =
+                unsafe { exporter.export_hardware(|_| panic!("duplicate allocation")) }.unwrap();
+            done_tx.send(retained.physical_address()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        release_tx.send(()).unwrap();
+        reading.join().unwrap();
+        assert_eq!(done_rx.recv().unwrap(), 0);
+        exporting.join().unwrap();
+        assert_eq!(storage.entries.load(Ordering::Relaxed), 1);
+        page.with_write(0, 1, |bytes| bytes[0] = 31);
+        page.with_read(0, 1, |bytes| assert_eq!(bytes, [31]));
+        assert_eq!(storage.entries.load(Ordering::Relaxed), 3);
+        assert_eq!(storage.active.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn ordinary_raw_transfers_never_enter_a_hardware_byte_borrow() {
+        struct NoBorrow {
+            bytes: Box<UnsafeCell<[u8; PAGE_SIZE as usize]>>,
+        }
+        // All host operations hold the page's regions and use asm for bytes.
+        unsafe impl Sync for NoBorrow {}
+        unsafe impl HardwareStorage for NoBorrow {
+            fn pointer(&self) -> *mut u8 {
+                self.bytes.get().cast()
+            }
+            fn physical_address(&self) -> u64 {
+                0
+            }
+            fn begin_host_access(&self) {
+                panic!("ordinary transfer borrowed hardware bytes");
+            }
+            fn end_host_access(&self) {
+                panic!("ordinary transfer ended a byte borrow");
+            }
+        }
+        let storage = Arc::new(NoBorrow {
+            bytes: Box::new(UnsafeCell::new([0; PAGE_SIZE as usize])),
+        });
+        let page = SharedPage::zero();
+        unsafe {
+            page.export_hardware(|_| Ok(storage.clone())).unwrap();
+        }
+        for offset in [0, 1, 63, 64, 4096 - 17] {
+            let input = [0x39; 17];
+            page.copy_write(offset, &input);
+            let mut output = [0; 17];
+            page.copy_read(offset, &mut output);
+            assert_eq!(output, input);
+        }
+        let _ = page.snapshot();
+        assert!(page.revision() > 0);
+        // Scalar fast paths must not acquire a byte borrow for an absent
+        // protected CPU alias before falling back to ordinary raw transfers.
+        let mut memory = crate::Memory::default();
+        memory
+            .map(0x1000, PAGE_SIZE, crate::Permissions::RW)
+            .unwrap();
+        let frame = memory.pages[&0x1000];
+        memory.frames[frame].as_mut().unwrap().bytes =
+            std::rc::Rc::new(crate::mmu::PageBytes::Concurrent(Arc::new(page)));
+        for word in 0..32u64 {
+            memory.write_array(0x1018, word.to_le_bytes()).unwrap();
+            assert_eq!(memory.read_array::<8>(0x1018).unwrap(), word.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn hardware_view_versions_separate_mapping_and_joined_publication() {
+        use crate::{CpuMemory, Memory, Permissions};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let original = view.hardware_view_version();
+        view.write_array(0x1000, 19u64.to_le_bytes()).unwrap();
+        assert_eq!(view.hardware_view_version(), original);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let joined = view.hardware_view_version();
+        assert_eq!(joined.0, original.0);
+        assert_ne!(joined.1, original.1);
+        drop(view);
+        memory.write_array(0x1000, 23u64.to_le_bytes()).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.hardware_view_version().0, original.0);
+        drop(view);
+        memory.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_ne!(view.hardware_view_version().0, original.0);
+    }
+
+    #[test]
+    fn mapping_deltas_are_bounded_and_write_indices_reject_stale_membership() {
+        use crate::{CpuMemory, Memory, Permissions};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 8, Permissions::RW).unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x1000, [1]).unwrap();
+        let token = view.hardware_write_frame(0x1000).unwrap();
+        let original = view.hardware_view_version().0;
+        assert_eq!(view.hardware_mapping_changes(original).unwrap().count(), 0);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        memory.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(
+            view.hardware_mapping_changes(original)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [0x1000]
+        );
+        assert!(view.mark_hardware_frame_write(token).is_err());
+        drop(view);
+        for round in 0..40 {
+            memory
+                .protect(
+                    0x2000,
+                    PAGE_SIZE,
+                    if round % 2 == 0 {
+                        Permissions::R
+                    } else {
+                        Permissions::RW
+                    },
+                )
+                .unwrap();
+            drop(memory.parallel_view(&mut registry).unwrap());
+        }
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(
+            view.hardware_mapping_changes(original).is_none(),
+            "lagging consumers must reconcile fully"
+        );
+        drop(view);
+        memory.unmap(0x1000, PAGE_SIZE).unwrap();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x1000, [2]).unwrap();
+        assert!(view.mark_hardware_frame_write(token).is_err());
+        let current = view.hardware_write_frame(0x1000).unwrap();
+        view.mark_hardware_frame_write(current).unwrap();
+    }
+
+    #[test]
+    fn private_hardware_ram_is_canonical_without_per_page_fake_dirty_writes() {
+        use crate::{Memory, Permissions};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let original = memory.revision();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let storage = Arc::new(Storage {
+            bytes: Box::new(UnsafeCell::new([0; PAGE_SIZE as usize])),
+            borrows: AtomicUsize::new(0),
+        });
+        unsafe {
+            view.export_hardware_page(0x1000, crate::Access::Write, |_| Ok(storage.clone()))
+                .unwrap();
+        }
+        let token = view.hardware_write_frame(0x1000).unwrap();
+        assert!(!token.needs_publication());
+        // Stand in for a hardware store, not a software View write.
+        unsafe {
+            storage.pointer().cast::<u64>().write(713);
+        }
+        view.mark_hardware_frame_write(token).unwrap();
+        assert!(!token.needs_publication());
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert!(memory.revision() > original);
+        assert_eq!(
+            memory.read_array::<8>(0x1000).unwrap(),
+            713u64.to_le_bytes()
+        );
+        let mut child = memory.clone();
+        child.write_array(0x1000, 919u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            memory.read_array::<8>(0x1000).unwrap(),
+            713u64.to_le_bytes()
+        );
+        assert_eq!(child.read_array::<8>(0x1000).unwrap(), 919u64.to_le_bytes());
+    }
+
     #[test]
     fn hardware_metadata_does_not_require_read_access_or_hide_code_changes() {
         use crate::{Access, CpuMemory, Memory, MemoryError, Permissions};

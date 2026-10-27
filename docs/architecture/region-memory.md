@@ -390,3 +390,63 @@ uses completed slices as progress without inventing retired instructions.
 The Mac adapter owns the platform paging implementation, including preserved
 file-backed physical storage and memory-pressure events. The common runtime does
 not claim an exact process RSS limit or impose a second paging policy on iPad.
+
+
+### Concurrent raw transfers and hardware translation versions
+
+Hardware guest RAM has three distinct capabilities. Metadata retention holds the
+existing region mask without exposing bytes or revoking hardware. Ordinary
+copy-in/out uses `RawGuard`, which has no guest slice accessor. Explicit Rust
+slice callbacks retain the original region and hardware exclusion gates.
+
+On AArch64 and x86-64, ordinary copies execute audited inline-assembly loads and
+stores over the exact checked range. Guest bytes never become LLVM loads/stores
+or Rust references, including scalar read results. Host input/output buffers
+retain normal Rust ownership. Aligned 64-bit transfers use one ordinary host
+load/store; longer transfers may observe normal guest races and are not promised
+an atomic snapshot. There is no added fence, global native-call lock or guest
+race error. Other architectures retain exclusion and the original copy path.
+
+Region ownership still stabilizes storage and excludes overlapping host slice
+borrows. It protects monitor bookkeeping; it does not exclude hardware ordinary
+access. Stable physical storage retains its initialized host mapping through
+page-out; OS page-in and writeback do not recycle the virtual allocation. Cold
+exports and rebinding still acquire every region and the original byte gate
+before copying or replacing storage. These are the lifetime/compiler conditions
+of this implementation, not an assumption that raw pointers make Rust races safe.
+
+`HardwareStorage::publish_host_write` publishes the affected code range after an
+actual host raw write. Scoped callbacks conservatively publish their page before
+ending exclusion, including unwind. The Mac backend skips data-only slots and
+uses the existing instruction-cache operation for code. Guest self-modifying
+code retains its architectural IC/DC maintenance responsibility. Initial
+executable mappings, executable permission transitions, physical page-in and
+changed executable backing still publish code. A global interpreter code epoch
+is not a reason for a hardware consumer to flush every executable page.
+
+The common frozen View exposes a mapping token independently of joined dirty
+publication. Data-only refresh preserves that token. Incremental metadata
+updates record affected virtual addresses in a bounded history (32 batches and
+4,096 addresses). A lagging consumer or full snapshot replacement gets an
+explicit full-reconciliation fallback. This history neither retains physical
+RAM nor adds per-instruction tracking. Checked write-frame tokens use stable
+root indices plus VM/VA/storage identity to publish dirty metadata without a
+repeated virtual-address lookup; stale or revoked membership is rejected.
+
+Ordinary hardware View reads/writes, coordinator concurrent-page transfers and
+VFS mapped-file copies use this protocol. Native/scoped reference callbacks and
+atomic update APIs still use their existing exclusion contract. This is not a
+claim that every source of hardware protection changes has been removed.
+
+
+Canonical private non-executable hardware RAM has no provider copyback or code
+publication work: the hardware store already changes the coordinator's bytes.
+Its admitted writable mappings now set one conservative VM-dirty flag per joined
+epoch. Commit advances the VM generation once, preserving coordinator monitor
+invalidation and fork's existing canonical-byte COW source. It does not invent
+per-page writes, touch every private frame's counters, or rebuild their metadata.
+Shared backings, executable pages and non-direct providers retain their original
+dirty/persistence/code hooks. Software interpreter and native View writes retain
+their existing region, monitor and dirty-fragment protocol. All execution Views
+of a hardware VM must still use hardware mode; mixed interpreter/hardware
+exclusive-monitor execution is outside this admission contract.

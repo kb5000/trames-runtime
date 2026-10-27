@@ -69,6 +69,22 @@ impl PageStorage {
             Self::Published { bytes, .. } => bytes.revision(),
         }
     }
+    fn copy_read(&self, offset: usize, out: &mut [u8]) {
+        match self {
+            Self::Unpublished { .. } => {
+                self.with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes))
+            }
+            Self::Published { bytes, .. } => bytes.copy_read(offset, out),
+        }
+    }
+    fn copy_write(&self, offset: usize, input: &[u8]) {
+        match self {
+            Self::Unpublished { .. } => {
+                self.with_write(offset, input.len(), |bytes| bytes.copy_from_slice(input))
+            }
+            Self::Published { bytes, .. } => bytes.copy_write(offset, input),
+        }
+    }
     fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
         match self {
             // SAFETY: this private tag cannot escape FileMapping/MappedData.
@@ -346,13 +362,9 @@ impl MappedData {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                p.bytes.read().unwrap().with_read(
+                p.bytes.read().unwrap().copy_read(
                     (start - base) as usize,
-                    (to - start) as usize,
-                    |bytes| {
-                        out[(start - offset) as usize..(to - offset) as usize]
-                            .copy_from_slice(bytes);
-                    },
+                    &mut out[(start - offset) as usize..(to - offset) as usize],
                 );
             }
         }
@@ -367,14 +379,9 @@ impl MappedData {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
                 if !p.bytes.read().unwrap().is_shared() {
-                    p.bytes.write().unwrap().with_write(
+                    p.bytes.write().unwrap().copy_write(
                         (start - base) as usize,
-                        (to - start) as usize,
-                        |out| {
-                            out.copy_from_slice(
-                                &bytes[(start - offset) as usize..(to - offset) as usize],
-                            );
-                        },
+                        &bytes[(start - offset) as usize..(to - offset) as usize],
                     );
                 }
                 p.changed();
@@ -393,9 +400,11 @@ impl MappedData {
         }
         let count = self.len().saturating_sub(offset).min(PAGE_SIZE) as usize;
         if count != 0 {
-            let written = page.bytes.read().unwrap().with_read(0, count, |bytes| {
-                self.data.borrow_mut().write_at(offset, bytes)
-            })?;
+            // The file syscall consumes owned host bytes, never a reference
+            // into concurrently executable guest RAM or a held byte guard.
+            let mut bytes = [0; PAGE_SIZE as usize];
+            page.bytes.read().unwrap().copy_read(0, &mut bytes[..count]);
+            let written = self.data.borrow_mut().write_at(offset, &bytes[..count])?;
             if written != count {
                 return Err(Errno(5));
             }
@@ -601,18 +610,14 @@ impl PageBacking for FileMapping {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> std::result::Result<(), MemoryError> {
-        self.with_bytes(|storage| {
-            storage.with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes))
-        });
+        self.with_bytes(|storage| storage.copy_read(offset, out));
         Ok(())
     }
     fn write(&self, offset: usize, bytes: &[u8]) -> std::result::Result<(), MemoryError> {
         if !self.writable {
             return Err(MemoryError::BackingIo(13));
         }
-        self.with_bytes(|storage| {
-            storage.with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes))
-        });
+        self.with_bytes(|storage| storage.copy_write(offset, bytes));
         self.changed();
         Ok(())
     }

@@ -100,7 +100,8 @@ impl MutablePage {
     // Storage changes only under all region bits, before hardware publication;
     // ordinary access holds its regions, and hardware storage never moves again.
     fn storage(&self) -> &Bytes {
-        // SAFETY: callers own a byte guard, or the cold physical-export contract.
+        // SAFETY: callers hold region ownership (metadata or bytes), or the
+        // cold physical-export contract. Hardware actors never modify Bytes.
         unsafe { &*self.bytes.get() }
     }
     /// Export canonical storage once; all future host borrows revoke hardware
@@ -138,11 +139,18 @@ impl MutablePage {
         )
             -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError>,
     ) -> Result<std::sync::Arc<dyn crate::HardwareStorage>, crate::MemoryError> {
-        let mut guard = self.lock(0, PAGE);
+        // Holding the region mask stabilizes the storage enum/owner. Keeping
+        // an existing handle does not read guest bytes or create a byte reference.
+        let regions = self.lock_regions(u64::MAX);
         if let Bytes::Hardware(storage) = self.storage() {
             if storage.is_live() {
                 return Ok(storage.clone());
             }
+        }
+        // Cold export/rebinding may inspect or copy bytes. Enter exactly the
+        // original host-access gate before forming any byte reference.
+        let mut guard = regions.into_bytes();
+        if let Bytes::Hardware(storage) = self.storage() {
             // The former VM is gone permanently. End its host-only gate before
             // moving the bytes into a new VM; the full region lock stays held.
             storage.end_host_access();
@@ -316,7 +324,32 @@ impl MutablePage {
         self.version.load(Ordering::Acquire)
     }
     pub(crate) fn snapshot(&self) -> [u8; PAGE] {
-        self.with_read(0, PAGE, |b| b.try_into().unwrap())
+        let mut bytes = [0; PAGE];
+        self.copy_read(0, &mut bytes);
+        bytes
+    }
+    /// Ordinary guest transfer: no reference into potentially concurrent RAM.
+    pub fn copy_read(&self, offset: usize, out: &mut [u8]) {
+        self.raw_lock(offset, out.len()).read_into(offset, out);
+    }
+    pub fn copy_write(&self, offset: usize, bytes: &[u8]) {
+        let mut raw = self.raw_lock(offset, bytes.len());
+        self.changed(&mut raw.ownership, offset, bytes.len());
+        raw.write_from(offset, bytes);
+    }
+    pub(crate) fn raw_lock(&self, offset: usize, len: usize) -> RawGuard<'_> {
+        let regions = self.lock_regions(mask(offset, len));
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let ownership = Guard {
+            page: std::ptr::from_ref(regions.page),
+            mask: regions.mask,
+            _owner: std::marker::PhantomData,
+        };
+        // Unsupported raw-copy architectures retain the original exclusion.
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let ownership = Guard::new(regions.page, regions.mask, 0);
+        std::mem::forget(regions);
+        RawGuard { ownership }
     }
     /// A shared logical zero page stays unallocated until its first write.
     pub fn zero() -> Self {
@@ -400,6 +433,9 @@ impl MutablePage {
         self.acquisitions.load(Ordering::Relaxed)
     }
     fn lock_mask(&self, mask: u64) -> Guard<'_> {
+        self.lock_regions(mask).into_bytes()
+    }
+    fn lock_regions(&self, mask: u64) -> Regions<'_> {
         let mut attempts = 0;
         loop {
             if self
@@ -411,7 +447,7 @@ impl MutablePage {
             {
                 #[cfg(test)]
                 self.acquisitions.fetch_add(1, Ordering::Relaxed);
-                return Guard::new(self, mask, 0);
+                return Regions { page: self, mask };
             }
             // Native borrows are bounded. Avoid an unbounded tight spin when a
             // peer is descheduled while holding an overlapping region.
@@ -421,6 +457,64 @@ impl MutablePage {
             } else {
                 std::thread::yield_now();
             }
+        }
+    }
+}
+
+// Metadata ownership only: no byte accessor or raw byte pointer is exposed.
+// The existing region mask excludes storage replacement; hardware may still
+// access the stable allocation's bytes. Conversion transfers the same mask to
+// a byte Guard after beginning its original hardware host-access gate.
+struct Regions<'a> {
+    page: &'a MutablePage,
+    mask: u64,
+}
+impl<'a> Regions<'a> {
+    fn into_bytes(self) -> Guard<'a> {
+        let guard = Guard::new(self.page, self.mask, 0);
+        std::mem::forget(self);
+        guard
+    }
+}
+impl Drop for Regions<'_> {
+    fn drop(&mut self) {
+        self.page.held.fetch_and(!self.mask, Ordering::Release);
+    }
+}
+
+/// A region/lifetime capability with no guest slice accessor. Its embedded
+/// guard is used only for monitor metadata and unlocking, never read()/write().
+/// Hardware and raw asm may race with ordinary ARM semantics. Existing host
+/// slice callbacks still acquire these regions AND their hardware gate.
+pub(crate) struct RawGuard<'a> {
+    pub(super) ownership: Guard<'a>,
+}
+impl RawGuard<'_> {
+    pub fn read_into(&self, offset: usize, out: &mut [u8]) {
+        self.ownership.covers(offset, out.len());
+        let page = self.ownership.page();
+        // SAFETY: region ownership stabilizes storage/its allocation and
+        // excludes host references. asm permits concurrent hardware bytes.
+        unsafe {
+            crate::raw::copy(
+                page.storage().as_ptr().cast::<u8>().add(offset),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+    }
+    pub fn write_from(&mut self, offset: usize, input: &[u8]) {
+        self.ownership.covers(offset, input.len());
+        let page = self.ownership.page();
+        unsafe {
+            crate::raw::copy(
+                input.as_ptr(),
+                page.storage().write_ptr(&page.unmaterialized).add(offset),
+                input.len(),
+            );
+        }
+        if let Bytes::Hardware(storage) = page.storage() {
+            storage.publish_host_write(offset, input.len());
         }
     }
 }
@@ -612,6 +706,9 @@ impl Drop for Guard<'_> {
     fn drop(&mut self) {
         if self.page.addr() & 3 == 3 {
             if let Bytes::Hardware(storage) = self.page().storage() {
+                // Scoped callbacks can write or unwind; conservatively publish
+                // this page before restoring hardware, never the whole image.
+                storage.publish_host_write(0, PAGE);
                 storage.end_host_access();
             }
         }

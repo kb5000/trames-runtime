@@ -193,6 +193,7 @@ struct Frame {
     charge: Arc<Charge>,
     direct: bool,
     hardware_shared_export: bool,
+    hardware_track_writes: bool,
     dynamic_code: bool,
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
     private_access: u8,
@@ -424,6 +425,9 @@ fn prepare_frame(
         bytes,
         direct,
         hardware_shared_export,
+        hardware_track_writes: !direct
+            || page.permissions.execute
+            || page.backing.as_ref().is_some_and(|b| b.shared),
         dynamic_code: page.permissions.execute
             && (page.permissions.write
                 || page
@@ -435,6 +439,10 @@ fn prepare_frame(
 
 pub(super) struct Snapshot {
     hardware: bool,
+    hardware_generation: u64,
+    hardware_changes: std::collections::VecDeque<snapshot::HardwareChange>,
+    hardware_writes: AtomicU64,
+    hardware_private_dirty: std::sync::atomic::AtomicBool,
     mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
@@ -695,10 +703,17 @@ impl View {
         if let Some(bytes) = &frame.bytes.constant {
             out.copy_from_slice(&bytes[offset..offset + out.len()]);
         } else {
-            let guard = self.frame_guard(frame, offset, out.len());
-            // Logical zero storage itself supplies zeros. Quota membership is
-            // not a byte-publication fence or an extra read-side condition.
-            out.copy_from_slice(guard.read(offset, out.len()));
+            if self.hardware_mode {
+                frame
+                    .bytes
+                    .bytes
+                    .as_ref()
+                    .expect("hardware page")
+                    .copy_read(offset, out);
+            } else {
+                let guard = self.frame_guard(frame, offset, out.len());
+                out.copy_from_slice(guard.read(offset, out.len()));
+            }
         }
     }
     #[inline]
@@ -792,9 +807,20 @@ impl View {
         input: &[u8],
     ) -> Result<(), MemoryError> {
         self.ensure_resident(frame)?;
-        let mut guard = self.frame_guard(frame, offset, input.len());
-        guard.write(offset, input.len()).copy_from_slice(input);
-        self.changed(frame, &mut guard, offset, input.len());
+        if self.hardware_mode {
+            let mut raw = frame
+                .bytes
+                .bytes
+                .as_ref()
+                .expect("hardware page")
+                .raw_lock(offset, input.len());
+            raw.write_from(offset, input);
+            self.changed(frame, &mut raw.ownership, offset, input.len());
+        } else {
+            let mut guard = self.frame_guard(frame, offset, input.len());
+            guard.write(offset, input.len()).copy_from_slice(input);
+            self.changed(frame, &mut guard, offset, input.len());
+        }
         Ok(())
     }
 }
@@ -947,12 +973,7 @@ impl CpuMemory for View {
         }
         let (frame, offset) = self.reached(address, 4, Access::Execute)?;
         let mut bytes = [0; 4];
-        if let Some(data) = &frame.bytes.constant {
-            bytes.copy_from_slice(&data[offset..offset + 4]);
-        } else {
-            let guard = self.frame_guard(frame, offset, 4);
-            bytes.copy_from_slice(guard.read(offset, 4));
-        }
+        self.read_fragment(frame, offset, &mut bytes);
         Ok(u32::from_le_bytes(bytes))
     }
     fn instruction_identity(&self) -> (u64, u64, u64) {
@@ -1250,6 +1271,10 @@ impl Memory {
         let dynamic_code_pages = frames.iter().filter(|frame| frame.dynamic_code).count();
         let mut snapshot = Snapshot {
             hardware: registry.hardware,
+            hardware_generation: new_backing_identity(),
+            hardware_changes: Default::default(),
+            hardware_writes: AtomicU64::new(0),
+            hardware_private_dirty: std::sync::atomic::AtomicBool::new(false),
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
             dynamic_code: dynamic_code_pages != 0,
@@ -1428,6 +1453,21 @@ impl Memory {
             }
             Ok(())
         })();
+        // Private non-executable RAM already is the coordinator's canonical
+        // storage. One conservative VM generation replaces per-page fake dirty
+        // writes; there is no provider to flush or instruction cache to retire.
+        if cache
+            .snapshot
+            .hardware_private_dirty
+            .swap(false, Ordering::Relaxed)
+        {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        // The joined handoff orders this token; no byte fence is needed.
+        cache
+            .snapshot
+            .hardware_writes
+            .fetch_add(1, Ordering::Relaxed);
         // Frame generations are rebuilt after kernel writes. Keep data-only
         // worker rounds cheap when there was no coordinator mutation.
         cache.source_revision = self.revision;
@@ -1448,6 +1488,71 @@ impl View {
     pub fn enable_hardware(&mut self) {
         self.private_mode = PrivateMode::Guarded;
         self.hardware_mode = true;
+    }
+    /// Mapping identity is independent of ordinary data writes. The second
+    /// token changes only at joined dirty publication, not at every CPU slice.
+    pub fn hardware_view_version(&self) -> (u64, u64) {
+        (
+            self.snapshot.hardware_generation,
+            self.snapshot.hardware_writes.load(Ordering::Relaxed),
+        )
+    }
+    /// Deltas after a previously observed mapping token. None means history
+    /// expired or a full snapshot replacement: revalidate the cached mappings.
+    pub fn hardware_mapping_changes(&self, since: u64) -> Option<impl Iterator<Item = u64> + '_> {
+        let changes = &self.snapshot.hardware_changes;
+        let start = if since == self.snapshot.hardware_generation {
+            changes.len()
+        } else {
+            changes.iter().position(|change| change.before == since)?
+        };
+        Some(
+            changes
+                .iter()
+                .skip(start)
+                .flat_map(|change| change.addresses.iter().copied()),
+        )
+    }
+    pub fn hardware_write_frame(
+        &self,
+        address: u64,
+    ) -> Result<crate::HardwareWriteFrame, MemoryError> {
+        let frame = self.frame(address, Access::Write)?;
+        if !frame.charge.resident() {
+            return Err(MemoryError::InvalidRange);
+        }
+        Ok(crate::HardwareWriteFrame {
+            vm: self.snapshot.identity,
+            base: frame.base,
+            root: frame.root_frame,
+            storage: frame.bytes.identity,
+            publication: frame.hardware_track_writes,
+        })
+    }
+    pub fn mark_hardware_frame_write(
+        &self,
+        token: crate::HardwareWriteFrame,
+    ) -> Result<(), MemoryError> {
+        let position = self
+            .snapshot
+            .positions
+            .get(token.root)
+            .copied()
+            .flatten()
+            .ok_or(MemoryError::InvalidRange)?;
+        let frame = &self.snapshot.frames[position];
+        if token.vm != self.snapshot.identity
+            || token.base != frame.base
+            || token.storage != frame.bytes.identity
+            || !frame.permissions.write
+        {
+            return Err(MemoryError::InvalidRange);
+        }
+        if let Some(error) = &frame.error {
+            return Err(error.clone());
+        }
+        self.mark_hardware_frame(frame);
+        Ok(())
     }
     pub fn hardware_page_info(&self, address: u64) -> Result<HardwarePageInfo, MemoryError> {
         if !address.is_multiple_of(PAGE_SIZE) {
@@ -1471,7 +1576,7 @@ impl View {
             instruction_revision: if frame.permissions.execute {
                 (
                     frame.code_revision,
-                    self.snapshot.code_epoch.load(Ordering::Acquire),
+                    frame.bytes.version().load(Ordering::Acquire),
                 )
             } else {
                 (0, 0)
@@ -1483,6 +1588,21 @@ impl View {
     }
     pub fn mark_hardware_write(&self, address: u64) -> Result<(), MemoryError> {
         let frame = self.frame(address, Access::Write)?;
+        self.mark_hardware_frame(frame);
+        Ok(())
+    }
+    /// An admitted writable private-data mapping may have stored directly into
+    /// canonical RAM. No per-page byte/monitor counter or copyback is needed.
+    pub fn mark_hardware_private_writes(&self) {
+        self.snapshot
+            .hardware_private_dirty
+            .store(true, Ordering::Relaxed);
+    }
+    fn mark_hardware_frame(&self, frame: &Frame) {
+        if !frame.hardware_track_writes {
+            self.mark_hardware_private_writes();
+            return;
+        }
         frame.bytes.dirty.store(u64::MAX, Ordering::Relaxed);
         frame.bytes.version().fetch_add(1, Ordering::Relaxed);
         self.snapshot.dirty_pages[frame.root_frame / 64]
@@ -1490,7 +1610,6 @@ impl View {
         if frame.permissions.execute {
             frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
         }
-        Ok(())
     }
     /// Export one admitted page from the same storage used by CPU/native/VFS.
     ///
