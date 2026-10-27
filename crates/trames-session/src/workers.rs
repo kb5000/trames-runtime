@@ -1589,7 +1589,9 @@ mod tests {
         // SAFETY: all root byte access waits until the owned Views are drained.
         assert!(unsafe { View::try_private_epoch(&mut [&mut first, &mut second]) });
         let control = Arc::new(Control::new(1000));
-        let epoch = crate::run_queue::Epoch::new(control.clone());
+        // This asserts exact retirement at the explicit close checkpoint,
+        // independently of host-load time-slice preemption.
+        let epoch = crate::run_queue::Epoch::unpreempted(control.clone());
         for (pid, pc, fd, op, view) in [(1, 0x1000, a, 2, first), (2, 0x2000, b, 8, second)] {
             let mut cpu = Cpu::new(pc, 0);
             cpu.set_x(8, 32);

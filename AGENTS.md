@@ -36,3 +36,11 @@
 - 按改动范围验证；代码未变的通过结果直接复用，只重跑受影响项目和失败项。
 - 不因文档、记录或测试等待方式的调整重复触发完整 CPU、Linux、网络和图形验收。
 - 完整检查留到合入或正式发版节点。测试 IPA 可以使用已验证且源码未变的 guest 产物。
+
+## Development flow
+
+- Keep one development line per repository on `main`. Merge validated changes
+  promptly; do not maintain stacked or parallel long-lived draft PRs. If repository
+  rules require a PR, keep it short-lived and target `main`.
+- Preserve tested commit identities and paired runtime pins when integrating.
+  Prefer fast-forward integration; do not rewrite published history for cleanup.
