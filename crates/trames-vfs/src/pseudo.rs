@@ -456,6 +456,8 @@ pub struct ProcessInfo {
 #[derive(Clone, Default)]
 pub struct RuntimeInfo {
     pub cpu_count: usize,
+    /// Zero retains the default capacity when no session snapshot is present.
+    pub task_limit: usize,
     pub per_cpu_ticks: Vec<u64>,
     pub cpu_features: &'static str,
     pub processes: Vec<ProcessInfo>,
@@ -1259,6 +1261,11 @@ impl Vfs {
         let path = at.key();
         let pseudo = self.pseudo.borrow();
         let r = self.proc_runtime(at, &pseudo.runtime);
+        let task_limit = if r.task_limit == 0 {
+            MAX_TASKS
+        } else {
+            r.task_limit
+        };
         let current = self.proc_namespace(at).local(self.pid);
         let own = r.processes.iter().find(|p| p.pid == current);
         let directory = || Some((Content::Directory, 0o40555));
@@ -1373,9 +1380,9 @@ impl Vfs {
             b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(regular(n)); },
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
-            b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{MAX_TASKS}\n").into_bytes())),
-            b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", MAX_TASKS * MAX_FDS as usize).into_bytes())),
-            b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), MAX_TASKS * MAX_FDS as usize).into_bytes())),
+            b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
+            b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
+            b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
             b"/proc/sys/net/bridge/bridge-nf-call-iptables"|b"/proc/sys/net/bridge/bridge-nf-call-ip6tables"|b"/proc/sys/net/ipv4/ip_forward"|b"/proc/sys/net/ipv4/conf/all/forwarding"|b"/proc/sys/net/ipv6/conf/all/forwarding"=>return Ok(Some((file(Vec::new()),0o100644))),
             b"/proc/sys/net/bridge"|b"/proc/sys/net/ipv4/conf"|b"/proc/sys/net/ipv4/conf/all"|b"/proc/sys/net/ipv6"|b"/proc/sys/net/ipv6/conf"|b"/proc/sys/net/ipv6/conf/all"=>return Ok(directory()),
@@ -1550,7 +1557,7 @@ impl Vfs {
                                     v.to_string()
                                 }
                             };
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {MAX_TASKS:<20} {MAX_TASKS:<20} processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };

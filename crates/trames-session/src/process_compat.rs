@@ -81,7 +81,7 @@ impl<C: Cpu> Kernel<C> {
             2 | 5 | 9 => self.memory_limits.per_process as u64,
             3 => super::super::STACK_SIZE,
             4 | 8 | 12 | 13 | 14 => 0,
-            6 => MAX_PROCESSES as u64,
+            6 => self.task_limit as u64,
             7 => trames_vfs::MAX_FDS as u64,
             11 => 64,
             _ => return Err(Errno(22)),

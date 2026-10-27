@@ -76,7 +76,7 @@ impl<C: Cpu> Kernel<C> {
         // children. PR_SET_CHILD_SUBREAPER is scoped by the same ancestry.
         let mut reaper = namespace.init();
         let mut at = parent;
-        for _ in 0..MAX_PROCESSES {
+        for _ in 0..self.task_limit {
             let Some(ancestor) = self.processes.get(&at) else {
                 break;
             };

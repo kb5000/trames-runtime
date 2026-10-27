@@ -83,3 +83,19 @@ live anonymous pages remain separate memory work.
 See [execution backends](execution-backends.md) for the three-project target and
 [source-bound validation](../validation/kernel-task-boundaries-summary.json)
 for this step's local CI and original-ELF evidence.
+
+
+## Product task capacity
+
+`Linux::task_limit` configures the initial session's combined task capacity;
+threads and processes each consume one slot. The shared default remains 256,
+while products with multiprocess browser workloads may opt into a higher value.
+The session captures the configured value from its root Linux context before
+execution, including when that context is moved out of `Runtime`. Clone admission,
+RLIMIT_NPROC, proc limit reports and the bounded ancestry walk share this value.
+
+Capacity does not reserve task objects, stacks or guest memory and does not
+create host threads. Existing CPU-worker and aggregate memory limits remain
+independent. Regression coverage creates 299 shared-VM children at capacity 300,
+checks the next rejection and reported limits, and executes a real guest
+getrlimit at session startup with a product capacity of 1,024.

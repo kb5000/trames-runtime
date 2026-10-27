@@ -15,6 +15,7 @@ use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, AT_FDCWD, MAX_FDS, O_NONBLOCK};
 
+#[cfg(all(test, trames_interpreter_conformance))]
 const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
 #[cfg(all(test, trames_interpreter_conformance))]
 const TOTAL_MAPPED_LIMIT: usize = 1024 * 1024 * 1024;
@@ -342,6 +343,7 @@ pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
     memory_limits: super::MemoryLimits,
     cpu_count: usize,
+    task_limit: usize,
     workers: crate::workers::Pool<C>,
     engine: C::Engine,
     backend_error: Option<String>,
@@ -775,6 +777,7 @@ impl<C: Cpu> Kernel<C> {
             pid,
             trames_vfs::RuntimeInfo {
                 cpu_count: self.cpu_count,
+                task_limit: self.task_limit,
                 per_cpu_ticks: self
                     .per_cpu
                     .iter()
@@ -1493,6 +1496,7 @@ impl<C: Cpu> Kernel<C> {
             runtime.linux.vfs.unshare_dumpable();
             runtime.linux.vfs.set_dumpable(execute_vfs.dumpable())?;
             runtime.linux.trace = p.linux.trace;
+            runtime.linux.task_limit = p.linux.task_limit;
             p.linux = runtime.linux;
             p.cpu = runtime.cpu;
             p.memory = runtime.memory;
@@ -1895,7 +1899,8 @@ impl<C: Cpu> Kernel<C> {
                 {
                     return Err(Errno(22));
                 }
-                if self.processes.len() + 1 >= MAX_PROCESSES || (!shared_vm && !p.memory.can_fork())
+                if self.processes.len() + 1 >= self.task_limit
+                    || (!shared_vm && !p.memory.can_fork())
                 {
                     return Err(Errno(11));
                 }
@@ -4495,6 +4500,7 @@ pub(super) fn run<C: Cpu>(
         byte_target: Arc::new(JoinedByteWake),
         memory_limits: runtime.memory_limits,
         cpu_count: count,
+        task_limit: root.linux.task_limit.max(1),
         workers: crate::workers::Pool::<C>::with_profiling(count, runtime.profile_syscalls),
         engine: std::mem::take(&mut runtime.engine),
         backend_error: None,
@@ -5845,6 +5851,7 @@ mod tests {
             byte_target: Arc::new(JoinedByteWake),
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
+            task_limit: trames_vfs::MAX_TASKS,
             engine: Default::default(),
             backend_error: None,
             workers: crate::workers::Pool::new(1),
@@ -7049,6 +7056,52 @@ mod boundary_tests {
         Kernel::queue_one(1, &mut p, 9, 2);
         k.deliver(1, &mut p).unwrap();
         assert!(matches!(p.state, State::Zombie(9)));
+    }
+    #[test]
+    fn configured_task_capacity_admits_more_than_256_threads_and_reports_the_limit() {
+        let mut p = process();
+        let mut k = kernel();
+        k.task_limit = 300;
+        let before = p.memory.resident_bytes();
+        for _ in 1..300 {
+            k.syscall(
+                1,
+                &mut p,
+                220,
+                [0x10900, 0x8000, 0, 0, 0, 0],
+                &mut CapturedOutput::default(),
+            )
+            .unwrap();
+        }
+        assert_eq!(k.processes.len(), 299);
+        assert_eq!(p.memory.resident_bytes(), before);
+        assert_eq!(
+            k.syscall(
+                1,
+                &mut p,
+                220,
+                [0x10900, 0x8000, 0, 0, 0, 0],
+                &mut CapturedOutput::default()
+            ),
+            Err(Errno(11))
+        );
+        k.rlimit(&mut p, 163, [6, 0x1000, 0, 0, 0, 0]).unwrap();
+        assert_eq!(read_u64(&p.memory, 0x1000).unwrap(), 300);
+        k.refresh_proc(1, &mut p);
+        let fd = p
+            .linux
+            .vfs
+            .open_at(-100, b"/proc/sys/kernel/threads-max", 0, 0)
+            .unwrap();
+        assert_eq!(p.linux.vfs.read(fd, 64).unwrap(), b"300\n");
+        let fd = p.linux.vfs.open_at(-100, b"/proc/1/limits", 0, 0).unwrap();
+        let limits = String::from_utf8(p.linux.vfs.read(fd, 4096).unwrap()).unwrap();
+        assert!(limits.lines().any(|line| line.starts_with("Max processes")
+            && line
+                .split_whitespace()
+                .skip(2)
+                .take(2)
+                .all(|value| value == "300")));
     }
     #[test]
     fn process_limit_rejects_fork_without_changing_parent_memory() {

@@ -487,6 +487,52 @@ mod tests {
         }
     }
     #[test]
+    fn initial_session_retains_configured_task_capacity_when_linux_is_moved() {
+        // getrlimit(RLIMIT_NPROC, 0x2000); exit_group(0).
+        let words = [
+            0xd28000c0u32,
+            0xd2840001,
+            0xd2801468,
+            0xd4000001,
+            0xd2800000,
+            0xd2800bc8,
+            0xd4000001,
+        ];
+        let mut memory = Memory::default();
+        memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        for (i, word) in words.into_iter().enumerate() {
+            memory
+                .write_array(0x1000 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let mut linux = Linux::new(0);
+        linux.task_limit = 1024;
+        let mut runtime = Runtime {
+            memory_limits: MemoryLimits::default(),
+            vulkan_display: VulkanDisplay::default(),
+            cpu: Cpu::new(0x1000, 0),
+            engine: Default::default(),
+            memory,
+            linux,
+            terminal: None,
+            metrics: RuntimeMetrics::default(),
+            profile_syscalls: false,
+            cpu_count: 1,
+        };
+        assert_eq!(
+            runtime
+                .run(&mut trames_linux::CapturedOutput::default(), 100)
+                .unwrap()
+                .code,
+            0
+        );
+        assert_eq!(
+            runtime.memory.read_array::<8>(0x2000).unwrap(),
+            1024u64.to_le_bytes()
+        );
+    }
+    #[test]
     fn virtual_devices_work_without_any_proc_access_or_snapshot_refresh() {
         // openat(AT_FDCWD,"/dev/zero",0); read(fd,path,8); exit(0)
         let words = [

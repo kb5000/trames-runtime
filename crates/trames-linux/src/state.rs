@@ -25,6 +25,9 @@ pub struct Linux {
     pub(crate) uring_active: Vec<std::rc::Weak<trames_vfs::Uring>>,
     pub vfs: Vfs,
     pub trace: bool,
+    /// Initial session capacity for guest processes and threads. Jobs and
+    /// stacks remain demand allocated; this does not create host CPU workers.
+    pub task_limit: usize,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable_path: Vec<u8>,
@@ -57,6 +60,7 @@ impl Linux {
             uring_active: self.uring_active.clone(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
             trace: self.trace,
+            task_limit: self.task_limit,
             arguments: self.arguments.clone(),
             environment: self.environment.clone(),
             executable_path: self.executable_path.clone(),
@@ -99,6 +103,7 @@ impl Linux {
             uring_active: Vec::new(),
             vfs: Vfs::default(),
             trace: false,
+            task_limit: trames_vfs::MAX_TASKS,
             arguments: Vec::new(),
             environment: Vec::new(),
             executable_path: Vec::new(),
