@@ -439,13 +439,14 @@ atomic update APIs still use their existing exclusion contract. This is not a
 claim that every source of hardware protection changes has been removed.
 
 
-Canonical private non-executable hardware RAM has no provider copyback or code
-publication work: the hardware store already changes the coordinator's bytes.
+Canonical private hardware RAM, including writable executable pages, has no
+joined provider copyback or instruction publication work: a hardware store
+already changes the coordinator's bytes.
 Its admitted writable mappings now set one conservative VM-dirty flag per joined
 epoch. Commit advances the VM generation once, preserving coordinator monitor
 invalidation and fork's existing canonical-byte COW source. It does not invent
 per-page writes, touch every private frame's counters, or rebuild their metadata.
-Shared backings, executable pages and non-direct providers retain their original
+Shared backings and non-direct providers retain their original
 dirty/persistence/code hooks. Software interpreter and native View writes retain
 their existing region, monitor and dirty-fragment protocol. All execution Views
 of a hardware VM must still use hardware mode; mixed interpreter/hardware
@@ -470,3 +471,28 @@ and discards the complete cached View even when the mappings are unchanged.
 The default implementation retains the interpreter's existing direct Memory
 execution. Standalone hardware executors may own an independent registry when
 they are not participating in a session.
+
+
+### Hardware-owned private code
+
+Executable permission does not imply that an admitted hardware CPU has written
+a page. Private canonical RWX mappings use the same single VM-dirty notice as
+private data, rather than advancing every page's instruction generation at each
+joined epoch. This removes invented writes, frame reconstruction, mapping
+reconciliation and host instruction-cache publication for unchanged JIT pages.
+
+Guest code writers retain the AArch64 self-modifying-code protocol, including
+the required cache operations, barriers and receiving CPU synchronization.
+Actual host writes publish their affected range through `HardwareStorage`.
+Initial executable mappings, permission changes, page-in and physical replacement
+still perform the backend's existing code publication. Shared file/provider
+dirty hooks remain necessary for durability and non-canonical backing caches.
+No new first-write exception or global memory fence is introduced.
+
+This policy applies only to admitted hardware execution. All execution Views
+of that VM must use hardware mode; it does not promise an interpreter decode
+cache can follow unannounced hardware stores. The iPad interpreter's software
+write, monitor and instruction-generation paths remain unchanged. Regression
+coverage checks stable private RWX metadata across joined rounds, real guest
+IC/DC publication between two host-thread-affine vCPUs, host code writes,
+permission revocation, physical replacement and preserved page-out/page-in.

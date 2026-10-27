@@ -449,9 +449,11 @@ fn prepare_frame(
         bytes,
         direct,
         hardware_shared_export,
-        hardware_track_writes: !direct
-            || page.permissions.execute
-            || page.backing.as_ref().is_some_and(|b| b.shared),
+        // Hardware executes private code from these same canonical bytes.
+        // Guest IC/DC maintenance handles guest stores; actual host writes
+        // publish their range at the producer. Executability alone must not
+        // invent a write and rebuild code metadata after every joined epoch.
+        hardware_track_writes: !direct || page.backing.as_ref().is_some_and(|b| b.shared),
         dynamic_code: page.permissions.execute
             && (page.permissions.write
                 || page
@@ -1460,9 +1462,10 @@ impl Memory {
             }
             Ok(())
         })();
-        // Private non-executable RAM already is the coordinator's canonical
-        // storage. One conservative VM generation replaces per-page fake dirty
-        // writes; there is no provider to flush or instruction cache to retire.
+        // Private RAM already is the coordinator's canonical storage. One
+        // conservative VM generation replaces per-page fake dirty writes.
+        // Guest code stores use architectural IC/DC maintenance; actual host
+        // writers publish their affected range, not a joined code generation.
         if cache
             .snapshot
             .hardware_private_dirty
@@ -1598,8 +1601,9 @@ impl View {
         self.mark_hardware_frame(frame);
         Ok(())
     }
-    /// An admitted writable private-data mapping may have stored directly into
+    /// An admitted writable private mapping may have stored directly into
     /// canonical RAM. No per-page byte/monitor counter or copyback is needed.
+    /// Guest code stores retain their architectural IC/DC responsibility.
     pub fn mark_hardware_private_writes(&self) {
         self.snapshot
             .hardware_private_dirty

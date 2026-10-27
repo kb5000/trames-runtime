@@ -532,6 +532,48 @@ mod tests {
     }
 
     #[test]
+    fn private_hardware_code_does_not_invent_joined_instruction_changes() {
+        let mut memory = crate::Memory::default();
+        memory
+            .map(
+                0x1000,
+                crate::PAGE_SIZE,
+                crate::Permissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let storage = Arc::new(Storage {
+            bytes: Box::new(UnsafeCell::new([0; PAGE_SIZE as usize])),
+            borrows: AtomicUsize::new(0),
+        });
+        // SAFETY: no external actors; all execution Views use hardware mode.
+        unsafe {
+            view.export_hardware_page(0x1000, crate::Access::Write, |_| Ok(storage.clone()))
+                .unwrap();
+        }
+        let original = view.hardware_page_info(0x1000).unwrap();
+        let mapping = view.hardware_view_version().0;
+        for _ in 0..8 {
+            let token = view.hardware_write_frame(0x1000).unwrap();
+            assert!(!token.needs_publication());
+            view.mark_hardware_frame_write(token).unwrap();
+            drop(view);
+            memory.commit_parallel().unwrap();
+            view = memory.parallel_view(&mut registry).unwrap();
+            view.enable_hardware();
+            assert_eq!(view.hardware_page_info(0x1000).unwrap(), original);
+            assert_eq!(view.hardware_view_version().0, mapping);
+        }
+    }
+
+    #[test]
     fn entering_hardware_mode_cannot_reuse_a_software_snapshot_token() {
         let mut memory = crate::Memory::default();
         memory

@@ -15,7 +15,8 @@ pub struct HardwareWriteFrame {
     pub(crate) publication: bool,
 }
 impl HardwareWriteFrame {
-    /// Canonical private data needs no provider or instruction publication.
+    /// Canonical private RAM needs no joined provider/instruction publication.
+    /// Host code writers publish at the producer; guest code uses IC/DC.
     pub fn needs_publication(self) -> bool {
         self.publication
     }
