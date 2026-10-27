@@ -349,6 +349,11 @@ storage once, under all of its region bits. Untouched logical zeros still need
 no physical allocation. The cold `Memory::prepare_hardware` boundary retires
 native MMU aliases **and their cached translations** before any transfer. A
 hardware View never uses the former native aliases or unlocked private epochs.
+Admission skips the resident-page pin search when the fixed-buffer registration
+table is empty. A live registration still requires the original mapped-page
+check; dropped or unmapped pins do not exclude unrelated hardware execution.
+This keeps repeated admission independent of resident image size for the common
+case without adding per-page metadata or changing byte-access synchronization.
 Externally pinned/GPU raw mappings remain unsupported by this export contract.
 Shared providers without a canonical `shared_page()` export are also rejected:
 conservative hardware page dirtiness must never copy clean shadow bytes over a

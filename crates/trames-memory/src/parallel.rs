@@ -1563,8 +1563,12 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().prepare_hardware();
         }
+        // Most hardware address spaces never register fixed I/O buffers. An
+        // empty pin table proves that no mapped page can be pinned; do not walk
+        // the entire resident image at every CPU admission in that case.
         if !self.parallel_views_quiescent()
-            || self.frames.iter().flatten().any(|p| self.page_pinned(p))
+            || (!self.pinned.is_empty()
+                && self.frames.iter().flatten().any(|p| self.page_pinned(p)))
         {
             return Err(MemoryError::BackingIo(95));
         }
@@ -1578,6 +1582,27 @@ impl Memory {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn hardware_admission_rejects_only_mapped_live_pins() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory.prepare_hardware().unwrap();
+
+        let pin = memory.pin_rw(0x1000, 16).unwrap();
+        assert_eq!(memory.prepare_hardware(), Err(MemoryError::BackingIo(95)));
+        drop(pin);
+        // The weak registration remains, but no byte actor owns the old pin.
+        memory.prepare_hardware().unwrap();
+
+        let pin = memory.pin_rw(0x2000, 16).unwrap();
+        memory.unmap(0x2000, PAGE_SIZE).unwrap();
+        // An exported buffer can outlive its mapping without excluding an
+        // unrelated hardware address space from execution.
+        memory.prepare_hardware().unwrap();
+        pin.write(0, b"retained").unwrap();
+        assert_eq!(pin.read(0, 8).unwrap(), b"retained");
+    }
 
     #[test]
     fn sparse_publication_survives_frame_reuse_and_repeated_worker_epochs() {
