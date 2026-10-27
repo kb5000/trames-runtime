@@ -7,7 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use trames_wayland::{Server, WindowMode};
+use trames_wayland::{InputEvent, Server, WindowMode};
 
 #[test]
 #[ignore = "build original C client with scripts/test-wayland.sh"]
@@ -81,6 +81,15 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                 }
                 if !resized {
                     server.resize(snapshot.windows[0].id, 320, 200).unwrap();
+                    // The independent C peer must observe both decoration and
+                    // keyboard focus transitions, including native focus loss.
+                    for window in [
+                        Some(snapshot.windows[0].id),
+                        Some(snapshot.windows[1].id),
+                        None,
+                    ] {
+                        server.input(InputEvent::Focus { window }).unwrap();
+                    }
                     resized = true;
                 }
                 if snapshot.windows[0].scene[0].buffer.shm().unwrap().width == 320
@@ -123,7 +132,21 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert!(String::from_utf8_lossy(&output.stdout).contains("wayland-client-ok"));
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("wayland-client-ok"));
+                for window in [1, 2] {
+                    let prefix = format!("wayland-window-state window={window} activated=");
+                    let states = text
+                        .lines()
+                        .filter_map(|line| line.strip_prefix(&prefix))
+                        .collect::<Vec<_>>();
+                    let active = states
+                        .iter()
+                        .position(|state| *state == "1")
+                        .expect("activated configure");
+                    assert!(states[..active].contains(&"0"), "{text}");
+                    assert!(states[active + 1..].contains(&"0"), "{text}");
+                }
                 break;
             }
             if began.elapsed() > Duration::from_secs(10) {

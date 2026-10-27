@@ -151,11 +151,23 @@ impl State {
         self.seat.keymap = Some(map);
         Ok(())
     }
+    pub(crate) fn focus_toplevel(&self, mut id: Option<u64>) -> Option<u64> {
+        for _ in 0..256 {
+            let surface = self.surfaces.get(&id?)?;
+            if surface.is_toplevel() {
+                return id;
+            }
+            id = surface.parent.map(|parent| parent.0);
+        }
+        None
+    }
     pub(crate) fn focus_surface(&mut self, id: Option<u64>) {
         let id = id.filter(|id| self.surfaces.get(id).is_some_and(|s| s.current.is_some()));
         if self.seat.focus == id {
             return;
         }
+        let previous_top = self.focus_toplevel(self.seat.focus);
+        let next_top = self.focus_toplevel(id);
         let serial = self.next_serial();
         if let Some(old) = self.seat.focus.and_then(|id| self.surfaces.get(&id)) {
             for k in &self.seat.keyboards {
@@ -181,6 +193,11 @@ impl State {
         }
         self.text_focus_enter();
         self.selection_focus_changed();
+        if previous_top != next_top {
+            for top in [previous_top, next_top].into_iter().flatten() {
+                self.configure(top);
+            }
+        }
         self.changed();
     }
     pub(crate) fn input(&mut self, event: InputEvent) {

@@ -35,10 +35,14 @@ impl State {
         }
         self.serial = self.serial.wrapping_add(1).max(1);
         let serial = self.serial;
+        let activated = self.focus_toplevel(self.seat.focus) == Some(id);
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
         };
         let mut states = Vec::new();
+        if activated {
+            states.extend_from_slice(&(xdg_toplevel::State::Activated as u32).to_ne_bytes());
+        }
         if s.mode == WindowMode::Maximized {
             states.extend_from_slice(&(xdg_toplevel::State::Maximized as u32).to_ne_bytes());
         }
