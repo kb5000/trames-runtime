@@ -78,6 +78,7 @@ impl<C: Cpu> Kernel<C> {
         };
         let fixed = match resource {
             0 | 1 | 10 | 15 => u64::MAX,
+            2 | 5 | 9 if self.memory_limits.is_host_managed() => u64::MAX,
             2 | 5 | 9 => self.memory_limits.per_process as u64,
             3 => super::super::STACK_SIZE,
             4 | 8 | 12 | 13 | 14 => 0,

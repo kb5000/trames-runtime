@@ -1226,6 +1226,12 @@ impl Memory {
         frame: usize,
         registry: &mut Registry,
     ) {
+        // prepare_frame already handles hardware canonical ownership and true
+        // fork detachment. A temporary software MMU slot here would be copied
+        // into hardware RAM and its protected CPU alias immediately retired.
+        if registry.hardware {
+            return;
+        }
         let page = self.frames[frame].as_ref().expect("mapped frame");
         // Untouched anonymous zeros need neither RAM nor a physical VA owner.
         // Publishing them into mapped storage would retain whole windows over
@@ -1882,8 +1888,13 @@ impl Memory {
         {
             return Err(MemoryError::BackingIo(95));
         }
+        // A canonical SharedPage can transfer Heap -> hardware storage during
+        // this epoch. Retire coordinator cached byte pointers at every admission,
+        // even though the separate software CPU alias arena stays disabled.
         self.invalidate_translations();
-        self.mmu = Default::default();
+        if self.mmu.cpu_aliases_enabled() {
+            self.mmu = mmu::Arena::without_cpu_aliases();
+        }
         Ok(())
     }
 }

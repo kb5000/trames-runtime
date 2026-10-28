@@ -252,7 +252,7 @@ impl Clone for Memory {
         self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
         let account = self.fork_account();
         Self {
-            mmu: mmu::Arena::default(),
+            mmu: self.mmu.empty_like(),
             pages: self.pages.clone(),
             reservations: self.reservations.clone(),
             frames: self

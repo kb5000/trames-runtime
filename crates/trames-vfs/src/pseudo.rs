@@ -69,6 +69,64 @@ mod tests {
         out
     }
     #[test]
+    fn proc_limits_reports_the_runtime_address_cap_or_unlimited() {
+        for (value, expected) in [(4u64 << 30, "4294967296"), (u64::MAX, "unlimited")] {
+            let mut vfs = Vfs::default();
+            vfs.set_runtime_info(
+                1,
+                RuntimeInfo {
+                    processes: vec![ProcessInfo {
+                        pid: 1,
+                        tgid: 1,
+                        address_space_limit: Some(value),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let text = String::from_utf8(read(&mut vfs, b"/proc/1/limits")).unwrap();
+            let row = text
+                .lines()
+                .find(|line| line.starts_with("Max address space"))
+                .unwrap();
+            assert_eq!(
+                row.split_whitespace().skip(3).collect::<Vec<_>>(),
+                [expected, expected, "bytes"]
+            );
+        }
+    }
+    #[test]
+    fn meminfo_can_report_reclaimable_availability_separately_from_free_bytes() {
+        let mut vfs = Vfs::default();
+        vfs.set_runtime_info(
+            1,
+            RuntimeInfo {
+                memory_limit: 24usize << 30,
+                used_memory: 21usize << 30,
+                available_memory: Some(8usize << 30),
+                ..Default::default()
+            },
+        );
+        let text = String::from_utf8(read(&mut vfs, b"/proc/meminfo")).unwrap();
+        let values: BTreeMap<_, _> = text
+            .lines()
+            .filter_map(|line| {
+                let (key, rest) = line.split_once(':')?;
+                Some((
+                    key,
+                    rest.split_whitespace()
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap(),
+                ))
+            })
+            .collect();
+        assert_eq!(values["MemTotal"], 24 << 20);
+        assert_eq!(values["MemFree"], 3 << 20);
+        assert_eq!(values["MemAvailable"], 8 << 20);
+    }
+    #[test]
     fn proc_route_uses_guest_little_endian_addresses_for_native_and_bridge_rows() {
         use std::net::Ipv4Addr;
         // Decode the text exactly as little-endian route/BusyBox consumers do.
@@ -446,6 +504,7 @@ pub struct ProcessInfo {
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
+    pub address_space_limit: Option<u64>,
     pub oom: std::sync::Weak<OomTask>,
     pub pending: u64,
     pub shared_pending: u64,
@@ -467,6 +526,8 @@ pub struct RuntimeInfo {
     pub cpu_user_ticks: u64,
     pub idle: Duration,
     pub memory_limit: usize,
+    /// Host-managed MemAvailable hint; None retains total minus guest usage.
+    pub available_memory: Option<usize>,
     pub load: [f64; 3],
     pub processes_created: u32,
     pub used_memory: usize,
@@ -1350,7 +1411,8 @@ impl Vfs {
                 let total = r.memory_limit as u64 / 1024;
                 let used: u64 = r.used_memory as u64 / 1024;
                 let free = total.saturating_sub(used);
-                return Ok(regular(format!("MemTotal: {total:8} kB\nMemFree: {free:8} kB\nMemAvailable: {free:8} kB\nBuffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").into_bytes()));
+                let available = r.available_memory.map_or(free, |bytes| (bytes as u64 / 1024).min(total));
+                return Ok(regular(format!("MemTotal: {total:8} kB\nMemFree: {free:8} kB\nMemAvailable: {available:8} kB\nBuffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").into_bytes()));
             }
             b"/proc/cpuinfo" => return Ok(regular((0..r.cpu_count.max(1)).map(|cpu|format!("processor\t: {cpu}\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t: {}\n\n",r.cpu_features)).collect::<String>().into_bytes())),
             b"/proc/swaps" => return Ok(regular(b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_vec())),
@@ -1557,7 +1619,8 @@ impl Vfs {
                                     v.to_string()
                                 }
                             };
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         536870912            536870912             bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
+                            let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };

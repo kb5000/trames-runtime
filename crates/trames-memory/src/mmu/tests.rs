@@ -751,3 +751,39 @@ fn host_group_relocation_refreshes_unchanged_parallel_neighbors() {
     }
     assert!(registry.metrics.incremental_updates > 0);
 }
+
+#[test]
+fn hardware_admission_keeps_software_cpu_windows_disabled_across_mapping_writes_and_fork() {
+    let mut parent = Memory::default();
+    parent.map(0x40000, 4 * PAGE_SIZE, Permissions::RW).unwrap();
+    parent.write_array(0x40000, [0x31; 8]).unwrap();
+    parent.prepare_hardware().unwrap();
+    assert!(!parent.mmu.cpu_aliases_enabled());
+    for i in 0..8 {
+        let address = 0x100000 + i * 4 * PAGE_SIZE;
+        parent.map(address, 4 * PAGE_SIZE, Permissions::RW).unwrap();
+        parent.write_array(address, [i as u8; 8]).unwrap();
+        parent.protect(address, PAGE_SIZE, Permissions::R).unwrap();
+        assert!(parent.mmu.windows.borrow().is_empty());
+    }
+    let mut child = parent.clone();
+    assert!(!child.mmu.cpu_aliases_enabled());
+    let mut registry = crate::parallel::Registry::default();
+    registry.use_hardware();
+    let mut view = child.parallel_view(&mut registry).unwrap();
+    view.enable_hardware();
+    view.write_array(0x40000, [0x72; 8]).unwrap();
+    drop(view);
+    child.commit_parallel().unwrap();
+    assert_eq!(child.read_array::<8>(0x40000).unwrap(), [0x72; 8]);
+    assert_eq!(parent.read_array::<8>(0x40000).unwrap(), [0x31; 8]);
+    assert!(child.mmu.windows.borrow().is_empty());
+    assert!(parent.mmu.windows.borrow().is_empty());
+    // A fresh interpreter address space keeps its protected alias fast path.
+    let mut software = Memory::default();
+    software
+        .map(0x40000, 4 * PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    assert!(software.mmu.cpu_aliases_enabled());
+    assert!(!software.mmu.windows.borrow().is_empty());
+}

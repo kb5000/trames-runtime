@@ -20,7 +20,7 @@ use trames_memory::{Memory, MemoryError, DEFAULT_MEMORY_LIMIT, PAGE_SIZE};
 
 /// Guest resident-page budgets. Untouched anonymous zeros/reservations have no
 /// resident charge. File mappings and fork COW remain conservative; CLONE_VM
-/// shares one accounting domain. Per-process mapped-page caps also bound metadata.
+/// shares one accounting domain. Mapping metadata has its independent bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryLimits {
     pub per_process: usize,
@@ -35,6 +35,39 @@ impl Default for MemoryLimits {
     }
 }
 impl MemoryLimits {
+    /// No product resident-byte quota: the guest architectural address ceiling
+    /// bounds accounting arithmetic. The host adapter supplies physical memory
+    /// reports and pressure reclamation. This allocates/reserves no RAM, does
+    /// not raise independent descriptor limits, and changes no iPad defaults.
+    pub const fn host_managed() -> Self {
+        Self {
+            per_process: trames_memory::ADDRESS_LIMIT as usize,
+            total: trames_memory::ADDRESS_LIMIT as usize,
+        }
+    }
+    pub fn is_host_managed(self) -> bool {
+        self == Self::host_managed()
+    }
+    fn reported(
+        self,
+        used: usize,
+        host: Option<trames_linux::HostMemoryInfo>,
+    ) -> trames_linux::HostMemoryInfo {
+        if self.is_host_managed() {
+            let host = host.unwrap_or_default();
+            return trames_linux::HostMemoryInfo {
+                total: host.total,
+                free: host.free.min(host.total),
+                available: host.available.min(host.total),
+            };
+        }
+        let free = self.total.saturating_sub(used);
+        trames_linux::HostMemoryInfo {
+            total: self.total,
+            free,
+            available: free,
+        }
+    }
     pub fn validate(self) -> Result<(), RuntimeError> {
         if self.per_process == 0
             || self.total < self.per_process
@@ -768,5 +801,48 @@ mod accelerator_tests {
         assert_eq!(r.cpu.pc, 0x100c);
         assert_eq!(r.cpu.x(1), 0x91);
         assert_eq!(r.metrics.native.faults, 1);
+    }
+}
+
+#[cfg(test)]
+mod host_memory_reporting_tests {
+    use super::*;
+    use trames_linux::HostMemoryInfo;
+
+    #[test]
+    fn host_management_uses_host_reports_without_a_fixed_resident_pool() {
+        let limits = MemoryLimits::host_managed();
+        limits.validate().unwrap();
+        assert!(limits.per_process > 24usize << 30);
+        assert!(limits.is_host_managed());
+        let sample = HostMemoryInfo {
+            total: 24usize << 30,
+            free: 3usize << 30,
+            available: 8usize << 30,
+        };
+        assert_eq!(limits.reported(5usize << 30, Some(sample)), sample);
+        assert_eq!(limits.reported(0, None), HostMemoryInfo::default());
+    }
+    #[test]
+    fn explicit_budgets_ignore_host_capacity_and_keep_saturating_guest_availability() {
+        let limits = MemoryLimits {
+            per_process: 1usize << 30,
+            total: 4usize << 30,
+        };
+        let host = HostMemoryInfo {
+            total: 24usize << 30,
+            free: 20usize << 30,
+            available: 22usize << 30,
+        };
+        assert!(!limits.is_host_managed());
+        assert_eq!(
+            limits.reported(1usize << 30, Some(host)),
+            HostMemoryInfo {
+                total: 4usize << 30,
+                free: 3usize << 30,
+                available: 3usize << 30
+            }
+        );
+        assert_eq!(limits.reported(5usize << 30, Some(host)).free, 0);
     }
 }

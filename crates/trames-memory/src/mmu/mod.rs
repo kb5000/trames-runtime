@@ -286,6 +286,24 @@ impl Default for Arena {
     }
 }
 impl Arena {
+    /// Hardware executors own their translations. Keep canonical byte owners,
+    /// never create a second protected CPU alias arena at later mmap/write/fork.
+    pub fn without_cpu_aliases() -> Self {
+        Self {
+            granule: 0,
+            ..Self::default()
+        }
+    }
+    pub fn cpu_aliases_enabled(&self) -> bool {
+        self.granule != 0
+    }
+    pub fn empty_like(&self) -> Self {
+        if self.cpu_aliases_enabled() {
+            Self::default()
+        } else {
+            Self::without_cpu_aliases()
+        }
+    }
     fn window(&self, address: u64, create: bool) -> Option<Rc<Window>> {
         if self.granule == 0 {
             return None;

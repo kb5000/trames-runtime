@@ -49,7 +49,22 @@ pub enum TerminalEvent {
     Signal(u32),
 }
 
+/// Optional host memory snapshot for a host-managed session. Values are bytes;
+/// available may include reclaimable pages and is a hint, never a reservation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostMemoryInfo {
+    pub total: usize,
+    pub free: usize,
+    pub available: usize,
+}
+
 pub trait GuestOutput {
+    /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
+    /// Queried only for memory/proc metadata, never on CPU/native byte access.
+    fn host_memory(&self) -> Option<HostMemoryInfo> {
+        None
+    }
+
     /// Poll host queues/resource metadata without touching guest bytes or
     /// changing namespace/FD topology. True requests the stopped control hook.
     /// Legacy adapters conservatively retain their existing joined callback.

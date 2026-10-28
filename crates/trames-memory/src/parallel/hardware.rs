@@ -4,6 +4,9 @@ use super::*;
 
 impl Snapshot {
     pub(super) fn refresh_mmu_all(&mut self) {
+        if self.hardware {
+            return;
+        }
         let addresses: Slots<_> = self.pages.keys().copied().collect();
         self.refresh_mmu(addresses);
     }

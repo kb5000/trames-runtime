@@ -583,3 +583,39 @@ Validation includes 80 missed updates, journal interval overflow, sparse chunk
 removal/reuse, snapshot replacement and zero untouched-page residency. The Mac
 signed acceptance also checks that late CPUs skip unrelated cached chunks while
 still observing read-only protection, unmap and fresh bytes after address reuse.
+
+
+### Host-managed policy and hardware-only coordinator mappings
+
+`MemoryLimits::host_managed()` selects the guest architectural ceiling for
+resident accounting, rather than a fixed product RAM quota. It allocates no RAM.
+The host adapter opts in through `GuestOutput::host_memory`; startup rejects a
+missing adapter. `sysinfo` and procfs use the adapter's physical/free/available
+snapshot, while numeric bounded policies retain their original guest-budget
+reports and enforcement. Host-managed data/RSS/address rlimits are unlimited;
+proc address-space limits now follow the same policy instead of a fixed 512 MiB.
+Common/iPad defaults remain bounded and unchanged. The Mac product's default is
+host-managed, with `--memory-mib N` retaining an explicit resident-byte cap.
+
+This changes resident policy, not mapping representation: accessible VMAs still
+have the independent 4,194,304-page / 16 GiB descriptor ceiling per address space.
+Large sparse accessible mappings still cost metadata; sparse PROT_NONE ranges
+use their existing representation. Host-managed sessions share the host memory
+pool across VMs but this is not unlimited sparse per-process virtual memory or
+unique-physical RSS/PSS accounting. Fork accounting/copies remain conservative.
+
+Hardware admission now leaves the coordinator software CPU-alias arena disabled
+across subsequent map/protect/write operations and fork. Previously admission
+cleared it, but later mapping operations recreated protected host CPU windows
+that hardware execution would discard again. `prepare_frame` already transfers
+canonical owned bytes and detaches true writable fork COW pages, so hardware
+preparation skips the redundant software mapped-slot promotion. Software/iPad
+registries retain their original alias path. Hardware snapshots already skipped
+worker CPU aliases; they now also skip collecting unused full-refresh addresses.
+
+Every hardware admission still invalidates coordinator cached byte pointers:
+canonical storage can transfer from Heap to hardware during an epoch even when
+no mapping changed. Region/permission/EOF checks, host borrow gates, mapped pin
+rejection and hardware export ownership remain unchanged. Validation covers
+mapping/protection/kernel writes without recreated windows, writable child COW
+isolation, retained data, and a fresh interpreter arena retaining its fast path.

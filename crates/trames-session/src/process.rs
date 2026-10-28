@@ -746,6 +746,11 @@ impl<C: Cpu> Kernel<C> {
             fds: p.linux.vfs.fd_snapshot(),
             auxiliary: p.linux.auxiliary.clone(),
             file_size_limits: Some(p.file_size_limit.get()),
+            address_space_limit: Some(if self.memory_limits.is_host_managed() {
+                u64::MAX
+            } else {
+                self.memory_limits.per_process as u64
+            }),
             oom: Arc::downgrade(&p.oom),
             pending: p.signals.pending.bits(),
             shared_pending: p.signals.shared_pending.borrow().bits(),
@@ -754,7 +759,15 @@ impl<C: Cpu> Kernel<C> {
             caught,
         }
     }
-    fn refresh_proc(&self, pid: u32, p: &mut Process<C>) {
+    fn refresh_proc(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        host: Option<trames_linux::HostMemoryInfo>,
+    ) {
+        let memory = self
+            .memory_limits
+            .reported(self.other_memory(p.vm_id) + p.memory.resident_bytes(), host);
         // Bound cached bytes by the current memory-owner set, even after repeated
         // fork/exec. Never cache fd paths, credentials, names, argv bytes or
         // other mutable process metadata under a mapping-generation key.
@@ -790,10 +803,11 @@ impl<C: Cpu> Kernel<C> {
                 context_switches: self.context_switches,
                 cpu_user_ticks: (self.cpu_total.as_millis() / 10) as u64,
                 idle: self.idle,
-                memory_limit: self.memory_limits.total,
+                memory_limit: memory.total,
+                available_memory: Some(memory.available),
                 load: self.load,
                 processes_created: self.next_pid - 1,
-                used_memory: self.other_memory(p.vm_id) + p.memory.resident_bytes(),
+                used_memory: memory.total.saturating_sub(memory.free),
             },
         );
     }
@@ -2278,11 +2292,18 @@ impl<C: Cpu> Kernel<C> {
             179 => {
                 Linux::check(&p.memory, a[0], 112, Access::Write)?;
                 let used = self.other_memory(p.vm_id) + p.memory.resident_bytes();
+                let memory = self.memory_limits.reported(
+                    used,
+                    self.memory_limits
+                        .is_host_managed()
+                        .then(|| io.host_memory())
+                        .flatten(),
+                );
                 let mut out = [0; 112];
                 for (offset, value) in [
                     (0, self.started.elapsed().as_secs()),
-                    (32, self.memory_limits.total as u64),
-                    (40, self.memory_limits.total.saturating_sub(used) as u64),
+                    (32, memory.total as u64),
+                    (40, memory.free as u64),
                 ] {
                     out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
                 }
@@ -2485,7 +2506,14 @@ impl<C: Cpu> Kernel<C> {
             }));
         if reads_proc {
             self.proc_refreshes += 1;
-            self.refresh_proc(pid, p);
+            self.refresh_proc(
+                pid,
+                p,
+                self.memory_limits
+                    .is_host_managed()
+                    .then(|| io.host_memory())
+                    .flatten(),
+            );
         }
         let was_blocked = matches!(p.state, State::Blocked(..));
         p.cpu.set_x(8, number as u64);
@@ -4451,6 +4479,13 @@ pub(super) fn run<C: Cpu>(
     limit: u64,
 ) -> Result<Exit, RuntimeError> {
     runtime.memory_limits.validate()?;
+    let host_memory = if runtime.memory_limits.is_host_managed() {
+        Some(io.host_memory().ok_or(RuntimeError::Configuration(
+            "host-managed memory requires a host memory adapter",
+        ))?)
+    } else {
+        None
+    };
     runtime
         .memory
         .set_limit(runtime.memory_limits.per_process)?;
@@ -4587,7 +4622,7 @@ pub(super) fn run<C: Cpu>(
     };
     // Enable all virtual mounts once, including /dev and /sys for programs
     // that never touch /proc. Subsequent full snapshots are demand-driven.
-    kernel.refresh_proc(1, &mut root);
+    kernel.refresh_proc(1, &mut root, host_memory);
     kernel.proc_refreshes += 1;
     kernel.processes.insert(1, Box::new(root));
     let result = kernel.drive(io, limit);
@@ -5821,7 +5856,7 @@ mod tests {
     fn host_pty_keyboard_and_resize_signals_are_scoped_to_the_foreground_session() {
         let mut k = kernel();
         let mut root = process();
-        k.refresh_proc(1, &mut root);
+        k.refresh_proc(1, &mut root, None);
         let fd = root.linux.vfs.open_at(-100, b"/dev/ptmx", 2, 0).unwrap();
         let pair = root.linux.vfs.pty(fd).unwrap().unwrap().pair.clone();
         {
@@ -6009,7 +6044,7 @@ mod tests {
         old.vm_id = 2;
         k.process_maps(&old);
         assert_eq!(k.proc_maps.borrow().len(), 2);
-        k.refresh_proc(1, &mut p);
+        k.refresh_proc(1, &mut p, None);
         assert_eq!(k.proc_maps.borrow().len(), 1);
     }
 
@@ -7093,7 +7128,7 @@ mod boundary_tests {
         );
         k.rlimit(&mut p, 163, [6, 0x1000, 0, 0, 0, 0]).unwrap();
         assert_eq!(read_u64(&p.memory, 0x1000).unwrap(), 300);
-        k.refresh_proc(1, &mut p);
+        k.refresh_proc(1, &mut p, None);
         let fd = p
             .linux
             .vfs
