@@ -187,6 +187,19 @@ impl Anonymous {
         }
         changed
     }
+    pub fn prune(&self) {
+        let mut seen = BTreeSet::new();
+        for range in self.ranges.values() {
+            if seen.insert(Arc::as_ptr(&range.store) as usize) {
+                for shard in &range.store.pages {
+                    shard.lock().unwrap().retain(|&base, _| {
+                        self.containing(base)
+                            .is_some_and(|(_, r)| Arc::ptr_eq(&r.store, &range.store))
+                    });
+                }
+            }
+        }
+    }
     pub fn fork(&self, account: &std::sync::Arc<residency::Account>) -> Self {
         Self {
             ranges: self
@@ -391,6 +404,10 @@ mod tests {
         drop(second);
         m.commit_parallel().unwrap();
         assert_eq!(m.read_u64(base).unwrap(), 8);
+        assert!(
+            m.pages.is_empty(),
+            "ordinary handoff must retain the sparse canonical page"
+        );
         assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
         let mut child = m.clone();
         child.write_array(base, 99u64.to_le_bytes()).unwrap();
@@ -414,6 +431,78 @@ mod tests {
         drop(view);
         m.commit_parallel().unwrap();
         assert_eq!(m.read_array::<8>(base + PAGE_SIZE).unwrap(), [9; 8]);
+    }
+
+    #[test]
+    fn sparse_shared_views_keep_atomic_updates_and_publish_one_vm_generation() {
+        let mut m = Memory::default();
+        let base = 1 << 32;
+        m.map(base, 1 << 30, Permissions::RW).unwrap();
+        let before = m.revision();
+        let mut registry = Registry::default();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let mut view = m.parallel_view(&mut registry).unwrap();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1024 {
+                    view.atomic_update(base, 8, |bytes| {
+                        let value = u64::from_le_bytes(bytes.try_into().unwrap()) + 1;
+                        bytes.copy_from_slice(&value.to_le_bytes());
+                        ((), true)
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_u64(base).unwrap(), 8192);
+        assert_ne!(m.revision(), before);
+        assert!(m.pages.is_empty());
+        assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
+    }
+
+    #[test]
+    fn sparse_partial_unmap_releases_only_removed_bytes_and_fork_stays_cow() {
+        let mut m = Memory::default();
+        let base = 1 << 32;
+        m.map(base, 1 << 30, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        for page in 0..4 {
+            view.write_array(base + page * PAGE_SIZE, [page as u8 + 1])
+                .unwrap();
+        }
+        drop(view);
+        m.commit_parallel().unwrap();
+        assert!(m.pages.is_empty());
+        m.unmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(m.resident_bytes(), 3 * PAGE_SIZE as usize);
+        let child = m.clone();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.write_array(base, [17]).unwrap();
+        drop(view);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<1>(base).unwrap(), [17]);
+        assert_eq!(child.read_array::<1>(base).unwrap(), [1]);
+        assert_eq!(m.read_array::<1>(base + 2 * PAGE_SIZE).unwrap(), [3]);
+    }
+
+    #[test]
+    fn sparse_precharged_zero_fork_cannot_be_modified_by_later_parent_worker() {
+        let mut m = Memory::default();
+        let base = 1 << 32;
+        m.map(base, 1 << 30, Permissions::RW).unwrap();
+        m.check(base, 1, Access::Write).unwrap();
+        let child = m.clone();
+        let mut view = m.parallel_view(&mut Registry::default()).unwrap();
+        view.write_array(base, [17]).unwrap();
+        assert_eq!(child.read_array::<1>(base).unwrap(), [0]);
     }
 
     #[test]

@@ -562,6 +562,7 @@ pub(super) struct Snapshot {
     hardware_changes: std::collections::VecDeque<snapshot::HardwareChange>,
     hardware_writes: AtomicU64,
     hardware_private_dirty: std::sync::atomic::AtomicBool,
+    anonymous_dirty: std::sync::atomic::AtomicBool,
     mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
@@ -857,6 +858,12 @@ impl View {
     #[inline]
     fn changed(&self, frame: &Frame, state: &mut page::Guard<'_>, offset: usize, len: usize) {
         frame.bytes.changed(state, offset, len);
+        if len != 0
+            && frame.root_frame == usize::MAX
+            && !self.snapshot.anonymous_dirty.load(Ordering::Relaxed)
+        {
+            self.snapshot.anonymous_dirty.store(true, Ordering::Relaxed);
+        }
         if len != 0 && frame.root_frame != usize::MAX {
             let word = &self.snapshot.dirty_pages[frame.root_frame / 64];
             let bit = 1 << (frame.root_frame % 64);
@@ -1297,7 +1304,15 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().parallel_view(registry);
         }
-        self.adopt_anonymous();
+        if self
+            .parallel_cache
+            .as_ref()
+            .map_or(self.fork_epoch.get() != 0, |cache| {
+                cache.source_fork_epoch != self.fork_epoch.get()
+            })
+        {
+            self.adopt_anonymous();
+        }
         // A resumed runtime can construct a new coordinator registry. Cached
         // shared pages must join that registry's alias/code domain, not silently
         // retain an earlier one while fork peers allocate duplicate snapshots.
@@ -1435,7 +1450,12 @@ impl Memory {
                 }
             }
         }
-        let anonymous = anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
+        let anonymous = anonymous::Anonymous::freeze(
+            self,
+            registry.code_epoch.clone(),
+            registry.hardware,
+            None,
+        );
         let anonymous_executable = anonymous.executable();
         let mut snapshot = Snapshot {
             anonymous,
@@ -1445,6 +1465,7 @@ impl Memory {
             hardware_changes: Default::default(),
             hardware_writes: AtomicU64::new(0),
             hardware_private_dirty: std::sync::atomic::AtomicBool::new(false),
+            anonymous_dirty: std::sync::atomic::AtomicBool::new(false),
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
             dynamic_code: dynamic_code_pages != 0 || anonymous_executable,
@@ -1510,7 +1531,6 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().commit_parallel();
         }
-        self.adopt_anonymous();
         let Some(mut cache) = self.parallel_cache.take() else {
             return Ok(());
         };
@@ -1637,6 +1657,10 @@ impl Memory {
             .snapshot
             .hardware_private_dirty
             .swap(false, Ordering::Relaxed)
+            | cache
+                .snapshot
+                .anonymous_dirty
+                .swap(false, Ordering::Relaxed)
         {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -1716,6 +1740,11 @@ impl View {
             .get(&(address / crate::HARDWARE_MAPPING_CHUNK_SIZE))
             .copied()
             .or_else(|| {
+                self.snapshot
+                    .anonymous
+                    .chunk_version(address / crate::HARDWARE_MAPPING_CHUNK_SIZE)
+            })
+            .or_else(|| {
                 let start = address / crate::HARDWARE_MAPPING_CHUNK_SIZE
                     * crate::HARDWARE_MAPPING_CHUNK_SIZE;
                 self.snapshot
@@ -1724,8 +1753,9 @@ impl View {
                     .then_some(self.snapshot.hardware_generation)
             })
     }
-    /// Existing hardware storage only: no source load, allocation, quota charge
-    /// or byte borrow. The result preserves this View's permission/EOF model.
+    /// Existing hardware bytes only: no source load, RAM allocation, quota charge
+    /// or byte borrow. A fresh executor may prepare metadata for retained pages.
+    /// The result preserves this View's permission/EOF model.
     pub fn retained_hardware_page(
         &self,
         address: u64,
@@ -1736,7 +1766,7 @@ impl View {
         let frame = if let Some(&i) = self.snapshot.pages.get(&address) {
             &self.snapshot.frames[i]
         } else {
-            self.snapshot.anonymous.cached(address)?
+            self.snapshot.anonymous.retained(address)?
         };
         if frame.error.is_some() || !frame.charge.resident() || !frame.hardware_shared_export {
             return None;
@@ -1771,7 +1801,7 @@ impl View {
         let frame = if token.root == usize::MAX {
             self.snapshot
                 .anonymous
-                .cached(token.base)
+                .metadata(token.base)?
                 .ok_or(MemoryError::InvalidRange)?
         } else {
             let position = self
@@ -1850,7 +1880,9 @@ impl View {
         }
         frame.bytes.dirty.store(u64::MAX, Ordering::Relaxed);
         frame.bytes.version().fetch_add(1, Ordering::Relaxed);
-        if frame.root_frame != usize::MAX {
+        if frame.root_frame == usize::MAX {
+            self.snapshot.anonymous_dirty.store(true, Ordering::Relaxed);
+        } else {
             self.snapshot.dirty_pages[frame.root_frame / 64]
                 .fetch_or(1 << (frame.root_frame % 64), Ordering::Relaxed);
         }

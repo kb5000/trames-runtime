@@ -3,19 +3,28 @@
 use super::*;
 use std::sync::Mutex;
 
+type FrameCache = [Mutex<BTreeMap<u64, Arc<Frame>>>; 16];
+
 struct Range {
     end: u64,
     permissions: Permissions,
     code_revision: u64,
     store: Arc<crate::anonymous::Store>,
-    pages: [Mutex<BTreeMap<u64, Arc<Frame>>>; 16],
+    pages: Arc<FrameCache>,
 }
 pub(crate) struct Anonymous {
     ranges: BTreeMap<u64, Range>,
     code_epoch: Arc<AtomicU64>,
+    hardware: bool,
+    chunks: Mutex<BTreeMap<u64, u64>>,
 }
 impl Anonymous {
-    pub(super) fn freeze(memory: &Memory, epoch: Arc<AtomicU64>) -> Self {
+    pub(super) fn freeze(
+        memory: &Memory,
+        epoch: Arc<AtomicU64>,
+        hardware: bool,
+        previous: Option<&Self>,
+    ) -> Self {
         Self {
             ranges: memory
                 .anonymous
@@ -29,12 +38,64 @@ impl Anonymous {
                             permissions: r.page.permissions,
                             code_revision: r.page.instruction_revision,
                             store: r.store.clone(),
-                            pages: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
+                            pages: previous
+                                .and_then(|old| old.range(base))
+                                .filter(|old| {
+                                    old.end >= r.end
+                                        && old.permissions == r.page.permissions
+                                        && old.code_revision == r.page.instruction_revision
+                                        && Arc::ptr_eq(&old.store, &r.store)
+                                })
+                                .map(|old| old.pages.clone())
+                                .unwrap_or_else(|| {
+                                    Arc::new(std::array::from_fn(|_| Mutex::new(BTreeMap::new())))
+                                }),
                         },
                     )
                 })
                 .collect(),
             code_epoch: epoch,
+            hardware,
+            chunks: Mutex::new(
+                previous.map_or_else(BTreeMap::new, |old| old.chunks.lock().unwrap().clone()),
+            ),
+        }
+    }
+    pub(super) fn chunk_version(&self, chunk: u64) -> Option<u64> {
+        self.chunks.lock().unwrap().get(&chunk).copied()
+    }
+    pub(super) fn note_changes(&self, ranges: &[std::ops::Range<u64>], generation: u64) {
+        let mut chunks = self.chunks.lock().unwrap();
+        for range in ranges {
+            let first = range.start / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            let last = (range.end - 1) / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            for (_, stamp) in chunks.range_mut(first..=last) {
+                *stamp = generation;
+            }
+        }
+        chunks.retain(|&key, _| {
+            self.overlaps(
+                key * crate::HARDWARE_MAPPING_CHUNK_SIZE,
+                (key + 1) * crate::HARDWARE_MAPPING_CHUNK_SIZE,
+            )
+        });
+    }
+    // The caller excludes every View generation of this VM before removing
+    // Frame allocations: worker TLB tokens can contain their raw addresses.
+    pub(super) fn prune(&self) {
+        let mut seen = BTreeSet::new();
+        for range in self.ranges.values() {
+            if seen.insert(Arc::as_ptr(&range.pages) as usize) {
+                for shard in range.pages.iter() {
+                    shard.lock().unwrap().retain(|&base, frame| {
+                        self.range(base).is_some_and(|r| {
+                            Arc::ptr_eq(&r.pages, &range.pages)
+                                && frame.permissions == r.permissions
+                                && frame.code_revision == r.code_revision
+                        })
+                    });
+                }
+            }
         }
     }
     fn range(&self, address: u64) -> Option<&Range> {
@@ -49,6 +110,16 @@ impl Anonymous {
     }
     pub(super) fn executable(&self) -> bool {
         self.ranges.values().any(|r| r.permissions.execute)
+    }
+    pub(super) fn retained(&self, address: u64) -> Option<&Frame> {
+        if let Some(frame) = self.cached(address) {
+            return Some(frame);
+        }
+        let resident = self.range(address)?.store.lookup(address)?;
+        if !resident.charge.resident() || resident.bytes.retained_hardware().is_none() {
+            return None;
+        }
+        self.metadata(address).ok().flatten()
     }
     pub(super) fn cached(&self, address: u64) -> Option<&Frame> {
         let r = self.range(address)?;
@@ -82,6 +153,13 @@ impl Anonymous {
         let shard = ((base / PAGE_SIZE) & 15) as usize;
         let mut pages = r.pages[shard].lock().unwrap();
         let frame = pages.entry(base).or_insert_with(|| {
+            if self.hardware {
+                self.chunks
+                    .lock()
+                    .unwrap()
+                    .entry(base / crate::HARDWARE_MAPPING_CHUNK_SIZE)
+                    .or_insert_with(new_backing_identity);
+            }
             let resident = r.store.get(base);
             let storage = resident.bytes.clone();
             let bytes = Arc::new(ConcurrentPage::shared(storage, self.code_epoch.clone()));

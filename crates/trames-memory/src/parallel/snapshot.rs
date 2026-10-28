@@ -119,6 +119,8 @@ impl Snapshot {
                 *stamp = self.hardware_generation;
             }
         }
+        self.anonymous
+            .note_changes(&merged, self.hardware_generation);
         if merged.len() > 4096 {
             self.hardware_changes.clear();
             return;
@@ -223,11 +225,15 @@ impl Memory {
         if self.has_parallel_users() {
             return 0;
         }
-        self.adopt_anonymous();
-        let anonymous = self
-            .parallel_cache
-            .as_ref()
-            .map(|c| super::anonymous::Anonymous::freeze(self, c.snapshot.code_epoch.clone()));
+        self.anonymous.prune();
+        let anonymous = self.parallel_cache.as_ref().map(|c| {
+            super::anonymous::Anonymous::freeze(
+                self,
+                c.snapshot.code_epoch.clone(),
+                c.snapshot.hardware,
+                Some(&c.snapshot.anonymous),
+            )
+        });
         let Some(cache) = &mut self.parallel_cache else {
             return 0;
         };
@@ -243,6 +249,7 @@ impl Memory {
         }
         if let Some(anonymous) = anonymous {
             snapshot.anonymous = anonymous;
+            snapshot.anonymous.prune();
             self.parallel_anonymous_dirty = false;
         }
         let retired: Vec<_> = self
@@ -474,8 +481,13 @@ impl Memory {
             snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
         }
         if self.parallel_anonymous_dirty {
-            snapshot.anonymous =
-                super::anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
+            snapshot.anonymous = super::anonymous::Anonymous::freeze(
+                self,
+                registry.code_epoch.clone(),
+                registry.hardware,
+                Some(&snapshot.anonymous),
+            );
+            snapshot.anonymous.prune();
             self.parallel_anonymous_dirty = false;
         }
         snapshot.note_hardware_changes(

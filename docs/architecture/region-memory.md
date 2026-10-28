@@ -637,14 +637,17 @@ the existing shared-page region/atomic protocol, with no whole-call lock or
 additional ordinary memory barrier. CPU, native output, bulk copies, exclusive
 operations and pins use that same reached storage and charge.
 
-At joined checkpoints, reached charged pages enter the existing explicit-frame
-and COW representation without copying their bytes. Remaining zero intervals can
-then drop stale stores and snapshot caches. Retained Views prevent that store
-replacement and keep old physical owners alive through unmap/discard; reclamation
-releases their quota after the last View joins. Fork copies a live writer's
-reached pages and otherwise uses the existing Rc COW boundary. Large remap and
-protection operations visit intervals plus explicit reached pages, rather than
-all virtual pages. Software alias refresh also skips absent physical windows.
+Canonical sparse stores remain authoritative across ordinary execution handoffs.
+Commit publishes one VM dirty-generation bit, without converting reached worker
+pages into a duplicate coordinator descriptor graph. Unchanged range fragments
+reuse their immutable worker-frame cache. Fork epoch changes, remap and account
+rebinding retain the existing explicit-frame/COW boundary when needed; native
+coordinator accesses materialize only their reached descriptors. Retained Views
+keep old byte owners through unmap/discard. Store/cache pruning removes only
+retired addresses after every View generation joins, releasing their quota.
+Fork copies a live writer's reached pages and otherwise uses Rc COW. Large remap
+and protection operations visit intervals plus explicit reached pages, rather
+than all virtual pages. Software alias refresh skips absent physical windows.
 
 Worker TLB tokens may contain a tagged pointer to an immutable lazy Frame. Each
 Frame has an Arc owner in an insertion-only snapshot cache; a live View prevents
@@ -654,16 +657,18 @@ invalidate translations before retirement. No guest address becomes a host
 pointer, and mapped/permission/EOF checks still precede access.
 
 Hardware mapping journals combine explicit-page and VMA intervals into compact
-ranges. Explicit cached chunks retain persistent stamps. Unvisited anonymous
-chunks obtain their range-snapshot generation on demand, without allocating a
-stamp per virtual chunk; joined adoption makes exported leaves explicit before
-normal VMA edits. Both direct deltas and expired-history fallback revalidate
+ranges. Explicit cached chunks and actually visited anonymous chunks retain persistent
+stamps. Unvisited chunks obtain a range-snapshot generation on demand; no stamp
+is allocated per virtual chunk. Sparse VMA changes update only intersecting
+visited stamps, so missed journal history does not turn an unrelated mapping
+edit into a scan of every cached leaf. Both direct deltas and expired-history fallback revalidate
 permissions/storage after sparse changes. Hardware physical exports and S1
 translations still use the existing per-page fault path: native range backing
 and hardware block mappings are a separate subsequent optimization.
 
 Regression coverage includes 64 GiB accessible VMAs with a two-page resident
 budget, large grow/move/shrink, partial permissions/unmap, retained-writer fork,
-cross-generation canonical atomics, discard and delayed quota release. The total
+cross-generation canonical atomics, eight concurrent sparse atomic writers,
+ordinary handoffs without descriptor conversion, discard and delayed quota release. The total
 allocation request for mapping, freezing and partially protecting an untouched
 1 GiB VMA is bounded below 128 KiB by an allocator-instrumented test.
