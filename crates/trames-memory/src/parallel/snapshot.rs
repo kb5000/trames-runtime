@@ -225,16 +225,21 @@ impl Memory {
         if self.has_parallel_users() {
             return 0;
         }
-        self.anonymous.prune();
-        let anonymous = self.parallel_cache.as_ref().map(|c| {
-            super::anonymous::Anonymous::freeze(
-                self,
-                c.snapshot.code_epoch.clone(),
-                c.snapshot.hardware,
-                Some(&c.snapshot.anonymous),
-            )
-        });
+        self.anonymous.prune(&self.anonymous_retired);
+        let anonymous = (self.parallel_anonymous_dirty || !self.anonymous_retired.is_empty())
+            .then(|| {
+                self.parallel_cache.as_ref().map(|c| {
+                    super::anonymous::Anonymous::freeze(
+                        self,
+                        c.snapshot.code_epoch.clone(),
+                        c.snapshot.hardware,
+                        Some(&c.snapshot.anonymous),
+                    )
+                })
+            })
+            .flatten();
         let Some(cache) = &mut self.parallel_cache else {
+            self.anonymous_retired.clear();
             return 0;
         };
         let Some(snapshot) = Arc::get_mut(&mut cache.snapshot) else {
@@ -249,7 +254,8 @@ impl Memory {
         }
         if let Some(anonymous) = anonymous {
             snapshot.anonymous = anonymous;
-            snapshot.anonymous.prune();
+            snapshot.anonymous.prune(&self.anonymous_retired);
+            self.anonymous_retired.clear();
             self.parallel_anonymous_dirty = false;
         }
         let retired: Vec<_> = self
@@ -487,8 +493,12 @@ impl Memory {
                 registry.hardware,
                 Some(&snapshot.anonymous),
             );
-            snapshot.anonymous.prune();
             self.parallel_anonymous_dirty = false;
+        }
+        if !self.has_parallel_users() && !self.anonymous_retired.is_empty() {
+            self.anonymous.prune(&self.anonymous_retired);
+            snapshot.anonymous.prune(&self.anonymous_retired);
+            self.anonymous_retired.clear();
         }
         snapshot.note_hardware_changes(
             mmu_changed.iter().copied(),

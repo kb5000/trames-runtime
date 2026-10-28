@@ -562,7 +562,7 @@ pub(super) struct Snapshot {
     hardware_changes: std::collections::VecDeque<snapshot::HardwareChange>,
     hardware_writes: AtomicU64,
     hardware_private_dirty: std::sync::atomic::AtomicBool,
-    anonymous_dirty: std::sync::atomic::AtomicBool,
+    anonymous_dirty: Arc<std::sync::atomic::AtomicBool>,
     mmu: mmu::Frozen,
     has_aliases: bool,
     dynamic_code: bool,
@@ -1313,6 +1313,9 @@ impl Memory {
         {
             self.adopt_anonymous();
         }
+        if !self.has_parallel_users() && !self.anonymous_retired.is_empty() {
+            self.reclaim_unused();
+        }
         // A resumed runtime can construct a new coordinator registry. Cached
         // shared pages must join that registry's alias/code domain, not silently
         // retain an earlier one while fork peers allocate duplicate snapshots.
@@ -1465,7 +1468,13 @@ impl Memory {
             hardware_changes: Default::default(),
             hardware_writes: AtomicU64::new(0),
             hardware_private_dirty: std::sync::atomic::AtomicBool::new(false),
-            anonymous_dirty: std::sync::atomic::AtomicBool::new(false),
+            anonymous_dirty: old
+                .as_ref()
+                .filter(|cache| cache.snapshot.identity == self.identity)
+                .map_or_else(
+                    || Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    |cache| cache.snapshot.anonymous_dirty.clone(),
+                ),
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
             dynamic_code: dynamic_code_pages != 0 || anonymous_executable,

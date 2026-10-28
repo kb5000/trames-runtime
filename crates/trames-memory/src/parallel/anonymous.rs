@@ -82,18 +82,33 @@ impl Anonymous {
     }
     // The caller excludes every View generation of this VM before removing
     // Frame allocations: worker TLB tokens can contain their raw addresses.
-    pub(super) fn prune(&self) {
+    pub(super) fn prune(&self, changes: &[std::ops::Range<u64>]) {
+        if changes.is_empty() {
+            return;
+        }
         let mut seen = BTreeSet::new();
         for range in self.ranges.values() {
             if seen.insert(Arc::as_ptr(&range.pages) as usize) {
                 for shard in range.pages.iter() {
-                    shard.lock().unwrap().retain(|&base, frame| {
-                        self.range(base).is_some_and(|r| {
-                            Arc::ptr_eq(&r.pages, &range.pages)
-                                && frame.permissions == r.permissions
-                                && frame.code_revision == r.code_revision
-                        })
-                    });
+                    let mut pages = shard.lock().unwrap();
+                    for change in changes {
+                        let retired: Vec<_> = pages
+                            .range(change.clone())
+                            .filter_map(|(&base, frame)| {
+                                #[cfg(test)]
+                                crate::anonymous::note_prune_visit();
+                                (!self.range(base).is_some_and(|r| {
+                                    Arc::ptr_eq(&r.pages, &range.pages)
+                                        && frame.permissions == r.permissions
+                                        && frame.code_revision == r.code_revision
+                                }))
+                                .then_some(base)
+                            })
+                            .collect();
+                        for base in retired {
+                            pages.remove(&base);
+                        }
+                    }
                 }
             }
         }

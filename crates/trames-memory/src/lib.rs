@@ -227,6 +227,7 @@ pub struct Memory {
     sparse_pages: RefCell<BTreeMap<u64, Rc<Page>>>,
     parallel_anonymous_dirty: bool,
     parallel_anonymous_changes: Vec<std::ops::Range<u64>>,
+    anonymous_retired: Vec<std::ops::Range<u64>>,
     frames: Slots<Option<Page>>,
     free_frames: Slots<usize>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -263,6 +264,7 @@ impl Clone for Memory {
             sparse_pages: RefCell::new(BTreeMap::new()),
             parallel_anonymous_dirty: false,
             parallel_anonymous_changes: Vec::new(),
+            anonymous_retired: Vec::new(),
             reservations: self.reservations.clone(),
             frames: self
                 .frames
@@ -378,6 +380,7 @@ impl Memory {
             sparse_pages: RefCell::new(BTreeMap::new()),
             parallel_anonymous_dirty: false,
             parallel_anonymous_changes: Vec::new(),
+            anonymous_retired: Vec::new(),
             frames: Slots::new(),
             free_frames: Slots::new(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),

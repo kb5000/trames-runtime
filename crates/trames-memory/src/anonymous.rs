@@ -187,15 +187,31 @@ impl Anonymous {
         }
         changed
     }
-    pub fn prune(&self) {
+    pub fn prune(&self, changes: &[std::ops::Range<u64>]) {
+        if changes.is_empty() {
+            return;
+        }
         let mut seen = BTreeSet::new();
         for range in self.ranges.values() {
             if seen.insert(Arc::as_ptr(&range.store) as usize) {
                 for shard in &range.store.pages {
-                    shard.lock().unwrap().retain(|&base, _| {
-                        self.containing(base)
-                            .is_some_and(|(_, r)| Arc::ptr_eq(&r.store, &range.store))
-                    });
+                    let mut pages = shard.lock().unwrap();
+                    for change in changes {
+                        let retired: Vec<_> = pages
+                            .range(change.clone())
+                            .filter_map(|(&base, _)| {
+                                #[cfg(test)]
+                                note_prune_visit();
+                                (!self
+                                    .containing(base)
+                                    .is_some_and(|(_, r)| Arc::ptr_eq(&r.store, &range.store)))
+                                .then_some(base)
+                            })
+                            .collect();
+                        for base in retired {
+                            pages.remove(&base);
+                        }
+                    }
                 }
             }
         }
@@ -224,6 +240,7 @@ impl Anonymous {
 impl Memory {
     pub(super) fn note_anonymous_change(&mut self, start: u64, end: u64) {
         self.parallel_anonymous_dirty = true;
+        self.retire_anonymous_range(start, end);
         if self.parallel_cache.is_none() {
             return;
         }
@@ -234,6 +251,15 @@ impl Memory {
             }
         }
         self.parallel_anonymous_changes.push(start..end);
+    }
+    pub(super) fn retire_anonymous_range(&mut self, start: u64, end: u64) {
+        if let Some(last) = self.anonymous_retired.last_mut() {
+            if start >= last.start && start <= last.end {
+                last.end = last.end.max(end);
+                return;
+            }
+        }
+        self.anonymous_retired.push(start..end);
     }
     pub(super) fn anonymous_page(&self, permissions: Permissions) -> Rc<Page> {
         Rc::new(Page {
@@ -285,6 +311,7 @@ impl Memory {
             self.anonymous.remove(base, base + PAGE_SIZE);
             self.insert_owned_page(base, page);
             self.parallel_anonymous_dirty = true;
+            self.retire_anonymous_range(base, base + PAGE_SIZE);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -331,6 +358,13 @@ impl Memory {
             .get_mut()
             .retain(|&base, _| base < start || base >= end);
     }
+}
+
+#[cfg(test)]
+thread_local! { static PRUNE_VISITS: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn note_prune_visit() {
+    PRUNE_VISITS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(test)]
@@ -491,6 +525,63 @@ mod tests {
         assert_eq!(m.read_array::<1>(base).unwrap(), [17]);
         assert_eq!(child.read_array::<1>(base).unwrap(), [1]);
         assert_eq!(m.read_array::<1>(base + 2 * PAGE_SIZE).unwrap(), [3]);
+    }
+
+    #[test]
+    fn local_unmap_prunes_only_changed_addresses_in_large_resident_vmas() {
+        let mut m = Memory::default();
+        let a = 1 << 32;
+        let b = 1 << 34;
+        let len = 1 << 20;
+        for base in [a, b] {
+            m.map(base, len, Permissions::RW).unwrap();
+        }
+        let mut registry = Registry::default();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        for base in [a, b] {
+            for page in 0..len / PAGE_SIZE {
+                view.write_array(base + page * PAGE_SIZE, [17]).unwrap();
+            }
+        }
+        drop(view);
+        m.commit_parallel().unwrap();
+        assert!(m.pages.is_empty());
+        PRUNE_VISITS.set(0);
+        m.unmap(a + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(
+            PRUNE_VISITS.get() <= 2,
+            "local release visited {} page entries",
+            PRUNE_VISITS.get()
+        );
+        assert_eq!(m.resident_bytes(), (2 * len - PAGE_SIZE) as usize);
+        assert_eq!(m.read_array::<1>(b).unwrap(), [17]);
+    }
+
+    #[test]
+    fn retained_sparse_generation_publishes_late_writes_and_deferred_retirement() {
+        let mut m = Memory::default();
+        let base = 1 << 32;
+        m.map(base, 1 << 30, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let mut old = m.parallel_view(&mut registry).unwrap();
+        old.write_array(base, [7]).unwrap();
+        old.write_array(base + PAGE_SIZE, [9]).unwrap();
+        backing::backing_changed();
+        drop(m.parallel_view(&mut registry).unwrap());
+        m.commit_parallel().unwrap();
+        let before = m.revision();
+        old.write_array(base, [11]).unwrap();
+        m.commit_parallel().unwrap();
+        assert_ne!(m.revision(), before);
+        assert_eq!(m.read_array::<1>(base).unwrap(), [11]);
+        m.unmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        drop(m.parallel_view(&mut registry).unwrap());
+        assert_eq!(m.resident_bytes(), 2 * PAGE_SIZE as usize);
+        drop(old);
+        m.commit_parallel().unwrap();
+        m.reclaim_unused();
+        assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(m.read_array::<1>(base).unwrap(), [11]);
     }
 
     #[test]
