@@ -500,7 +500,23 @@ impl Memory {
         address: u64,
         len: usize,
     ) -> Result<(), MemoryError> {
-        self.materialize_descriptors(address, len);
+        let granule = self.mmu.granule as u64;
+        let base = address & !(PAGE_SIZE - 1);
+        let cached = self.translations[Translation::slot(base)].get();
+        if granule > PAGE_SIZE
+            && !self.has_parallel_users()
+            && len <= (PAGE_SIZE - address % PAGE_SIZE) as usize
+            && cached.matches(base, Translation::VALID)
+            && cached.frame & anonymous::TOKEN != 0
+        {
+            // The software CPU aliases protect a host granule at a time. Only
+            // reached granules need descriptors; untouched neighbors stay zero
+            // and uncharged. Hardware-only executors keep granule == 0.
+            let begin = address & !(granule - 1);
+            self.materialize_descriptors(begin, granule as usize);
+        } else {
+            self.materialize_descriptors(address, len);
+        }
         if self.materialize_zero(address, len)? {
             self.invalidate_translations();
         }

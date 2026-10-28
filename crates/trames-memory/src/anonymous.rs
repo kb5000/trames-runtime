@@ -38,9 +38,6 @@ impl Store {
             .get(&base)
             .cloned()
     }
-    fn is_empty(&self) -> bool {
-        self.pages.iter().all(|p| p.lock().unwrap().is_empty())
-    }
     pub fn remove(&self, base: u64) {
         self.pages[((base / PAGE_SIZE) & 15) as usize]
             .lock()
@@ -60,6 +57,13 @@ impl Store {
         }
         out
     }
+}
+
+#[derive(Clone)]
+pub(super) struct Retirement {
+    pub start: u64,
+    pub end: u64,
+    pub store: Arc<Store>,
 }
 
 pub(super) const TOKEN: usize = 1usize << (usize::BITS - 1);
@@ -172,49 +176,38 @@ impl Anonymous {
         }
         pages
     }
-    pub fn rebase(&mut self, account: &Arc<Account>) -> bool {
-        let mut replacements = BTreeMap::new();
-        let mut changed = false;
-        for range in self.ranges.values_mut() {
-            let source = Arc::as_ptr(&range.store) as usize;
-            let replacement = replacements
-                .entry(source)
-                .or_insert_with(|| (!range.store.is_empty()).then(|| Store::new(account.clone())));
-            if let Some(replacement) = replacement {
-                range.store = replacement.clone();
-                changed = true;
-            }
-        }
-        changed
-    }
-    pub fn prune(&self, changes: &[std::ops::Range<u64>]) {
-        if changes.is_empty() {
-            return;
-        }
-        let mut seen = BTreeSet::new();
-        for range in self.ranges.values() {
-            if seen.insert(Arc::as_ptr(&range.store) as usize) {
-                for shard in &range.store.pages {
-                    let mut pages = shard.lock().unwrap();
-                    for change in changes {
-                        let retired: Vec<_> = pages
-                            .range(change.clone())
-                            .filter_map(|(&base, _)| {
-                                #[cfg(test)]
-                                note_prune_visit();
-                                (!self
-                                    .containing(base)
-                                    .is_some_and(|(_, r)| Arc::ptr_eq(&r.store, &range.store)))
-                                .then_some(base)
-                            })
-                            .collect();
-                        for base in retired {
-                            pages.remove(&base);
-                        }
-                    }
+    pub fn prune(&self, changes: &[Retirement]) {
+        for change in changes {
+            #[cfg(test)]
+            note_prune_scope();
+            for shard in &change.store.pages {
+                let mut pages = shard.lock().unwrap();
+                let retired: Vec<_> = pages
+                    .range(change.start..change.end)
+                    .filter_map(|(&base, _)| {
+                        #[cfg(test)]
+                        note_prune_visit();
+                        (!self
+                            .containing(base)
+                            .is_some_and(|(_, r)| Arc::ptr_eq(&r.store, &change.store)))
+                        .then_some(base)
+                    })
+                    .collect();
+                for base in retired {
+                    pages.remove(&base);
                 }
             }
         }
+    }
+    pub fn overlapping(&self, start: u64, end: u64) -> Vec<(u64, &Range)> {
+        let mut out = Vec::new();
+        if let Some((&base, r)) = self.ranges.range(..start).next_back() {
+            if r.end > start {
+                out.push((base, r));
+            }
+        }
+        out.extend(self.ranges.range(start..end).map(|(&base, r)| (base, r)));
+        out
     }
     pub fn fork(&self, account: &std::sync::Arc<residency::Account>) -> Self {
         Self {
@@ -240,7 +233,6 @@ impl Anonymous {
 impl Memory {
     pub(super) fn note_anonymous_change(&mut self, start: u64, end: u64) {
         self.parallel_anonymous_dirty = true;
-        self.retire_anonymous_range(start, end);
         if self.parallel_cache.is_none() {
             return;
         }
@@ -253,13 +245,42 @@ impl Memory {
         self.parallel_anonymous_changes.push(start..end);
     }
     pub(super) fn retire_anonymous_range(&mut self, start: u64, end: u64) {
-        if let Some(last) = self.anonymous_retired.last_mut() {
-            if start >= last.start && start <= last.end {
-                last.end = last.end.max(end);
-                return;
+        for (base, r) in self.anonymous.overlapping(start, end) {
+            let a = base.max(start);
+            let b = r.end.min(end);
+            if let Some(last) = self.anonymous_retired.last_mut() {
+                if Arc::ptr_eq(&last.store, &r.store) && a >= last.start && a <= last.end {
+                    last.end = last.end.max(b);
+                    continue;
+                }
             }
+            self.anonymous_retired.push(Retirement {
+                start: a,
+                end: b,
+                store: r.store.clone(),
+            });
         }
-        self.anonymous_retired.push(start..end);
+    }
+    pub(super) fn anonymous_index_changes(&self) -> Vec<std::ops::Range<u64>> {
+        let mut ranges = self.parallel_anonymous_changes.clone();
+        ranges.extend(self.anonymous_retired.iter().map(|r| r.start..r.end));
+        ranges.extend(
+            self.parallel_mappings
+                .iter()
+                .map(|&base| base..base + PAGE_SIZE),
+        );
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+        for r in ranges {
+            if let Some(last) = merged.last_mut() {
+                if r.start <= last.end {
+                    last.end = last.end.max(r.end);
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        merged
     }
     pub(super) fn anonymous_page(&self, permissions: Permissions) -> Rc<Page> {
         Rc::new(Page {
@@ -308,10 +329,10 @@ impl Memory {
 
             self.sparse_pages.get_mut().remove(&base);
             self.invalidate_translations();
+            self.retire_anonymous_range(base, base + PAGE_SIZE);
             self.anonymous.remove(base, base + PAGE_SIZE);
             self.insert_owned_page(base, page);
             self.parallel_anonymous_dirty = true;
-            self.retire_anonymous_range(base, base + PAGE_SIZE);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -354,17 +375,37 @@ impl Memory {
     }
     pub(super) fn retire_sparse(&mut self, start: u64, end: u64) {
         self.invalidate_translations();
-        self.sparse_pages
-            .get_mut()
-            .retain(|&base, _| base < start || base >= end);
+        let pages = self.sparse_pages.get_mut();
+        let keys: Vec<_> = pages.range(start..end).map(|(&base, _)| base).collect();
+        for base in keys {
+            pages.remove(&base);
+        }
     }
 }
 
 #[cfg(test)]
-thread_local! { static PRUNE_VISITS: Cell<usize> = const { Cell::new(0) }; }
+thread_local! {
+    static PRUNE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static INDEX_VISITS: Cell<usize> = const { Cell::new(0) };
+    static PRUNE_SCOPES: Cell<usize> = const { Cell::new(0) };
+    static REGION_LISTS: Cell<usize> = const { Cell::new(0) };
+}
 #[cfg(test)]
 pub(crate) fn note_prune_visit() {
     PRUNE_VISITS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn note_region_list() {
+    REGION_LISTS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+pub(crate) fn note_prune_scope() {
+    PRUNE_SCOPES.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+pub(crate) fn note_index_visit() {
+    INDEX_VISITS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(test)]
@@ -582,6 +623,81 @@ mod tests {
         m.reclaim_unused();
         assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
         assert_eq!(m.read_array::<1>(base).unwrap(), [11]);
+    }
+
+    #[test]
+    fn fragmented_vmas_use_direct_retirement_and_incremental_snapshot_updates() {
+        let mut m = Memory::default();
+        let first = 1 << 32;
+        let stride = 1 << 20;
+        let len = 128 << 10;
+        for index in 0..2000 {
+            m.map(first + index * stride, len, Permissions::RW).unwrap();
+        }
+        let mut registry = Registry::default();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        for index in 0..2000 {
+            view.write_array(first + index * stride, [17]).unwrap();
+        }
+        let target = first + 1000 * stride;
+        view.write_array(target + PAGE_SIZE, [23]).unwrap();
+        drop(view);
+        m.commit_parallel().unwrap();
+        PRUNE_SCOPES.set(0);
+        INDEX_VISITS.set(0);
+        REGION_LISTS.set(0);
+        assert_eq!(
+            m.find_free(first + 2000 * stride, len),
+            Some(first + 2000 * stride)
+        );
+        assert_eq!(REGION_LISTS.get(), 0);
+        m.unmap(target + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(
+            PRUNE_SCOPES.get() <= 2,
+            "visited {} stores/caches",
+            PRUNE_SCOPES.get()
+        );
+        assert!(
+            INDEX_VISITS.get() <= 2,
+            "rebuilt {} index ranges",
+            INDEX_VISITS.get()
+        );
+        assert_eq!(m.resident_bytes(), 2000 * PAGE_SIZE as usize);
+        PRUNE_SCOPES.set(0);
+        INDEX_VISITS.set(0);
+        m.protect(target + 2 * PAGE_SIZE, PAGE_SIZE, Permissions::R)
+            .unwrap();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(first).unwrap(), [17]);
+        assert_eq!(view.read_array::<1>(target).unwrap(), [17]);
+        assert!(PRUNE_SCOPES.get() <= 1);
+        assert!(INDEX_VISITS.get() <= 2);
+        assert_eq!(REGION_LISTS.get(), 0);
+    }
+
+    #[test]
+    fn remap_keeps_unreached_peer_store_canonical_across_incremental_updates() {
+        let mut m = Memory::default();
+        let a = 1 << 32;
+        let b = 1 << 34;
+        let c = 1 << 36;
+        let len = 1 << 30;
+        m.map(a, len, Permissions::RW).unwrap();
+        m.map(b, len, Permissions::RW).unwrap();
+        let mut registry = Registry::default();
+        let view = m.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(b).unwrap(), [0]);
+        drop(view);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<1>(b).unwrap(), [0]);
+        m.write_array(a, [7]).unwrap();
+        m.remap(a, len, c, len, false).unwrap();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.write_array(b, [17]).unwrap();
+        drop(view);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<1>(b).unwrap(), [17]);
+        assert_eq!(m.read_array::<1>(c).unwrap(), [7]);
     }
 
     #[test]

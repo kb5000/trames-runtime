@@ -790,3 +790,22 @@ fn hardware_admission_keeps_software_cpu_windows_disabled_across_mapping_writes_
     assert!(software.mmu.cpu_aliases_enabled());
     assert!(!software.mmu.windows.borrow().is_empty());
 }
+
+#[test]
+fn sparse_large_vma_reaches_only_one_host_granule_and_keeps_cpu_aliases() {
+    let mut memory = Memory::new(PAGE_SIZE as usize);
+    memory.mmu.granule = 16384;
+    let base = 0x400000;
+    memory.map(base, 1 << 30, Permissions::RW).unwrap();
+    assert!(memory.pages.is_empty());
+    memory.write_array(base + 8, [42; 8]).unwrap();
+    assert_eq!(memory.pages.len(), 4);
+    assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+    let entry = memory.translation(base).unwrap();
+    assert_ne!(entry.cpu, 0);
+    // SAFETY: this is the owning live TLB entry and its 8-byte operand is
+    // contained in the page; no other execution actor exists.
+    assert_eq!(unsafe { entry.read::<8>(8) }, Some([42; 8]));
+    assert_eq!(memory.read_array::<8>(base + PAGE_SIZE).unwrap(), [0; 8]);
+    assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+}

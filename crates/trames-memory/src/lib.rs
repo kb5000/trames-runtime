@@ -227,7 +227,7 @@ pub struct Memory {
     sparse_pages: RefCell<BTreeMap<u64, Rc<Page>>>,
     parallel_anonymous_dirty: bool,
     parallel_anonymous_changes: Vec<std::ops::Range<u64>>,
-    anonymous_retired: Vec<std::ops::Range<u64>>,
+    anonymous_retired: Vec<anonymous::Retirement>,
     frames: Slots<Option<Page>>,
     free_frames: Slots<usize>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -410,6 +410,8 @@ impl Memory {
 
     /// Contiguous guest mappings for procfs; no native address is exposed.
     pub fn regions(&self) -> Vec<(u64, u64, Permissions)> {
+        #[cfg(test)]
+        anonymous::note_region_list();
         if let Some(shared) = &self.shared {
             return shared.borrow().regions();
         }
@@ -674,16 +676,31 @@ impl Memory {
             return shared.borrow().find_free(start, len);
         }
         let mut candidate = start.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-        for (a, b, _) in self.regions() {
-            if b <= candidate {
-                continue;
+        loop {
+            let end = Self::mapping_end(candidate, len).ok()?;
+            let reservation = self
+                .reservations
+                .range(candidate..end)
+                .next_back()
+                .map(|(_, &stop)| stop)
+                .or_else(|| self.reserved_end(candidate));
+            let anonymous = self
+                .anonymous
+                .ranges
+                .range(candidate..end)
+                .next_back()
+                .map(|(_, r)| r.end)
+                .or_else(|| self.anonymous.containing(candidate).map(|(_, r)| r.end));
+            let page = self
+                .pages
+                .range(candidate..end)
+                .next_back()
+                .map(|(&base, _)| base + PAGE_SIZE);
+            match [reservation, anonymous, page].into_iter().flatten().max() {
+                Some(stop) => candidate = stop,
+                None => return Some(candidate),
             }
-            if a >= Self::mapping_end(candidate, len).ok()? {
-                return Some(candidate);
-            }
-            candidate = candidate.max(b);
         }
-        Self::mapping_end(candidate, len).ok().map(|_| candidate)
     }
 
     /// Atomic anonymous MAP_FIXED: account for replaced pages before changing data.
@@ -710,6 +727,7 @@ impl Memory {
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
         self.retire_sparse(address, end);
+        self.retire_anonymous_range(address, end);
         if self.anonymous.overlaps(address, end) {
             self.note_anonymous_change(address, end);
             self.anonymous.remove(address, end);
@@ -849,18 +867,21 @@ impl Memory {
         self.check_reservation_split(address, end, 0)?;
         self.retire_sparse(address, end);
         self.advance_code_revision();
-        let parts: Vec<_> = self
-            .regions()
-            .into_iter()
-            .filter(|(a, b, _)| *a < end && *b > address)
-            .map(|(a, b, _)| (a.max(address), b.min(end)))
+        let mut reserved: Vec<_> = self
+            .reservations
+            .range(address..end)
+            .map(|(&a, &b)| (a, b.min(end)))
             .collect();
+        if let Some((&a, &b)) = self.reservations.range(..address).next_back() {
+            if b > address {
+                reserved.push((address.max(a), end.min(b)));
+            }
+        }
         let old: Vec<_> = self
             .anonymous
-            .ranges
-            .iter()
-            .filter(|(a, r)| **a < end && r.end > address)
-            .map(|(&a, r)| {
+            .overlapping(address, end)
+            .into_iter()
+            .map(|(a, r)| {
                 (
                     a.max(address),
                     r.end.min(end),
@@ -877,24 +898,9 @@ impl Memory {
             self.anonymous.insert_store(a, b, Rc::new(page), store);
         }
         self.remove_reservations(address, end)?;
-        for (a, b) in parts {
-            let mut at = a;
-            while at < b {
-                if let Some((_, r)) = self.anonymous.containing(at) {
-                    at = r.end.min(b);
-                } else if self.pages.contains_key(&at) {
-                    at += PAGE_SIZE;
-                } else {
-                    let stop = self.pages.range(at..b).next().map_or(b, |(&a, _)| a);
-                    self.anonymous.insert(
-                        at,
-                        stop,
-                        self.anonymous_page(permissions),
-                        &self.account,
-                    );
-                    at = stop;
-                }
-            }
+        for (a, b) in reserved {
+            self.anonymous
+                .insert(a, b, self.anonymous_page(permissions), &self.account);
         }
         self.note_anonymous_change(address, end);
         for (&base, &frame) in self.pages.range(address..end) {

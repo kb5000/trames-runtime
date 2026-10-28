@@ -17,48 +17,116 @@ pub(crate) struct Anonymous {
     code_epoch: Arc<AtomicU64>,
     hardware: bool,
     chunks: Mutex<BTreeMap<u64, u64>>,
+    executable_ranges: usize,
 }
 impl Anonymous {
-    pub(super) fn freeze(
-        memory: &Memory,
-        epoch: Arc<AtomicU64>,
-        hardware: bool,
-        previous: Option<&Self>,
-    ) -> Self {
-        Self {
-            ranges: memory
-                .anonymous
-                .ranges
-                .iter()
-                .map(|(&base, r)| {
-                    (
-                        base,
-                        Range {
-                            end: r.end,
-                            permissions: r.page.permissions,
-                            code_revision: r.page.instruction_revision,
-                            store: r.store.clone(),
-                            pages: previous
-                                .and_then(|old| old.range(base))
-                                .filter(|old| {
-                                    old.end >= r.end
-                                        && old.permissions == r.page.permissions
-                                        && old.code_revision == r.page.instruction_revision
-                                        && Arc::ptr_eq(&old.store, &r.store)
-                                })
-                                .map(|old| old.pages.clone())
-                                .unwrap_or_else(|| {
-                                    Arc::new(std::array::from_fn(|_| Mutex::new(BTreeMap::new())))
-                                }),
-                        },
-                    )
+    fn freeze_range(source: &crate::anonymous::Range, previous: Option<&Range>) -> Range {
+        #[cfg(test)]
+        crate::anonymous::note_index_visit();
+        Range {
+            end: source.end,
+            permissions: source.page.permissions,
+            code_revision: source.page.instruction_revision,
+            store: source.store.clone(),
+            pages: previous
+                .filter(|old| {
+                    old.end >= source.end
+                        && old.permissions == source.page.permissions
+                        && old.code_revision == source.page.instruction_revision
+                        && Arc::ptr_eq(&old.store, &source.store)
                 })
-                .collect(),
+                .map(|old| old.pages.clone())
+                .unwrap_or_else(|| Arc::new(std::array::from_fn(|_| Mutex::new(BTreeMap::new())))),
+        }
+    }
+    pub(super) fn freeze(memory: &Memory, epoch: Arc<AtomicU64>, hardware: bool) -> Self {
+        let ranges: BTreeMap<_, _> = memory
+            .anonymous
+            .ranges
+            .iter()
+            .map(|(&base, r)| (base, Self::freeze_range(r, None)))
+            .collect();
+        let executable_ranges = ranges.values().filter(|r| r.permissions.execute).count();
+        Self {
+            ranges,
+            executable_ranges,
             code_epoch: epoch,
             hardware,
-            chunks: Mutex::new(
-                previous.map_or_else(BTreeMap::new, |old| old.chunks.lock().unwrap().clone()),
-            ),
+            chunks: Mutex::new(BTreeMap::new()),
+        }
+    }
+    fn overlapping(&self, start: u64, end: u64) -> Vec<(u64, &Range)> {
+        let mut out = Vec::new();
+        if let Some((&base, r)) = self.ranges.range(..start).next_back() {
+            if r.end > start {
+                out.push((base, r));
+            }
+        }
+        out.extend(self.ranges.range(start..end).map(|(&base, r)| (base, r)));
+        out
+    }
+    // No current Snapshot View is live. Other generations retain their own
+    // immutable index; byte/frame owners can be shared through unchanged ranges.
+    pub(super) fn refresh(
+        &mut self,
+        current: &crate::anonymous::Anonymous,
+        changes: &[std::ops::Range<u64>],
+    ) {
+        self.prune_against(current, changes);
+        let mut windows: Vec<std::ops::Range<u64>> = Vec::new();
+        for change in changes {
+            if windows
+                .last()
+                .is_some_and(|last| last.start <= change.start && last.end >= change.end)
+            {
+                continue;
+            }
+            let mut start = change.start;
+            let mut end = change.end;
+            loop {
+                let mut a = start;
+                let mut b = end;
+                for (base, r) in self.overlapping(start, end) {
+                    a = a.min(base);
+                    b = b.max(r.end);
+                }
+                for (base, r) in current.overlapping(start, end) {
+                    a = a.min(base);
+                    b = b.max(r.end);
+                }
+                if a == start && b == end {
+                    break;
+                }
+                start = a;
+                end = b;
+            }
+            if let Some(last) = windows.last_mut() {
+                if start <= last.end {
+                    last.end = last.end.max(end);
+                    continue;
+                }
+            }
+            windows.push(start..end);
+        }
+        for window in windows {
+            let replacements: Vec<_> = current
+                .overlapping(window.start, window.end)
+                .into_iter()
+                .map(|(base, r)| (base, Self::freeze_range(r, self.range(base))))
+                .collect();
+            let keys: Vec<_> = self
+                .ranges
+                .range(window.clone())
+                .map(|(&base, _)| base)
+                .collect();
+            for base in keys {
+                self.executable_ranges -=
+                    usize::from(self.ranges.remove(&base).unwrap().permissions.execute);
+            }
+            for (base, r) in replacements {
+                self.executable_ranges += usize::from(r.permissions.execute);
+                self.ranges.insert(base, r);
+            }
         }
     }
     pub(super) fn chunk_version(&self, chunk: u64) -> Option<u64> {
@@ -69,45 +137,52 @@ impl Anonymous {
         for range in ranges {
             let first = range.start / crate::HARDWARE_MAPPING_CHUNK_SIZE;
             let last = (range.end - 1) / crate::HARDWARE_MAPPING_CHUNK_SIZE;
-            for (_, stamp) in chunks.range_mut(first..=last) {
-                *stamp = generation;
+            let keys: Vec<_> = chunks.range(first..=last).map(|(&key, _)| key).collect();
+            for key in keys {
+                if self.overlaps(
+                    key * crate::HARDWARE_MAPPING_CHUNK_SIZE,
+                    (key + 1) * crate::HARDWARE_MAPPING_CHUNK_SIZE,
+                ) {
+                    *chunks.get_mut(&key).unwrap() = generation;
+                } else {
+                    chunks.remove(&key);
+                }
             }
         }
-        chunks.retain(|&key, _| {
-            self.overlaps(
-                key * crate::HARDWARE_MAPPING_CHUNK_SIZE,
-                (key + 1) * crate::HARDWARE_MAPPING_CHUNK_SIZE,
-            )
-        });
     }
-    // The caller excludes every View generation of this VM before removing
-    // Frame allocations: worker TLB tokens can contain their raw addresses.
-    pub(super) fn prune(&self, changes: &[std::ops::Range<u64>]) {
-        if changes.is_empty() {
-            return;
-        }
-        let mut seen = BTreeSet::new();
-        for range in self.ranges.values() {
-            if seen.insert(Arc::as_ptr(&range.pages) as usize) {
+    // The current Snapshot is unique before removing Frames. Cold/full rebuilds
+    // create fresh frame caches, so other View generations never hold these
+    // Frame addresses (only the separate canonical byte stores are shared).
+    fn prune_against(
+        &self,
+        current: &crate::anonymous::Anonymous,
+        changes: &[std::ops::Range<u64>],
+    ) {
+        for change in changes {
+            let mut seen = BTreeSet::new();
+            for (_, range) in self.overlapping(change.start, change.end) {
+                if !seen.insert(Arc::as_ptr(&range.pages) as usize) {
+                    continue;
+                }
+                #[cfg(test)]
+                crate::anonymous::note_prune_scope();
                 for shard in range.pages.iter() {
                     let mut pages = shard.lock().unwrap();
-                    for change in changes {
-                        let retired: Vec<_> = pages
-                            .range(change.clone())
-                            .filter_map(|(&base, frame)| {
-                                #[cfg(test)]
-                                crate::anonymous::note_prune_visit();
-                                (!self.range(base).is_some_and(|r| {
-                                    Arc::ptr_eq(&r.pages, &range.pages)
-                                        && frame.permissions == r.permissions
-                                        && frame.code_revision == r.code_revision
-                                }))
-                                .then_some(base)
-                            })
-                            .collect();
-                        for base in retired {
-                            pages.remove(&base);
-                        }
+                    let retired: Vec<_> = pages
+                        .range(change.clone())
+                        .filter_map(|(&base, frame)| {
+                            #[cfg(test)]
+                            crate::anonymous::note_prune_visit();
+                            (!current.containing(base).is_some_and(|(_, r)| {
+                                Arc::ptr_eq(&r.store, &range.store)
+                                    && frame.permissions == r.page.permissions
+                                    && frame.code_revision == r.page.instruction_revision
+                            }))
+                            .then_some(base)
+                        })
+                        .collect();
+                    for base in retired {
+                        pages.remove(&base);
                     }
                 }
             }
@@ -124,7 +199,7 @@ impl Anonymous {
         self.range(start).is_some() || self.ranges.range(start..end).next().is_some()
     }
     pub(super) fn executable(&self) -> bool {
-        self.ranges.values().any(|r| r.permissions.execute)
+        self.executable_ranges != 0
     }
     pub(super) fn retained(&self, address: u64) -> Option<&Frame> {
         if let Some(frame) = self.cached(address) {
@@ -226,11 +301,6 @@ impl Memory {
         let pages = self.anonymous.populated();
         for base in pages {
             self.materialize_descriptors(base, PAGE_SIZE as usize);
-        }
-        if !self.has_parallel_users() && self.anonymous.rebase(&self.account) {
-            self.invalidate_translations();
-            self.sparse_pages.get_mut().clear();
-            self.parallel_anonymous_dirty = true;
         }
     }
 }

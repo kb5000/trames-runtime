@@ -643,15 +643,24 @@ pages into a duplicate coordinator descriptor graph. Unchanged range fragments
 reuse their immutable worker-frame cache. Fork epoch changes, remap and account
 rebinding retain the existing explicit-frame/COW boundary when needed; native
 coordinator accesses materialize only their reached descriptors. Retained Views
-keep old byte owners through unmap/discard. Store/cache pruning looks up only
-retired address intervals after every View generation joins, without walking
-unrelated resident pages. A separate retirement backlog survives snapshot
-replacement while old Views remain live. The anonymous dirty bit is shared by
+keep old byte owners through unmap/discard. Retirement tickets retain the exact
+old stores and address intervals; canonical storage is pruned after every View
+generation joins. The current snapshot's independent frame cache is pruned through
+its overlap index while that snapshot is unique. Cold/full snapshot construction
+creates fresh frame caches, so no other generation can retain those Frame
+addresses. The retirement backlog survives snapshot replacement while old Views
+remain live. The anonymous dirty bit is shared by
 those snapshot generations, so their late canonical writes remain publishable.
 Retirement releases the removed pages' quota.
 Fork copies a live writer's reached pages and otherwise uses Rc COW. Large remap
-and protection operations visit intervals plus explicit reached pages, rather
-than all virtual pages. Software alias refresh skips absent physical windows.
+and protection operations visit affected intervals plus explicit reached pages,
+rather than all virtual pages. Joined snapshots update their interval index in
+place, preserve unchanged frame caches and maintain an executable-range count.
+Mmap search queries mapping collisions directly; mprotect and coordinator-cache
+retirement avoid constructing or scanning the process-wide region list. Hardware
+chunk stamps visit only changed visited chunks. Software alias refresh skips
+absent physical windows; a first scalar store can describe its one host granule
+without charging or populating untouched neighboring pages.
 
 Worker TLB tokens may contain a tagged pointer to an immutable lazy Frame. Each
 Frame has an Arc owner in an insertion-only snapshot cache; a live View prevents
@@ -674,8 +683,11 @@ Regression coverage includes 64 GiB accessible VMAs with a two-page resident
 budget, large grow/move/shrink, partial permissions/unmap, retained-writer fork,
 cross-generation canonical atomics, eight concurrent sparse atomic writers,
 ordinary handoffs without descriptor conversion, discard and delayed quota
-release across retained snapshot generations. A visited-entry counter verifies
-that releasing one page checks at most its store/cache entries, while another
-large resident VMA stays untouched. The total
+release across retained snapshot generations. Counters cover visited stores,
+frame caches, rebuilt index rows and complete region-list construction. A
+2,000-VMA regression bounds local retirement to its target store/cache and an
+incremental update to at most two range records, independent of unrelated VMAs.
+A separate test preserves software CPU aliases while charging only the reached
+4 KiB page of a 16 KiB host granule. The total
 allocation request for mapping, freezing and partially protecting an untouched
 1 GiB VMA is bounded below 128 KiB by an allocator-instrumented test.

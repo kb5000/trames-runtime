@@ -226,18 +226,7 @@ impl Memory {
             return 0;
         }
         self.anonymous.prune(&self.anonymous_retired);
-        let anonymous = (self.parallel_anonymous_dirty || !self.anonymous_retired.is_empty())
-            .then(|| {
-                self.parallel_cache.as_ref().map(|c| {
-                    super::anonymous::Anonymous::freeze(
-                        self,
-                        c.snapshot.code_epoch.clone(),
-                        c.snapshot.hardware,
-                        Some(&c.snapshot.anonymous),
-                    )
-                })
-            })
-            .flatten();
+        let changes = self.anonymous_index_changes();
         let Some(cache) = &mut self.parallel_cache else {
             self.anonymous_retired.clear();
             return 0;
@@ -252,9 +241,8 @@ impl Memory {
         {
             return 0; // uncommitted worker effects still own their original frames
         }
-        if let Some(anonymous) = anonymous {
-            snapshot.anonymous = anonymous;
-            snapshot.anonymous.prune(&self.anonymous_retired);
+        if self.parallel_anonymous_dirty || !changes.is_empty() {
+            snapshot.anonymous.refresh(&self.anonymous, &changes);
             self.anonymous_retired.clear();
             self.parallel_anonymous_dirty = false;
         }
@@ -292,6 +280,7 @@ impl Memory {
         // permission check or guest byte synchronization changes here.
         let snapshot = Arc::get_mut(&mut cache.snapshot).expect("unique joined snapshot");
         registry.metrics.incremental_updates += 1;
+        let anonymous_changes = self.anonymous_index_changes();
         let mapping_changes = std::mem::take(&mut self.parallel_mappings);
         let mut changed = mapping_changes.clone();
         let dirty = std::mem::take(&mut self.parallel_dirty);
@@ -477,28 +466,26 @@ impl Memory {
                 });
             if adoption {
                 let chunk = base / crate::HARDWARE_MAPPING_CHUNK_SIZE;
-                snapshot
-                    .hardware_chunks
-                    .entry(chunk)
-                    .or_insert(snapshot.hardware_generation);
+                let stamp = snapshot
+                    .anonymous
+                    .chunk_version(chunk)
+                    .unwrap_or(snapshot.hardware_generation);
+                snapshot.hardware_chunks.entry(chunk).or_insert(stamp);
             } else {
                 mmu_changed.push(base);
             }
             snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
         }
-        if self.parallel_anonymous_dirty {
-            snapshot.anonymous = super::anonymous::Anonymous::freeze(
-                self,
-                registry.code_epoch.clone(),
-                registry.hardware,
-                Some(&snapshot.anonymous),
-            );
+        if self.parallel_anonymous_dirty || !anonymous_changes.is_empty() {
+            let joined = !self.has_parallel_users();
+            snapshot
+                .anonymous
+                .refresh(&self.anonymous, &anonymous_changes);
+            if joined {
+                self.anonymous.prune(&self.anonymous_retired);
+                self.anonymous_retired.clear();
+            }
             self.parallel_anonymous_dirty = false;
-        }
-        if !self.has_parallel_users() && !self.anonymous_retired.is_empty() {
-            self.anonymous.prune(&self.anonymous_retired);
-            snapshot.anonymous.prune(&self.anonymous_retired);
-            self.anonymous_retired.clear();
         }
         snapshot.note_hardware_changes(
             mmu_changed.iter().copied(),

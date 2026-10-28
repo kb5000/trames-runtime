@@ -1453,12 +1453,8 @@ impl Memory {
                 }
             }
         }
-        let anonymous = anonymous::Anonymous::freeze(
-            self,
-            registry.code_epoch.clone(),
-            registry.hardware,
-            None,
-        );
+        let anonymous =
+            anonymous::Anonymous::freeze(self, registry.code_epoch.clone(), registry.hardware);
         let anonymous_executable = anonymous.executable();
         let mut snapshot = Snapshot {
             anonymous,
