@@ -98,7 +98,9 @@ impl Memory {
     pub(super) fn check_mapped_range(&self, start: u64, end: u64) -> Result<(), MemoryError> {
         let mut address = start;
         while address < end {
-            if let Some(stop) = self.reserved_end(address) {
+            if let Some((_, r)) = self.anonymous.containing(address) {
+                address = r.end.min(end);
+            } else if let Some(stop) = self.reserved_end(address) {
                 address = stop.min(end);
             } else if self.pages.contains_key(&address) {
                 address += PAGE_SIZE;
@@ -195,11 +197,11 @@ mod tests {
                 access: Access::Execute
             })
         );
-        assert_eq!(
-            m.protect(start, len, Permissions::RW),
-            Err(MemoryError::Limit)
-        );
-        assert_eq!(m.mapped_bytes(), 0);
+        m.protect(start, len, Permissions::RW).unwrap();
+        assert_eq!(m.mapped_bytes(), len as usize);
+        assert_eq!(m.resident_bytes(), 0);
+        m.unmap(start, len).unwrap();
+        m.reserve(start, len, false).unwrap();
         m.protect(start + PAGE_SIZE, PAGE_SIZE, Permissions::RW)
             .unwrap();
         assert_eq!(m.read_u64(start + PAGE_SIZE).unwrap(), 0);

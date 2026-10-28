@@ -78,7 +78,7 @@ impl View {
         }
         // SAFETY: only this immutable snapshot fills this view's TLB. The caller
         // proves one-page bounds; no mapping can change during a view's lifetime.
-        let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
+        let frame = self.snapshot.frame_token(entry.frame);
         let _guard = frame
             .bytes
             .mutable()
@@ -98,7 +98,7 @@ impl View {
             return false;
         }
         // SAFETY: same retained immutable snapshot and page-contained operand.
-        let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
+        let frame = self.snapshot.frame_token(entry.frame);
         let Some(_) = frame.bytes.mutable() else {
             return false;
         };

@@ -235,6 +235,7 @@ impl Memory {
         } else {
             self.map(address, len, permissions)?;
         }
+        self.materialize_descriptors(address, len as usize);
         let zero = Rc::new(PageBytes::Zero);
         for (i, (object, charge)) in objects.into_iter().zip(charges).enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
@@ -278,10 +279,18 @@ impl Memory {
         Ok((address..end)
             .step_by(PAGE_SIZE as usize)
             .map(|base| {
-                self.pages.get(&base).map_or(0, |&frame| {
-                    let page = self.frames[frame].as_ref().expect("page");
-                    u8::from(page.charge.resident() && page.check_backing(base).is_ok())
-                })
+                self.pages.get(&base).map_or_else(
+                    || {
+                        self.anonymous
+                            .containing(base)
+                            .and_then(|(_, r)| r.store.lookup(base))
+                            .map_or(0, |p| u8::from(p.charge.resident()))
+                    },
+                    |&frame| {
+                        let page = self.frames[frame].as_ref().expect("page");
+                        u8::from(page.charge.resident() && page.check_backing(base).is_ok())
+                    },
+                )
             })
             .collect())
     }
@@ -291,7 +300,22 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
+        self.adopt_anonymous();
+        self.retire_sparse(address, end);
         self.advance_code_revision();
+        let ranges: Vec<_> = self
+            .anonymous
+            .ranges
+            .iter()
+            .filter(|(a, r)| **a < end && r.end > address)
+            .map(|(&a, r)| (a.max(address), r.end.min(end), (*r.page).clone()))
+            .collect();
+        self.anonymous.remove(address, end);
+        for (a, b, mut page) in ranges {
+            page.instruction_revision = self.code_revision;
+            self.anonymous.insert(a, b, Rc::new(page), &self.account);
+        }
+        self.note_anonymous_change(address, end);
         for (&base, &frame) in self.pages.range(address..end) {
             let page = self.frames[frame].as_mut().expect("page");
             if page.backing.as_ref().is_some_and(|b| b.shared) {
@@ -348,6 +372,72 @@ impl Memory {
             self.unmap(old, old_len)?;
             return self.reserve(new, new_len, fixed);
         }
+        self.check_mapped_range(old, old_end)?;
+        self.adopt_anonymous();
+        let first = self
+            .page_for_access_unchecked(old)
+            .ok_or(MemoryError::Unmapped(old))?
+            .clone();
+        if first.backing.is_none() {
+            if self
+                .reservations
+                .range(..old_end)
+                .any(|(&a, &b)| a < old_end && b > old)
+                || self.pages.range(old..old_end).any(|(_, &i)| {
+                    let p = self.frames[i].as_ref().unwrap();
+                    p.backing.is_some()
+                        || p.permissions != first.permissions
+                        || p.mapping != first.mapping
+                })
+                || self.anonymous.ranges.range(..old_end).any(|(&a, r)| {
+                    a < old_end
+                        && r.end > old
+                        && (r.page.permissions != first.permissions
+                            || r.page.mapping != first.mapping)
+                })
+            {
+                return Err(MemoryError::InvalidRange);
+            }
+            if old == new && new_len > old_len && !self.is_free(old_end, new_len - old_len) {
+                return Err(MemoryError::Overlap(old_end));
+            }
+            if old != new && !fixed && !self.is_free(new, new_len) {
+                return Err(MemoryError::Overlap(new));
+            }
+            self.check_reservation_split(new, new_end, 0)?;
+            let pages: Vec<_> = self
+                .pages
+                .range(old..old_end.min(old + new_len))
+                .map(|(&base, &i)| (new + base - old, self.frames[i].as_ref().unwrap().clone()))
+                .collect();
+            self.unmap(old, old_len)?;
+            if fixed {
+                self.unmap(new, new_len)?;
+            }
+            // One range replaces the VMA; only reached pages move individually.
+            self.map(new, new_len, first.permissions)?;
+            for r in self
+                .anonymous
+                .ranges
+                .range_mut(new..new_end)
+                .map(|(_, r)| r)
+            {
+                Rc::make_mut(&mut r.page).mapping = first.mapping;
+            }
+            for (base, mut page) in pages {
+                page.instruction_revision = self.code_revision;
+                self.anonymous.remove(base, base + PAGE_SIZE);
+                self.insert_owned_page(base, page);
+            }
+            // Small mappings may already have materialized zero descriptors.
+            for (_, &i) in self.pages.range(new..new_end) {
+                self.frames[i].as_mut().unwrap().mapping = first.mapping;
+            }
+            self.parallel_anonymous_dirty = true;
+            self.refresh_mapping_mmu(new, new_len);
+            self.invalidate_translations();
+            return Ok(());
+        }
         self.invalidate_translations();
         self.mmu.retire();
         let mut pages = Vec::new();
@@ -383,7 +473,7 @@ impl Memory {
         if fixed && old != new {
             self.check_reservation_split(new, new_end, 0)?;
         }
-        if (self.mapped_bytes() as u64)
+        if (self.pages.len() as u64 * PAGE_SIZE)
             .saturating_sub(old_len + if old == new { 0 } else { replaced })
             .checked_add(new_len)
             .is_none_or(|n| n > MAX_DESCRIBED_BYTES as u64)
@@ -418,6 +508,7 @@ impl Memory {
             self.unmap(new, new_len)?;
         }
         self.map_fixed(new, new_len, permissions)?;
+        self.materialize_descriptors(new, new_len as usize);
         self.cpu_borrow_safe &= pages.iter().all(|p| {
             p.backing
                 .as_ref()
@@ -574,13 +665,7 @@ mod tests {
             .is_err());
         assert_eq!(m.read_array::<8>(0x1000).unwrap(), [3; 8]);
         assert!(m
-            .remap(
-                0x1000,
-                PAGE_SIZE,
-                0x8000,
-                MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
-                false
-            )
+            .remap(0x1000, PAGE_SIZE, 0x8000, ADDRESS_LIMIT, false)
             .is_err());
         assert!(m.is_free(0x8000, PAGE_SIZE * 3));
         m.remap(0x1000, PAGE_SIZE, 0x8000, PAGE_SIZE * 3, false)

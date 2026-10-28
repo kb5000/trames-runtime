@@ -314,6 +314,8 @@ impl Memory {
             return Err(MemoryError::InvalidRange);
         }
         Self::end(address, len as u64)?;
+        self.check(address, len, Access::Write)?;
+        self.materialize_descriptors(address, len);
         let frame = self
             .frame(address & !(PAGE_SIZE - 1))
             .ok_or_else(|| self.missing_page(address, Access::Write))?;
@@ -488,11 +490,12 @@ impl Memory {
                     .min((PAGE_SIZE - src % PAGE_SIZE) as usize);
                 (dst, src, count)
             };
+            self.materialize_descriptors(src, count);
+            self.prepare_mmu_write(dst, count)?;
             let df = self
                 .frame(dst & !(PAGE_SIZE - 1))
                 .expect("checked destination");
             let sf = self.frame(src & !(PAGE_SIZE - 1)).expect("checked source");
-            self.prepare_mmu_write(dst, count)?;
             self.mark_native_write(df);
             let di = (dst % PAGE_SIZE) as usize;
             let si = (src % PAGE_SIZE) as usize;

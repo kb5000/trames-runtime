@@ -688,7 +688,7 @@ impl Linux {
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
-        if !reservation && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
+        if a[3] & 0x23 != 0x22 && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
             return Err(Errno(12));
         }
         let flags = a[3];
@@ -782,9 +782,6 @@ impl Linux {
             return Err(Errno(22));
         }
         let reservation = memory.is_reserved(a[0], old_len);
-        if !reservation && new_len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
-            return Err(Errno(12));
-        }
         let fixed = a[3] & 2 != 0;
         let address = if fixed {
             a[4]
@@ -1636,17 +1633,7 @@ mod tests {
         let args = [0, 513 * 1024 * 1024, 3, 0, 0, 0];
         assert_eq!(linux.mmap(args, &mut memory), Err(Errno(22)));
         assert_eq!(
-            linux.mmap(
-                [
-                    0,
-                    trames_memory::MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
-                    3,
-                    0x22,
-                    u64::MAX,
-                    0
-                ],
-                &mut memory
-            ),
+            linux.mmap([0, ADDRESS_LIMIT, 3, 0x22, u64::MAX, 0], &mut memory),
             Err(Errno(12))
         );
         let base = linux
@@ -1661,6 +1648,30 @@ mod tests {
             Err(MemoryError::Limit)
         );
     }
+    #[test]
+    fn huge_private_mmap_and_mremap_only_charge_reached_pages() {
+        let mut linux = Linux::new(0x3000);
+        let mut memory = Memory::new(2 * PAGE_SIZE as usize);
+        let len = 32 << 30;
+        let base = linux
+            .mmap([0, len, 3, 0x22, u64::MAX, 0], &mut memory)
+            .unwrap();
+        assert_eq!(memory.resident_bytes(), 0);
+        memory.write_array(base + len - 8, [42; 8]).unwrap();
+        let target = 1 << 40;
+        assert_eq!(
+            linux.mremap([base, len, 2 * len, 3, target, 0], &mut memory),
+            Ok(target)
+        );
+        assert_eq!(memory.read_array::<8>(target + len - 8).unwrap(), [42; 8]);
+        assert_eq!(memory.read_array::<8>(target + len).unwrap(), [0; 8]);
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(
+            linux.mmap([0, len, 3, 0x21, u64::MAX, 0], &mut memory),
+            Err(Errno(12))
+        );
+    }
+
     #[test]
     fn munmap_metadata_exhaustion_returns_enomem_and_retains_the_range() {
         let mut linux = Linux::new(0);
@@ -2090,13 +2101,7 @@ mod tests {
         assert_eq!(parent.brk(0x2000, &mut memory), 0x2000);
         assert_eq!(shared_query.get(), 0x2000);
         assert_eq!(private_query.get(), 0x1000);
-        assert_eq!(
-            shared.brk(
-                trames_memory::MAX_DESCRIBED_BYTES as u64 + 0x2000,
-                &mut memory
-            ),
-            0x2000
-        );
+        assert_eq!(shared.brk(ADDRESS_LIMIT, &mut memory), 0x2000);
         assert_eq!(shared_query.get(), 0x2000);
 
         let first = parent
@@ -2109,17 +2114,7 @@ mod tests {
         assert_eq!(second, first + PAGE_SIZE);
         let before = parent.heap_context();
         assert_eq!(
-            shared.mmap(
-                [
-                    0,
-                    trames_memory::MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
-                    3,
-                    0x22,
-                    u64::MAX,
-                    0
-                ],
-                &mut memory
-            ),
+            shared.mmap([0, ADDRESS_LIMIT, 3, 0x22, u64::MAX, 0], &mut memory),
             Err(Errno(12))
         );
         assert_eq!(parent.heap_context(), before);
@@ -2139,10 +2134,7 @@ mod tests {
         let mut m = Memory::new(4096);
         assert_eq!(linux.brk(0x1800, &mut m), 0x1800);
         m.write(0x1000, b"x").unwrap();
-        assert_eq!(
-            linux.brk(trames_memory::MAX_DESCRIBED_BYTES as u64 + 0x2000, &mut m),
-            0x1800
-        );
+        assert_eq!(linux.brk(ADDRESS_LIMIT, &mut m), 0x1800);
         assert_eq!(m.mapped_bytes(), 4096);
         assert_eq!(m.read_array::<1>(0x1000), Ok(*b"x"));
         assert_eq!(linux.brk(0x3000, &mut m), 0x3000);

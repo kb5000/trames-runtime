@@ -157,7 +157,7 @@ impl Memory {
         } else {
             0
         };
-        if (self.mapped_bytes() - reused)
+        if (self.pages.len() * PAGE_SIZE as usize - reused)
             .checked_add(len as usize)
             .is_none_or(|bytes| bytes > MAX_DESCRIBED_BYTES)
         {
@@ -195,6 +195,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().bind_account(account);
         }
+        self.adopt_anonymous();
         self.parallel_cache = None;
         let mut charges = Vec::new();
         for page in self.frames.iter().flatten() {
@@ -207,6 +208,9 @@ impl Memory {
         for (page, charge) in self.frames.iter_mut().flatten().zip(charges) {
             page.charge = charge;
         }
+        self.anonymous = self.anonymous.fork(&account);
+        self.sparse_pages.get_mut().clear();
+        self.invalidate_translations();
         self.account = account;
         Ok(())
     }

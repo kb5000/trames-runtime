@@ -92,61 +92,41 @@ pub(super) struct HardwareChange {
     pub(super) ranges: Vec<std::ops::Range<u64>>,
 }
 impl Snapshot {
-    fn note_hardware_changes(&mut self, addresses: impl Iterator<Item = u64>) {
-        if !self.hardware {
+    fn note_anonymous_changes(&mut self, mut ranges: Vec<std::ops::Range<u64>>) {
+        if !self.hardware || ranges.is_empty() {
             return;
         }
-        let mut addresses = addresses.peekable();
-        if addresses.peek().is_none() {
-            return;
-        }
-        let before = self.hardware_generation;
-        self.hardware_generation = new_backing_identity();
-        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        let mut last_chunk = None;
-        let mut overflow = false;
-        // Callers have finished all removals/replacements. Keep stamps only for
-        // currently mapped chunks, so sparse VA churn cannot grow tombstones.
-        // Metadata is immutable throughout a worker epoch; no new data barrier
-        // or hardware/storage owner is involved.
-        for address in addresses {
-            let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
-            if last_chunk != Some(chunk) {
-                let start = chunk * crate::HARDWARE_MAPPING_CHUNK_SIZE;
-                if self
-                    .pages
-                    .range(start..start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
-                    .next()
-                    .is_some()
-                {
-                    self.hardware_chunks.insert(chunk, self.hardware_generation);
-                } else {
-                    self.hardware_chunks.remove(&chunk);
-                }
-                last_chunk = Some(chunk);
-            }
-            if overflow {
-                continue; // still update all persistent chunk stamps
-            }
-            if let Some(last) = ranges.last_mut() {
-                debug_assert!(address >= last.start);
-                if address <= last.end {
-                    last.end = last.end.max(address + PAGE_SIZE);
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end {
+                    last.end = last.end.max(range.end);
                     continue;
                 }
             }
-            ranges.push(address..address + PAGE_SIZE);
-            if ranges.len() > 4096 {
-                ranges.clear();
-                overflow = true;
+            merged.push(range);
+        }
+        let before = self.hardware_generation;
+        self.hardware_generation = new_backing_identity();
+        // Allocate stamps only for explicit chunks. An unvisited anonymous
+        // chunk uses this range generation on demand. All exported hardware
+        // leaves are adopted into explicit descriptors at joined checkpoints.
+        for range in &merged {
+            let first = range.start / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            let last = (range.end - 1) / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            for (_, stamp) in self.hardware_chunks.range_mut(first..=last) {
+                *stamp = self.hardware_generation;
             }
         }
-        if overflow {
+        if merged.len() > 4096 {
             self.hardware_changes.clear();
             return;
         }
-        self.hardware_changes
-            .push_back(HardwareChange { before, ranges });
+        self.hardware_changes.push_back(HardwareChange {
+            before,
+            ranges: merged,
+        });
         while self.hardware_changes.len() > 32
             || self
                 .hardware_changes
@@ -157,6 +137,35 @@ impl Snapshot {
         {
             self.hardware_changes.pop_front();
         }
+    }
+    fn note_hardware_changes(
+        &mut self,
+        addresses: impl Iterator<Item = u64>,
+        mut ranges: Vec<std::ops::Range<u64>>,
+    ) {
+        if !self.hardware {
+            return;
+        }
+        let mut last_chunk = None;
+        for address in addresses {
+            let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            if last_chunk != Some(chunk) {
+                let start = chunk * crate::HARDWARE_MAPPING_CHUNK_SIZE;
+                if self
+                    .pages
+                    .range(start..start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
+                    .next()
+                    .is_some()
+                {
+                    self.hardware_chunks.entry(chunk).or_insert(0);
+                } else {
+                    self.hardware_chunks.remove(&chunk);
+                }
+                last_chunk = Some(chunk);
+            }
+            ranges.push(address..address + PAGE_SIZE);
+        }
+        self.note_anonymous_changes(ranges);
     }
     fn remove_frame(&mut self, base: u64) -> Option<Frame> {
         let index = self.pages.remove(&base)?;
@@ -214,6 +223,11 @@ impl Memory {
         if self.has_parallel_users() {
             return 0;
         }
+        self.adopt_anonymous();
+        let anonymous = self
+            .parallel_cache
+            .as_ref()
+            .map(|c| super::anonymous::Anonymous::freeze(self, c.snapshot.code_epoch.clone()));
         let Some(cache) = &mut self.parallel_cache else {
             return 0;
         };
@@ -226,6 +240,10 @@ impl Memory {
             .any(|word| word.load(Ordering::Relaxed) != 0)
         {
             return 0; // uncommitted worker effects still own their original frames
+        }
+        if let Some(anonymous) = anonymous {
+            snapshot.anonymous = anonymous;
+            self.parallel_anonymous_dirty = false;
         }
         let retired: Vec<_> = self
             .parallel_mappings
@@ -241,10 +259,10 @@ impl Memory {
         for base in &retired {
             drop(snapshot.remove_frame(*base));
         }
-        snapshot.note_hardware_changes(retired.iter().copied());
+        snapshot.note_hardware_changes(retired.iter().copied(), Vec::new());
         snapshot.refresh_mmu(retired.iter().copied());
         snapshot.has_aliases = snapshot.alias_count != 0;
-        snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
+        snapshot.dynamic_code = snapshot.dynamic_code_pages != 0 || snapshot.anonymous.executable();
         // Keep source_revision/parallel_mappings unchanged. The next normal
         // preparation still installs new permissions/bytes/reservations once.
         retired.len()
@@ -260,6 +278,11 @@ impl Memory {
         // view uses the immutable full-snapshot path instead. No raw pointer,
         // permission check or guest byte synchronization changes here.
         let snapshot = Arc::get_mut(&mut cache.snapshot).expect("unique joined snapshot");
+        if self.parallel_anonymous_dirty {
+            snapshot.anonymous =
+                super::anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
+            self.parallel_anonymous_dirty = false;
+        }
         registry.metrics.incremental_updates += 1;
         let mapping_changes = std::mem::take(&mut self.parallel_mappings);
         let mut changed = mapping_changes.clone();
@@ -436,10 +459,13 @@ impl Memory {
             )?;
             snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
         }
-        snapshot.note_hardware_changes(mmu_changed.iter().copied());
+        snapshot.note_hardware_changes(
+            mmu_changed.iter().copied(),
+            std::mem::take(&mut self.parallel_anonymous_changes),
+        );
         snapshot.refresh_mmu(mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;
-        snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
+        snapshot.dynamic_code = snapshot.dynamic_code_pages != 0 || snapshot.anonymous.executable();
         snapshot.identity = self.identity;
         snapshot.code_revision = self.code_revision;
         if executable_changed {
@@ -534,6 +560,7 @@ mod tests {
         memory
             .map(PAGE_SIZE, 8194 * PAGE_SIZE, Permissions::RW)
             .unwrap();
+        memory.materialize_descriptors(PAGE_SIZE, 8194 * PAGE_SIZE as usize);
         let view = memory.parallel_view(&mut registry).unwrap();
         assert!(view.snapshot.hardware_chunks.is_empty());
         drop(view);
@@ -726,7 +753,7 @@ mod tests {
             drop(view);
         }
         assert_eq!(registry.metrics.full_rebuilds, 1);
-        assert_eq!(registry.metrics.full_rebuild_pages, 1024);
+        assert_eq!(registry.metrics.full_rebuild_pages, 0);
         assert_eq!(registry.metrics.incremental_pages, 128);
     }
 

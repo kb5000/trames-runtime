@@ -114,6 +114,7 @@ impl Memory {
         let address = address & 0x00ffffffffffffff;
         self.check(address, length, Access::Read)?;
         self.check(address, length, Access::Write)?;
+        self.materialize_descriptors(address, length);
         let mut cursor = address;
         let end = address
             .checked_add(length as u64)

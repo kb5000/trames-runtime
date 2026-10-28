@@ -235,6 +235,8 @@ impl CpuMemory for Memory {
             return shared.borrow_mut().exclusive_read(a, b);
         }
         let a = a & 0x00ffffffffffffff;
+        self.check(a, b.len(), Access::Read)?;
+        self.materialize_descriptors(a, b.len());
         let page = self.page_for_access(a, b.len(), Access::Read)?;
         if page
             .backing

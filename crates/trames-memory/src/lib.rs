@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
+mod anonymous;
 mod backing;
 mod cpu_memory;
 mod hardware;
@@ -37,9 +38,9 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const HARDWARE_MAPPING_CHUNK_SIZE: u64 = 512 * PAGE_SIZE;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
 pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
-/// Independent bound on the current page-descriptor representation. Virtual
-/// mappings do not consume the guest resident quota. PROT_NONE reservations
-/// use ranges and remain governed by MAX_RESERVATIONS instead of this bound.
+/// Bound for explicitly described pages (including file/shared backing).
+/// Large private anonymous VMAs use sparse ranges; their virtual size does not
+/// consume this bound or the guest resident quota.
 pub const MAX_PAGE_DESCRIPTORS: usize = 4 * 1024 * 1024;
 pub const MAX_DESCRIBED_BYTES: usize = MAX_PAGE_DESCRIPTORS * PAGE_SIZE as usize;
 static NEXT_SPACE: AtomicU64 = AtomicU64::new(1);
@@ -222,6 +223,10 @@ pub struct Memory {
     pages: BTreeMap<u64, usize>,
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
+    anonymous: anonymous::Anonymous,
+    sparse_pages: RefCell<BTreeMap<u64, Rc<Page>>>,
+    parallel_anonymous_dirty: bool,
+    parallel_anonymous_changes: Vec<std::ops::Range<u64>>,
     frames: Slots<Option<Page>>,
     free_frames: Slots<usize>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -251,9 +256,13 @@ impl Clone for Memory {
         self.mmu.retire();
         self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
         let account = self.fork_account();
-        Self {
+        let mut cloned = Self {
             mmu: self.mmu.empty_like(),
             pages: self.pages.clone(),
+            anonymous: self.anonymous.fork(&account),
+            sparse_pages: RefCell::new(BTreeMap::new()),
+            parallel_anonymous_dirty: false,
+            parallel_anonymous_changes: Vec::new(),
             reservations: self.reservations.clone(),
             frames: self
                 .frames
@@ -296,7 +305,22 @@ impl Clone for Memory {
             parallel_dirty: Vec::new(),
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
+        };
+        // A retained worker can have reached pages absent from the coordinator's
+        // descriptor table. Fork them through the same Rc/COW boundary as pages.
+        for base in self.anonymous.populated() {
+            let source = self.sparse_page(base);
+            let mut page = source.clone();
+            if self.has_parallel_users() {
+                page.bytes = Rc::new((*page.bytes).clone());
+            }
+            page.charge = Charge::new(&cloned.account);
+            page.charge.ensure().expect("fork admitted by can_fork");
+            page.parallel_dirty = false;
+            cloned.anonymous.remove(base, base + PAGE_SIZE);
+            cloned.insert_owned_page(base, page);
         }
+        cloned
     }
 }
 
@@ -350,6 +374,10 @@ impl Memory {
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
+            anonymous: anonymous::Anonymous::default(),
+            sparse_pages: RefCell::new(BTreeMap::new()),
+            parallel_anonymous_dirty: false,
+            parallel_anonymous_changes: Vec::new(),
             frames: Slots::new(),
             free_frames: Slots::new(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -374,7 +402,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().mapped_bytes();
         }
-        self.pages.len() * PAGE_SIZE as usize
+        self.pages.len() * PAGE_SIZE as usize + self.anonymous.bytes()
     }
 
     /// Contiguous guest mappings for procfs; no native address is exposed.
@@ -382,24 +410,40 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().regions();
         }
-        let mut regions: Vec<(u64, u64, Permissions)> = Vec::new();
-        for (&address, &frame) in &self.pages {
-            let page = self.frames[frame].as_ref().expect("mapped frame");
-            if let Some(last) = regions.last_mut() {
-                if last.1 == address && last.2 == page.permissions {
-                    last.1 += PAGE_SIZE;
+        let mut parts: Vec<_> = self
+            .pages
+            .iter()
+            .map(|(&a, &i)| {
+                (
+                    a,
+                    a + PAGE_SIZE,
+                    self.frames[i].as_ref().unwrap().permissions,
+                )
+            })
+            .collect();
+        parts.extend(
+            self.anonymous
+                .ranges
+                .iter()
+                .map(|(&a, r)| (a, r.end, r.page.permissions)),
+        );
+        parts.extend(
+            self.reservations
+                .iter()
+                .map(|(&a, &b)| (a, b, Permissions::NONE)),
+        );
+        parts.sort_unstable_by_key(|r| r.0);
+        let mut out: Vec<(u64, u64, Permissions)> = Vec::new();
+        for (a, b, p) in parts {
+            if let Some(last) = out.last_mut() {
+                if last.1 == a && last.2 == p {
+                    last.1 = b;
                     continue;
                 }
             }
-            regions.push((address, address + PAGE_SIZE, page.permissions));
+            out.push((a, b, p));
         }
-        regions.extend(
-            self.reservations
-                .iter()
-                .map(|(&start, &end)| (start, end, Permissions::NONE)),
-        );
-        regions.sort_unstable_by_key(|region| region.0);
-        regions
+        out
     }
 
     fn invalidate_translations(&self) {
@@ -410,7 +454,9 @@ impl Memory {
 
     #[inline]
     fn frame(&self, base: u64) -> Option<usize> {
-        self.translation(base).map(|entry| entry.frame)
+        self.translation(base)
+            .filter(|entry| entry.frame & anonymous::TOKEN == 0)
+            .map(|entry| entry.frame)
     }
 
     #[inline]
@@ -425,8 +471,12 @@ impl Memory {
     #[cold]
     #[inline(never)]
     fn fill_translation(&self, base: u64) -> Option<Translation> {
-        let frame = *self.pages.get(&base)?;
-        let page = self.frames[frame].as_ref().expect("mapped frame");
+        let (frame, page) = if let Some(&frame) = self.pages.get(&base) {
+            (frame, self.frames[frame].as_ref().expect("mapped frame"))
+        } else {
+            let page = self.anonymous.page(base)?;
+            (anonymous::TOKEN | (base / PAGE_SIZE) as usize, page)
+        };
         let mut entry = Translation::new(
             base,
             frame,
@@ -479,11 +529,23 @@ impl Memory {
     }
 
     #[inline]
+    fn page_for_access_unchecked(&self, address: u64) -> Option<&Page> {
+        let base = address & !(PAGE_SIZE - 1);
+        if let Some(&i) = self.pages.get(&base) {
+            return self.frames[i].as_ref();
+        }
+        self.anonymous.page(base)
+    }
     fn translated_page(&self, entry: Translation) -> &Page {
         // SAFETY: entries are filled only from pages -> live slab slots. Every
         // mapping mutation flushes translations before another access, and no
         // callback/mutation occurs between translation and dereference. This
         // local Memory is !Send/!Sync; no worker can edit its page table.
+        if entry.frame & anonymous::TOKEN != 0 {
+            // SAFETY: immutable anonymous range metadata owns this Page. Every
+            // mapping/descriptor mutation clears the TLB before dropping it.
+            return self.sparse_page(entry.tag & !(PAGE_SIZE - 1));
+        }
         debug_assert!(self.frames.get(entry.frame).is_some_and(Option::is_some));
         unsafe {
             self.frames
@@ -497,40 +559,17 @@ impl Memory {
     fn translated_page_mut(&mut self, entry: Translation) -> &mut Page {
         // SAFETY: same live-slot invariant as translated_page, with exclusive
         // access to this coordinator Memory. The entry owns no byte allocation.
+        assert_eq!(
+            entry.frame & anonymous::TOKEN,
+            0,
+            "write descriptor must be materialized"
+        );
         debug_assert!(self.frames.get(entry.frame).is_some_and(Option::is_some));
         unsafe {
             self.frames
                 .get_unchecked_mut(entry.frame)
                 .as_mut()
                 .unwrap_unchecked()
-        }
-    }
-
-    fn insert_page(&mut self, base: u64, permissions: Permissions) {
-        if self.parallel_cache.is_some() {
-            self.parallel_mappings.insert(base);
-        }
-        let page = Page {
-            bytes: Rc::new(PageBytes::Zero),
-            charge: Charge::new(&self.account),
-            permissions,
-            instruction_revision: self.code_revision,
-            backing: None,
-            mapping: self.code_revision,
-            data_revision: 0,
-            parallel_dirty: false,
-        };
-        if let Some(&frame) = self.pages.get(&base) {
-            self.frames[frame] = Some(page);
-        } else {
-            let frame = if let Some(frame) = self.free_frames.pop() {
-                self.frames[frame] = Some(page);
-                frame
-            } else {
-                self.frames.push(Some(page));
-                self.frames.len() - 1
-            };
-            self.pages.insert(base, frame);
         }
     }
 
@@ -541,6 +580,12 @@ impl Memory {
         self.pages
             .last_key_value()
             .map_or(0, |(&address, _)| address + PAGE_SIZE)
+            .max(
+                self.anonymous
+                    .ranges
+                    .last_key_value()
+                    .map_or(0, |(_, r)| r.end),
+            )
             .max(
                 self.reservations
                     .last_key_value()
@@ -618,6 +663,7 @@ impl Memory {
         Self::mapping_end(address, len).is_ok_and(|end| {
             self.pages.range(address..end).next().is_none()
                 && !self.reservation_overlaps(address, end)
+                && !self.anonymous.overlaps(address, end)
         })
     }
     pub fn find_free(&self, start: u64, len: u64) -> Option<u64> {
@@ -625,33 +671,18 @@ impl Memory {
             return shared.borrow().find_free(start, len);
         }
         let mut candidate = start.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-        if let Some(stop) = self.reserved_end(candidate) {
-            candidate = stop;
-        }
-        let mut pages = self
-            .pages
-            .range(candidate..)
-            .map(|(&a, _)| (a, a + PAGE_SIZE))
-            .peekable();
-        let mut reserved = self
-            .reservations
-            .range(candidate..)
-            .map(|(&a, &b)| (a, b))
-            .peekable();
-        loop {
-            let next = match (pages.peek(), reserved.peek()) {
-                (Some(a), Some(b)) if a.0 < b.0 => pages.next(),
-                (_, Some(_)) => reserved.next(),
-                (Some(_), None) => pages.next(),
-                (None, None) => return Self::mapping_end(candidate, len).ok().map(|_| candidate),
-            };
-            let (base, stop) = next.expect("occupied range");
-            if base >= Self::mapping_end(candidate, len).ok()? {
+        for (a, b, _) in self.regions() {
+            if b <= candidate {
+                continue;
+            }
+            if a >= Self::mapping_end(candidate, len).ok()? {
                 return Some(candidate);
             }
-            candidate = candidate.max(stop);
+            candidate = candidate.max(b);
         }
+        Self::mapping_end(candidate, len).ok().map(|_| candidate)
     }
+
     /// Atomic anonymous MAP_FIXED: account for replaced pages before changing data.
     pub fn map_fixed(
         &mut self,
@@ -663,26 +694,9 @@ impl Memory {
             return shared.borrow_mut().map_fixed(address, len, permissions);
         }
         let end = Self::mapping_end(address, len)?;
-        let replaced = self.pages.range(address..end).count() * PAGE_SIZE as usize;
-        let size = usize::try_from(len).map_err(|_| MemoryError::Limit)?;
-        if self
-            .mapped_bytes()
-            .saturating_sub(replaced)
-            .checked_add(size)
-            .is_none_or(|n| n > MAX_DESCRIBED_BYTES)
-        {
-            return Err(MemoryError::Limit);
-        }
-        self.remove_reservations(address, end)?;
-        self.advance_code_revision();
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            self.insert_page(base, permissions);
-        }
-        self.revision = self.revision.wrapping_add(1);
-        self.refresh_mapping_mmu(address, len);
-        self.invalidate_translations();
-        self.reclaim_unused();
-        Ok(())
+        self.check_reservation_split(address, end, 0)?;
+        self.unmap(address, len)?;
+        self.map(address, len, permissions)
     }
 
     /// Linux munmap permits holes; validate the range before removing mapped pages.
@@ -692,6 +706,12 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
+        self.retire_sparse(address, end);
+        if self.anonymous.overlaps(address, end) {
+            self.note_anonymous_change(address, end);
+            self.anonymous.remove(address, end);
+        }
+
         let keys: Vec<_> = self
             .pages
             .range(address..end)
@@ -768,27 +788,27 @@ impl Memory {
             return shared.borrow_mut().map(address, len, permissions);
         }
         let end = Self::mapping_end(address, len)?;
-        let len = usize::try_from(len).map_err(|_| MemoryError::Limit)?;
-        if self
-            .mapped_bytes()
-            .checked_add(len)
-            .ok_or(MemoryError::Limit)?
-            > MAX_DESCRIBED_BYTES
-        {
-            return Err(MemoryError::Limit);
-        }
-        if let Some((&base, _)) = self.pages.range(address..end).next() {
-            return Err(MemoryError::Overlap(base));
-        }
-        if self.reservation_overlaps(address, end) {
+        if !self.is_free(address, len) {
             return Err(MemoryError::Overlap(address));
         }
+        if self.anonymous.ranges.len() >= MAX_PAGE_DESCRIPTORS {
+            return Err(MemoryError::Limit);
+        }
         self.advance_code_revision();
-        for base in (address..end).step_by(PAGE_SIZE as usize) {
-            self.insert_page(base, permissions);
+        self.anonymous.insert(
+            address,
+            end,
+            self.anonymous_page(permissions),
+            &self.account,
+        );
+        self.note_anonymous_change(address, end);
+        // Small mappings retain compact direct frame indexing and immediately
+        // usable software CPU aliases. Large VMAs remain range-only until used.
+        if len <= 64 * 1024 {
+            self.materialize_descriptors(address, len as usize);
+            self.refresh_mapping_mmu(address, len);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.refresh_mapping_mmu(address, len as u64);
         self.invalidate_translations();
         Ok(())
     }
@@ -804,14 +824,6 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
-        let committed = self.pages.range(address..end).count() as u64 * PAGE_SIZE;
-        let commit = permissions != Permissions::NONE;
-        if commit
-            && (end - address - committed)
-                > MAX_DESCRIBED_BYTES.saturating_sub(self.mapped_bytes()) as u64
-        {
-            return Err(MemoryError::Limit);
-        }
         for (&base, &frame) in self.pages.range(address..end) {
             let p = self.frames[frame].as_ref().expect("page");
             if permissions.execute && p.backing.as_ref().is_some_and(|b| !b.object.executable()) {
@@ -831,17 +843,57 @@ impl Memory {
                 });
             }
         }
-        if commit {
-            self.remove_reservations(address, end)?;
-        }
+        self.check_reservation_split(address, end, 0)?;
+        self.retire_sparse(address, end);
         self.advance_code_revision();
-        if commit {
-            for base in (address..end).step_by(PAGE_SIZE as usize) {
-                if !self.pages.contains_key(&base) {
-                    self.insert_page(base, permissions);
+        let parts: Vec<_> = self
+            .regions()
+            .into_iter()
+            .filter(|(a, b, _)| *a < end && *b > address)
+            .map(|(a, b, _)| (a.max(address), b.min(end)))
+            .collect();
+        let old: Vec<_> = self
+            .anonymous
+            .ranges
+            .iter()
+            .filter(|(a, r)| **a < end && r.end > address)
+            .map(|(&a, r)| {
+                (
+                    a.max(address),
+                    r.end.min(end),
+                    r.page.clone(),
+                    r.store.clone(),
+                )
+            })
+            .collect();
+        self.anonymous.remove(address, end);
+        for (a, b, source, store) in old {
+            let mut page = (*source).clone();
+            page.permissions = permissions;
+            page.instruction_revision = self.code_revision;
+            self.anonymous.insert_store(a, b, Rc::new(page), store);
+        }
+        self.remove_reservations(address, end)?;
+        for (a, b) in parts {
+            let mut at = a;
+            while at < b {
+                if let Some((_, r)) = self.anonymous.containing(at) {
+                    at = r.end.min(b);
+                } else if self.pages.contains_key(&at) {
+                    at += PAGE_SIZE;
+                } else {
+                    let stop = self.pages.range(at..b).next().map_or(b, |(&a, _)| a);
+                    self.anonymous.insert(
+                        at,
+                        stop,
+                        self.anonymous_page(permissions),
+                        &self.account,
+                    );
+                    at = stop;
                 }
             }
         }
+        self.note_anonymous_change(address, end);
         for (&base, &frame) in self.pages.range(address..end) {
             if self.parallel_cache.is_some() {
                 self.parallel_mappings.insert(base);
@@ -864,6 +916,7 @@ impl Memory {
         }
         Self::end(address, 1)?;
         if self.pages.contains_key(&(address & !(PAGE_SIZE - 1)))
+            || self.anonymous.containing(address).is_some()
             || self.reserved_end(address).is_some()
         {
             Ok(())
@@ -902,10 +955,7 @@ impl Memory {
         let mut allowed = true;
         for base in (first..end).step_by(PAGE_SIZE as usize) {
             let fault_address = base.max(address);
-            let frame = self
-                .frame(base)
-                .ok_or_else(|| self.missing_page(fault_address, access))?;
-            let page = self.frames[frame].as_ref().expect("mapped frame");
+            let page = self.page_for_access(fault_address, 1, access)?;
             if !page.permissions.allows(access) {
                 return Err(MemoryError::Permission {
                     address: fault_address,
@@ -935,10 +985,7 @@ impl Memory {
             let base = address & !(PAGE_SIZE - 1);
             let offset = (address - base) as usize;
             let len = out.len().min(PAGE_SIZE as usize - offset);
-            let frame = self.frame(base).expect("validated page");
-            self.frames[frame]
-                .as_ref()
-                .expect("mapped frame")
+            self.page_for_access(address, len, Access::Read)?
                 .read_bytes(offset, &mut out[..len])?;
             address += len as u64;
             out = &mut out[len..];
@@ -991,9 +1038,12 @@ impl Memory {
         }
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if input.len() <= PAGE_SIZE as usize - offset {
-            let entry = self.access_translation(address, input.len(), Access::Write)?;
-            let frame = entry.frame;
+            let mut entry = self.access_translation(address, input.len(), Access::Write)?;
             self.prepare_mmu_write(address, input.len())?;
+            if entry.frame & anonymous::TOKEN != 0 {
+                entry = self.access_translation(address, input.len(), Access::Write)?;
+            }
+            let frame = entry.frame;
             let next_code_revision = self.code_revision.wrapping_add(1);
             let page = self.translated_page_mut(entry);
             if entry.tag & Translation::BACKED != 0 {
@@ -1134,9 +1184,12 @@ impl Memory {
             self.note_parallel_write(entry.frame);
             return Ok(());
         }
-        let entry = self.access_translation(address, N, Access::Write)?;
-        let frame = entry.frame;
+        let mut entry = self.access_translation(address, N, Access::Write)?;
         self.prepare_mmu_write(address, N)?;
+        if entry.frame & anonymous::TOKEN != 0 {
+            entry = self.access_translation(address, N, Access::Write)?;
+        }
+        let frame = entry.frame;
         let next_code_revision = self.code_revision.wrapping_add(1);
         let page = self.translated_page_mut(entry);
         if entry.tag & Translation::BACKED != 0 {
@@ -1389,11 +1442,10 @@ mod tests {
             m.map(0x1000, PAGE_SIZE, Permissions::RW),
             Err(MemoryError::Overlap(_))
         ));
-        assert_eq!(
-            m.map(0x2000, MAX_DESCRIBED_BYTES as u64, Permissions::RW),
-            Err(MemoryError::Limit)
-        );
-        assert_eq!(m.mapped_bytes(), PAGE_SIZE as usize);
+        m.map(0x2000, MAX_DESCRIBED_BYTES as u64, Permissions::RW)
+            .unwrap();
+        assert_eq!(m.mapped_bytes(), MAX_DESCRIBED_BYTES + PAGE_SIZE as usize);
+        assert_eq!(m.resident_bytes(), 0);
         assert!(m.check(u64::MAX, 2, Access::Read).is_err());
         assert!(m.check(ADDRESS_LIMIT - 1, 2, Access::Read).is_err());
         assert!(m.check(u64::MAX, 0, Access::Read).is_ok());
@@ -1471,12 +1523,8 @@ mod tests {
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         m.write(0x1000, b"data").unwrap();
         assert_eq!(
-            m.map_fixed(
-                0x1000,
-                MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
-                Permissions::R
-            ),
-            Err(MemoryError::Limit)
+            m.map_fixed(0x1000, ADDRESS_LIMIT, Permissions::R),
+            Err(MemoryError::AddressRange(0x1000))
         );
         let mut bytes = [0; 4];
         m.read(0x1000, &mut bytes).unwrap();

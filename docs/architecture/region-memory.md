@@ -329,10 +329,11 @@ OOM policy, not Linux victim selection.
 Virtual mappings and RAM accounting are separate. Creating an accessible VMA,
 changing its protection, retaining a snapshot, querying permissions or obtaining
 a futex identity does not charge the mapped length to the guest RAM budget.
-Accessible page descriptors have an independent 4,194,304-page (16 GiB) metadata
-ceiling; PROT_NONE reservations keep their separate sparse interval bound. The
-descriptors still consume host metadata, so an unused mapping is not free in
-host RSS even though it consumes no guest byte quota.
+Private anonymous VMAs larger than 64 KiB now use interval metadata, including
+accessible mappings. Their virtual size does not spend a per-page descriptor
+budget. Small mappings retain direct frame indexing and software CPU aliases.
+File/shared mappings retain the 4,194,304-page (16 GiB) descriptor bound, while
+PROT_NONE reservations retain their separate interval bound.
 
 PlainFile-backed VFS pages retain an Arc-owned page source, offset and live EOF
 capability. Creating a mapping or worker frame does not read file bytes. CPU or
@@ -597,12 +598,11 @@ proc address-space limits now follow the same policy instead of a fixed 512 MiB.
 Common/iPad defaults remain bounded and unchanged. The Mac product's default is
 host-managed, with `--memory-mib N` retaining an explicit resident-byte cap.
 
-This changes resident policy, not mapping representation: accessible VMAs still
-have the independent 4,194,304-page / 16 GiB descriptor ceiling per address space.
-Large sparse accessible mappings still cost metadata; sparse PROT_NONE ranges
-use their existing representation. Host-managed sessions share the host memory
-pool across VMs but this is not unlimited sparse per-process virtual memory or
-unique-physical RSS/PSS accounting. Fork accounting/copies remain conservative.
+Resident policy and mapping representation are independent. Large private
+anonymous mappings now have sparse accessible intervals as described below;
+file/shared mappings retain their descriptor ceiling. Host-managed sessions
+share the host memory pool across VMs. This does not provide unique-physical
+RSS/PSS accounting; fork accounting/copies remain conservative.
 
 Hardware admission now leaves the coordinator software CPU-alias arena disabled
 across subsequent map/protect/write operations and fork. Previously admission
@@ -619,3 +619,51 @@ no mapping changed. Region/permission/EOF checks, host borrow gates, mapped pin
 rejection and hardware export ownership remain unchanged. Validation covers
 mapping/protection/kernel writes without recreated windows, writable child COW
 isolation, retained data, and a fresh interpreter arena retaining its fast path.
+
+### Sparse accessible anonymous ranges (2026-10-29)
+
+An untouched large private anonymous VMA owns interval metadata and an immutable
+zero-page template. Worker snapshots freeze those intervals without constructing
+a Frame/ConcurrentPage graph per 4 KiB. First accesses create descriptors only
+for reached addresses. Linux private anonymous mmap, brk and mremap can exceed
+the former 16 GiB virtual descriptor ceiling. File/shared mapping and mincore
+output bounds remain independent and unchanged.
+
+Every interval owns a shared, object-sharded sparse store of canonical bytes and
+quota charges. Successive snapshot generations clone that store identity;
+backing-epoch refreshes cannot create competing bytes for the same address.
+Only initial descriptor lookup takes a store shard lock. Byte operations retain
+the existing shared-page region/atomic protocol, with no whole-call lock or
+additional ordinary memory barrier. CPU, native output, bulk copies, exclusive
+operations and pins use that same reached storage and charge.
+
+At joined checkpoints, reached charged pages enter the existing explicit-frame
+and COW representation without copying their bytes. Remaining zero intervals can
+then drop stale stores and snapshot caches. Retained Views prevent that store
+replacement and keep old physical owners alive through unmap/discard; reclamation
+releases their quota after the last View joins. Fork copies a live writer's
+reached pages and otherwise uses the existing Rc COW boundary. Large remap and
+protection operations visit intervals plus explicit reached pages, rather than
+all virtual pages. Software alias refresh also skips absent physical windows.
+
+Worker TLB tokens may contain a tagged pointer to an immutable lazy Frame. Each
+Frame has an Arc owner in an insertion-only snapshot cache; a live View prevents
+unique snapshot replacement, and inserts never move/remove Frame allocations.
+Coordinator wrappers have the equivalent Rc ownership and mapping mutations
+invalidate translations before retirement. No guest address becomes a host
+pointer, and mapped/permission/EOF checks still precede access.
+
+Hardware mapping journals combine explicit-page and VMA intervals into compact
+ranges. Explicit cached chunks retain persistent stamps. Unvisited anonymous
+chunks obtain their range-snapshot generation on demand, without allocating a
+stamp per virtual chunk; joined adoption makes exported leaves explicit before
+normal VMA edits. Both direct deltas and expired-history fallback revalidate
+permissions/storage after sparse changes. Hardware physical exports and S1
+translations still use the existing per-page fault path: native range backing
+and hardware block mappings are a separate subsequent optimization.
+
+Regression coverage includes 64 GiB accessible VMAs with a two-page resident
+budget, large grow/move/shrink, partial permissions/unmap, retained-writer fork,
+cross-generation canonical atomics, discard and delayed quota release. The total
+allocation request for mapping, freezing and partially protecting an untouched
+1 GiB VMA is bounded below 128 KiB by an allocator-instrumented test.

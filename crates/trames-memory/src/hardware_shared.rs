@@ -501,6 +501,7 @@ mod tests {
         drop(view);
         let length = 8192 * PAGE_SIZE;
         memory.map(0x100000, length, Permissions::RW).unwrap();
+        memory.materialize_descriptors(0x100000, length as usize);
         let view = memory.parallel_view(&mut registry).unwrap();
         let mut ranges = view.hardware_mapping_ranges(original).unwrap();
         assert_eq!(ranges.next(), Some(0x100000..0x100000 + length));

@@ -2,6 +2,7 @@
 //! CPU/native views between quiescent kernel checkpoints. Scoped page guards
 //! stay on workers; Rc backings, mappings and persistence stay coordinated.
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
+pub(super) mod anonymous;
 #[cfg(test)]
 mod exclusive;
 mod hardware;
@@ -48,7 +49,7 @@ pub struct Metrics {
     /// Dispatches sharing immutable private pages across CPUs of one VM.
     pub readonly_private_views: u64,
 }
-struct ConcurrentPage {
+pub(super) struct ConcurrentPage {
     identity: u64,
     hardware_constant: std::sync::OnceLock<Arc<SharedPage>>,
     constant: Option<Arc<PageBytes>>,
@@ -97,7 +98,7 @@ impl ConcurrentPage {
             code_epoch,
         }
     }
-    fn mutable(&self) -> Option<&Arc<page::MutablePage>> {
+    pub(super) fn mutable(&self) -> Option<&Arc<page::MutablePage>> {
         self.bytes.as_ref().or_else(|| self.loaded.get())
     }
     fn load(&self) -> Result<(), MemoryError> {
@@ -231,7 +232,7 @@ impl ConcurrentPage {
         }
     }
 }
-struct Frame {
+pub(super) struct Frame {
     base: u64,
     root_frame: usize,
     permissions: Permissions,
@@ -243,8 +244,8 @@ struct Frame {
     native_one_shot: std::sync::atomic::AtomicBool,
     native_live_private: std::sync::atomic::AtomicBool,
     error: Option<MemoryError>,
-    bytes: Arc<ConcurrentPage>,
-    charge: Arc<Charge>,
+    pub(super) bytes: Arc<ConcurrentPage>,
+    pub(super) charge: Arc<Charge>,
     direct: bool,
     hardware_shared_export: bool,
     hardware_track_writes: bool,
@@ -554,6 +555,7 @@ fn prepare_frame(
 }
 
 pub(super) struct Snapshot {
+    pub(super) anonymous: anonymous::Anonymous,
     hardware: bool,
     hardware_generation: u64,
     hardware_chunks: BTreeMap<u64, u64>,
@@ -753,8 +755,7 @@ impl View {
             // SAFETY: a view's snapshot owns an immutable frame slab and page
             // table. Only successfully checked frames populate this view's
             // private TLB. Snapshot refresh creates a new view with empty TLB.
-            debug_assert!(cached.frame < self.snapshot.frames.len());
-            return Ok(unsafe { self.snapshot.frames.get_unchecked(cached.frame) });
+            return Ok(self.snapshot.frame_token(cached.frame));
         }
         self.frame_slow(address, access)
     }
@@ -771,6 +772,22 @@ impl View {
                 .is_some_and(|(_, end)| address < *end)
             {
                 return Err(MemoryError::Permission { address, access });
+            }
+            if let Some(frame) = self.snapshot.anonymous.get(address, access)? {
+                let pointer = frame as *const Frame as usize;
+                assert_eq!(pointer & crate::anonymous::TOKEN, 0);
+                let mut entry = Translation::new(
+                    base,
+                    pointer | crate::anonymous::TOKEN,
+                    frame.permissions,
+                    false,
+                    0,
+                );
+                if frame.charge.resident() {
+                    entry.tag |= Translation::RESIDENT;
+                }
+                self.translations[Translation::slot(base)].set(entry);
+                return Ok(frame);
             }
             return Err(MemoryError::Unmapped(address));
         };
@@ -840,7 +857,7 @@ impl View {
     #[inline]
     fn changed(&self, frame: &Frame, state: &mut page::Guard<'_>, offset: usize, len: usize) {
         frame.bytes.changed(state, offset, len);
-        if len != 0 {
+        if len != 0 && frame.root_frame != usize::MAX {
             let word = &self.snapshot.dirty_pages[frame.root_frame / 64];
             let bit = 1 << (frame.root_frame % 64);
             if word.load(Ordering::Relaxed) & bit == 0 {
@@ -1279,6 +1296,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().parallel_view(registry);
         }
+        self.adopt_anonymous();
         // A resumed runtime can construct a new coordinator registry. Cached
         // shared pages must join that registry's alias/code domain, not silently
         // retain an earlier one while fork peers allocate duplicate snapshots.
@@ -1291,7 +1309,10 @@ impl Memory {
         }
         let backing_revision = backing::backing_revision();
         if let Some(c) = &self.parallel_cache {
-            if c.source_revision == self.revision && c.source_backing_revision == backing_revision {
+            if c.source_revision == self.revision
+                && c.source_backing_revision == backing_revision
+                && !self.parallel_anonymous_dirty
+            {
                 registry.metrics.cache_hits += 1;
                 return Some(View::new(c.snapshot.clone()));
             }
@@ -1305,6 +1326,7 @@ impl Memory {
                 && c.snapshot.identity == self.identity
                 && self.parallel_mappings.is_empty()
                 && !self.parallel_reservations_dirty
+                && !self.parallel_anonymous_dirty
                 && self.parallel_dirty.iter().all(|&index| {
                     let frame =
                         &c.snapshot.frames[c.snapshot.positions[index].expect("dirty frame")];
@@ -1412,7 +1434,10 @@ impl Memory {
                 }
             }
         }
+        let anonymous = anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
+        let anonymous_executable = anonymous.executable();
         let mut snapshot = Snapshot {
+            anonymous,
             hardware: registry.hardware,
             hardware_generation,
             hardware_chunks,
@@ -1421,7 +1446,7 @@ impl Memory {
             hardware_private_dirty: std::sync::atomic::AtomicBool::new(false),
             mmu: mmu::Frozen::default(),
             has_aliases: alias_count != 0,
-            dynamic_code: dynamic_code_pages != 0,
+            dynamic_code: dynamic_code_pages != 0 || anonymous_executable,
             dynamic_code_pages,
             identities,
             alias_count,
@@ -1466,6 +1491,8 @@ impl Memory {
         });
         self.parallel_mappings.clear();
         self.parallel_reservations_dirty = false;
+        self.parallel_anonymous_dirty = false;
+        self.parallel_anonymous_changes.clear();
         for index in self.parallel_dirty.drain(..) {
             if let Some(page) = self.frames[index].as_mut() {
                 page.parallel_dirty = false;
@@ -1482,6 +1509,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().commit_parallel();
         }
+        self.adopt_anonymous();
         let Some(mut cache) = self.parallel_cache.take() else {
             return Ok(());
         };
@@ -1621,7 +1649,9 @@ impl Memory {
         cache.source_revision = self.revision;
         // Retain the captured backing epoch: writes through another mapping
         // may require refreshing an undetached private file view next round.
-        if cache.snapshot.code_revision != self.code_revision || !self.parallel_mappings.is_empty()
+        if cache.snapshot.code_revision != self.code_revision
+            || !self.parallel_mappings.is_empty()
+            || self.parallel_anonymous_dirty
         {
             cache.source_revision = self.revision.wrapping_sub(1);
         }
@@ -1684,6 +1714,14 @@ impl View {
             .hardware_chunks
             .get(&(address / crate::HARDWARE_MAPPING_CHUNK_SIZE))
             .copied()
+            .or_else(|| {
+                let start = address / crate::HARDWARE_MAPPING_CHUNK_SIZE
+                    * crate::HARDWARE_MAPPING_CHUNK_SIZE;
+                self.snapshot
+                    .anonymous
+                    .overlaps(start, start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
+                    .then_some(self.snapshot.hardware_generation)
+            })
     }
     /// Existing hardware storage only: no source load, allocation, quota charge
     /// or byte borrow. The result preserves this View's permission/EOF model.
@@ -1694,7 +1732,11 @@ impl View {
         if !self.hardware_mode {
             return None;
         }
-        let frame = &self.snapshot.frames[*self.snapshot.pages.get(&address)?];
+        let frame = if let Some(&i) = self.snapshot.pages.get(&address) {
+            &self.snapshot.frames[i]
+        } else {
+            self.snapshot.anonymous.cached(address)?
+        };
         if frame.error.is_some() || !frame.charge.resident() || !frame.hardware_shared_export {
             return None;
         }
@@ -1725,14 +1767,21 @@ impl View {
         &self,
         token: crate::HardwareWriteFrame,
     ) -> Result<(), MemoryError> {
-        let position = self
-            .snapshot
-            .positions
-            .get(token.root)
-            .copied()
-            .flatten()
-            .ok_or(MemoryError::InvalidRange)?;
-        let frame = &self.snapshot.frames[position];
+        let frame = if token.root == usize::MAX {
+            self.snapshot
+                .anonymous
+                .cached(token.base)
+                .ok_or(MemoryError::InvalidRange)?
+        } else {
+            let position = self
+                .snapshot
+                .positions
+                .get(token.root)
+                .copied()
+                .flatten()
+                .ok_or(MemoryError::InvalidRange)?;
+            &self.snapshot.frames[position]
+        };
         if token.vm != self.snapshot.identity
             || token.base != frame.base
             || token.storage != frame.bytes.identity
@@ -1750,12 +1799,14 @@ impl View {
         if !address.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::InvalidRange);
         }
-        let index = *self
-            .snapshot
-            .pages
-            .get(&address)
-            .ok_or(MemoryError::Unmapped(address))?;
-        let frame = &self.snapshot.frames[index];
+        let frame = if let Some(&i) = self.snapshot.pages.get(&address) {
+            &self.snapshot.frames[i]
+        } else {
+            self.snapshot
+                .anonymous
+                .metadata(address)?
+                .ok_or(MemoryError::Unmapped(address))?
+        };
         if let Some(error) = &frame.error {
             return Err(error.clone());
         }
@@ -1798,8 +1849,10 @@ impl View {
         }
         frame.bytes.dirty.store(u64::MAX, Ordering::Relaxed);
         frame.bytes.version().fetch_add(1, Ordering::Relaxed);
-        self.snapshot.dirty_pages[frame.root_frame / 64]
-            .fetch_or(1 << (frame.root_frame % 64), Ordering::Relaxed);
+        if frame.root_frame != usize::MAX {
+            self.snapshot.dirty_pages[frame.root_frame / 64]
+                .fetch_or(1 << (frame.root_frame % 64), Ordering::Relaxed);
+        }
         if frame.permissions.execute {
             frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
         }

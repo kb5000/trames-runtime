@@ -500,6 +500,7 @@ impl Memory {
         address: u64,
         len: usize,
     ) -> Result<(), MemoryError> {
+        self.materialize_descriptors(address, len);
         if self.materialize_zero(address, len)? {
             self.invalidate_translations();
         }
@@ -551,9 +552,29 @@ impl Memory {
             .saturating_add(len)
             .saturating_add(granule as u64 - 1)
             & !(granule as u64 - 1);
-        let mut at = begin;
-        while at < end {
-            let stop = end.min((at & !(WINDOW as u64 - 1)) + WINDOW as u64);
+        let window_mask = !(WINDOW as u64 - 1);
+        let mut windows: BTreeSet<_> = self
+            .pages
+            .range(begin..end)
+            .map(|(&base, _)| base & window_mask)
+            .collect();
+        windows.extend(
+            self.mmu
+                .windows
+                .borrow()
+                .range((begin & window_mask)..end)
+                .map(|(&base, _)| base),
+        );
+        windows.extend(
+            self.mmu
+                .unavailable
+                .borrow()
+                .range((begin & window_mask)..end)
+                .copied(),
+        );
+        for window_base in windows {
+            let mut at = begin.max(window_base);
+            let stop = end.min(window_base + WINDOW as u64);
             let Some(window) = self
                 .mmu
                 .window(at, self.pages.range(at..stop).next().is_some())
@@ -569,7 +590,6 @@ impl Memory {
                 }
                 // Huge reserved/hole ranges own no physical windows. Skip the
                 // entire sparse window instead of inspecting every 4KiB page.
-                at = stop;
                 continue;
             };
             if self
@@ -583,7 +603,6 @@ impl Memory {
                 self.mmu.cache.clear();
                 self.mmu.windows.borrow_mut().remove(&window.base);
                 changed = true;
-                at = stop;
                 continue;
             }
             let mapping = window

@@ -146,7 +146,10 @@ fn untouched_worker_pages_release_physical_va_on_fork() {
         .values()
         .map(|window| Arc::downgrade(window.mapping.as_ref().unwrap()))
         .collect();
-    assert!(!physical.is_empty());
+    assert!(
+        physical.is_empty(),
+        "untouched ranges must not allocate CPU windows"
+    );
     let mut registry = crate::parallel::Registry::default();
     let view = parent.parallel_view(&mut registry).unwrap();
     assert_eq!(view.read_array::<8>(base).unwrap(), [0; 8]);

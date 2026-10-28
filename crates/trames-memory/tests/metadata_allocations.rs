@@ -9,11 +9,13 @@ use trames_memory::{parallel::Registry, CpuMemory, Memory, NativeMemory, Permiss
 struct MeasuredAllocator;
 thread_local! {
     static LARGEST: Cell<Option<usize>> = const { Cell::new(None) };
+    static TOTAL: Cell<usize> = const { Cell::new(0) };
 }
 fn record(size: usize) {
     let _ = LARGEST.try_with(|largest| {
         if let Some(previous) = largest.get() {
             largest.set(Some(previous.max(size)));
+            TOTAL.with(|total| total.set(total.get() + size));
         }
     });
 }
@@ -78,4 +80,29 @@ fn large_sparse_vm_fork_and_worker_publication_use_small_allocations() {
     let view = small_allocations(|| memory.parallel_view(&mut registry).unwrap());
     assert_eq!(view.read_array::<1>(address).unwrap(), [0]);
     assert!(!view.native_writable_range(address, 1).unwrap());
+}
+
+#[test]
+fn untouched_gib_mapping_and_worker_snapshots_have_bounded_total_metadata() {
+    let mut memory = Memory::default();
+    let base = 1 << 32;
+    let len = 1 << 30;
+    let mut registry = Registry::default();
+    registry.use_hardware();
+    memory.prepare_hardware().unwrap();
+    TOTAL.set(0);
+    small_allocations(|| {
+        memory.map(base, len, Permissions::RW).unwrap();
+        drop(memory.parallel_view(&mut registry).unwrap());
+        memory
+            .protect(base + PAGE_SIZE, len - 2 * PAGE_SIZE, Permissions::R)
+            .unwrap();
+        drop(memory.parallel_view(&mut registry).unwrap());
+    });
+    assert!(
+        TOTAL.get() < 128 * 1024,
+        "untouched metadata allocated {} bytes",
+        TOTAL.get()
+    );
+    assert_eq!(memory.resident_bytes(), 0);
 }
