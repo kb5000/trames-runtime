@@ -28,6 +28,11 @@ fn requested(memory: &Memory, header: u64) -> Result<u64> {
     Ok(total)
 }
 impl Linux {
+    /// Batch sends can deliver SIGPIPE after earlier messages succeeded, even
+    /// though the syscall returns a positive count instead of the final EPIPE.
+    pub fn take_batch_pipe_signal(&mut self) -> bool {
+        std::mem::take(&mut self.batch_pipe_signal)
+    }
     pub(super) fn send_messages(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         // Linux rejects compat flags, validates fd even for vlen=0, caps vlen,
         // reports completed messages after later errors, and stops on a short
@@ -42,7 +47,7 @@ impl Linux {
         let count = (a[2] as u32).min(1024) as u64;
         let mut completed = 0;
         while completed < count {
-            let send = (|| {
+            let send: Result<bool> = (|| {
                 let header = a[1].checked_add(completed * 64).ok_or(Errno(14))?;
                 let length = requested(memory, header)?;
                 let sent =
@@ -63,11 +68,14 @@ impl Linux {
                     }
                 }
                 Err(error) => {
+                    if error.0 == 32 && flags & 0x4000 == 0 {
+                        self.batch_pipe_signal = true;
+                    }
                     return if completed == 0 {
                         Err(error)
                     } else {
                         Ok(completed)
-                    }
+                    };
                 }
             }
         }

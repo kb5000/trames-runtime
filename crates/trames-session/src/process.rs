@@ -2573,7 +2573,8 @@ impl<C: Cpu> Kernel<C> {
             269 => a[3] & 0x4000 == 0,
             _ => false,
         };
-        if signal_pipe && raw == Some(error(Errno(32))) {
+        let batch_pipe_signal = p.linux.take_batch_pipe_signal();
+        if signal_pipe && raw == Some(error(Errno(32))) || batch_pipe_signal {
             Self::queue_one(pid, p, 13, pid);
         }
         if p.linux.vfs.take_file_size_signal() {

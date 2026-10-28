@@ -3,10 +3,16 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+// Test the syscall itself: musl may implement sendmmsg as a userspace loop.
+#define sendmmsg(fd, messages, count, flags) ((int)syscall(SYS_sendmmsg, fd, messages, count, flags))
+static volatile sig_atomic_t pipes;
+static void pipe_signal(int value) { (void)value; pipes++; }
 int main(void) {
  int fds[2]; assert(!socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, fds));
  char a[]="abc", b[]="xyz", output[8];
@@ -30,5 +36,10 @@ int main(void) {
  assert(sendmmsg(1,0,0,0)==-1 && errno==ENOTSOCK);
  assert(sendmmsg(fds[0],0,0,0)==0);
  assert(!munmap(readonly,4096)); assert(!close(fds[0]) && !close(fds[1]));
- puts("sendmmsg: datagrams, partial progress, length faults, zero-length validation passed");
+ assert(signal(SIGPIPE,pipe_signal)!=SIG_ERR);
+ assert(!socketpair(AF_UNIX,SOCK_STREAM,0,fds)); assert(!close(fds[1]));
+ assert(sendmmsg(fds[0],msg,1,0)==-1 && errno==EPIPE && pipes==1);
+ assert(sendmmsg(fds[0],msg,1,MSG_NOSIGNAL)==-1 && errno==EPIPE && pipes==1);
+ assert(!close(fds[0]));
+ puts("sendmmsg: datagrams, partial progress, length faults, signals, zero-length validation passed");
 }

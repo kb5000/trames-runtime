@@ -21,6 +21,7 @@ pub(crate) struct VectorImport {
 const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 
 pub struct Linux {
+    pub(crate) batch_pipe_signal: bool,
     pub(crate) uring_clock: std::time::Instant,
     pub(crate) uring_active: Vec<std::rc::Weak<trames_vfs::Uring>>,
     pub vfs: Vfs,
@@ -56,6 +57,7 @@ impl Linux {
         shared_vm: bool,
     ) -> Self {
         Self {
+            batch_pipe_signal: false,
             uring_clock: self.uring_clock,
             uring_active: self.uring_active.clone(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
@@ -99,6 +101,7 @@ impl Linux {
     }
     pub fn new(brk_base: u64) -> Self {
         Self {
+            batch_pipe_signal: false,
             uring_clock: std::time::Instant::now(),
             uring_active: Vec::new(),
             vfs: Vfs::default(),
