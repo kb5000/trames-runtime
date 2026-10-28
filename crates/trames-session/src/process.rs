@@ -1302,6 +1302,7 @@ impl<C: Cpu> Kernel<C> {
                             | 207
                             | 211
                             | 212
+                            | 269
                     )
                 {
                     put_args(&mut p.cpu, a);
@@ -2398,6 +2399,7 @@ impl<C: Cpu> Kernel<C> {
                     206 => a[3] & 0x40 != 0,
                     207 => a[3] & (0x40 | 0x2000) != 0,
                     211 => a[2] & 0x40 != 0,
+                    269 => a[3] & 0x40 != 0,
                     212 => a[2] & (0x40 | 0x2000) != 0,
                     _ => false,
                 };
@@ -2407,7 +2409,7 @@ impl<C: Cpu> Kernel<C> {
                 if ((raw == error(Errno(11))
                     && matches!(
                         number,
-                        63 | 64 | 65 | 66 | 71 | 76 | 202 | 203 | 242 | 206 | 207 | 211 | 212
+                        63 | 64 | 65 | 66 | 71 | 76 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269
                     )
                     && !per_call_nonblock)
                     || (raw == error(Errno(115)) && number == 203)
@@ -2417,7 +2419,7 @@ impl<C: Cpu> Kernel<C> {
                     if !matches!(p.state, State::Blocked(..)) {
                         p.socket_deadline = match number {
                             63 | 65 | 202 | 242 | 207 | 212 => Some(true),
-                            64 | 66 | 203 | 206 | 211 => Some(false),
+                            64 | 66 | 203 | 206 | 211 | 269 => Some(false),
                             _ => None,
                         }
                         .and_then(|receive| {
@@ -2568,6 +2570,7 @@ impl<C: Cpu> Kernel<C> {
             64 | 66 | 71 | 76 => true,
             206 => a[3] & 0x4000 == 0,
             211 => a[2] & 0x4000 == 0,
+            269 => a[3] & 0x4000 == 0,
             _ => false,
         };
         if signal_pipe && raw == Some(error(Errno(32))) {
@@ -4308,7 +4311,7 @@ impl<C: Cpu> Kernel<C> {
                         || matches!(p.state, State::Sleep(..))
                         || Self::waits_for_host_stdin(p)
                         || matches!(p.state, State::Blocked(number, a)
-                        if matches!(number, 63 | 64 | 65 | 66 | 202 | 203 | 242 | 206 | 207 | 211 | 212)
+                        if matches!(number, 63 | 64 | 65 | 66 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269)
                         && p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Socket))
                         || matches!(p.state,State::Blocked(76,a)if [a[0],a[2]].iter().any(|fd|p.linux.vfs.fd_kind(*fd as u32).ok()==Some(FdKind::Socket)))
                         || (matches!(p.state, State::Blocked(22 | 72 | 73 | 441, _))
@@ -4396,7 +4399,7 @@ impl<C: Cpu> Kernel<C> {
                     add(a[0] as u32, 1);
                     add(a[2] as u32, 4);
                 }
-                64 | 66 | 203 | 206 | 211 => add(a[0] as u32, 4),
+                64 | 66 | 203 | 206 | 211 | 269 => add(a[0] as u32, 4),
                 73 => {
                     for i in 0..a[1].min(256) {
                         if let (Ok(fd), Ok(events)) = (

@@ -941,6 +941,7 @@ impl Linux {
                 Ok(count as u64)
             }
             198..=212 | 242 => self.network_syscall(number, a, memory),
+            269 => self.send_messages(a, memory),
             65 => self.readv(a, memory, io),
             37 => {
                 if a[4] & !0x400 != 0 {

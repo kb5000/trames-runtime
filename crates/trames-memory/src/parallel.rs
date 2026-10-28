@@ -1628,6 +1628,18 @@ impl View {
     /// Deltas after a previously observed mapping token. None means history
     /// expired or a full snapshot replacement: revalidate the cached mappings.
     pub fn hardware_mapping_changes(&self, since: u64) -> Option<impl Iterator<Item = u64> + '_> {
+        Some(
+            self.hardware_mapping_ranges(since)?
+                .flat_map(|range| range.step_by(PAGE_SIZE as usize)),
+        )
+    }
+    /// Bounded interval journal for hardware backends. Intersect with cached
+    /// mappings rather than enumerating untouched pages in a large changed VMA.
+    /// Intervals from different updates can overlap or arrive out of order.
+    pub fn hardware_mapping_ranges(
+        &self,
+        since: u64,
+    ) -> Option<impl Iterator<Item = std::ops::Range<u64>> + '_> {
         let changes = &self.snapshot.hardware_changes;
         let start = if since == self.snapshot.hardware_generation {
             changes.len()
@@ -1638,7 +1650,7 @@ impl View {
             changes
                 .iter()
                 .skip(start)
-                .flat_map(|change| change.addresses.iter().copied()),
+                .flat_map(|change| change.ranges.iter().cloned()),
         )
     }
     /// Existing hardware storage only: no source load, allocation, quota charge

@@ -490,6 +490,38 @@ mod tests {
     }
 
     #[test]
+    fn large_contiguous_vma_changes_keep_a_compact_hardware_journal() {
+        use crate::{Memory, Permissions};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let original = view.hardware_view_version().0;
+        drop(view);
+        let length = 8192 * PAGE_SIZE;
+        memory.map(0x100000, length, Permissions::RW).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let mut ranges = view.hardware_mapping_ranges(original).unwrap();
+        assert_eq!(ranges.next(), Some(0x100000..0x100000 + length));
+        assert!(ranges.next().is_none());
+        drop(ranges);
+        assert_eq!(
+            view.hardware_mapping_changes(original).unwrap().count(),
+            8192
+        );
+        drop(view);
+        memory.unmap(0x100000, length).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let ranges: Vec<_> = view.hardware_mapping_ranges(original).unwrap().collect();
+        assert!(!ranges.is_empty());
+        assert!(ranges
+            .iter()
+            .all(|range| range == &(0x100000..0x100000 + length)));
+        assert_eq!(memory.resident_bytes(), 0);
+    }
+
+    #[test]
     fn private_hardware_ram_is_canonical_without_per_page_fake_dirty_writes() {
         use crate::{Memory, Permissions};
         let mut memory = Memory::default();

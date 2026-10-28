@@ -554,3 +554,16 @@ aliases (including a private COW alias) at 8, 256 and 1024 file pages. Truncatio
 checks all aliases and preserves SIGBUS. The Mac
 [mapping-scope checkpoint](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-windows.md#local-mapping-scope-and-backing-ranges-2026-10-28)
 records the real Linux comparison and platform acceptance.
+
+
+### Hardware mapping change intervals
+
+Hardware-only mapping history coalesces ordered changed pages into address
+intervals. Its metadata budget counts intervals, with the existing bounded
+update history, rather than counting pages in a large contiguous VMA. Backends
+can intersect these intervals with their retained PTEs without walking untouched
+pages or unrelated code/data. Overlapping updates can repeat intervals; consumers
+merge/intersect them before inspecting leaves. Expired history and full snapshot
+replacement still require complete revalidation. The compatibility page iterator
+expands the same intervals for older consumers. Software interpreter Views do
+not build this journal. No byte-visibility, permission or concurrency rule changes.

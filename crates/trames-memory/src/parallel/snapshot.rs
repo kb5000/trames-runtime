@@ -89,32 +89,43 @@ impl BackingIndex {
 
 pub(super) struct HardwareChange {
     pub(super) before: u64,
-    pub(super) addresses: Vec<u64>,
+    pub(super) ranges: Vec<std::ops::Range<u64>>,
 }
 impl Snapshot {
     fn note_hardware_changes(&mut self, addresses: impl Iterator<Item = u64>) {
         if !self.hardware {
             return;
         }
-        let addresses: Vec<_> = addresses.collect();
-        if addresses.is_empty() {
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        // Both callers walk ordered page maps/sets. Bound representation by
+        // changed intervals, so a large contiguous VMA does not erase history.
+        for address in addresses {
+            if let Some(last) = ranges.last_mut() {
+                debug_assert!(address >= last.start);
+                if address <= last.end {
+                    last.end = last.end.max(address + PAGE_SIZE);
+                    continue;
+                }
+            }
+            ranges.push(address..address + PAGE_SIZE);
+            if ranges.len() > 4096 {
+                self.hardware_generation = new_backing_identity();
+                self.hardware_changes.clear();
+                return;
+            }
+        }
+        if ranges.is_empty() {
             return;
         }
         let before = self.hardware_generation;
         self.hardware_generation = new_backing_identity();
-        // A lagging worker falls back to a full reconciliation, never silently
-        // skips invalidation. Bound both history length and retained addresses.
-        if addresses.len() > 4096 {
-            self.hardware_changes.clear();
-            return;
-        }
         self.hardware_changes
-            .push_back(HardwareChange { before, addresses });
+            .push_back(HardwareChange { before, ranges });
         while self.hardware_changes.len() > 32
             || self
                 .hardware_changes
                 .iter()
-                .map(|c| c.addresses.len())
+                .map(|c| c.ranges.len())
                 .sum::<usize>()
                 > 4096
         {
