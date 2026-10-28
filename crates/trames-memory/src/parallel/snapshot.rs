@@ -96,10 +96,38 @@ impl Snapshot {
         if !self.hardware {
             return;
         }
+        let mut addresses = addresses.peekable();
+        if addresses.peek().is_none() {
+            return;
+        }
+        let before = self.hardware_generation;
+        self.hardware_generation = new_backing_identity();
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        // Both callers walk ordered page maps/sets. Bound representation by
-        // changed intervals, so a large contiguous VMA does not erase history.
+        let mut last_chunk = None;
+        let mut overflow = false;
+        // Callers have finished all removals/replacements. Keep stamps only for
+        // currently mapped chunks, so sparse VA churn cannot grow tombstones.
+        // Metadata is immutable throughout a worker epoch; no new data barrier
+        // or hardware/storage owner is involved.
         for address in addresses {
+            let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            if last_chunk != Some(chunk) {
+                let start = chunk * crate::HARDWARE_MAPPING_CHUNK_SIZE;
+                if self
+                    .pages
+                    .range(start..start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
+                    .next()
+                    .is_some()
+                {
+                    self.hardware_chunks.insert(chunk, self.hardware_generation);
+                } else {
+                    self.hardware_chunks.remove(&chunk);
+                }
+                last_chunk = Some(chunk);
+            }
+            if overflow {
+                continue; // still update all persistent chunk stamps
+            }
             if let Some(last) = ranges.last_mut() {
                 debug_assert!(address >= last.start);
                 if address <= last.end {
@@ -109,16 +137,14 @@ impl Snapshot {
             }
             ranges.push(address..address + PAGE_SIZE);
             if ranges.len() > 4096 {
-                self.hardware_generation = new_backing_identity();
-                self.hardware_changes.clear();
-                return;
+                ranges.clear();
+                overflow = true;
             }
         }
-        if ranges.is_empty() {
+        if overflow {
+            self.hardware_changes.clear();
             return;
         }
-        let before = self.hardware_generation;
-        self.hardware_generation = new_backing_identity();
         self.hardware_changes
             .push_back(HardwareChange { before, ranges });
         while self.hardware_changes.len() > 32
@@ -212,10 +238,10 @@ impl Memory {
                 }) && snapshot.pages.contains_key(base)
             })
             .collect();
-        snapshot.note_hardware_changes(retired.iter().copied());
         for base in &retired {
             drop(snapshot.remove_frame(*base));
         }
+        snapshot.note_hardware_changes(retired.iter().copied());
         snapshot.refresh_mmu(retired.iter().copied());
         snapshot.has_aliases = snapshot.alias_count != 0;
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
@@ -384,7 +410,6 @@ impl Memory {
             .iter()
             .filter_map(|&base| snapshot.remove_frame(base).map(|frame| (base, frame)))
             .collect();
-        snapshot.note_hardware_changes(changed.iter().copied());
         let mmu_changed: Slots<_> = changed.iter().copied().collect();
         for base in changed {
             let Some(&root_frame) = self.pages.get(&base) else {
@@ -411,6 +436,7 @@ impl Memory {
             )?;
             snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
         }
+        snapshot.note_hardware_changes(mmu_changed.iter().copied());
         snapshot.refresh_mmu(mmu_changed);
         snapshot.has_aliases = snapshot.alias_count != 0;
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0;
@@ -437,6 +463,101 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_chunk_versions_survive_journal_expiry_without_retaining_holes() {
+        let mut memory = Memory::default();
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        memory.prepare_hardware().unwrap();
+        let a = PAGE_SIZE;
+        let b = 2 * crate::HARDWARE_MAPPING_CHUNK_SIZE;
+        memory.map(a, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(b, PAGE_SIZE, Permissions::RW).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let old = view.hardware_view_version().0;
+        let unchanged = view.hardware_mapping_chunk_version(a).unwrap();
+        let changed = view.hardware_mapping_chunk_version(b).unwrap();
+        drop(view);
+        for i in 0..80 {
+            memory
+                .protect(
+                    b,
+                    PAGE_SIZE,
+                    if i % 2 == 0 {
+                        Permissions::R
+                    } else {
+                        Permissions::RW
+                    },
+                )
+                .unwrap();
+            drop(memory.parallel_view(&mut registry).unwrap());
+        }
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(view.hardware_mapping_ranges(old).is_none());
+        assert_eq!(view.hardware_mapping_chunk_version(a), Some(unchanged));
+        assert_ne!(view.hardware_mapping_chunk_version(b), Some(changed));
+        drop(view);
+        memory.unmap(b, PAGE_SIZE).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.hardware_mapping_chunk_version(b), None);
+        assert_eq!(view.snapshot.hardware_chunks.len(), 1);
+        drop(view);
+        // Sparse addresses must not accumulate permanent invalidation tombstones.
+        for i in 2..82 {
+            let address = i * crate::HARDWARE_MAPPING_CHUNK_SIZE;
+            memory.map(address, PAGE_SIZE, Permissions::RW).unwrap();
+            let view = memory.parallel_view(&mut registry).unwrap();
+            let version = view.hardware_mapping_chunk_version(address).unwrap();
+            assert_ne!(version, changed);
+            assert_eq!(view.snapshot.hardware_chunks.len(), 2);
+            drop(view);
+            memory.unmap(address, PAGE_SIZE).unwrap();
+            let view = memory.parallel_view(&mut registry).unwrap();
+            assert_eq!(view.snapshot.hardware_chunks.len(), 1);
+            assert_eq!(view.hardware_mapping_chunk_version(address), None);
+            drop(view);
+        }
+        // A replacement snapshot has no shared history; even steady chunks get
+        // fresh stamps, so an executor cannot mistake it for its previous schema.
+        let mut replacement = Registry::default();
+        replacement.use_hardware();
+        let view = memory.parallel_view(&mut replacement).unwrap();
+        assert_ne!(view.hardware_mapping_chunk_version(a), Some(unchanged));
+        assert_eq!(memory.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn hardware_chunk_stamps_cover_interval_overflow_and_stay_absent_in_software_views() {
+        let mut memory = Memory::default();
+        let mut registry = Registry::default();
+        memory
+            .map(PAGE_SIZE, 8194 * PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(view.snapshot.hardware_chunks.is_empty());
+        drop(view);
+        registry.use_hardware();
+        memory.prepare_hardware().unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        let old = view.hardware_view_version().0;
+        drop(view);
+        for page in (1..8195).step_by(2) {
+            memory
+                .protect(page * PAGE_SIZE, PAGE_SIZE, Permissions::R)
+                .unwrap();
+        }
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(view.hardware_mapping_ranges(old).is_none());
+        for chunk in 0..17 {
+            assert_eq!(
+                view.hardware_mapping_chunk_version(chunk * crate::HARDWARE_MAPPING_CHUNK_SIZE),
+                Some(view.hardware_view_version().0)
+            );
+        }
+        assert_eq!(view.snapshot.hardware_chunks.len(), 17);
+        assert_eq!(memory.resident_bytes(), 0);
+    }
 
     #[test]
     fn unversioned_provider_storage_replacement_keeps_the_conservative_refresh() {

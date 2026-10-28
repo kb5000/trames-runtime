@@ -444,9 +444,10 @@ is not a reason for a hardware consumer to flush every executable page.
 
 The common frozen View exposes a mapping token independently of joined dirty
 publication. Data-only refresh preserves that token. Incremental metadata
-updates record affected virtual addresses in a bounded history (32 batches and
-4,096 addresses). A lagging consumer or full snapshot replacement gets an
-explicit full-reconciliation fallback. This history neither retains physical
+updates record changed intervals in a bounded history (32 batches and
+4,096 intervals). A lagging consumer can compare persistent 2 MiB chunk stamps
+when that history expires. Full snapshot replacement changes all live stamps.
+This metadata neither retains physical
 RAM nor adds per-instruction tracking. Checked write-frame tokens use stable
 root indices plus VM/VA/storage identity to publish dirty metadata without a
 repeated virtual-address lookup; stale or revoked membership is rejected.
@@ -563,7 +564,22 @@ intervals. Its metadata budget counts intervals, with the existing bounded
 update history, rather than counting pages in a large contiguous VMA. Backends
 can intersect these intervals with their retained PTEs without walking untouched
 pages or unrelated code/data. Overlapping updates can repeat intervals; consumers
-merge/intersect them before inspecting leaves. Expired history and full snapshot
-replacement still require complete revalidation. The compatibility page iterator
-expands the same intervals for older consumers. Software interpreter Views do
-not build this journal. No byte-visibility, permission or concurrency rule changes.
+merge/intersect them before inspecting leaves. The compatibility page iterator
+expands the same intervals for older consumers.
+
+A persistent metadata stamp per currently mapped 2 MiB chunk bounds the fallback
+for CPUs that miss more than the journal retains. `hardware_mapping_chunk_version`
+returns the stamp, or None for a chunk with no mapped pages. Backends compare
+cached stamps and inspect leaves only in changed chunks. Installing a single
+leaf must not acknowledge old unchecked leaves in the same chunk. This is a
+coarse invalidation hint, never a substitute for existing per-page permissions,
+storage identity or live EOF checks. A full snapshot replacement assigns fresh
+stamps to every live chunk. Removed chunks leave no tombstones, byte owners or
+quota charges; metadata stays bounded by currently mapped chunks under sparse
+address churn. Software interpreter Views build neither the journal nor chunk
+stamps. No byte-visibility, permission or concurrency rule changes.
+
+Validation includes 80 missed updates, journal interval overflow, sparse chunk
+removal/reuse, snapshot replacement and zero untouched-page residency. The Mac
+signed acceptance also checks that late CPUs skip unrelated cached chunks while
+still observing read-only protection, unmap and fresh bytes after address reuse.

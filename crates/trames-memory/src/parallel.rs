@@ -556,6 +556,7 @@ fn prepare_frame(
 pub(super) struct Snapshot {
     hardware: bool,
     hardware_generation: u64,
+    hardware_chunks: BTreeMap<u64, u64>,
     hardware_changes: std::collections::VecDeque<snapshot::HardwareChange>,
     hardware_writes: AtomicU64,
     hardware_private_dirty: std::sync::atomic::AtomicBool,
@@ -1393,9 +1394,22 @@ impl Memory {
             frames.push(frame);
         }
         let dynamic_code_pages = frames.iter().filter(|frame| frame.dynamic_code).count();
+        let hardware_generation = new_backing_identity();
+        let mut hardware_chunks = BTreeMap::new();
+        if registry.hardware {
+            let mut last = None;
+            for &address in pages.keys() {
+                let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+                if last != Some(chunk) {
+                    hardware_chunks.insert(chunk, hardware_generation);
+                    last = Some(chunk);
+                }
+            }
+        }
         let mut snapshot = Snapshot {
             hardware: registry.hardware,
-            hardware_generation: new_backing_identity(),
+            hardware_generation,
+            hardware_chunks,
             hardware_changes: Default::default(),
             hardware_writes: AtomicU64::new(0),
             hardware_private_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -1652,6 +1666,18 @@ impl View {
                 .skip(start)
                 .flat_map(|change| change.ranges.iter().cloned()),
         )
+    }
+    /// Persistent metadata stamp for the 2MiB chunk containing `address`.
+    /// Unlike the bounded interval journal this survives arbitrarily many joined
+    /// updates. None means no mapped page in the chunk. Full snapshot replacement
+    /// changes every live stamp; removed chunks retain no tombstone or RAM owner.
+    /// This is an invalidation hint only; page permissions/storage still come
+    /// from hardware_page_info. No guest byte is loaded, allocated or charged.
+    pub fn hardware_mapping_chunk_version(&self, address: u64) -> Option<u64> {
+        self.snapshot
+            .hardware_chunks
+            .get(&(address / crate::HARDWARE_MAPPING_CHUNK_SIZE))
+            .copied()
     }
     /// Existing hardware storage only: no source load, allocation, quota charge
     /// or byte borrow. The result preserves this View's permission/EOF model.

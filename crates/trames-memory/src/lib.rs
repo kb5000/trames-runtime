@@ -33,6 +33,8 @@ use std::{
 };
 
 pub const PAGE_SIZE: u64 = 4096;
+/// Coarse metadata versioning for hardware translation caches, not RAM allocation.
+pub const HARDWARE_MAPPING_CHUNK_SIZE: u64 = 512 * PAGE_SIZE;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
 pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 /// Independent bound on the current page-descriptor representation. Virtual
