@@ -646,7 +646,7 @@ mod tests {
         assert!(view.exclusive_write(0x1000, &[9; 8], Some(first)).unwrap());
         {
             let frame = view.frame(0x1000, Access::Write).unwrap();
-            let _guard = frame.bytes.bytes.as_ref().unwrap().lock(0, 4096);
+            let _guard = frame.bytes.mutable().unwrap().lock(0, 4096);
             frame.bytes.version().store(u64::MAX - 1, Ordering::Relaxed);
         }
         view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();

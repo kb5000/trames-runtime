@@ -685,7 +685,7 @@ impl Linux {
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let len = Self::page_length(a[1])?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
-        if !reservation && len > memory.limit() as u64 {
+        if !reservation && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
             return Err(Errno(12));
         }
         let flags = a[3];
@@ -779,7 +779,7 @@ impl Linux {
             return Err(Errno(22));
         }
         let reservation = memory.is_reserved(a[0], old_len);
-        if !reservation && new_len > memory.limit() as u64 {
+        if !reservation && new_len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
             return Err(Errno(12));
         }
         let fixed = a[3] & 2 != 0;
@@ -1483,7 +1483,7 @@ impl Linux {
                     };
                 }
                 let len = Self::page_length(a[1])?;
-                if len > memory.limit() as u64 {
+                if len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
                     return Err(Errno(12));
                 }
                 let resident = memory.resident(a[0], len).map_err(Self::memory_errno)?;
@@ -1625,16 +1625,37 @@ mod tests {
         assert_eq!(linux.vfs.pread(fd, 6, 0).unwrap(), b"xbcdef");
     }
     #[test]
-    fn mmap_uses_configured_budget_instead_of_the_legacy_half_gib_cap() {
+    fn mmap_virtual_capacity_is_independent_of_the_resident_budget() {
         let mut linux = Linux::new(0);
-        let mut memory = Memory::new(1024 * 1024 * 1024);
-        // Invalid flags must reach validation with a permitted large length;
-        // no host allocation is needed to detect an obsolete fixed quota.
+        let mut memory = Memory::new(PAGE_SIZE as usize);
+        // Length admission must not confuse virtual bytes with resident RAM.
         let args = [0, 513 * 1024 * 1024, 3, 0, 0, 0];
         assert_eq!(linux.mmap(args, &mut memory), Err(Errno(22)));
-        memory.set_limit(512 * 1024 * 1024).unwrap();
-        assert_eq!(linux.mmap(args, &mut memory), Err(Errno(12)));
-        assert_eq!(memory.mapped_bytes(), 0);
+        assert_eq!(
+            linux.mmap(
+                [
+                    0,
+                    trames_memory::MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
+                    3,
+                    0x22,
+                    u64::MAX,
+                    0
+                ],
+                &mut memory
+            ),
+            Err(Errno(12))
+        );
+        let base = linux
+            .mmap([0, 32 * PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut memory)
+            .unwrap();
+        assert_eq!(memory.mapped_bytes(), 32 * PAGE_SIZE as usize);
+        assert_eq!(memory.resident_bytes(), 0);
+        memory.write(base, b"x").unwrap();
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(
+            memory.write(base + PAGE_SIZE, b"y"),
+            Err(MemoryError::Limit)
+        );
     }
     #[test]
     fn munmap_metadata_exhaustion_returns_enomem_and_retains_the_range() {
@@ -2065,7 +2086,13 @@ mod tests {
         assert_eq!(parent.brk(0x2000, &mut memory), 0x2000);
         assert_eq!(shared_query.get(), 0x2000);
         assert_eq!(private_query.get(), 0x1000);
-        assert_eq!(shared.brk(0x100000, &mut memory), 0x2000);
+        assert_eq!(
+            shared.brk(
+                trames_memory::MAX_DESCRIBED_BYTES as u64 + 0x2000,
+                &mut memory
+            ),
+            0x2000
+        );
         assert_eq!(shared_query.get(), 0x2000);
 
         let first = parent
@@ -2078,7 +2105,17 @@ mod tests {
         assert_eq!(second, first + PAGE_SIZE);
         let before = parent.heap_context();
         assert_eq!(
-            shared.mmap([0, 9 * PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut memory),
+            shared.mmap(
+                [
+                    0,
+                    trames_memory::MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
+                    3,
+                    0x22,
+                    u64::MAX,
+                    0
+                ],
+                &mut memory
+            ),
             Err(Errno(12))
         );
         assert_eq!(parent.heap_context(), before);
@@ -2098,9 +2135,16 @@ mod tests {
         let mut m = Memory::new(4096);
         assert_eq!(linux.brk(0x1800, &mut m), 0x1800);
         m.write(0x1000, b"x").unwrap();
-        assert_eq!(linux.brk(0x3000, &mut m), 0x1800);
+        assert_eq!(
+            linux.brk(trames_memory::MAX_DESCRIBED_BYTES as u64 + 0x2000, &mut m),
+            0x1800
+        );
         assert_eq!(m.mapped_bytes(), 4096);
-        assert_eq!(linux.brk(0x800, &mut m), 0x1800);
+        assert_eq!(m.read_array::<1>(0x1000), Ok(*b"x"));
+        assert_eq!(linux.brk(0x3000, &mut m), 0x3000);
+        assert_eq!(m.resident_bytes(), 4096);
+        assert_eq!(m.write(0x2000, b"y"), Err(MemoryError::Limit));
+        assert_eq!(linux.brk(0x800, &mut m), 0x3000);
         assert_eq!(linux.brk(0x1000, &mut m), 0x1000);
         assert_eq!(m.mapped_bytes(), 0);
     }

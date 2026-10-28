@@ -300,10 +300,7 @@ fn initial_stack_bytes<C: Cpu>(
         argv,
         envp,
         credentials,
-        trames_execution::Features {
-            hwcap: C::FEATURES.hwcap,
-            hwcap2: C::FEATURES.hwcap2,
-        },
+        C::features(),
         &extra,
         exec_filename,
     )

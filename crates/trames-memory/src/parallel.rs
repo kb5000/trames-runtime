@@ -53,6 +53,9 @@ struct ConcurrentPage {
     hardware_constant: std::sync::OnceLock<Arc<SharedPage>>,
     constant: Option<Arc<PageBytes>>,
     bytes: Option<Arc<page::MutablePage>>,
+    loaded: std::sync::OnceLock<Arc<page::MutablePage>>,
+    source: Option<Arc<dyn PageSource>>,
+    private_source: bool,
     dirty: AtomicU64,
     version: AtomicU64,
     executable: std::sync::atomic::AtomicBool,
@@ -64,6 +67,9 @@ impl ConcurrentPage {
             identity: bytes.identity,
             hardware_constant: Default::default(),
             bytes: Some(bytes),
+            loaded: Default::default(),
+            source: None,
+            private_source: false,
             constant: None,
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
@@ -71,10 +77,54 @@ impl ConcurrentPage {
             code_epoch,
         }
     }
+    fn deferred(
+        identity: u64,
+        source: Arc<dyn PageSource>,
+        private_source: bool,
+        code_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            identity,
+            hardware_constant: Default::default(),
+            constant: None,
+            bytes: None,
+            loaded: Default::default(),
+            source: Some(source),
+            private_source,
+            dirty: AtomicU64::new(0),
+            version: AtomicU64::new(0),
+            executable: std::sync::atomic::AtomicBool::new(false),
+            code_epoch,
+        }
+    }
+    fn mutable(&self) -> Option<&Arc<page::MutablePage>> {
+        self.bytes.as_ref().or_else(|| self.loaded.get())
+    }
+    fn load(&self) -> Result<(), MemoryError> {
+        if self.source.is_none() {
+            return Ok(());
+        }
+        if self.loaded.get().is_none() {
+            if let Some(source) = &self.source {
+                let page = source.load()?;
+                let page = if self.private_source {
+                    Arc::new(if page.unmaterialized_zero() {
+                        SharedPage::zero()
+                    } else {
+                        SharedPage::new(page.snapshot())
+                    })
+                } else {
+                    page
+                };
+                // One retained winner; losing first-access proposals are simply
+                // dropped. No coordinator or busy-wait service is introduced.
+                let _ = self.loaded.set(page);
+            }
+        }
+        Ok(())
+    }
     fn version(&self) -> &AtomicU64 {
-        self.bytes
-            .as_ref()
-            .map_or(&self.version, |bytes| &bytes.version)
+        self.mutable().map_or(&self.version, |bytes| &bytes.version)
     }
     fn new(
         bytes: [u8; PAGE_SIZE as usize],
@@ -115,6 +165,9 @@ impl ConcurrentPage {
             hardware_constant: Default::default(),
             constant: immutable,
             bytes: mutable,
+            loaded: Default::default(),
+            source: None,
+            private_source: false,
             dirty: AtomicU64::new(0),
             version: AtomicU64::new(0),
             executable: std::sync::atomic::AtomicBool::new(false),
@@ -161,8 +214,7 @@ impl ConcurrentPage {
             return;
         }
         let mut guard = self
-            .bytes
-            .as_ref()
+            .mutable()
             .expect("mutable page")
             .lock(0, PAGE_SIZE as usize);
         {
@@ -196,6 +248,7 @@ struct Frame {
     direct: bool,
     hardware_shared_export: bool,
     hardware_track_writes: bool,
+    backed: bool,
     dynamic_code: bool,
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
     private_access: u8,
@@ -237,7 +290,7 @@ fn direct_matches(page: &Page, frame: &Frame) -> bool {
     storage
         .as_ref()
         .or_else(|| page.bytes.shared())
-        .zip(frame.bytes.bytes.as_ref())
+        .zip(frame.bytes.mutable())
         .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
 }
 
@@ -251,14 +304,20 @@ fn prepare_frame(
 ) -> Option<Frame> {
     let error = page.check_backing(base).err();
     let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
+    let source = page
+        .backing
+        .as_ref()
+        .filter(|backing| !backing.private_copy && error.is_none())
+        .and_then(|backing| backing.object.page_source());
     let resident_backing = page
         .backing
         .as_ref()
         .filter(|b| b.shared || (!b.private_copy && !page.permissions.write))
         .filter(|_| error.is_none())
         .and_then(|b| b.object.shared_page());
-    let hardware_shared_export =
-        page.backing.as_ref().is_none_or(|b| !b.shared) || resident_backing.is_some();
+    let hardware_shared_export = page.backing.as_ref().is_none_or(|b| !b.shared)
+        || resident_backing.is_some()
+        || source.is_some();
     let key = page
         .backing
         .as_ref()
@@ -278,27 +337,56 @@ fn prepare_frame(
         .backing
         .as_ref()
         .is_none_or(|b| !b.shared && b.private_copy);
-    let direct = direct_owned || resident_backing.is_some();
-    let bytes = if let Some(shared) = resident_backing {
+    let direct = direct_owned
+        || resident_backing.is_some()
+        || (source.is_some()
+            && page
+                .backing
+                .as_ref()
+                .is_some_and(|b| b.shared || !page.permissions.write));
+    let bytes = if let Some(source) = source {
+        let private = page
+            .backing
+            .as_ref()
+            .is_some_and(|b| !b.shared && page.permissions.write);
+        let source_key = page.backing.as_ref().and_then(|b| b.object.parallel_key());
+        let reused = same.map(|frame| frame.bytes.clone()).or_else(|| {
+            (!private)
+                .then(|| {
+                    source_key
+                        .and_then(|key| registry.shared.get(&key))
+                        .and_then(Weak::upgrade)
+                })
+                .flatten()
+        });
+        let bytes = reused.unwrap_or_else(|| {
+            Arc::new(ConcurrentPage::deferred(
+                if private {
+                    new_backing_identity()
+                } else {
+                    source_key.map_or_else(new_backing_identity, |key| key.0)
+                },
+                source,
+                private,
+                registry.code_epoch.clone(),
+            ))
+        });
+        if !private {
+            if let Some(key) = source_key {
+                registry.shared.insert(key, Arc::downgrade(&bytes));
+            }
+        }
+        bytes
+    } else if let Some(shared) = resident_backing {
         registry.metrics.shared_frames += 1;
         let previous = previous.map(|f| &f.bytes);
         let reused = previous
-            .filter(|bytes| {
-                bytes
-                    .bytes
-                    .as_ref()
-                    .is_some_and(|old| Arc::ptr_eq(old, &shared))
-            })
+            .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
             .cloned()
             .or_else(|| {
                 key.and_then(|key| registry.shared.get(&key))
                     .and_then(Weak::upgrade)
-                    .filter(|bytes| {
-                        bytes
-                            .bytes
-                            .as_ref()
-                            .is_some_and(|old| Arc::ptr_eq(old, &shared))
-                    })
+                    .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
             });
         let bytes = reused.unwrap_or_else(|| {
             Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
@@ -340,8 +428,7 @@ fn prepare_frame(
         if let Some(previous) = previous.filter(|f| {
             f.direct
                 && f.bytes
-                    .bytes
-                    .as_ref()
+                    .mutable()
                     .is_some_and(|old| Arc::ptr_eq(old, &shared))
         }) {
             previous.bytes.clone()
@@ -411,12 +498,15 @@ fn prepare_frame(
     let private_unique = direct_owned
         && Rc::strong_count(&page.bytes) == 1
         && bytes
-            .bytes
-            .as_ref()
+            .mutable()
             .is_some_and(|bytes| Arc::strong_count(bytes) == 2);
     Some(Frame {
         base,
         root_frame,
+        backed: page
+            .backing
+            .as_ref()
+            .is_some_and(|backing| backing.object.charge_reads()),
         permissions: page.permissions,
         code_revision: page.instruction_revision,
         data_revision: AtomicU64::new(page.data_revision),
@@ -622,7 +712,7 @@ impl View {
         offset: usize,
         len: usize,
     ) -> page::Guard<'a> {
-        let storage = bytes.bytes.as_ref().expect("mutable page");
+        let storage = bytes.mutable().expect("mutable page");
         let mode = self.private_mode as u8 & private_access;
         if mode != 0 {
             // SAFETY: admission proves exclusive or immutable epoch ownership;
@@ -641,7 +731,7 @@ impl View {
         b: usize,
         len: usize,
     ) -> page::Guard<'a> {
-        let storage = bytes.bytes.as_ref().expect("mutable page");
+        let storage = bytes.mutable().expect("mutable page");
         let mode = self.private_mode as u8 & private_access;
         if mode != 0 {
             // SAFETY: same epoch/physical ownership proof for both subranges.
@@ -722,7 +812,12 @@ impl View {
         if len > PAGE_SIZE as usize - offset {
             return Err(MemoryError::InvalidRange);
         }
-        Ok((self.frame(address, access)?, offset))
+        let frame = self.frame(address, access)?;
+        self.load_frame(frame)?;
+        if frame.backed {
+            frame.charge.ensure()?;
+        }
+        Ok((frame, offset))
     }
     #[inline]
     fn read_fragment(&self, frame: &Frame, offset: usize, out: &mut [u8]) {
@@ -732,8 +827,7 @@ impl View {
             if self.hardware_mode {
                 frame
                     .bytes
-                    .bytes
-                    .as_ref()
+                    .mutable()
                     .expect("hardware page")
                     .copy_read(offset, out);
             } else {
@@ -757,6 +851,12 @@ impl View {
             }
         }
     }
+    fn load_frame(&self, frame: &Frame) -> Result<(), MemoryError> {
+        if frame.backed && frame.bytes.source.is_some() && frame.bytes.loaded.get().is_none() {
+            frame.charge.check_available()?;
+        }
+        frame.bytes.load()
+    }
     fn ensure_resident(&self, frame: &Frame) -> Result<(), MemoryError> {
         // Residency is monotonic for the lifetime of this immutable frame.
         // CPU software stores and native chunks reuse the same paid TLB bit as
@@ -766,6 +866,7 @@ impl View {
         if entry.matches(frame.base, Translation::RESIDENT) {
             return Ok(());
         }
+        self.load_frame(frame)?;
         frame.charge.ensure()?;
         if entry.matches(frame.base, Translation::VALID) {
             entry.tag |= Translation::RESIDENT;
@@ -778,6 +879,10 @@ impl View {
         let mut done = 0;
         while done < out.len() {
             let frame = self.frame(address, Access::Read)?;
+            self.load_frame(frame)?;
+            if frame.backed {
+                frame.charge.ensure()?;
+            }
             let offset = (address % PAGE_SIZE) as usize;
             let len = (out.len() - done).min(PAGE_SIZE as usize - offset);
             self.read_fragment(frame, offset, &mut out[done..done + len]);
@@ -836,8 +941,7 @@ impl View {
         if self.hardware_mode {
             let mut raw = frame
                 .bytes
-                .bytes
-                .as_ref()
+                .mutable()
                 .expect("hardware page")
                 .raw_lock(offset, input.len());
             raw.write_from(offset, input);
@@ -853,7 +957,11 @@ impl View {
 impl CpuMemory for View {
     fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
         let address = address & 0x00ff_ffff_ffff_ffff;
-        self.reached(address, 4, Access::Read)?;
+        Memory::end(address, 4)?;
+        if 4 > PAGE_SIZE - address % PAGE_SIZE {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.frame(address, Access::Read)?;
         Ok(self
             .snapshot
             .backings
@@ -1018,7 +1126,8 @@ impl CpuMemory for View {
         if !address.is_multiple_of(4) {
             return Err(MemoryError::Alignment(address));
         }
-        let (frame, _) = self.reached(address, 4, Access::Execute)?;
+        Memory::end(address, 4)?;
+        let frame = self.frame(address, Access::Execute)?;
         Ok((
             self.snapshot.identity,
             frame.bytes.identity,
@@ -1412,8 +1521,7 @@ impl Memory {
                     } else {
                         let guard = frame
                             .bytes
-                            .bytes
-                            .as_ref()
+                            .mutable()
                             .expect("dirty writable page")
                             .lock(0, PAGE_SIZE as usize);
                         while dirty != 0 {
@@ -1532,6 +1640,26 @@ impl View {
                 .skip(start)
                 .flat_map(|change| change.addresses.iter().copied()),
         )
+    }
+    /// Existing hardware storage only: no source load, allocation, quota charge
+    /// or byte borrow. The result preserves this View's permission/EOF model.
+    pub fn retained_hardware_page(
+        &self,
+        address: u64,
+    ) -> Option<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo)> {
+        if !self.hardware_mode {
+            return None;
+        }
+        let frame = &self.snapshot.frames[*self.snapshot.pages.get(&address)?];
+        if frame.error.is_some() || !frame.charge.resident() || !frame.hardware_shared_export {
+            return None;
+        }
+        let page = frame
+            .bytes
+            .mutable()
+            .or_else(|| frame.bytes.hardware_constant.get())?;
+        let storage = page.retained_hardware()?;
+        Some((storage, self.hardware_page_info(address).ok()?))
     }
     pub fn hardware_write_frame(
         &self,
@@ -1666,13 +1794,17 @@ impl View {
     ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
         assert!(self.hardware_mode);
         let frame = self.frame(address, access)?;
+        self.load_frame(frame)?;
+        if frame.backed {
+            frame.charge.ensure()?;
+        }
         if !frame.hardware_shared_export {
             return Err(MemoryError::BackingIo(95));
         }
-        if access == Access::Write {
-            self.ensure_resident(frame)?;
-        }
-        let page = if let Some(page) = &frame.bytes.bytes {
+        // A hardware export binds a real physical slot even for a zero read.
+        // Ordinary software zero reads remain allocation-free and uncharged.
+        self.ensure_resident(frame)?;
+        let page = if let Some(page) = frame.bytes.mutable() {
             page
         } else {
             frame.bytes.hardware_constant.get_or_init(|| {

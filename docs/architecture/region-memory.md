@@ -326,15 +326,33 @@ store. A first-touch quota failure terminates the faulting guest group with
 SIGKILL; mmap/fork admission still returns its ordinary errno. This is a bounded
 OOM policy, not Linux victim selection.
 
-File mappings preflight available quota before VFS page storage is created.
-Fixed file replacements reuse charged destination slots. File mappings and
-materialized fork COW pages are still charged conservatively per address space;
-CLONE_VM shares one account and now builds a shared task directly, avoiding an
-intermediate page-table clone and MMU retirement. The per-process mapped-page
-cap still bounds page-table metadata, including untouched readable mappings.
-This is not complete Linux demand paging or exact host RSS/PSS accounting.
-Runtime shadow storage, COW windows and host allocator bookkeeping are outside
-the guest byte quota and remain further memory work.
+Virtual mappings and RAM accounting are separate. Creating an accessible VMA,
+changing its protection, retaining a snapshot, querying permissions or obtaining
+a futex identity does not charge the mapped length to the guest RAM budget.
+Accessible page descriptors have an independent 4,194,304-page (16 GiB) metadata
+ceiling; PROT_NONE reservations keep their separate sparse interval bound. The
+descriptors still consume host metadata, so an unused mapping is not free in
+host RSS even though it consumes no guest byte quota.
+
+PlainFile-backed VFS pages retain an Arc-owned page source, offset and live EOF
+capability. Creating a mapping or worker frame does not read file bytes. CPU or
+native byte access loads the reached page under its existing object lock and
+charges that page; a private writable file view detaches bytes only when reached.
+Only Send + Sync resource handles cross to workers, never the coordinator's Rc
+provider. Shared aliases retain the same published SharedPage and the original
+version, dirty and truncation hooks. Unknown/custom providers retain their
+conservative preparation path. Cold quota preflight rejects a known-full budget
+before file I/O; the final atomic charge remains authoritative under contention.
+
+Anonymous software zero reads remain uncharged. A hardware executor that needs
+a physical zero-page slot must charge that real allocation too; no global
+hardware zero-page alias is implemented. File mappings and materialized fork COW
+pages are still charged conservatively per address space; CLONE_VM shares one
+account and avoids an intermediate page-table clone. Retained Views keep their
+charges until their byte owners end. This is demand allocation with a bounded
+OOM policy, not exact unique-physical-page RSS/PSS accounting. Runtime shadow
+storage, page descriptors, COW windows and host allocator bookkeeping remain
+outside the guest byte quota.
 
 The [Firefox memory investigation](../validation/firefox-memory.md) records the
 original Scudo ELF, the 512MiB BSS oracle, budgets, complete/partial diagnostics

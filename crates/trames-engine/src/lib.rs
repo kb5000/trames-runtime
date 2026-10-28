@@ -79,6 +79,14 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     type Engine: Default;
     const FEATURES: Features;
     const FEATURE_NAMES: &'static str;
+    /// A backend may query its actual execution configuration once at runtime.
+    /// Static interpreter profiles keep the existing constants by default.
+    fn features() -> Features {
+        Self::FEATURES
+    }
+    fn feature_names() -> &'static str {
+        Self::FEATURE_NAMES
+    }
     const PARALLEL: bool;
     const EXACT_INSTRUCTIONS: bool;
     fn new(pc: u64, sp: u64) -> Self;

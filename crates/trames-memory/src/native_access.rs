@@ -266,6 +266,13 @@ impl Memory {
         {
             return Ok((page.bytes.with_read(offset, len, operation), true));
         }
+        if page
+            .backing
+            .as_ref()
+            .is_some_and(|backing| backing.object.charge_reads())
+        {
+            page.charge.ensure()?;
+        }
         let mut operation = Some(operation);
         let mut result = None;
         if page

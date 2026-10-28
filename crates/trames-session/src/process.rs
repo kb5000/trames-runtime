@@ -783,7 +783,7 @@ impl<C: Cpu> Kernel<C> {
                     .iter()
                     .map(|t| (t.as_millis() / 10) as u64)
                     .collect(),
-                cpu_features: C::FEATURE_NAMES,
+                cpu_features: C::feature_names(),
                 processes,
                 uptime: self.started.elapsed(),
                 boot_time: self.boot_time,
@@ -2395,8 +2395,10 @@ impl<C: Cpu> Kernel<C> {
                 }
                 let per_call_nonblock = match number {
                     76 => a[5] & 2 != 0 || p.linux.vfs.flags(a[2] as u32)? & O_NONBLOCK != 0,
-                    206 | 207 => a[3] & 0x40 != 0,
-                    211 | 212 => a[2] & 0x40 != 0,
+                    206 => a[3] & 0x40 != 0,
+                    207 => a[3] & (0x40 | 0x2000) != 0,
+                    211 => a[2] & 0x40 != 0,
+                    212 => a[2] & (0x40 | 0x2000) != 0,
                     _ => false,
                 };
                 if number == 116 && a[0] as u32 == 2 && raw == error(Errno(11)) {

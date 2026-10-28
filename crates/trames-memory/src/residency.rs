@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! First-write accounting for anonymous zero pages. Charges are shared with
-//! worker frames, so concurrent first stores cannot bypass the guest budget.
+//! Demand accounting for guest pages, independent of virtual mapping size.
+//! Anonymous software zeros pay on write; file bytes and physical hardware
+//! exports pay on access. Worker frames retain the same per-page charge.
 use super::*;
 use std::sync::{
     atomic::{AtomicU8, AtomicUsize},
@@ -49,6 +50,7 @@ impl Account {
             )
         })
     }
+
     pub(super) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             local: Budget::new(limit),
@@ -97,6 +99,18 @@ impl Charge {
         // Do not turn accounting into a second acquire on ordinary accesses.
         self.state.load(Ordering::Relaxed) == 2
     }
+    /// Cold I/O preflight only. The final atomic ensure remains authoritative;
+    /// a peer already reserving this same page must not get a false quota error.
+    pub(super) fn check_available(&self) -> Result<(), MemoryError> {
+        if self.state.load(Ordering::Relaxed) != 0
+            || self.account.available() >= PAGE_SIZE as usize
+            || self.state.load(Ordering::Relaxed) != 0
+        {
+            Ok(())
+        } else {
+            Err(MemoryError::Limit)
+        }
+    }
     pub(super) fn ensure(&self) -> Result<(), MemoryError> {
         if self.resident() {
             return Ok(());
@@ -139,22 +153,21 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         let reused = if fixed {
-            self.pages
-                .range(address..end)
-                .filter(|(_, frame)| self.frames[**frame].as_ref().unwrap().charge.resident())
-                .count() as u64
-                * PAGE_SIZE
+            self.pages.range(address..end).count() * PAGE_SIZE as usize
         } else {
             0
         };
-        if len - reused > self.account.available() as u64 {
-            Err(MemoryError::Limit)
-        } else {
-            Ok(())
+        if (self.mapped_bytes() - reused)
+            .checked_add(len as usize)
+            .is_none_or(|bytes| bytes > MAX_DESCRIBED_BYTES)
+        {
+            return Err(MemoryError::Limit);
         }
+        // No resident charge until this mapping actually supplies CPU/native bytes.
+        Ok(())
     }
     /// Anonymous zero mappings are not resident until their first write. File
-    /// mappings remain conservatively charged; fork still charges each VM.
+    /// mappings are charged on access; fork still charges each VM.
     pub fn resident_bytes(&self) -> usize {
         if let Some(shared) = &self.shared {
             return shared.borrow().resident_bytes();
@@ -282,10 +295,7 @@ mod tests {
             .unwrap();
         m.write_array(0x11000, [42u8]).unwrap();
         assert_eq!(m.resident_bytes(), 2 * P);
-        assert_eq!(
-            m.check_backed_mapping(0x12000, PAGE_SIZE, false),
-            Err(MemoryError::Limit)
-        );
+        assert_eq!(m.check_backed_mapping(0x12000, PAGE_SIZE, false), Ok(()));
         assert_eq!(m.check_backed_mapping(0x10000, PAGE_SIZE, true), Ok(()));
         assert_eq!(m.write_array(0x12000, [99u8]), Err(MemoryError::Limit));
         assert_eq!(m.read_array::<1>(0x12000), Ok([0]));
@@ -388,5 +398,34 @@ mod tests {
             "exactly one VM can commit the only page"
         );
         assert_eq!(parent.resident_bytes() + child.resident_bytes(), P);
+    }
+}
+
+#[cfg(test)]
+mod overcommit_tests {
+    use super::*;
+    #[test]
+    fn untouched_accessible_mappings_and_protection_do_not_spend_ram_quota() {
+        let mut memory = Memory::new(2 * PAGE_SIZE as usize);
+        memory
+            .map(0x10000, 256 * PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        memory
+            .map(0x200000, 256 * PAGE_SIZE, Permissions::NONE)
+            .unwrap();
+        memory
+            .protect(0x200000, 256 * PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        assert_eq!(memory.resident_bytes(), 0);
+        assert_eq!(memory.read_u64(0x10000).unwrap(), 0);
+        assert_eq!(memory.read_u64(0x2ff000).unwrap(), 0);
+        assert_eq!(memory.resident_bytes(), 0);
+        memory.set_limit(PAGE_SIZE as usize).unwrap();
+        memory.write_array(0x10000, [17]).unwrap();
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(memory.write_array(0x200000, [19]), Err(MemoryError::Limit));
+        memory.unmap(0x10000, PAGE_SIZE).unwrap();
+        memory.write_array(0x200000, [19]).unwrap();
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
     }
 }

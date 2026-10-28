@@ -35,11 +35,11 @@ fn admit(views: &mut [View]) -> bool {
     unsafe { View::try_private_epoch(&mut views.iter_mut().collect::<Vec<_>>()) }
 }
 fn storage(view: &View, at: u64) -> Arc<SharedPage> {
+    view.read_array::<8>(at).unwrap();
     view.frame(at, Access::Read)
         .unwrap()
         .bytes
-        .bytes
-        .as_ref()
+        .mutable()
         .unwrap()
         .clone()
 }

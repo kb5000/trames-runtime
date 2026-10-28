@@ -98,7 +98,7 @@ fn coordinator_and_four_workers_share_one_allocation_and_atomic_domain() {
         .clone();
     let frame = view.frame(0x40000, Access::Write).unwrap();
     assert!(frame.direct);
-    assert!(Arc::ptr_eq(&source, frame.bytes.bytes.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(&source, frame.bytes.mutable().unwrap()));
     assert_eq!(
         physical,
         source

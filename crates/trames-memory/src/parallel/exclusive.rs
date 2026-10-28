@@ -11,7 +11,7 @@ fn locks(view: &View) -> u64 {
     view.snapshot
         .frames
         .iter()
-        .filter_map(|f| f.bytes.bytes.as_ref())
+        .filter_map(|f| f.bytes.mutable())
         .map(|p| p.acquisitions())
         .sum()
 }
@@ -168,20 +168,19 @@ fn shared_backings_remain_atomic_across_private_vm_epochs() {
         .map(|(rank, mut view)| {
             let gate = gate.clone();
             std::thread::spawn(move || {
+                view.read_array::<8>(0x50000).unwrap();
                 let private = view
                     .frame(0x40000, Access::Write)
                     .unwrap()
                     .bytes
-                    .bytes
-                    .as_ref()
+                    .mutable()
                     .unwrap()
                     .clone();
                 let shared = view
                     .frame(0x50000, Access::Write)
                     .unwrap()
                     .bytes
-                    .bytes
-                    .as_ref()
+                    .mutable()
                     .unwrap()
                     .clone();
                 let (p, s) = (private.acquisitions(), shared.acquisitions());

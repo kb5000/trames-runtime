@@ -18,7 +18,7 @@ mod reservations;
 mod residency;
 mod slots;
 use backing::Backed;
-pub use backing::{backing_changed, PageBacking};
+pub use backing::{backing_changed, PageBacking, PageSource};
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
@@ -35,6 +35,11 @@ use std::{
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_LIMIT: u64 = 1 << 48;
 pub const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+/// Independent bound on the current page-descriptor representation. Virtual
+/// mappings do not consume the guest resident quota. PROT_NONE reservations
+/// use ranges and remain governed by MAX_RESERVATIONS instead of this bound.
+pub const MAX_PAGE_DESCRIPTORS: usize = 4 * 1024 * 1024;
+pub const MAX_DESCRIBED_BYTES: usize = MAX_PAGE_DESCRIPTORS * PAGE_SIZE as usize;
 static NEXT_SPACE: AtomicU64 = AtomicU64::new(1);
 static NEXT_BACKING: AtomicU64 = AtomicU64::new(1);
 /// Opaque identity shared by aliases of one backing page, never a host pointer.
@@ -331,7 +336,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().set_limit(limit);
         }
-        if self.mapped_bytes() > limit {
+        if self.resident_bytes() > limit {
             return Err(MemoryError::Limit);
         }
         self.limit = limit;
@@ -662,7 +667,7 @@ impl Memory {
             .mapped_bytes()
             .saturating_sub(replaced)
             .checked_add(size)
-            .is_none_or(|n| n > self.limit)
+            .is_none_or(|n| n > MAX_DESCRIBED_BYTES)
         {
             return Err(MemoryError::Limit);
         }
@@ -766,7 +771,7 @@ impl Memory {
             .mapped_bytes()
             .checked_add(len)
             .ok_or(MemoryError::Limit)?
-            > self.limit
+            > MAX_DESCRIBED_BYTES
         {
             return Err(MemoryError::Limit);
         }
@@ -800,7 +805,8 @@ impl Memory {
         let committed = self.pages.range(address..end).count() as u64 * PAGE_SIZE;
         let commit = permissions != Permissions::NONE;
         if commit
-            && (end - address - committed) > self.limit.saturating_sub(self.mapped_bytes()) as u64
+            && (end - address - committed)
+                > MAX_DESCRIBED_BYTES.saturating_sub(self.mapped_bytes()) as u64
         {
             return Err(MemoryError::Limit);
         }
@@ -909,6 +915,13 @@ impl Memory {
             // read consumes a queue or advances an open-file description.
             if access == Access::Write {
                 page.charge.ensure()?;
+                if let Some(source) = page
+                    .backing
+                    .as_ref()
+                    .and_then(|backing| backing.object.page_source())
+                {
+                    source.load()?;
+                }
             }
             allowed &= eligible(page);
         }
@@ -1375,7 +1388,7 @@ mod tests {
             Err(MemoryError::Overlap(_))
         ));
         assert_eq!(
-            m.map(0x2000, PAGE_SIZE * 2, Permissions::RW),
+            m.map(0x2000, MAX_DESCRIBED_BYTES as u64, Permissions::RW),
             Err(MemoryError::Limit)
         );
         assert_eq!(m.mapped_bytes(), PAGE_SIZE as usize);
@@ -1456,7 +1469,11 @@ mod tests {
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         m.write(0x1000, b"data").unwrap();
         assert_eq!(
-            m.map_fixed(0x1000, PAGE_SIZE * 2, Permissions::R),
+            m.map_fixed(
+                0x1000,
+                MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
+                Permissions::R
+            ),
             Err(MemoryError::Limit)
         );
         let mut bytes = [0; 4];

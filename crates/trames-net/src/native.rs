@@ -226,6 +226,7 @@ impl Network {
             dns: RefCell::default(),
             dns_target: Cell::new(direct_dns::ADDRESS),
             dns_peer: Cell::new(false),
+            dns_receive_errors: Cell::new(false),
             echo: RefCell::default(),
             policy: RefCell::default(),
             receive_packet_info: Cell::new(false),
@@ -324,6 +325,7 @@ pub struct Socket {
     dns: RefCell<std::collections::BTreeMap<SocketAddr, Rc<direct_dns::Endpoint>>>,
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
+    dns_receive_errors: Cell<bool>,
     echo: RefCell<icmp::Echo>,
     receive_packet_info: Cell<bool>,
     policy: RefCell<Option<Rc<crate::netlink::Namespace>>>,
@@ -365,6 +367,10 @@ impl Socket {
         flags: u8,
         source: Option<IpAddr>,
     ) -> Result<()> {
+        if self.dns_receive_errors.get() && !direct_dns::system_address(peer) {
+            return Err(NetError(92));
+        }
+
         let policy = self.policy.borrow();
         let Some(namespace) = policy.as_ref() else {
             return Ok(());
@@ -860,6 +866,23 @@ impl Socket {
         Ok(received)
     }
     fn recv_inner(&self, count: usize, flags: u32) -> Result<Received> {
+        if flags & 0x2000 != 0 {
+            // MSG_ERRQUEUE is always nonblocking.
+            if flags & !(0x2000 | MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC) != 0 {
+                return Err(NetError(95));
+            }
+            if self.kind == 2
+                && (self.dns_peer.get()
+                    || self.dns_receive_errors.get() && self.connection.get() == Connection::Idle)
+            {
+                // An in-process DNS service has no ICMP route: failures are DNS
+                // replies. Reading its genuinely empty error queue consumes no
+                // normal reply. Ordinary host UDP error queues stay unsupported.
+                return Err(NetError(11));
+            }
+            return Err(NetError(95));
+        }
+
         if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
         }
@@ -887,8 +910,11 @@ impl Socket {
                 Err(e) => return Err(e),
             }
         }
-        if self.dns_peer.get() {
+        if self.dns_peer.get() || self.dns_receive_errors.get() && !self.dns.borrow().is_empty() {
             return Err(NetError(11));
+        }
+        if self.dns_receive_errors.get() {
+            return Err(NetError(92));
         }
         if self.kind == 1 {
             self.before_io()?;
@@ -1052,6 +1078,13 @@ impl Socket {
         )
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
+        if (level, name) == (0, 11) && self.family == 2 && self.kind == 2 {
+            if value != 0 && self.connection.get() != Connection::Idle && !self.dns_peer.get() {
+                return Err(NetError(92));
+            }
+            self.dns_receive_errors.set(value != 0);
+            return Ok(());
+        }
         if self.kind == 4 {
             if (level, name) == (255, 7) && self.family == 10 {
                 return if value == 2 {
@@ -1131,6 +1164,9 @@ impl Socket {
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
+            (0, 11) if self.family == 2 && self.kind == 2 => {
+                Ok(i32::from(self.dns_receive_errors.get()))
+            }
             (0, 8) if self.family == 2 => Ok(i32::from(self.receive_packet_info.get())),
             (41, 49) if self.family == 10 => Ok(i32::from(self.receive_packet_info.get())),
             (1, 3) => Ok(match self.kind {
@@ -1358,5 +1394,42 @@ mod tests {
         );
         let full = Network::new(NetworkMode::Full);
         assert!(full.binding("[::]:12345".parse().unwrap(), 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod dns_error_options {
+    use super::*;
+    #[test]
+    fn resolver_error_option_and_empty_error_queue_preserve_normal_reply() {
+        let network = crate::Network::new(NetworkMode::Outbound);
+        let socket = network.socket(2, 2, 0).unwrap();
+        socket.set_option(0, 11, 1).unwrap();
+        assert_eq!(socket.get_option(0, 11), Ok(1));
+        socket.connect(direct_dns::ROUTABLE_ADDRESS).unwrap();
+        assert_eq!(socket.send(b"xx", 0, None), Ok(2));
+        assert!(matches!(socket.recv(512, 0x2000), Err(NetError(11))));
+        let answer = socket.recv(512, 0).unwrap();
+        assert_eq!(&answer.data[..2], b"xx");
+        assert_eq!(answer.data[3] & 15, 1);
+        assert!(matches!(
+            socket.recv(512, 0x2000 | MSG_DONTWAIT),
+            Err(NetError(11))
+        ));
+        socket.set_option(0, 11, 0).unwrap();
+        assert_eq!(socket.get_option(0, 11), Ok(0));
+    }
+    #[test]
+    fn native_udp_does_not_silently_claim_linux_icmp_error_queue_support() {
+        let network = crate::Network::new(NetworkMode::Loopback);
+        let socket = network.socket(2, 2, 0).unwrap();
+        socket.set_option(0, 11, 1).unwrap();
+        let peer = SocketAddr::from(([127, 0, 0, 1], 9));
+        assert_eq!(socket.connect(peer), Err(NetError(92)));
+        assert_eq!(socket.send(b"not sent", 0, Some(peer)), Err(NetError(92)));
+        socket.set_option(0, 11, 0).unwrap();
+        socket.connect(peer).unwrap();
+        assert_eq!(socket.set_option(0, 11, 1), Err(NetError(92)));
+        assert_eq!(socket.get_option(0, 11), Ok(0));
     }
 }

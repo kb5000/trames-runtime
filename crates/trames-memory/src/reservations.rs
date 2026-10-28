@@ -175,7 +175,7 @@ mod tests {
     fn large_reservation_commit_split_fork_share_and_failed_commit_are_atomic() {
         let mut m = Memory::new(2 * PAGE_SIZE as usize);
         let start = 0x10000;
-        let len = 4 * 1024 * 1024 * 1024;
+        let len = MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE;
         m.reserve(start, len, false).unwrap();
         assert_eq!(m.mapped_bytes(), 0);
         assert!(!m.is_free(start + PAGE_SIZE, PAGE_SIZE));
@@ -196,7 +196,7 @@ mod tests {
             })
         );
         assert_eq!(
-            m.protect(start, 3 * PAGE_SIZE, Permissions::RW),
+            m.protect(start, len, Permissions::RW),
             Err(MemoryError::Limit)
         );
         assert_eq!(m.mapped_bytes(), 0);

@@ -20,6 +20,11 @@ pub(super) struct FilePage {
 }
 #[derive(Clone)]
 enum PageStorage {
+    Deferred {
+        source: Arc<file_data::PlainFile>,
+        offset: u64,
+        state: std::sync::Weak<MappingState>,
+    },
     // Only the coordinator's Rc-backed FileMapping/MappedData APIs access this
     // capability. Before first publication there is one actor; layout changes
     // occur at joined checkpoints. No unpublished capability reaches a worker.
@@ -69,7 +74,7 @@ impl PageStorage {
     }
     fn version(&self) -> u64 {
         match self {
-            Self::Unpublished { .. } => 0,
+            Self::Unpublished { .. } | Self::Deferred { .. } => 0,
             Self::Published { bytes, .. } => bytes.revision(),
         }
     }
@@ -79,6 +84,7 @@ impl PageStorage {
                 self.with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes))
             }
             Self::Published { bytes, .. } => bytes.copy_read(offset, out),
+            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
     fn copy_write(&self, offset: usize, input: &[u8]) {
@@ -87,6 +93,9 @@ impl PageStorage {
                 self.with_write(offset, input.len(), |bytes| bytes.copy_from_slice(input))
             }
             Self::Published { bytes, .. } => bytes.copy_write(offset, input),
+            // Only MappedData::write_at reaches an unloaded page here, after
+            // writing the retained PlainFile. A later page-in reads that update.
+            Self::Deferred { .. } => {}
         }
     }
     fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
@@ -97,6 +106,7 @@ impl PageStorage {
                 bytes.with_unpublished_read(offset, len, f)
             },
             Self::Published { bytes, .. } => bytes.with_read(offset, len, f),
+            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
     fn with_write<T>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
@@ -107,6 +117,7 @@ impl PageStorage {
                 bytes.with_unpublished_write(offset, len, f)
             },
             Self::Published { bytes, .. } => bytes.with_write(offset, len, f),
+            Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
 }
@@ -134,9 +145,43 @@ impl FilePage {
         *self.bytes.write().unwrap() = bytes;
         self.layout.fetch_add(1, Ordering::Relaxed);
     }
+    fn deferred(&self) -> bool {
+        matches!(*self.bytes.read().unwrap(), PageStorage::Deferred { .. })
+    }
+    fn materialize(&self) -> std::result::Result<(), MemoryError> {
+        let mut storage = self.bytes.write().unwrap();
+        let PageStorage::Deferred {
+            source,
+            offset,
+            state,
+        } = &*storage
+        else {
+            return Ok(());
+        };
+        let data = source
+            .read_at(*offset, PAGE_SIZE as usize, None)
+            .map_err(|error| MemoryError::BackingIo(error.0))?;
+        let state = state.upgrade();
+        let range = *offset..offset.saturating_add(PAGE_SIZE);
+        *storage = if data.is_empty() {
+            PageStorage::zero()
+        } else {
+            let mut bytes = Box::new([0; PAGE_SIZE as usize]);
+            bytes[..data.len()].copy_from_slice(&data);
+            PageStorage::heap(bytes)
+        };
+        self.layout.fetch_add(1, Ordering::Relaxed);
+        self.changed();
+        drop(storage);
+        if let Some(state) = state {
+            state.changed(Some(range));
+        }
+        Ok(())
+    }
     fn shared_page(&self) -> Arc<SharedPage> {
         let mut layout = self.bytes.write().unwrap();
         match &*layout {
+            PageStorage::Deferred { .. } => unreachable!("page-in precedes publication"),
             PageStorage::Published { bytes, .. } => bytes.clone(),
             PageStorage::Unpublished { bytes, shared } => {
                 let bytes = bytes.clone();
@@ -155,6 +200,12 @@ impl FilePage {
             layout: self.layout.load(Ordering::Relaxed),
             bytes: self.bytes.read().unwrap().clone(),
         }
+    }
+}
+impl trames_memory::PageSource for FilePage {
+    fn load(&self) -> std::result::Result<Arc<SharedPage>, MemoryError> {
+        self.materialize()?;
+        Ok(self.shared_page())
     }
 }
 // The live length is a capability to the actual storage, never a cached length
@@ -356,7 +407,17 @@ impl MappedData {
         {
             return Ok(p);
         }
-        let bytes = if let Some(map) = self
+        let source = match &**self.data.borrow() {
+            FileData::Plain(source) => Some(source.clone()),
+            _ => None,
+        };
+        let bytes = if let Some(source) = source {
+            PageStorage::Deferred {
+                source,
+                offset,
+                state: Arc::downgrade(&self.state),
+            }
+        } else if let Some(map) = self
             .shared_file()
             .and_then(|file| file.map(offset as usize, PAGE_SIZE as usize).ok())
         {
@@ -378,7 +439,7 @@ impl MappedData {
     }
     fn batch(&self, offset: u64, len: u64) -> Result<Vec<Arc<FilePage>>> {
         self.pages.borrow_mut().retain(|_, p| p.strong_count() != 0);
-        if self.shared_file().is_some() {
+        if self.shared_file().is_some() || matches!(&**self.data.borrow(), FileData::Plain(_)) {
             return (offset..offset + len)
                 .step_by(PAGE_SIZE as usize)
                 .map(|at| self.page(at))
@@ -423,7 +484,7 @@ impl MappedData {
         let mut out = self.data.borrow().read_at(offset, count)?;
         let end = offset + out.len() as u64;
         for (&base, p) in self.pages.borrow().range((offset & !(PAGE_SIZE - 1))..end) {
-            if let Some(p) = p.upgrade() {
+            if let Some(p) = p.upgrade().filter(|page| !page.deferred()) {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
                 p.bytes.read().unwrap().copy_read(
@@ -498,7 +559,7 @@ impl MappedData {
         self.refresh_shared_pages();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                if !page.bytes.read().unwrap().is_shared() {
+                if !page.deferred() && !page.bytes.read().unwrap().is_shared() {
                     let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
                     let mut content = page.bytes.write().unwrap();
                     if bytes.is_empty() {
@@ -582,12 +643,16 @@ struct FileMapping {
     executable: bool,
 }
 impl FileMapping {
-    fn with_bytes<T>(&self, f: impl FnOnce(&PageStorage) -> T) -> T {
+    fn with_bytes<T>(
+        &self,
+        f: impl FnOnce(&PageStorage) -> T,
+    ) -> std::result::Result<T, MemoryError> {
+        self.page.materialize()?;
         let mut cache = self.cached.borrow_mut();
         if cache.layout != self.page.layout.load(Ordering::Relaxed) {
             *cache = self.page.cached();
         }
-        f(&cache.bytes)
+        Ok(f(&cache.bytes))
     }
     fn changed(&self) {
         // Like the first writable fault of a dirty mmap interval, update mtime
@@ -676,13 +741,16 @@ impl PageBacking for FileMapping {
         true
     }
     fn native_resident(&self) -> bool {
-        true
+        !self.page.deferred()
     }
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((self.page.identity, 0))
     }
     fn shared_page(&self) -> Option<Arc<SharedPage>> {
-        Some(self.page.shared_page())
+        (!self.page.deferred()).then(|| self.page.shared_page())
+    }
+    fn page_source(&self) -> Option<Arc<dyn trames_memory::PageSource>> {
+        Some(self.page.clone() as Arc<dyn trames_memory::PageSource>)
     }
     fn publish_write(&self, _: usize, _: usize) -> std::result::Result<(), MemoryError> {
         if !self.writable {
@@ -699,14 +767,14 @@ impl PageBacking for FileMapping {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> std::result::Result<(), MemoryError> {
-        self.with_bytes(|storage| storage.copy_read(offset, out));
+        self.with_bytes(|storage| storage.copy_read(offset, out))?;
         Ok(())
     }
     fn write(&self, offset: usize, bytes: &[u8]) -> std::result::Result<(), MemoryError> {
         if !self.writable {
             return Err(MemoryError::BackingIo(13));
         }
-        self.with_bytes(|storage| storage.copy_write(offset, bytes));
+        self.with_bytes(|storage| storage.copy_write(offset, bytes))?;
         self.changed();
         Ok(())
     }
@@ -716,7 +784,7 @@ impl PageBacking for FileMapping {
         len: usize,
         f: &mut dyn FnMut(&[u8]),
     ) -> std::result::Result<bool, MemoryError> {
-        self.with_bytes(|storage| storage.with_read(offset, len, f));
+        self.with_bytes(|storage| storage.with_read(offset, len, f))?;
         Ok(true)
     }
     fn with_write(
@@ -729,7 +797,7 @@ impl PageBacking for FileMapping {
             return Err(MemoryError::BackingIo(13));
         }
         self.changed();
-        self.with_bytes(|storage| storage.with_write(offset, len, f));
+        self.with_bytes(|storage| storage.with_write(offset, len, f))?;
         Ok(true)
     }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
@@ -746,7 +814,7 @@ impl PageBacking for FileMapping {
         self.page
             .version
             .load(Ordering::Relaxed)
-            .wrapping_add(self.with_bytes(PageStorage::version))
+            .wrapping_add(self.page.bytes.read().unwrap().version())
     }
     fn executable(&self) -> bool {
         self.executable
@@ -1745,6 +1813,7 @@ mod tests {
     fn eof_placeholders_stay_zero_and_growth_updates_existing_mappings() {
         let data = MappedData::new(FileData::memory(vec![17; 10]), true);
         let pages = data.batch(0, 32 * PAGE_SIZE).unwrap();
+        pages[0].materialize().unwrap();
         assert!(!pages[0]
             .bytes
             .read()
@@ -1752,9 +1821,10 @@ mod tests {
             .with_read(0, 10, |bytes| bytes.iter().all(|&b| b == 0)));
         assert!(pages[1..]
             .iter()
-            .all(|p| matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
+            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
         data.truncate(4 * PAGE_SIZE).unwrap();
         data.write_at(3 * PAGE_SIZE + 8, b"grown").unwrap();
+        pages[3].materialize().unwrap();
         assert_eq!(
             pages[3]
                 .bytes
@@ -1764,12 +1834,13 @@ mod tests {
             b"grown"
         );
         assert!(
-            matches!(&*pages[31].bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())
+            pages[31].deferred()
+                || matches!(&*pages[31].bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())
         );
         data.truncate(0).unwrap();
         assert!(pages
             .iter()
-            .all(|p| matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
+            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
 
         use trames_memory::{parallel::Registry, CpuMemory};
         let mut v = Vfs::default();
@@ -2152,5 +2223,84 @@ mod tests {
         view.enable_hardware();
         assert_eq!(view.read_array::<1>(0x10000).unwrap(), [99]);
         assert_eq!(view.read_array::<1>(0x20000).unwrap(), [71]);
+    }
+}
+
+#[cfg(test)]
+mod demand_page_tests {
+    use super::*;
+    use trames_memory::{parallel::Registry, Access, CpuMemory, Memory, Permissions};
+    #[test]
+    fn unused_file_vmas_and_queries_do_not_load_or_charge_pages() {
+        let mut vfs = Vfs::default();
+        let fd = vfs
+            .open_at(AT_FDCWD, b"/demand-pages", 0x42, 0o600)
+            .unwrap();
+        vfs.truncate_fd(fd, PAGE_SIZE * 8).unwrap();
+        vfs.write(fd, b"page zero").unwrap();
+        let objects = vfs.mapping_pages(fd, 0, PAGE_SIZE * 8, true, true).unwrap();
+        let mut memory = Memory::new(PAGE_SIZE as usize * 2);
+        memory
+            .map_backed(0x10000, objects, true, Permissions::RW, false)
+            .unwrap();
+        let loaded = || {
+            let node = vfs
+                .descriptor(fd)
+                .unwrap()
+                .open
+                .borrow()
+                .data_node()
+                .unwrap();
+            let inode = node.borrow();
+            let Content::File(FileData::Mapped(data)) = &inode.content else {
+                unreachable!()
+            };
+            let count = data
+                .pages
+                .borrow()
+                .values()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter(|page| !page.deferred())
+                .count();
+            count
+        };
+        assert_eq!(loaded(), 0);
+        assert_eq!(memory.resident_bytes(), 0);
+        memory
+            .check(0x10000, PAGE_SIZE as usize * 8, Access::Read)
+            .unwrap();
+        let mut registry = Registry::default();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        view.shared_futex_key(0x11000).unwrap();
+        view.check(0x10000, PAGE_SIZE as usize * 8, Access::Read)
+            .unwrap();
+        assert_eq!(loaded(), 0);
+        assert_eq!(memory.resident_bytes(), 0);
+        assert_eq!(view.read_array::<9>(0x10000).unwrap(), *b"page zero");
+        assert_eq!(loaded(), 1);
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        memory
+            .with_read_chunk(0x13000, 8, |bytes| assert_eq!(bytes, &[0; 8]))
+            .unwrap();
+        assert_eq!(loaded(), 2);
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize * 2);
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<8>(0x14000), Err(MemoryError::Limit));
+        assert_eq!(
+            loaded(),
+            2,
+            "quota failure must precede unnecessary backing I/O"
+        );
+        drop(view);
+        memory.unmap(0x10000, PAGE_SIZE).unwrap();
+        assert_eq!(memory.resident_bytes(), PAGE_SIZE as usize);
+        assert_eq!(memory.read_array::<8>(0x14000).unwrap(), [0; 8]);
+        assert_eq!(
+            loaded(),
+            2,
+            "released mapping no longer pins its original page"
+        );
     }
 }

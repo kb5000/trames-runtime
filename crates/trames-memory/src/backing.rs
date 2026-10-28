@@ -9,7 +9,19 @@ pub fn backing_changed() {
 pub(super) fn backing_revision() -> u64 {
     BACKING_REVISION.load(Ordering::Relaxed)
 }
+/// Thread-safe cold page-in capability. Namespace/OFD metadata stays in VFS;
+/// this handle retains only the byte resource needed by a reached CPU page.
+pub trait PageSource: Send + Sync {
+    fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
+}
+
 pub trait PageBacking {
+    /// Anonymous shared zeros need a charge only on writes; file data is charged
+    /// on the first actual read or write, never on VMA/permission metadata.
+    fn charge_reads(&self) -> bool {
+        true
+    }
+
     /// Check/read/write/version and scoped native-span methods never re-enter
     /// their containing Memory or invoke an arbitrary host callback. Allows one
     /// local VM borrow per interpreter slice or native call; external/custom
@@ -26,6 +38,10 @@ pub trait PageBacking {
     /// Share resident physical bytes with workers. The provider keeps metadata
     /// coordinator-local; every CPU/native byte access must use these guards.
     fn shared_page(&self) -> Option<std::sync::Arc<SharedPage>> {
+        None
+    }
+    /// No byte read/allocation: a stable resource handle for deferred page-in.
+    fn page_source(&self) -> Option<std::sync::Arc<dyn PageSource>> {
         None
     }
     /// Joined snapshot metadata is unchanged when version() and check() match.
@@ -162,6 +178,9 @@ impl Page {
     pub(super) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
             if b.shared || !b.private_copy {
+                if b.object.charge_reads() {
+                    self.charge.ensure()?;
+                }
                 return b.object.read(offset, out);
             }
         }
@@ -208,24 +227,9 @@ impl Memory {
         }
         let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
         self.check_backed_mapping(address, len, fixed)?;
-        let charges: Vec<_> = objects
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let charge = if fixed {
-                    self.pages
-                        .get(&(address + i as u64 * PAGE_SIZE))
-                        .and_then(|&frame| self.frames[frame].as_ref())
-                        .filter(|page| page.charge.resident())
-                        .map(|page| page.charge.clone())
-                        .unwrap_or_else(|| Charge::new(&self.account))
-                } else {
-                    Charge::new(&self.account)
-                };
-                charge.ensure()?;
-                Ok(charge)
-            })
-            .collect::<Result<_, MemoryError>>()?;
+        let charges: Vec<_> = (0..objects.len())
+            .map(|_| Charge::new(&self.account))
+            .collect();
         if fixed {
             self.map_fixed(address, len, permissions)?;
         } else {
@@ -382,7 +386,7 @@ impl Memory {
         if (self.mapped_bytes() as u64)
             .saturating_sub(old_len + if old == new { 0 } else { replaced })
             .checked_add(new_len)
-            .is_none_or(|n| n > self.limit as u64)
+            .is_none_or(|n| n > MAX_DESCRIBED_BYTES as u64)
         {
             return Err(MemoryError::Limit);
         }
@@ -398,7 +402,6 @@ impl Memory {
                 page.bytes = Rc::new(PageBytes::Zero);
                 page.charge = Charge::new(&self.account);
                 if let Some(b) = &mut page.backing {
-                    page.charge.ensure()?;
                     b.object = last
                         .backing
                         .as_ref()
@@ -439,13 +442,26 @@ struct AnonymousPage {
 impl AnonymousPage {
     fn allocate() -> Rc<dyn PageBacking> {
         Rc::new(Self {
-            bytes: std::sync::Arc::new(SharedPage::new([0; PAGE_SIZE as usize])),
+            bytes: std::sync::Arc::new(SharedPage::zero()),
             revision: Cell::new(0),
             identity: new_backing_identity(),
         })
     }
 }
+struct RetainedPageSource(std::sync::Arc<SharedPage>);
+impl PageSource for RetainedPageSource {
+    fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError> {
+        Ok(self.0.clone())
+    }
+}
 impl PageBacking for AnonymousPage {
+    fn charge_reads(&self) -> bool {
+        false
+    }
+    fn page_source(&self) -> Option<std::sync::Arc<dyn PageSource>> {
+        Some(std::sync::Arc::new(RetainedPageSource(self.bytes.clone())))
+    }
+
     fn cpu_borrow_safe(&self) -> bool {
         true
     }
@@ -558,7 +574,13 @@ mod tests {
             .is_err());
         assert_eq!(m.read_array::<8>(0x1000).unwrap(), [3; 8]);
         assert!(m
-            .remap(0x1000, PAGE_SIZE, 0x8000, PAGE_SIZE * 5, false)
+            .remap(
+                0x1000,
+                PAGE_SIZE,
+                0x8000,
+                MAX_DESCRIBED_BYTES as u64 + PAGE_SIZE,
+                false
+            )
             .is_err());
         assert!(m.is_free(0x8000, PAGE_SIZE * 3));
         m.remap(0x1000, PAGE_SIZE, 0x8000, PAGE_SIZE * 3, false)

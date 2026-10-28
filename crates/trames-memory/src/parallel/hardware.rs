@@ -36,11 +36,7 @@ impl Snapshot {
                 let storage = if let Some(bytes) = &frame.bytes.constant {
                     bytes.physical()
                 } else {
-                    frame
-                        .bytes
-                        .bytes
-                        .as_ref()
-                        .and_then(|bytes| bytes.physical())
+                    frame.bytes.mutable().and_then(|bytes| bytes.physical())
                 };
                 let Some((mapping, offset)) = storage else {
                     break;
@@ -82,8 +78,7 @@ impl View {
         let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
         let _guard = frame
             .bytes
-            .bytes
-            .as_ref()
+            .mutable()
             .map(|_| self.frame_guard(frame, offset, N));
         // SAFETY: mutable physical bytes retain the exact same region guard;
         // constant frames cannot be mutated through any published view.
@@ -101,7 +96,7 @@ impl View {
         }
         // SAFETY: same retained immutable snapshot and page-contained operand.
         let frame = unsafe { self.snapshot.frames.get_unchecked(entry.frame) };
-        let Some(_) = &frame.bytes.bytes else {
+        let Some(_) = frame.bytes.mutable() else {
             return false;
         };
         let mut guard = self.frame_guard(frame, offset, N);
