@@ -278,11 +278,6 @@ impl Memory {
         // view uses the immutable full-snapshot path instead. No raw pointer,
         // permission check or guest byte synchronization changes here.
         let snapshot = Arc::get_mut(&mut cache.snapshot).expect("unique joined snapshot");
-        if self.parallel_anonymous_dirty {
-            snapshot.anonymous =
-                super::anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
-            self.parallel_anonymous_dirty = false;
-        }
         registry.metrics.incremental_updates += 1;
         let mapping_changes = std::mem::take(&mut self.parallel_mappings);
         let mut changed = mapping_changes.clone();
@@ -433,9 +428,10 @@ impl Memory {
             .iter()
             .filter_map(|&base| snapshot.remove_frame(base).map(|frame| (base, frame)))
             .collect();
-        let mmu_changed: Slots<_> = changed.iter().copied().collect();
+        let mut mmu_changed = Slots::new();
         for base in changed {
             let Some(&root_frame) = self.pages.get(&base) else {
+                mmu_changed.push(base);
                 continue;
             };
             self.prepare_shared_storage(base, root_frame, registry);
@@ -457,7 +453,30 @@ impl Memory {
                 previous.get(&base),
                 registry,
             )?;
+            let adoption = snapshot.hardware
+                && snapshot.anonymous.cached(base).is_some_and(|old| {
+                    old.permissions == frame.permissions
+                        && old.code_revision == frame.code_revision
+                        && old.bytes.identity == frame.bytes.identity
+                        && old.error == frame.error
+                        && old.backing_version.load(Ordering::Relaxed)
+                            == frame.backing_version.load(Ordering::Relaxed)
+                });
+            if adoption {
+                let chunk = base / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+                snapshot
+                    .hardware_chunks
+                    .entry(chunk)
+                    .or_insert(snapshot.hardware_generation);
+            } else {
+                mmu_changed.push(base);
+            }
             snapshot.insert_frame(frame, page.backing.as_ref(), shared_futex_page_key(page));
+        }
+        if self.parallel_anonymous_dirty {
+            snapshot.anonymous =
+                super::anonymous::Anonymous::freeze(self, registry.code_epoch.clone());
+            self.parallel_anonymous_dirty = false;
         }
         snapshot.note_hardware_changes(
             mmu_changed.iter().copied(),

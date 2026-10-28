@@ -40,8 +40,14 @@ impl Memory {
         if !base.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::InvalidRange);
         }
-        let frame = self.frame(base).ok_or(MemoryError::Unmapped(base))?;
-        let page = self.frames[frame].as_ref().unwrap();
+        let page = if let Some(frame) = self.frame(base) {
+            self.frames[frame].as_ref().unwrap()
+        } else {
+            self.anonymous
+                .page(base)
+                .ok_or(MemoryError::Unmapped(base))?;
+            self.sparse_page(base)
+        };
         page.check_backing(base)?;
         // Shared providers need a common physical export, not a private shadow
         // that silently diverges from file I/O or another VM. Pins remain actors.
@@ -94,6 +100,7 @@ impl Memory {
         if !self.parallel_views_quiescent() {
             return Err(MemoryError::InvalidRange);
         }
+        self.materialize_descriptors(base, PAGE_SIZE as usize);
         let frame = self.frame(base).unwrap();
         let page = self.frames[frame].as_mut().unwrap();
         if write {

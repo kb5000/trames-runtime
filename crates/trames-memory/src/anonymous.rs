@@ -271,7 +271,7 @@ impl Memory {
             self.invalidate_translations();
             self.anonymous.remove(base, base + PAGE_SIZE);
             self.insert_owned_page(base, page);
-            self.note_anonymous_change(base, base + PAGE_SIZE);
+            self.parallel_anonymous_dirty = true;
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -337,6 +337,11 @@ mod tests {
         let mut registry = Registry::default();
         let view = m.parallel_view(&mut registry).unwrap();
         assert_eq!(registry.metrics.full_rebuild_pages, 0);
+        view.check_translation(base + len - 1).unwrap();
+        assert_eq!(
+            view.check_translation(base + len),
+            Err(MemoryError::Unmapped(base + len))
+        );
         assert_eq!(view.read_array::<8>(base + len - 8).unwrap(), [0; 8]);
         drop(view);
         m.protect(base + PAGE_SIZE, PAGE_SIZE, Permissions::R)

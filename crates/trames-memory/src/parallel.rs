@@ -1043,6 +1043,7 @@ impl CpuMemory for View {
             .snapshot
             .pages
             .contains_key(&(address & !(PAGE_SIZE - 1)))
+            || self.snapshot.anonymous.overlaps(address, address + 1)
             || self
                 .snapshot
                 .reservations
