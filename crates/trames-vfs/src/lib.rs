@@ -1192,7 +1192,8 @@ impl Vfs {
     }
     /// The last actual proc traversal identifies the data dependency even when
     /// lookup fails (e.g. missing /proc/sys keys). Missing process directories
-    /// retain full refresh so newly-created tasks can resolve after publication.
+    /// first refresh identities; the caller re-probes the final data dependency
+    /// after publishing newly-created tasks.
     pub fn proc_observation(&self, dirfd: i32, path: &[u8]) -> Option<ProcRefresh> {
         self.proc_accessed.set(false);
         self.proc_refresh.set(ProcRefresh::Independent);
