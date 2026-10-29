@@ -81,6 +81,13 @@ pub unsafe trait HardwareRange: HardwareStorage {
         self.len() == 0
     }
     fn resident_bytes(&self) -> usize;
+    /// Guest-page offsets whose bytes may differ from untouched zeroes, including
+    /// compressed/paged-out storage. Returning every page is a safe fallback.
+    /// Omitted pages must still be the original zeroes; residency alone is not
+    /// sufficient, since a nonresident page can retain modified contents.
+    fn populated_pages(&self) -> Vec<usize> {
+        (0..self.len()).step_by(crate::PAGE_SIZE as usize).collect()
+    }
 }
 
 /// Race-free one-shot readiness. Callbacks carry only scheduling authority,

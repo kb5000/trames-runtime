@@ -100,7 +100,13 @@ impl Store {
         if let Some(native) = &self.native {
             for (&base, r) in native.lock().unwrap().ranges.iter() {
                 out.extend(
-                    (base.max(start)..(base + r.len() as u64).min(end)).step_by(PAGE_SIZE as usize),
+                    r.populated_pages()
+                        .into_iter()
+                        .filter(|&offset| {
+                            offset < r.len() && offset.is_multiple_of(PAGE_SIZE as usize)
+                        })
+                        .map(|offset| base + offset as u64)
+                        .filter(|&at| at >= start && at < end),
                 );
             }
             out.sort_unstable();
