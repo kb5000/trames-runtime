@@ -632,7 +632,9 @@ impl<C: Cpu> Kernel<C> {
             .values()
             .filter(|p| p.vm_id != vm_id && !matches!(p.state, State::Zombie(_)))
         {
-            spaces.entry(p.vm_id).or_insert(p.memory.resident_bytes());
+            spaces
+                .entry(p.memory.instruction_identity().0)
+                .or_insert_with(|| p.memory.resident_bytes());
         }
         spaces.values().sum()
     }
@@ -682,7 +684,12 @@ impl<C: Cpu> Kernel<C> {
         );
         maps
     }
-    fn process_info(&self, pid: u32, p: &Process<C>) -> trames_vfs::ProcessInfo {
+    fn process_info(
+        &self,
+        pid: u32,
+        p: &Process<C>,
+        resident_bytes: usize,
+    ) -> trames_vfs::ProcessInfo {
         let maps = self.process_maps(p);
         let arguments = p
             .linux
@@ -728,7 +735,7 @@ impl<C: Cpu> Kernel<C> {
             ),
             executable_file: p.linux.executable_file.as_ref().map(Rc::downgrade),
             cwd: p.linux.vfs.cwd().unwrap_or_else(|_| b"/".to_vec()),
-            mapped_bytes: p.memory.resident_bytes(),
+            mapped_bytes: resident_bytes,
             virtual_bytes: p.memory.virtual_bytes(),
             maps,
             affinity: p.affinity,
@@ -765,9 +772,31 @@ impl<C: Cpu> Kernel<C> {
         p: &mut Process<C>,
         host: Option<trames_linux::HostMemoryInfo>,
     ) {
-        let memory = self
-            .memory_limits
-            .reported(self.other_memory(p.vm_id) + p.memory.resident_bytes(), host);
+        // Residency belongs to an address space, not each task. A native
+        // provider may query the host pager: take one live observation per
+        // real owner and reuse it for both totals and every thread's proc row.
+        // Do not cache across requests; hardware can populate/reclaim pages
+        // without changing the guest mapping generation.
+        let tasks = || {
+            self.processes
+                .values()
+                .map(|p| p.as_ref())
+                .chain(std::iter::once(&*p))
+        };
+        let mut resident = BTreeMap::new();
+        for task in tasks() {
+            resident
+                .entry(task.memory.instruction_identity().0)
+                .or_insert_with(|| task.memory.resident_bytes());
+        }
+        let used: usize = tasks()
+            .filter(|task| !matches!(task.state, State::Zombie(_)))
+            .map(|task| task.memory.instruction_identity().0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .iter()
+            .map(|owner| resident[owner])
+            .sum();
+        let memory = self.memory_limits.reported(used, host);
         // Bound cached bytes by the current memory-owner set, even after repeated
         // fork/exec. Never cache fd paths, credentials, names, argv bytes or
         // other mutable process metadata under a mapping-generation key.
@@ -783,9 +812,11 @@ impl<C: Cpu> Kernel<C> {
         let mut processes: Vec<_> = self
             .processes
             .iter()
-            .map(|(&id, other)| self.process_info(id, other))
+            .map(|(&id, other)| {
+                self.process_info(id, other, resident[&other.memory.instruction_identity().0])
+            })
             .collect();
-        processes.push(self.process_info(pid, p));
+        processes.push(self.process_info(pid, p, resident[&p.memory.instruction_identity().0]));
         p.linux.vfs.set_runtime_info(
             pid,
             trames_vfs::RuntimeInfo {
@@ -6029,11 +6060,11 @@ mod tests {
         p.linux.arguments = vec![b"first".to_vec()];
         p.linux.argument_pointers = vec![0x1000];
         p.memory.write(0x1000, b"first\0").unwrap();
-        let before = k.process_info(1, &p);
+        let before = k.process_info(1, &p, p.memory.resident_bytes());
         p.memory.write(0x1000, b"other\0").unwrap();
         let pipe = p.linux.vfs.pipe(0).unwrap();
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
-        let after = k.process_info(1, &p);
+        let after = k.process_info(1, &p, p.memory.resident_bytes());
         assert_eq!(before.maps, after.maps);
         assert_eq!(before.arguments, [b"first".to_vec()]);
         assert_eq!(after.arguments, [b"other".to_vec()]);
@@ -6046,6 +6077,98 @@ mod tests {
         assert_eq!(k.proc_maps.borrow().len(), 2);
         k.refresh_proc(1, &mut p, None);
         assert_eq!(k.proc_maps.borrow().len(), 1);
+    }
+
+    #[test]
+    fn proc_residency_queries_each_real_owner_once_and_refreshes_live_values() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        #[repr(align(4096))]
+        struct AlignedPage([u8; 4096]);
+        struct Range {
+            pages: Vec<AlignedPage>,
+            queries: AtomicUsize,
+            resident: AtomicUsize,
+        }
+        // SAFETY: stable initialized disjoint storage, no hardware actors or
+        // byte mutations in this metadata-only test. Views retain the owner.
+        unsafe impl trames_memory::HardwareStorage for Range {
+            fn pointer(&self) -> *mut u8 {
+                self.pages[0].0.as_ptr().cast_mut()
+            }
+            fn physical_address(&self) -> u64 {
+                0x400000
+            }
+            fn begin_host_access(&self) {}
+            fn end_host_access(&self) {}
+        }
+        // SAFETY: the complete aligned range is retained and initialized;
+        // observations only read atomic host metadata and never guest bytes.
+        unsafe impl trames_memory::HardwareRange for Range {
+            fn len(&self) -> usize {
+                1 << 21
+            }
+            fn resident_bytes(&self) -> usize {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.resident.load(Ordering::Relaxed)
+            }
+        }
+        let range = Arc::new(Range {
+            pages: vec![AlignedPage([0; 4096]); 512],
+            queries: AtomicUsize::new(0),
+            resident: AtomicUsize::new(3 * PAGE_SIZE as usize),
+        });
+        let mut p = process();
+        p.memory = Memory::new(trames_memory::ADDRESS_LIMIT as usize);
+        p.memory.map(0x200000, 1 << 21, Permissions::RW).unwrap();
+        let mut registry = trames_memory::parallel::Registry::default();
+        registry.use_hardware();
+        p.memory.prepare_hardware().unwrap();
+        let mut view = p.memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        // SAFETY: only this test's hardware-mode View can export the fresh range.
+        unsafe { view.export_hardware_range(0x200000, || Ok(range.clone())) }
+            .unwrap()
+            .unwrap();
+        drop(view);
+        let mut k = kernel();
+        for id in 2..=13 {
+            let mut peer = process();
+            peer.memory = p.memory.share();
+            k.processes.insert(id, peer);
+        }
+        // A dead leader may retain the old VM id with a different empty owner.
+        // It must neither hide real peers' residency nor add to used memory.
+        let mut zombie = process();
+        zombie.state = State::Zombie(0);
+        k.processes.insert(14, zombie);
+        for (iteration, pages) in [(1, 3), (2, 5)] {
+            range
+                .resident
+                .store(pages * PAGE_SIZE as usize, Ordering::Relaxed);
+            k.refresh_proc(1, &mut p, None);
+            assert_eq!(
+                range.queries.load(Ordering::Relaxed),
+                iteration,
+                "one host observation per owner, independent of thread count"
+            );
+            for id in 1..=13 {
+                let fd = p
+                    .linux
+                    .vfs
+                    .open_at(-100, format!("/proc/{id}/statm").as_bytes(), 0, 0)
+                    .unwrap();
+                let text = String::from_utf8(p.linux.vfs.read(fd, 128).unwrap()).unwrap();
+                assert_eq!(text.split_whitespace().nth(1).unwrap(), pages.to_string());
+                p.linux.vfs.close(fd).unwrap();
+            }
+        }
+        assert_eq!(k.other_memory(u64::MAX), 5 * PAGE_SIZE as usize);
+        assert_eq!(
+            range.queries.load(Ordering::Relaxed),
+            3,
+            "aggregate accounting also queries a shared mm only once"
+        );
     }
 
     #[test]

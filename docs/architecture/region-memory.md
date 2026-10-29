@@ -746,3 +746,11 @@ interpreter CLONE_VM peer reading a newly published mapping with zero VM
 checkpoints. Mac acceptance separately verifies one data translation fault for all
 512 pages, sparse host residency, partial protection/discard/reuse, migration and
 pressure recovery.
+
+Residency observations are batched by real address-space owner for each proc
+snapshot and reused by its aggregate total and thread rows. Hardware can populate
+or reclaim native pages without a mapping-generation change, so results are not
+cached between observations. A 13-task shared-mm regression bounds the provider
+query to one per snapshot and verifies changed live values on the next request.
+This keeps host pager queries from multiplying with the number of guest threads;
+normal CPU/native byte accesses still perform no residency query.
