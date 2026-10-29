@@ -44,6 +44,18 @@ impl<C: Cpu> Kernel<C> {
                 let number = p.cpu.x(8) as u32;
                 assert!(crate::worker_syscalls::vm_call(number));
                 let args = std::array::from_fn(|i| p.cpu.x(i));
+                let kind = match number {
+                    214 => 0,
+                    215 => 1,
+                    216 => 2,
+                    222 => 3,
+                    226 => 4,
+                    232 => 5,
+                    233 if args[2] as u32 == 4 => 6,
+                    233 => 7,
+                    _ => unreachable!(),
+                };
+                self.vm_checkpoint_calls[kind] += 1;
                 self.call(pid, &mut p, number, args, io);
                 assert!(matches!(p.state, State::Ready), "mapping call cannot park");
                 job.work.cpu = std::mem::take(&mut p.cpu);
@@ -149,7 +161,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
-    use trames_memory::{MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE};
+    use trames_memory::{MemoryError, PAGE_SIZE, PageBacking, Permissions, SharedPage};
 
     struct Page {
         bytes: Arc<SharedPage>,
@@ -447,11 +459,13 @@ mod tests {
         assert_eq!(k.vm_checkpoint_spaces, if relation == 1 { 2 } else { 1 });
         assert_eq!(k.vm_local_syscalls, 1);
         assert_eq!(k.parallel_rounds, 1);
-        assert!(!k.processes[&1]
-            .memory
-            .regions()
-            .iter()
-            .any(|(a, b, _)| *a <= 0x8000 && *b > 0x8000));
+        assert!(
+            !k.processes[&1]
+                .memory
+                .regions()
+                .iter()
+                .any(|(a, b, _)| *a <= 0x8000 && *b > 0x8000)
+        );
     }
     #[test]
     fn vm_commit_keeps_an_unrelated_cpu_running_while_the_owner_blocks() {
@@ -510,10 +524,11 @@ mod tests {
         assert_eq!(k.parallel_rounds, 1);
         assert_eq!(k.vm_checkpoint_groups, 0);
         assert_eq!(k.parallel_memory.metrics.full_rebuilds, 2);
-        assert!(k
-            .processes
-            .values()
-            .all(|p| p.memory.parallel_views_quiescent()));
+        assert!(
+            k.processes
+                .values()
+                .all(|p| p.memory.parallel_views_quiescent())
+        );
         let limit = k.instructions + 1000;
         assert!(matches!(
             k.drive(&mut trames_linux::CapturedOutput::default(), limit),

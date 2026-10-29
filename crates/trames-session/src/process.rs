@@ -10,10 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 use trames_engine::{Cpu, SliceOutcome};
-use trames_linux::{GuestOutput, Linux, OutputFd, SyscallOutcome, TerminalEvent, MAX_WRITE};
+use trames_linux::{GuestOutput, Linux, MAX_WRITE, OutputFd, SyscallOutcome, TerminalEvent};
 use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
-use trames_vfs::{Errno, FdKind, AT_FDCWD, MAX_FDS, O_NONBLOCK};
+use trames_vfs::{AT_FDCWD, Errno, FdKind, MAX_FDS, O_NONBLOCK};
 
 #[cfg(all(test, trames_interpreter_conformance))]
 const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
@@ -288,7 +288,7 @@ impl<C: Cpu> Process<C> {
             .linux
             .clone_with_resources(shared_files, shared_fs, shared_vm);
         Box::new(Self {
-            cpu: self.cpu.clone(),
+            cpu: self.cpu.fork_cpu(shared_vm),
             affinity: self.affinity,
             last_cpu: self.last_cpu,
             nice: self.nice,
@@ -353,6 +353,7 @@ pub(crate) struct Kernel<C: Cpu> {
     parallel_rounds: u64,
     vm_checkpoint_groups: u64,
     vm_checkpoint_spaces: u64,
+    vm_checkpoint_calls: [u64; 8],
     vm_local_syscalls: u64,
     persistent_control_checks: u64,
     worker_slices: u64,
@@ -1391,16 +1392,40 @@ impl<C: Cpu> Kernel<C> {
             _ => {}
         }
         let mut state = p.cpu.architectural_state();
+        let sme = p.cpu.sme_config().map(|config| {
+            (
+                config,
+                p.cpu.sme_state(),
+                C::features().hwcap2 & (1 << 37) != 0,
+            )
+        });
         p.signals
-            .enter(&mut state, &mut p.memory, sig, info, action)?;
+            .enter_sme(&mut state, &mut p.memory, sig, info, action, sme)?;
+        let has_sme = sme.is_some();
         p.cpu.restore_architectural_state(&state);
+        if has_sme {
+            p.cpu.set_sme_state(None);
+        }
         p.state = State::Ready;
         Ok(true)
     }
     fn sigreturn(p: &mut Process<C>) -> Result<(), Errno> {
         let mut state = p.cpu.architectural_state();
-        p.signals.restore(&mut state, &p.memory)?;
+        let registers = if let Some(config) = p.cpu.sme_config() {
+            Some(p.signals.restore_sme(
+                &mut state,
+                &p.memory,
+                config,
+                C::features().hwcap2 & (1 << 37) != 0,
+            )?)
+        } else {
+            p.signals.restore(&mut state, &p.memory)?;
+            None
+        };
         p.cpu.restore_architectural_state(&state);
+        if let Some(registers) = registers {
+            p.cpu.set_sme_state(registers);
+        }
         p.state = State::Ready;
         Ok(())
     }
@@ -1559,6 +1584,7 @@ impl<C: Cpu> Kernel<C> {
             runtime.linux.trace = p.linux.trace;
             runtime.linux.task_limit = p.linux.task_limit;
             p.linux = runtime.linux;
+            runtime.cpu.inherit_exec(&p.cpu);
             p.cpu = runtime.cpu;
             p.memory = runtime.memory;
             p.signals.exec();
@@ -1630,11 +1656,7 @@ impl<C: Cpu> Kernel<C> {
                 return Ok(Some(p.linux.vfs.visible_pid(child) as u64));
             }
         }
-        if a[2] & 1 != 0 {
-            Ok(Some(0))
-        } else {
-            Ok(None)
-        }
+        if a[2] & 1 != 0 { Ok(Some(0)) } else { Ok(None) }
     }
     fn syscall(
         &mut self,
@@ -2166,6 +2188,16 @@ impl<C: Cpu> Kernel<C> {
             },
             167 if matches!(a[0], 7 | 8 | 23 | 24 | 27 | 28 | 38 | 39 | 47) => {
                 p.linux.vfs.credentials.caps.prctl(a).map(Some)
+            }
+            167 if matches!(a[0], 63 | 64) => {
+                let mut config = p.cpu.sme_config().ok_or(Errno(22))?;
+                if a[0] == 64 {
+                    Ok(Some(config.get()))
+                } else {
+                    let value = config.set(a[1], C::sme_lengths()).ok_or(Errno(22))?;
+                    p.cpu.set_sme_config(config);
+                    Ok(Some(value))
+                }
             }
             167 if !matches!(a[0], 15 | 16) => Err(Errno(22)),
             72 | 73 => self.poll(p, number, a, io),
@@ -2905,7 +2937,7 @@ impl<C: Cpu> Kernel<C> {
                             .linux
                             .vfs
                             .open_pty_peer(a[0] as u32, a[2] as u32)
-                            .map(|fd| Some(fd as u64))
+                            .map(|fd| Some(fd as u64));
                     }
                     _ => unreachable!(),
                 }
@@ -3036,7 +3068,7 @@ impl<C: Cpu> Kernel<C> {
             }
             let count = match tty.queue_output(&bytes) {
                 Err(Errno(11)) if p.linux.vfs.flags(a[0] as u32)? & O_NONBLOCK == 0 => {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 result => result?,
             };
@@ -4603,6 +4635,7 @@ pub(super) fn run<C: Cpu>(
         parallel_rounds: 0,
         vm_checkpoint_groups: 0,
         vm_checkpoint_spaces: 0,
+        vm_checkpoint_calls: [0; 8],
         vm_local_syscalls: 0,
         persistent_control_checks: 0,
         worker_slices: 0,
@@ -4685,6 +4718,7 @@ pub(super) fn run<C: Cpu>(
         parallel_rounds: kernel.parallel_rounds,
         vm_checkpoint_groups: kernel.vm_checkpoint_groups,
         vm_checkpoint_spaces: kernel.vm_checkpoint_spaces,
+        vm_checkpoint_calls: kernel.vm_checkpoint_calls,
         vm_local_syscalls: kernel.vm_local_syscalls,
         persistent_control_checks: kernel.persistent_control_checks,
         worker_slices: kernel.worker_slices,
@@ -4764,7 +4798,7 @@ mod tests {
     type Kernel = crate::process::Kernel<Cpu>;
 
     use super::*;
-    use trames_memory::{Permissions, PAGE_SIZE};
+    use trames_memory::{PAGE_SIZE, Permissions};
     #[test]
     fn shared_resources_are_visible_without_propagation_and_private_domains_remain_separate() {
         let mut k = kernel();
@@ -5685,15 +5719,16 @@ mod tests {
             assert_eq!(k.deliver(1, &mut p), Ok(true));
             assert!(p.flock_wait.is_none());
             // Signal frame restores either EINTR or the original SVC for restart.
-            assert!(k
-                .syscall(
+            assert!(
+                k.syscall(
                     1,
                     &mut p,
                     139,
                     [0; 6],
                     &mut trames_linux::CapturedOutput::default()
                 )
-                .is_ok());
+                .is_ok()
+            );
             assert_eq!(
                 p.cpu.pc,
                 if restart {
@@ -5842,11 +5877,12 @@ mod tests {
         assert_eq!(k.parallel_rounds - before.2, ROUNDS);
         assert_eq!(k.instructions - before.0, ROUNDS * 5);
         assert_eq!(k.processes.len(), TASKS as usize);
-        assert!(k
-            .processes
-            .iter()
-            .filter(|(id, _)| **id != 1)
-            .all(|(_, p)| matches!(p.state, State::Futex { ref wait, .. } if !wait.woken())));
+        assert!(
+            k.processes
+                .iter()
+                .filter(|(id, _)| **id != 1)
+                .all(|(_, p)| matches!(p.state, State::Futex { ref wait, .. } if !wait.woken()))
+        );
         assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 0);
         println!(
             "cohort_preparation tasks={TASKS} rounds={ROUNDS} instructions={} seconds={seconds:.6}",
@@ -5954,6 +5990,7 @@ mod tests {
             parallel_rounds: 0,
             vm_checkpoint_groups: 0,
             vm_checkpoint_spaces: 0,
+            vm_checkpoint_calls: [0; 8],
             vm_local_syscalls: 0,
             persistent_control_checks: 0,
             worker_slices: 0,
@@ -6049,9 +6086,11 @@ mod tests {
         let maps = String::from_utf8(k.process_maps(&peer)).unwrap();
         assert!(maps.contains("000000100000-000000101000 rw-p"));
         p.memory.unmap(0x100000, 2 * PAGE_SIZE).unwrap();
-        assert!(!String::from_utf8(k.process_maps(&p))
-            .unwrap()
-            .contains("000000100000-"));
+        assert!(
+            !String::from_utf8(k.process_maps(&p))
+                .unwrap()
+                .contains("000000100000-")
+        );
         let mut child = p.fork();
         child.vm_id = 2;
         child
@@ -6973,10 +7012,11 @@ mod tests {
             ),
             Err(Errno(22))
         );
-        assert!(p
-            .linux
-            .vfs
-            .shares_descriptors_with(&k.processes[&2].linux.vfs));
+        assert!(
+            p.linux
+                .vfs
+                .shares_descriptors_with(&k.processes[&2].linux.vfs)
+        );
         assert_eq!(
             k.syscall(
                 1,
@@ -6987,10 +7027,11 @@ mod tests {
             ),
             Ok(Some(0))
         );
-        assert!(!p
-            .linux
-            .vfs
-            .shares_descriptors_with(&k.processes[&2].linux.vfs));
+        assert!(
+            !p.linux
+                .vfs
+                .shares_descriptors_with(&k.processes[&2].linux.vfs)
+        );
         assert_eq!(p.linux.vfs.fd_kind(fd), Err(Errno(9)));
         assert!(k.processes[&2].linux.vfs.fd_kind(fd).is_ok());
         let fd = p.linux.vfs.open_at(-100, b"/file", 0, 0).unwrap();
@@ -7341,12 +7382,14 @@ mod boundary_tests {
         assert_eq!(p.linux.vfs.read(fd, 64).unwrap(), b"300\n");
         let fd = p.linux.vfs.open_at(-100, b"/proc/1/limits", 0, 0).unwrap();
         let limits = String::from_utf8(p.linux.vfs.read(fd, 4096).unwrap()).unwrap();
-        assert!(limits.lines().any(|line| line.starts_with("Max processes")
-            && line
-                .split_whitespace()
-                .skip(2)
-                .take(2)
-                .all(|value| value == "300")));
+        assert!(limits.lines().any(|line| {
+            line.starts_with("Max processes")
+                && line
+                    .split_whitespace()
+                    .skip(2)
+                    .take(2)
+                    .all(|value| value == "300")
+        }));
     }
     #[test]
     fn process_limit_rejects_fork_without_changing_parent_memory() {
@@ -7509,12 +7552,13 @@ mod boundary_tests {
         let mut other = process();
         other.group = 2;
         k.processes.insert(2, other);
-        assert!(k
-            .pump_terminal(&mut Events(Some(TerminalEvent::Resize {
+        assert!(
+            k.pump_terminal(&mut Events(Some(TerminalEvent::Resize {
                 rows: 40,
                 columns: 120
             })))
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(&k.terminal.as_ref().unwrap().window[..4], &[40, 0, 120, 0]);
         assert!(k.processes[&1].signals.pending.contains_key(&28));
         assert!(!k.processes[&2].signals.pending.contains_key(&28));

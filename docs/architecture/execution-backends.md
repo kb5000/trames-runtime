@@ -202,3 +202,31 @@ fork and CLONE_FILES invalidate membership through the existing FD identity.
 An empty index avoids walking unrelated descriptors. This creates no polling
 bus, service thread or additional timer authority, and weak entries cannot keep
 a closed timer alive.
+
+
+## Optional SME streaming context (2026-10-29)
+
+`Aarch64State` remains 816 bytes. `Cpu` has optional SME hooks with unsupported
+interpreter defaults; iPad gains no capability bit, per-task matrix allocation,
+or platform dependency. The bounded extended register profile holds up to
+64-byte streaming vectors, predicates, ZA and one ZT register. A hardware backend
+owns the optional buffer and supplies its actual supported vector lengths.
+Non-streaming SVE and SME FA64/FFR are outside this profile.
+
+The shared session implements Linux SME vector-length prctl, deferred/inherited
+exec policy, CLONE_VM ZA/TPIDR2 clearing and fork preservation. Unused prctl
+arguments are ignored, matching Linux. Syscall return clears streaming mode,
+preserves low vector lanes and retains live ZA/ZT. Exec resets register state.
+The signal kernel emits and validates streaming SVE, ZA, ZT and TPIDR2 records;
+large contexts use Linux's contiguous `extra_context` layout. Handlers start
+with SM/ZA/TPIDR2 cleared. Full frame validation precedes task/register changes.
+An SME image receives AT_MINSIGSTKSZ=8192 for the bounded profile. Existing
+non-SME signal and interpreter behavior remains available without these records.
+Debugger regsets are not implemented by the session's existing ptrace boundary.
+
+The Mac product validates actual EL0 matrix instructions, private context
+permissions, preemption and host-thread migration. Its Linux fixture additionally
+checks streaming signal restoration after a clobbering handler, fork, pthread
+creation and exec. The common ABI follows the
+[Linux SME documentation](https://docs.kernel.org/arch/arm64/sme.html) and
+[signal-record layout](https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/sigcontext.h).

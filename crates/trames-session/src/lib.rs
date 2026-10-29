@@ -16,7 +16,7 @@ mod worker_syscalls;
 mod workers;
 #[cfg(all(test, trames_interpreter_conformance))]
 use trames_memory::Permissions;
-use trames_memory::{Memory, MemoryError, DEFAULT_MEMORY_LIMIT, PAGE_SIZE};
+use trames_memory::{DEFAULT_MEMORY_LIMIT, Memory, MemoryError, PAGE_SIZE};
 
 /// Guest resident-page budgets. Untouched anonymous zeros/reservations have no
 /// resident charge. File mappings and fork COW remain conservative; CLONE_VM
@@ -75,7 +75,9 @@ impl MemoryLimits {
             || !self.per_process.is_multiple_of(PAGE_SIZE as usize)
             || !self.total.is_multiple_of(PAGE_SIZE as usize)
         {
-            return Err(RuntimeError::Configuration("memory budgets must be positive page multiples, process <= total <= guest address space"));
+            return Err(RuntimeError::Configuration(
+                "memory budgets must be positive page multiples, process <= total <= guest address space",
+            ));
         }
         Ok(())
     }
@@ -169,6 +171,9 @@ pub struct RuntimeMetrics {
     /// Mapping checkpoint groups and actual address spaces quiesced locally.
     pub vm_checkpoint_groups: u64,
     pub vm_checkpoint_spaces: u64,
+    /// Calls requiring an mm checkpoint: brk, munmap, mremap, mmap, mprotect,
+    /// mincore, destructive madvise, advisory madvise. Counts are not pauses.
+    pub vm_checkpoint_calls: [u64; 8],
     pub vm_local_syscalls: u64,
     /// Host control checks that retain the current jobs and translations.
     pub persistent_control_checks: u64,

@@ -2,7 +2,7 @@
 //! Linux process-entry ABI shared by interpreter and hardware execution.
 use trames_elf::LoadedElf;
 use trames_execution::Features;
-use trames_memory::{Memory, MemoryError, Permissions, PAGE_SIZE};
+use trames_memory::{Memory, MemoryError, PAGE_SIZE, Permissions};
 pub const STACK_TOP: u64 = 0x0000_7fff_fff0_0000;
 pub const STACK_SIZE: u64 = 1024 * 1024;
 const INITIAL_ARGUMENT_BYTES: u64 = 64 * 1024;
@@ -91,6 +91,9 @@ pub fn build_initial_stack(
         (31, execfn.unwrap_or(arguments[0])),
         (25, cursor),
     ];
+    if features.hwcap2 & (1 << 23) != 0 {
+        auxv.push((51, trames_execution::SME_SIGNAL_STACK_MIN));
+    }
     if let Some(phdr) = elf.phdr {
         auxv.extend([(3, phdr), (4, 56), (5, elf.phnum as u64)]);
     }

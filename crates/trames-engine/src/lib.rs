@@ -2,8 +2,8 @@
 //! Cold task/executor interface. Ordinary guest instructions and accesses stay
 //! inside each engine, with static dispatch and its existing memory model.
 use std::fmt;
-use trames_execution::{Aarch64State, Features, Registers};
-use trames_memory::{parallel::View, Memory, MemoryError};
+use trames_execution::{Aarch64State, Features, Registers, SmeConfig, SmeState};
+use trames_memory::{Memory, MemoryError, parallel::View};
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct DecodeStats {
@@ -96,6 +96,22 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn set_tls(&mut self, value: u64);
     fn architectural_state(&self) -> Aarch64State;
     fn restore_architectural_state(&mut self, state: &Aarch64State);
+    /// Optional Linux SME ABI; interpreters incur no extra register storage.
+    fn sme_config(&self) -> Option<SmeConfig> {
+        None
+    }
+    fn sme_lengths() -> &'static [u16] {
+        &[]
+    }
+    fn set_sme_config(&mut self, _: SmeConfig) {}
+    fn sme_state(&self) -> Option<&SmeState> {
+        None
+    }
+    fn set_sme_state(&mut self, _: Option<Box<SmeState>>) {}
+    fn fork_cpu(&self, _: bool) -> Self {
+        self.clone()
+    }
+    fn inherit_exec(&mut self, _: &Self) {}
     fn set_native_calls(&mut self, enabled: bool);
     fn set_vulkan_calls(&mut self, enabled: bool);
     fn clear_exclusive(&mut self);
