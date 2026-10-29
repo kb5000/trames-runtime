@@ -345,7 +345,28 @@ fn prepare_frame(
                 .backing
                 .as_ref()
                 .is_some_and(|b| b.shared || !page.permissions.write));
-    let bytes = if let Some(source) = source {
+    // A resident backing already owns the canonical allocation. Retain it
+    // directly so a rebuilt snapshot preserves its physical identity and a
+    // retained hardware PTE can publish without faulting the source in again.
+    let bytes = if let Some(shared) = resident_backing {
+        registry.metrics.shared_frames += 1;
+        let previous = previous.map(|f| &f.bytes);
+        let reused = previous
+            .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
+            .cloned()
+            .or_else(|| {
+                key.and_then(|key| registry.shared.get(&key))
+                    .and_then(Weak::upgrade)
+                    .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
+            });
+        let bytes = reused.unwrap_or_else(|| {
+            Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
+        });
+        if let Some(key) = key {
+            registry.shared.insert(key, Arc::downgrade(&bytes));
+        }
+        bytes
+    } else if let Some(source) = source {
         let private = page
             .backing
             .as_ref()
@@ -376,24 +397,6 @@ fn prepare_frame(
             if let Some(key) = source_key {
                 registry.shared.insert(key, Arc::downgrade(&bytes));
             }
-        }
-        bytes
-    } else if let Some(shared) = resident_backing {
-        registry.metrics.shared_frames += 1;
-        let previous = previous.map(|f| &f.bytes);
-        let reused = previous
-            .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
-            .cloned()
-            .or_else(|| {
-                key.and_then(|key| registry.shared.get(&key))
-                    .and_then(Weak::upgrade)
-                    .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
-            });
-        let bytes = reused.unwrap_or_else(|| {
-            Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
-        });
-        if let Some(key) = key {
-            registry.shared.insert(key, Arc::downgrade(&bytes));
         }
         bytes
     } else if direct_owned {

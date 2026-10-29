@@ -8,8 +8,8 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -448,10 +448,7 @@ impl<C: Cpu> Epoch<C> {
             let pending = job.hardware_wait.as_ref().is_some_and(|w| !w.ready())
                 || job.waiting.is_some()
                 || job.io.as_ref().is_some_and(|io| !io.signal.ready())
-                || job
-                    .gpu_pending
-                    .as_ref()
-                    .is_some_and(|gpu| !gpu.signal().ready());
+                || job.gpu_pending.as_ref().is_some_and(|gpu| gpu.waiting());
             if pending {
                 self.publish_deadline(
                     job.waiting
@@ -875,7 +872,47 @@ mod tests {
     type Job = crate::run_queue::Job<Cpu>;
 
     use super::*;
-    use trames_memory::{CpuMemory, Memory, PAGE_SIZE, Permissions};
+    use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn vm_checkpoint_requeues_an_unarmed_adopted_gpu_compile() {
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        let mut gpu = job(1, &epoch);
+        let mut mapper = job(2, &epoch);
+        mapper.affinity = 2;
+        mapper.work.memory = gpu.work.memory.clone();
+        gpu.gpu_pending = Some(crate::gpu::Pending::adopted(crate::gpu::Compile {
+            call: crate::gpu::Call {
+                pc: 0x1000,
+                operation: 65,
+                args: [65, 0, 0],
+            },
+            job: 71,
+            began: Instant::now(),
+            peer_instructions: 0,
+        }));
+        epoch.add(gpu);
+        epoch.add(mapper);
+        let gpu = epoch.take(0).unwrap();
+        let mapper = epoch.take(1).unwrap();
+        epoch.park(gpu, None);
+        epoch.checkpoint(mapper, SliceOutcome::Syscall { instructions: 0 });
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        epoch.restore_checkpoint(checkpoint, true);
+        let mut resumed = vec![epoch.take(0).unwrap(), epoch.take(1).unwrap()];
+        resumed.sort_by_key(|job| job.work.pid);
+        assert_eq!(resumed[0].work.pid, 1);
+        assert_eq!(
+            resumed[0]
+                .gpu_pending
+                .as_ref()
+                .unwrap()
+                .checkpoint(0)
+                .unwrap()
+                .job,
+            71
+        );
+    }
+
     #[test]
     fn ready_peer_preempts_only_after_progress_and_quantum() {
         let epoch = Epoch::new(Arc::new(Control::new(100)));
@@ -1237,16 +1274,14 @@ mod tests {
         epoch.stop();
         let done = epoch.drain();
         assert!(signal.upgrade().is_none());
-        assert!(
-            done[0]
-                .io
-                .as_ref()
-                .unwrap()
-                .flock
-                .as_ref()
-                .unwrap()
-                .same_owner(&request)
-        );
+        assert!(done[0]
+            .io
+            .as_ref()
+            .unwrap()
+            .flock
+            .as_ref()
+            .unwrap()
+            .same_owner(&request));
         assert_eq!(done[0].io.as_ref().unwrap().args, args);
         vfs.flock(b, 8).unwrap(); // Old callback cannot resurrect this stopped epoch.
         assert!(epoch.take(0).is_none());

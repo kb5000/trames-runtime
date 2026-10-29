@@ -68,6 +68,11 @@ impl Pending {
     pub fn signal(&self) -> &Arc<IoSignal> {
         self.signal.as_ref().expect("armed GPU wait")
     }
+    pub fn waiting(&self) -> bool {
+        // An adopted compile has not registered a wake yet. Give it a worker
+        // turn to subscribe and poll before any VM checkpoint can park it.
+        self.signal.as_ref().is_some_and(|signal| !signal.ready())
+    }
     pub fn checkpoint(&self, peer: u64) -> Option<Compile> {
         self.compile.map(|mut c| {
             c.peer_instructions += peer.saturating_sub(self.peer_started);

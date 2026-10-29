@@ -2158,6 +2158,46 @@ mod tests {
         };
     }
     #[test]
+    fn hardware_publication_keeps_resident_source_across_registry_rebuild() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"retained-hardware-source", 0).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let mut memory = Memory::default();
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x10000,
+            PAGE_SIZE,
+            true,
+            Permissions::RW,
+        );
+        memory.prepare_hardware().unwrap();
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x10000, [71]).unwrap();
+        let retained = view.hardware_write_frame(0x10000).unwrap();
+        assert!(retained.needs_publication());
+        drop(view);
+        memory.commit_parallel().unwrap();
+        // A parked hardware executor can retain its physical mapping while a
+        // fresh registry replaces the old ConcurrentPage metadata. Publishing
+        // that retained PTE must not require a new byte read/first-touch fault.
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.mark_hardware_frame_write(retained).unwrap();
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<1>(0x10000).unwrap(), [71]);
+        assert_eq!(v.pread(fd, 1, 0).unwrap(), [71]);
+    }
+
+    #[test]
     fn direct_content_refresh_keeps_mapping_generation_but_eof_and_cow_still_change() {
         use trames_memory::{parallel::Registry, CpuMemory};
         let mut v = Vfs::default();

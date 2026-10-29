@@ -45,20 +45,18 @@ fn main() {
             _ => panic!("unsupported MoltenVK target architecture"),
         };
         let directory = archive_directory(&archive, "moltenvk", arch);
-        if target.contains("ios") {
+        {
             // rustc links with -nodefaultlibs. MoltenVK's original Clang-built
-            // availability checks need Apple's compiler-rt, which that flag
-            // otherwise omits. Bundle its matching original architecture too.
-            let simulator = target.ends_with("-sim") || target.starts_with("x86_64-");
-            let sdk = if simulator {
-                "iphonesimulator"
+            // availability checks need Apple's compiler-rt on macOS as well as
+            // iOS. Bundle the SDK's matching original architecture too.
+            let ios = target.contains("ios");
+            let simulator = ios && (target.ends_with("-sim") || target.starts_with("x86_64-"));
+            let (sdk, runtime) = if simulator {
+                ("iphonesimulator", "clang_rt.iossim")
+            } else if ios {
+                ("iphoneos", "clang_rt.ios")
             } else {
-                "iphoneos"
-            };
-            let runtime = if simulator {
-                "clang_rt.iossim"
-            } else {
-                "clang_rt.ios"
+                ("macosx", "clang_rt.osx")
             };
             let result = Command::new("xcrun")
                 .args(["--sdk", sdk, "clang", "--print-runtime-dir"])
@@ -86,6 +84,9 @@ fn main() {
         );
         println!("cargo:rustc-link-lib=static=MoltenVK");
         println!("cargo:rustc-link-lib=c++");
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            println!("cargo:rustc-link-lib=framework=IOKit");
+        }
         for framework in [
             "Metal",
             "Foundation",
