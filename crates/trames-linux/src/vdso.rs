@@ -49,10 +49,12 @@ pub fn image() -> Vec<u8> {
     word(&mut bytes, 32, 64, 8);
     word(&mut bytes, 52, 64, 2);
     word(&mut bytes, 54, 56, 2);
-    word(&mut bytes, 56, 3, 2);
+    word(&mut bytes, 56, 2, 2);
+    // One RX ELF load segment; the adjacent R calibration mapping is not an
+    // ELF load segment. Older glibc uses a zero load address as an unset sentinel
+    // and miscomputes the bias when a second PT_LOAD follows the zero-based one.
     for (i, (kind, flags, offset, len, align)) in [
         (1, 5, 0, PAGE_SIZE, PAGE_SIZE),
-        (1, 4, PAGE_SIZE, PAGE_SIZE, PAGE_SIZE),
         (2, 4, DYNAMIC as u64, 160, 8),
     ]
     .into_iter()

@@ -283,6 +283,12 @@ Linux/session code owns the ELF, stack ABI, permissions and clock semantics;
 platform counter APIs stay in the executor. The iPad interpreter advertises no
 vDSO and retains its existing syscall behavior and capability profile.
 
+The ELF has one zero-based RX `PT_LOAD`; the adjacent read-only calibration
+page is a separate mapping. This also supports older glibc vDSO registration,
+whose [zero-address sentinel](https://github.com/bminor/glibc/blob/glibc-2.31/elf/setup-vdso.h)
+miscomputes the load bias if a second nonzero `PT_LOAD` follows it. A real
+glibc-interpreted PIE is a regression, alongside static/dynamic musl lookup.
+
 Initialization and exec bind the counter to the same session `Instant` origin
 used by syscalls and Wayland. Eight bounded calibration brackets select the
 narrowest sample; a bracket wider than one microsecond disables the fast clock.
