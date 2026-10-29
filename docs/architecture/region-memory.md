@@ -754,3 +754,17 @@ cached between observations. A 13-task shared-mm regression bounds the provider
 query to one per snapshot and verifies changed live values on the next request.
 This keeps host pager queries from multiplying with the number of guest threads;
 normal CPU/native byte accesses still perform no residency query.
+
+Proc observation also declares the fields it consumes along the actual VFS
+traversal. Independent kernel endpoints (including missing sysctl keys and the
+fresh read-only random UUID endpoint) do not rebuild a task snapshot. Maps and
+other process metadata refresh without host residency queries; statm/status/stat
+and meminfo retain live memory observations. Unknown process lookups stay
+conservative so newly-published tasks can resolve. Alias, cwd and dirfd tests
+cover this classification. The shared-mm provider test verifies that UUID,
+CPU-info and maps reads make zero residency calls, then a statm read observes
+new hardware residency. No cross-request timer cache is introduced.
+
+The UUID endpoint uses the existing host CSPRNG and generates a new UUID v4 on
+retrieval, matching the documented [Linux random sysctl semantics](https://docs.kernel.org/admin-guide/sysctl/kernel.html#random).
+Its directory and file are runtime pseudo nodes outside disk storage quotas.

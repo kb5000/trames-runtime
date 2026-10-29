@@ -400,6 +400,55 @@ impl Filesystem {
         Ok(())
     }
 }
+/// Process snapshot fields actually consumed by a proc lookup. Unknown paths
+/// stay conservative; independent kernel endpoints never enumerate tasks/RSS.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProcRefresh {
+    #[default]
+    Independent,
+    Metadata,
+    Residency,
+}
+impl ProcRefresh {
+    pub fn for_path(path: &[u8]) -> Self {
+        if path == b"/proc/sys/fs/file-nr" {
+            return Self::Metadata;
+        }
+        if path == b"/proc/sys"
+            || path.starts_with(b"/proc/sys/")
+            || matches!(
+                path,
+                b"/proc/cpuinfo"
+                    | b"/proc/version"
+                    | b"/proc/swaps"
+                    | b"/proc/partitions"
+                    | b"/proc/devices"
+                    | b"/proc/diskstats"
+                    | b"/proc/filesystems"
+            )
+        {
+            return Self::Independent;
+        }
+        if matches!(path, b"/proc/stat" | b"/proc/uptime" | b"/proc/loadavg")
+            || [
+                b"/maps".as_slice(),
+                b"/cmdline",
+                b"/environ",
+                b"/auxv",
+                b"/comm",
+                b"/limits",
+                b"/mounts",
+                b"/mountinfo",
+            ]
+            .iter()
+            .any(|tail| path.ends_with(tail))
+        {
+            return Self::Metadata;
+        }
+        Self::Residency
+    }
+}
+
 pub struct Vfs {
     network: trames_net::Network,
     native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
@@ -429,6 +478,7 @@ pub struct Vfs {
     file_size_signal: Cell<bool>,
     next_open: Rc<Cell<u64>>,
     proc_accessed: Cell<bool>,
+    proc_refresh: Cell<ProcRefresh>,
     ptys: Rc<RefCell<BTreeMap<u32, Weak<Pty>>>>,
     embedding_terminal: Rc<Cell<bool>>,
     pub controlling_terminal: Option<u32>,
@@ -487,6 +537,7 @@ impl Vfs {
             file_size_signal: self.file_size_signal.clone(),
             next_open: self.next_open.clone(),
             proc_accessed: self.proc_accessed.clone(),
+            proc_refresh: self.proc_refresh.clone(),
             ptys: self.ptys.clone(),
             embedding_terminal: self.embedding_terminal.clone(),
             controlling_terminal: self.controlling_terminal,
@@ -542,6 +593,7 @@ impl Default for Vfs {
             file_size_signal: Cell::new(false),
             next_open: Rc::new(Cell::new(1)),
             proc_accessed: Cell::new(false),
+            proc_refresh: Cell::new(ProcRefresh::Independent),
             bridge: None,
         };
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
@@ -989,6 +1041,7 @@ impl Vfs {
         if self.uses_pseudo(path) {
             if key == b"/proc" || key.starts_with(b"/proc/") {
                 self.proc_accessed.set(true);
+                self.proc_refresh.set(ProcRefresh::for_path(key));
             }
             if let Some(node) = self.pseudo_node(path)? {
                 return Ok(node);
@@ -1095,9 +1148,18 @@ impl Vfs {
     /// lookups of newly created process directories. A textual prefix check
     /// would miss aliases such as /dev/fd and links into another process's proc.
     pub fn accesses_proc(&self, dirfd: i32, path: &[u8]) -> bool {
+        self.proc_observation(dirfd, path).is_some()
+    }
+    /// The last actual proc traversal identifies the data dependency even when
+    /// lookup fails (e.g. missing /proc/sys keys). Missing process directories
+    /// retain full refresh so newly-created tasks can resolve after publication.
+    pub fn proc_observation(&self, dirfd: i32, path: &[u8]) -> Option<ProcRefresh> {
         self.proc_accessed.set(false);
+        self.proc_refresh.set(ProcRefresh::Independent);
         let _ = self.resolve(dirfd, path);
-        self.proc_accessed.replace(false)
+        self.proc_accessed
+            .replace(false)
+            .then(|| self.proc_refresh.get())
     }
     pub fn resolve_final(
         &self,

@@ -772,6 +772,15 @@ impl<C: Cpu> Kernel<C> {
         p: &mut Process<C>,
         host: Option<trames_linux::HostMemoryInfo>,
     ) {
+        self.refresh_proc_observed(pid, p, host, true);
+    }
+    fn refresh_proc_observed(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        host: Option<trames_linux::HostMemoryInfo>,
+        observe_residency: bool,
+    ) {
         // Residency belongs to an address space, not each task. A native
         // provider may query the host pager: take one live observation per
         // real owner and reuse it for both totals and every thread's proc row.
@@ -787,7 +796,13 @@ impl<C: Cpu> Kernel<C> {
         for task in tasks() {
             resident
                 .entry(task.memory.instruction_identity().0)
-                .or_insert_with(|| task.memory.resident_bytes());
+                .or_insert_with(|| {
+                    if observe_residency {
+                        task.memory.resident_bytes()
+                    } else {
+                        0
+                    }
+                });
         }
         let used: usize = tasks()
             .filter(|task| !matches!(task.state, State::Zombie(_)))
@@ -2527,23 +2542,29 @@ impl<C: Cpu> Kernel<C> {
             }
             _ => None,
         };
-        let reads_proc = matches!(number, 39..=41) || proc_path.is_some_and(|(dirfd, address)| {
-            p.memory.read_c_string(address, 4096).is_ok_and(|path| {
-                p.linux.vfs.accesses_proc(dirfd, &path)
-            })
-        }) || (matches!(number, 44 | 61 | 63 | 65 | 67 | 69 | 78 | 80)
-            && p.linux.vfs.fd_kind(a[0] as u32).is_ok_and(|kind| {
-                matches!(kind, FdKind::Node(path) if path == b"/proc" || path.starts_with(b"/proc/"))
-            }));
-        if reads_proc {
+        use trames_vfs::ProcRefresh;
+        let mut proc_observation = matches!(number, 39..=41).then_some(ProcRefresh::Metadata);
+        if let Some((dirfd, address)) = proc_path {
+            if let Ok(path) = p.memory.read_c_string(address, 4096) {
+                proc_observation = proc_observation.max(p.linux.vfs.proc_observation(dirfd, &path));
+            }
+        }
+        if matches!(number, 44 | 61 | 63 | 65 | 67 | 69 | 78 | 80) {
+            if let Ok(FdKind::Node(path)) = p.linux.vfs.fd_kind(a[0] as u32) {
+                if path == b"/proc" || path.starts_with(b"/proc/") {
+                    proc_observation = proc_observation.max(Some(ProcRefresh::for_path(&path)));
+                }
+            }
+        }
+        if let Some(demand) = proc_observation.filter(|d| *d != ProcRefresh::Independent) {
             self.proc_refreshes += 1;
-            self.refresh_proc(
+            self.refresh_proc_observed(
                 pid,
                 p,
-                self.memory_limits
-                    .is_host_managed()
+                (demand == ProcRefresh::Residency && self.memory_limits.is_host_managed())
                     .then(|| io.host_memory())
                     .flatten(),
+                demand == ProcRefresh::Residency,
             );
         }
         let was_blocked = matches!(p.state, State::Blocked(..));
@@ -6082,6 +6103,7 @@ mod tests {
     #[test]
     fn proc_residency_queries_each_real_owner_once_and_refreshes_live_values() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use trames_linux::CapturedOutput;
         #[derive(Clone)]
         #[repr(align(4096))]
         struct AlignedPage([u8; 4096]);
@@ -6169,6 +6191,65 @@ mod tests {
             3,
             "aggregate accounting also queries a shared mm only once"
         );
+        p.memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut io = CapturedOutput::default();
+        for path in [
+            b"/proc/sys/kernel/random/uuid".as_slice(),
+            b"/proc/sys/kernel/random/trames-absent",
+            b"/proc/cpuinfo",
+            b"/proc/self/maps",
+        ] {
+            let mut name = path.to_vec();
+            name.push(0);
+            p.memory.write(0x1000, &name).unwrap();
+            k.call(
+                1,
+                &mut p,
+                56,
+                [(-100i64) as u64, 0x1000, 0, 0, 0, 0],
+                &mut io,
+            );
+            let fd = p.cpu.x(0);
+            if fd < 256 {
+                k.call(1, &mut p, 63, [fd, 0x1100, 128, 0, 0, 0], &mut io);
+                k.call(1, &mut p, 57, [fd, 0, 0, 0, 0, 0], &mut io);
+            } else {
+                assert_eq!(path, b"/proc/sys/kernel/random/trames-absent");
+                assert_eq!(fd, error(Errno(2)));
+            }
+            assert_eq!(
+                range.queries.load(Ordering::Relaxed),
+                3,
+                "independent endpoints and maps cannot observe unrelated residency"
+            );
+        }
+        p.memory.write(0x1000, b"/proc/self/statm\0").unwrap();
+        range
+            .resident
+            .store(7 * PAGE_SIZE as usize, Ordering::Relaxed);
+        k.call(
+            1,
+            &mut p,
+            56,
+            [(-100i64) as u64, 0x1000, 0, 0, 0, 0],
+            &mut io,
+        );
+        let fd = p.cpu.x(0);
+        assert!(fd < 256);
+        k.call(1, &mut p, 63, [fd, 0x1100, 128, 0, 0, 0], &mut io);
+        let len = p.cpu.x(0) as usize;
+        let mut bytes = vec![0; len];
+        p.memory.read(0x1100, &mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap(),
+            "8",
+            "a real memory observation refreshes live RSS, including the control page"
+        );
+        assert_eq!(range.queries.load(Ordering::Relaxed), 5);
     }
 
     #[test]

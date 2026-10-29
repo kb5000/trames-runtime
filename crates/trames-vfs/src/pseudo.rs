@@ -24,6 +24,26 @@ fn proc_ipv4_route_row(
     )
 }
 
+// Linux kernel/random/uuid is a fresh read-only UUID on each retrieval.
+// Use the same host CSPRNG as /dev/urandom; no guest/process metadata is needed.
+fn proc_uuid() -> Result<Vec<u8>> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| Errno(5))?;
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = Vec::with_capacity(37);
+    for (i, byte) in random.into_iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            value.push(b'-');
+        }
+        value.push(HEX[(byte >> 4) as usize]);
+        value.push(HEX[(byte & 15) as usize]);
+    }
+    value.push(b'\n');
+    Ok(value)
+}
+
 #[derive(Clone)]
 pub struct FdInfo {
     pub fd: u32,
@@ -68,6 +88,47 @@ mod tests {
         v.close(fd).unwrap();
         out
     }
+    #[test]
+    fn random_uuid_is_fresh_v4_readonly_and_discoverable() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let capacity = v.capacity();
+        let path = b"/proc/sys/kernel/random/uuid";
+        let mut values = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let fd = v.open_at(AT_FDCWD, path, 0, 0).unwrap();
+            let value = v.read(fd, 128).unwrap();
+            assert_eq!(value.len(), 37);
+            assert_eq!(value[36], b'\n');
+            for (i, &byte) in value[..36].iter().enumerate() {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    assert_eq!(byte, b'-');
+                } else {
+                    assert!(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                }
+            }
+            assert_eq!(value[14], b'4');
+            assert!(b"89ab".contains(&value[19]));
+            assert!(values.insert(value));
+            assert!(v.read(fd, 128).unwrap().is_empty());
+            v.close(fd).unwrap();
+        }
+        assert_eq!(v.open_at(AT_FDCWD, path, 1, 0), Err(Errno(30)));
+        let directory = v
+            .open_at(AT_FDCWD, b"/proc/sys/kernel/random", O_DIRECTORY, 0)
+            .unwrap();
+        assert!(v
+            .getdents(directory, 4096)
+            .unwrap()
+            .windows(5)
+            .any(|w| w == b"uuid\0"));
+        assert_eq!(
+            v.capacity(),
+            capacity,
+            "runtime pseudo files do not enter storage quotas"
+        );
+    }
+
     #[test]
     fn proc_limits_reports_the_runtime_address_cap_or_unlimited() {
         for (value, expected) in [(4u64 << 30, "4294967296"), (u64::MAX, "unlimited")] {
@@ -1376,7 +1437,7 @@ impl Vfs {
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
             b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
-            b"/proc/sys/kernel" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
+            b"/proc/sys/kernel" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
             b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
@@ -1435,6 +1496,7 @@ impl Vfs {
                 let running = r.processes.iter().filter(|p| p.state == 'R').count();
                 return Ok(regular(format!("{:.2} {:.2} {:.2} {running}/{} {}\n", r.load[0],r.load[1],r.load[2],r.processes.len(),r.processes_created).into_bytes()));
             }
+            b"/proc/sys/kernel/random/uuid" => return Ok(regular(proc_uuid()?)),
             b"/proc/sys/kernel/ostype" => return Ok(regular(b"Linux\n".to_vec())),
             b"/proc/sys/kernel/osrelease" => return Ok(regular(b"6.0.0-trames\n".to_vec())),
             b"/proc/sys/kernel/version" => return Ok(regular(b"Trames userspace runtime\n".to_vec())),
@@ -2147,10 +2209,12 @@ impl Vfs {
                 "pid_max",
                 "cap_last_cap",
                 "threads-max",
+                "random",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
+            b"/proc/sys/kernel/random" => vec![b"uuid".to_vec()],
             b"/proc/sys/fs" => vec![b"file-max".to_vec(), b"file-nr".to_vec()],
             b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],
@@ -2372,6 +2436,54 @@ impl Vfs {
 #[cfg(test)]
 mod proc_probe_tests {
     use super::*;
+    #[test]
+    fn proc_observation_tracks_dependencies_through_aliases_and_failed_lookups() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.symlink_at(b"/proc/sys/kernel", AT_FDCWD, b"/keys")
+            .unwrap();
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"/keys/random/uuid"),
+            Some(ProcRefresh::Independent)
+        );
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"/proc/cpuinfo"),
+            Some(ProcRefresh::Independent)
+        );
+        let fd = v.open_at(AT_FDCWD, b"/proc/sys", O_DIRECTORY, 0).unwrap();
+        assert_eq!(
+            v.proc_observation(fd as i32, b"kernel/random/uuid"),
+            Some(ProcRefresh::Independent)
+        );
+        v.chdir(b"/proc/sys").unwrap();
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"kernel/random/uuid"),
+            Some(ProcRefresh::Independent)
+        );
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"/proc/12345/status"),
+            Some(ProcRefresh::Residency)
+        );
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"/proc/12345/maps"),
+            Some(ProcRefresh::Residency),
+            "unknown tasks need conservative refresh before their final file can resolve"
+        );
+        assert_eq!(v.proc_observation(AT_FDCWD, b"/ordinary"), None);
+        assert_eq!(
+            ProcRefresh::for_path(b"/proc/1/maps"),
+            ProcRefresh::Metadata
+        );
+        assert_eq!(
+            ProcRefresh::for_path(b"/proc/1/statm"),
+            ProcRefresh::Residency
+        );
+        assert_eq!(
+            ProcRefresh::for_path(b"/proc/sys/fs/file-nr"),
+            ProcRefresh::Metadata
+        );
+    }
+
     #[test]
     fn proc_probe_follows_aliases_cwd_and_dirfd_even_for_missing_processes() {
         let mut v = Vfs::default();
