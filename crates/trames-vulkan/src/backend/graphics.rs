@@ -412,7 +412,11 @@ impl Backend {
         ] {
             bytes.extend(n.to_le_bytes());
         }
-        bytes.extend(p.max_resource_size.min(MAX_ALLOCATION).to_le_bytes());
+        bytes.extend(
+            p.max_resource_size
+                .min(self.budget.max_allocation())
+                .to_le_bytes(),
+        );
         write(m, a[6], &bytes)
     }
     pub(super) fn start_graphics_compile(
@@ -1593,8 +1597,16 @@ impl Backend {
                         }
                         let properties = |s: ImageShape| unsafe { device.instance.native.get_physical_device_format_properties(self.physical, s.format) }.optimal_tiling_features;
                         if std::env::var_os("TRAMES_VULKAN_TRACE").is_some() {
-                            eprintln!("trames-vulkan blit src={:?}/{:?} dst={:?}/{:?} filter={} src-features={:?} dst-features={:?}",
-                                src_shape.format, src_shape.ty, dst_shape.format, dst_shape.ty, a[8], properties(src_shape), properties(dst_shape));
+                            eprintln!(
+                                "trames-vulkan blit src={:?}/{:?} dst={:?}/{:?} filter={} src-features={:?} dst-features={:?}",
+                                src_shape.format,
+                                src_shape.ty,
+                                dst_shape.format,
+                                dst_shape.ty,
+                                a[8],
+                                properties(src_shape),
+                                properties(dst_shape)
+                            );
                         }
                         let src_flags = vk::FormatFeatureFlags::BLIT_SRC
                             | if a[8] != 0 {

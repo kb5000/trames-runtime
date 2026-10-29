@@ -392,7 +392,7 @@ impl NativeImage {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT.into());
         };
         let bytes = requirements.size;
-        if bytes > MAX_ALLOCATION || !backend.budget.reserve(bytes) {
+        if bytes > backend.budget.max_allocation() || !backend.budget.reserve(bytes) {
             unsafe {
                 d.destroy_image(raw, None);
             }

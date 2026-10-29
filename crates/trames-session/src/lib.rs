@@ -17,7 +17,7 @@ mod worker_syscalls;
 mod workers;
 #[cfg(all(test, trames_interpreter_conformance))]
 use trames_memory::Permissions;
-use trames_memory::{DEFAULT_MEMORY_LIMIT, Memory, MemoryError, PAGE_SIZE};
+use trames_memory::{Memory, MemoryError, DEFAULT_MEMORY_LIMIT, PAGE_SIZE};
 
 /// Guest resident-page budgets. Untouched anonymous zeros/reservations have no
 /// resident charge. File mappings and fork COW remain conservative; CLONE_VM
@@ -48,6 +48,13 @@ impl MemoryLimits {
     }
     pub fn is_host_managed(self) -> bool {
         self == Self::host_managed()
+    }
+    fn gpu_budget(self) -> trames_vulkan::Budget {
+        if self.is_host_managed() {
+            trames_vulkan::Budget::host_managed()
+        } else {
+            trames_vulkan::Budget::for_guest_memory(self.total)
+        }
     }
     fn reported(
         self,
@@ -498,6 +505,15 @@ mod tests {
     type Runtime = crate::Runtime<Cpu>;
 
     use super::*;
+    #[test]
+    fn host_managed_memory_selects_native_heap_accounting_without_changing_caps() {
+        let host = MemoryLimits::host_managed().gpu_budget();
+        assert_eq!(host.limit(), u64::MAX);
+        assert_eq!(host.used(), 0);
+        let bounded = MemoryLimits::default().gpu_budget();
+        assert_eq!(bounded.limit(), 128 << 20);
+        assert_eq!(bounded.used(), 0);
+    }
     #[test]
     fn memory_budget_validation_accepts_large_limits_without_preallocation() {
         let limits = MemoryLimits {

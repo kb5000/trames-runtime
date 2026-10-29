@@ -20,6 +20,22 @@ impl Default for Budget {
     }
 }
 impl Budget {
+    /// Track live native bytes without a product byte quota. The original
+    /// driver decides whether actual allocations fit the shared host heap.
+    /// Counter overflow is still rejected, and construction reserves no RAM.
+    pub fn host_managed() -> Self {
+        Self {
+            limit: u64::MAX,
+            ..Self::default()
+        }
+    }
+    pub(crate) fn max_allocation(&self) -> u64 {
+        if self.limit == u64::MAX {
+            u64::MAX
+        } else {
+            64 << 20
+        }
+    }
     /// Native allocations and coherent mapping baselines share this additional
     /// session quota. Reserve no memory until an actual resource is created.
     pub fn for_guest_memory(guest_bytes: usize) -> Self {
@@ -62,6 +78,22 @@ impl Drop for CompilePermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_managed_native_accounting_has_no_smoke_test_byte_ceilings() {
+        let budget = Budget::host_managed();
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.limit(), u64::MAX);
+        assert_eq!(budget.max_allocation(), u64::MAX);
+        let peer = budget.clone();
+        assert!(budget.reserve(2 << 30));
+        assert!(peer.reserve(192 << 20));
+        assert_eq!(budget.used(), (2 << 30) + (192 << 20));
+        assert!(!peer.reserve(u64::MAX));
+        peer.release(192 << 20);
+        budget.release(2 << 30);
+        assert_eq!(peer.used(), 0);
+        assert_eq!(Budget::default().max_allocation(), 64 << 20);
+    }
     #[test]
     fn compiler_capacity_is_shared_and_released_without_a_global_work_lock() {
         let budget = Budget::default();

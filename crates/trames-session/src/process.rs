@@ -10,10 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 use trames_engine::{Cpu, SliceOutcome};
-use trames_linux::{GuestOutput, Linux, MAX_WRITE, OutputFd, SyscallOutcome, TerminalEvent};
+use trames_linux::{GuestOutput, Linux, OutputFd, SyscallOutcome, TerminalEvent, MAX_WRITE};
 use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
-use trames_vfs::{AT_FDCWD, Errno, FdKind, MAX_FDS, O_NONBLOCK};
+use trames_vfs::{Errno, FdKind, AT_FDCWD, MAX_FDS, O_NONBLOCK};
 
 #[cfg(all(test, trames_interpreter_conformance))]
 const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
@@ -1558,8 +1558,12 @@ impl<C: Cpu> Kernel<C> {
                 RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
                 _ => Errno(8),
             })?;
-            super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, clock_origin)
-                .map_err(|_| Errno(12))?;
+            super::clock::initialize::<C>(
+                &mut runtime.memory,
+                &runtime.linux.auxiliary,
+                clock_origin,
+            )
+            .map_err(|_| Errno(12))?;
             if runtime.memory.resident_bytes() > budget {
                 return Err(Errno(12));
             }
@@ -1667,7 +1671,11 @@ impl<C: Cpu> Kernel<C> {
                 return Ok(Some(p.linux.vfs.visible_pid(child) as u64));
             }
         }
-        if a[2] & 1 != 0 { Ok(Some(0)) } else { Ok(None) }
+        if a[2] & 1 != 0 {
+            Ok(Some(0))
+        } else {
+            Ok(None)
+        }
     }
     fn syscall(
         &mut self,
@@ -4713,7 +4721,7 @@ pub(super) fn run<C: Cpu>(
         next_timer: 1,
         native: trames_accel::native::Registry::default(),
         gpu: RefCell::new(BTreeMap::new()),
-        gpu_budget: trames_vulkan::Budget::for_guest_memory(runtime.memory_limits.total),
+        gpu_budget: runtime.memory_limits.gpu_budget(),
         gpu_display: runtime.vulkan_display.clone(),
         gpu_compiles: 0,
         gpu_peak_pending: 0,
@@ -4817,7 +4825,7 @@ mod tests {
     type Kernel = crate::process::Kernel<Cpu>;
 
     use super::*;
-    use trames_memory::{PAGE_SIZE, Permissions};
+    use trames_memory::{Permissions, PAGE_SIZE};
     #[test]
     fn shared_resources_are_visible_without_propagation_and_private_domains_remain_separate() {
         let mut k = kernel();
@@ -5738,16 +5746,15 @@ mod tests {
             assert_eq!(k.deliver(1, &mut p), Ok(true));
             assert!(p.flock_wait.is_none());
             // Signal frame restores either EINTR or the original SVC for restart.
-            assert!(
-                k.syscall(
+            assert!(k
+                .syscall(
                     1,
                     &mut p,
                     139,
                     [0; 6],
                     &mut trames_linux::CapturedOutput::default()
                 )
-                .is_ok()
-            );
+                .is_ok());
             assert_eq!(
                 p.cpu.pc,
                 if restart {
@@ -5896,12 +5903,11 @@ mod tests {
         assert_eq!(k.parallel_rounds - before.2, ROUNDS);
         assert_eq!(k.instructions - before.0, ROUNDS * 5);
         assert_eq!(k.processes.len(), TASKS as usize);
-        assert!(
-            k.processes
-                .iter()
-                .filter(|(id, _)| **id != 1)
-                .all(|(_, p)| matches!(p.state, State::Futex { ref wait, .. } if !wait.woken()))
-        );
+        assert!(k
+            .processes
+            .iter()
+            .filter(|(id, _)| **id != 1)
+            .all(|(_, p)| matches!(p.state, State::Futex { ref wait, .. } if !wait.woken())));
         assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 0);
         println!(
             "cohort_preparation tasks={TASKS} rounds={ROUNDS} instructions={} seconds={seconds:.6}",
@@ -6010,9 +6016,9 @@ mod tests {
             vm_checkpoint_groups: 0,
             vm_checkpoint_spaces: 0,
             vm_checkpoint_calls: [0; 8],
-        vm_checkpoint_time: [Duration::ZERO; 7],
-        vm_checkpoint_wait_bins: [0; 8],
-        vm_checkpoint_batch: [0; 3],
+            vm_checkpoint_time: [Duration::ZERO; 7],
+            vm_checkpoint_wait_bins: [0; 8],
+            vm_checkpoint_batch: [0; 3],
             vm_local_syscalls: 0,
             persistent_control_checks: 0,
             worker_slices: 0,
@@ -6108,11 +6114,9 @@ mod tests {
         let maps = String::from_utf8(k.process_maps(&peer)).unwrap();
         assert!(maps.contains("000000100000-000000101000 rw-p"));
         p.memory.unmap(0x100000, 2 * PAGE_SIZE).unwrap();
-        assert!(
-            !String::from_utf8(k.process_maps(&p))
-                .unwrap()
-                .contains("000000100000-")
-        );
+        assert!(!String::from_utf8(k.process_maps(&p))
+            .unwrap()
+            .contains("000000100000-"));
         let mut child = p.fork();
         child.vm_id = 2;
         child
@@ -7034,11 +7038,10 @@ mod tests {
             ),
             Err(Errno(22))
         );
-        assert!(
-            p.linux
-                .vfs
-                .shares_descriptors_with(&k.processes[&2].linux.vfs)
-        );
+        assert!(p
+            .linux
+            .vfs
+            .shares_descriptors_with(&k.processes[&2].linux.vfs));
         assert_eq!(
             k.syscall(
                 1,
@@ -7049,11 +7052,10 @@ mod tests {
             ),
             Ok(Some(0))
         );
-        assert!(
-            !p.linux
-                .vfs
-                .shares_descriptors_with(&k.processes[&2].linux.vfs)
-        );
+        assert!(!p
+            .linux
+            .vfs
+            .shares_descriptors_with(&k.processes[&2].linux.vfs));
         assert_eq!(p.linux.vfs.fd_kind(fd), Err(Errno(9)));
         assert!(k.processes[&2].linux.vfs.fd_kind(fd).is_ok());
         let fd = p.linux.vfs.open_at(-100, b"/file", 0, 0).unwrap();
@@ -7579,13 +7581,12 @@ mod boundary_tests {
         let mut other = process();
         other.group = 2;
         k.processes.insert(2, other);
-        assert!(
-            k.pump_terminal(&mut Events(Some(TerminalEvent::Resize {
+        assert!(k
+            .pump_terminal(&mut Events(Some(TerminalEvent::Resize {
                 rows: 40,
                 columns: 120
             })))
-            .unwrap()
-        );
+            .unwrap());
         assert_eq!(&k.terminal.as_ref().unwrap().window[..4], &[40, 0, 120, 0]);
         assert!(k.processes[&1].signals.pending.contains_key(&28));
         assert!(!k.processes[&2].signals.pending.contains_key(&28));

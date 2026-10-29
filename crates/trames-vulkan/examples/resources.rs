@@ -99,7 +99,60 @@ fn compile(b: &mut Backend, m: &mut Memory, args: &[u64]) -> u64 {
     }
     word(m, OUT)
 }
+// The browser exceeds the old per-context 128 MiB smoke-test ceiling even
+// when the shared session quota has room. Exercise actual native allocations,
+// not just the quota counter, and check release at the wire lifetime boundary.
+fn allocation_budget_case(budget: Budget, size: u64, accepted: usize) {
+    let mut b = Backend::with_budget(budget.clone());
+    let mut m = Memory::new(2 * PAGE_SIZE as usize);
+    m.map(PACKET, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+    call(&mut b, &mut m, 1, &[OUT]);
+    let instance = word(&m, OUT);
+    m.write(0x2080, &1u32.to_le_bytes()).unwrap();
+    call(&mut b, &mut m, 3, &[instance, 0x2080, OUT]);
+    let physical = word(&m, OUT);
+    call(&mut b, &mut m, 5, &[physical, 0x2500]);
+    let count = word(&m, 0x2500) as u32;
+    assert_ne!(count, 0);
+    call(&mut b, &mut m, 8, &[physical, 0, OUT]);
+    let device = word(&m, OUT);
+    let mut allocations = Vec::new();
+    for i in 0..3 {
+        let result = request(&mut b, &mut m, 14, &[device, size, 0, OUT]);
+        if i < accepted {
+            assert_eq!(result, 0, "native allocation {i}, size {size}");
+            allocations.push(word(&m, OUT));
+        } else {
+            assert_eq!(
+                result,
+                (-2i64) as u64,
+                "bounded session must reject overcommit"
+            );
+        }
+    }
+    assert_eq!(budget.used(), accepted as u64 * size);
+    for allocation in allocations {
+        call(&mut b, &mut m, 15, &[device, allocation]);
+    }
+    assert_eq!(budget.used(), 0);
+    call(&mut b, &mut m, 9, &[device]);
+    call(&mut b, &mut m, 2, &[instance]);
+    assert_eq!(budget.used(), 0);
+}
+fn allocation_budget() {
+    allocation_budget_case(Budget::for_guest_memory(4usize << 30), 64 << 20, 3);
+    allocation_budget_case(Budget::default(), 64 << 20, 2);
+    allocation_budget_case(Budget::host_managed(), 96 << 20, 3);
+    println!(
+        "native allocation accounting: 192 MiB bounded / 288 MiB host-managed, explicit quota rejection and final release to zero"
+    );
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--budget-only") {
+        allocation_budget();
+        return;
+    }
     let code = std::fs::read(
         std::env::args()
             .nth(1)
@@ -325,5 +378,7 @@ fn main() {
     call(&mut b, &mut m, 9, &[dev]);
     assert_eq!(budget.used(), 0);
     call(&mut b, &mut m, 2, &[instance]);
-    println!("native-resources-ok: dynamic offsets, texel read/write, scalar vec3 at offset4, storage image, pipeline cache roundtrip, descriptor pool reset/reuse and 256 GPU results correct; budget released");
+    println!(
+        "native-resources-ok: dynamic offsets, texel read/write, scalar vec3 at offset4, storage image, pipeline cache roundtrip, descriptor pool reset/reuse and 256 GPU results correct; budget released"
+    );
 }

@@ -1190,9 +1190,9 @@ impl Backend {
                         b.as_mut_ptr().cast(),
                     );
                 }
-                // The virtual device exposes a session quota, rather than the
-                // host's entire physical heap. Multiple contexts and coherent
-                // baselines still compete for the same live budget.
+                // Explicitly capped sessions expose their native quota. Host-
+                // managed sessions retain the original driver's heap sizes.
+                // Contexts and coherent baselines share live accounting.
                 // SAFETY: u64 storage provides the native struct's alignment;
                 // the original Vulkan driver initialized this complete value.
                 let properties =
@@ -1545,7 +1545,7 @@ impl Backend {
             11 => {
                 self.room(1)?;
                 output(m, a[3], 8)?;
-                if a[1] == 0 || a[1] > MAX_ALLOCATION {
+                if a[1] == 0 || a[1] > self.budget.max_allocation() {
                     return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
                 }
                 let mut allowed = vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
@@ -1585,20 +1585,7 @@ impl Backend {
             14 => {
                 self.room(1)?;
                 output(m, a[3], 8)?;
-                if a[1] == 0 || a[1] > MAX_ALLOCATION {
-                    return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
-                }
-                let retained_bytes = self
-                    .retained
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .filter(|x| x.kind == Kind::Memory)
-                    .map(|x| x.size)
-                    .sum::<u64>();
-                if retained_bytes
-                    .checked_add(a[1])
-                    .is_none_or(|n| n > 128 << 20)
-                {
+                if a[1] == 0 || a[1] > self.budget.max_allocation() {
                     return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
                 }
                 let props = unsafe {
