@@ -145,14 +145,25 @@ impl Vectors {
         Linux::check(memory, pointer, count as usize * 16, Access::Read)?;
         let mut parts = Vec::new();
         let mut size = 0usize;
+        let mut requested = 0u64;
         for i in 0..count {
             let base = u64_at(memory, pointer + i * 16)?;
             let length = u64_at(memory, pointer + i * 16 + 8)?;
-            // Datagram sends must never silently change a packet by shortening
-            // the iovecs. Stream callers can retry a short send themselves.
-            if length > (trames_net::MAX_TRANSFER - size) as u64 {
+            // Keep the Linux signed-iovec total valid even when only a short
+            // transport prefix will be copied from a large receive capacity.
+            requested = requested.checked_add(length)
+                .filter(|&n| n <= i64::MAX as u64).ok_or(Errno(22))?;
+            // A receive capacity may exceed one transport chunk. Complete a
+            // bounded short receive instead of rejecting the caller's buffer.
+            // Sends preserve message lengths so datagrams are never shortened.
+            let room = (trames_net::MAX_TRANSFER - size) as u64;
+            let length = if matches!(access, Access::Write) {
+                length.min(room)
+            } else if length > room {
                 return Err(Errno(90));
-            }
+            } else {
+                length
+            };
             Linux::check(memory, base, length as usize, access)?;
             size += length as usize;
             parts.push((base, length as usize));

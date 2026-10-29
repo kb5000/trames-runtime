@@ -765,6 +765,19 @@ cover this classification. The shared-mm provider test verifies that UUID,
 CPU-info and maps reads make zero residency calls, then a statm read observes
 new hardware residency. No cross-request timer cache is introduced.
 
+The same demand projection applies to mutable argv and descriptor payloads.
+Only cmdline observations borrow guest argument pages. Only fd/fdinfo, network
+socket tables and file-nr observations enumerate descriptors and resolve their
+paths/socket metadata. Ordinary maps/stat/status queries do neither. Publishing
+process identities and re-probing unresolved paths preserves newly-created PIDs;
+cwd, dirfd and aliases still use actual VFS traversal. Traversing a proc FD magic
+link into another proc payload combines both dependencies conservatively. Full
+explicit snapshots retain all fields. No argv/FD cache, timer, new lock or service
+thread is added, and interpreter/native executors use the same policy.
+The 13-task shared-mm regression also bounds argument-page borrows to zero for
+unrelated metadata, while a separate syscall regression mutates argv through a
+previously opened alias and a proc FD magic link and verifies live bytes.
+
 The UUID endpoint uses the existing host CSPRNG and generates a new UUID v4 on
 retrieval, matching the documented [Linux random sysctl semantics](https://docs.kernel.org/admin-guide/sysctl/kernel.html#random).
 Its directory and file are runtime pseudo nodes outside disk storage quotas.

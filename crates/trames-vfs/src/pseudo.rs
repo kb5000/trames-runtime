@@ -2437,6 +2437,36 @@ impl Vfs {
 mod proc_probe_tests {
     use super::*;
     #[test]
+    fn live_argument_demand_survives_alias_cwd_and_directory_fd_resolution() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo {
+            processes: vec![ProcessInfo { pid: 1, tgid: 1, ..Default::default() }],
+            ..Default::default()
+        });
+        v.symlink_at(b"/proc/self/cmdline", AT_FDCWD, b"/arguments").unwrap();
+        for path in [b"/proc/self/cmdline".as_slice(), b"/arguments"] {
+            assert_eq!(v.proc_observation(AT_FDCWD, path), Some(ProcRefresh::Arguments));
+        }
+        v.symlink_at(b"/proc/self/fdinfo", AT_FDCWD, b"/descriptors").unwrap();
+        assert_eq!(v.proc_observation(AT_FDCWD, b"/descriptors"), Some(ProcRefresh::Descriptors));
+        for path in [b"/proc/self/status".as_slice(), b"/proc/self/stat", b"/proc/self/statm"] {
+            assert_eq!(v.proc_observation(AT_FDCWD, path), Some(ProcRefresh::Residency));
+        }
+        for path in [b"/proc/self/fd/1".as_slice(), b"/proc/self/fdinfo/1", b"/proc/self/net/tcp", b"/proc/sys/fs/file-nr"] {
+            assert_eq!(ProcRefresh::for_path(path), ProcRefresh::Descriptors);
+        }
+        let fd = v.open_at(AT_FDCWD, b"/proc/self", O_DIRECTORY, 0).unwrap();
+        assert_eq!(v.proc_observation(fd as i32, b"cmdline"), Some(ProcRefresh::Arguments));
+        let argv = v.open_at(AT_FDCWD, b"/proc/self/cmdline", 0, 0).unwrap();
+        v.set_runtime_info(1, RuntimeInfo {
+            processes: vec![ProcessInfo { pid: 1, tgid: 1, fds: v.fd_snapshot(), ..Default::default() }],
+            ..Default::default()
+        });
+        assert_eq!(v.proc_observation(AT_FDCWD, format!("/proc/self/fd/{argv}").as_bytes()), Some(ProcRefresh::Full));
+        v.chdir(b"/proc/self").unwrap();
+        assert_eq!(v.proc_observation(AT_FDCWD, b"cmdline"), Some(ProcRefresh::Arguments));
+    }
+    #[test]
     fn proc_observation_tracks_dependencies_through_aliases_and_failed_lookups() {
         let mut v = Vfs::default();
         v.set_runtime_info(1, RuntimeInfo::default());
@@ -2462,11 +2492,11 @@ mod proc_probe_tests {
         );
         assert_eq!(
             v.proc_observation(AT_FDCWD, b"/proc/12345/status"),
-            Some(ProcRefresh::Residency)
+            Some(ProcRefresh::Metadata)
         );
         assert_eq!(
             v.proc_observation(AT_FDCWD, b"/proc/12345/maps"),
-            Some(ProcRefresh::Residency),
+            Some(ProcRefresh::Metadata),
             "unknown tasks need conservative refresh before their final file can resolve"
         );
         assert_eq!(v.proc_observation(AT_FDCWD, b"/ordinary"), None);
@@ -2480,7 +2510,7 @@ mod proc_probe_tests {
         );
         assert_eq!(
             ProcRefresh::for_path(b"/proc/sys/fs/file-nr"),
-            ProcRefresh::Metadata
+            ProcRefresh::Descriptors
         );
     }
 

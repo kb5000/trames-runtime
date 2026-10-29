@@ -407,12 +407,15 @@ pub enum ProcRefresh {
     #[default]
     Independent,
     Metadata,
+    Arguments,
+    Descriptors,
     Residency,
+    Full,
 }
 impl ProcRefresh {
     pub fn for_path(path: &[u8]) -> Self {
         if path == b"/proc/sys/fs/file-nr" {
-            return Self::Metadata;
+            return Self::Descriptors;
         }
         if path == b"/proc/sys"
             || path.starts_with(b"/proc/sys/")
@@ -429,10 +432,15 @@ impl ProcRefresh {
         {
             return Self::Independent;
         }
+        if path.split(|&c| c == b'/').any(|part| matches!(part, b"fd" | b"fdinfo" | b"net")) {
+            return Self::Descriptors;
+        }
+        if path.ends_with(b"/cmdline") {
+            return Self::Arguments;
+        }
         if matches!(path, b"/proc/stat" | b"/proc/uptime" | b"/proc/loadavg")
             || [
                 b"/maps".as_slice(),
-                b"/cmdline",
                 b"/environ",
                 b"/auxv",
                 b"/comm",
@@ -445,7 +453,33 @@ impl ProcRefresh {
         {
             return Self::Metadata;
         }
-        Self::Residency
+        if path == b"/proc/meminfo"
+            || [b"/stat".as_slice(), b"/statm", b"/status", b"/smaps", b"/smaps_rollup"]
+                .iter().any(|tail| path.ends_with(tail))
+        {
+            return Self::Residency;
+        }
+        // Directory traversal publishes identities first. The caller re-probes
+        // a newly visible path before selecting its live data payload.
+        Self::Metadata
+    }
+    /// A syscall can traverse a proc FD link into a different live payload.
+    /// Keep both dependencies; these uncommon mixed observations use a full
+    /// refresh rather than dropping one field through enum ordering.
+    pub fn merge(self, other: Self) -> Self {
+        if self == other { self }
+        else if self <= Self::Metadata { other }
+        else if other <= Self::Metadata { self }
+        else { Self::Full }
+    }
+    pub fn arguments(self) -> bool {
+        matches!(self, Self::Arguments | Self::Full)
+    }
+    pub fn descriptors(self) -> bool {
+        matches!(self, Self::Descriptors | Self::Full)
+    }
+    pub fn residency(self) -> bool {
+        matches!(self, Self::Residency | Self::Full)
     }
 }
 
@@ -1041,7 +1075,13 @@ impl Vfs {
         if self.uses_pseudo(path) {
             if key == b"/proc" || key.starts_with(b"/proc/") {
                 self.proc_accessed.set(true);
-                self.proc_refresh.set(ProcRefresh::for_path(key));
+                let demand = ProcRefresh::for_path(key);
+                let previous = self.proc_refresh.get();
+                self.proc_refresh.set(if previous.descriptors() {
+                    previous.merge(demand)
+                } else {
+                    demand
+                });
             }
             if let Some(node) = self.pseudo_node(path)? {
                 return Ok(node);

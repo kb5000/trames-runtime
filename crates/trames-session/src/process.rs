@@ -693,22 +693,29 @@ impl<C: Cpu> Kernel<C> {
         pid: u32,
         p: &Process<C>,
         resident_bytes: usize,
+        demand: trames_vfs::ProcRefresh,
     ) -> trames_vfs::ProcessInfo {
         let maps = self.process_maps(p);
-        let arguments = p
-            .linux
-            .argument_pointers
-            .iter()
-            .enumerate()
-            .map(|(i, pointer)| {
-                p.memory
-                    .read_c_string(
-                        *pointer,
-                        p.linux.arguments.get(i).map_or(65536, |a| a.len() + 1),
-                    )
-                    .unwrap_or_else(|_| p.linux.arguments.get(i).cloned().unwrap_or_default())
-            })
-            .collect();
+        // Argument bytes are mutable guest memory, so read them live only for
+        // an actual cmdline observation. Unrelated proc files never consume
+        // this payload; their next cmdline lookup requests its own refresh.
+        let arguments = if demand.arguments() {
+            p.linux
+                .argument_pointers
+                .iter()
+                .enumerate()
+                .map(|(i, pointer)| {
+                    p.memory
+                        .read_c_string(
+                            *pointer,
+                            p.linux.arguments.get(i).map_or(65536, |a| a.len() + 1),
+                        )
+                        .unwrap_or_else(|_| p.linux.arguments.get(i).cloned().unwrap_or_default())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (ignored, caught) = p.signals.actions.masks();
         trames_vfs::ProcessInfo {
             pid,
@@ -754,7 +761,7 @@ impl<C: Cpu> Kernel<C> {
                 / 10) as u64,
             terminal: p.linux.vfs.controlling_terminal.is_some(),
             terminal_number: p.linux.vfs.controlling_terminal.unwrap_or(0),
-            fds: p.linux.vfs.fd_snapshot(),
+            fds: if demand.descriptors() { p.linux.vfs.fd_snapshot() } else { Vec::new() },
             auxiliary: p.linux.auxiliary.clone(),
             file_size_limits: Some(p.file_size_limit.get()),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
@@ -776,14 +783,14 @@ impl<C: Cpu> Kernel<C> {
         p: &mut Process<C>,
         host: Option<trames_linux::HostMemoryInfo>,
     ) {
-        self.refresh_proc_observed(pid, p, host, true);
+        self.refresh_proc_observed(pid, p, host, trames_vfs::ProcRefresh::Full);
     }
     fn refresh_proc_observed(
         &self,
         pid: u32,
         p: &mut Process<C>,
         host: Option<trames_linux::HostMemoryInfo>,
-        observe_residency: bool,
+        demand: trames_vfs::ProcRefresh,
     ) {
         // Residency belongs to an address space, not each task. A native
         // provider may query the host pager: take one live observation per
@@ -801,7 +808,7 @@ impl<C: Cpu> Kernel<C> {
             resident
                 .entry(task.memory.instruction_identity().0)
                 .or_insert_with(|| {
-                    if observe_residency {
+                    if demand.residency() {
                         task.memory.resident_bytes()
                     } else {
                         0
@@ -832,10 +839,20 @@ impl<C: Cpu> Kernel<C> {
             .processes
             .iter()
             .map(|(&id, other)| {
-                self.process_info(id, other, resident[&other.memory.instruction_identity().0])
+                self.process_info(
+                    id,
+                    other,
+                    resident[&other.memory.instruction_identity().0],
+                    demand,
+                )
             })
             .collect();
-        processes.push(self.process_info(pid, p, resident[&p.memory.instruction_identity().0]));
+        processes.push(self.process_info(
+            pid,
+            p,
+            resident[&p.memory.instruction_identity().0],
+            demand,
+        ));
         p.linux.vfs.set_runtime_info(
             pid,
             trames_vfs::RuntimeInfo {
@@ -2596,15 +2613,19 @@ impl<C: Cpu> Kernel<C> {
         };
         use trames_vfs::ProcRefresh;
         let mut proc_observation = matches!(number, 39..=41).then_some(ProcRefresh::Metadata);
-        if let Some((dirfd, address)) = proc_path {
-            if let Ok(path) = p.memory.read_c_string(address, 4096) {
-                proc_observation = proc_observation.max(p.linux.vfs.proc_observation(dirfd, &path));
+        let proc_lookup = proc_path.and_then(|(dirfd, address)| {
+            p.memory.read_c_string(address, 4096).ok().map(|path| (dirfd, path))
+        });
+        if let Some((dirfd, path)) = &proc_lookup {
+            if let Some(demand) = p.linux.vfs.proc_observation(*dirfd, path) {
+                proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
         }
         if matches!(number, 44 | 61 | 63 | 65 | 67 | 69 | 78 | 80) {
             if let Ok(FdKind::Node(path)) = p.linux.vfs.fd_kind(a[0] as u32) {
                 if path == b"/proc" || path.starts_with(b"/proc/") {
-                    proc_observation = proc_observation.max(Some(ProcRefresh::for_path(&path)));
+                    let demand = ProcRefresh::for_path(&path);
+                    proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
                 }
             }
         }
@@ -2613,11 +2634,22 @@ impl<C: Cpu> Kernel<C> {
             self.refresh_proc_observed(
                 pid,
                 p,
-                (demand == ProcRefresh::Residency && self.memory_limits.is_host_managed())
+                (demand.residency() && self.memory_limits.is_host_managed())
                     .then(|| io.host_memory())
                     .flatten(),
-                demand == ProcRefresh::Residency,
+                demand,
             );
+            // A missing pid/task directory can stop the first traversal before
+            // the requested payload. Publish identities, then resolve aliases
+            // again so new processes receive live arguments/FDs/residency too.
+            if let Some(refined) = proc_lookup.as_ref().and_then(|(dirfd, path)| {
+                p.linux.vfs.proc_observation(*dirfd, path)
+            }).filter(|&refined| refined != demand && refined > ProcRefresh::Metadata) {
+                self.proc_refreshes += 1;
+                self.refresh_proc_observed(pid, p,
+                    (refined.residency() && self.memory_limits.is_host_managed())
+                        .then(|| io.host_memory()).flatten(), demand.merge(refined));
+            }
         }
         let was_blocked = matches!(p.state, State::Blocked(..));
         p.cpu.set_x(8, number as u64);
@@ -6146,14 +6178,23 @@ mod tests {
         p.linux.arguments = vec![b"first".to_vec()];
         p.linux.argument_pointers = vec![0x1000];
         p.memory.write(0x1000, b"first\0").unwrap();
-        let before = k.process_info(1, &p, p.memory.resident_bytes());
+        let before = k.process_info(1, &p, p.memory.resident_bytes(), trames_vfs::ProcRefresh::Full);
         p.memory.write(0x1000, b"other\0").unwrap();
         let pipe = p.linux.vfs.pipe(0).unwrap();
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
-        let after = k.process_info(1, &p, p.memory.resident_bytes());
+        let after = k.process_info(1, &p, p.memory.resident_bytes(), trames_vfs::ProcRefresh::Full);
         assert_eq!(before.maps, after.maps);
         assert_eq!(before.arguments, [b"first".to_vec()]);
         assert_eq!(after.arguments, [b"other".to_vec()]);
+        assert!(!after.fds.is_empty());
+        for demand in [trames_vfs::ProcRefresh::Metadata, trames_vfs::ProcRefresh::Residency] {
+            let projected = k.process_info(1, &p, p.memory.resident_bytes(), demand);
+            assert!(projected.arguments.is_empty());
+            assert!(projected.fds.is_empty(), "unrelated proc reads must not enumerate descriptors");
+        }
+        let descriptors = k.process_info(1, &p, 0, trames_vfs::ProcRefresh::Descriptors);
+        assert_eq!(descriptors.fds.len(), after.fds.len());
+        assert!(descriptors.arguments.is_empty());
         assert_eq!(after.credentials.euid, 1000);
         assert_eq!(after.fds.len(), before.fds.len() + 2);
         assert!(after.fds.iter().any(|fd| fd.fd == pipe[0]));
@@ -6175,6 +6216,7 @@ mod tests {
         struct Range {
             pages: Vec<AlignedPage>,
             queries: AtomicUsize,
+            argument_accesses: AtomicUsize,
             resident: AtomicUsize,
         }
         // SAFETY: stable initialized disjoint storage, no hardware actors or
@@ -6186,7 +6228,9 @@ mod tests {
             fn physical_address(&self) -> u64 {
                 0x400000
             }
-            fn begin_host_access(&self) {}
+            fn begin_host_access(&self) {
+                self.argument_accesses.fetch_add(1, Ordering::Relaxed);
+            }
             fn end_host_access(&self) {}
         }
         // SAFETY: the complete aligned range is retained and initialized;
@@ -6200,9 +6244,12 @@ mod tests {
                 self.resident.load(Ordering::Relaxed)
             }
         }
+        let mut pages = vec![AlignedPage([0; 4096]); 512];
+        pages[0].0[..6].copy_from_slice(b"probe\0");
         let range = Arc::new(Range {
-            pages: vec![AlignedPage([0; 4096]); 512],
+            pages,
             queries: AtomicUsize::new(0),
+            argument_accesses: AtomicUsize::new(0),
             resident: AtomicUsize::new(3 * PAGE_SIZE as usize),
         });
         let mut p = process();
@@ -6218,10 +6265,14 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(view);
+        p.linux.arguments = vec![b"probe".to_vec()];
+        p.linux.argument_pointers = vec![0x200000];
         let mut k = kernel();
         for id in 2..=13 {
             let mut peer = process();
             peer.memory = p.memory.share();
+            peer.linux.arguments = p.linux.arguments.clone();
+            peer.linux.argument_pointers = p.linux.argument_pointers.clone();
             k.processes.insert(id, peer);
         }
         // A dead leader may retain the old VM id with a different empty owner.
@@ -6257,6 +6308,7 @@ mod tests {
             "aggregate accounting also queries a shared mm only once"
         );
         p.memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let before_arguments = range.argument_accesses.load(Ordering::Relaxed);
         let mut io = CapturedOutput::default();
         for path in [
             b"/proc/sys/kernel/random/uuid".as_slice(),
@@ -6287,6 +6339,11 @@ mod tests {
                 3,
                 "independent endpoints and maps cannot observe unrelated residency"
             );
+            assert_eq!(
+                range.argument_accesses.load(Ordering::Relaxed),
+                before_arguments,
+                "proc metadata must not borrow every task's argv pages"
+            );
         }
         p.memory.write(0x1000, b"/proc/self/statm\0").unwrap();
         range
@@ -6315,6 +6372,88 @@ mod tests {
             "a real memory observation refreshes live RSS, including the control page"
         );
         assert_eq!(range.queries.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn unix_stream_recvmsg_accepts_a_large_receive_capacity() {
+        let mut k = kernel();
+        let mut p = process();
+        let [sender, receiver] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+        p.memory.map(0x10000, 2 << 20, Permissions::RW).unwrap();
+        p.memory.write(0x2000, b"x").unwrap();
+        let mut io = trames_linux::CapturedOutput::default();
+        k.call(1, &mut p, 206, [sender as u64, 0x2000, 1, 0, 0, 0], &mut io);
+        assert_eq!(p.cpu.x(0), 1);
+        let mut header = [0; 56];
+        header[16..24].copy_from_slice(&0x3100u64.to_le_bytes());
+        header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        p.memory.write(0x3000, &header).unwrap();
+        write_u64(&mut p.memory, 0x3100, 0x10000).unwrap();
+        write_u64(&mut p.memory, 0x3108, 2 << 20).unwrap();
+        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
+        assert_eq!(
+            p.cpu.x(0), 1,
+            "a receive capacity is not a packet size; stream reads may complete short"
+        );
+        assert_eq!(p.memory.read_array::<1>(0x10000).unwrap(), *b"x");
+        k.call(1, &mut p, 206, [sender as u64, 0x2000, 1, 0, 0, 0], &mut io);
+        assert_eq!(p.cpu.x(0), 1);
+        write_u64(&mut p.memory, 0x3108, u64::MAX).unwrap();
+        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
+        assert_eq!(p.cpu.x(0), error(Errno(22)));
+        write_u64(&mut p.memory, 0x3108, 2 << 20).unwrap();
+        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
+        assert_eq!(p.cpu.x(0), 1, "invalid iovecs must not consume the queued byte");
+    }
+
+    #[test]
+    fn cmdline_observations_keep_live_bytes_through_aliases_and_unseen_pids() {
+        use trames_linux::CapturedOutput;
+        fn read(k: &mut Kernel, p: &mut Process, path: &[u8], after_open: Option<&[u8]>) -> Vec<u8> {
+            let mut name = path.to_vec();
+            name.push(0);
+            p.memory.write(0x1000, &name).unwrap();
+            let mut io = CapturedOutput::default();
+            k.call(1, p, 56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0], &mut io);
+            let fd = p.cpu.x(0);
+            assert!(fd < 256, "proc open {path:?}: {fd}");
+            if let Some(value) = after_open {
+                p.memory.write(0x2000, value).unwrap();
+            }
+            k.call(1, p, 63, [fd, 0x1100, 128, 0, 0, 0], &mut io);
+            let len = p.cpu.x(0) as usize;
+            assert!(len <= 128);
+            let mut bytes = vec![0; len];
+            p.memory.read(0x1100, &mut bytes).unwrap();
+            k.call(1, p, 57, [fd, 0, 0, 0, 0, 0], &mut io);
+            bytes
+        }
+        let mut k = kernel();
+        let mut p = process();
+        p.linux.arguments = vec![b"before".to_vec()];
+        p.linux.argument_pointers = vec![0x2000];
+        p.memory.write(0x2000, b"before\0").unwrap();
+        k.refresh_proc(1, &mut p, None);
+        p.linux.vfs.symlink_at(b"/proc/self/cmdline", AT_FDCWD, b"/argv-alias").unwrap();
+        p.memory.write(0x2000, b"first\0").unwrap();
+        assert_eq!(read(&mut k, &mut p, b"/proc/self/cmdline", None), b"first\0");
+        p.memory.write(0x2000, b"second\0").unwrap();
+        assert_eq!(read(&mut k, &mut p, b"/argv-alias", Some(b"third\0")), b"third\0");
+        p.memory.write(0x1000, b"/proc/self/cmdline\0").unwrap();
+        let mut io = CapturedOutput::default();
+        k.call(1, &mut p, 56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0], &mut io);
+        let fd = p.cpu.x(0);
+        assert!(fd < 256);
+        p.memory.write(0x2000, b"fourth\0").unwrap();
+        assert_eq!(read(&mut k, &mut p, format!("/proc/self/fd/{fd}").as_bytes(), None), b"fourth\0");
+        k.call(1, &mut p, 57, [fd, 0, 0, 0, 0, 0], &mut io);
+        let mut child = process();
+        child.tgid = 2;
+        child.linux.arguments = vec![b"before".to_vec()];
+        child.linux.argument_pointers = vec![0x2000];
+        child.memory.write(0x2000, b"child\0").unwrap();
+        k.processes.insert(2, child);
+        assert_eq!(read(&mut k, &mut p, b"/proc/2/cmdline", None), b"child\0");
     }
 
     #[test]
