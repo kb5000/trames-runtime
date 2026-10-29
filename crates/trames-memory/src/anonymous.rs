@@ -7,10 +7,15 @@ pub(super) struct Resident {
     pub bytes: Arc<SharedPage>,
     pub charge: Arc<Charge>,
 }
+#[derive(Default)]
+struct NativeRanges {
+    ranges: BTreeMap<u64, Arc<dyn crate::HardwareRange>>,
+    refused: BTreeSet<u64>,
+}
 pub(super) struct Store {
     pages: [Mutex<BTreeMap<u64, Arc<Resident>>>; 16],
     account: Arc<Account>,
-    native: Option<Mutex<BTreeMap<u64, Arc<dyn crate::HardwareRange>>>>,
+    native: Option<Mutex<NativeRanges>>,
 }
 impl Store {
     fn new(account: Arc<Account>) -> Arc<Self> {
@@ -18,7 +23,7 @@ impl Store {
             pages: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
             native: account
                 .native_allowed()
-                .then(|| Mutex::new(BTreeMap::new())),
+                .then(|| Mutex::new(NativeRanges::default())),
             account,
         })
     }
@@ -26,7 +31,7 @@ impl Store {
         let native = self.native.as_ref().map(|n| n.lock().unwrap());
         let range = native
             .as_ref()
-            .and_then(|n| n.range(..=base).next_back())
+            .and_then(|n| n.ranges.range(..=base).next_back())
             .filter(|(start, r)| base - **start < r.len() as u64);
         self.pages[((base / PAGE_SIZE) & 15) as usize]
             .lock()
@@ -76,7 +81,7 @@ impl Store {
             );
         }
         if let Some(native) = &self.native {
-            for (&base, r) in native.lock().unwrap().iter() {
+            for (&base, r) in native.lock().unwrap().ranges.iter() {
                 out.extend(
                     (base.max(start)..(base + r.len() as u64).min(end)).step_by(PAGE_SIZE as usize),
                 );
@@ -90,6 +95,7 @@ impl Store {
         self.native.as_ref().is_some_and(|n| {
             n.lock()
                 .unwrap()
+                .ranges
                 .range(..=address)
                 .next_back()
                 .is_some_and(|(&base, r)| address - base < r.len() as u64)
@@ -101,12 +107,18 @@ impl Store {
         len: usize,
         allocate: impl FnOnce() -> Result<Arc<dyn crate::HardwareRange>, MemoryError>,
     ) -> Result<Option<Arc<dyn crate::HardwareRange>>, MemoryError> {
+        if !self.account.native_allowed() {
+            return Ok(None);
+        }
         let Some(native) = &self.native else {
             return Ok(None);
         };
         let mut native = native.lock().unwrap();
-        if let Some(r) = native.get(&base) {
+        if let Some(r) = native.ranges.get(&base) {
             return Ok((r.len() == len && r.is_live()).then(|| r.clone()));
+        }
+        if native.refused.contains(&base) {
+            return Ok(None);
         }
         // Get and install take this object lock before the shards. No page can
         // acquire a competing canonical allocation while a range is admitted.
@@ -117,6 +129,7 @@ impl Store {
                 .next()
                 .is_some()
         }) {
+            native.refused.insert(base);
             return Ok(None);
         }
         let range = allocate()?;
@@ -127,7 +140,7 @@ impl Store {
             return Err(MemoryError::InvalidRange);
         }
         self.account.register_native(&range);
-        native.insert(base, range.clone());
+        native.ranges.insert(base, range.clone());
         Ok(Some(range))
     }
 }
@@ -283,6 +296,7 @@ impl Anonymous {
                 let mut native = native.lock().unwrap();
                 let first = change.start & !(HARDWARE_MAPPING_CHUNK_SIZE - 1);
                 let candidates: Vec<_> = native
+                    .ranges
                     .range(first..change.end)
                     .map(|(&base, r)| (base, r.len() as u64))
                     .collect();
@@ -292,7 +306,7 @@ impl Anonymous {
                         .iter()
                         .any(|(_, r)| Arc::ptr_eq(&r.store, &change.store))
                     {
-                        native.remove(&base);
+                        native.ranges.remove(&base);
                     }
                 }
             }
@@ -1034,6 +1048,25 @@ mod native_tests {
         .is_none());
         assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
     }
+    #[test]
+    fn native_policy_withdrawal_requires_join_and_invalidates_snapshot_admission() {
+        let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        assert!(v.hardware_ranges_enabled());
+        assert_eq!(m.set_limit(64 << 20), Err(MemoryError::InvalidRange));
+        drop(v);
+        m.set_limit(64 << 20).unwrap();
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        assert!(!v.hardware_ranges_enabled());
+        assert!(
+            unsafe { v.export_hardware_range(0x200000, || panic!("withdrawn native policy")) }
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn native_range_retirement_waits_for_retained_views_and_reuse_is_zero() {
         let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);

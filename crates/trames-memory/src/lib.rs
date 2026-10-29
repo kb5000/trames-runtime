@@ -364,10 +364,18 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().set_limit(limit);
         }
+        let native_policy_changed =
+            (self.limit >= ADDRESS_LIMIT as usize) != (limit >= ADDRESS_LIMIT as usize);
+        if native_policy_changed && self.has_parallel_users() {
+            return Err(MemoryError::InvalidRange);
+        }
         if self.resident_bytes() > limit {
             return Err(MemoryError::Limit);
         }
         self.replace_native_account(limit)?;
+        if native_policy_changed {
+            self.parallel_cache = None;
+        }
         self.limit = limit;
         self.update_resident_limit(limit);
         Ok(())

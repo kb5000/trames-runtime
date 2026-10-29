@@ -17,6 +17,7 @@ pub(crate) struct Anonymous {
     ranges: BTreeMap<u64, Range>,
     code_epoch: Arc<AtomicU64>,
     hardware: bool,
+    pub(super) native_allowed: bool,
     chunks: Mutex<BTreeMap<u64, u64>>,
     executable_ranges: usize,
 }
@@ -90,6 +91,7 @@ impl Anonymous {
             executable_ranges,
             code_epoch: epoch,
             hardware,
+            native_allowed: memory.account.native_allowed(),
             chunks: Mutex::new(BTreeMap::new()),
         }
     }

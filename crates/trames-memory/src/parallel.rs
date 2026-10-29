@@ -1895,6 +1895,12 @@ impl View {
             frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
         }
     }
+    /// Immutable admission hint: bounded policies do no speculative range work
+    /// on their existing 4KiB fault path.
+    #[inline]
+    pub fn hardware_ranges_enabled(&self) -> bool {
+        self.snapshot.anonymous.native_allowed
+    }
     /// Bind one untouched uniform anonymous chunk without creating its page
     /// graph or touching its bytes. Only host-managed accounting can admit it.
     ///
