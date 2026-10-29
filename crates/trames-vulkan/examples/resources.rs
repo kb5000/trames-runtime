@@ -148,7 +148,53 @@ fn allocation_budget() {
     );
 }
 
+// Real native descriptor objects exercise the object budget, not byte quota
+// arithmetic. Five pools cross the previous 16,384-object context ceiling.
+fn object_budget_case(budget: Budget, accepted: usize) {
+    let mut b = Backend::with_budget(budget);
+    let mut m = Memory::new(128 << 10);
+    m.map(PACKET, 31 * PAGE_SIZE, Permissions::RW).unwrap();
+    call(&mut b, &mut m, 1, &[OUT]);
+    let instance = word(&m, OUT);
+    m.write(0x2080, &1u32.to_le_bytes()).unwrap();
+    call(&mut b, &mut m, 3, &[instance, 0x2080, OUT]);
+    let physical = word(&m, OUT);
+    call(&mut b, &mut m, 8, &[physical, 0, OUT]);
+    let device = word(&m, OUT);
+    call(&mut b, &mut m, 23, &[device, 0, 0, OUT]);
+    let layout = word(&m, OUT);
+    words(&mut m, 0x3000, &vec![layout; 4096]);
+    let started = Instant::now();
+    let mut pools = Vec::new();
+    for i in 0..5 {
+        call(&mut b, &mut m, 29, &[device, 0, 0, 4096, 1, OUT]);
+        let pool = word(&m, OUT);
+        pools.push(pool);
+        let result = request(&mut b, &mut m, 31, &[device, pool, 0x3000, 4096, 0xc000]);
+        if i < accepted {
+            assert_eq!(result, 0, "native descriptor batch {i} must fit selected object policy");
+        } else {
+            assert_eq!(result, (-1i64) as u64, "explicit object budget must remain bounded");
+            break;
+        }
+    }
+    let create_ms = started.elapsed().as_secs_f64() * 1000.0;
+    for pool in pools { call(&mut b, &mut m, 30, &[device, pool]); }
+    call(&mut b, &mut m, 24, &[device, layout]);
+    call(&mut b, &mut m, 9, &[device]);
+    call(&mut b, &mut m, 2, &[instance]);
+    println!("native descriptor objects: {} sets, create_ms={create_ms:.3}, pools and layouts released", accepted * 4096);
+}
+fn object_budget() {
+    object_budget_case(Budget::default(), 3);
+    object_budget_case(Budget::host_managed(), 5);
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--objects-only") {
+        object_budget();
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--budget-only") {
         allocation_budget();
         return;

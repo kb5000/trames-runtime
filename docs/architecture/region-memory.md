@@ -484,6 +484,18 @@ mapping changes, COW, EOF/errors, executable changes and unknown providers still
 use normal frame preparation and translation invalidation. Regression coverage
 includes shared writes, truncate/grow and independent private COW mappings.
 
+The built-in shared-anonymous provider also opts into versioned preparation.
+Its retained SharedPage allocation never changes, check() is infallible, and its
+existing version() includes coordinator/worker writes. An unrelated backing
+notification therefore keeps these frames intact instead of rebuilding every
+shared-anonymous page and changing native mapping generations. A data write still
+publishes the page's current version/dirty metadata. The provider retains its
+existing quiescence dependencies, borrow guards and CPU memory ordering; no new
+change domain, cache, lock or byte-visibility rule is introduced. A 64-page test
+runs software and hardware snapshot modes: an unrelated notification prepares
+zero frames rather than 64, and a one-page write refreshes exactly that page
+without changing the hardware mapping schema.
+
 The session also passes its registration domain to serial CPU dispatch through
 `Cpu::run_coordinated`. Hardware backends must use that domain for both solo and
 worker execution. Otherwise a runnable-count change switches code/alias domains

@@ -702,6 +702,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_anonymous_epochs_keep_stable_frames_for_unrelated_and_data_only_changes() {
+        for hardware in [false, true] {
+            let mut memory = Memory::default();
+            memory.map_shared_anonymous(0x10000, 64 * PAGE_SIZE, Permissions::RW, false).unwrap();
+            let object = memory.frames[memory.pages[&0x10000]]
+                .as_ref().unwrap().backing.as_ref().unwrap().object.clone();
+            let mut registry = Registry::default();
+            if hardware {
+                memory.prepare_hardware().unwrap();
+                registry.use_hardware();
+            }
+            let view = memory.parallel_view(&mut registry).unwrap();
+            let before = view.hardware_view_version();
+            drop(view);
+            backing_changed(); // An unrelated resource wrote; these pages did not.
+            let view = memory.parallel_view(&mut registry).unwrap();
+            assert_eq!(registry.metrics.incremental_pages, 0,
+                "unchanged anonymous storage must not rebuild 64 native frames");
+            if hardware { assert_eq!(view.hardware_view_version(), before); }
+            drop(view);
+            object.write(0, &[7]).unwrap();
+            let view = memory.parallel_view(&mut registry).unwrap();
+            assert_eq!(view.read_array::<1>(0x10000).unwrap(), [7]);
+            assert_eq!(view.read_array::<1>(0x11000).unwrap(), [0]);
+            assert_eq!(registry.metrics.direct_frame_refreshes, 1);
+            assert_eq!(registry.metrics.incremental_pages, 1,
+                "the changed page still publishes its version and dirty metadata");
+            if hardware { assert_eq!(view.hardware_view_version(), before,
+                "canonical data writes do not change physical mapping schema"); }
+        }
+    }
+
+    #[test]
     fn backing_epochs_refresh_only_backed_pages_and_preserve_aliases_and_cow() {
         let mut memory = Memory::default();
         memory

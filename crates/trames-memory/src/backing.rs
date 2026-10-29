@@ -546,6 +546,12 @@ impl PageSource for RetainedPageSource {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn parallel_versioned(&self) -> bool {
+        // This provider never replaces its retained SharedPage allocation;
+        // check() is infallible and version() already covers coordinator and
+        // worker writes. Unrelated backing changes need no frame replacement.
+        true
+    }
     fn charge_reads(&self) -> bool {
         false
     }

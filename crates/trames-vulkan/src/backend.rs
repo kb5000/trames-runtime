@@ -4,7 +4,7 @@ use ash::{vk, Entry};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    rc::{Rc, Weak},
+    rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -25,7 +25,8 @@ use graphics::{ImageShape, PassInfo, Recording};
 
 // Mesa/glamor caches descriptors, shaders and pixmaps across X11 windows. The
 // old smoke-test ceiling of 256 exhausted even xterm + xclock. This bounds
-// object metadata; native allocations still charge the separate GPU budget.
+// object metadata for explicitly bounded sessions. Host-managed sessions use
+// the native driver's capacity; byte accounting follows the same policy.
 const LIMIT: usize = 16_384;
 // Match the pool bound for allocation/free batches as well. Original Zink
 // grows its descriptor cache in batches of 100 after the first ten sets.
@@ -127,6 +128,26 @@ enum Kind {
     QueryPool,
 }
 type DescriptorResources = BTreeMap<(u32, u32), Vec<Rc<Object>>>;
+// Object Rc ownership stays on the backend's owner thread. Count each actual
+// lifetime once, including dependencies retained after the guest destroys its
+// ID; cloning a command/descriptor reference does not add another object.
+#[derive(Clone, Default)]
+struct ObjectCount(Rc<Cell<usize>>);
+impl ObjectCount {
+    fn lease(&self) -> ObjectLease {
+        self.0.set(self.0.get() + 1);
+        ObjectLease(self.clone())
+    }
+    fn get(&self) -> usize {
+        self.0.get()
+    }
+}
+struct ObjectLease(ObjectCount);
+impl Drop for ObjectLease {
+    fn drop(&mut self) {
+        self.0.0.set(self.0.get() - 1);
+    }
+}
 struct Object {
     kind: Kind,
     raw: u64,
@@ -157,6 +178,7 @@ struct Object {
     // Keep that signal isolated from a later use of the guest's logical fence.
     acquisition: RefCell<Option<Rc<Object>>>,
     budget: crate::Budget,
+    _count: Option<ObjectLease>,
 }
 impl Object {
     fn retain(&self, other: Rc<Object>) {
@@ -307,7 +329,7 @@ pub struct Backend {
     queue: vk::Queue,
     family: u32,
     objects: BTreeMap<u64, Rc<Object>>,
-    retained: Vec<Weak<Object>>,
+    live_objects: ObjectCount,
     mappings: BTreeMap<u64, Mapping>,
     submissions: Vec<Submission>,
     compiles: BTreeMap<u64, Compile>,
@@ -343,7 +365,7 @@ impl Backend {
             queue: vk::Queue::null(),
             family: 0,
             objects: BTreeMap::new(),
-            retained: Vec::new(),
+            live_objects: ObjectCount::default(),
             mappings: BTreeMap::new(),
             submissions: Vec::new(),
             compiles: BTreeMap::new(),
@@ -373,14 +395,12 @@ impl Backend {
         id
     }
     fn room(&self, n: usize) -> Result<()> {
-        if self
-            .retained
-            .iter()
-            .filter(|x| x.strong_count() != 0)
-            .count()
-            + self.compiles.len()
-            + n
-            > LIMIT
+        if self.budget.limit() == u64::MAX {
+            return Ok(());
+        }
+        if self.live_objects.get()
+            .saturating_add(self.compiles.len())
+            .saturating_add(n) > LIMIT
         {
             Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into())
         } else {
@@ -434,9 +454,9 @@ impl Backend {
             wayland_pool: RefCell::new(None),
             acquisition: RefCell::new(None),
             budget: self.budget.clone(),
+            _count: Some(self.live_objects.lease()),
         });
         let id = self.id();
-        self.retained.push(Rc::downgrade(&object));
         self.objects.insert(id, object);
         id
     }
@@ -699,12 +719,12 @@ impl Backend {
             wayland_pool: RefCell::new(None),
             acquisition: RefCell::new(None),
             budget: self.budget.clone(),
+            _count: None, // Internal submission fences were never quota objects.
         }))
     }
     fn collect(&mut self) {
         self.reap_abandoned();
         self.wayland.collect();
-        self.retained.retain(|x| x.strong_count() != 0);
         self.submissions.retain_mut(|s| {
             let done = unsafe {
                 s.fence
@@ -2783,6 +2803,40 @@ mod tests {
         ] {
             assert!(compute_stage(stage).is_err());
         }
+    }
+    #[test]
+    fn host_managed_objects_have_no_context_smoke_test_ceiling() {
+        let host = Backend::with_budget(crate::Budget::host_managed());
+        assert!(
+            host.room(LIMIT + 1).is_ok(),
+            "host-managed native objects use the driver's actual capacity"
+        );
+        let bounded = Backend::new();
+        assert!(bounded.room(LIMIT).is_ok());
+        assert!(bounded.room(LIMIT + 1).is_err());
+    }
+    #[test]
+    fn live_object_count_follows_last_dependency_and_backend_lifetime() {
+        let mut bounded = Backend::new();
+        let mut objects: Vec<_> = (0..LIMIT)
+            .map(|_| Rc::new(bounded.live_objects.lease()))
+            .collect();
+        assert!(bounded.room(1).is_err());
+        let dependency = objects.pop().unwrap();
+        let command = dependency.clone();
+        drop(objects);
+        assert_eq!(bounded.live_objects.get(), 1);
+        assert!(bounded.room(LIMIT - 1).is_ok());
+        assert!(bounded.room(LIMIT).is_err());
+        drop(dependency);
+        assert_eq!(bounded.live_objects.get(), 1);
+        let observer = bounded.live_objects.clone();
+        // A pending command may outlive the owner's object map/backend.
+        bounded.objects.clear();
+        drop(bounded);
+        assert_eq!(observer.get(), 1);
+        drop(command);
+        assert_eq!(observer.get(), 0);
     }
     #[test]
     fn malformed_transport_cannot_read_guest_memory_or_create_driver_objects() {
