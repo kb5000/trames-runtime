@@ -68,6 +68,21 @@ pub unsafe trait HardwareStorage: Send + Sync {
     fn end_host_access(&self);
 }
 
+/// Stable demand-zero private RAM for one uniform anonymous extent.
+///
+/// # Safety
+/// Every page has HardwareStorage's lifetime and borrow contract. The complete
+/// initialized range remains at pointer()/physical_address() until Drop. Native
+/// hardware writes are canonical immediately, even before a page wrapper exists.
+/// Residency queries inspect host metadata only, never guest byte references.
+pub unsafe trait HardwareRange: HardwareStorage {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn resident_bytes(&self) -> usize;
+}
+
 /// Race-free one-shot readiness. Callbacks carry only scheduling authority,
 /// never guest bytes. A blocked hardware task returns its execution slot.
 #[derive(Default)]

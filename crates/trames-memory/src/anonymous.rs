@@ -10,24 +10,44 @@ pub(super) struct Resident {
 pub(super) struct Store {
     pages: [Mutex<BTreeMap<u64, Arc<Resident>>>; 16],
     account: Arc<Account>,
+    native: Option<Mutex<BTreeMap<u64, Arc<dyn crate::HardwareRange>>>>,
 }
 impl Store {
     fn new(account: Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             pages: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
+            native: account
+                .native_allowed()
+                .then(|| Mutex::new(BTreeMap::new())),
             account,
         })
     }
     pub fn get(&self, base: u64) -> Arc<Resident> {
+        let native = self.native.as_ref().map(|n| n.lock().unwrap());
+        let range = native
+            .as_ref()
+            .and_then(|n| n.range(..=base).next_back())
+            .filter(|(start, r)| base - **start < r.len() as u64);
         self.pages[((base / PAGE_SIZE) & 15) as usize]
             .lock()
             .unwrap()
             .entry(base)
             .or_insert_with(|| {
-                Arc::new(Resident {
-                    bytes: Arc::new(SharedPage::from_owned(PageBytes::Zero, None)),
-                    charge: Charge::new(&self.account),
-                })
+                if let Some((&start, range)) = range {
+                    let storage = Arc::new(RangePage {
+                        range: range.clone(),
+                        offset: (base - start) as usize,
+                    });
+                    Arc::new(Resident {
+                        bytes: Arc::new(SharedPage::from_hardware(storage)),
+                        charge: Charge::native(&self.account),
+                    })
+                } else {
+                    Arc::new(Resident {
+                        bytes: Arc::new(SharedPage::from_owned(PageBytes::Zero, None)),
+                        charge: Charge::new(&self.account),
+                    })
+                }
             })
             .clone()
     }
@@ -55,7 +75,87 @@ impl Store {
                     .filter_map(|(&base, p)| p.charge.resident().then_some(base)),
             );
         }
+        if let Some(native) = &self.native {
+            for (&base, r) in native.lock().unwrap().iter() {
+                out.extend(
+                    (base.max(start)..(base + r.len() as u64).min(end)).step_by(PAGE_SIZE as usize),
+                );
+            }
+            out.sort_unstable();
+            out.dedup();
+        }
         out
+    }
+    pub fn native_contains(&self, address: u64) -> bool {
+        self.native.as_ref().is_some_and(|n| {
+            n.lock()
+                .unwrap()
+                .range(..=address)
+                .next_back()
+                .is_some_and(|(&base, r)| address - base < r.len() as u64)
+        })
+    }
+    pub fn export_range(
+        &self,
+        base: u64,
+        len: usize,
+        allocate: impl FnOnce() -> Result<Arc<dyn crate::HardwareRange>, MemoryError>,
+    ) -> Result<Option<Arc<dyn crate::HardwareRange>>, MemoryError> {
+        let Some(native) = &self.native else {
+            return Ok(None);
+        };
+        let mut native = native.lock().unwrap();
+        if let Some(r) = native.get(&base) {
+            return Ok((r.len() == len && r.is_live()).then(|| r.clone()));
+        }
+        // Get and install take this object lock before the shards. No page can
+        // acquire a competing canonical allocation while a range is admitted.
+        if self.pages.iter().any(|s| {
+            s.lock()
+                .unwrap()
+                .range(base..base + len as u64)
+                .next()
+                .is_some()
+        }) {
+            return Ok(None);
+        }
+        let range = allocate()?;
+        if range.len() != len
+            || !range.physical_address().is_multiple_of(len as u64)
+            || !(range.pointer() as usize).is_multiple_of(PAGE_SIZE as usize)
+        {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.account.register_native(&range);
+        native.insert(base, range.clone());
+        Ok(Some(range))
+    }
+}
+
+struct RangePage {
+    range: Arc<dyn crate::HardwareRange>,
+    offset: usize,
+}
+// SAFETY: a checked, retained subpage of the canonical complete range. Its
+// original hardware gate excludes actors before exposing any Rust byte borrow.
+unsafe impl crate::HardwareStorage for RangePage {
+    fn pointer(&self) -> *mut u8 {
+        self.range.pointer().wrapping_add(self.offset)
+    }
+    fn physical_address(&self) -> u64 {
+        self.range.physical_address() + self.offset as u64
+    }
+    fn is_live(&self) -> bool {
+        self.range.is_live()
+    }
+    fn begin_host_access(&self) {
+        self.range.begin_host_access();
+    }
+    fn end_host_access(&self) {
+        self.range.end_host_access();
+    }
+    fn publish_host_write(&self, offset: usize, len: usize) {
+        self.range.publish_host_write(self.offset + offset, len);
     }
 }
 
@@ -75,6 +175,7 @@ pub(super) struct Range {
 }
 #[derive(Clone, Default)]
 pub(super) struct Anonymous {
+    pub live: Arc<crate::parallel::anonymous::Additions>,
     pub ranges: BTreeMap<u64, Range>,
 }
 impl Anonymous {
@@ -178,6 +279,23 @@ impl Anonymous {
     }
     pub fn prune(&self, changes: &[Retirement]) {
         for change in changes {
+            if let Some(native) = &change.store.native {
+                let mut native = native.lock().unwrap();
+                let first = change.start & !(HARDWARE_MAPPING_CHUNK_SIZE - 1);
+                let candidates: Vec<_> = native
+                    .range(first..change.end)
+                    .map(|(&base, r)| (base, r.len() as u64))
+                    .collect();
+                for (base, len) in candidates {
+                    if !self
+                        .overlapping(base, base + len)
+                        .iter()
+                        .any(|(_, r)| Arc::ptr_eq(&r.store, &change.store))
+                    {
+                        native.remove(&base);
+                    }
+                }
+            }
             #[cfg(test)]
             note_prune_scope();
             for shard in &change.store.pages {
@@ -211,6 +329,7 @@ impl Anonymous {
     }
     pub fn fork(&self, account: &std::sync::Arc<residency::Account>) -> Self {
         Self {
+            live: Default::default(),
             ranges: self
                 .ranges
                 .iter()
@@ -231,6 +350,34 @@ impl Anonymous {
     }
 }
 impl Memory {
+    /// Publish a new RW anonymous range to existing execution Views. No old
+    /// address, permission, byte owner, software alias or cached TLB is edited.
+    /// Destructive edits still use the joined mapping boundary.
+    pub fn map_anonymous_live(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().map_anonymous_live(address, len);
+        }
+        let end = Self::mapping_end(address, len)?;
+        if !self.is_free(address, len) {
+            return Err(MemoryError::Overlap(address));
+        }
+        if self.anonymous.ranges.len() >= MAX_PAGE_DESCRIPTORS {
+            return Err(MemoryError::Limit);
+        }
+        self.advance_code_revision();
+        self.anonymous.insert(
+            address,
+            end,
+            self.anonymous_page(Permissions::RW),
+            &self.account,
+        );
+        let range = &self.anonymous.ranges[&address];
+        self.anonymous.live.publish(address, range);
+        self.note_anonymous_change(address, end);
+        self.revision = self.revision.wrapping_add(1);
+        self.invalidate_translations();
+        Ok(())
+    }
     pub(super) fn note_anonymous_change(&mut self, start: u64, end: u64) {
         self.parallel_anonymous_dirty = true;
         if self.parallel_cache.is_none() {
@@ -312,7 +459,10 @@ impl Memory {
                 continue;
             }
             let range = self.anonymous.containing(base).unwrap().1;
-            let mut page = if !self.has_parallel_users() && range.store.lookup(base).is_none() {
+            let mut page = if !self.has_parallel_users()
+                && range.store.lookup(base).is_none()
+                && !range.store.native_contains(base)
+            {
                 let mut page = (*range.page).clone();
                 page.charge = Charge::new(&self.account);
                 page
@@ -374,6 +524,9 @@ impl Memory {
         unsafe { &*pointer }
     }
     pub(super) fn retire_sparse(&mut self, start: u64, end: u64) {
+        // Destructive generations do not reuse the append-only publication
+        // index. Retained Views keep the old immutable entries and byte owners.
+        self.anonymous.live = Default::default();
         self.invalidate_translations();
         let pages = self.sparse_pages.get_mut();
         let keys: Vec<_> = pages.range(start..end).map(|(&base, _)| base).collect();
@@ -755,5 +908,260 @@ mod tests {
         m.write_array(base + 2 * PAGE_SIZE, [8]).unwrap();
         m.discard(base, len).unwrap();
         assert_eq!(m.resident_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::{parallel::Registry, CpuMemory, HardwareRange, HardwareStorage};
+    use std::sync::atomic::AtomicUsize;
+    struct Native {
+        pointer: usize,
+        resident: AtomicUsize,
+    }
+    impl Native {
+        fn new() -> Arc<Self> {
+            let layout = std::alloc::Layout::from_size_align(
+                HARDWARE_MAPPING_CHUNK_SIZE as usize,
+                PAGE_SIZE as usize,
+            )
+            .unwrap();
+            let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!pointer.is_null());
+            Arc::new(Self {
+                pointer: pointer as usize,
+                resident: AtomicUsize::new(0),
+            })
+        }
+    }
+    impl Drop for Native {
+        fn drop(&mut self) {
+            unsafe {
+                std::alloc::dealloc(
+                    self.pointer as *mut _,
+                    std::alloc::Layout::from_size_align(
+                        HARDWARE_MAPPING_CHUNK_SIZE as usize,
+                        PAGE_SIZE as usize,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+    }
+    // SAFETY: test hardware stores are explicit raw writes; no concurrent actor.
+    unsafe impl HardwareStorage for Native {
+        fn pointer(&self) -> *mut u8 {
+            self.pointer as *mut u8
+        }
+        fn physical_address(&self) -> u64 {
+            0x200000
+        }
+        fn begin_host_access(&self) {}
+        fn end_host_access(&self) {}
+    }
+    unsafe impl HardwareRange for Native {
+        fn len(&self) -> usize {
+            HARDWARE_MAPPING_CHUNK_SIZE as usize
+        }
+        fn resident_bytes(&self) -> usize {
+            self.resident.load(Ordering::Relaxed)
+        }
+    }
+    fn setup(limit: usize) -> (Memory, Registry) {
+        let mut m = Memory::new(limit);
+        m.map(0x200000, HARDWARE_MAPPING_CHUNK_SIZE, Permissions::RW)
+            .unwrap();
+        let mut r = Registry::default();
+        r.use_hardware();
+        m.prepare_hardware().unwrap();
+        (m, r)
+    }
+    #[test]
+    fn native_ranges_share_late_bytes_and_never_charge_unreached_addresses() {
+        let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);
+        let native = Native::new();
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        unsafe {
+            v.export_hardware_range(0x200000, || Ok(native.clone()))
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(m.resident_bytes(), 0);
+        unsafe {
+            native
+                .pointer()
+                .add(3 * PAGE_SIZE as usize)
+                .cast::<u64>()
+                .write(713);
+        }
+        native.resident.store(PAGE_SIZE as usize, Ordering::Relaxed);
+        assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
+        assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
+        drop(v);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
+        let mut child = m.clone();
+        child.write_array(0x203000, 919u64.to_le_bytes()).unwrap();
+        assert_eq!(m.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
+        assert_eq!(
+            child.read_array::<8>(0x203000).unwrap(),
+            919u64.to_le_bytes()
+        );
+    }
+    #[test]
+    fn native_range_admission_keeps_strict_quotas_and_existing_pages_authoritative() {
+        let (mut m, mut r) = setup(64 << 20);
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        assert!(unsafe {
+            v.export_hardware_range(0x200000, || {
+                panic!("bounded quota cannot admit untracked hardware stores")
+            })
+        }
+        .unwrap()
+        .is_none());
+        drop(v);
+        let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);
+        m.write_array(0x203000, 713u64.to_le_bytes()).unwrap();
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        assert!(unsafe {
+            v.export_hardware_range(0x200000, || panic!("never replace reached canonical bytes"))
+        }
+        .unwrap()
+        .is_none());
+        assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
+    }
+    #[test]
+    fn native_range_retirement_waits_for_retained_views_and_reuse_is_zero() {
+        let (mut m, mut r) = setup(ADDRESS_LIMIT as usize);
+        let native = Native::new();
+        let weak = Arc::downgrade(&native);
+        let mut v = m.parallel_view(&mut r).unwrap();
+        v.enable_hardware();
+        unsafe {
+            v.export_hardware_range(0x200000, || Ok(native.clone()))
+                .unwrap()
+                .unwrap();
+        }
+        unsafe {
+            native.pointer().cast::<u64>().write(117);
+        }
+        native.resident.store(PAGE_SIZE as usize, Ordering::Relaxed);
+        drop(native);
+        m.unmap(0x200000, HARDWARE_MAPPING_CHUNK_SIZE).unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(v.read_array::<8>(0x200000).unwrap(), 117u64.to_le_bytes());
+        m.map(0x200000, HARDWARE_MAPPING_CHUNK_SIZE, Permissions::RW)
+            .unwrap();
+        let mut fresh = m.parallel_view(&mut r).unwrap();
+        fresh.enable_hardware();
+        assert_eq!(fresh.read_array::<8>(0x200000).unwrap(), [0; 8]);
+        drop(fresh);
+        drop(v);
+        m.commit_parallel().unwrap();
+        m.reclaim_unused();
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::{parallel::Registry, CpuMemory};
+    #[test]
+    fn live_anonymous_additions_reach_running_views_without_rebuilding_old_frames() {
+        let mut m = Memory::new(2 * PAGE_SIZE as usize);
+        m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut r = Registry::default();
+        let mut old = m.parallel_view(&mut r).unwrap();
+        old.write_array(0x1000, 7u64.to_le_bytes()).unwrap();
+        m.map_anonymous_live(0x200000, HARDWARE_MAPPING_CHUNK_SIZE)
+            .unwrap();
+        assert_eq!(old.read_array::<8>(0x200000).unwrap(), [0; 8]);
+        old.write_array(0x201000, 73u64.to_le_bytes()).unwrap();
+        assert_eq!(m.resident_bytes(), 2 * PAGE_SIZE as usize);
+        assert_eq!(old.read_array::<8>(0x1000).unwrap(), 7u64.to_le_bytes());
+        assert_eq!(
+            m.map_anonymous_live(0x201000, PAGE_SIZE),
+            Err(MemoryError::Overlap(0x201000))
+        );
+        assert_eq!(old.write_array(0x202000, [1]), Err(MemoryError::Limit));
+        drop(old);
+        m.commit_parallel().unwrap();
+        let fresh = m.parallel_view(&mut r).unwrap();
+        assert_eq!(
+            fresh.read_array::<8>(0x201000).unwrap(),
+            73u64.to_le_bytes()
+        );
+        drop(fresh);
+        assert_eq!(m.read_array::<8>(0x201000).unwrap(), 73u64.to_le_bytes());
+    }
+    #[test]
+    fn live_range_tokens_survive_other_snapshot_refreshes_and_retirement() {
+        let mut m = Memory::default();
+        let mut r = Registry::default();
+        let mut old = m.parallel_view(&mut r).unwrap();
+        m.map_anonymous_live(0x200000, HARDWARE_MAPPING_CHUNK_SIZE)
+            .unwrap();
+        old.write_array(0x201000, 17u64.to_le_bytes()).unwrap();
+        let mut later = m.parallel_view(&mut r).unwrap();
+        later.write_array(0x201000, 37u64.to_le_bytes()).unwrap();
+        assert_eq!(old.read_array::<8>(0x201000).unwrap(), 37u64.to_le_bytes());
+        m.protect(0x201000, PAGE_SIZE, Permissions::R).unwrap();
+        let protected = m.parallel_view(&mut r).unwrap();
+        assert!(matches!(
+            protected.check(0x201000, 1, Access::Write),
+            Err(MemoryError::Permission { .. })
+        ));
+        assert_eq!(old.read_array::<8>(0x201000).unwrap(), 37u64.to_le_bytes());
+        drop(protected);
+        drop(later);
+        drop(old);
+        m.commit_parallel().unwrap();
+        m.unmap(0x200000, HARDWARE_MAPPING_CHUNK_SIZE).unwrap();
+        let absent = m.parallel_view(&mut r).unwrap();
+        assert_eq!(
+            absent.check_translation(0x201000),
+            Err(MemoryError::Unmapped(0x201000))
+        );
+    }
+    #[test]
+    fn live_additions_keep_one_store_across_concurrent_software_atomics() {
+        let mut m = Memory::default();
+        let mut r = Registry::default();
+        let original = m.parallel_view(&mut r).unwrap();
+        m.map_anonymous_live(0x200000, PAGE_SIZE).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let mut v = original.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        loop {
+                            let mut bytes = [0; 8];
+                            let token = v.exclusive_read(0x200000, &mut bytes).unwrap();
+                            let next = u64::from_le_bytes(bytes) + 1;
+                            if v.exclusive_write(0x200000, &next.to_le_bytes(), Some(token))
+                                .unwrap()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            original.read_array::<8>(0x200000).unwrap(),
+            1600u64.to_le_bytes()
+        );
+        drop(original);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<8>(0x200000).unwrap(), 1600u64.to_le_bytes());
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! In-epoch services: coordinator-owned FD state, caller-owned concurrent bytes.
-//! Never inspect Process::memory/CPU or change mappings while peers execute.
+//! Ordinary I/O uses caller Views. New private-anonymous intervals may be
+//! published through the append-only mapping authority while peers execute.
 use super::*;
 
 #[derive(Default)]
@@ -190,6 +191,15 @@ impl<C: Cpu> Kernel<C> {
             return None;
         }
         let a = request.args;
+        if request.number == 222 && p.seccomp.mode() == 0 {
+            let began = Instant::now();
+            let result = p.linux.mmap_additive(a, &mut p.memory)?;
+            self.parallel_memory_time += began.elapsed();
+            self.vm_local_syscalls += 1;
+            // Every result is final, including errors. No mapping effect can
+            // fall back/replay through a later joined request.
+            return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+        }
         match request.number {
             25 if matches!(a[1], 1 | 3) => {}
             62 | 80 => {

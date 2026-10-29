@@ -1895,6 +1895,25 @@ impl View {
             frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
         }
     }
+    /// Bind one untouched uniform anonymous chunk without creating its page
+    /// graph or touching its bytes. Only host-managed accounting can admit it.
+    ///
+    /// # Safety
+    /// Same hardware-only View/retained-storage contract as page exports. The
+    /// allocator supplies a fresh initialized demand-zero complete range.
+    pub unsafe fn export_hardware_range(
+        &self,
+        address: u64,
+        allocate: impl FnOnce() -> Result<Arc<dyn crate::HardwareRange>, MemoryError>,
+    ) -> Result<Option<Arc<dyn crate::HardwareRange>>, MemoryError> {
+        assert!(self.hardware_mode);
+        let len = crate::HARDWARE_MAPPING_CHUNK_SIZE;
+        let base = address & !(len - 1);
+        Memory::end(base, len)?;
+        self.snapshot
+            .anonymous
+            .export_range(base, len as usize, Access::Write, allocate)
+    }
     /// Export one admitted page from the same storage used by CPU/native/VFS.
     ///
     /// # Safety

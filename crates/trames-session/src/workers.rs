@@ -592,6 +592,17 @@ impl<C: Cpu> Pool<C> {
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                         && snapshot.seccomp.mode() == 0
+                                        && work.cpu.x(8) as u32 == 222
+                                        && trames_linux::Linux::mmap_is_additive(std::array::from_fn(|i|work.cpu.x(i)))
+                                    {
+                                        // New anonymous ownership only. The
+                                        // existing owner publishes its interval;
+                                        // peers and their translations continue.
+                                        service = true;
+                                        break SliceOutcome::Yield { instructions: 0 };
+                                    }
+                                    if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
+                                        && snapshot.seccomp.mode() == 0
                                         && crate::worker_syscalls::vm_call(work.cpu.x(8) as u32)
                                     {
                                         vm_checkpoint = true;

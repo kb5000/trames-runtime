@@ -239,6 +239,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn additive_mmap_reaches_a_running_clone_vm_peer_without_a_vm_checkpoint() {
+        struct Completed {
+            bytes: Arc<SharedPage>,
+            deadline: Instant,
+        }
+        impl GuestOutput for Completed {
+            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(!self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
+                    && Instant::now() < self.deadline)
+            }
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
+                    || Instant::now() >= self.deadline)
+            }
+            fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+        }
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        let mut a = super::super::tests::process();
+        let bytes = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+        map(&mut a, 0x1000, bytes.clone(), None);
+        // mmap; store 17 in the returned mapping; STLR its pointer; keep running.
+        let mut words = vec![
+            0xd4000001, 0xaa0003e2, 0xd2800221, 0xf9000041, 0xd2820003, 0xc89ffc62, 0x14000000,
+        ];
+        words.resize(64, 0xd503201f);
+        // LDAR pointer; wait for publication; load through the original View.
+        words.extend([
+            0xd2820003, 0xc8dffc60, 0xb4ffffe0, 0xf9400001, 0xf9000461, 0xf9400862, 0x91000442,
+            0xf9000862, 0x17fffffd,
+        ]);
+        code(&mut a, &words);
+        for (i, x) in [0, 1 << 21, 3, 0x22, u64::MAX, 0].into_iter().enumerate() {
+            a.cpu.set_x(i, x);
+        }
+        a.cpu.set_x(8, 222);
+        let memory = a.memory.share();
+        let mut b = a.fork_with_memory(memory);
+        b.cpu.pc = 0x4100;
+        b.affinity = 2;
+        k.processes.insert(1, a);
+        k.processes.insert(2, b);
+        let mut io = Completed {
+            bytes: bytes.clone(),
+            deadline: Instant::now() + Duration::from_secs(3),
+        };
+        assert!(matches!(
+            k.drive(&mut io, u64::MAX),
+            Err(RuntimeError::Cancelled)
+        ));
+        assert_eq!(
+            bytes.with_read(8, 8, |b| u64::from_le_bytes(b.try_into().unwrap())),
+            17
+        );
+        assert_eq!(
+            k.vm_checkpoint_groups, 0,
+            "a pure addition cannot pause same-mm peers"
+        );
+        assert_eq!(k.vm_local_syscalls, 1);
+        assert_eq!(k.service_requests, 1);
+        assert_eq!(k.parallel_rounds, 1, "the cohort remains live");
+    }
+
     fn commit_while_peer_runs(relation: u8) {
         let mut k = super::super::tests::kernel();
         k.cpu_count = if relation == 0 { 2 } else { 3 };

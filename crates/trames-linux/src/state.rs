@@ -685,7 +685,18 @@ impl Linux {
             _ => 12,
         })
     }
+    pub fn mmap_is_additive(a: [u64; 6]) -> bool {
+        a[2] == 3 && a[3] & 0x23 == 0x22 && a[3] & (0x10 | 0x100000) == 0
+    }
+    /// Pure new private-anonymous ownership; reuse the ordinary mmap ABI
+    /// validation/address allocator, publishing only after the full preflight.
+    pub fn mmap_additive(&mut self, a: [u64; 6], memory: &mut Memory) -> Option<Result<u64>> {
+        Self::mmap_is_additive(a).then(|| self.mmap_impl(a, memory, true))
+    }
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+        self.mmap_impl(a, memory, false)
+    }
+    fn mmap_impl(&mut self, a: [u64; 6], memory: &mut Memory, live: bool) -> Result<u64> {
         let len = Self::page_length(a[1])?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
         if a[3] & 0x23 != 0x22 && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
@@ -763,9 +774,15 @@ impl Linux {
                 .map_fixed(address, len, permissions)
                 .map_err(Self::memory_errno)?;
         } else {
-            memory
-                .map(address, len, permissions)
-                .map_err(Self::memory_errno)?;
+            if live {
+                memory
+                    .map_anonymous_live(address, len)
+                    .map_err(Self::memory_errno)?;
+            } else {
+                memory
+                    .map(address, len, permissions)
+                    .map_err(Self::memory_errno)?;
+            }
         }
         // A successful caller-chosen hint must not move the ordinary search
         // cursor. Scudo deliberately probes randomized high addresses; moving

@@ -13,11 +13,48 @@ struct Range {
     pages: Arc<FrameCache>,
 }
 pub(crate) struct Anonymous {
+    live: Arc<Additions>,
     ranges: BTreeMap<u64, Range>,
     code_epoch: Arc<AtomicU64>,
     hardware: bool,
     chunks: Mutex<BTreeMap<u64, u64>>,
     executable_ranges: usize,
+}
+/// Insert-only range publication. Heap Range/Frame addresses stay owned
+/// until every Snapshot using this generation retires. There is no removal,
+/// permission edit or frame-cache pruning through this shared index.
+#[derive(Default)]
+pub(crate) struct Additions {
+    ranges: Mutex<BTreeMap<u64, Arc<Range>>>,
+}
+impl Additions {
+    pub(crate) fn publish(&self, base: u64, source: &crate::anonymous::Range) {
+        let range = Arc::new(Anonymous::freeze_range(source, None));
+        let mut ranges = self.ranges.lock().unwrap();
+        assert!(
+            ranges.insert(base, range).is_none(),
+            "additions never replace a live range"
+        );
+    }
+    fn range(&self, address: u64) -> Option<&Range> {
+        let ranges = self.ranges.lock().unwrap();
+        let (_, range) = ranges
+            .range(..=address)
+            .next_back()
+            .filter(|(_, r)| address < r.end)?;
+        let pointer = Arc::as_ptr(range);
+        // SAFETY: this insert-only owner outlives the borrow. Inserts never
+        // move/remove heap allocations; no mutable Range/Frame reference exists.
+        Some(unsafe { &*pointer })
+    }
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        let ranges = self.ranges.lock().unwrap();
+        ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, r)| start < r.end)
+            || ranges.range(start..end).next().is_some()
+    }
 }
 impl Anonymous {
     fn freeze_range(source: &crate::anonymous::Range, previous: Option<&Range>) -> Range {
@@ -48,6 +85,7 @@ impl Anonymous {
             .collect();
         let executable_ranges = ranges.values().filter(|r| r.permissions.execute).count();
         Self {
+            live: memory.anonymous.live.clone(),
             ranges,
             executable_ranges,
             code_epoch: epoch,
@@ -73,6 +111,7 @@ impl Anonymous {
         changes: &[std::ops::Range<u64>],
     ) {
         self.prune_against(current, changes);
+        self.live = current.live.clone();
         let mut windows: Vec<std::ops::Range<u64>> = Vec::new();
         for change in changes {
             if windows
@@ -112,7 +151,7 @@ impl Anonymous {
             let replacements: Vec<_> = current
                 .overlapping(window.start, window.end)
                 .into_iter()
-                .map(|(base, r)| (base, Self::freeze_range(r, self.range(base))))
+                .map(|(base, r)| (base, Self::freeze_range(r, self.base_range(base))))
                 .collect();
             let keys: Vec<_> = self
                 .ranges
@@ -128,6 +167,32 @@ impl Anonymous {
                 self.ranges.insert(base, r);
             }
         }
+    }
+    pub(super) fn export_range(
+        &self,
+        base: u64,
+        len: usize,
+        access: Access,
+        allocate: impl FnOnce() -> Result<Arc<dyn crate::HardwareRange>, MemoryError>,
+    ) -> Result<Option<Arc<dyn crate::HardwareRange>>, MemoryError> {
+        let Some(r) = self.range(base) else {
+            return Ok(None);
+        };
+        if base.checked_add(len as u64).is_none_or(|end| end > r.end)
+            || r.permissions != Permissions::RW
+            || access == Access::Execute
+        {
+            return Ok(None);
+        }
+        let result = r.store.export_range(base, len, allocate)?;
+        if result.is_some() {
+            self.chunks
+                .lock()
+                .unwrap()
+                .entry(base / crate::HARDWARE_MAPPING_CHUNK_SIZE)
+                .or_insert_with(new_backing_identity);
+        }
+        Ok(result)
     }
     pub(super) fn chunk_version(&self, chunk: u64) -> Option<u64> {
         self.chunks.lock().unwrap().get(&chunk).copied()
@@ -188,15 +253,21 @@ impl Anonymous {
             }
         }
     }
-    fn range(&self, address: u64) -> Option<&Range> {
+    fn base_range(&self, address: u64) -> Option<&Range> {
         self.ranges
             .range(..=address)
             .next_back()
             .filter(|(_, r)| address < r.end)
             .map(|(_, r)| r)
     }
+    fn range(&self, address: u64) -> Option<&Range> {
+        self.base_range(address)
+            .or_else(|| self.live.range(address))
+    }
     pub(super) fn overlaps(&self, start: u64, end: u64) -> bool {
-        self.range(start).is_some() || self.ranges.range(start..end).next().is_some()
+        self.base_range(start).is_some()
+            || self.ranges.range(start..end).next().is_some()
+            || self.live.overlaps(start, end)
     }
     pub(super) fn executable(&self) -> bool {
         self.executable_ranges != 0

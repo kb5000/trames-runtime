@@ -6,7 +6,7 @@ mod cpu_memory;
 mod hardware;
 pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
-pub use hardware_shared::{HardwareStorage, HardwareWait, SharedMapping};
+pub use hardware_shared::{HardwareRange, HardwareStorage, HardwareWait, SharedMapping};
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -367,6 +367,7 @@ impl Memory {
         if self.resident_bytes() > limit {
             return Err(MemoryError::Limit);
         }
+        self.replace_native_account(limit)?;
         self.limit = limit;
         self.update_resident_limit(limit);
         Ok(())

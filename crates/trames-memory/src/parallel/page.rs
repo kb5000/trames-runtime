@@ -249,6 +249,9 @@ impl MutablePage {
         let bytes = unsafe { Box::from_raw(Box::into_raw(bytes).cast::<[UnsafeCell<u8>; PAGE]>()) };
         Self::with_storage(Bytes::Heap(bytes))
     }
+    pub(crate) fn from_hardware(storage: std::sync::Arc<dyn crate::HardwareStorage>) -> Self {
+        Self::with_storage(Bytes::Hardware(storage))
+    }
     pub(crate) fn from_owned(
         bytes: crate::mmu::PageBytes,
         slot: Option<std::sync::Arc<crate::mmu::Slot>>,

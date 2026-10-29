@@ -691,3 +691,55 @@ A separate test preserves software CPU aliases while charging only the reached
 4 KiB page of a 16 KiB host granule. The total
 allocation request for mapping, freezing and partially protecting an untouched
 1 GiB VMA is bounded below 128 KiB by an allocator-instrumented test.
+
+### Native anonymous extents and additive publication (2026-10-29)
+
+Hardware-only host-managed address spaces can export an untouched uniform RW
+private anonymous 2 MiB extent through HardwareRange. The provider retains one
+stable demand-zero host allocation and linear physical-address range. Hardware
+can reach any page without a SharedPage/Frame export at each 4 KiB. Later
+CPU/native/coordinator accesses create subpage wrappers referring to those same
+bytes, with the existing region and hardware-borrow gates. A store-level lock
+serializes only first extent admission against first page creation; normal byte
+operations add no range lock, ordinary barrier or new permission policy.
+
+Only architectural-ceiling local and aggregate budgets admit this path. Explicit
+resident-byte caps retain per-page admission. Native extent wrappers do not charge
+all virtual bytes: their owning account queries provider residency metadata when
+reporting resident_bytes. This is host-granule residency rather than unique
+physical/PSS accounting. Old page budgets remain conservative across fork. Fork
+and account rebinding materialize the extent's potentially modified pages through
+the existing COW boundary; changing a live native account to a smaller strict cap
+can therefore fail conservatively. Unchanged interpreter/iPad defaults never
+create hardware extents.
+
+An extent owns its bytes independently of the worker generation. Exact retirement
+tickets prune only intersecting extent keys. Retained Views and subpage/pin owners
+keep their legitimate allocations alive, and final release withdraws hardware
+before releasing addresses. Partial changes retain complete extent storage while
+any fragment/subpage owner survives; pressure can evict its hardware registration
+without discarding contents. There is no claim of 4 KiB host physical reclamation
+inside a retained 2 MiB extent.
+
+New private-anonymous RW mmap requests may publish an append-only range index
+while same-mm peers keep running. Linux reuses the original mmap validation and
+address allocator on the existing coordinator; the requesting task returns its
+execution slot through the existing queue. No resource-service thread or polling
+bus is added. The publication index owns insertion-stable Range/Frame allocations.
+Old Views consult it only after a cold lookup misses their frozen index; existing
+TLB entries and byte accesses are unchanged. Published entries are never replaced,
+pruned, or permission-edited in place.
+
+Destructive generations rotate that publication owner. Retained Views keep their
+old immutable index and bytes; current snapshots receive the new owner. Shared
+publication frame caches are never reused by the unique-snapshot pruning path.
+Permission withdrawal, unmap, discard, fixed/file/shared mappings, tracing and
+seccomp retain their joined boundaries. This removes the same-mm pause for pure
+additions, not every mapping synchronization operation.
+
+Regression tests cover late native bytes, quota exclusion, retained-view release,
+COW, concurrent exclusive operations, cross-generation cache lifetimes, and a real
+interpreter CLONE_VM peer reading a newly published mapping with zero VM
+checkpoints. Mac acceptance separately verifies one data translation fault for all
+512 pages, sparse host residency, partial protection/discard/reuse, migration and
+pressure recovery.

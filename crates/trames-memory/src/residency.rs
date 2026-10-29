@@ -33,8 +33,41 @@ impl Budget {
 pub(super) struct Account {
     local: Arc<Budget>,
     total: Option<Arc<Budget>>,
+    native: std::sync::Mutex<BTreeMap<usize, std::sync::Weak<dyn crate::HardwareRange>>>,
 }
 impl Account {
+    pub(super) fn native_allowed(&self) -> bool {
+        self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
+            && self
+                .total
+                .as_ref()
+                .is_none_or(|b| b.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize)
+    }
+    pub(super) fn register_native(&self, range: &Arc<dyn crate::HardwareRange>) {
+        let mut native = self.native.lock().unwrap();
+        native.insert(
+            Arc::as_ptr(range) as *const () as usize,
+            Arc::downgrade(range),
+        );
+    }
+    fn has_native(&self) -> bool {
+        self.native
+            .lock()
+            .unwrap()
+            .values()
+            .any(|r| r.strong_count() != 0)
+    }
+    fn native_resident(&self) -> usize {
+        let ranges: Vec<_> = {
+            let mut native = self.native.lock().unwrap();
+            native.retain(|_, r| r.strong_count() != 0);
+            native
+                .values()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect()
+        };
+        ranges.iter().map(|r| r.resident_bytes()).sum()
+    }
     fn available(&self) -> usize {
         let local = self
             .local
@@ -55,12 +88,14 @@ impl Account {
         Arc::new(Self {
             local: Budget::new(limit),
             total: None,
+            native: Default::default(),
         })
     }
     fn fork(&self) -> Arc<Self> {
         Arc::new(Self {
             local: Budget::new(self.local.limit.load(Ordering::Relaxed)),
             total: self.total.clone(),
+            native: Default::default(),
         })
     }
     fn take(&self, bytes: usize) -> Result<(), MemoryError> {
@@ -85,12 +120,21 @@ pub(super) struct Charge {
     // 0 = untouched, 1 = first writer reserving, 2 = charged. Region guards
     // may be disjoint; this state serializes only the page's first allocation.
     state: AtomicU8,
+    accounted: bool,
 }
 impl Charge {
     pub(super) fn new(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(0),
+            accounted: true,
+        })
+    }
+    pub(super) fn native(account: &Arc<Account>) -> Arc<Self> {
+        Arc::new(Self {
+            account: account.clone(),
+            state: AtomicU8::new(2),
+            accounted: false,
         })
     }
     pub(super) fn resident(&self) -> bool {
@@ -134,7 +178,7 @@ impl Charge {
 }
 impl Drop for Charge {
     fn drop(&mut self) {
-        if self.resident() {
+        if self.accounted && self.resident() {
             self.account.release(PAGE_SIZE as usize);
         }
     }
@@ -172,13 +216,14 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().resident_bytes();
         }
-        self.account.local.used.load(Ordering::Relaxed)
+        self.account.local.used.load(Ordering::Relaxed) + self.account.native_resident()
     }
     /// Bind a fresh runtime to one aggregate guest budget before workers start.
     pub fn set_total_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
         self.bind_account(Arc::new(Account {
             local: Budget::new(self.limit),
             total: Some(Budget::new(limit)),
+            native: Default::default(),
         }))
     }
     /// An exec address space joins the old VM's aggregate accounting domain.
@@ -189,6 +234,7 @@ impl Memory {
         self.bind_account(Arc::new(Account {
             local: Budget::new(self.limit),
             total: old.account.total.clone(),
+            native: Default::default(),
         }))
     }
     fn bind_account(&mut self, account: Arc<Account>) -> Result<(), MemoryError> {
@@ -213,6 +259,20 @@ impl Memory {
         self.invalidate_translations();
         self.account = account;
         Ok(())
+    }
+    pub(super) fn replace_native_account(&mut self, limit: usize) -> Result<bool, MemoryError> {
+        if !self.account.has_native() {
+            return Ok(false);
+        }
+        if self.has_parallel_users() {
+            return Err(MemoryError::InvalidRange);
+        }
+        self.bind_account(Arc::new(Account {
+            local: Budget::new(limit),
+            total: self.account.total.clone(),
+            native: Default::default(),
+        }))?;
+        Ok(true)
     }
     pub(super) fn update_resident_limit(&self, limit: usize) {
         self.account.local.limit.store(limit, Ordering::Relaxed);
