@@ -768,3 +768,22 @@ new hardware residency. No cross-request timer cache is introduced.
 The UUID endpoint uses the existing host CSPRNG and generates a new UUID v4 on
 retrieval, matching the documented [Linux random sysctl semantics](https://docs.kernel.org/admin-guide/sysctl/kernel.html#random).
 Its directory and file are runtime pseudo nodes outside disk storage quotas.
+
+
+## Hardware metadata reuse within a View (2026-10-29)
+
+Hardware metadata queries reuse the View's existing page-translation entries.
+Only a frame token and frozen permissions are retained: residency, backing/code
+versions and current hardware storage are read from that frame on every query.
+The Snapshot owns dense frames and boxed anonymous metadata for the View's
+lifetime, matching the existing raw token ownership proof. Joined changes make
+fresh Views and clear local caches. Ordinary guest bytes and their synchronization
+are unaffected; this does not cache borrowed Rust references across execution.
+
+A small worker-local cache also retains existing anonymous chunk stamps.
+Those entries do not change during the frozen View. Live additions and first
+touch can insert other entries, so absence and the pre-materialization fallback
+stamp are never cached. Queries still allocate no guest bytes and charge no RAM.
+The canonical native-page store first checks its existing page shard: a retained
+page needs no second native-range index lock. A miss follows the original range
+admission and lock order. No global byte or algorithm lock is added.

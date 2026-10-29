@@ -61,6 +61,8 @@ pub(super) fn clock(
     address: u64,
     started: Instant,
 ) -> Result<u64, Errno> {
+    // clockid_t is a signed 32-bit Linux ABI argument, including raw SVCs.
+    let id = id as u32;
     if !matches!(id, 0 | 1 | 4..=7) {
         return Err(Errno(22));
     }
@@ -521,6 +523,20 @@ mod tests {
         cpu.set_x(2, 1);
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
         assert_eq!(view.read_array::<4>(0x1000).unwrap(), 17u32.to_le_bytes());
+    }
+    #[test]
+    fn clockid_uses_the_linux_low_32_bit_argument_with_syscall_fallback() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            clock(&mut memory, 113, 0x1234_0000_0001, 0x1000, started),
+            Ok(0)
+        );
+        assert_eq!(
+            clock(&mut memory, 113, u64::MAX, 0x1000, started),
+            Err(Errno(22))
+        );
     }
     #[test]
     fn coarse_clocks_share_the_epoch_of_their_high_resolution_counterparts() {

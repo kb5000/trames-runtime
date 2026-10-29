@@ -1432,8 +1432,13 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Ready;
         Ok(())
     }
-    fn exec(p: &mut Process<C>, a: [u64; 6], budget: usize) -> Result<(), Errno> {
-        Self::exec_at(p, AT_FDCWD, a, 0, budget)
+    fn exec(
+        p: &mut Process<C>,
+        a: [u64; 6],
+        budget: usize,
+        clock_origin: Instant,
+    ) -> Result<(), Errno> {
+        Self::exec_at(p, AT_FDCWD, a, 0, budget, clock_origin)
     }
     fn exec_at(
         p: &mut Process<C>,
@@ -1441,6 +1446,7 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         flags: u32,
         budget: usize,
+        clock_origin: Instant,
     ) -> Result<(), Errno> {
         let mut path = Linux::path(&p.memory, a[0])?;
         if path.is_empty() && flags & 0x1000 == 0 {
@@ -1552,6 +1558,8 @@ impl<C: Cpu> Kernel<C> {
                 RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
                 _ => Errno(8),
             })?;
+            super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, clock_origin)
+                .map_err(|_| Errno(12))?;
             if runtime.memory.resident_bytes() > budget {
                 return Err(Errno(12));
             }
@@ -2110,7 +2118,7 @@ impl<C: Cpu> Kernel<C> {
             221 | 281 => {
                 let old_vm = p.vm_id;
                 if number == 221 {
-                    Self::exec(p, a, self.memory_limits.per_process)?;
+                    Self::exec(p, a, self.memory_limits.per_process, self.started)?;
                 } else {
                     Self::exec_at(
                         p,
@@ -2118,6 +2126,7 @@ impl<C: Cpu> Kernel<C> {
                         [a[1], a[2], a[3], 0, 0, 0],
                         a[4] as u32,
                         self.memory_limits.per_process,
+                        self.started,
                     )?;
                 }
                 let ids: Vec<_> = self
@@ -4579,6 +4588,12 @@ pub(super) fn run<C: Cpu>(
     runtime
         .memory
         .set_total_limit(runtime.memory_limits.total)?;
+    let started = runtime
+        .linux
+        .vfs
+        .wayland_server()
+        .map_or_else(Instant::now, |server| server.guest_clock_origin());
+    super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, started)?;
     let mut root = Process::<C> {
         cpu: std::mem::take(&mut runtime.cpu),
         affinity: (1u64 << runtime.cpu_count.clamp(1, 32)) - 1,
@@ -4619,11 +4634,6 @@ pub(super) fn run<C: Cpu>(
         seccomp: seccomp::Seccomp::default(),
     };
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
-    let started = root
-        .linux
-        .vfs
-        .wayland_server()
-        .map_or_else(Instant::now, |server| server.guest_clock_origin());
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake),
         memory_limits: runtime.memory_limits,
@@ -7435,7 +7445,12 @@ mod boundary_tests {
         p.memory.write(0x1000, b"/bad\0").unwrap();
         p.memory.write(0x1100, &[0; 8]).unwrap();
         assert_eq!(
-            Kernel::exec(&mut p, [0x1000, 0x1100, 0, 0, 0, 0], TOTAL_MAPPED_LIMIT),
+            Kernel::exec(
+                &mut p,
+                [0x1000, 0x1100, 0, 0, 0, 0],
+                TOTAL_MAPPED_LIMIT,
+                Instant::now()
+            ),
             Err(Errno(8))
         );
         assert_eq!(p.cpu.pc, 0x4000);

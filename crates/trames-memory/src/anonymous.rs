@@ -45,6 +45,11 @@ impl Store {
     }
     #[inline(never)]
     fn get_native(&self, base: u64) -> Arc<Resident> {
+        // An existing canonical page already excludes competing range admission.
+        // Its retained Arc needs only the page shard, not the range index lock.
+        if let Some(resident) = self.lookup(base) {
+            return resident;
+        }
         let native = self.native.as_ref().map(|n| n.lock().unwrap());
         let range = native
             .as_ref()
@@ -1094,11 +1099,15 @@ mod native_tests {
         m.write_array(0x203000, 713u64.to_le_bytes()).unwrap();
         let mut v = m.parallel_view(&mut r).unwrap();
         v.enable_hardware();
-        assert!(unsafe {
-            v.export_hardware_range(0x200000, || panic!("never replace reached canonical bytes"))
-        }
-        .unwrap()
-        .is_none());
+        assert!(
+            unsafe {
+                v.export_hardware_range(0x200000, || {
+                    panic!("never replace reached canonical bytes")
+                })
+            }
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
     }
     #[test]

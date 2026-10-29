@@ -6,6 +6,7 @@ use std::fmt;
 use trames_elf::{ElfError, LoadedElf};
 use trames_engine::{Cpu, CpuFault};
 use trames_linux::{GuestOutput, Linux};
+mod clock;
 mod futex;
 mod gpu;
 mod process;
@@ -278,7 +279,7 @@ fn initial_stack_bytes<C: Cpu>(
     options: RuntimeOptions,
     exec_filename: Option<&[u8]>,
 ) -> Result<u64, RuntimeError> {
-    let extra = [
+    let mut extra = vec![
         (
             trames_vulkan::AUXV_KEY,
             if options.vulkan_accelerator {
@@ -340,6 +341,10 @@ fn initial_stack_bytes<C: Cpu>(
             },
         ),
     ];
+    if C::clock_sample().is_some() {
+        let base = trames_linux::vdso::install(&mut elf.memory)?;
+        extra.push((trames_linux::vdso::AUXV, base));
+    }
     trames_linux::image::build_initial_stack(
         elf,
         argv,

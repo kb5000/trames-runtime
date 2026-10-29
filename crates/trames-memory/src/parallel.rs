@@ -611,6 +611,7 @@ pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     mmu_cache: mmu::Cache,
+    hardware_chunks: [Cell<(u64, u64)>; 16],
     private_mode: PrivateMode,
     hardware_mode: bool,
 }
@@ -640,6 +641,7 @@ impl View {
         Self {
             snapshot,
             mmu_cache: mmu::Cache::default(),
+            hardware_chunks: std::array::from_fn(|_| Cell::new((u64::MAX, 0))),
             private_mode: PrivateMode::Guarded,
             hardware_mode: false,
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -1740,23 +1742,58 @@ impl View {
     /// This is an invalidation hint only; page permissions/storage still come
     /// from hardware_page_info. No guest byte is loaded, allocated or charged.
     pub fn hardware_mapping_chunk_version(&self, address: u64) -> Option<u64> {
+        let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
+        if let Some(&version) = self.snapshot.hardware_chunks.get(&chunk) {
+            return Some(version);
+        }
+        let cache = &self.hardware_chunks[(chunk & 15) as usize];
+        let (key, version) = cache.get();
+        if key == chunk {
+            return Some(version);
+        }
+        if let Some(version) = self.snapshot.anonymous.chunk_version(chunk) {
+            // Existing stamps are immutable while this View lives. First-touch
+            // inserts only other entries; joined changes create fresh Views.
+            // Never cache absence or the pre-materialization fallback stamp.
+            cache.set((chunk, version));
+            return Some(version);
+        }
+        let start = chunk * crate::HARDWARE_MAPPING_CHUNK_SIZE;
         self.snapshot
-            .hardware_chunks
-            .get(&(address / crate::HARDWARE_MAPPING_CHUNK_SIZE))
+            .anonymous
+            .overlaps(start, start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
+            .then_some(self.snapshot.hardware_generation)
+    }
+    fn cached_hardware_frame(&self, address: u64) -> Option<&Frame> {
+        if !self.hardware_mode {
+            return None;
+        }
+        let entry = self.translations[Translation::slot(address)].get();
+        entry
+            .matches(address, Translation::VALID)
+            .then(|| self.snapshot.frame_token(entry.frame))
+    }
+    fn remember_hardware_frame(&self, address: u64, frame: &Frame) {
+        if !self.hardware_mode {
+            return;
+        }
+        let token = self
+            .snapshot
+            .pages
+            .get(&address)
             .copied()
-            .or_else(|| {
-                self.snapshot
-                    .anonymous
-                    .chunk_version(address / crate::HARDWARE_MAPPING_CHUNK_SIZE)
-            })
-            .or_else(|| {
-                let start = address / crate::HARDWARE_MAPPING_CHUNK_SIZE
-                    * crate::HARDWARE_MAPPING_CHUNK_SIZE;
-                self.snapshot
-                    .anonymous
-                    .overlaps(start, start + crate::HARDWARE_MAPPING_CHUNK_SIZE)
-                    .then_some(self.snapshot.hardware_generation)
-            })
+            .unwrap_or_else(|| {
+                let pointer = frame as *const Frame as usize;
+                debug_assert_eq!(pointer & crate::anonymous::TOKEN, 0);
+                pointer | crate::anonymous::TOKEN
+            });
+        let mut entry = Translation::new(address, token, frame.permissions, false, 0);
+        if frame.charge.resident() {
+            entry.tag |= Translation::RESIDENT;
+        }
+        // Same frozen-snapshot ownership and permission bits as frame_slow.
+        // Dynamic residency, code and backing versions are read from Frame.
+        self.translations[Translation::slot(address)].set(entry);
     }
     /// Existing hardware bytes only: no source load, RAM allocation, quota charge
     /// or byte borrow. A fresh executor may prepare metadata for retained pages.
@@ -1768,7 +1805,9 @@ impl View {
         if !self.hardware_mode {
             return None;
         }
-        let frame = if let Some(&i) = self.snapshot.pages.get(&address) {
+        let frame = if let Some(frame) = self.cached_hardware_frame(address) {
+            frame
+        } else if let Some(&i) = self.snapshot.pages.get(&address) {
             &self.snapshot.frames[i]
         } else {
             self.snapshot.anonymous.retained(address)?
@@ -1781,7 +1820,9 @@ impl View {
             .mutable()
             .or_else(|| frame.bytes.hardware_constant.get())?;
         let storage = page.retained_hardware()?;
-        Some((storage, self.hardware_page_info(address).ok()?))
+        let info = Self::hardware_info(frame).ok()?;
+        self.remember_hardware_frame(address, frame);
+        Some((storage, info))
     }
     pub fn hardware_write_frame(
         &self,
@@ -1803,7 +1844,9 @@ impl View {
         &self,
         token: crate::HardwareWriteFrame,
     ) -> Result<(), MemoryError> {
-        let frame = if token.root == usize::MAX {
+        let frame = if let Some(frame) = self.cached_hardware_frame(token.base) {
+            frame
+        } else if token.root == usize::MAX {
             self.snapshot
                 .anonymous
                 .metadata(token.base)?
@@ -1835,7 +1878,9 @@ impl View {
         if !address.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::InvalidRange);
         }
-        let frame = if let Some(&i) = self.snapshot.pages.get(&address) {
+        let frame = if let Some(frame) = self.cached_hardware_frame(address) {
+            frame
+        } else if let Some(&i) = self.snapshot.pages.get(&address) {
             &self.snapshot.frames[i]
         } else {
             self.snapshot
@@ -1843,6 +1888,11 @@ impl View {
                 .metadata(address)?
                 .ok_or(MemoryError::Unmapped(address))?
         };
+        let info = Self::hardware_info(frame)?;
+        self.remember_hardware_frame(address, frame);
+        Ok(info)
+    }
+    fn hardware_info(frame: &Frame) -> Result<HardwarePageInfo, MemoryError> {
         if let Some(error) = &frame.error {
             return Err(error.clone());
         }
@@ -2034,6 +2084,113 @@ impl Memory {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn cached_hardware_metadata_keeps_live_residency_and_fresh_epoch_permissions() {
+        let mut m = Memory::new(ADDRESS_LIMIT as usize);
+        m.map(0x1000000, 512 * PAGE_SIZE, Permissions::RW).unwrap();
+        m.prepare_hardware().unwrap();
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        let mut a = m.parallel_view(&mut registry).unwrap();
+        a.enable_hardware();
+        let mut b = a.clone();
+        let before = a.hardware_page_info(0x1000000).unwrap();
+        assert!(!before.writable);
+        b.write(0x1000000, b"native peer").unwrap();
+        let after = a.hardware_page_info(0x1000000).unwrap();
+        assert!(after.writable);
+        assert_eq!(before.storage_id, after.storage_id);
+        assert_eq!(a.read_array::<11>(0x1000000).unwrap(), *b"native peer");
+        drop(a);
+        drop(b);
+        m.commit_parallel().unwrap();
+        m.protect(0x1000000, PAGE_SIZE, Permissions::R).unwrap();
+        let mut a = m.parallel_view(&mut registry).unwrap();
+        a.enable_hardware();
+        let info = a.hardware_page_info(0x1000000).unwrap();
+        assert_eq!(info.permissions, Permissions::R);
+        assert!(!info.writable);
+        assert!(matches!(
+            a.write(0x1000000, b"x"),
+            Err(MemoryError::Permission { .. })
+        ));
+    }
+    #[test]
+    fn hardware_chunk_cache_does_not_hide_live_additions_or_first_touch_stamps() {
+        let mut m = Memory::new(ADDRESS_LIMIT as usize);
+        m.map(0x1000000, 512 * PAGE_SIZE, Permissions::RW).unwrap();
+        m.prepare_hardware().unwrap();
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        let mut view = m.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let next = 0x1200000;
+        assert_eq!(view.hardware_mapping_chunk_version(next), None);
+        m.map_anonymous_live(next, 512 * PAGE_SIZE).unwrap();
+        let fallback = view.hardware_mapping_chunk_version(next).unwrap();
+        view.hardware_page_info(next).unwrap();
+        let reached = view.hardware_mapping_chunk_version(next).unwrap();
+        assert_ne!(fallback, reached);
+        for _ in 0..100 {
+            assert_eq!(view.hardware_mapping_chunk_version(next), Some(reached));
+        }
+        assert_eq!(m.resident_bytes(), 0);
+    }
+
+    #[test]
+    #[ignore = "fixed-work metadata contention diagnostic, not a timing gate"]
+    fn hardware_metadata_contention_probe() {
+        let cpus: usize = std::env::var("TRAMES_PROBE_CPUS")
+            .unwrap_or("12".into())
+            .parse()
+            .unwrap();
+        let rounds: u64 = std::env::var("TRAMES_PROBE_ROUNDS")
+            .unwrap_or("200000".into())
+            .parse()
+            .unwrap();
+        let mut memory = Memory::new(ADDRESS_LIMIT as usize);
+        memory
+            .map(0x1000000, 512 * PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        memory.prepare_hardware().unwrap();
+        let mut registry = Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let barrier = Arc::new(Barrier::new(cpus + 1));
+        let mut workers = Vec::new();
+        for id in 0..cpus {
+            let view = view.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut sum = 0;
+                for i in 0..rounds {
+                    let address =
+                        std::hint::black_box(0x1000000 + ((i + id as u64 * 17) % 512) * PAGE_SIZE);
+                    let info = view.hardware_page_info(address).unwrap();
+                    assert!(view.retained_hardware_page(address).is_none());
+                    let again = view.hardware_page_info(address).unwrap();
+                    assert_eq!(info.storage_id, again.storage_id);
+                    assert_eq!(info.permissions, Permissions::RW);
+                    assert!(!info.writable);
+                    assert!(view.hardware_mapping_chunk_version(address).is_some());
+                    sum += u64::from(info.permissions.read) + u64::from(again.permissions.write);
+                }
+                sum
+            }));
+        }
+        barrier.wait();
+        let began = std::time::Instant::now();
+        let sum: u64 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(sum, cpus as u64 * rounds * 2);
+        assert_eq!(memory.resident_bytes(), 0);
+        println!(
+            "metadata_probe cpus={cpus} rounds={rounds} elapsed_us={} checksum={sum}",
+            began.elapsed().as_micros()
+        );
+    }
 
     #[test]
     fn hardware_admission_rejects_only_mapped_live_pins() {

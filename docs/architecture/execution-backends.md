@@ -260,3 +260,49 @@ counts distinguish shorter waits from excessive stop/wake cycles. Times can
 overlap across independent domains; summing them is not session wall time.
 Measured tradeoffs and the reproducible fixture are in the Mac
 [execution design](https://github.com/kb5000/trames-mac/blob/main/docs/architecture/execution-backends.md).
+
+
+## Worker wakeups and optional clock vDSO (2026-10-29)
+
+The shared run queue retains its existing mutex and blocking event sources.
+Each idle worker registers its slot under that mutex before atomically releasing
+it in a condition-variable wait. Publication selects sleeping slots that can run
+the ready jobs, honoring initial placement and affinity and preferring the last
+worker. Each selected slot receives one notification. A claimant passes remaining
+ready work on, covering flexible/pinned placement overlap. When no ready task is
+eligible, one idle worker still observes I/O, deadline or control changes. Stop
+wakes every registered sleeper. Existing host-event wakeups remain; no polling
+bus, resource-service thread or lock around guest/native bodies is introduced.
+
+`Cpu::clock_sample` is optional and defaults to unsupported. A backend that
+supplies it must expose the same counter domain and frequency as guest
+`CNTVCT_EL0`, including migration and host sleep behavior. Such images receive
+an AArch64 ELF vDSO through `AT_SYSINFO_EHDR`, with versioned `LINUX_2.6.39`
+symbols and ordinary guest RX code / read-only calibration pages. The common
+Linux/session code owns the ELF, stack ABI, permissions and clock semantics;
+platform counter APIs stay in the executor. The iPad interpreter advertises no
+vDSO and retains its existing syscall behavior and capability profile.
+
+Initialization and exec bind the counter to the same session `Instant` origin
+used by syscalls and Wayland. Eight bounded calibration brackets select the
+narrowest sample; a bracket wider than one microsecond disables the fast clock.
+While tasks are stopped, initialization preserves the data page's guest
+permissions and skips a removed/replaced optional mapping. No recurring updater
+or shared fast-path lock is needed. The generated machine code is checked in;
+`crates/trames-linux/src/vdso/rebuild.py` reproduces it with Clang and rust-lld,
+without adding an assembler dependency to normal Cargo builds.
+
+The current session's monotonic IDs 1/4/6/7 use a counter read and integer
+conversion, with quotient/remainder arithmetic before multiplication to avoid
+long-uptime overflow. Realtime IDs 0/5 retain the syscall so host wall-clock
+adjustments remain observable. Unsupported IDs, `gettimeofday`, unavailable
+calibration and unsupported executors retain syscall fallback. Resolution
+queries retain the existing 1 ns ABI value; this is not a precision guarantee.
+Clock IDs use Linux's low 32-bit `clockid_t` argument on both paths. These hooks
+do not change the session's existing clock-ID/suspend policy.
+
+Regression coverage includes actual blocked affinity/stop wakeups, dynamic
+metadata state, real Linux libc/versioned symbol lookup, clock/syscall agreement,
+concurrent callers, fork/exec, long elapsed-time arithmetic and realtime fallback.
+The Mac product records full-application and targeted measurements in its
+[execution design](https://github.com/kb5000/trames-mac/blob/main/docs/architecture/execution-backends.md).

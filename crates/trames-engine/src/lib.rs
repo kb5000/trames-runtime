@@ -72,6 +72,14 @@ pub enum SliceOutcome {
     Fault(CpuFault),
 }
 
+/// A backend counter with the same domain as the guest's CNTVCT_EL0.
+/// The hardware backend must preserve this domain across vCPU migration/sleep.
+#[derive(Clone, Copy)]
+pub struct ClockSample {
+    pub ticks: u64,
+    pub frequency: u64,
+}
+
 /// Thread-safe request to stop the owning executor's next/active CPU entry.
 /// It carries no guest register or memory authority. A retained handle must
 /// become inert before its CPU is destroyed or its identifier can be reused.
@@ -84,6 +92,12 @@ pub trait ExecutionInterrupt: Send + Sync {
 /// worker. Interpreter states retain their decoder and deferred flags in place.
 pub trait Cpu: Registers + Default + Clone + Send + 'static {
     type Engine: Default;
+    /// Optional coherent counter for the common Linux monotonic clock vDSO.
+    /// Software engines retain the syscall path without an advertised vDSO.
+    fn clock_sample() -> Option<ClockSample> {
+        None
+    }
+
     /// Prepare the thread-affine engine on its worker before the first CPU
     /// entry of an assignment. Software engines use their existing local poll.
     fn execution_interrupt(

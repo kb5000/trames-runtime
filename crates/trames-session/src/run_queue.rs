@@ -199,11 +199,13 @@ struct Queues<C: Cpu> {
     domains: domains::Domains<C>,
     retired: Vec<(Box<Job<C>>, Option<SliceOutcome>)>,
     idle_notified: bool,
+    sleeping_slots: u64,
 }
 pub(super) struct Epoch<C: Cpu> {
     pub control: Arc<Control>,
     queues: Mutex<Queues<C>>,
     changed: Condvar,
+    slot_changed: [Condvar; 32],
     host_events: OnceLock<Option<Arc<trames_vfs::HostEvents>>>,
     pub io_target: Weak<dyn trames_vfs::IoWake>,
     deadline_origin: Instant,
@@ -232,6 +234,7 @@ impl<C: Cpu> Epoch<C> {
                 ..Default::default()
             }),
             changed: Condvar::new(),
+            slot_changed: std::array::from_fn(|_| Condvar::new()),
             host_events: OnceLock::new(),
             io_target: me.clone(),
             deadline_origin: Instant::now(),
@@ -257,7 +260,42 @@ impl<C: Cpu> Epoch<C> {
             .as_nanos()
             .min((u64::MAX - 1) as u128) as u64
     }
-    fn notify(&self) {
+    // Called under the existing queue mutex. A sleeper registers before the
+    // atomic mutex-release/wait, so targeted notifications cannot be lost.
+    fn notify(&self, q: &mut Queues<C>) {
+        let mut wake = 0;
+        if self.control.stopped() {
+            wake = q.sleeping_slots;
+        } else {
+            for job in &q.ready {
+                let eligible = q
+                    .initial_slots
+                    .get(&job.work.pid)
+                    .map_or(job.affinity, |slot| 1 << slot)
+                    & q.sleeping_slots
+                    & !wake;
+                if eligible != 0 {
+                    let previous = 1u64 << job.stats.worker;
+                    wake |= if eligible & previous != 0 {
+                        previous
+                    } else {
+                        1 << eligible.trailing_zeros()
+                    };
+                }
+            }
+            // With no eligible ready job, one existing worker must observe new
+            // I/O/deadline/control state and enter the shared host wait source.
+            if wake == 0 && q.sleeping_slots != 0 {
+                wake = 1 << q.sleeping_slots.trailing_zeros();
+            }
+        }
+        q.sleeping_slots &= !wake;
+        while wake != 0 {
+            let slot = wake.trailing_zeros() as usize;
+            wake &= wake - 1;
+            self.slot_changed[slot].notify_one();
+        }
+        // This condition is for test/owner observers, never production workers.
         self.changed.notify_all();
         if let Some(Some(events)) = self.host_events.get() {
             events.wake();
@@ -326,7 +364,7 @@ impl<C: Cpu> Epoch<C> {
             .unwrap()
             .deadline = Some(deadline);
         self.publish_deadline(Some(deadline));
-        self.notify();
+        self.notify(&mut q);
     }
     /// Only before launch: every View is prepared/admitted before any CPU runs.
     pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
@@ -347,9 +385,9 @@ impl<C: Cpu> Epoch<C> {
         self.ready(&mut q, job);
     }
     pub fn stop(&self) {
-        let _q = self.queues.lock().unwrap();
+        let mut q = self.queues.lock().unwrap();
         self.control.stop();
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn assign(&self, chosen: &[(u32, usize)]) {
         let mut q = self.queues.lock().unwrap();
@@ -383,7 +421,7 @@ impl<C: Cpu> Epoch<C> {
         q.domains.pause(BTreeSet::from([id]));
         q.domains.hold(job);
         self.capture_paused(&mut q);
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
         self.queues.lock().unwrap().domains.take()
@@ -427,7 +465,7 @@ impl<C: Cpu> Epoch<C> {
             }
         }
         self.capture_paused(&mut q);
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn wake(&self, ticket: &Arc<Ticket>) -> bool {
         let mut q = self.queues.lock().unwrap();
@@ -444,7 +482,7 @@ impl<C: Cpu> Epoch<C> {
             job.waiting = None;
             job.stats.resumes += 1;
             self.ready(&mut q, job);
-            self.notify(); // affinity can require a particular worker
+            self.notify(&mut q); // affinity can require a particular worker
         }
         // Wake may precede park. The ticket CAS is then consumed by park below.
         true
@@ -538,7 +576,7 @@ impl<C: Cpu> Epoch<C> {
                 if result.is_err() {
                     self.control.stop();
                 }
-                self.notify();
+                self.notify(&mut q);
                 continue;
             }
             if let Some(i) = available {
@@ -555,6 +593,11 @@ impl<C: Cpu> Epoch<C> {
                 }
                 q.running += 1;
                 q.domains.running(work.pid);
+                // A woken worker may have taken a pinned task ahead of the
+                // flexible task that selected it. Pass remaining ready work on.
+                if !q.ready.is_empty() {
+                    self.notify(&mut q);
+                }
                 return Some(job);
             }
             if q.running == 0
@@ -574,18 +617,22 @@ impl<C: Cpu> Epoch<C> {
                     }
                 } else {
                     self.control.stop();
-                    self.notify();
+                    self.notify(&mut q);
                     return None;
                 }
             }
+            q.sleeping_slots |= 1 << slot;
+            #[cfg(all(test, trames_interpreter_conformance))]
+            self.changed.notify_all();
             q = if let Some(deadline) = deadline {
-                self.changed
+                self.slot_changed[slot]
                     .wait_timeout(q, deadline.saturating_duration_since(Instant::now()))
                     .unwrap()
                     .0
             } else {
-                self.changed.wait(q).unwrap()
+                self.slot_changed[slot].wait(q).unwrap()
             };
+            q.sleeping_slots &= !(1 << slot);
         }
     }
     pub fn park(&self, mut job: Box<Job<C>>, waiting: Option<WaitState>) {
@@ -600,7 +647,7 @@ impl<C: Cpu> Epoch<C> {
             }
             q.domains.hold(job);
             q.domains.notify_ready();
-            self.notify();
+            self.notify(&mut q);
             return;
         }
         if let Some(waiting) = waiting {
@@ -618,7 +665,7 @@ impl<C: Cpu> Epoch<C> {
             job.stats.yields += 1;
             self.ready(&mut q, job);
         }
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn park_hardware(
         self: &Arc<Self>,
@@ -637,7 +684,7 @@ impl<C: Cpu> Epoch<C> {
                     let mut job = q.parked.remove(&pid).unwrap();
                     job.hardware_wait = None;
                     epoch.ready(&mut q, job);
-                    epoch.notify();
+                    epoch.notify(&mut q);
                 }
             }
         });
@@ -655,7 +702,7 @@ impl<C: Cpu> Epoch<C> {
         } else {
             assert!(q.parked.insert(pid, job).is_none());
         }
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn park_io(&self, mut job: Box<Job<C>>, pending: trames_linux::PendingIo) {
         let mut q = self.queues.lock().unwrap();
@@ -674,7 +721,7 @@ impl<C: Cpu> Epoch<C> {
             self.publish_deadline(job.io.as_ref().and_then(|io| io.wake_deadline()));
             assert!(q.parked.insert(job.work.pid, job).is_none());
         }
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn park_gpu(&self, mut job: Box<Job<C>>, pending: crate::gpu::Pending) {
         let mut q = self.queues.lock().unwrap();
@@ -698,7 +745,7 @@ impl<C: Cpu> Epoch<C> {
                 .count();
             q.gpu_peak_pending = q.gpu_peak_pending.max(count);
         }
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn gpu_peak_pending(&self) -> usize {
         self.queues.lock().unwrap().gpu_peak_pending
@@ -721,7 +768,7 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.services += 1;
         q.domains.start_service(pid);
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn pending_services(&self) -> usize {
         self.queues.lock().unwrap().services
@@ -752,7 +799,7 @@ impl<C: Cpu> Epoch<C> {
                 self.control.stop();
             }
         }
-        self.notify();
+        self.notify(&mut q);
     }
     pub fn finish(&self, done: Done<C>) {
         let mut q = self.queues.lock().unwrap();
@@ -760,7 +807,7 @@ impl<C: Cpu> Epoch<C> {
         q.domains.returned(done.pid);
         q.finished.push(done);
         self.control.stop();
-        self.notify();
+        self.notify(&mut q);
     }
     /// All launched workers must have acknowledged stop before this call.
     pub fn drain(&self) -> Vec<Done<C>> {
@@ -813,7 +860,7 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             let mut job = q.parked.remove(&signal.pid).unwrap();
             job.stats.resumes += 1;
             self.ready(&mut q, job);
-            self.notify();
+            self.notify(&mut q);
         }
         // If still running, park_io consumes the signal's fired bit under this
         // same queue lock. Notifications never access a guest Memory or CPU.
@@ -863,6 +910,60 @@ mod tests {
             0,
             None,
         )
+    }
+    #[test]
+    fn targeted_wakes_preserve_pinned_affinity_and_stop_every_waiting_slot() {
+        let (events, _receive) = std::sync::mpsc::channel();
+        let epoch = Epoch::with_events(Arc::new(Control::new(100)), events, true);
+        for pid in 1..=2 {
+            let mut task = job(pid, &epoch);
+            task.affinity = 1 << (pid - 1);
+            epoch.add(task);
+        }
+        let first = epoch.take(0).unwrap();
+        let second = epoch.take(1).unwrap();
+        let waits = [
+            Arc::new(trames_memory::HardwareWait::default()),
+            Arc::new(trames_memory::HardwareWait::default()),
+        ];
+        epoch.park_hardware(first, waits[0].clone());
+        epoch.park_hardware(second, waits[1].clone());
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for slot in 0..2 {
+            let epoch = epoch.clone();
+            let send = send.clone();
+            workers.push(std::thread::spawn(move || {
+                if let Some(task) = epoch.take(slot) {
+                    send.send((task.work.pid, slot)).unwrap();
+                    epoch.park_hardware(task, Arc::new(trames_memory::HardwareWait::default()));
+                }
+                assert!(epoch.take(slot).is_none());
+            }));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut q = epoch.queues.lock().unwrap();
+        while q.sleeping_slots & 3 != 3 {
+            let left = until.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero());
+            q = epoch.changed.wait_timeout(q, left).unwrap().0;
+        }
+        drop(q);
+        waits[1].fire();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (2, 1)
+        );
+        waits[0].fire();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (1, 0)
+        );
+        epoch.stop();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(epoch.drain().len(), 2);
     }
     #[test]
     fn stop_keeps_an_accepted_cpu_exit_until_the_joined_kernel_consumes_it() {

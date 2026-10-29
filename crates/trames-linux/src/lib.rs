@@ -3,6 +3,7 @@
 use std::io;
 use trames_execution::Registers;
 pub mod image;
+pub mod vdso;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
 mod direct;
