@@ -8,8 +8,8 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -87,6 +87,9 @@ pub(super) struct Job<C: Cpu> {
     pub gpu_pending: Option<crate::gpu::Pending>,
     pub domain: Option<Arc<Domain>>,
     pub checkpoint: Option<SliceOutcome>,
+    /// Guest code reached this exit during a bounded exclusive-mm window.
+    /// Its syscall/native/fault handling still belongs to normal dispatch.
+    pub pending_cpu: Option<SliceOutcome>,
 }
 impl<C: Cpu> Job<C> {
     pub fn new(
@@ -106,6 +109,7 @@ impl<C: Cpu> Job<C> {
             gpu_pending: None,
             domain: None,
             checkpoint: None,
+            pending_cpu: None,
             stats: Stats {
                 before,
                 after: before,
@@ -115,6 +119,9 @@ impl<C: Cpu> Job<C> {
         })
     }
     pub fn finish(self, outcome: Option<SliceOutcome>, peer: u64) -> Done<C> {
+        // Cancellation can join a ready job before a worker consumes its
+        // accepted CPU exit. Preserve it rather than skipping a past-PC SVC.
+        let outcome = self.pending_cpu.or(outcome);
         let io = self.io.as_ref().map(IoCall::from).or(self.retry);
         drop(self.io);
         let gpu_pending = self.gpu_pending.as_ref().and_then(|p| p.checkpoint(peer));
@@ -380,6 +387,12 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
         self.queues.lock().unwrap().domains.take()
+    }
+    /// The existing owner may briefly execute guest code only when no worker
+    /// can claim an unrelated job. This reserves logical CPU capacity without
+    /// adding an execution slot or pausing unrelated address spaces.
+    pub fn checkpoint_owns_all_jobs(&self, checkpoint: &Checkpoint<C>) -> bool {
+        checkpoint.jobs.len() == self.queues.lock().unwrap().members.len()
     }
     pub fn idle(&self) -> bool {
         let q = self.queues.lock().unwrap();
@@ -815,7 +828,7 @@ mod tests {
     type Job = crate::run_queue::Job<Cpu>;
 
     use super::*;
-    use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
+    use trames_memory::{CpuMemory, Memory, PAGE_SIZE, Permissions};
     #[test]
     fn ready_peer_preempts_only_after_progress_and_quantum() {
         let epoch = Epoch::new(Arc::new(Control::new(100)));
@@ -850,6 +863,33 @@ mod tests {
             0,
             None,
         )
+    }
+    #[test]
+    fn stop_keeps_an_accepted_cpu_exit_until_the_joined_kernel_consumes_it() {
+        for outcome in [
+            SliceOutcome::Syscall { instructions: 0 },
+            SliceOutcome::NativeCall {
+                instructions: 0,
+                pc: 0x1000,
+                module: 0x10001,
+                function: 3,
+            },
+            SliceOutcome::Fault(trames_engine::CpuFault::Host("accepted fault".into())),
+        ] {
+            let expected = format!("{outcome:?}");
+            let epoch = Epoch::new(Arc::new(Control::new(100)));
+            let mut task = job(1, &epoch);
+            task.pending_cpu = Some(outcome);
+            epoch.add(task);
+            epoch.stop();
+            let mut done = epoch.drain();
+            assert_eq!(done.len(), 1);
+            assert_eq!(
+                format!("{:?}", done.pop().unwrap().outcome.unwrap()),
+                expected
+            );
+            assert!(epoch.drain().is_empty());
+        }
     }
     #[test]
     fn hardware_borrow_wait_releases_slot_and_resumes_same_task() {
@@ -1096,14 +1136,16 @@ mod tests {
         epoch.stop();
         let done = epoch.drain();
         assert!(signal.upgrade().is_none());
-        assert!(done[0]
-            .io
-            .as_ref()
-            .unwrap()
-            .flock
-            .as_ref()
-            .unwrap()
-            .same_owner(&request));
+        assert!(
+            done[0]
+                .io
+                .as_ref()
+                .unwrap()
+                .flock
+                .as_ref()
+                .unwrap()
+                .same_owner(&request)
+        );
         assert_eq!(done[0].io.as_ref().unwrap().args, args);
         vfs.flock(b, 8).unwrap(); // Old callback cannot resurrect this stopped epoch.
         assert!(epoch.take(0).is_none());

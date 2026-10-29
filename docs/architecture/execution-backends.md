@@ -230,3 +230,33 @@ checks streaming signal restoration after a clobbering handler, fork, pthread
 creation and exec. The common ABI follows the
 [Linux SME documentation](https://docs.kernel.org/arch/arm64/sme.html) and
 [signal-record layout](https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/sigcontext.h).
+
+
+## Bounded address-space checkpoint batches (2026-10-29)
+
+Mapping checkpoints still quiesce their actual mm/backing closure, including
+in-flight native and resource operations. A backend may publish a retained
+`ExecutionInterrupt` for its worker assignment. Pause and publication share a
+per-domain object lock, closing both pre-entry orders; no lock covers guest
+execution or ordinary memory. The handle carries only exit authority and must
+become inert before destruction or CPU identifier reuse. Interpreters return
+`None` and retain their existing polling path.
+
+Once these views have drained, an optional `run_quiesced` hook lets the existing
+owner coalesce consecutive mapping syscalls in a 250 microsecond window shared
+by all requesters in that checkpoint. This requires every admitted cohort job
+to be in the checkpoint, reserving logical CPU capacity while unrelated address
+spaces continue on the normal path. Mac supplies the remaining window duration to its hardware timer. Calls remain in the common Linux kernel and each accepted
+mapping operation completes even when the window or epoch ends. All non-mapping
+syscalls, native exits and faults are stored on the same job for ordinary worker
+dispatch, or joined-kernel handling on stop, exactly once. Native bodies do not
+run in this batch. A hardware-borrow yield can retry and park on its normal
+worker. Preempted peers are requeued before mapping requesters. No extra worker,
+resource service, polling bus or guest memory policy is introduced.
+
+Checkpoint metrics separate quiescence, owner queue delay, commit, Linux calls,
+view rebuild, resume and exclusive CPU time. Quiescence histograms and batch
+counts distinguish shorter waits from excessive stop/wake cycles. Times can
+overlap across independent domains; summing them is not session wall time.
+Measured tradeoffs and the reproducible fixture are in the Mac
+[execution design](https://github.com/kb5000/trames-mac/blob/main/docs/architecture/execution-backends.md).

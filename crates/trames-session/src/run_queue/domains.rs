@@ -10,9 +10,48 @@ use std::sync::{atomic::AtomicBool, mpsc::Sender};
 pub(crate) struct Domain {
     pub id: u64,
     paused: AtomicBool,
+    interrupts: Mutex<BTreeMap<usize, Arc<dyn trames_engine::ExecutionInterrupt>>>,
 }
 
+/// Bound once per running job, not per instruction, syscall or CPU slice.
+/// Publication and pause share this object lock, closing the pre-entry race.
+/// No guest data or execution is covered by the lock.
+pub(crate) struct ExecutionGuard {
+    domain: Arc<Domain>,
+    slot: usize,
+}
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        self.domain.interrupts.lock().unwrap().remove(&self.slot);
+    }
+}
 impl Domain {
+    pub fn bind_interrupt(
+        self: &Arc<Self>,
+        slot: usize,
+        interrupt: Arc<dyn trames_engine::ExecutionInterrupt>,
+    ) -> Option<ExecutionGuard> {
+        let mut active = self.interrupts.lock().unwrap();
+        if self.paused() {
+            return None;
+        }
+        assert!(
+            active.insert(slot, interrupt).is_none(),
+            "one running job per worker"
+        );
+        Some(ExecutionGuard {
+            domain: self.clone(),
+            slot,
+        })
+    }
+    fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        // A CPU published before pause is kicked, including a not-yet-entered
+        // CPU (the backend must latch the request). A later binder cannot enter.
+        for interrupt in self.interrupts.lock().unwrap().values() {
+            interrupt.request_exit();
+        }
+    }
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
@@ -25,6 +64,8 @@ struct Entry<C: Cpu> {
     services: usize,
     notified: bool,
     owned: bool,
+    requested: Option<Instant>,
+    quiescent: Option<Instant>,
 }
 #[derive(Default)]
 pub(super) struct Domains<C: Cpu> {
@@ -35,6 +76,10 @@ pub(super) struct Domains<C: Cpu> {
 pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
     pub jobs: Vec<Box<Job<C>>>,
+    pub requested: Instant,
+    pub quiescent: Instant,
+    pub taken: Instant,
+    requesters: BTreeSet<u32>,
 }
 impl<C: Cpu> Domains<C> {
     pub fn new(events: Option<Sender<crate::workers::Event<C>>>) -> Self {
@@ -50,6 +95,7 @@ impl<C: Cpu> Domains<C> {
             domain: Arc::new(Domain {
                 id,
                 paused: AtomicBool::new(false),
+                interrupts: Mutex::new(BTreeMap::new()),
             }),
             keys: view.commit_domains(),
             jobs: Vec::new(),
@@ -57,6 +103,8 @@ impl<C: Cpu> Domains<C> {
             services: 0,
             notified: false,
             owned: false,
+            requested: None,
+            quiescent: None,
         });
         assert!(self.tasks.insert(job.work.pid, id).is_none());
         job.domain = Some(entry.domain.clone());
@@ -108,7 +156,11 @@ impl<C: Cpu> Domains<C> {
     pub fn pause(&mut self, ids: BTreeSet<u64>) {
         for id in self.closure(ids) {
             let entry = self.entries.get_mut(&id).unwrap();
-            entry.domain.paused.store(true, Ordering::Relaxed);
+            if !entry.domain.paused() {
+                entry.requested = Some(Instant::now());
+                entry.quiescent = None;
+                entry.domain.pause();
+            }
         }
     }
     pub fn paused(&self, pid: u32) -> bool {
@@ -126,6 +178,7 @@ impl<C: Cpu> Domains<C> {
                 && !entry.notified
             {
                 entry.notified = true;
+                entry.quiescent = Some(Instant::now());
                 if let Some(events) = &self.events {
                     let _ = events.send(crate::workers::Event::<C>::VmReady);
                 }
@@ -146,20 +199,48 @@ impl<C: Cpu> Domains<C> {
             }) {
                 continue;
             }
+            let taken = Instant::now();
+            let requested = ids
+                .iter()
+                .filter_map(|id| self.entries[id].requested)
+                .min()
+                .unwrap_or(taken);
+            let quiescent = ids
+                .iter()
+                .filter_map(|id| self.entries[id].quiescent)
+                .max()
+                .unwrap_or(taken);
             let mut jobs = Vec::new();
             for id in &ids {
                 let entry = self.entries.get_mut(id).unwrap();
                 entry.owned = true;
                 jobs.append(&mut entry.jobs);
             }
-            return Some(Checkpoint::<C> { ids, jobs });
+            let requesters = jobs
+                .iter()
+                .filter(|job| job.checkpoint.is_some())
+                .map(|job| job.work.pid)
+                .collect();
+            return Some(Checkpoint::<C> {
+                ids,
+                jobs,
+                requested,
+                quiescent,
+                taken,
+                requesters,
+            });
         }
         None
     }
     /// Update layout dependencies before releasing any CPU. A new alias may
     /// join another already-paused VM; merge that checkpoint before resuming.
     pub fn restore(&mut self, checkpoint: Checkpoint<C>, resume: bool) -> Vec<Box<Job<C>>> {
-        let Checkpoint::<C> { ids, jobs } = checkpoint;
+        let Checkpoint::<C> {
+            ids,
+            jobs,
+            requesters,
+            ..
+        } = checkpoint;
         let mut updated = BTreeSet::new();
         for job in jobs {
             let id = self.tasks[&job.work.pid];
@@ -192,8 +273,14 @@ impl<C: Cpu> Domains<C> {
         for id in ids {
             let entry = self.entries.get_mut(&id).unwrap();
             entry.domain.paused.store(false, Ordering::Relaxed);
+            entry.requested = None;
+            entry.quiescent = None;
             ready.append(&mut entry.jobs);
         }
+        // Give preempted peers their first claim before the mapping callers.
+        // A caller returning directly to another VM syscall must not repeatedly
+        // pause the same peers before they can resume useful guest execution.
+        ready.sort_by_key(|job| requesters.contains(&job.work.pid));
         ready
     }
     pub fn drain(&mut self) -> Vec<Box<Job<C>>> {
@@ -217,10 +304,104 @@ mod tests {
 
     use super::*;
     use trames_memory::{
-        CpuMemory, Memory, MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE,
+        CpuMemory, Memory, MemoryError, PAGE_SIZE, PageBacking, Permissions, SharedPage,
     };
     use trames_vfs::Errno;
 
+    struct Interrupt(std::sync::atomic::AtomicUsize);
+    impl trames_engine::ExecutionInterrupt for Interrupt {
+        fn request_exit(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn pause_closes_both_preentry_orders_and_guard_withdraws_the_cpu() {
+        let domain = Arc::new(Domain {
+            id: 1,
+            paused: AtomicBool::new(false),
+            interrupts: Mutex::new(BTreeMap::new()),
+        });
+        let interrupt = Arc::new(Interrupt(Default::default()));
+        let guard = domain.bind_interrupt(0, interrupt.clone()).unwrap();
+        domain.pause();
+        assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
+        assert!(domain.bind_interrupt(1, interrupt.clone()).is_none());
+        drop(guard);
+        domain.paused.store(false, Ordering::Relaxed);
+        drop(domain.bind_interrupt(0, interrupt.clone()).unwrap());
+        domain.pause();
+        assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn pause_interrupts_aliased_backings_and_leaves_an_unrelated_cpu_running() {
+        let epoch = Epoch::new(Arc::new(Control::new(10000)));
+        let shared = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+        let mut a = memory();
+        let mut b = memory();
+        let mut c = memory();
+        map(&mut a, 0x3000, shared.clone());
+        map(&mut b, 0x4000, shared);
+        let mut registry = Default::default();
+        for (pid, m) in [(1, &mut a), (2, &mut b), (3, &mut c)] {
+            epoch.add(job(
+                pid,
+                Box::new(m.parallel_view(&mut registry).unwrap()),
+                &epoch,
+            ));
+        }
+        let caller = epoch.take(0).unwrap();
+        let sibling = epoch.take(1).unwrap();
+        let unrelated = epoch.take(2).unwrap();
+        let related = Arc::new(Interrupt(Default::default()));
+        let foreign = Arc::new(Interrupt(Default::default()));
+        let related_guard = sibling
+            .domain
+            .as_ref()
+            .unwrap()
+            .bind_interrupt(1, related.clone())
+            .unwrap();
+        let foreign_guard = unrelated
+            .domain
+            .as_ref()
+            .unwrap()
+            .bind_interrupt(2, foreign.clone())
+            .unwrap();
+        epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 1 });
+        assert_eq!(related.0.load(Ordering::Relaxed), 1);
+        assert_eq!(foreign.0.load(Ordering::Relaxed), 0);
+        assert!(epoch.take_checkpoint().is_none());
+        drop(related_guard);
+        epoch.park(sibling, None);
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        assert_eq!(checkpoint.jobs.len(), 2);
+        assert_eq!(checkpoint.ids.len(), 2);
+        assert!(!epoch.checkpoint_owns_all_jobs(&checkpoint));
+        assert!(checkpoint.requested <= checkpoint.quiescent);
+        assert!(checkpoint.quiescent <= checkpoint.taken);
+        epoch.restore_checkpoint(checkpoint, false);
+        drop(foreign_guard);
+        epoch.stop();
+        epoch.park(unrelated, None);
+        assert_eq!(epoch.drain().len(), 3);
+    }
+    #[test]
+    fn exclusive_cpu_capacity_requires_every_admitted_job_to_be_in_the_checkpoint() {
+        let epoch = Epoch::new(Arc::new(Control::new(10000)));
+        let mut memory = memory();
+        let view = memory.parallel_view(&mut Default::default()).unwrap();
+        epoch.add(job(1, Box::new(view.clone()), &epoch));
+        epoch.add(job(2, Box::new(view), &epoch));
+        let caller = epoch.take(0).unwrap();
+        let peer = epoch.take(1).unwrap();
+        epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 1 });
+        assert!(epoch.take_checkpoint().is_none());
+        epoch.park(peer, None);
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        assert!(epoch.checkpoint_owns_all_jobs(&checkpoint));
+        epoch.restore_checkpoint(checkpoint, false);
+        epoch.stop();
+        assert_eq!(epoch.drain().len(), 2);
+    }
     struct Backing(Arc<SharedPage>);
     impl PageBacking for Backing {
         fn parallel_key(&self) -> Option<(u64, u64)> {

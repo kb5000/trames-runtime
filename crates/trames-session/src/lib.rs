@@ -174,6 +174,13 @@ pub struct RuntimeMetrics {
     /// Calls requiring an mm checkpoint: brk, munmap, mremap, mmap, mprotect,
     /// mincore, destructive madvise, advisory madvise. Counts are not pauses.
     pub vm_checkpoint_calls: [u64; 8],
+    /// Group wall times: quiescence, owner queue, commit, syscalls, rebuild, resume, exclusive CPU.
+    /// Disjoint groups can overlap, so summed durations are not session wall time.
+    pub vm_checkpoint_time: [std::time::Duration; 7],
+    /// Quiescence samples below 5/20/100/500/1000/2000/5000 us, then >=5000 us.
+    pub vm_checkpoint_wait_bins: [u64; 8],
+    /// Exclusive windows used, CPU runs, and extra mapping calls coalesced.
+    pub vm_checkpoint_batch: [u64; 3],
     pub vm_local_syscalls: u64,
     /// Host control checks that retain the current jobs and translations.
     pub persistent_control_checks: u64,

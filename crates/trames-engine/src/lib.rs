@@ -72,11 +72,25 @@ pub enum SliceOutcome {
     Fault(CpuFault),
 }
 
+/// Thread-safe request to stop the owning executor's next/active CPU entry.
+/// It carries no guest register or memory authority. A retained handle must
+/// become inert before its CPU is destroyed or its identifier can be reused.
+pub trait ExecutionInterrupt: Send + Sync {
+    fn request_exit(&self);
+}
+
 /// Movable task state is separate from the host-thread-affine execution engine.
 /// Engines are created on the thread that executes them and never sent to a
 /// worker. Interpreter states retain their decoder and deferred flags in place.
 pub trait Cpu: Registers + Default + Clone + Send + 'static {
     type Engine: Default;
+    /// Prepare the thread-affine engine on its worker before the first CPU
+    /// entry of an assignment. Software engines use their existing local poll.
+    fn execution_interrupt(
+        _: &mut Self::Engine,
+    ) -> Result<Option<std::sync::Arc<dyn ExecutionInterrupt>>, CpuFault> {
+        Ok(None)
+    }
     const FEATURES: Features;
     const FEATURE_NAMES: &'static str;
     /// A backend may query its actual execution configuration once at runtime.
@@ -130,6 +144,21 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     ) -> SliceOutcome {
         let _ = registry;
         self.run(engine, memory, budget)
+    }
+    /// Optional bounded CPU run while the caller already exclusively owns
+    /// this mm at a mapping checkpoint. No native operation is executed here;
+    /// an exit is returned to the ordinary worker dispatch. Software engines
+    /// keep their existing coordinator policy and return None. Only engines
+    /// with unavailable instruction counts may opt in; exact engines need
+    /// the ordinary budget-owning worker path.
+    fn run_quiesced(
+        &mut self,
+        _: &mut Self::Engine,
+        _: &mut Memory,
+        _: &mut trames_memory::parallel::Registry,
+        _: std::time::Duration,
+    ) -> Option<SliceOutcome> {
+        None
     }
     fn prepare_hardware_memory(
         _: &mut Memory,

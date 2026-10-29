@@ -11,6 +11,19 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
         let began = Instant::now();
+        let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(&checkpoint);
+        let wait = checkpoint
+            .quiescent
+            .saturating_duration_since(checkpoint.requested);
+        self.vm_checkpoint_time[0] += wait;
+        self.vm_checkpoint_time[1] += checkpoint
+            .taken
+            .saturating_duration_since(checkpoint.quiescent);
+        let bucket = [5, 20, 100, 500, 1000, 2000, 5000]
+            .iter()
+            .position(|&limit| wait.as_micros() < limit)
+            .unwrap_or(7);
+        self.vm_checkpoint_wait_bins[bucket] += 1;
         // Every CPU/service of these mm/backing domains has returned. Their
         // coordinator Rc graphs stay here; no unrelated Memory is inspected.
         for job in &mut checkpoint.jobs {
@@ -30,7 +43,14 @@ impl<C: Cpu> Kernel<C> {
             }
             self.vm_checkpoint_groups += 1;
             self.vm_checkpoint_spaces += committed.len() as u64;
-            self.parallel_memory_time += began.elapsed();
+            let elapsed = began.elapsed();
+            self.parallel_memory_time += elapsed;
+            self.vm_checkpoint_time[2] += elapsed;
+            // Already exclusive: coalesce a short run of structural calls
+            // instead of waking every peer between consecutive VM syscalls.
+            // The hardware timer bounds the window even if guest code computes
+            // forever. Other exits retain ordinary worker authority and order.
+            let lease_deadline = Instant::now() + Duration::from_micros(250);
             for job in &mut checkpoint.jobs {
                 let Some(outcome) = job.checkpoint.take() else {
                     continue;
@@ -41,26 +61,68 @@ impl<C: Cpu> Kernel<C> {
                 assert!(!p.linux.trace && p.seccomp.mode() == 0);
                 p.cpu = std::mem::take(&mut job.work.cpu);
                 p.state = State::Ready;
-                let number = p.cpu.x(8) as u32;
-                assert!(crate::worker_syscalls::vm_call(number));
-                let args = std::array::from_fn(|i| p.cpu.x(i));
-                let kind = match number {
-                    214 => 0,
-                    215 => 1,
-                    216 => 2,
-                    222 => 3,
-                    226 => 4,
-                    232 => 5,
-                    233 if args[2] as u32 == 4 => 6,
-                    233 => 7,
-                    _ => unreachable!(),
-                };
-                self.vm_checkpoint_calls[kind] += 1;
-                self.call(pid, &mut p, number, args, io);
-                assert!(matches!(p.state, State::Ready), "mapping call cannot park");
+                let mut extra = false;
+                let mut used_window = false;
+                loop {
+                    let number = p.cpu.x(8) as u32;
+                    assert!(crate::worker_syscalls::vm_call(number));
+                    let args = std::array::from_fn(|i| p.cpu.x(i));
+                    let kind = match number {
+                        214 => 0,
+                        215 => 1,
+                        216 => 2,
+                        222 => 3,
+                        226 => 4,
+                        232 => 5,
+                        233 if args[2] as u32 == 4 => 6,
+                        233 => 7,
+                        _ => unreachable!(),
+                    };
+                    self.vm_checkpoint_calls[kind] += 1;
+                    let call_began = Instant::now();
+                    self.call(pid, &mut p, number, args, io);
+                    self.vm_checkpoint_time[3] += call_began.elapsed();
+                    assert!(matches!(p.state, State::Ready), "mapping call cannot park");
+                    self.vm_local_syscalls += 1;
+                    self.vm_checkpoint_batch[2] += u64::from(extra);
+                    let remaining = lease_deadline.saturating_duration_since(Instant::now());
+                    if !batch || remaining.is_zero() || epoch.control.stopped() {
+                        break;
+                    }
+                    let cpu_began = Instant::now();
+                    let Some(outcome) = p.cpu.run_quiesced(
+                        &mut self.engine,
+                        &mut p.memory,
+                        &mut self.parallel_memory,
+                        // Share one deadline across all requesters; guest
+                        // computation cannot extend the exclusive window.
+                        remaining,
+                    ) else {
+                        break;
+                    };
+                    let elapsed = cpu_began.elapsed();
+                    p.cpu_time += elapsed;
+                    self.cpu_total += elapsed;
+                    self.per_cpu[job.stats.worker] += elapsed;
+                    self.vm_checkpoint_time[6] += elapsed;
+                    self.context_switches += 1;
+                    self.vm_checkpoint_batch[0] += u64::from(!used_window);
+                    self.vm_checkpoint_batch[1] += 1;
+                    used_window = true;
+                    if matches!(outcome, SliceOutcome::Syscall { .. })
+                        && crate::worker_syscalls::vm_call(p.cpu.x(8) as u32)
+                    {
+                        p.cpu.clear_exclusive();
+                        extra = true;
+                        continue;
+                    }
+                    if !matches!(outcome, SliceOutcome::Yield { .. }) {
+                        job.pending_cpu = Some(outcome);
+                    }
+                    break;
+                }
                 job.work.cpu = std::mem::take(&mut p.cpu);
                 self.processes.insert(pid, p);
-                self.vm_local_syscalls += 1;
             }
             let members: Vec<_> = checkpoint
                 .jobs
@@ -81,10 +143,14 @@ impl<C: Cpu> Kernel<C> {
                     .work
                     .memory = Some(view);
             }
-            self.parallel_memory_time += began.elapsed();
+            let elapsed = began.elapsed();
+            self.parallel_memory_time += elapsed;
+            self.vm_checkpoint_time[4] += elapsed;
             Ok(true)
         })();
+        let resume_began = Instant::now();
         epoch.restore_checkpoint(checkpoint, matches!(result, Ok(true)));
+        self.vm_checkpoint_time[5] += resume_began.elapsed();
         result
     }
 

@@ -393,6 +393,9 @@ impl<C: Cpu> Pool<C> {
                     let mut yielded = false;
                     let mut service = false;
                     let mut vm_checkpoint = false;
+                    let mut interrupt_prepared = false;
+                    let mut execution_guard = None;
+
                     if let Some(snapshot) = &work.syscalls {
                         snapshot.direct.swap_scratch(&mut direct_scratch);
                         snapshot.direct.swap_disk_cache(&mut file_cache);
@@ -507,10 +510,31 @@ impl<C: Cpu> Pool<C> {
                                 }
                                 running = true;
                             }
-                            let result = work
-                                .cpu
-                                .run_parallel(&mut engine, work.memory.as_deref_mut().expect("worker view"), budget);
-                            chunks += 1;
+                            let result = if let Some(pending) = job.pending_cpu.take() {
+                                pending
+                            } else {
+                                if !interrupt_prepared {
+                                    let interrupt = match C::execution_interrupt(&mut engine) {
+                                        Ok(interrupt) => interrupt,
+                                        Err(error) => break SliceOutcome::Fault(error),
+                                    };
+                                    if let (Some(domain), Some(interrupt)) = (&domain, interrupt) {
+                                        let Some(guard) = domain.bind_interrupt(index, interrupt) else {
+                                            yielded = true;
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        };
+                                        execution_guard = Some(guard);
+                                    }
+                                    interrupt_prepared = true;
+                                }
+                                let result = work.cpu.run_parallel(
+                                    &mut engine,
+                                    work.memory.as_deref_mut().expect("worker view"),
+                                    budget,
+                                );
+                                chunks += 1;
+                                result
+                            };
                             if let Some(wait) = C::take_hardware_wait(&mut engine) {
                                 parked_hardware = Some(wait);
                                 break result;
@@ -757,6 +781,9 @@ impl<C: Cpu> Pool<C> {
                         }
                     }))
                     .ok();
+                    // Withdraw before requesting a checkpoint: this worker is
+                    // already out of guest code and must not kick its next job.
+                    drop(execution_guard.take());
                     // Reuse credits across native returns. Refund only when this
                     // assignment ends, avoiding a global RMW pair per libc call.
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
@@ -1111,6 +1138,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepted_syscall_and_fault_are_dispatched_without_executing_past_them() {
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        let control = Arc::new(Control::new(100));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        // The previous engine already accepted getpid; the PC is at mov x19,x0.
+        let mut task = work(1, &[0xaa0003f3, 0xd2800ba8, 0xd4000001], 7, control);
+        task.cpu.set_x(8, 172);
+        task.syscalls = Some(syscall_snapshot());
+        let mut task = crate::run_queue::Job::new(task, 1, 0, None);
+        task.pending_cpu = Some(SliceOutcome::Syscall { instructions: 0 });
+        epoch.add(task);
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(
+            (
+                done.cpu.x(19),
+                done.syscalls,
+                done.instructions,
+                done.chunks
+            ),
+            (21, 1, 3, 1)
+        );
+        assert!(matches!(done.outcome, Some(SliceOutcome::Syscall { .. })));
+
+        let control = Arc::new(Control::new(100));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let mut task = crate::run_queue::Job::new(work(1, &[0xd4000001], 0, control), 1, 0, None);
+        task.pending_cpu = Some(SliceOutcome::Fault(trames_engine::CpuFault::Host(
+            "accepted fault".into(),
+        )));
+        epoch.add(task);
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(
+            (done.cpu.pc, done.instructions, done.chunks),
+            (0x1000, 0, 0)
+        );
+        assert!(
+            matches!(done.outcome, Some(SliceOutcome::Fault(trames_engine::CpuFault::Host(ref error))) if error == "accepted fault")
+        );
+    }
+
+    #[test]
+    fn accepted_native_exit_enters_its_body_once_on_the_worker() {
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        let control = Arc::new(Control::new(100));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let (mut task, mut memory) = native_work(3, [0x2000, 0x6b, 128], Permissions::RW, control);
+        task.cpu.pc = 0x100c;
+        task.cpu.set_x(16, trames_accel::native::PROFILE);
+        task.cpu.set_x(17, 3);
+        let mut task = crate::run_queue::Job::new(task, 1, 0, None);
+        task.pending_cpu = Some(SliceOutcome::NativeCall {
+            instructions: 0,
+            pc: 0x100c,
+            module: trames_accel::native::PROFILE,
+            function: 3,
+        });
+        epoch.add(task);
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(
+            (
+                done.native.calls,
+                done.native.worker_calls,
+                done.instructions,
+                done.chunks
+            ),
+            (1, 1, 3, 1)
+        );
+        assert_eq!(done.cpu.pc, 0x1018);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<128>(0x2000).unwrap(), [0x6b; 128]);
+    }
     #[test]
     fn shared_futex_alias_requeue_and_wake_release_one_slot_with_exact_svc_retirement() {
         let mut parent = Memory::default();
