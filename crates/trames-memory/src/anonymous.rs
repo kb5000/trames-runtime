@@ -28,6 +28,23 @@ impl Store {
         })
     }
     pub fn get(&self, base: u64) -> Arc<Resident> {
+        if self.native.is_some() {
+            return self.get_native(base);
+        }
+        self.pages[((base / PAGE_SIZE) & 15) as usize]
+            .lock()
+            .unwrap()
+            .entry(base)
+            .or_insert_with(|| {
+                Arc::new(Resident {
+                    bytes: Arc::new(SharedPage::from_owned(PageBytes::Zero, None)),
+                    charge: Charge::new(&self.account),
+                })
+            })
+            .clone()
+    }
+    #[inline(never)]
+    fn get_native(&self, base: u64) -> Arc<Resident> {
         let native = self.native.as_ref().map(|n| n.lock().unwrap());
         let range = native
             .as_ref()
