@@ -708,9 +708,12 @@ resident-byte caps retain per-page admission. Native extent wrappers do not char
 all virtual bytes: their owning account queries provider residency metadata when
 reporting resident_bytes. This is host-granule residency rather than unique
 physical/PSS accounting. Old page budgets remain conservative across fork. Fork
-and account rebinding materialize the extent's potentially modified pages through
-the existing COW boundary; changing a live native account to a smaller strict cap
-can therefore fail conservatively. Unchanged interpreter/iPad defaults never
+and account rebinding materialize provider-reported populated host granules through
+the existing COW boundary, preserving untouched zero intervals. Population must
+include nonresident contents: the Mac provider queries Mach dispositions, including
+compressed/paged-out pages, rather than relying on mincore. Query failure retains
+the conservative full-extent fallback. Changing a live native account to a smaller
+strict cap can still fail conservatively. Unchanged interpreter/iPad defaults never
 create hardware extents.
 
 An extent owns its bytes independently of the worker generation. Exact retirement
