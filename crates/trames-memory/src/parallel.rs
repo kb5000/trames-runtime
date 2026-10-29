@@ -1977,7 +1977,22 @@ impl View {
         };
         // SAFETY: hardware mode bypasses every old protected native alias and
         // retains only region-guarded byte actors for this frozen snapshot.
-        let storage = unsafe { page.export_hardware_with_mapping(allocate, import) }?;
+        let storage = if self.hardware_ranges_enabled() {
+            unsafe {
+                page.export_hardware_with_mapping(
+                    |bytes| {
+                        frame.charge.promote_native()?;
+                        allocate(bytes)
+                    },
+                    |mapping| {
+                        frame.charge.promote_native()?;
+                        import(mapping)
+                    },
+                )
+            }?
+        } else {
+            unsafe { page.export_hardware_with_mapping(allocate, import) }?
+        };
         if self.hardware_page_info(address)?.writable {
             self.mark_hardware_write(address)?;
         }

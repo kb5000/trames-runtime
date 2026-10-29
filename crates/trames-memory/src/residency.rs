@@ -117,31 +117,49 @@ impl Account {
 }
 pub(super) struct Charge {
     account: Arc<Account>,
-    // 0 = untouched, 1 = first writer reserving, 2 = charged. Region guards
+    // 0 = untouched, 1 = first charge, 2 = charged, 3 = native extent,\n    // 4 = moving a native page into ordinary backing. Region guards
     // may be disjoint; this state serializes only the page's first allocation.
     state: AtomicU8,
-    accounted: bool,
 }
 impl Charge {
     pub(super) fn new(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(0),
-            accounted: true,
         })
     }
     pub(super) fn native(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
-            state: AtomicU8::new(2),
-            accounted: false,
+            state: AtomicU8::new(3),
         })
+    }
+    pub(super) fn promote_native(&self) -> Result<(), MemoryError> {
+        if self.state.load(Ordering::Relaxed) == 2 {
+            return Ok(());
+        }
+        loop {
+            match self
+                .state
+                .compare_exchange(3, 4, Ordering::Acquire, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let result = self.account.take(PAGE_SIZE as usize);
+                    self.state
+                        .store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
+                    return result;
+                }
+                Err(4) => std::hint::spin_loop(),
+                Err(2) => return Ok(()),
+                Err(_) => return self.ensure(),
+            }
+        }
     }
     pub(super) fn resident(&self) -> bool {
         // Only quota membership: bytes are initialized before view publication
         // and shared CPU/native accesses use their own region/ARM ordering.
         // Do not turn accounting into a second acquire on ordinary accesses.
-        self.state.load(Ordering::Relaxed) == 2
+        matches!(self.state.load(Ordering::Relaxed), 2 | 3)
     }
     /// Cold I/O preflight only. The final atomic ensure remains authoritative;
     /// a peer already reserving this same page must not get a false quota error.
@@ -170,7 +188,7 @@ impl Charge {
                         .store(if result.is_ok() { 2 } else { 0 }, Ordering::Release);
                     return result;
                 }
-                Err(2) => return Ok(()),
+                Err(2 | 3) => return Ok(()),
                 Err(_) => std::hint::spin_loop(),
             }
         }
@@ -178,7 +196,7 @@ impl Charge {
 }
 impl Drop for Charge {
     fn drop(&mut self) {
-        if self.accounted && self.resident() {
+        if self.state.load(Ordering::Relaxed) == 2 {
             self.account.release(PAGE_SIZE as usize);
         }
     }

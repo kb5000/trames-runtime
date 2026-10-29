@@ -137,8 +137,38 @@ impl Store {
             return Ok(None);
         };
         let mut native = native.lock().unwrap();
-        if let Some(r) = native.ranges.get(&base) {
-            return Ok((r.len() == len && r.is_live()).then(|| r.clone()));
+        if let Some(r) = native.ranges.get(&base).cloned() {
+            if r.is_live() {
+                return Ok((r.len() == len).then_some(r));
+            }
+            // The former VM is gone. Preserve only its populated subpages in
+            // the canonical store, then retire the coarse owner. Rebinding
+            // each SharedPage can release that old RAM instead of retaining
+            // a duplicate complete extent for the rest of the address space.
+            for offset in r
+                .populated_pages()
+                .into_iter()
+                .filter(|&a| a < r.len() && a.is_multiple_of(PAGE_SIZE as usize))
+            {
+                let address = base + offset as u64;
+                self.pages[((address / PAGE_SIZE) & 15) as usize]
+                    .lock()
+                    .unwrap()
+                    .entry(address)
+                    .or_insert_with(|| {
+                        let page = Arc::new(RangePage {
+                            range: r.clone(),
+                            offset,
+                        });
+                        Arc::new(Resident {
+                            bytes: Arc::new(SharedPage::from_hardware(page)),
+                            charge: Charge::native(&self.account),
+                        })
+                    });
+            }
+            native.ranges.remove(&base);
+            native.refused.insert(base);
+            return Ok(None);
         }
         if native.refused.contains(&base) {
             return Ok(None);
