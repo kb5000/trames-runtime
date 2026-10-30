@@ -2,6 +2,7 @@
 //! Selected core 1.0 graphics for allocated and borrowed swapchain images. No guest Vulkan structure/pointer is
 //! handed to the driver; all arrays are decoded to scoped native records.
 use super::*;
+mod render_pass;
 
 #[derive(Clone, Copy)]
 pub(super) struct ImageShape {
@@ -12,6 +13,7 @@ pub(super) struct ImageShape {
     pub(super) depth: u32,
     pub(super) mips: u32,
     pub(super) layers: u32,
+    pub(super) samples: vk::SampleCountFlags,
 }
 impl ImageShape {
     pub(super) fn d2(width: u32, height: u32, format: vk::Format) -> Self {
@@ -23,6 +25,7 @@ impl ImageShape {
             depth: 1,
             mips: 1,
             layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
         }
     }
     fn extent(self, mip: u64) -> Result<[u32; 3]> {
@@ -77,32 +80,28 @@ impl ImageShape {
         self.ty == vk::ImageType::TYPE_2D && self.mips == 1 && self.layers == 1
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PassInfo {
     colors: [vk::Format; MAX_COLORS],
     color_count: usize,
     depth: Option<vk::Format>,
-    clear_mask: u16,
+    clear_mask: u32,
+    formats: [vk::Format; MAX_ATTACHMENTS],
+    sample_counts: [vk::SampleCountFlags; MAX_ATTACHMENTS],
+    attachments: usize,
+    samples: vk::SampleCountFlags,
+    usages: [vk::ImageUsageFlags; MAX_ATTACHMENTS],
 }
 impl PassInfo {
-    fn used_colors(self) -> usize {
-        self.colors[..self.color_count]
-            .iter()
-            .filter(|&&f| f != vk::Format::UNDEFINED)
-            .count()
+    fn new(color_count: usize) -> Self {
+        Self { colors: [vk::Format::UNDEFINED; MAX_COLORS], color_count, depth: None,
+            clear_mask: 0, formats: [vk::Format::UNDEFINED; MAX_ATTACHMENTS],
+            sample_counts: [vk::SampleCountFlags::empty(); MAX_ATTACHMENTS],
+            attachments: 0, samples: vk::SampleCountFlags::empty(), usages: [vk::ImageUsageFlags::empty(); MAX_ATTACHMENTS] }
     }
-    fn attachment_count(self) -> usize {
-        self.used_colors() + usize::from(self.depth.is_some())
-    }
-    fn attachment_format(self, index: usize) -> vk::Format {
-        self.colors[..self.color_count]
-            .iter()
-            .copied()
-            .filter(|&f| f != vk::Format::UNDEFINED)
-            .nth(index)
-            .or(self.depth)
-            .unwrap_or(vk::Format::UNDEFINED)
-    }
+    fn attachment_count(&self) -> usize { self.attachments }
+    fn attachment_format(&self, index: usize) -> vk::Format { self.formats[index] }
+    fn attachment_usage(&self, index: usize) -> vk::ImageUsageFlags { self.usages[index] }
 }
 pub(super) struct AttachmentSpec {
     flags: vk::ImageCreateFlags,
@@ -173,7 +172,7 @@ fn block_layout(raw: u64) -> Option<(u64, u64, u64)> {
 pub(super) const DIMENSION: u32 = 4096;
 pub(super) const LAYERS: u32 = 2048;
 pub(super) const MAX_COLORS: usize = 8;
-const MAX_ATTACHMENTS: usize = MAX_COLORS + 1;
+const MAX_ATTACHMENTS: usize = MAX_COLORS * 2 + 1;
 fn format(raw: u64) -> Result<vk::Format> {
     if block_layout(raw).is_some() {
         Ok(vk::Format::from_raw(raw as i32))
@@ -280,6 +279,7 @@ pub(super) fn compatible_pass(a: &Object, b: &Object) -> bool {
         a.color_count == b.color_count
             && a.colors[..a.color_count] == b.colors[..b.color_count]
             && a.depth == b.depth
+            && a.samples == b.samples
     })
 }
 fn shape(object: &Object) -> Result<ImageShape> {
@@ -465,7 +465,7 @@ impl Backend {
             p.max_extent.depth.min(DIMENSION),
             p.max_mip_levels.min(DIMENSION.ilog2() + 1),
             p.max_array_layers.min(LAYERS),
-            1,
+            p.sample_counts.as_raw(),
         ] {
             bytes.extend(n.to_le_bytes());
         }
@@ -577,7 +577,7 @@ impl Backend {
         if std::env::var_os("TRAMES_VULKAN_TRACE").is_some() {
             eprintln!("trames-vulkan graphics-config={config:x?}");
         }
-        if config[0] & !16383 != 0 {
+        if config[0] & !32767 != 0 {
             return unsupported();
         }
         let sample_mask = if config[0] & 4096 != 0 {
@@ -585,6 +585,15 @@ impl Backend {
         } else {
             u32::MAX
         };
+        let samples = if config[0] & 16384 != 0 { sample_count(config[13])? } else { vk::SampleCountFlags::TYPE_1 };
+        let pass_samples = pass.pass.get().unwrap().samples;
+        if !pass_samples.is_empty() && pass_samples != samples
+            || pass_samples.is_empty() && !limits.framebuffer_no_attachments_sample_counts.contains(samples)
+        { return invalid(); }
+        let alpha_coverage = config[0] & 16384 != 0 && config[15] != 0;
+        let alpha_one = config[0] & 16384 != 0 && config[16] != 0;
+        if config[0] & 16384 != 0 && (config[14] > u32::MAX as u64 || config[15] > 1 || config[16] > 1)
+            || alpha_one && device.features.alpha_to_one == 0 { return unsupported(); }
         let sample_shading = config[0] & 8192 != 0;
         let min_sample_shading = if sample_shading {
             let value = f32::from_bits(
@@ -843,10 +852,12 @@ impl Backend {
                 .front_face(vk::FrontFace::from_raw(state[3] as i32))
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+                .rasterization_samples(samples)
+                .alpha_to_coverage_enable(alpha_coverage)
+                .alpha_to_one_enable(alpha_one)
                 .sample_shading_enable(sample_shading)
                 .min_sample_shading(min_sample_shading);
-            let sample_masks = [sample_mask];
+            let sample_masks = [sample_mask, if config[0] & 16384 != 0 { config[14] as u32 } else { u32::MAX }];
             let multisample = multisample.sample_mask(&sample_masks);
             let depth = vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(depth_test)
@@ -1019,12 +1030,14 @@ impl Backend {
                         depth: a[11] as u32,
                         mips: a[12] as u32,
                         layers: a[13] as u32,
+                        samples: sample_count(a[14].max(1))?,
                     }
                 };
                 if a[2] > u32::MAX as u64 || a[3] > u32::MAX as u64 {
                     return invalid();
                 }
                 validate_shape(s, a[9])?;
+                if s.samples != vk::SampleCountFlags::TYPE_1 && u.contains(vk::ImageUsageFlags::STORAGE) { return unsupported(); }
                 if a[9] & 32 != 0
                     && device
                         .portability
@@ -1051,6 +1064,7 @@ impl Backend {
                     || s.depth > limits.max_extent.depth
                     || s.mips > limits.max_mip_levels
                     || s.layers > limits.max_array_layers
+                    || !limits.sample_counts.contains(s.samples)
                 {
                     return invalid();
                 }
@@ -1072,7 +1086,7 @@ impl Backend {
                     })
                     .mip_levels(s.mips)
                     .array_layers(s.layers)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(s.samples)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(u)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -1259,104 +1273,111 @@ impl Backend {
                 }
                 self.room(1)?;
                 output(m, a[8], 8)?;
-                let layouts = if a[13] == 0 {
-                    vec![2, 2, 2, 2, 2, 2, 2, 2, 3]
+                let (mut pass, attachments, references, depth_reference, resolves) = if a[14] != 0 {
+                    render_pass::decode(self, m, a[14])?
                 } else {
-                    words64(m, a[13], 9)?
-                };
-                let colors = if a[10] == 0 {
-                    vec![a[1], a[2], a[3], a[4], a[5]]
-                } else {
-                    words64(m, a[10], bounded(a[11], MAX_COLORS)? * 5)?
-                };
-                let count = colors.len() / 5;
-                let limits = unsafe {
-                    device
-                        .instance
-                        .native
-                        .get_physical_device_properties(self.physical)
-                }
-                .limits;
-                if count > limits.max_color_attachments as usize {
-                    return unsupported();
-                }
-                let mut pass = PassInfo {
-                    colors: [vk::Format::UNDEFINED; MAX_COLORS],
-                    color_count: count,
-                    depth: None,
-                    clear_mask: 0,
-                };
-                let mut attachments = Vec::new();
-                let mut references = Vec::new();
-                for (slot, x) in colors.chunks_exact(5).enumerate() {
-                    if x[0] == 0 {
+                    let layouts = if a[13] == 0 {
+                        vec![2, 2, 2, 2, 2, 2, 2, 2, 3]
+                    } else {
+                        words64(m, a[13], 9)?
+                    };
+                    let colors = if a[10] == 0 {
+                        vec![a[1], a[2], a[3], a[4], a[5]]
+                    } else {
+                        words64(m, a[10], bounded(a[11], MAX_COLORS)? * 5)?
+                    };
+                    let count = colors.len() / 5;
+                    if count > device.max_color_attachments as usize { return unsupported(); }
+                    let mut pass = PassInfo::new(count);
+                    let mut attachments = Vec::new();
+                    let mut references = Vec::new();
+                    for (slot, x) in colors.chunks_exact(5).enumerate() {
+                        if x[0] == 0 {
+                            references.push(
+                                vk::AttachmentReference::default()
+                                    .attachment(vk::ATTACHMENT_UNUSED)
+                                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                            );
+                            continue;
+                        }
+                        let index = attachments.len();
+                        let f = format(x[0])?;
+                        if is_depth_stencil(f) || x[1] > 2 || x[2] > 1 {
+                            return unsupported();
+                        }
+                        pass.colors[slot] = f;
+                        if x[1] == 1 {
+                            pass.clear_mask |= 1 << index;
+                        }
+                        attachments.push(
+                            vk::AttachmentDescription::default()
+                                .format(f)
+                                .samples(vk::SampleCountFlags::TYPE_1)
+                                .load_op(vk::AttachmentLoadOp::from_raw(x[1] as i32))
+                                .store_op(vk::AttachmentStoreOp::from_raw(x[2] as i32))
+                                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                                .initial_layout(self.native_layout(x[3], true)?)
+                                .final_layout(self.native_layout(x[4], false)?),
+                        );
                         references.push(
                             vk::AttachmentReference::default()
-                                .attachment(vk::ATTACHMENT_UNUSED)
-                                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                                .attachment(index as u32)
+                                .layout(attachment_reference_layout(layouts[slot], false)?),
                         );
-                        continue;
                     }
-                    let index = attachments.len();
-                    let f = format(x[0])?;
-                    if is_depth_stencil(f) || x[1] > 2 || x[2] > 1 {
-                        return unsupported();
+                    let used_colors = attachments.len();
+                    let depth_reference = vk::AttachmentReference::default()
+                        .attachment(used_colors as u32)
+                        .layout(attachment_reference_layout(layouts[8], true)?);
+                    if a[9] != 0 {
+                        if a[12] > 1 {
+                            return unsupported();
+                        }
+                        let mut x = words64(m, a[9], if a[12] == 1 { 7 } else { 5 })?;
+                        if a[12] == 0 {
+                            x.extend([2, 1]); // Legacy wire: stencil DONT_CARE.
+                        }
+                        let f = format(x[0])?;
+                        if !is_depth_stencil(f) || x[1] > 2 || x[2] > 1 || x[5] > 2 || x[6] > 1 {
+                            return unsupported();
+                        }
+                        pass.depth = Some(f);
+                        let aspects = format_aspects(f);
+                        if aspects.contains(vk::ImageAspectFlags::DEPTH) && x[1] == 1
+                            || aspects.contains(vk::ImageAspectFlags::STENCIL) && x[5] == 1
+                        {
+                            pass.clear_mask |= 1 << used_colors;
+                        }
+                        attachments.push(
+                            vk::AttachmentDescription::default()
+                                .format(f)
+                                .samples(vk::SampleCountFlags::TYPE_1)
+                                .load_op(vk::AttachmentLoadOp::from_raw(x[1] as i32))
+                                .store_op(vk::AttachmentStoreOp::from_raw(x[2] as i32))
+                                .stencil_load_op(vk::AttachmentLoadOp::from_raw(x[5] as i32))
+                                .stencil_store_op(vk::AttachmentStoreOp::from_raw(x[6] as i32))
+                                .initial_layout(self.native_layout(x[3], true)?)
+                                .final_layout(self.native_layout(x[4], false)?),
+                        );
                     }
-                    pass.colors[slot] = f;
-                    if x[1] == 1 {
-                        pass.clear_mask |= 1 << index;
-                    }
-                    attachments.push(
-                        vk::AttachmentDescription::default()
-                            .format(f)
-                            .samples(vk::SampleCountFlags::TYPE_1)
-                            .load_op(vk::AttachmentLoadOp::from_raw(x[1] as i32))
-                            .store_op(vk::AttachmentStoreOp::from_raw(x[2] as i32))
-                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                            .initial_layout(self.native_layout(x[3], true)?)
-                            .final_layout(self.native_layout(x[4], false)?),
-                    );
-                    references.push(
-                        vk::AttachmentReference::default()
-                            .attachment(index as u32)
-                            .layout(attachment_reference_layout(layouts[slot], false)?),
-                    );
+                    (pass, attachments, references, depth_reference, Vec::new())
+                };
+                pass.attachments = attachments.len();
+                for (i, x) in attachments.iter().enumerate() {
+                    pass.formats[i] = x.format;
+                    pass.sample_counts[i] = x.samples;
                 }
-                let used_colors = attachments.len();
-                let depth_reference = vk::AttachmentReference::default()
-                    .attachment(used_colors as u32)
-                    .layout(attachment_reference_layout(layouts[8], true)?);
-                if a[9] != 0 {
-                    if a[12] > 1 {
-                        return unsupported();
-                    }
-                    let mut x = words64(m, a[9], if a[12] == 1 { 7 } else { 5 })?;
-                    if a[12] == 0 {
-                        x.extend([2, 1]); // Legacy wire: stencil DONT_CARE.
-                    }
-                    let f = format(x[0])?;
-                    if !is_depth_stencil(f) || x[1] > 2 || x[2] > 1 || x[5] > 2 || x[6] > 1 {
-                        return unsupported();
-                    }
-                    pass.depth = Some(f);
-                    let aspects = format_aspects(f);
-                    if aspects.contains(vk::ImageAspectFlags::DEPTH) && x[1] == 1
-                        || aspects.contains(vk::ImageAspectFlags::STENCIL) && x[5] == 1
-                    {
-                        pass.clear_mask |= 1 << used_colors;
-                    }
-                    attachments.push(
-                        vk::AttachmentDescription::default()
-                            .format(f)
-                            .samples(vk::SampleCountFlags::TYPE_1)
-                            .load_op(vk::AttachmentLoadOp::from_raw(x[1] as i32))
-                            .store_op(vk::AttachmentStoreOp::from_raw(x[2] as i32))
-                            .stencil_load_op(vk::AttachmentLoadOp::from_raw(x[5] as i32))
-                            .stencil_store_op(vk::AttachmentStoreOp::from_raw(x[6] as i32))
-                            .initial_layout(self.native_layout(x[3], true)?)
-                            .final_layout(self.native_layout(x[4], false)?),
-                    );
+                if pass.color_count > device.max_color_attachments as usize { return unsupported(); }
+                for r in references.iter().chain(resolves.iter()) {
+                    if r.attachment != vk::ATTACHMENT_UNUSED { pass.usages[r.attachment as usize] |= vk::ImageUsageFlags::COLOR_ATTACHMENT; }
+                }
+                if pass.depth.is_some() { pass.usages[depth_reference.attachment as usize] |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT; }
+                for r in references.iter().chain(pass.depth.is_some().then_some(&depth_reference)) {
+                    if r.attachment == vk::ATTACHMENT_UNUSED { continue; }
+                    let samples = attachments[r.attachment as usize].samples;
+                    if !pass.samples.is_empty() && pass.samples != samples { return invalid(); }
+                    pass.samples = samples;
                 }
                 let wire = words64(m, a[6], bounded(a[7], 8)? * 7)?;
                 let mut dependencies = Vec::new();
@@ -1403,18 +1424,19 @@ impl Backend {
                         })
                         .collect();
                     let depth_reference = vk::AttachmentReference2::default()
-                        .attachment(used_colors as u32)
+                        .attachment(depth_reference.attachment)
                         .layout(depth_reference.layout)
                         .aspect_mask(
                             pass.depth
                                 .map_or(vk::ImageAspectFlags::empty(), format_aspects),
                         );
+                    let resolves: Vec<_> = resolves.iter().map(|r| vk::AttachmentReference2::default()
+                        .attachment(r.attachment).layout(r.layout).aspect_mask(vk::ImageAspectFlags::COLOR)).collect();
                     let mut subpass = vk::SubpassDescription2::default()
                         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                         .color_attachments(&references);
-                    if pass.depth.is_some() {
-                        subpass = subpass.depth_stencil_attachment(&depth_reference);
-                    }
+                    if pass.depth.is_some() { subpass = subpass.depth_stencil_attachment(&depth_reference); }
+                    if !resolves.is_empty() { subpass = subpass.resolve_attachments(&resolves); }
                     let subpasses = [subpass];
                     let dependencies: Vec<_> = dependencies
                         .iter()
@@ -1439,9 +1461,8 @@ impl Backend {
                     let mut subpass = vk::SubpassDescription::default()
                         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                         .color_attachments(&references);
-                    if pass.depth.is_some() {
-                        subpass = subpass.depth_stencil_attachment(&depth_reference);
-                    }
+                    if pass.depth.is_some() { subpass = subpass.depth_stencil_attachment(&depth_reference); }
+                    if !resolves.is_empty() { subpass = subpass.resolve_attachments(&resolves); }
                     let subpasses = [subpass];
                     let info = vk::RenderPassCreateInfo::default()
                         .attachments(&attachments)
@@ -1450,7 +1471,7 @@ impl Backend {
                     unsafe { d.create_render_pass(&info, None) }?
                 };
                 let id = self.put(Kind::RenderPass, raw.as_raw(), vec![], 0, 0);
-                self.objects[&id].pass.set(Some(pass));
+                self.objects[&id].pass.set(Box::new(pass)).expect("new render pass metadata");
                 self.publish(m, a[8], id)?;
             }
             67 => self.remove(a[1], Kind::RenderPass)?,
@@ -1481,16 +1502,13 @@ impl Backend {
                 for (i, id) in ids.into_iter().enumerate() {
                     let view = self.object(id, Kind::ImageView)?;
                     let shape = shape(&view)?;
-                    let required = if i < p.used_colors() {
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    } else {
-                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    };
+                    let required = p.attachment_usage(i);
                     if !shape.attachment()
                         || shape.format != p.attachment_format(i)
+                        || shape.samples != p.sample_counts[i]
                         || a[3] > shape.width as u64
                         || a[4] > shape.height as u64
-                        || view.deps.borrow()[0].flags & required.as_raw() == 0
+                        || view.deps.borrow()[0].flags & required.as_raw() != required.as_raw()
                     {
                         return invalid();
                     }
@@ -1534,11 +1552,7 @@ impl Backend {
                 for (i, x) in wire.chunks_exact(7).enumerate() {
                     let u = usage(x[1])?;
                     let wanted = p.attachment_format(i);
-                    let required = if i < p.used_colors() {
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    } else {
-                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    };
+                    let required = p.attachment_usage(i);
                     let formats: Vec<_> = words32(m, x[5], bounded(x[6], 16)?)?
                         .into_iter()
                         .map(view_format)
@@ -1585,7 +1599,7 @@ impl Backend {
                     .push_next(&mut attachment_info);
                 info.attachment_count = count as u32;
                 let raw = unsafe { d.create_framebuffer(&info, None) }?;
-                let id = self.put(Kind::Framebuffer, raw.as_raw(), vec![pass], 0, 1);
+                let id = self.put(Kind::Framebuffer, raw.as_raw(), vec![pass.clone()], 0, 1);
                 self.objects[&id].image.set(Some(ImageShape::d2(
                     a[2] as u32,
                     a[3] as u32,
@@ -1595,7 +1609,7 @@ impl Backend {
                 self.publish(m, a[6], id)?;
             }
             69 => self.remove(a[1], Kind::Framebuffer)?,
-            71..=76 | 94..=97 | 114 | 123..=124 | 134..=136 | 151 => {
+            71..=76 | 94..=97 | 114 | 123..=124 | 134..=136 | 151 | 215 => {
                 let c = self.object(a[1], Kind::CommandBuffer)?;
                 if c.state.get() != 1 {
                     return invalid();
@@ -1756,7 +1770,7 @@ impl Backend {
                         }
                         c.retain(image);
                     }
-                    134 => {
+                    134 | 215 => {
                         let src = self.object(a[2], Kind::Image)?;
                         let dst = self.object(a[4], Kind::Image)?;
                         let src_shape = shape(&src)?;
@@ -1783,6 +1797,11 @@ impl Backend {
                         {
                             return invalid();
                         }
+                        if op == 215 {
+                            if src_shape.samples == vk::SampleCountFlags::TYPE_1 || dst_shape.samples != vk::SampleCountFlags::TYPE_1
+                                || src_shape.format != dst_shape.format || is_depth_stencil(src_shape.format)
+                            { return invalid(); }
+                        } else if src_shape.samples != dst_shape.samples { return invalid(); }
                         let wire = words64(m, a[6], bounded(a[7], 64)? * 17)?;
                         let regions = wire
                             .chunks_exact(17)
@@ -1800,14 +1819,20 @@ impl Backend {
                         }
 
                         unsafe {
-                            d.cmd_copy_image(
+                            if op == 215 {
+                                let regions: Vec<_> = regions.iter().map(|r| vk::ImageResolve::default()
+                                    .src_subresource(r.src_subresource).src_offset(r.src_offset)
+                                    .dst_subresource(r.dst_subresource).dst_offset(r.dst_offset).extent(r.extent)).collect();
+                                d.cmd_resolve_image(raw, vk::Image::from_raw(src.raw), src_layout,
+                                    vk::Image::from_raw(dst.raw), dst_layout, &regions);
+                            } else { d.cmd_copy_image(
                                 raw,
                                 vk::Image::from_raw(src.raw),
                                 src_layout,
                                 vk::Image::from_raw(dst.raw),
                                 dst_layout,
                                 &regions,
-                            );
+                            ); }
                         }
                         // Old swapchain pools and regular image memory survive replacement,
                         // command-buffer reset and guest handle destruction until submission completion.
@@ -1880,7 +1905,7 @@ impl Backend {
                         let mut clears = Vec::new();
                         for index in 0..a[9] {
                             let words = words32(m, a[8] + index * 16, 4)?;
-                            if index < pass.pass.get().unwrap().used_colors() as u64 {
+                            if !is_depth_stencil(pass.pass.get().unwrap().attachment_format(index as usize)) {
                                 clears.push(vk::ClearValue {
                                     color: vk::ClearColorValue {
                                         float32: std::array::from_fn(|i| f32::from_bits(words[i])),
@@ -1918,6 +1943,7 @@ impl Backend {
                                 let wanted = p.attachment_format(i);
                                 if !shape.attachment()
                                     || shape.format != wanted
+                                    || shape.samples != p.sample_counts[i]
                                     || !spec.formats.contains(&shape.format)
                                     || image.image_flags.get() != spec.flags.as_raw()
                                     || image.flags != spec.usage.as_raw()
@@ -2314,12 +2340,17 @@ fn image_type(raw: u64) -> Result<vk::ImageType> {
         _ => Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED.into()),
     }
 }
+fn sample_count(value: u64) -> Result<vk::SampleCountFlags> {
+    if value == 0 || value > 64 || !value.is_power_of_two() { return invalid(); }
+    Ok(vk::SampleCountFlags::from_raw(value as u32))
+}
 fn validate_shape(s: ImageShape, flags: u64) -> Result<()> {
     let ext = [s.width, s.height, s.depth];
     if ext.iter().any(|&n| n == 0 || n > DIMENSION)
         || s.layers == 0
         || s.layers > LAYERS
         || s.mips == 0
+        || s.samples != vk::SampleCountFlags::TYPE_1 && (s.ty != vk::ImageType::TYPE_2D || s.mips != 1 || flags & 16 != 0)
         || s.mips > ext.into_iter().max().unwrap().ilog2() + 1
         || s.ty == vk::ImageType::TYPE_1D && (s.height != 1 || s.depth != 1)
         || s.ty == vk::ImageType::TYPE_2D && s.depth != 1
@@ -2439,6 +2470,7 @@ fn checked_blocks(image: ImageShape, mip: u64, offset: &[u64], extent: &[u64]) -
     Ok(())
 }
 fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
+    if image.samples != vk::SampleCountFlags::TYPE_1 { return invalid(); }
     // Packed depth/stencil is transferred one aspect at a time: D32S8 uses
     // four bytes for depth and one for stencil, never eight bytes per aspect.
     let bytes = aspect_bytes(image.format, x[3])?;
@@ -2535,6 +2567,7 @@ fn numeric_class(f: vk::Format) -> u8 {
     }
 }
 fn checked_blit(x: &[u64], src: ImageShape, dst: ImageShape) -> Result<vk::ImageBlit> {
+    if src.samples != vk::SampleCountFlags::TYPE_1 || dst.samples != vk::SampleCountFlags::TYPE_1 { return invalid(); }
     if is_depth_stencil(src.format) != is_depth_stencil(dst.format)
         || is_depth_stencil(src.format) && src.format != dst.format
         || numeric_class(src.format) != numeric_class(dst.format)
@@ -2590,7 +2623,7 @@ fn blit_overlap(a: &vk::ImageBlit, b: &vk::ImageBlit) -> bool {
     })
 }
 
-fn clear_attachment(pass: PassInfo, wire: &[u64]) -> Result<vk::ClearAttachment> {
+fn clear_attachment(pass: &PassInfo, wire: &[u64]) -> Result<vk::ClearAttachment> {
     if !matches!(wire[0], 1 | 2 | 4 | 6) {
         return invalid();
     }
@@ -2686,32 +2719,28 @@ mod tests {
     }
     #[test]
     fn attachment_clears_preserve_subpass_slots_aspects_and_render_area() {
-        let mut pass = PassInfo {
-            colors: [vk::Format::UNDEFINED; MAX_COLORS],
-            color_count: 3,
-            depth: Some(vk::Format::D24_UNORM_S8_UINT),
-            clear_mask: 0,
-        };
+        let mut pass = PassInfo::new(3);
+        pass.depth = Some(vk::Format::D24_UNORM_S8_UINT);
         pass.colors[0] = vk::Format::R8G8B8A8_UNORM;
         pass.colors[2] = vk::Format::R8G8B8A8_UNORM;
         assert_eq!(
-            clear_attachment(pass, &[1, 2, 7, 8, 9, 10])
+            clear_attachment(&pass, &[1, 2, 7, 8, 9, 10])
                 .unwrap()
                 .color_attachment,
             2
         );
-        assert!(clear_attachment(pass, &[1, 1, 0, 0, 0, 0]).is_ok()); // UNUSED is ignored
-        assert!(clear_attachment(pass, &[1, 3, 0, 0, 0, 0]).is_err());
+        assert!(clear_attachment(&pass, &[1, 1, 0, 0, 0, 0]).is_ok()); // UNUSED is ignored
+        assert!(clear_attachment(&pass, &[1, 3, 0, 0, 0, 0]).is_err());
         let depth = 0.75f32.to_bits() as u64;
         for aspects in [2, 4, 6] {
-            assert!(clear_attachment(pass, &[aspects, 999, depth, 0xab, 0, 0]).is_ok());
+            assert!(clear_attachment(&pass, &[aspects, 999, depth, 0xab, 0, 0]).is_ok());
         }
         for aspects in [0, 3, 5, 7, 8] {
-            assert!(clear_attachment(pass, &[aspects, 0, depth, 0, 0, 0]).is_err());
+            assert!(clear_attachment(&pass, &[aspects, 0, depth, 0, 0, 0]).is_err());
         }
-        assert!(clear_attachment(pass, &[2, 0, f32::NAN.to_bits() as u64, 0, 0, 0]).is_err());
+        assert!(clear_attachment(&pass, &[2, 0, f32::NAN.to_bits() as u64, 0, 0, 0]).is_err());
         pass.depth = Some(vk::Format::D16_UNORM);
-        assert!(clear_attachment(pass, &[4, 0, 0, 0, 0, 0]).is_err());
+        assert!(clear_attachment(&pass, &[4, 0, 0, 0, 0, 0]).is_err());
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 8, y: 4 },
             extent: vk::Extent2D {

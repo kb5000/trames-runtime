@@ -48,6 +48,7 @@ core_features! {
     21 => texture_compression_bc,
     22 => shader_int16,
     23 => shader_int64,
+    24 => alpha_to_one,
 }
 
 #[cfg(test)]

@@ -100,6 +100,7 @@ struct Device {
     viewport_dimensions: [u32; 2],
     viewport_bounds: [f32; 2],
     max_indirect_draw_count: u32,
+    max_color_attachments: u32,
     compute_workgroup_count: [u32; 3],
     compute_features: u64,
 }
@@ -179,7 +180,8 @@ struct Object {
     memory_binding: Cell<Option<coherent::Binding>>,
     image: Cell<Option<ImageShape>>,
     image_flags: Cell<u32>,
-    pass: Cell<Option<PassInfo>>,
+    // Large immutable attachment tables belong only to render-pass objects.
+    pass: std::cell::OnceCell<Box<PassInfo>>,
     attachment_specs: RefCell<Vec<graphics::AttachmentSpec>>,
     recording: RefCell<Recording>,
     vertex_inputs: RefCell<Vec<graphics::VertexBinding>>,
@@ -527,7 +529,7 @@ impl Backend {
             memory_binding: Cell::new(None),
             image: Cell::new(None),
             image_flags: Cell::new(0),
-            pass: Cell::new(None),
+            pass: Default::default(),
             attachment_specs: RefCell::new(Vec::new()),
             recording: RefCell::new(Recording::default()),
             vertex_inputs: RefCell::new(Vec::new()),
@@ -805,7 +807,7 @@ impl Backend {
             memory_binding: Cell::new(None),
             image: Cell::new(None),
             image_flags: Cell::new(0),
-            pass: Cell::new(None),
+            pass: Default::default(),
             attachment_specs: RefCell::new(Vec::new()),
             recording: RefCell::new(Recording::default()),
             vertex_inputs: RefCell::new(Vec::new()),
@@ -1528,6 +1530,7 @@ impl Backend {
                     viewport_dimensions: limits.max_viewport_dimensions,
                     viewport_bounds: limits.viewport_bounds_range,
                     max_indirect_draw_count: limits.max_draw_indirect_count,
+                    max_color_attachments: limits.max_color_attachments,
                     compute_workgroup_count: limits.max_compute_work_group_count,
                     compute_features: a[7],
                 }));
@@ -2586,7 +2589,7 @@ impl Backend {
                     *c.recording.borrow_mut() = Recording::default();
                 }
             }
-            60..=76 | 94..=97 | 114 | 122..=125 | 134..=136 | 151 => {
+            60..=76 | 94..=97 | 114 | 122..=125 | 134..=136 | 151 | 215 => {
                 self.graphics_call(m, op, a)?
             }
             132 => self.dynamic_call(m, a)?,

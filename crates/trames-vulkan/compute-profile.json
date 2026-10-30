@@ -1,5 +1,5 @@
 {
-  "wire_revision": 11,
+  "wire_revision": 12,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
