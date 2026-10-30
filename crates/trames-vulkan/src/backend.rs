@@ -15,6 +15,7 @@ use trames_memory::Memory;
 use trames_memory::{Access, CpuMemory, MemoryError};
 use vk::Handle;
 mod coherent;
+mod core_features;
 mod completion;
 mod shared_memory;
 mod feedback;
@@ -96,6 +97,7 @@ struct Device {
     map_alignment: u64,
     viewport_dimensions: [u32; 2],
     viewport_bounds: [f32; 2],
+    max_indirect_draw_count: u32,
 }
 impl Drop for Device {
     fn drop(&mut self) {
@@ -1361,39 +1363,7 @@ impl Backend {
             }
             7 => {
                 let native = unsafe { instance.native.get_physical_device_features(self.physical) };
-                let mut features = vec![0; std::mem::size_of::<vk::PhysicalDeviceFeatures>()];
-                for (at, value) in [
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, sampler_anisotropy),
-                        native.sampler_anisotropy,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, logic_op),
-                        native.logic_op,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, fill_mode_non_solid),
-                        native.fill_mode_non_solid,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, shader_clip_distance),
-                        native.shader_clip_distance,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, independent_blend),
-                        native.independent_blend,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, image_cube_array),
-                        native.image_cube_array,
-                    ),
-                    (
-                        std::mem::offset_of!(vk::PhysicalDeviceFeatures, sample_rate_shading),
-                        native.sample_rate_shading,
-                    ),
-                ] {
-                    features[at..at + 4].copy_from_slice(&value.to_le_bytes());
-                }
+                let features = core_features::encode(native);
                 write(m, a[1], &features)?;
             }
             8 => {
@@ -1450,30 +1420,7 @@ impl Backend {
                 }
                 let native_features =
                     unsafe { instance.native.get_physical_device_features(self.physical) };
-                if a[4] & !127 != 0
-                    || [
-                        native_features.sampler_anisotropy,
-                        native_features.logic_op,
-                        native_features.fill_mode_non_solid,
-                        native_features.shader_clip_distance,
-                        native_features.independent_blend,
-                        native_features.image_cube_array,
-                        native_features.sample_rate_shading,
-                    ]
-                    .iter()
-                    .enumerate()
-                    .any(|(i, &v)| a[4] & (1 << i) != 0 && v == 0)
-                {
-                    return unsupported();
-                }
-                let features = vk::PhysicalDeviceFeatures::default()
-                    .sampler_anisotropy(a[4] & 1 != 0)
-                    .logic_op(a[4] & 2 != 0)
-                    .fill_mode_non_solid(a[4] & 4 != 0)
-                    .shader_clip_distance(a[4] & 8 != 0)
-                    .independent_blend(a[4] & 16 != 0)
-                    .image_cube_array(a[4] & 32 != 0)
-                    .sample_rate_shading(a[4] & 64 != 0);
+                let features = core_features::select(native_features, a[4])?;
                 self.wsi.device_enabled = a[3] != 0;
                 zink::device_extensions(a[5], &self.capabilities, &mut names)?;
                 let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default()
@@ -1546,6 +1493,7 @@ impl Backend {
                     map_alignment: limits.min_memory_map_alignment as u64,
                     viewport_dimensions: limits.max_viewport_dimensions,
                     viewport_bounds: limits.viewport_bounds_range,
+                    max_indirect_draw_count: limits.max_draw_indirect_count,
                 }));
                 self.device_id = self.id();
                 self.queue_id = self.id();
@@ -2594,6 +2542,7 @@ impl Backend {
                 self.graphics_call(m, op, a)?
             }
             132 => self.dynamic_call(m, a)?,
+            203..=205 => self.indirect_call(op, a)?,
             127..=128 => self.texel_view_call(m, op, a)?,
             92..=93 => self.sampler_call(m, op, a)?,
             87..=91 => self.wsi_device(m, op, a)?,
@@ -2686,7 +2635,15 @@ fn visibility_stages(raw: u64) -> Result<vk::ShaderStageFlags> {
     }
     Ok(vk::ShaderStageFlags::from_raw(raw as u32))
 }
-fn compute_stage(stage: u32) -> Result<vk::PipelineStageFlags> {
+fn compute_stage(mut stage: u32) -> Result<vk::PipelineStageFlags> {
+    // Mesa's aggregate shader barriers include all graphics stages, even in
+    // GLES contexts without tessellation/geometry. Those stages cannot execute
+    // in this profile; retain every active producer/consumer, omit empty stages.
+    let absent = vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
+        | vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER
+        | vk::PipelineStageFlags::GEOMETRY_SHADER;
+    let graphics = absent | vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
+    if stage & graphics.as_raw() == graphics.as_raw() { stage &= !absent.as_raw(); }
     let allowed = vk::PipelineStageFlags::TOP_OF_PIPE
         | vk::PipelineStageFlags::DRAW_INDIRECT
         | vk::PipelineStageFlags::VERTEX_INPUT
@@ -2939,6 +2896,14 @@ mod tests {
         assert!(compute_stage(vk::PipelineStageFlags::COMPUTE_SHADER.as_raw()).is_ok());
         assert!(compute_stage(vk::PipelineStageFlags::VERTEX_INPUT.as_raw()).is_ok());
         assert!(compute_stage(vk::PipelineStageFlags::ALL_COMMANDS.as_raw()).is_ok());
+        let aggregate = vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER
+            | vk::PipelineStageFlags::GEOMETRY_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::COMPUTE_SHADER;
+        assert_eq!(compute_stage(aggregate.as_raw()).unwrap(), vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER);
         for stage in [
             0,
             vk::PipelineStageFlags::GEOMETRY_SHADER.as_raw(),

@@ -155,12 +155,27 @@ fn texel_size(raw: u64) -> Option<u32> {
         _ => None,
     }
 }
+fn compressed_block(raw: u64) -> Option<(u64, u64, u64)> {
+    match raw {
+        131..=134 | 139..=140 | 147..=150 | 153..=154 => Some((4, 4, 8)),
+        135..=138 | 141..=146 | 151..=152 | 155..=156 => Some((4, 4, 16)),
+        157..=184 => {
+            const ASTC: [(u64, u64); 14] = [(4,4),(5,4),(5,5),(6,5),(6,6),(8,5),(8,6),(8,8),(10,5),(10,6),(10,8),(10,10),(12,10),(12,12)];
+            let (width, height) = ASTC[((raw - 157) / 2) as usize];
+            Some((width, height, 16))
+        }
+        _ => None,
+    }
+}
+fn block_layout(raw: u64) -> Option<(u64, u64, u64)> {
+    compressed_block(raw).or_else(|| texel_size(raw).map(|bytes| (1, 1, bytes as u64)))
+}
 pub(super) const DIMENSION: u32 = 4096;
 pub(super) const LAYERS: u32 = 2048;
 pub(super) const MAX_COLORS: usize = 8;
 const MAX_ATTACHMENTS: usize = MAX_COLORS + 1;
 fn format(raw: u64) -> Result<vk::Format> {
-    if texel_size(raw).is_some() {
+    if block_layout(raw).is_some() {
         Ok(vk::Format::from_raw(raw as i32))
     } else {
         Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED.into())
@@ -246,8 +261,8 @@ fn aspect_bytes(format: vk::Format, aspect: u64) -> Result<u64> {
             124 | 128 => 2,
             _ => 4,
         },
-        _ => texel_size(format.as_raw() as u64)
-            .ok_or(Failure::Vk(vk::Result::ERROR_FORMAT_NOT_SUPPORTED))? as u64,
+        _ => block_layout(format.as_raw() as u64)
+            .ok_or(Failure::Vk(vk::Result::ERROR_FORMAT_NOT_SUPPORTED))?.2,
     })
 }
 fn format_usage(format: vk::Format, raw: u64) -> Result<vk::ImageUsageFlags> {
@@ -274,6 +289,48 @@ fn shape(object: &Object) -> Result<ImageShape> {
         .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))
 }
 impl Backend {
+    pub(super) fn indirect_call(&mut self, op: u64, a: [u64; 16]) -> Result<()> {
+        let command = self.object(a[1], Kind::CommandBuffer)?;
+        let buffer = self.object(a[2], Kind::Buffer)?;
+        let device = &command.device;
+        if command.state.get() != 1 || buffer.deps.borrow().is_empty()
+            || buffer.flags & vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw() == 0
+        { return invalid(); }
+        let dispatch = op == 205;
+        let indexed = op == 204;
+        let count = if dispatch { 1 } else { a[4] };
+        if !dispatch && (count > device.max_indirect_draw_count as u64
+            || count > 1 && device.features.multi_draw_indirect == 0)
+        { return unsupported(); }
+        let size = if dispatch { 12 } else if indexed { 20 } else { 16 };
+        indirect_span(buffer.size, a[3], count, a[5], size)?;
+        let recording = command.recording.borrow();
+        if dispatch {
+            if recording.pass.is_some() || recording.compute_pipeline.is_none() { return invalid(); }
+        } else {
+            let pass = recording.pass.as_ref().ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
+            let pipeline = recording.pipeline.as_ref().ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
+            if pipeline.flags != vk::PipelineBindPoint::GRAPHICS.as_raw() as u32
+                || !compatible_pass(&pipeline.deps.borrow()[1], pass)
+                || !recording.viewport && pipeline.static_states.get() & 1 == 0
+                || !recording.scissor && pipeline.static_states.get() & 2 == 0
+                || indexed && recording.index.is_none()
+                || pipeline.vertex_inputs.borrow().iter().any(|v|
+                    v.extent != 0 && !recording.vertices.contains_key(&v.binding))
+            { return invalid(); }
+        }
+        // GPU-written arguments stay on the GPU. No mapped-memory readback,
+        // count expansion, descriptor rescan or extra publication barrier.
+        let raw = vk::CommandBuffer::from_raw(command.raw);
+        let source = vk::Buffer::from_raw(buffer.raw);
+        unsafe {
+            if dispatch { device.native.cmd_dispatch_indirect(raw, source, a[3]); }
+            else if indexed { device.native.cmd_draw_indexed_indirect(raw, source, a[3], count as u32, a[5] as u32); }
+            else { device.native.cmd_draw_indirect(raw, source, a[3], count as u32, a[5] as u32); }
+        }
+        command.retain(buffer);
+        Ok(())
+    }
     fn native_layout(&self, raw: u64, initial: bool) -> Result<vk::ImageLayout> {
         let value = layout(raw, initial)?;
         Ok(
@@ -1086,8 +1143,8 @@ impl Backend {
                     && (image.image_flags.get() & 8 == 0
                         || is_depth_stencil(view_format)
                         || is_depth_stencil(shape.format)
-                        || texel_size(view_format.as_raw() as u64)
-                            != texel_size(shape.format.as_raw() as u64))
+                        || block_layout(view_format.as_raw() as u64)
+                            != block_layout(shape.format.as_raw() as u64))
                     || image.deps.borrow().is_empty()
                         && image.swapchain.borrow().is_none()
                         && image.wayland_pool.borrow().is_none()
@@ -1761,6 +1818,7 @@ impl Backend {
                         let shape = shape(&image)?;
                         if c.recording.borrow().pass.is_some()
                             || is_depth_stencil(shape.format)
+                            || compressed_block(shape.format.as_raw() as u64).is_some()
                             || image.flags & vk::ImageUsageFlags::TRANSFER_DST.as_raw() == 0
                             || (image.deps.borrow().is_empty()
                                 && image.swapchain.borrow().is_none()
@@ -2225,6 +2283,15 @@ impl Backend {
         Ok(())
     }
 }
+fn indirect_span(size: u64, offset: u64, count: u64, stride: u64, command_size: u64) -> Result<()> {
+    if !offset.is_multiple_of(4) || offset > size
+        || count > 1 && (!stride.is_multiple_of(4) || stride < command_size || stride > u32::MAX as u64)
+    { return invalid(); }
+    let bytes = if count == 0 { Some(0) } else if count == 1 { Some(command_size) }
+        else { (count - 1).checked_mul(stride).and_then(|n| n.checked_add(command_size)) };
+    if bytes.and_then(|n| offset.checked_add(n)).is_none_or(|end| end > size) { return invalid(); }
+    Ok(())
+}
 fn valid_viewport(v: &[f32], maintenance1: bool, dimensions: [u32; 2], bounds: [f32; 2]) -> bool {
     v.iter().all(|v| v.is_finite())
         && v[0] >= bounds[0]
@@ -2360,6 +2427,16 @@ fn checked_region(
     }
     Ok(layers)
 }
+fn checked_blocks(image: ImageShape, mip: u64, offset: &[u64], extent: &[u64]) -> Result<()> {
+    let Some((width, height, _)) = compressed_block(image.format.as_raw() as u64) else { return Ok(()) };
+    let edge = image.extent(mip)?;
+    for (axis, block) in [(0, width), (1, height)] {
+        if !offset[axis].is_multiple_of(block)
+            || !extent[axis].is_multiple_of(block) && offset[axis] + extent[axis] != edge[axis] as u64
+        { return invalid(); }
+    }
+    Ok(())
+}
 fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
     // Packed depth/stencil is transferred one aspect at a time: D32S8 uses
     // four bytes for depth and one for stencil, never eight bytes per aspect.
@@ -2374,8 +2451,11 @@ fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
     {
         return invalid();
     }
-    let row = if x[1] == 0 { x[10] } else { x[1] };
-    let height = if x[2] == 0 { x[11] } else { x[2] };
+    let (bw, bh, _) = block_layout(image.format.as_raw() as u64).unwrap();
+    checked_blocks(image, x[4], &x[7..10], &x[10..13])?;
+    if x[1] != 0 && !x[1].is_multiple_of(bw) || x[2] != 0 && !x[2].is_multiple_of(bh) { return invalid(); }
+    let row = (if x[1] == 0 { x[10] } else { x[1] }).div_ceil(bw);
+    let height = (if x[2] == 0 { x[11] } else { x[2] }).div_ceil(bh);
     // Array layers and volume slices both advance by bufferImageHeight rows.
     // The last row does not require its padding to exist in the buffer.
     let slices = x[6]
@@ -2383,9 +2463,9 @@ fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
         .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
     if (slices - 1)
         .checked_mul(height)
-        .and_then(|n| n.checked_add(x[11] - 1))
+        .and_then(|n| n.checked_add(x[11].div_ceil(bh) - 1))
         .and_then(|n| n.checked_mul(row))
-        .and_then(|n| n.checked_add(x[10]))
+        .and_then(|n| n.checked_add(x[10].div_ceil(bw)))
         .and_then(|n| n.checked_mul(bytes))
         .and_then(|n| n.checked_add(x[0]))
         .is_none_or(|n| n > buffer_size)
@@ -2398,13 +2478,15 @@ fn checked_image_copy(x: &[u64], src: ImageShape, dst: ImageShape) -> Result<vk:
     let depth = is_depth_stencil(src.format);
     if depth != is_depth_stencil(dst.format)
         || depth && src.format != dst.format
-        || texel_size(src.format.as_raw() as u64) != texel_size(dst.format.as_raw() as u64)
+        || block_layout(src.format.as_raw() as u64) != block_layout(dst.format.as_raw() as u64)
         || (src.ty == vk::ImageType::TYPE_3D) != (dst.ty == vk::ImageType::TYPE_3D)
     {
         return unsupported();
     }
     let src_sub = checked_region(src, &x[..4], &x[4..7], &x[14..17])?;
     let dst_sub = checked_region(dst, &x[7..11], &x[11..14], &x[14..17])?;
+    checked_blocks(src, x[1], &x[4..7], &x[14..17])?;
+    checked_blocks(dst, x[8], &x[11..14], &x[14..17])?;
     if src_sub.layer_count != dst_sub.layer_count || src_sub.aspect_mask != dst_sub.aspect_mask {
         return invalid();
     }
@@ -3044,10 +3126,42 @@ mod tests {
             format(110).is_err(),
             "64-bit channels remain outside the profile"
         );
-        assert!(
-            format(131).is_err(),
-            "compressed block copies need separate footprints"
-        );
+        assert_eq!(compressed_block(131), Some((4, 4, 8)));
+    }
+    #[test]
+    fn compressed_copy_footprints_use_blocks_mip_edges_and_array_strides() {
+        for raw in 131..=184 {
+            let (bw, bh, bytes) = compressed_block(raw).unwrap();
+            let mut image = ImageShape::d2((bw + 1) as u32, (bh + 1) as u32, format(raw).unwrap());
+            image.layers = 2;
+            let region = [0, 0, 0, 1, 0, 0, 2, 0, 0, 0, bw + 1, bh + 1, 1];
+            assert!(checked_copy(&region, image, 8 * bytes).is_ok(), "format {raw}");
+            assert!(checked_copy(&region, image, 8 * bytes - 1).is_err());
+            let mut padded = region;
+            padded[1] = 3 * bw; padded[2] = 3 * bh;
+            assert!(checked_copy(&padded, image, 14 * bytes).is_ok());
+            assert!(checked_copy(&padded, image, 14 * bytes - 1).is_err());
+            let mut partial = region;
+            partial[7] = bw; partial[8] = bh; partial[10] = 1; partial[11] = 1;
+            assert!(checked_copy(&partial, image, 2 * bytes).is_ok());
+            for (field, value) in [(0, 4), (1, bw + 1), (2, bh + 1), (7, 1), (8, 1), (10, 1), (11, 1)] {
+                let mut bad = region; bad[field] = value;
+                assert!(checked_copy(&bad, image, u64::MAX).is_err(), "format {raw}, field {field}");
+            }
+            image.mips = 2;
+            let mip = [0, 0, 0, 1, 1, 0, 1, 0, 0, 0, bw.div_ceil(2), bh.div_ceil(2), 1];
+            assert!(checked_copy(&mip, image, bytes).is_ok());
+        }
+    }
+    #[test]
+    fn indirect_arguments_keep_vulkan_zero_and_single_draw_stride_rules() {
+        assert!(indirect_span(64, 64, 0, 3, 16).is_ok());
+        assert!(indirect_span(16, 0, 1, 3, 16).is_ok());
+        assert!(indirect_span(40, 0, 2, 20, 20).is_ok());
+        assert!(indirect_span(39, 0, 2, 20, 20).is_err());
+        assert!(indirect_span(64, 2, 1, 0, 12).is_err());
+        assert!(indirect_span(64, 0, 2, 12, 16).is_err());
+        assert!(indirect_span(u64::MAX, 0, u64::MAX, 16, 16).is_err());
     }
     #[test]
     fn packed_depth_stencil_aspects_and_exact_copy_footprints() {
