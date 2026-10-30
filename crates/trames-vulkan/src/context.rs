@@ -53,12 +53,30 @@ impl Lease<'_> {
         size: u64,
         authenticated: Option<(trames_wayland::Server, u64)>,
     ) -> Call {
+        self.invoke_with_images(memory, operation, address, size, authenticated, None)
+    }
+    pub fn invoke_with_images(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        operation: u64,
+        address: u64,
+        size: u64,
+        authenticated: Option<(trames_wayland::Server, u64)>,
+        images: Option<&Arc<dyn trames_graphics::ImageFds>>,
+    ) -> Call {
         let backend = &mut self.backend.as_mut().unwrap().0;
         if matches!(operation, 110 | 111) {
             backend.authenticate_wayland(authenticated);
         }
+        let image_call = matches!(operation, 14 | 240..=242);
+        if image_call {
+            backend.authenticate_images(images.cloned());
+        }
         let before = backend.transfers;
         let result = backend.invoke(memory, operation, address, size);
+        if image_call {
+            backend.authenticate_images(None);
+        }
         let after = backend.transfers;
         (result, after.since(before))
     }
@@ -120,6 +138,18 @@ impl Context {
     ) -> Call {
         self.lock()
             .invoke(memory, operation, address, size, authenticated)
+    }
+    pub fn invoke_with_images(
+        &self,
+        memory: &mut impl CpuMemory,
+        operation: u64,
+        address: u64,
+        size: u64,
+        authenticated: Option<(trames_wayland::Server, u64)>,
+        images: Option<&Arc<dyn trames_graphics::ImageFds>>,
+    ) -> Call {
+        self.lock()
+            .invoke_with_images(memory, operation, address, size, authenticated, images)
     }
     pub fn poll(&self, memory: &mut impl CpuMemory, job: u64) -> Result<Option<u64>, MemoryError> {
         self.lock().poll(memory, job)

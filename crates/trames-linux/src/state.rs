@@ -1216,6 +1216,8 @@ impl Linux {
                         0xb703 => Ok(kind),
                         _ => Err(Errno(25)),
                     }
+                } else if self.vfs.is_render_device(a[0] as u32)? {
+                    self.render_ioctl(a[1], a[2], memory)
                 } else if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
                     self.network_ioctl(a, memory)
                 } else {

@@ -422,6 +422,7 @@ pub(crate) struct Kernel<C: Cpu> {
     next_timer: i32,
     native: trames_accel::native::Registry,
     gpu: RefCell<BTreeMap<u64, trames_vulkan::Context>>,
+    video: RefCell<BTreeMap<u64, trames_video::Context>>,
     gpu_budget: trames_vulkan::Budget,
     gpu_display: trames_vulkan::Display,
     gpu_compiles: u64,
@@ -490,6 +491,62 @@ impl<C: Cpu> Kernel<C> {
         function: u64,
         a: [u64; 3],
     ) -> Result<Option<trames_accel::native::Return>, trames_accel::native::Error> {
+        if module == trames_video::PROFILE {
+            if !accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE) {
+                return Err(trames_accel::native::Error::InvalidEntry);
+            }
+            self.native
+                .authorize_stateful(&p.memory, pc, module, function)?;
+            if matches!(
+                a[0],
+                trames_video::EXPORT_FRAME | trames_video::ALLOCATE_IMAGE
+            ) {
+                let files = p.linux.vfs.image_fds();
+                let value = crate::video::image_call(
+                    &self.video_context(p),
+                    &*files,
+                    &mut p.memory,
+                    a[0],
+                    a[1],
+                    a[2],
+                )
+                .map_err(trames_accel::native::Error::Memory)?;
+                return Ok(Some(trames_accel::native::Return {
+                    value,
+                    fallback: false,
+                }));
+            }
+            let notify = if a[0] == trames_video::CREATE_SURFACE && a[2] == 128 {
+                let fd = p
+                    .memory
+                    .read_u64(a[1])
+                    .map_err(trames_accel::native::Error::Memory)?;
+                match u32::try_from(fd)
+                    .ok()
+                    .and_then(|fd| p.linux.vfs.native_event(fd).ok())
+                {
+                    Some(event) => {
+                        Some(std::sync::Arc::new(move || event.notify()) as trames_video::Notify)
+                    }
+                    None => {
+                        return Ok(Some(trames_accel::native::Return {
+                            value: (-22i64) as u64,
+                            fallback: false,
+                        }))
+                    }
+                }
+            } else {
+                None
+            };
+            let value = self
+                .video_context(p)
+                .invoke(&mut p.memory, a[0], a[1], a[2], notify)
+                .map_err(trames_accel::native::Error::Memory)?;
+            return Ok(Some(trames_accel::native::Return {
+                value,
+                fallback: false,
+            }));
+        }
         if module != trames_vulkan::PROFILE {
             return self
                 .native
@@ -516,7 +573,15 @@ impl<C: Cpu> Kernel<C> {
         } else {
             None
         };
-        let (value, transfers) = backend.invoke(&mut p.memory, a[0], a[1], a[2], authenticated);
+        let images = matches!(a[0], 14 | 240..=242).then(|| p.linux.vfs.image_fds());
+        let (value, transfers) = backend.invoke_with_images(
+            &mut p.memory,
+            a[0],
+            a[1],
+            a[2],
+            authenticated,
+            images.as_ref(),
+        );
         self.gpu_transfers.merge(transfers);
         let value = value.map_err(trames_accel::native::Error::Memory)?;
         let value = match value {
@@ -565,6 +630,9 @@ impl<C: Cpu> Kernel<C> {
             fallback: false,
         }))
     }
+    fn video_context(&self, p: &Process<C>) -> trames_video::Context {
+        self.video.borrow_mut().entry(p.vm_id).or_default().clone()
+    }
     fn gpu_context(&self, p: &Process<C>) -> trames_vulkan::Context {
         self.gpu
             .borrow_mut()
@@ -572,6 +640,7 @@ impl<C: Cpu> Kernel<C> {
             .or_insert_with(|| {
                 trames_vulkan::Context::new(
                     trames_vulkan::Backend::with_budget(self.gpu_budget.clone())
+                        .with_native_images()
                         .with_display(self.gpu_display.clone())
                         .with_wayland(p.linux.vfs.wayland_server()),
                 )
@@ -929,6 +998,7 @@ impl<C: Cpu> Kernel<C> {
             .any(|other| other.vm_id == p.vm_id && !matches!(other.state, State::Zombie(_)))
         {
             self.gpu.borrow_mut().remove(&p.vm_id);
+            self.video.borrow_mut().remove(&p.vm_id);
         }
         p.linux.vfs.set_lock_owner(p.tgid);
         let live = |t: &&Process<C>| !matches!(t.state, State::Zombie(_));
@@ -1577,6 +1647,11 @@ impl<C: Cpu> Kernel<C> {
                         trames_accel::native::AUXV_KEY,
                         trames_accel::native::PROFILE,
                     ),
+                    video_accelerator: accelerated(
+                        p,
+                        trames_video::AUXV_KEY,
+                        trames_video::PROFILE,
+                    ),
                     vulkan_accelerator: accelerated(
                         p,
                         trames_vulkan::AUXV_KEY,
@@ -2214,6 +2289,7 @@ impl<C: Cpu> Kernel<C> {
                     .any(|other| other.vm_id == old_vm && !matches!(other.state, State::Zombie(_)))
                 {
                     self.gpu.borrow_mut().remove(&old_vm);
+                    self.video.borrow_mut().remove(&old_vm);
                 }
                 Ok(None)
             }
@@ -3822,11 +3898,13 @@ impl<C: Cpu> Kernel<C> {
         let began = Instant::now();
         for (id, _, view) in views {
             let p = &self.processes[&id];
-            let gpu = accelerated(p, trames_vulkan::AUXV_KEY, trames_vulkan::PROFILE).then(|| {
-                crate::gpu::Authority {
-                    context: self.gpu_context(p),
-                    auth: p.linux.vfs.wayland_auth_snapshot(),
-                }
+            let gpu = (accelerated(p, trames_vulkan::AUXV_KEY, trames_vulkan::PROFILE)
+                || accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE))
+            .then(|| crate::gpu::Authority {
+                context: self.gpu_context(p),
+                video: self.video_context(p),
+                images: Some(p.linux.vfs.image_fds()),
+                auth: p.linux.vfs.wayland_auth_snapshot(),
             });
             let p = self.processes.get_mut(&id).expect("cohort process");
             let waiting = if let State::Futex { wait, deadline } = &p.state {
@@ -4826,6 +4904,7 @@ pub(super) fn run<C: Cpu>(
         next_timer: 1,
         native: trames_accel::native::Registry::default(),
         gpu: RefCell::new(BTreeMap::new()),
+        video: RefCell::new(BTreeMap::new()),
         gpu_budget: runtime.memory_limits.gpu_budget(),
         gpu_display: runtime.vulkan_display.clone(),
         gpu_compiles: 0,
@@ -6190,6 +6269,7 @@ mod tests {
             next_timer: 1,
             native: trames_accel::native::Registry::default(),
             gpu: RefCell::new(BTreeMap::new()),
+            video: RefCell::new(BTreeMap::new()),
             gpu_budget: trames_vulkan::Budget::default(),
             gpu_display: trames_vulkan::Display::default(),
             gpu_compiles: 0,

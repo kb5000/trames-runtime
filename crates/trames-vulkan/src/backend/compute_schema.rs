@@ -157,6 +157,8 @@ compute_properties! {
     PhysicalDeviceMultiviewProperties, 1 << 24 => [max_multiview_view_count, max_multiview_instance_index];
     PhysicalDeviceDepthStencilResolveProperties, 1 << 26 => [supported_depth_resolve_modes.as_raw(), supported_stencil_resolve_modes.as_raw(), independent_resolve_none, independent_resolve];
 }
+// c_char is signed on Apple and unsigned on AArch64 Linux.
+#[allow(clippy::unnecessary_cast)]
 fn query_aggregate_properties(caps: &mut Capabilities, query: &ash::khr::get_physical_device_properties2::Instance, physical: vk::PhysicalDevice) {
     if caps.api >= vk::API_VERSION_1_1 {
         let mut native = vk::PhysicalDeviceVulkan11Properties::default();

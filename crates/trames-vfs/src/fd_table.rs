@@ -5,14 +5,14 @@ use super::*;
 use std::sync::Mutex;
 
 #[derive(Clone)]
-enum SlotOpen {
+pub(super) enum SlotOpen {
     Shared(Arc<SharedOpenDescription>),
     Owner(usize),
 }
 #[derive(Clone)]
-struct Slot {
-    open: SlotOpen,
-    cloexec: CloseOnExec,
+pub(super) struct Slot {
+    pub(super) open: SlotOpen,
+    pub(super) cloexec: CloseOnExec,
 }
 impl Slot {
     fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
@@ -38,12 +38,12 @@ impl Slot {
     }
 }
 #[derive(Default)]
-struct Membership {
-    entries: Mutex<MembershipEntries>,
+pub(super) struct Membership {
+    pub(super) entries: Mutex<MembershipEntries>,
     revision: AtomicU64,
 }
 #[derive(Default)]
-struct MembershipEntries {
+pub(super) struct MembershipEntries {
     slots: BTreeMap<u32, Slot>,
     wayland: Option<PreparedWayland>,
 }
@@ -61,12 +61,15 @@ impl std::ops::DerefMut for MembershipEntries {
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
 /// owner slots carry no worker endpoint/control authority.
 #[derive(Clone, Default)]
-pub struct SharedFiles(Arc<Membership>);
+pub struct SharedFiles(pub(super) Arc<Membership>);
 #[derive(Clone)]
 pub struct SharedFd {
     open: Arc<SharedOpenDescription>,
 }
 impl SharedFd {
+    pub(super) fn native_image(&self) -> Option<Arc<dyn trames_graphics::Image>> {
+        self.open.native_image.clone()
+    }
     pub(super) fn new(open: Arc<SharedOpenDescription>) -> Self {
         Self { open }
     }
@@ -101,7 +104,8 @@ impl SharedFd {
         // Named FIFO descriptions keep their pathname kind, but their poll
         // state and subscriptions still belong to the real pipe resource.
         let fd = DirectFd::shared_byte(&self.open).or_else(|| {
-            matches!(self.open.kind, FdKind::Node(_)).then(|| DirectFd::regular_poll(&self.open))
+            (self.open.native_image.is_some() || matches!(self.open.kind, FdKind::Node(_)))
+                .then(|| DirectFd::regular_poll(&self.open))
         })?;
         Some(fd.with_ofd(self))
     }
@@ -150,7 +154,7 @@ impl SharedFiles {
         )?;
         Ok(0)
     }
-    fn changed(&self, entries: &mut MembershipEntries) {
+    pub(super) fn changed(&self, entries: &mut MembershipEntries) {
         self.0.revision.fetch_add(1, Ordering::Relaxed);
         // Called under the membership lock by owner and worker mutations.
         // Only retained host capabilities are retired here; no VFS callback.

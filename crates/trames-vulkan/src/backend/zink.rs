@@ -50,6 +50,9 @@ impl Capabilities {
             compute: compute::Capabilities::query(instance, physical, &ext),
             ..Self::default()
         };
+        if cfg!(target_vendor = "apple") && has(ash::ext::metal_objects::NAME) {
+            result.bits |= external::CAPABILITY;
+        }
         if has(ash::khr::maintenance1::NAME) {
             result.bits |= MAINTENANCE1;
         }

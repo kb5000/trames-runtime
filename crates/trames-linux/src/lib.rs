@@ -13,6 +13,7 @@ pub use direct::{
 };
 mod file_calls;
 mod heap;
+mod render;
 pub use heap::ProgramBreak;
 mod network;
 mod network_batch;

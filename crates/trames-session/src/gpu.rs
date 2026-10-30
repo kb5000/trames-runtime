@@ -12,12 +12,16 @@ use trames_vulkan::{Context, Invocation};
 #[derive(Clone)]
 pub(super) struct Authority {
     pub context: Context,
+    pub video: trames_video::Context,
+    pub images: Option<Arc<dyn trames_graphics::ImageFds>>,
     pub auth: WaylandAuth,
 }
 impl From<Context> for Authority {
     fn from(context: Context) -> Self {
         Self {
             context,
+            video: Default::default(),
+            images: None,
             auth: Default::default(),
         }
     }
@@ -154,12 +158,13 @@ impl Pending {
                 } else {
                     None
                 };
-            let (value, transfers) = lease.invoke(
+            let (value, transfers) = lease.invoke_with_images(
                 memory,
                 self.call.operation,
                 self.call.args[1],
                 self.call.args[2],
                 authenticated,
+                authority.images.as_ref(),
             );
             stats.record(self.call.pc, self.call.operation, &value, transfers);
             match value {

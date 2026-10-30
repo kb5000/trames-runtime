@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+trames-graphics = { path = "../trames-graphics" }
 trames-shared = { path = "../trames-shared" }
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
 trames-wayland = { path = "../trames-wayland" }

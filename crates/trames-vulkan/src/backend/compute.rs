@@ -182,13 +182,12 @@ impl Capabilities {
             return unsupported();
         }
         for &(bit, name, _) in EXTENSIONS {
-            if bits & bit != 0 {
-                if !names
+            if bits & bit != 0
+                && !names
                     .iter()
                     .any(|&n| unsafe { std::ffi::CStr::from_ptr(n) == name })
-                {
-                    names.push(name.as_ptr());
-                }
+            {
+                names.push(name.as_ptr());
             }
         }
         Ok(())

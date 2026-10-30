@@ -28,6 +28,8 @@ mod directory;
 mod disk_io;
 pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob, DiskSync, DiskSyncJob};
 mod direct_io;
+mod native_images;
+pub use direct_io::NativeEvent;
 mod file_data;
 mod file_io;
 use direct_io::PipeResource;
@@ -166,6 +168,7 @@ struct OpenDescription {
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Endpoint/namespace control projections above still retain owner ownership.
 struct SharedOpenDescription {
+    native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
     control: Option<events::SharedControl>,
     id: u64,
@@ -210,7 +213,11 @@ impl Drop for OpenDescription {
 }
 impl Drop for SharedOpenDescription {
     fn drop(&mut self) {
-        if self.pipe.is_some() || self.kernel_log.is_some() || self.control.is_some() {
+        if self.pipe.is_some()
+            || self.kernel_log.is_some()
+            || self.control.is_some()
+            || self.native_image.is_some()
+        {
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
         drop(self.notification.take());
@@ -670,6 +677,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
                             read_node: None,
@@ -963,6 +971,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
                             read_node: None,
@@ -1964,6 +1973,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
                         control: None,
                         read_node,
@@ -2164,6 +2174,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
                             read_node: None,
@@ -2686,6 +2697,13 @@ impl Vfs {
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
+        if let Some(image) = &o.native_image {
+            return match (offset, whence) {
+                (0, 0) => Ok(0),
+                (0, 2) => Ok(image.info().size),
+                _ => Err(Errno(22)),
+            };
+        }
         if matches!(o.anonymous, Some(events::Anonymous::Signal { .. })) {
             return Ok(o.position);
         }
@@ -2849,6 +2867,20 @@ impl Vfs {
         self.stat_open(&open)
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
+        if let Some(image) = &o.native_image {
+            let mut stat = [0; 128];
+            let info = image.info();
+            stat[..8].copy_from_slice(&16u64.to_le_bytes());
+            stat[8..16].copy_from_slice(&o.id.to_le_bytes());
+            stat[16..20].copy_from_slice(&0o100600u32.to_le_bytes());
+            stat[20..24].copy_from_slice(&1u32.to_le_bytes());
+            stat[24..28].copy_from_slice(&o.owner.0.to_le_bytes());
+            stat[28..32].copy_from_slice(&o.owner.1.to_le_bytes());
+            stat[48..56].copy_from_slice(&info.size.to_le_bytes());
+            stat[56..60].copy_from_slice(&4096u32.to_le_bytes());
+            stat[64..72].copy_from_slice(&info.size.div_ceil(512).to_le_bytes());
+            return Ok(stat);
+        }
         if let Some(n) = o.metadata_node() {
             let mut stat = self.stat_node(&n.borrow(), o.mount.as_ref())?;
             if let Some(source) = &o.read_node {

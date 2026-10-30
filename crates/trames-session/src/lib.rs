@@ -13,6 +13,7 @@ mod process;
 mod run_queue;
 mod signal_actions;
 mod terminal;
+mod video;
 mod worker_syscalls;
 mod workers;
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -102,6 +103,8 @@ pub struct RuntimeOptions {
     pub native_allocator: bool,
     /// Experimental standard Vulkan ICD compute bridge; host opt-in only.
     pub vulkan_accelerator: bool,
+    /// VideoToolbox-backed guest VA-API; independent of the GPU execution profile.
+    pub video_accelerator: bool,
 }
 
 pub use trames_linux::image::{STACK_SIZE, STACK_TOP};
@@ -293,6 +296,14 @@ fn initial_stack_bytes<C: Cpu>(
 ) -> Result<u64, RuntimeError> {
     let mut extra = vec![
         (
+            trames_video::AUXV_KEY,
+            if options.video_accelerator {
+                trames_video::PROFILE
+            } else {
+                0
+            },
+        ),
+        (
             trames_vulkan::AUXV_KEY,
             if options.vulkan_accelerator {
                 trames_vulkan::PROFILE
@@ -396,6 +407,9 @@ impl<C: Cpu> Runtime<C> {
         exec_filename: Option<&[u8]>,
     ) -> Result<Self, RuntimeError> {
         options.memory_limits.validate()?;
+        if options.video_accelerator {
+            vfs.enable_video_device();
+        }
         let mut elf =
             trames_elf::load_with_interpreter(bytes, options.memory_limits.per_process, |path| {
                 vfs.executable(path).map_err(|e| ElfError::Interpreter(e.0))
@@ -450,6 +464,7 @@ impl<C: Cpu> Runtime<C> {
         let mut cpu = C::new(elf.start_entry, sp);
         cpu.set_native_calls(options.pure_accelerator);
         cpu.set_vulkan_calls(options.vulkan_accelerator);
+        cpu.set_video_calls(options.video_accelerator);
         Ok(Self {
             memory_limits: options.memory_limits,
             vulkan_display: VulkanDisplay::default(),

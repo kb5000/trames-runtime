@@ -186,6 +186,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
                         control: None,
                         read_node: None,

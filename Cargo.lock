@@ -677,6 +677,13 @@ name = "trames-execution"
 version = "1.3.0"
 
 [[package]]
+name = "trames-graphics"
+version = "1.3.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "trames-kernel"
 version = "1.3.0"
 dependencies = [
@@ -727,11 +734,13 @@ dependencies = [
  "trames-elf",
  "trames-engine",
  "trames-execution",
+ "trames-graphics",
  "trames-kernel",
  "trames-linux",
  "trames-memory",
  "trames-net",
  "trames-vfs",
+ "trames-video",
  "trames-vulkan",
  "trames-wayland",
 ]
@@ -750,6 +759,7 @@ version = "1.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "trames-bridge",
+ "trames-graphics",
  "trames-memory",
  "trames-net",
  "trames-shared",
@@ -757,10 +767,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trames-video"
+version = "1.3.0"
+dependencies = [
+ "cc",
+ "trames-graphics",
+ "trames-memory",
+]
+
+[[package]]
 name = "trames-vulkan"
 version = "1.3.0"
 dependencies = [
  "ash",
+ "trames-graphics",
  "trames-memory",
  "trames-shared",
  "trames-wayland",

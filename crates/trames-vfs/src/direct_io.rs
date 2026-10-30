@@ -5,6 +5,17 @@ use super::*;
 use crate::readiness::Readiness;
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 
+/// A retained event object for native asynchronous completions. It carries no
+/// guest descriptor-table borrow or guest pointer, and does not resolve a reused FD.
+#[derive(Clone)]
+pub struct NativeEvent(Arc<EventCounter>);
+impl NativeEvent {
+    pub fn notify(&self) {
+        // Saturation already leaves the level-triggered descriptor readable.
+        let _ = self.0.write(&1u64.to_le_bytes());
+    }
+}
+
 pub(super) struct EventCounter {
     count: AtomicU64,
     semaphore: bool,
@@ -799,6 +810,16 @@ impl DirectFds {
     }
 }
 impl Vfs {
+    pub fn native_event(&self, fd: u32) -> Result<NativeEvent> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        match &open.control {
+            Some(events::SharedControl::Event(counter)) if open.flags.get() & O_PATH == 0 => {
+                Ok(NativeEvent(counter.clone()))
+            }
+            _ => Err(Errno(22)),
+        }
+    }
     /// Legacy record readers consume each nonempty iovec independently.
     /// A single inotify event cannot be split across two short destinations.
     pub fn readv_records(&self, fd: u32) -> Result<bool> {
@@ -1041,6 +1062,19 @@ mod tests {
             vfs.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(),
             vec![(1, 123)]
         );
+    }
+    #[test]
+    fn native_completion_retains_the_original_event_after_close_and_fd_reuse() {
+        let mut vfs = Vfs::default();
+        let fd = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        let event = vfs.native_event(fd).unwrap();
+        let old = vfs.direct_descriptors().get(fd).unwrap();
+        vfs.close(fd).unwrap();
+        let reused = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        assert_eq!(fd, reused);
+        std::thread::spawn(move || event.notify()).join().unwrap();
+        assert_eq!(old.read(8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(vfs.read(reused, 8), Err(Errno(11)));
     }
     #[test]
     fn atomic_eventfd_and_semaphore_preserve_concurrent_counts() {

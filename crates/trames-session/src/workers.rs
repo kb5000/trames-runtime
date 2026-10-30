@@ -732,7 +732,18 @@ impl<C: Cpu> Pool<C> {
                                 work.cpu.clear_exclusive();
                                 let args = [work.cpu.x(0), work.cpu.x(1), work.cpu.x(2)];
                                 let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && trames_vulkan::Context::worker_operation(args[0]) && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
-                                let native = if let Some(authority) = gpu {
+                                let video = work.gpu.as_ref().filter(|_| *module == trames_video::PROFILE && args[0] != trames_video::CREATE_SURFACE);
+                                let native = if let Some(authority) = video {
+                                    registry.authorize_stateful(work.memory.as_deref().expect("worker view"), *pc, *module, *function)
+                                        .and_then(|()| {
+                                            let memory=work.memory.as_deref_mut().expect("worker view");
+                                            if matches!(args[0],trames_video::EXPORT_FRAME|trames_video::ALLOCATE_IMAGE) {
+                                                crate::video::image_call(&authority.video,&**authority.images.as_ref().expect("native image FD authority"),memory,args[0],args[1],args[2])
+                                            } else {authority.video.invoke(memory,args[0],args[1],args[2],None)}
+                                        }
+                                        .map(|value| trames_accel::native::Return { value, fallback: false })
+                                        .map_err(trames_accel::native::Error::Memory))
+                                } else if let Some(authority) = gpu {
                                     match registry.authorize_stateful(work.memory.as_deref().expect("worker view"), *pc, *module, *function) {
                                         Err(error) => Err(error),
                                         Ok(()) => if let Some(epoch) = &epoch {

@@ -95,8 +95,12 @@ impl Backend {
             }
             228 => {
                 let memory = self.object(a[1], Kind::Memory)?;
-                let committed = unsafe {
-                    d.get_device_memory_commitment(vk::DeviceMemory::from_raw(memory.raw))
+                let committed = if memory.external.borrow().is_some() {
+                    memory.size
+                } else {
+                    unsafe {
+                        d.get_device_memory_commitment(vk::DeviceMemory::from_raw(memory.raw))
+                    }
                 };
                 write(m, a[2], &committed.to_le_bytes())?;
             }
@@ -113,8 +117,21 @@ impl Backend {
                     .aspect_mask(vk::ImageAspectFlags::from_raw(a[2] as u32))
                     .mip_level(a[3] as u32)
                     .array_layer(a[4] as u32);
-                let layout =
-                    unsafe { d.get_image_subresource_layout(vk::Image::from_raw(image.raw), sub) };
+                let layout = if let Some(r) = self.imported_requirements(&image) {
+                    let extra = image.external.borrow();
+                    let Some(external::Resource::Image(extra)) = extra.as_deref() else {
+                        unreachable!()
+                    };
+                    vk::SubresourceLayout {
+                        offset: extra.offset,
+                        size: r.size,
+                        row_pitch: extra.pitch,
+                        array_pitch: r.size,
+                        depth_pitch: r.size,
+                    }
+                } else {
+                    unsafe { d.get_image_subresource_layout(vk::Image::from_raw(image.raw), sub) }
+                };
                 let values = [
                     layout.offset,
                     layout.size,
@@ -157,6 +174,22 @@ impl Backend {
                     self.object(a[2], if a[1] == 1 { Kind::Buffer } else { Kind::Image })?;
                 let mut dedicated = vk::MemoryDedicatedRequirements::default();
                 let mut result = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+                if a[1] == 2 {
+                    let image = self.object(a[2], Kind::Image)?;
+                    if let Some(r) = self.imported_requirements(&image) {
+                        let mut bytes = r.size.to_le_bytes().to_vec();
+                        bytes.extend(r.alignment.to_le_bytes());
+                        bytes.extend(r.memory_type_bits.to_le_bytes());
+                        bytes.extend([0; 4]);
+                        write(m, a[3], &bytes)?;
+                        if a[4] != 0 {
+                            let mut bytes = 1u32.to_le_bytes().to_vec();
+                            bytes.extend(1u32.to_le_bytes());
+                            write(m, a[4], &bytes)?;
+                        }
+                        return Ok(());
+                    }
+                }
                 unsafe {
                     if a[1] == 1 {
                         d.get_buffer_memory_requirements2(

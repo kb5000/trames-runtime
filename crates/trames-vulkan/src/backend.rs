@@ -20,6 +20,7 @@ mod compute;
 mod core_commands;
 mod core_features;
 mod descriptors;
+mod external;
 mod feedback;
 mod graphics;
 mod shared_memory;
@@ -81,6 +82,8 @@ impl Drop for Instance {
     }
 }
 struct Device {
+    metal_device: usize,
+    external_image_memory_types: u32,
     host_alignment: u64,
     anisotropy: bool,
     features: vk::PhysicalDeviceFeatures,
@@ -162,6 +165,7 @@ impl Drop for ObjectLease {
     }
 }
 struct Object {
+    external: RefCell<Option<Box<external::Resource>>>,
     host_allocation: RefCell<Option<Arc<shared_memory::Allocation>>>,
     kind: Kind,
     raw: u64,
@@ -232,6 +236,12 @@ impl Drop for Object {
                     d.destroy_framebuffer(vk::Framebuffer::from_raw(self.raw), None)
                 }
                 Kind::Memory => {
+                    if matches!(
+                        self.external.get_mut().as_deref(),
+                        Some(external::Resource::Memory { .. })
+                    ) {
+                        return;
+                    }
                     if self.mapped.get() != 0 {
                         d.unmap_memory(vk::DeviceMemory::from_raw(self.raw));
                     }
@@ -425,6 +435,8 @@ struct Compile {
 }
 
 pub struct Backend {
+    native_images: bool,
+    image_files: Option<Arc<dyn trames_graphics::ImageFds>>,
     completion: Arc<trames_shared::Readiness>,
     waits: BTreeMap<u64, completion::Wait>,
     budget: crate::Budget,
@@ -466,6 +478,8 @@ impl Backend {
     pub fn with_budget(budget: crate::Budget) -> Self {
         Self {
             budget,
+            native_images: false,
+            image_files: None,
             domain: DOMAIN.fetch_add(1, Ordering::Relaxed),
             next: 1,
             instance: None,
@@ -498,6 +512,13 @@ impl Backend {
     pub fn with_display(mut self, display: crate::Display) -> Self {
         self.display = display;
         self
+    }
+    pub fn with_native_images(mut self) -> Self {
+        self.native_images = true;
+        self
+    }
+    pub fn authenticate_images(&mut self, files: Option<Arc<dyn trames_graphics::ImageFds>>) {
+        self.image_files = files;
     }
     pub fn with_wayland(mut self, server: Option<trames_wayland::Server>) -> Self {
         self.wayland.server = server;
@@ -548,6 +569,7 @@ impl Backend {
     }
     fn put(&mut self, kind: Kind, raw: u64, deps: Vec<Rc<Object>>, size: u64, flags: u32) -> u64 {
         let object = Rc::new(Object {
+            external: RefCell::new(None),
             host_allocation: Default::default(),
             kind,
             raw,
@@ -820,6 +842,7 @@ impl Backend {
         let d = &device.native;
         let raw = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let fence = Rc::new(Object {
+            external: RefCell::new(None),
             host_allocation: Default::default(),
             kind: Kind::Fence,
             raw: raw.as_raw(),
@@ -1215,6 +1238,13 @@ impl Backend {
             if simulator {
                 info = info.push_next(&mut layer_settings);
             }
+            #[cfg(target_vendor = "apple")]
+            let mut metal = vk::ExportMetalObjectCreateInfoEXT::default()
+                .export_object_type(vk::ExportMetalObjectTypeFlagsEXT::METAL_DEVICE);
+            #[cfg(target_vendor = "apple")]
+            if self.native_images {
+                info = info.push_next(&mut metal);
+            }
             let native = unsafe { entry.create_instance(&info, None) }?;
             let instance = Arc::new(Instance {
                 native,
@@ -1235,6 +1265,9 @@ impl Backend {
                 })
                 .ok_or(Failure::Vk(vk::Result::ERROR_INITIALIZATION_FAILED))?;
             self.capabilities = zink::Capabilities::query(&instance, self.physical)?;
+            if !self.native_images {
+                self.capabilities.bits &= !external::CAPABILITY;
+            }
             self.wsi_enabled = a[1] != 0;
             self.instance = Some(instance);
             self.instance_id = self.id();
@@ -1507,7 +1540,9 @@ impl Backend {
                 if a[3] != 0 && !self.virtual_wsi {
                     names.push(ash::khr::swapchain::NAME.as_ptr());
                 }
-                if self.virtual_wsi && cfg!(target_vendor = "apple") {
+                if (self.virtual_wsi || self.capabilities.bits & external::CAPABILITY != 0)
+                    && cfg!(target_vendor = "apple")
+                {
                     if !ext.iter().any(|e|unsafe {std::ffi::CStr::from_ptr(e.extension_name.as_ptr())}==ash::ext::metal_objects::NAME){return unsupported();}
                     names.push(ash::ext::metal_objects::NAME.as_ptr());
                 }
@@ -1573,6 +1608,29 @@ impl Backend {
                 }
                 let info = compute.chain(a[6], info);
                 let native = unsafe { instance.native.create_device(self.physical, &info, None) }?;
+                #[allow(unused_mut)] // assigned only by the Apple driver export below
+                let mut metal_device = 0;
+                #[cfg(target_vendor = "apple")]
+                if self.capabilities.bits & external::CAPABILITY != 0 {
+                    let mut metal = vk::ExportMetalDeviceInfoEXT::default();
+                    let mut export = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut metal);
+                    let extension = ash::ext::metal_objects::Device::new(&instance.native, &native);
+                    unsafe {
+                        (extension.fp().export_metal_objects_ext)(native.handle(), &mut export)
+                    };
+                    metal_device = metal.mtl_device as usize;
+                }
+                let memory_properties = unsafe {
+                    instance
+                        .native
+                        .get_physical_device_memory_properties(self.physical)
+                };
+                let external_image_memory_types = (0..memory_properties.memory_type_count)
+                    .filter(|&i| {
+                        memory_properties.memory_types[i as usize].property_flags
+                            == vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    })
+                    .fold(0, |bits, i| bits | (1 << i));
                 self.queue = unsafe { native.get_device_queue(a[1] as u32, 0) };
                 self.family = a[1] as u32;
                 let limits = unsafe {
@@ -1582,6 +1640,8 @@ impl Backend {
                 }
                 .limits;
                 self.device = Some(Arc::new(Device {
+                    metal_device,
+                    external_image_memory_types,
                     host_alignment,
                     anisotropy: a[4] & 1 != 0,
                     features,
@@ -1659,6 +1719,7 @@ impl Backend {
         let dev = self.device.as_ref().unwrap().clone();
         let d = &dev.native;
         match op {
+            240..=242 => self.image_fd_call(m, op, a)?,
             112 => {
                 self.room(1)?;
                 output(m, a[1], 8)?;
@@ -1801,6 +1862,9 @@ impl Backend {
             14 => {
                 self.room(1)?;
                 output(m, a[3], 8)?;
+                if a[7] != 0 {
+                    return self.import_image_memory(m, a);
+                }
                 if a[1] == 0 || a[1] > self.budget.max_allocation() {
                     return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
                 }
@@ -1847,7 +1911,7 @@ impl Backend {
                 if flags.contains(
                     vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
                 ) && (a[5] == 0
-                    || dev.host_alignment != 0 && a[1].is_multiple_of(dev.host_alignment as u64))
+                    || dev.host_alignment != 0 && a[1].is_multiple_of(dev.host_alignment))
                 {
                     if let Some(Ok((raw, owner))) =
                         self.allocate_shared(&dev, a[1], a[2] as u32, a[4] as u32, shared_dedicated)
@@ -1893,6 +1957,9 @@ impl Backend {
                 self.remove(a[1], Kind::Memory)?;
             }
             16 => {
+                if self.object(a[2], Kind::Memory)?.external.borrow().is_some() {
+                    return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+                }
                 let b = self.object(a[1], Kind::Buffer)?;
                 let mem = self.object(a[2], Kind::Memory)?;
                 let r = unsafe { d.get_buffer_memory_requirements(vk::Buffer::from_raw(b.raw)) };
@@ -1920,6 +1987,9 @@ impl Backend {
                 b.retain(mem);
             }
             17 => {
+                if self.object(a[1], Kind::Memory)?.external.borrow().is_some() {
+                    return Err(vk::Result::ERROR_MEMORY_MAP_FAILED.into());
+                }
                 let mem = self.object(a[1], Kind::Memory)?;
                 if mem.mapped.get() != 0
                     || mem.flags & vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw() == 0

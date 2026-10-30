@@ -334,8 +334,7 @@ fn read_sme_records(
                     != sp
                         .checked_add((592 + offset + 48) as u64)
                         .ok_or(Errno(14))?
-                    || bytes < 16
-                    || bytes > 8192
+                    || !(16..=8192).contains(&bytes)
                     || bytes % 16 != 0
                 {
                     return Err(Errno(14));

@@ -333,6 +333,23 @@ mod tests {
         assert_eq!(v.write(fd, b"1\n"), Err(Errno(13)));
     }
     #[test]
+    fn render_device_discovery_requires_opt_in_and_has_linux_char_identity() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        assert_eq!(v.stat_at(AT_FDCWD, b"/dev/dri/renderD128"), Err(Errno(2)));
+        v.enable_video_device();
+        let fd = v.open_at(AT_FDCWD, b"/dev/dri/renderD128", 2, 0).unwrap();
+        let stat = v.stat_fd(fd).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o170000,
+            0o20000
+        );
+        assert_eq!(u64::from_le_bytes(stat[32..40].try_into().unwrap()), 0xe280);
+        assert!(v.is_render_device(fd).unwrap());
+        v.stat_at(AT_FDCWD, b"/sys/dev/char/226:128/device/drm")
+            .unwrap();
+    }
+    #[test]
     fn device_directory_enumerates_only_available_embedding_devices() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -595,6 +612,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) video_device: bool,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) nodes: BTreeMap<(u64, Vec<u8>), NodeRef>,
@@ -660,6 +678,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Render,
     Unregistered(u32),
     Kmsg,
     Zero,
@@ -688,6 +707,7 @@ impl Device {
                 0x109 => Self::Urandom,
                 0x10b => Self::Kmsg,
                 0x502 => Self::Ptmx,
+                0xe280 => Self::Render,
                 _ => Self::Unregistered(value),
             }),
         }
@@ -695,6 +715,7 @@ impl Device {
     pub(super) fn rdev(self) -> u64 {
         match self {
             Self::Unregistered(rdev) => rdev as u64,
+            Self::Render => 0xe280,
             Self::Kmsg => 0x10b,
             Self::Zero => 0x105,
             Self::Full => 0x107,
@@ -711,6 +732,7 @@ impl Device {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
             Self::Unregistered(_) => return Err(Errno(6)),
+            Self::Render => return Err(Errno(22)),
             Self::Zero | Self::Full => {}
             Self::Random | Self::Urandom => getrandom::fill(&mut data).map_err(|_| Errno(5))?,
             Self::Kmsg => return Err(Errno(29)),
@@ -724,6 +746,7 @@ impl Device {
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
             Self::Unregistered(_) => Err(Errno(6)),
+            Self::Render => Err(Errno(22)),
             Self::Full => Err(Errno(28)),
             Self::Kmsg => Err(Errno(29)),
             Self::Pts(_, _) => Err(Errno(11)),
@@ -753,6 +776,17 @@ fn comm(p: &ProcessInfo) -> Vec<u8> {
     name
 }
 impl Vfs {
+    pub fn is_render_device(&self, fd: u32) -> Result<bool> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        Ok(open
+            .node
+            .as_ref()
+            .is_some_and(|n| matches!(n.borrow().content, Content::Device(Device::Render))))
+    }
+    pub fn enable_video_device(&self) {
+        self.pseudo.borrow_mut().video_device = true;
+    }
     pub fn set_runtime_info(&mut self, pid: u32, mut runtime: RuntimeInfo) {
         self.pid = pid;
         if let Some(p) = runtime.processes.iter_mut().find(|p| p.pid == pid) {
@@ -862,6 +896,9 @@ impl Vfs {
                             .as_ref()
                             .and_then(|n| self.path_of(n).ok())
                             .unwrap_or_else(|| b"/dev/pts/0".to_vec()),
+                        FdKind::Anonymous if o.native_image.is_some() => {
+                            b"anon_inode:[trames-image]".to_vec()
+                        }
                         FdKind::Anonymous => o
                             .anonymous
                             .as_ref()
@@ -976,6 +1013,7 @@ impl Vfs {
         };
         Ok(Some(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
                 read_node: None,
@@ -1119,7 +1157,11 @@ impl Vfs {
         if flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
         }
-        if original.socket.is_some() || original.local.is_some() || original.anonymous.is_some() {
+        if original.socket.is_some()
+            || original.local.is_some()
+            || original.anonymous.is_some()
+            || original.native_image.is_some()
+        {
             return Err(Errno(6));
         }
         if flags & O_DIRECTORY != 0
@@ -1207,6 +1249,7 @@ impl Vfs {
         };
         let descriptor = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
                 read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
@@ -1286,9 +1329,12 @@ impl Vfs {
             || o.local.is_some()
             || (o.pipe.is_some() && o.node.is_none())
             || o.anonymous.is_some()
+            || o.native_image.is_some()
         {
             out.fill(0);
-            let magic = if o.namespace.is_some() {
+            let magic = if o.native_image.is_some() {
+                0x444d4142u64
+            } else if o.namespace.is_some() {
                 0x6e736673u64
             } else if o.anonymous.is_some() {
                 0x09041934u64
@@ -1432,6 +1478,18 @@ impl Vfs {
             }
         }
         match path {
+            b"/dev/dri" | b"/sys/dev/char" | b"/sys/class/drm" |
+            b"/sys/devices/platform" | b"/sys/devices/platform/trames" |
+            b"/sys/devices/platform/trames/drm" | b"/sys/devices/platform/trames/drm/renderD128" |
+            b"/sys/bus" | b"/sys/bus/platform" if self.pseudo.borrow().video_device => return Ok(directory()),
+            b"/dev/dri/renderD128" if self.pseudo.borrow().video_device => return Ok(Some((Content::Device(Device::Render), 0o20666))),
+            b"/sys/dev/char/226:128" | b"/sys/class/drm/renderD128" if self.pseudo.borrow().video_device => return Ok(link(b"../../devices/platform/trames/drm/renderD128".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/device" if self.pseudo.borrow().video_device => return Ok(link(b"../..".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/subsystem" if self.pseudo.borrow().video_device => return Ok(link(b"../../../../../class/drm".to_vec())),
+            b"/sys/devices/platform/trames/subsystem" if self.pseudo.borrow().video_device => return Ok(link(b"../../../bus/platform".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/dev" if self.pseudo.borrow().video_device => return Ok(regular(b"226:128\n".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/uevent" if self.pseudo.borrow().video_device => return Ok(regular(b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n".to_vec())),
+            b"/sys/devices/platform/trames/uevent" if self.pseudo.borrow().video_device => return Ok(regular(b"DRIVER=trames\nMODALIAS=platform:trames\n".to_vec())),
             b"/proc" | b"/sys" | b"/sys/fs" | b"/sys/fs/cgroup" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
             b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
@@ -2127,6 +2185,20 @@ impl Vfs {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
+            b"/dev/dri" | b"/sys/class/drm" => vec![b"renderD128".to_vec()],
+            b"/sys/dev/char" => vec![b"226:128".to_vec()],
+            b"/sys/devices/platform" => vec![b"trames".to_vec()],
+            b"/sys/devices/platform/trames" => {
+                vec![b"drm".to_vec(), b"subsystem".to_vec(), b"uevent".to_vec()]
+            }
+            b"/sys/devices/platform/trames/drm" => vec![b"renderD128".to_vec()],
+            b"/sys/devices/platform/trames/drm/renderD128" => vec![
+                b"dev".to_vec(),
+                b"device".to_vec(),
+                b"subsystem".to_vec(),
+                b"uevent".to_vec(),
+            ],
+            b"/sys/bus" => vec![b"platform".to_vec()],
             b"/sys/fs" => vec![b"cgroup".to_vec()],
             b"/sys" => vec![
                 b"fs".to_vec(),
@@ -2240,6 +2312,16 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
+        if self.pseudo.borrow().video_device {
+            match path {
+                b"/dev" => names.push(b"dri".to_vec()),
+                b"/sys" => names.push(b"bus".to_vec()),
+                b"/sys/class" => names.push(b"drm".to_vec()),
+                b"/sys/dev" => names.push(b"char".to_vec()),
+                b"/sys/devices" => names.push(b"platform".to_vec()),
+                _ => {}
+            }
+        }
         if path == b"/dev" && self.bridge.is_some() {
             names.push(b"trames-bridge".to_vec());
         }

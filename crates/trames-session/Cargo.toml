@@ -17,6 +17,8 @@ trames-linux = { path = "../trames-linux" }
 trames-vfs = { path = "../trames-vfs" }
 trames-net = { path = "../trames-net" }
 trames-vulkan = { path = "../trames-vulkan" }
+trames-video = { path = "../trames-video" }
+trames-graphics = { path = "../trames-graphics" }
 
 [lints]
 workspace = true

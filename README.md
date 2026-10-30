@@ -33,7 +33,7 @@ Mac instantiates hardware task state. Each execution thread owns its engine, so
 an HVF vCPU never acquires `Send` or migrates between host threads. Interpreter
 instructions keep their existing decoder, deferred flags and memory path.
 
-Native acceleration and Vulkan services also live here because they operate on
+Native acceleration, Vulkan and video services also live here because they operate on
 guest memory/values without a decoder dependency. Products opt into their guest
 profiles independently; the hardware shell executes original ARM64 code.
 
@@ -45,3 +45,15 @@ CI must run that target as well as standalone common tests.
 
 Live-anonymous host-pressure paging remains tracked by
 [issue 44](https://github.com/kb5000/trames-ipad/issues/44).
+
+`trames-video` implements the opt-in `0x10007` VA-API bridge to VideoToolbox.
+`trames-graphics` owns host-neutral image-plane and FD authority interfaces;
+Apple buffer/Metal types remain behind its Apple backend. The guest libva driver
+is built with `scripts/build-video-guest.sh` on ARM64 Linux. Progressive H.264
+8-bit 4:2:0 (POC0/2) is implemented; other codecs are not advertised.
+Native callbacks publish owned frames through existing eventfd readiness and
+guest waits yield execution slots. Image FDs use the existing files_struct, dup
+and SCM_RIGHTS lifetime model, and the Vulkan profile imports their retained
+plane textures without copying decoded pixels. See the
+[architecture and measured acceptance](https://github.com/kb5000/trames-ipad/blob/main/docs/architecture/vaapi.md)
+for exact limitations, Mesa adapters, Firefox setup and integration fixtures.

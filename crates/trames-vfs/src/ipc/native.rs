@@ -142,6 +142,7 @@ impl OpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Self {
         Self {
             shared: Arc::new(SharedOpenDescription {
+                native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
                 read_node: None,
@@ -628,6 +629,7 @@ impl Vfs {
         drop(fs);
         Ok(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
                 read_node: None,

@@ -543,6 +543,7 @@ impl Backend {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)] // Mirrors VkPhysicalDeviceImageFormatInfo2 and its view/stencil inputs.
     fn native_image_limits(
         &self,
         f: vk::Format,
@@ -652,7 +653,9 @@ impl Backend {
         {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED.into());
         }
-        let extra = if a[8] == u64::MAX {
+        let extra = if a[8] == u64::MAX - 1 {
+            words64(m, a[7], 8)?
+        } else if a[8] == u64::MAX {
             words64(m, a[7], 3)?
         } else {
             vec![a[7], a[8], 0]
@@ -1229,7 +1232,7 @@ impl Backend {
         let stride = match stride {
             0 => 5,
             6 => 6,
-            10 => 10,
+            10 | 12 => stride as usize,
             _ => return unsupported(),
         };
         let wire = words64(m, address, bounded(count, 64)? * stride)?;
@@ -1247,7 +1250,18 @@ impl Backend {
                 return invalid();
             }
             let s = shape(&image)?;
-            let range = if stride == 10 {
+            if stride == 12 {
+                for &family in &b[10..12] {
+                    if family != u64::from(vk::QUEUE_FAMILY_IGNORED)
+                        && family != u64::from(self.family)
+                        && !(image.external.borrow().is_some()
+                            && matches!(family, 0xfffffffd | 0xfffffffe))
+                    {
+                        return unsupported();
+                    }
+                }
+            }
+            let range = if stride == 10 || stride == 12 {
                 s.range(&b[5..10])?
             } else {
                 let mut r = s.whole();
@@ -1315,7 +1329,7 @@ impl Backend {
                         samples: sample_count(a[14].max(1))?,
                         tiling: match a[15] {
                             0 => vk::ImageTiling::OPTIMAL,
-                            1 => vk::ImageTiling::LINEAR,
+                            1 | 1000158000 => vk::ImageTiling::LINEAR,
                             _ => return unsupported(),
                         },
                     }
@@ -1336,7 +1350,9 @@ impl Backend {
                 {
                     return unsupported();
                 }
-                let extra = if a[8] == u64::MAX {
+                let extra = if a[8] == u64::MAX - 1 {
+                    words64(m, a[7], 8)?
+                } else if a[8] == u64::MAX {
                     words64(m, a[7], 3)?
                 } else {
                     vec![a[7], a[8], 0]
@@ -1348,13 +1364,41 @@ impl Backend {
                 if !formats.is_empty() && !device.format_list {
                     return unsupported();
                 }
+                let external = extra.len() == 8 && extra[3] != 0;
+                if external
+                    && (device.metal_device == 0
+                        || extra[3] != 512
+                        || extra[4] != 0
+                        || extra[6] != 0
+                        || extra[7] != 1
+                        || s.ty != vk::ImageType::TYPE_2D
+                        || s.mips != 1
+                        || s.layers != 1
+                        || s.samples != vk::SampleCountFlags::TYPE_1
+                        || trames_graphics::Format::from_vk(f.as_raw() as u32).is_none()
+                        || extra[5]
+                            < u64::from(s.width)
+                                * u64::from(
+                                    trames_graphics::Format::from_vk(f.as_raw() as u32)
+                                        .unwrap()
+                                        .bytes(),
+                                )
+                        || extra[5].checked_mul(u64::from(s.height)).is_none())
+                {
+                    return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+                }
+                let host_tiling = if external {
+                    vk::ImageTiling::OPTIMAL
+                } else {
+                    s.tiling
+                };
                 let limits = self.native_image_limits(
                     f,
                     s.ty,
                     u,
                     vk::ImageCreateFlags::from_raw(a[9] as u32),
                     &formats,
-                    s.tiling,
+                    host_tiling,
                     extra[2] as u32,
                 )?;
                 if s.width > limits.max_extent.width
@@ -1387,7 +1431,7 @@ impl Backend {
                     .mip_levels(s.mips)
                     .array_layers(s.layers)
                     .samples(s.samples)
-                    .tiling(s.tiling)
+                    .tiling(host_tiling)
                     .usage(u)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .initial_layout(match a[6] {
@@ -1404,6 +1448,13 @@ impl Backend {
                 }
                 let raw = unsafe { d.create_image(&info, None) }?;
                 let id = self.put(Kind::Image, raw.as_raw(), vec![], 0, u.as_raw());
+                if external {
+                    *self.objects[&id].external.borrow_mut() =
+                        Some(Box::new(external::Resource::Image(external::ImageLayout {
+                            pitch: extra[5],
+                            offset: extra[6],
+                        })));
+                }
                 self.objects[&id].image_flags.set(a[9] as u32);
                 self.objects[&id].image.set(Some(s));
                 self.objects[&id].stencil_usage.set(extra[2] as u32);
@@ -1415,7 +1466,11 @@ impl Backend {
                 if image.kind == Kind::SwapchainImage {
                     return invalid();
                 }
-                let r = unsafe { d.get_image_memory_requirements(vk::Image::from_raw(image.raw)) };
+                let r = self
+                    .imported_requirements(&image)
+                    .unwrap_or_else(|| unsafe {
+                        d.get_image_memory_requirements(vk::Image::from_raw(image.raw))
+                    });
                 let mut bytes = Vec::new();
                 bytes.extend(r.size.to_le_bytes());
                 bytes.extend(r.alignment.to_le_bytes());
@@ -1425,11 +1480,22 @@ impl Backend {
             }
             63 => {
                 let image = self.object(a[1], Kind::Image)?;
+                if image.external.borrow().is_some() {
+                    drop(image);
+                    return self.bind_native_image(a[1], a[2], a[3]);
+                }
                 let memory = self.object(a[2], Kind::Memory)?;
+                if memory.external.borrow().is_some() {
+                    return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+                }
                 if image.kind == Kind::SwapchainImage {
                     return invalid();
                 }
-                let r = unsafe { d.get_image_memory_requirements(vk::Image::from_raw(image.raw)) };
+                let r = self
+                    .imported_requirements(&image)
+                    .unwrap_or_else(|| unsafe {
+                        d.get_image_memory_requirements(vk::Image::from_raw(image.raw))
+                    });
                 if image.swapchain.borrow().is_some()
                     || image.wayland_pool.borrow().is_some()
                     || !image.deps.borrow().is_empty()
