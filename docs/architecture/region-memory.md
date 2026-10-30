@@ -555,6 +555,39 @@ Real-worker conformance sends wl_display.sync after dispatch and verifies the
 and with every CPU parked. A third case starts with already-blocked tasks. The
 old active-peer case rebuilds eight cohorts for eight host control checks.
 
+### Filtered memory calls
+
+Firefox content sandboxes install immutable seccomp BPF chains. Treating every
+filtered mapping call as an unsupported worker operation defeats mm-local
+checkpoints: a sandbox's ordinary madvise/mmap/unmap/protect can then return the
+entire cohort. Workers now request the existing mm checkpoint before evaluating
+these filtered structural calls. A brk size query retains its existing local
+query route. Unfiltered additive mmap keeps its append-only service route.
+
+The mm owner evaluates the original number, post-SVC PC and all six arguments
+once, after its related Views have quiesced and before syscall effects. An ALLOW
+result executes through the same syscall implementation in that local domain.
+Other actions return the checkpoint for an ordinary full join before applying
+ERRNO, SIGSYS, broker or kill behavior. A one-entry cached result is bound to the
+exact number/PC/arguments, strict mode and immutable filter-chain identity.
+Changing an entry or installing/TSYNCing another chain invalidates it. The joined
+call consumes this result; neither BPF nor its actions are replayed. Fork never
+inherits a pending result. No filter policy or sandbox preference is relaxed.
+
+Filtered calls do not use the hardware exclusive coalescing window: a subsequent
+entry must make its own decision, and a denial cannot apply cross-task actions
+inside a partially quiesced cohort. Existing unfiltered batching is unchanged.
+Real-worker negative controls show the old filtered route stopping an unrelated
+VM; the fixed route preserves that VM's progress while joining same-mm peers.
+Additional checks cover one BPF evaluation for allowed/denied calls, unchanged
+memory on denial and rejection of cached results after entry/policy changes.
+
+Profiling-only cohort-return histograms count pending syscall/native occurrences
+at whole-cohort joins. Several pending calls can share a join, and an mm request
+can be caught by another task's stop. These counts are not unique initiating
+causes, wall-time shares or local syscall totals. Mac --metrics also reports
+cohort rounds, host control checks, services and preparation/dispatch/drain time.
+
 ## Local mapping commits and backing range history
 
 A content-change domain is separate from a quiescence dependency. Local mapping

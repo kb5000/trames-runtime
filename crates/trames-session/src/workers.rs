@@ -561,6 +561,17 @@ impl<C: Cpu> Pool<C> {
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
+                                // A filtered mapping entry has no worker-side
+                                // effects. Evaluate BPF once on its mm owner;
+                                // only an allowed call may mutate that domain.
+                                if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
+                                    && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0)
+                                    && crate::worker_syscalls::vm_call(work.cpu.x(8) as u32)
+                                    && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
+                                {
+                                    vm_checkpoint = true;
+                                    break result;
+                                }
                                 if let Some(snapshot) = work
                                     .syscalls
                                     .as_ref()

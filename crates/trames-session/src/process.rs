@@ -111,6 +111,7 @@ pub(crate) struct Process<C: Cpu> {
     file_size_limit: Rc<Cell<(u64, u64)>>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
+    seccomp_entry: Option<seccomp::EntryDecision>,
 }
 impl<C: Cpu> Process<C> {
     fn shares_wait_resources(&self, fds: &trames_vfs::DirectFds) -> bool {
@@ -325,6 +326,7 @@ impl<C: Cpu> Process<C> {
             file_size_limit: Rc::new(Cell::new(self.file_size_limit.get())),
             oom: Arc::new(self.oom.fork()),
             seccomp: self.seccomp.clone(),
+            seccomp_entry: None,
         })
     }
 }
@@ -351,6 +353,8 @@ pub(crate) struct Kernel<C: Cpu> {
     futex_ready: Vec<std::sync::Arc<crate::futex::Ticket>>,
     parallel_memory: trames_memory::parallel::Registry,
     parallel_rounds: u64,
+    cohort_return_syscalls: BTreeMap<u32, u64>,
+    cohort_return_native: BTreeMap<(u64, u64), u64>,
     vm_checkpoint_groups: u64,
     vm_checkpoint_spaces: u64,
     vm_checkpoint_calls: [u64; 8],
@@ -4133,6 +4137,25 @@ impl<C: Cpu> Kernel<C> {
             self.decode_misses += done.after.misses - done.before.misses;
             self.instructions_decoded += done.after.instructions - done.before.instructions;
             let outcome = done.outcome.expect("checked worker completion");
+            if self.profile_syscalls {
+                match &outcome {
+                    SliceOutcome::Syscall { .. } => {
+                        *self
+                            .cohort_return_syscalls
+                            .entry(p.cpu.x(8) as u32)
+                            .or_default() += 1;
+                    }
+                    SliceOutcome::NativeCall {
+                        module, function, ..
+                    } => {
+                        *self
+                            .cohort_return_native
+                            .entry((*module, *function))
+                            .or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
             self.instructions += done.instructions;
             self.worker_chunks += done.chunks;
             self.worker_syscalls += done.syscalls;
@@ -4682,6 +4705,7 @@ pub(super) fn run<C: Cpu>(
         file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
+        seccomp_entry: None,
     };
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
@@ -4696,6 +4720,8 @@ pub(super) fn run<C: Cpu>(
         futex_ready: Vec::new(),
         parallel_memory: trames_memory::parallel::Registry::default(),
         parallel_rounds: 0,
+        cohort_return_syscalls: BTreeMap::new(),
+        cohort_return_native: BTreeMap::new(),
         vm_checkpoint_groups: 0,
         vm_checkpoint_spaces: 0,
         vm_checkpoint_calls: [0; 8],
@@ -4782,6 +4808,8 @@ pub(super) fn run<C: Cpu>(
         parallel_snapshots: kernel.parallel_memory.metrics,
         cpu_count: kernel.cpu_count,
         parallel_rounds: kernel.parallel_rounds,
+        cohort_return_syscalls: kernel.cohort_return_syscalls,
+        cohort_return_native: kernel.cohort_return_native,
         vm_checkpoint_groups: kernel.vm_checkpoint_groups,
         vm_checkpoint_spaces: kernel.vm_checkpoint_spaces,
         vm_checkpoint_calls: kernel.vm_checkpoint_calls,
@@ -5887,6 +5915,7 @@ mod tests {
             file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
+            seccomp_entry: None,
         })
     }
     #[test]
@@ -6055,6 +6084,8 @@ mod tests {
             futex_ready: Vec::new(),
             parallel_memory: trames_memory::parallel::Registry::default(),
             parallel_rounds: 0,
+            cohort_return_syscalls: BTreeMap::new(),
+            cohort_return_native: BTreeMap::new(),
             vm_checkpoint_groups: 0,
             vm_checkpoint_spaces: 0,
             vm_checkpoint_calls: [0; 8],

@@ -58,9 +58,25 @@ impl<C: Cpu> Kernel<C> {
                 assert!(matches!(outcome, SliceOutcome::Syscall { .. }));
                 let pid = job.work.pid;
                 let mut p = self.processes.remove(&pid).expect("paused task");
-                assert!(!p.linux.trace && p.seccomp.mode() == 0);
+                assert!(!p.linux.trace);
                 p.cpu = std::mem::take(&mut job.work.cpu);
                 p.state = State::Ready;
+                if p.seccomp.mode() != 0 {
+                    let entry =
+                        p.seccomp
+                            .entry_decision(p.cpu.x(8) as u32, p.cpu.pc(), args(&p.cpu));
+                    let allowed = entry.allowed();
+                    p.seccomp_entry = Some(entry);
+                    if !allowed {
+                        // Signal/kill/broker effects retain their full owner
+                        // boundary. Preserve this entry and its BPF result for
+                        // the ordinary joined call, without replaying either.
+                        job.checkpoint = Some(outcome);
+                        job.work.cpu = std::mem::take(&mut p.cpu);
+                        self.processes.insert(pid, p);
+                        return Ok(false);
+                    }
+                }
                 let mut extra = false;
                 let mut used_window = false;
                 loop {
@@ -86,7 +102,11 @@ impl<C: Cpu> Kernel<C> {
                     self.vm_local_syscalls += 1;
                     self.vm_checkpoint_batch[2] += u64::from(extra);
                     let remaining = lease_deadline.saturating_duration_since(Instant::now());
-                    if !batch || remaining.is_zero() || epoch.control.stopped() {
+                    if !batch
+                        || p.seccomp.mode() != 0
+                        || remaining.is_zero()
+                        || epoch.control.stopped()
+                    {
                         break;
                     }
                     let cpu_began = Instant::now();
@@ -385,12 +405,29 @@ mod tests {
         assert_eq!(k.parallel_rounds, 1, "the cohort remains live");
     }
 
+    fn install_filter(k: &mut Kernel<Cpu>, p: &mut Process, action: u32) {
+        p.memory
+            .write_array(0x1000, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        let mut instruction = [0u8; 8];
+        instruction[..2].copy_from_slice(&6u16.to_le_bytes());
+        instruction[4..].copy_from_slice(&action.to_le_bytes());
+        p.memory.write_array(0x1100, instruction).unwrap();
+        p.linux.vfs.credentials.caps.no_new_privs = true;
+        assert_eq!(k.seccomp(p, [1, 0, 0x1000, 0, 0, 0]), Ok(0));
+    }
     fn commit_while_peer_runs(relation: u8) {
+        commit_with_filter(relation, false);
+    }
+    fn commit_with_filter(relation: u8, filtered: bool) {
         let mut k = super::super::tests::kernel();
         k.cpu_count = if relation == 0 { 2 } else { 3 };
         k.workers = crate::workers::Pool::new(k.cpu_count);
         k.per_cpu = vec![Duration::ZERO; k.cpu_count];
         let mut a = super::super::tests::process();
+        if filtered {
+            install_filter(&mut k, &mut a, 0x7fff_0000);
+        }
         let (entered, wait) = mpsc::sync_channel(0);
         let (release, receive) = mpsc::sync_channel(0);
         map(
@@ -525,13 +562,51 @@ mod tests {
         assert_eq!(k.vm_checkpoint_spaces, if relation == 1 { 2 } else { 1 });
         assert_eq!(k.vm_local_syscalls, 1);
         assert_eq!(k.parallel_rounds, 1);
-        assert!(
-            !k.processes[&1]
-                .memory
-                .regions()
-                .iter()
-                .any(|(a, b, _)| *a <= 0x8000 && *b > 0x8000)
-        );
+        if filtered {
+            assert_eq!(k.processes[&1].seccomp.evaluations(), 1);
+        }
+        assert!(!k.processes[&1]
+            .memory
+            .regions()
+            .iter()
+            .any(|(a, b, _)| *a <= 0x8000 && *b > 0x8000));
+    }
+    #[test]
+    fn allowed_filtered_mapping_keeps_an_unrelated_cpu_running() {
+        commit_with_filter(0, true);
+    }
+    #[test]
+    fn allowed_filtered_mapping_quiesces_only_its_clone_vm_peers() {
+        commit_with_filter(2, true);
+    }
+    #[test]
+    fn denied_filtered_mapping_preserves_memory_and_applies_its_decision_once() {
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        let mut a = super::super::tests::process();
+        install_filter(&mut k, &mut a, 0x0005_000d); // ERRNO(EACCES)
+        code(&mut a, &[0xd4000001, 0x14000000]);
+        a.cpu.set_x(0, 0x8000);
+        a.cpu.set_x(1, PAGE_SIZE);
+        a.cpu.set_x(8, 215);
+        let mut b = super::super::tests::process();
+        code(&mut b, &[0x14000000]);
+        b.tgid = 2;
+        b.vm_id = 2;
+        b.affinity = 2;
+        k.processes.insert(1, a);
+        k.processes.insert(2, b);
+        assert!(k
+            .parallel_round(&mut trames_linux::CapturedOutput::default(), u64::MAX)
+            .unwrap());
+        let p = &k.processes[&1];
+        assert_eq!(p.cpu.x(0), error(Errno(13)));
+        assert!(p.memory.read_array::<1>(0x8000).is_ok());
+        assert_eq!(p.seccomp.evaluations(), 1);
+        assert!(p.seccomp_entry.is_none());
+        assert_eq!(k.vm_local_syscalls, 0);
     }
     #[test]
     fn vm_commit_keeps_an_unrelated_cpu_running_while_the_owner_blocks() {
@@ -601,6 +676,37 @@ mod tests {
             Err(RuntimeError::BudgetExceeded(_))
         ));
         assert_eq!(k.instructions, limit);
+    }
+    #[test]
+    fn cohort_return_profile_excludes_local_calls_and_disabled_profiling() {
+        for (profile, number, returned) in [
+            (false, 0xff00, false),
+            (true, 172, false),
+            (true, 0xff00, true),
+        ] {
+            let mut k = super::super::tests::kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(2);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.profile_syscalls = profile;
+            for id in 1..=2 {
+                let mut p = super::super::tests::process();
+                p.tgid = id;
+                p.vm_id = id as u64;
+                p.affinity = 1 << (id - 1);
+                code(&mut p, &[0xd4000001, 0x17ffffff]);
+                p.cpu.set_x(8, number);
+                k.processes.insert(id, p);
+            }
+            assert!(k
+                .parallel_round(&mut trames_linux::CapturedOutput::default(), 1000)
+                .unwrap());
+            assert_eq!(
+                k.cohort_return_syscalls.contains_key(&(number as u32)),
+                returned
+            );
+            assert!(k.cohort_return_native.is_empty());
+        }
     }
     fn native_bridge_retains_cohort(idle_peer: bool, start_parked: bool) {
         struct Roundtrip {

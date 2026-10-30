@@ -176,6 +176,11 @@ pub struct RuntimeMetrics {
     pub gpu_transfers: trames_vulkan::TransferMetrics,
     pub cpu_count: usize,
     pub parallel_rounds: u64,
+    /// Pending calls returned at a whole-cohort join, collected only with
+    /// profile_syscalls. Several pending calls can share one join; these are
+    /// occurrences, not unique first-stop causes or worker-local completions.
+    pub cohort_return_syscalls: std::collections::BTreeMap<u32, u64>,
+    pub cohort_return_native: std::collections::BTreeMap<(u64, u64), u64>,
     /// Mapping checkpoint groups and actual address spaces quiesced locally.
     pub vm_checkpoint_groups: u64,
     pub vm_checkpoint_spaces: u64,

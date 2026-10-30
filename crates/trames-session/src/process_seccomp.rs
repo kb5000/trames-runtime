@@ -24,6 +24,30 @@ pub(crate) struct Seccomp {
     // Immutable across a CPU epoch. Cloning a process/worker snapshot is O(1);
     // installation copies only the small chain of program handles after join.
     filters: Arc<Vec<Arc<Filter>>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
+    evaluations: Arc<std::sync::atomic::AtomicU64>,
+}
+/// A single immutable BPF result, bound to its exact architectural entry and
+/// filter chain. A deferred denial must not rerun BPF or apply actions locally.
+pub(super) struct EntryDecision {
+    policy: Seccomp,
+    number: u32,
+    pc: u64,
+    args: [u64; 6],
+    value: u32,
+}
+impl EntryDecision {
+    pub(super) fn allowed(&self) -> bool {
+        self.value & 0xffff_0000 == ALLOW
+    }
+    fn value_for(self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
+        (self.number == number
+            && self.pc == pc
+            && self.args == args
+            && self.policy.strict == policy.strict
+            && Arc::ptr_eq(&self.policy.filters, &policy.filters))
+        .then_some(self.value)
+    }
 }
 impl Seccomp {
     fn push(&mut self, filter: Arc<Filter>) {
@@ -53,7 +77,23 @@ impl Seccomp {
                 .zip(other.filters.iter())
                 .all(|(a, b)| Arc::ptr_eq(a, b))
     }
+    pub(super) fn entry_decision(&self, number: u32, pc: u64, args: [u64; 6]) -> EntryDecision {
+        EntryDecision {
+            policy: self.clone(),
+            number,
+            pc,
+            args,
+            value: self.decision(number, pc, args),
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(super) fn evaluations(&self) -> u64 {
+        self.evaluations.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn decision(&self, number: u32, pc: u64, args: [u64; 6]) -> u32 {
+        #[cfg(all(test, trames_interpreter_conformance))]
+        self.evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.strict {
             return if matches!(number, 63 | 64 | 93 | 139) {
                 ALLOW
@@ -303,7 +343,11 @@ impl<C: Cpu> Kernel<C> {
         number: u32,
         args: [u64; 6],
     ) -> bool {
-        let decision = p.seccomp.decision(number, p.cpu.pc(), args);
+        let decision = p
+            .seccomp_entry
+            .take()
+            .and_then(|entry| entry.value_for(&p.seccomp, number, p.cpu.pc(), args))
+            .unwrap_or_else(|| p.seccomp.decision(number, p.cpu.pc(), args));
         match decision & 0xffff_0000 {
             ALLOW => return false,
             0x0005_0000 => {
@@ -354,6 +398,50 @@ mod tests {
     type Kernel = crate::process::Kernel<Cpu>;
 
     use super::*;
+    #[test]
+    fn cached_mapping_decision_is_bound_to_entry_and_filter_identity() {
+        let mut policy = Seccomp::default();
+        policy.push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+        let args = [0x8000, trames_memory::PAGE_SIZE, 0, 0, 0, 0];
+        assert_eq!(
+            policy
+                .entry_decision(215, 0x4004, args)
+                .value_for(&policy, 215, 0x4004, args),
+            Some(ALLOW)
+        );
+        assert!(policy
+            .entry_decision(215, 0x4004, args)
+            .value_for(&policy, 233, 0x4004, args)
+            .is_none());
+        assert!(policy
+            .entry_decision(215, 0x4004, args)
+            .value_for(&policy, 215, 0x4008, args)
+            .is_none());
+        let mut changed = args;
+        changed[1] += trames_memory::PAGE_SIZE;
+        assert!(policy
+            .entry_decision(215, 0x4004, args)
+            .value_for(&policy, 215, 0x4004, changed)
+            .is_none());
+        let mut p = super::super::tests::process();
+        p.cpu.pc = 0x4004;
+        p.seccomp = policy.clone();
+        p.seccomp_entry = Some(policy.entry_decision(215, p.cpu.pc, args));
+        p.seccomp.push(Arc::new(
+            Filter::validate(vec![i(6, 0, 0, 0x0005_000d)]).unwrap(),
+        ));
+        let mut kernel = super::super::tests::kernel();
+        kernel.call(
+            1,
+            &mut p,
+            215,
+            args,
+            &mut trames_linux::CapturedOutput::default(),
+        );
+        assert_eq!(p.cpu.x(0), error(Errno(13)));
+        assert!(p.memory.read_array::<1>(0x8000).is_ok());
+        assert!(p.seccomp_entry.is_none());
+    }
     #[test]
     fn filtered_membership_changes_stay_joined_before_filter_evaluation_or_effects() {
         for decision in [ALLOW, 0x5007b] {
@@ -1158,10 +1246,12 @@ mod tests {
         let b = Arc::new(Filter::validate(vec![i(6, 0, 0, 0x50002)]).unwrap());
         let ancestor = Seccomp {
             strict: false,
+            evaluations: Arc::default(),
             filters: Arc::new(vec![a.clone()]),
         };
         let current = Seccomp {
             strict: false,
+            evaluations: Arc::default(),
             filters: Arc::new(vec![a, b]),
         };
         assert!(ancestor.ancestor_of(&current));
