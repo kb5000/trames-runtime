@@ -3,6 +3,90 @@
 //! boundaries. Pixel presentation remains an independent no-readback path.
 use super::*;
 
+/// Validated native resource binding, in VkDeviceMemory coordinates. Opaque
+/// allocation IDs never reuse a freed allocation's identity in this context.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Binding {
+    pub memory: u64,
+    pub offset: u64,
+    pub size: u64,
+}
+/// Conservative resource intervals, coalesced per allocation. This is only
+/// metadata: it owns no guest pointers, native allocations or execution locks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Scope(BTreeMap<u64, Vec<(u64, u64)>>);
+impl Scope {
+    pub(super) fn resources(objects: &[Rc<Object>]) -> Self {
+        let mut scope = Self::default();
+        for object in objects {
+            if let Some(binding) = object.memory_binding.get() {
+                scope.insert(
+                    binding.memory,
+                    binding.offset,
+                    binding.offset + binding.size,
+                );
+            }
+        }
+        scope
+    }
+    fn insert(&mut self, memory: u64, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
+        }
+        let ranges = self.0.entry(memory).or_default();
+        let first = ranges.partition_point(|&(_, hi)| hi < start);
+        let mut last = first;
+        while last < ranges.len() && ranges[last].0 <= end {
+            start = start.min(ranges[last].0);
+            end = end.max(ranges[last].1);
+            last += 1;
+        }
+        ranges.splice(first..last, [(start, end)]);
+    }
+    fn extend(&mut self, other: &Self) {
+        for (&memory, ranges) in &other.0 {
+            for &(start, end) in ranges {
+                self.insert(memory, start, end);
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, memory: u64) {
+        self.0.remove(&memory);
+    }
+    #[cfg(test)]
+    fn contains(&self, memory: u64) -> bool {
+        self.0.contains_key(&memory)
+    }
+    fn downloaded(&mut self, success: bool, pending: &Self) {
+        if !success {
+            return;
+        }
+        self.0.retain(|memory, ranges| {
+            let Some(producers) = pending.0.get(memory) else {
+                return false;
+            };
+            let (mut i, mut j) = (0, 0);
+            let mut kept = Vec::new();
+            while i < ranges.len() && j < producers.len() {
+                let (lo, hi) = ranges[i];
+                let (other_lo, other_hi) = producers[j];
+                let start = lo.max(other_lo);
+                let end = hi.min(other_hi);
+                if start < end {
+                    kept.push((start, end));
+                }
+                if hi <= other_hi {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            *ranges = kept;
+            !ranges.is_empty()
+        });
+    }
+}
+
 pub(super) struct CoherentBytes {
     bytes: Vec<u8>,
     budget: crate::Budget,
@@ -146,7 +230,12 @@ pub(super) fn synchronize(
     m.check(guest, len, if up { Access::Read } else { Access::Write })?;
     let native = (map.memory.mapped.get() as *mut u8).wrapping_add(offset as usize);
     let mut at = 0;
-    let mut metrics = TransferMetrics::default();
+    let mut metrics = TransferMetrics {
+        coherent_ranges: 1,
+        coherent_upload_scanned_bytes: if up { len as u64 } else { 0 },
+        coherent_download_scanned_bytes: if up { 0 } else { len as u64 },
+        ..Default::default()
+    };
     while at < len {
         let address = guest + at as u64;
         let n = (len - at)
@@ -169,27 +258,121 @@ pub(super) fn synchronize(
 }
 impl Backend {
     pub(super) fn record_transfer(&mut self, t: TransferMetrics) {
-        self.transfers.upload_bytes += t.upload_bytes;
-        self.transfers.download_bytes += t.download_bytes;
-        self.transfers.direct_bytes += t.direct_bytes;
-        self.transfers.buffered_bytes += t.buffered_bytes;
+        self.transfers.merge(t);
     }
-    pub(super) fn coherent_sync(&mut self, m: &mut impl CpuMemory, up: bool) -> Result<()> {
-        let mut totals = TransferMetrics::default();
-        for map in self.mappings.values_mut() {
-            let t = synchronize(map, m, map.offset, map.size, up)?;
-            totals.upload_bytes += t.upload_bytes;
-            totals.download_bytes += t.download_bytes;
-            totals.direct_bytes += t.direct_bytes;
-            totals.buffered_bytes += t.buffered_bytes;
+    /// Inspect only the mapping intersections actually reachable by submitted
+    /// commands. Buffer/image/view/descriptor dependencies are captured before
+    /// queue submission, including descriptor contents updated after recording.
+    pub(super) fn coherent_sync_scope(
+        &mut self,
+        m: &mut impl CpuMemory,
+        scope: &Scope,
+        up: bool,
+    ) -> Result<()> {
+        self.transfers.coherent_syncs += 1;
+        for (&memory, ranges) in &scope.0 {
+            for &(start, end) in ranges {
+                let Some(map) = self.mappings.get_mut(&memory) else {
+                    continue;
+                };
+                let start = start.max(map.offset);
+                let end = end.min(map.offset + map.size);
+                if start >= end {
+                    continue;
+                }
+                let t = synchronize(map, m, start, end - start, up)?;
+                self.record_transfer(t);
+            }
         }
-        self.record_transfer(totals);
         Ok(())
+    }
+    /// Keep touched coherent ranges until a successful host readback. Producers
+    /// still in flight keep their ranges dirty even if an earlier wait succeeds.
+    pub(super) fn coherent_submitted(&mut self, scope: &Scope) {
+        for (&memory, ranges) in &scope.0 {
+            if let Some(map) = self.mappings.get(&memory).filter(|m| m.coherent.is_some()) {
+                for &(start, end) in ranges {
+                    self.coherent_pending.insert(
+                        memory,
+                        start.max(map.offset),
+                        end.min(map.offset + map.size),
+                    );
+                }
+            }
+        }
+    }
+    pub(super) fn coherent_mapped(&mut self, memory: u64) {
+        self.coherent_pending.remove(memory);
+        // A mapping may be established after GPU work has already been queued.
+        // Its initial copy cannot stand in for those producers' later writes.
+        let mut scope = Scope::default();
+        for submission in &self.submissions {
+            if let Some(ranges) = submission.coherent_scope.0.get(&memory) {
+                for &(start, end) in ranges {
+                    scope.insert(memory, start, end);
+                }
+            }
+        }
+        self.coherent_submitted(&scope);
+    }
+    pub(super) fn coherent_download(&mut self, m: &mut impl CpuMemory) -> Result<()> {
+        let mut scope = std::mem::take(&mut self.coherent_pending);
+        let result = self.coherent_sync_scope(m, &scope, false);
+        scope.downloaded(result.is_ok(), &self.coherent_producers());
+        // On failure, earlier baseline runs may already have committed. Retain
+        // every outstanding interval so the remaining bytes can be retried.
+        self.coherent_pending.extend(&scope);
+        result
+    }
+    fn coherent_producers(&self) -> Scope {
+        let mut scope = Scope::default();
+        for submission in &self.submissions {
+            if !submission.commands_complete {
+                scope.extend(&submission.coherent_scope);
+            }
+        }
+        scope
+    }
+    pub(super) fn coherent_signal(&mut self, m: &mut impl CpuMemory) -> Result<()> {
+        self.coherent_sync_scope(m, &self.coherent_producers(), true)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binding_ranges_coalesce_aliases_without_joining_unrelated_allocations() {
+        let mut scope = Scope::default();
+        scope.insert(7, 4096, 8192);
+        scope.insert(7, 12288, 16384);
+        scope.insert(7, 7168, 12288);
+        scope.insert(8, 0, 4096);
+        scope.insert(7, 20000, 20000);
+        assert_eq!(scope.0[&7], [(4096, 16384)]);
+        assert_eq!(scope.0[&8], [(0, 4096)]);
+        scope.remove(7);
+        assert!(!scope.contains(7) && scope.contains(8));
+    }
+    #[test]
+    fn readback_keeps_inflight_producers_and_failure_retries_without_pinning_resources() {
+        let mut scope = Scope::default();
+        scope.insert(7, 1024, 4096);
+        scope.insert(8, 4096, 8192);
+        let original = scope.clone();
+        scope.downloaded(false, &Scope::default());
+        assert_eq!(scope, original);
+        let mut producer = Scope::default();
+        producer.insert(7, 2048, 3072);
+        scope.downloaded(true, &producer);
+        assert_eq!(scope.0[&7], [(2048, 3072)]);
+        assert!(!scope.contains(8));
+        // A later write by allocation 7 must still be considered on the next
+        // successful wait; only completion of its last producer retires it.
+        scope.insert(7, 3072, 4096);
+        assert_eq!(scope.0[&7], [(2048, 4096)]);
+        scope.downloaded(true, &Scope::default());
+        assert_eq!(scope, Scope::default());
+    }
     #[test]
     fn independent_cpu_inputs_and_gpu_outputs_do_not_overwrite_each_other() {
         let mut guest = [0u8; 16];

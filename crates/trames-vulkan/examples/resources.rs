@@ -190,6 +190,124 @@ fn object_budget() {
     object_budget_case(Budget::host_managed(), 5);
 }
 
+// Real native GPU work must not inspect unrelated mappings or the unused tail
+// of a pooled allocation. A later empty queue fence still exposes prior writes.
+fn coherent_scope_oracle() {
+    let mut b = Backend::new();
+    let mut m = Memory::new(2 << 20);
+    m.map(0x1000, 256 * PAGE_SIZE, Permissions::RW).unwrap();
+    call(&mut b, &mut m, 1, &[OUT]);
+    let instance = word(&m, OUT);
+    m.write(0x2080, &1u32.to_le_bytes()).unwrap();
+    call(&mut b, &mut m, 3, &[instance, 0x2080, OUT]);
+    let physical = word(&m, OUT);
+    call(&mut b, &mut m, 8, &[physical, 0, OUT]);
+    let dev = word(&m, OUT);
+    call(&mut b, &mut m, 10, &[dev, 0, 0, OUT]);
+    let queue = word(&m, OUT);
+    call(&mut b, &mut m, 11, &[dev, 256, 2, OUT]);
+    let used = word(&m, OUT);
+    call(&mut b, &mut m, 13, &[dev, used, 0x2100]);
+    let size = word(&m, 0x2100);
+    let align = word(&m, 0x2108);
+    let bits = word(&m, 0x2110) as u32;
+    let offset = (size.div_ceil(align) * align * 2).max(PAGE_SIZE * 2);
+    let allocation = offset + size * 2;
+    assert!(allocation < 0x40000);
+    call(&mut b, &mut m, 5, &[physical, 0x2500]);
+    let count = word(&m, 0x2500) as u32;
+    let ty = (0..count)
+        .find(|i| {
+            bits & (1 << i) != 0
+                && m.read_array::<4>(0x2504 + *i as u64 * 8)
+                    .is_ok_and(|b| u32::from_le_bytes(b) & 6 == 6)
+        })
+        .unwrap();
+    call(&mut b, &mut m, 14, &[dev, allocation, ty as u64, OUT]);
+    let memory = word(&m, OUT);
+    call(&mut b, &mut m, 16, &[dev, used, memory, offset]);
+    call(&mut b, &mut m, 17, &[dev, memory, 0, allocation, 0x30000]);
+    let (_unused, _) = buffer(&mut b, &mut m, dev, physical, 0x10000, 2, 0x80000);
+    m.write(0x30000, &[23]).unwrap();
+    m.write(0x80000, &[29]).unwrap();
+    call(&mut b, &mut m, 34, &[dev, 0, 2, OUT]);
+    let pool = word(&m, OUT);
+    call(&mut b, &mut m, 36, &[dev, pool, OUT]);
+    let cmd = word(&m, OUT);
+    call(&mut b, &mut m, 48, &[dev, 0, OUT]);
+    let fence = word(&m, OUT);
+    for round in 0..4 {
+        if round != 0 {
+            call(&mut b, &mut m, 50, &[dev, fence]);
+            call(&mut b, &mut m, 53, &[dev, pool, 0]);
+        }
+        if round == 1 {
+            // Neither unused mapping needs to be host-readable by this submit.
+            m.protect(0x80000, 0x10000, Permissions::NONE).unwrap();
+            m.protect(0x30000, PAGE_SIZE, Permissions::NONE).unwrap();
+        }
+        if round == 3 {
+            m.protect(0x30000, PAGE_SIZE, Permissions::RW).unwrap();
+            call(&mut b, &mut m, 18, &[dev, memory]);
+            call(&mut b, &mut m, 17, &[dev, memory, offset, size, 0x50000]);
+        }
+        call(&mut b, &mut m, 38, &[dev, cmd, 0]);
+        let expected = 0x1020_3040 + round;
+        call(&mut b, &mut m, 46, &[dev, cmd, used, 0, 256, expected]);
+        call(
+            &mut b,
+            &mut m,
+            44,
+            &[dev, cmd, 4096, 16384, 4096, 8192, 0, 0, 6],
+        );
+        call(&mut b, &mut m, 39, &[dev, cmd]);
+        words(&mut m, 0x3c00, &[cmd]);
+        words(&mut m, 0x3d00, &[0, 0, 0, 0x3c00, 1, 0, 0]);
+        let before = b.transfers;
+        call(
+            &mut b,
+            &mut m,
+            56,
+            &[dev, queue, 0x3d00, 1, if round == 2 { 0 } else { fence }],
+        );
+        if round == 2 {
+            call(&mut b, &mut m, 56, &[dev, queue, 0, 0, fence]);
+        }
+        poll(&mut b, &mut m, 51, &[dev, fence], 1);
+        for i in 0..64 {
+            let guest = if round == 3 {
+                0x50000
+            } else {
+                0x30000 + offset
+            };
+            assert_eq!(
+                m.read_array::<4>(guest + i * 4).unwrap(),
+                (expected as u32).to_le_bytes()
+            );
+        }
+        assert_eq!(
+            b.transfers.coherent_upload_scanned_bytes - before.coherent_upload_scanned_bytes,
+            size,
+            "only the bound range can be scanned during upload"
+        );
+        let after = b.transfers;
+        for _ in 0..16 {
+            call(&mut b, &mut m, 51, &[dev, fence]);
+        }
+        assert_eq!(
+            b.transfers.coherent_download_scanned_bytes, after.coherent_download_scanned_bytes,
+            "an already-published fence cannot rescan unchanged mappings"
+        );
+    }
+    m.protect(0x80000, 0x10000, Permissions::RW).unwrap();
+    m.protect(0x30000, PAGE_SIZE, Permissions::RW).unwrap();
+    assert_eq!(m.read_array::<1>(0x30000).unwrap(), [23]);
+    assert_eq!(m.read_array::<1>(0x80000).unwrap(), [29]);
+    call(&mut b, &mut m, 9, &[dev]);
+    call(&mut b, &mut m, 2, &[instance]);
+    println!("native-coherent-scope-ok: nonzero pooled binding, unrelated PROT_NONE mappings, partial remap, 256 GPU words, empty-submit fence and zero rescan on repeated fence status");
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--objects-only") {
         object_budget();
@@ -199,6 +317,7 @@ fn main() {
         allocation_budget();
         return;
     }
+    coherent_scope_oracle();
     let code = std::fs::read(
         std::env::args()
             .nth(1)
@@ -234,6 +353,7 @@ fn main() {
     let (src, _) = buffer(&mut b, &mut m, dev, physical, 256, 4, 0x8000);
     let (dst, _) = buffer(&mut b, &mut m, dev, physical, 256, 8, 0x9000);
     let (uniform, _) = buffer(&mut b, &mut m, dev, physical, 272, 16, 0xa000);
+    let (late_uniform, _) = buffer(&mut b, &mut m, dev, physical, 272, 16, 0xe000);
     let (packed, _) = buffer(&mut b, &mut m, dev, physical, 20, 32, 0xc000);
     let (readback, _) = buffer(&mut b, &mut m, dev, physical, 256, 2, 0xd000);
     for i in 0..64 {
@@ -397,6 +517,11 @@ fn main() {
         call(&mut b, &mut m, 39, &[dev, cmd]);
         words(&mut m, 0x3c00, &[cmd]);
         words(&mut m, 0x3d00, &[0, 0, 0, 0x3c00, 1, 0, 0]);
+        // Descriptor contents are read at submission, not frozen while the
+        // command is recorded. Only this newly selected UBO receives the input.
+        m.write(0xe100, &((round + 1) * 100).to_le_bytes()).unwrap();
+        words(&mut m, 0x3700, &[late_uniform, 0, 16]);
+        call(&mut b, &mut m, 33, &[dev, set, 2, 0, 1, 8, 0x3700]);
         call(&mut b, &mut m, 56, &[dev, queue, 0x3d00, 1, fence]);
         poll(&mut b, &mut m, 51, &[dev, fence], 1);
         let mut ints = [0; 256];
@@ -425,6 +550,6 @@ fn main() {
     assert_eq!(budget.used(), 0);
     call(&mut b, &mut m, 2, &[instance]);
     println!(
-        "native-resources-ok: dynamic offsets, texel read/write, scalar vec3 at offset4, storage image, pipeline cache roundtrip, descriptor pool reset/reuse and 256 GPU results correct; budget released"
+        "native-resources-ok: late descriptor update, dynamic offsets, texel read/write, scalar vec3 at offset4, storage image, pipeline cache roundtrip, descriptor pool reset/reuse and 256 GPU results correct; budget released"
     );
 }

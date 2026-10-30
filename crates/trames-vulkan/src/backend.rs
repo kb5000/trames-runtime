@@ -164,6 +164,7 @@ struct Object {
     command_usage: Cell<u32>,
     pending_submissions: Cell<u32>,
     mapped: Cell<usize>,
+    memory_binding: Cell<Option<coherent::Binding>>,
     image: Cell<Option<ImageShape>>,
     image_flags: Cell<u32>,
     pass: Cell<Option<PassInfo>>,
@@ -262,6 +263,22 @@ struct Submission {
     timeline_completion: Vec<(Rc<Object>, u64)>,
     timeline_signals: Vec<(Rc<Object>, u64)>,
     commands_complete: bool,
+    coherent_scope: coherent::Scope,
+}
+impl Submission {
+    fn complete_commands(&mut self) {
+        if self.commands_complete {
+            return;
+        }
+        for command in &self.commands {
+            let remaining = command.pending_submissions.get() - 1;
+            command.pending_submissions.set(remaining);
+            if remaining == 0 {
+                command.state.set(2);
+            }
+        }
+        self.commands_complete = true;
+    }
 }
 struct Mapping {
     memory: Rc<Object>,
@@ -290,6 +307,38 @@ pub struct TransferMetrics {
     pub download_bytes: u64,
     pub direct_bytes: u64,
     pub buffered_bytes: u64,
+    /// Synchronization boundaries, including those with no eligible ranges.
+    pub coherent_syncs: u64,
+    /// Coherent mapping ranges inspected, not bytes copied or unique pages.
+    pub coherent_ranges: u64,
+    pub coherent_upload_scanned_bytes: u64,
+    pub coherent_download_scanned_bytes: u64,
+}
+impl TransferMetrics {
+    pub fn merge(&mut self, other: Self) {
+        self.upload_bytes += other.upload_bytes;
+        self.download_bytes += other.download_bytes;
+        self.direct_bytes += other.direct_bytes;
+        self.buffered_bytes += other.buffered_bytes;
+        self.coherent_syncs += other.coherent_syncs;
+        self.coherent_ranges += other.coherent_ranges;
+        self.coherent_upload_scanned_bytes += other.coherent_upload_scanned_bytes;
+        self.coherent_download_scanned_bytes += other.coherent_download_scanned_bytes;
+    }
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            upload_bytes: self.upload_bytes - before.upload_bytes,
+            download_bytes: self.download_bytes - before.download_bytes,
+            direct_bytes: self.direct_bytes - before.direct_bytes,
+            buffered_bytes: self.buffered_bytes - before.buffered_bytes,
+            coherent_syncs: self.coherent_syncs - before.coherent_syncs,
+            coherent_ranges: self.coherent_ranges - before.coherent_ranges,
+            coherent_upload_scanned_bytes: self.coherent_upload_scanned_bytes
+                - before.coherent_upload_scanned_bytes,
+            coherent_download_scanned_bytes: self.coherent_download_scanned_bytes
+                - before.coherent_download_scanned_bytes,
+        }
+    }
 }
 struct CompiledPipeline {
     device: Arc<Device>,
@@ -331,6 +380,7 @@ pub struct Backend {
     objects: BTreeMap<u64, Rc<Object>>,
     live_objects: ObjectCount,
     mappings: BTreeMap<u64, Mapping>,
+    coherent_pending: coherent::Scope,
     submissions: Vec<Submission>,
     compiles: BTreeMap<u64, Compile>,
     pub transfers: TransferMetrics,
@@ -367,6 +417,7 @@ impl Backend {
             objects: BTreeMap::new(),
             live_objects: ObjectCount::default(),
             mappings: BTreeMap::new(),
+            coherent_pending: Default::default(),
             submissions: Vec::new(),
             compiles: BTreeMap::new(),
             transfers: TransferMetrics::default(),
@@ -443,6 +494,7 @@ impl Backend {
             command_usage: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
+            memory_binding: Cell::new(None),
             image: Cell::new(None),
             image_flags: Cell::new(0),
             pass: Cell::new(None),
@@ -650,7 +702,18 @@ impl Backend {
                 info
             })
             .collect();
-        self.coherent_sync(m, true)?;
+        let mut resources = Vec::new();
+        let mut pending = commands.clone();
+        pending.extend(semaphores.iter().map(|(_, s)| s.clone()));
+        while let Some(object) = pending.pop() {
+            if resources.iter().any(|other| Rc::ptr_eq(other, &object)) {
+                continue;
+            }
+            pending.extend(object.deps.borrow().iter().cloned());
+            resources.push(object);
+        }
+        let coherent_scope = coherent::Scope::resources(&resources);
+        self.coherent_sync_scope(m, &coherent_scope, true)?;
         unsafe { d.queue_submit(self.queue, &infos, vk::Fence::from_raw(fence.raw)) }?;
         for c in &commands {
             c.state.set(3);
@@ -659,17 +722,9 @@ impl Backend {
         for (id, semaphore) in &semaphores {
             semaphore.state.set(semaphore_states[id]);
         }
-        let mut resources = Vec::new();
-        let mut pending = commands.clone();
-        pending.extend(semaphores.into_iter().map(|(_, s)| s));
-        while let Some(object) = pending.pop() {
-            if resources.iter().any(|other| Rc::ptr_eq(other, &object)) {
-                continue;
-            }
-            pending.extend(object.deps.borrow().iter().cloned());
-            resources.push(object);
-        }
+        self.coherent_submitted(&coherent_scope);
         self.submissions.push(Submission {
+            coherent_scope,
             fence,
             commands,
             _resources: resources,
@@ -708,6 +763,7 @@ impl Backend {
             command_usage: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
+            memory_binding: Cell::new(None),
             image: Cell::new(None),
             image_flags: Cell::new(0),
             pass: Cell::new(None),
@@ -750,15 +806,8 @@ impl Backend {
                         }
                         .is_ok_and(|counter| counter >= *value)
                     });
-            if logical && !s.commands_complete {
-                for command in &s.commands {
-                    let remaining = command.pending_submissions.get() - 1;
-                    command.pending_submissions.set(remaining);
-                    if remaining == 0 {
-                        command.state.set(2);
-                    }
-                }
-                s.commands_complete = true;
+            if logical {
+                s.complete_commands();
             }
             !done
         });
@@ -1483,6 +1532,7 @@ impl Backend {
         self.wayland.clear_device();
         self.wsi.clear_device();
         self.mappings.clear();
+        self.coherent_pending = Default::default();
         self.objects.clear();
         self.device = None;
         self.device_id = 0;
@@ -1646,6 +1696,7 @@ impl Backend {
                     }
                     map.memory.mapped.set(0);
                 }
+                self.coherent_pending.remove(a[1]);
                 self.remove(a[1], Kind::Memory)?;
             }
             16 => {
@@ -1666,6 +1717,11 @@ impl Backend {
                         a[3],
                     )
                 }?;
+                b.memory_binding.set(Some(coherent::Binding {
+                    memory: a[2],
+                    offset: a[3],
+                    size: r.size,
+                }));
                 b.retain(mem);
             }
             17 => {
@@ -1733,6 +1789,7 @@ impl Backend {
                         coherent,
                     },
                 );
+                self.coherent_mapped(a[1]);
             }
             18 => {
                 let map = self
@@ -1742,6 +1799,7 @@ impl Backend {
                 let t = coherent::synchronize(map, m, map.offset, map.size, true)?;
                 self.record_transfer(t);
                 let map = self.mappings.remove(&a[1]).unwrap();
+                self.coherent_pending.remove(a[1]);
                 unsafe {
                     d.unmap_memory(vk::DeviceMemory::from_raw(map.memory.raw));
                 }
@@ -2393,7 +2451,14 @@ impl Backend {
                 if !Self::fence_ready(&f)? {
                     return Err(vk::Result::NOT_READY.into());
                 }
-                self.coherent_sync(m, false)?;
+                // A fence can become signaled after collect()'s earlier poll.
+                // Its actual submission now has no remaining GPU producers.
+                for submission in &mut self.submissions {
+                    if Rc::ptr_eq(&submission.fence, &f) {
+                        submission.complete_commands();
+                    }
+                }
+                self.coherent_download(m)?;
             }
             52 | 56 | 120 => self.submit(m, op, a, dev.clone())?,
             54 => {

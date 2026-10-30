@@ -517,10 +517,7 @@ impl<C: Cpu> Kernel<C> {
             None
         };
         let (value, transfers) = backend.invoke(&mut p.memory, a[0], a[1], a[2], authenticated);
-        self.gpu_transfers.upload_bytes += transfers.upload_bytes;
-        self.gpu_transfers.download_bytes += transfers.download_bytes;
-        self.gpu_transfers.direct_bytes += transfers.direct_bytes;
-        self.gpu_transfers.buffered_bytes += transfers.buffered_bytes;
+        self.gpu_transfers.merge(transfers);
         let value = value.map_err(trames_accel::native::Error::Memory)?;
         let value = match value {
             trames_vulkan::Invocation::Complete(value) => value,
@@ -4185,10 +4182,7 @@ impl<C: Cpu> Kernel<C> {
             self.gpu_compiles += done.gpu.compiles;
             self.gpu_wait_time += done.gpu.wait_time;
             self.gpu_peer_instructions += done.gpu.peer_instructions;
-            self.gpu_transfers.upload_bytes += done.gpu.transfers.upload_bytes;
-            self.gpu_transfers.download_bytes += done.gpu.transfers.download_bytes;
-            self.gpu_transfers.direct_bytes += done.gpu.transfers.direct_bytes;
-            self.gpu_transfers.buffered_bytes += done.gpu.transfers.buffered_bytes;
+            self.gpu_transfers.merge(done.gpu.transfers);
             if let Some((pc, operation, value)) = done.gpu.last_error {
                 p.linux.vfs.log(
                     4,

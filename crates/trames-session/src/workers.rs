@@ -87,10 +87,7 @@ impl GpuStats {
         transfers: trames_vulkan::TransferMetrics,
     ) {
         self.calls += 1;
-        self.transfers.upload_bytes += transfers.upload_bytes;
-        self.transfers.download_bytes += transfers.download_bytes;
-        self.transfers.direct_bytes += transfers.direct_bytes;
-        self.transfers.buffered_bytes += transfers.buffered_bytes;
+        self.transfers.merge(transfers);
         if let Ok(trames_vulkan::Invocation::Complete(value)) = value {
             self.record_error(pc, operation, *value);
         }
@@ -103,10 +100,7 @@ impl GpuStats {
     }
     pub fn merge(&mut self, other: Self) {
         self.calls += other.calls;
-        self.transfers.upload_bytes += other.transfers.upload_bytes;
-        self.transfers.download_bytes += other.transfers.download_bytes;
-        self.transfers.direct_bytes += other.transfers.direct_bytes;
-        self.transfers.buffered_bytes += other.transfers.buffered_bytes;
+        self.transfers.merge(other.transfers);
         self.errors += other.errors;
         self.last_error = other.last_error.or(self.last_error);
         self.compiles += other.compiles;

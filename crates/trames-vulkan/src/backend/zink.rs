@@ -376,7 +376,7 @@ impl Backend {
             // A single native poll only. Guest waits yield through nanosleep;
             // no host worker/guest-memory guard is held across a blocking wait.
             unsafe { api.wait_semaphores(&info, 0) }?;
-            self.coherent_sync(m, false)?;
+            self.coherent_download(m)?;
         } else {
             if op == 117 {
                 output(m, a[2], 8)?;
@@ -392,7 +392,7 @@ impl Backend {
                     write(m, a[2], &value.to_le_bytes())?;
                 }
                 118 => {
-                    self.coherent_sync(m, true)?;
+                    self.coherent_signal(m)?;
                     let info = vk::SemaphoreSignalInfo::default()
                         .semaphore(native)
                         .value(a[2]);

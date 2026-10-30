@@ -871,3 +871,69 @@ stamp are never cached. Queries still allocate no guest bytes and charge no RAM.
 The canonical native-page store first checks its existing page shard: a retained
 page needs no second native-range index lock. A miss follows the original range
 admission and lock order. No global byte or algorithm lock is added.
+
+## Vulkan coherent resource intervals (2026-10-30)
+
+The shared Vulkan backend derives conservative memory intervals from the same
+retained object graph that already owns each native queue submission. Validated
+buffer/image bindings carry allocation ID, binding offset and native memory
+requirement size. Submission walks commands, current descriptor contents, views,
+framebuffers and their retained dependencies once, before uploading. Overlapping
+or adjacent spans of one allocation coalesce; synchronization intersects them
+with that allocation's current guest mapping. It no longer compares every mapped
+coherent allocation at each submit or successful wait.
+
+Successful submission records the coherent mapping intersections as unpublished
+GPU results. Fence/timeline readback visits that ledger, then retires intervals
+whose producers have completed. Intersections with still-pending submissions stay
+eligible for later writes; a successful earlier wait cannot mark them clean.
+Failed publication retains the ledger for retry, and the existing independent
+CPU/GPU baselines preserve bytes already committed. Empty queue submissions still
+observe preceding work. A successful fence poll completes its matching command
+ledger immediately, even if the fence changed since the earlier collection pass.
+Repeated polls after publication inspect no memory until new relevant work exists.
+
+All submission binding spans are retained as metadata, including unmapped ones.
+Mapping after submit adds intersections for retained producers; the initial native
+copy handles already-completed writes. Partial maps and nonzero binding offsets
+use allocation coordinates throughout. Unmap/free withdraw stale ledger entries.
+Explicit Flush/Invalidate retain requested-range behavior, and unmap retains its
+final upload. A host timeline signal uploads resources of still-pending producers.
+Native display acquisition-only submissions have no guest binding intervals;
+texture presentation remains an independent path without pixel readback.
+
+This optimization relies on the **existing complete lifetime graph for the exposed
+Vulkan API**, not on shader-side guesses about which bytes will execute. An API
+that introduces GPU addresses, sparse bindings or untracked external resources
+must extend that authority before becoming available. Each buffer/image's full
+binding requirement span is conservative, including padding. Active spans still
+use the existing checked, bounded raw CPU copies and byte baselines: this is not
+direct GPU access to guest pages or zero-copy mapping. There is no additional
+native permission policy, memory backend, hardware-protection change, global lock,
+ordinary-memory barrier or resource-service thread. The metadata stores opaque
+allocation identities, not guest pointers or extra native allocation owners.
+
+Transfer metrics distinguish changed bytes from work spent discovering them:
+`coherent_syncs` counts boundaries (including empty ones), `coherent_ranges`
+counts successfully inspected spans, and `coherent_*_scanned_bytes` counts bytes
+compared, including unchanged bytes and repeated observations. Those counters
+are not unique resident bytes or GPU timestamp measurements.
+
+The native `resources` example covers a 256-byte buffer at a nonzero offset in a
+larger allocation, an unrelated mapped allocation, inaccessible unrelated guest
+pages, partial remapping, 256 exact GPU words, empty-submit fence observation and
+16 repeat status polls per round with zero further scanning. The old global scan
+inspects 74,240 bytes at the first upload and fails the 256-byte assertion. The
+same example also updates a recorded command's descriptor before submit and
+checks its current buffer through the existing 256-result GPU oracle. Unit tests
+cover coalesced aliases, allocation isolation, pending-range intersection and
+failed-publication retry. Mac Firefox measurements and limitations are recorded
+in the [product validation](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-firefox-gpu.md#scoped-coherent-synchronization).
+
+The Vulkan rules still require application execution and memory dependencies;
+HOST_COHERENT removes explicit flush/invalidate requirements rather than those
+dependencies. See the [memory properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryPropertyFlagBits.html)
+and [synchronization specification](https://docs.vulkan.org/spec/latest/chapters/synchronization.html).
+The resource-interval optimization is this bridge's implementation for its exposed
+API and retained ownership graph, not an additional synchronization rule imposed
+on guest applications.

@@ -1069,6 +1069,11 @@ impl Backend {
                         a[3],
                     )
                 }?;
+                image.memory_binding.set(Some(coherent::Binding {
+                    memory: a[2],
+                    offset: a[3],
+                    size: r.size,
+                }));
                 image.retain(memory);
             }
             64 => {

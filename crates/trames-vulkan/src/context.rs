@@ -54,15 +54,7 @@ impl Lease<'_> {
         let before = backend.transfers;
         let result = backend.invoke(memory, operation, address, size);
         let after = backend.transfers;
-        (
-            result,
-            TransferMetrics {
-                upload_bytes: after.upload_bytes - before.upload_bytes,
-                download_bytes: after.download_bytes - before.download_bytes,
-                direct_bytes: after.direct_bytes - before.direct_bytes,
-                buffered_bytes: after.buffered_bytes - before.buffered_bytes,
-            },
-        )
+        (result, after.since(before))
     }
     pub fn poll(
         &mut self,

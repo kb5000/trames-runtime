@@ -510,6 +510,7 @@ impl Backend {
                     timeline_completion: Vec::new(),
                     timeline_signals: Vec::new(),
                     commands_complete: false,
+                    coherent_scope: Default::default(),
                 });
                 if let Err(error) = write(m, a[4], &index.to_le_bytes()) {
                     // Native acquisition happened: do not reuse an unpublished index.
