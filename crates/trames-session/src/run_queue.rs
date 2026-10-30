@@ -898,7 +898,7 @@ mod tests {
         epoch.checkpoint(mapper, SliceOutcome::Syscall { instructions: 0 });
         let checkpoint = epoch.take_checkpoint().unwrap();
         epoch.restore_checkpoint(checkpoint, true);
-        let mut resumed = vec![epoch.take(0).unwrap(), epoch.take(1).unwrap()];
+        let mut resumed = [epoch.take(0).unwrap(), epoch.take(1).unwrap()];
         resumed.sort_by_key(|job| job.work.pid);
         assert_eq!(resumed[0].work.pid, 1);
         assert_eq!(

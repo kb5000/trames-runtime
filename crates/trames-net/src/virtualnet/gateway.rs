@@ -799,7 +799,7 @@ impl Gateway {
         for (q, to) in queries {
             self.dns_query(q, to, nodes);
         }
-        while let Some((token, addresses, code)) = self.resolver.result() {
+        while let Some((token, response)) = self.resolver.result() {
             if let Some(index) = self.pending_dns.iter().position(|p| p.token == token) {
                 let p = self.pending_dns.remove(index);
                 if let ReplyTo::Tcp { handle } = p.to {
@@ -816,7 +816,7 @@ impl Gateway {
                 } else {
                     4096
                 };
-                self.dns_reply(&p.to, dns::answer(&p.question, &addresses, code, limit));
+                self.dns_reply(&p.to, response.answer(&p.question, limit));
             }
         }
         let expired: Vec<_> = self

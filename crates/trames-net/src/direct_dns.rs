@@ -44,15 +44,10 @@ impl Service {
         let Some(r) = resolver.as_mut() else {
             return;
         };
-        while let Some((token, addresses, code)) = r.worker.result() {
+        while let Some((token, response)) = r.worker.result() {
             if let Some(p) = r.pending.remove(&token) {
                 if let Some(e) = p.endpoint.upgrade() {
-                    e.complete(dns::answer(
-                        &p.question,
-                        &addresses,
-                        code,
-                        if e.stream { 4096 } else { 512 },
-                    ));
+                    e.complete(response.answer(&p.question, if e.stream { 4096 } else { 512 }));
                 }
             }
         }
@@ -83,6 +78,12 @@ impl Service {
                 return Ok(());
             }
         };
+        // localhost is synthesized locally, including absence of other RR
+        // types; it must not leak to an upstream public resolver.
+        if question.name == "localhost" && !matches!(question.kind, 1 | 28) {
+            endpoint.reply(dns::answer(packet, &[], 0, 512));
+            return Ok(());
+        }
         if self.mode == NetworkMode::Loopback && question.name != "localhost" {
             endpoint.reply(dns::answer(packet, &[], 5, 512));
             return Ok(());

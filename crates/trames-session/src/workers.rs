@@ -485,6 +485,15 @@ impl<C: Cpu> Pool<C> {
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
                                     trames_linux::IoAttempt::Checkpoint => {
+                                        // An owner-blocked call can leave -EAGAIN
+                                        // in x0. The joined path needs the original
+                                        // entry ABI, including when SCM_RIGHTS
+                                        // causes an ordinary byte wait to defer.
+                                        let call = saved_call.as_ref().expect("accepted I/O arguments");
+                                        for (i, value) in call.args.iter().enumerate() {
+                                            work.cpu.set_x(i, *value);
+                                        }
+                                        work.cpu.set_x(8, call.number as u64);
                                         // A SIGPIPE/checkpoint must still reach the
                                         // original accepted OFD in the joined kernel.
                                         job.retry = saved_call.filter(|call| call.retained_byte.is_some() || call.retained_poll.is_some());
@@ -1053,6 +1062,93 @@ mod tests {
     use trames_memory::{
         CpuMemory, Memory, MemoryError, NativeMemory, PageBacking, Permissions, PAGE_SIZE,
     };
+
+    #[test]
+    fn cohort_blocked_recvmsg_checkpoint_restores_original_arguments() {
+        let mut vfs = trames_vfs::Vfs::default();
+        let [receiver, sender] = vfs.socketpair(1, 1, 0).unwrap();
+        let passed = vfs.eventfd(0, 0).unwrap();
+        let socket = vfs.local_socket(sender).unwrap().unwrap();
+        socket
+            .send_rights(b"x", 0, vfs.send_rights(&[passed]).unwrap())
+            .unwrap();
+        let mut memory = Memory::default();
+        memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        memory
+            .write_array(0x1000, 0xd4000001u32.to_le_bytes())
+            .unwrap();
+        memory.write_array(0x2010, 0x2100u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2018, 1u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2020, 0x2300u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2028, 24u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2100, 0x2200u64.to_le_bytes()).unwrap();
+        memory.write_array(0x2108, 8u64.to_le_bytes()).unwrap();
+        let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+        // SAFETY: this test owns the root and its only execution View. Root
+        // byte access resumes after the worker has stopped and been drained.
+        assert!(unsafe { View::try_private_epoch(&mut [&mut view]) });
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::unpreempted(control.clone());
+        let args = [receiver as u64, 0x2000, 0, 0x4455, 0x6677, 0x8899];
+        let mut cpu = Cpu::new(0x1004, 0);
+        cpu.set_x(8, 212);
+        for (i, value) in args.into_iter().enumerate() {
+            cpu.set_x(i, value);
+        }
+        // The owner already attempted this blocking call. x0 holds EAGAIN,
+        // while the pending call, not the CPU return register, owns its args.
+        cpu.set_x(0, 0u64.wrapping_sub(11));
+        let mut snapshot = syscall_snapshot();
+        snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
+        let mut job = crate::run_queue::Job::new(
+            Work {
+                gpu: None,
+                pid: 7,
+                cpu,
+                memory: Some(Box::new(view)),
+                control: control.clone(),
+                syscalls: Some(snapshot),
+            },
+            1,
+            0,
+            None,
+        );
+        job.retry = Some(crate::run_queue::IoCall {
+            number: 212,
+            args,
+            deadline: None,
+            flock: None,
+            retained_byte: None,
+            retained_poll: None,
+        });
+        epoch.add(job);
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert!(matches!(
+            done.outcome,
+            Some(SliceOutcome::Syscall { instructions: 0 })
+        ));
+        assert_eq!(std::array::from_fn::<_, 6, _>(|i| done.cpu.x(i)), args);
+        assert_eq!((done.cpu.x(8), done.cpu.pc), (212, 0x1004));
+        assert_eq!(done.instructions, 0);
+        memory.commit_parallel().unwrap();
+        let received = vfs
+            .local_socket(receiver)
+            .unwrap()
+            .unwrap()
+            .recv(8, 0)
+            .unwrap();
+        assert_eq!(received.data, b"x");
+        let (fds, truncated) = vfs.receive_rights(received.rights, 1, false);
+        assert!(!truncated);
+        assert_eq!(fds.len(), 1);
+    }
 
     struct LivePage {
         bytes: RefCell<[u8; PAGE_SIZE as usize]>,
