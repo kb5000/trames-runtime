@@ -49,10 +49,14 @@ struct MembershipEntries {
 }
 impl std::ops::Deref for MembershipEntries {
     type Target = BTreeMap<u32, Slot>;
-    fn deref(&self) -> &Self::Target { &self.slots }
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
 }
 impl std::ops::DerefMut for MembershipEntries {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.slots }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
 }
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
 /// owner slots carry no worker endpoint/control authority.
@@ -292,7 +296,9 @@ pub(super) struct Entries<'a> {
 }
 impl Entries<'_> {
     pub(super) fn cached_wayland(&self, identity: u64, revision: u64) -> Option<WaylandAuth> {
-        self.membership.wayland.as_ref()
+        self.membership
+            .wayland
+            .as_ref()
             .filter(|(owner, generation, _)| *owner == identity && *generation == revision)
             .map(|(_, _, auth)| auth.clone())
     }
@@ -601,7 +607,10 @@ impl Clone for DescriptorTable {
                 metadata: Rc::default(),
             })),
             SharedFiles(Arc::new(Membership {
-                entries: Mutex::new(MembershipEntries { slots: entries, wayland: None }),
+                entries: Mutex::new(MembershipEntries {
+                    slots: entries,
+                    wayland: None,
+                }),
                 revision: AtomicU64::new(0),
             })),
         )

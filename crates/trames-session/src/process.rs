@@ -520,12 +520,16 @@ impl<C: Cpu> Kernel<C> {
         self.gpu_transfers.merge(transfers);
         let value = value.map_err(trames_accel::native::Error::Memory)?;
         let value = match value {
-            trames_vulkan::Invocation::Checkpoint => unreachable!("joined GPU call requested a mapping checkpoint"),
+            trames_vulkan::Invocation::Checkpoint => {
+                unreachable!("joined GPU call requested a mapping checkpoint")
+            }
             trames_vulkan::Invocation::Complete(value) => value,
             trames_vulkan::Invocation::Pending(job) => {
                 self.gpu_compiles += u64::from(matches!(a[0], 27 | 70));
                 let retired = matches!(a[0], 201 | 202);
-                if retired { self.instructions += 1; }
+                if retired {
+                    self.instructions += 1;
+                }
                 let pending = 1 + self
                     .processes
                     .values()
@@ -747,7 +751,11 @@ impl<C: Cpu> Kernel<C> {
             seccomp: p.seccomp.mode(),
             seccomp_filters: p.seccomp.count(),
             arguments,
-            environment: if demand.environment() { p.linux.environment.clone() } else { Vec::new() },
+            environment: if demand.environment() {
+                p.linux.environment.clone()
+            } else {
+                Vec::new()
+            },
             executable: p.linux.executable_file.as_ref().map_or_else(
                 || p.linux.executable_path.clone(),
                 |file| p.linux.vfs.executable_display(file),
@@ -769,8 +777,16 @@ impl<C: Cpu> Kernel<C> {
                 / 10) as u64,
             terminal: p.linux.vfs.controlling_terminal.is_some(),
             terminal_number: p.linux.vfs.controlling_terminal.unwrap_or(0),
-            fds: if demand.descriptors() { p.linux.vfs.fd_snapshot() } else { Vec::new() },
-            auxiliary: if demand.auxiliary() { p.linux.auxiliary.clone() } else { Vec::new() },
+            fds: if demand.descriptors() {
+                p.linux.vfs.fd_snapshot()
+            } else {
+                Vec::new()
+            },
+            auxiliary: if demand.auxiliary() {
+                p.linux.auxiliary.clone()
+            } else {
+                Vec::new()
+            },
             file_size_limits: Some(p.file_size_limit.get()),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
                 u64::MAX
@@ -2622,7 +2638,10 @@ impl<C: Cpu> Kernel<C> {
         use trames_vfs::ProcRefresh;
         let mut proc_observation = matches!(number, 39..=41).then_some(ProcRefresh::Metadata);
         let proc_lookup = proc_path.and_then(|(dirfd, address)| {
-            p.memory.read_c_string(address, 4096).ok().map(|path| (dirfd, path))
+            p.memory
+                .read_c_string(address, 4096)
+                .ok()
+                .map(|path| (dirfd, path))
         });
         if let Some((dirfd, path)) = &proc_lookup {
             if let Some(demand) = p.linux.vfs.proc_observation(*dirfd, path) {
@@ -2633,7 +2652,8 @@ impl<C: Cpu> Kernel<C> {
             if let Ok(FdKind::Node(path)) = p.linux.vfs.fd_kind(a[0] as u32) {
                 if path == b"/proc" || path.starts_with(b"/proc/") {
                     let demand = ProcRefresh::for_path(&path);
-                    proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
+                    proc_observation =
+                        Some(proc_observation.map_or(demand, |old| old.merge(demand)));
                 }
             }
         }
@@ -2650,13 +2670,20 @@ impl<C: Cpu> Kernel<C> {
             // A missing pid/task directory can stop the first traversal before
             // the requested payload. Publish identities, then resolve aliases
             // again so new processes receive live arguments/FDs/residency too.
-            if let Some(refined) = proc_lookup.as_ref().and_then(|(dirfd, path)| {
-                p.linux.vfs.proc_observation(*dirfd, path)
-            }).filter(|&refined| refined != demand && refined > ProcRefresh::Metadata) {
+            if let Some(refined) = proc_lookup
+                .as_ref()
+                .and_then(|(dirfd, path)| p.linux.vfs.proc_observation(*dirfd, path))
+                .filter(|&refined| refined != demand && refined > ProcRefresh::Metadata)
+            {
                 self.proc_refreshes += 1;
-                self.refresh_proc_observed(pid, p,
+                self.refresh_proc_observed(
+                    pid,
+                    p,
                     (refined.residency() && self.memory_limits.is_host_managed())
-                        .then(|| io.host_memory()).flatten(), demand.merge(refined));
+                        .then(|| io.host_memory())
+                        .flatten(),
+                    demand.merge(refined),
+                );
             }
         }
         let was_blocked = matches!(p.state, State::Blocked(..));
@@ -4023,7 +4050,9 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Some(crate::workers::Event::<C>::DiskSync(id, result)) => {
                     self.finish_disk_sync(id, result, &mut disk);
-                    if !self.resume_disk_waiters(&mut disk, io) { break; }
+                    if !self.resume_disk_waiters(&mut disk, io) {
+                        break;
+                    }
                 }
                 None => {}
             }
@@ -6229,24 +6258,47 @@ mod tests {
         p.linux.auxiliary = vec![23; 32];
         p.linux.argument_pointers = vec![0x1000];
         p.memory.write(0x1000, b"first\0").unwrap();
-        let before = k.process_info(1, &p, p.memory.resident_bytes(), trames_vfs::ProcRefresh::Full);
+        let before = k.process_info(
+            1,
+            &p,
+            p.memory.resident_bytes(),
+            trames_vfs::ProcRefresh::Full,
+        );
         p.memory.write(0x1000, b"other\0").unwrap();
         let pipe = p.linux.vfs.pipe(0).unwrap();
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
-        let after = k.process_info(1, &p, p.memory.resident_bytes(), trames_vfs::ProcRefresh::Full);
+        let after = k.process_info(
+            1,
+            &p,
+            p.memory.resident_bytes(),
+            trames_vfs::ProcRefresh::Full,
+        );
         assert_eq!(before.maps, after.maps);
         assert_eq!(before.arguments, [b"first".to_vec()]);
         assert_eq!(after.arguments, [b"other".to_vec()]);
         assert!(!after.fds.is_empty());
-        for demand in [trames_vfs::ProcRefresh::Metadata, trames_vfs::ProcRefresh::Residency] {
+        for demand in [
+            trames_vfs::ProcRefresh::Metadata,
+            trames_vfs::ProcRefresh::Residency,
+        ] {
             let projected = k.process_info(1, &p, p.memory.resident_bytes(), demand);
             assert!(projected.arguments.is_empty());
-            assert!(projected.fds.is_empty(), "unrelated proc reads must not enumerate descriptors");
-            assert!(projected.maps.is_empty(), "status and metadata reads must not build mapping text");
+            assert!(
+                projected.fds.is_empty(),
+                "unrelated proc reads must not enumerate descriptors"
+            );
+            assert!(
+                projected.maps.is_empty(),
+                "status and metadata reads must not build mapping text"
+            );
             assert!(projected.environment.is_empty());
             assert!(projected.auxiliary.is_empty());
         }
-        for demand in [trames_vfs::ProcRefresh::Mappings, trames_vfs::ProcRefresh::Environment, trames_vfs::ProcRefresh::Auxiliary] {
+        for demand in [
+            trames_vfs::ProcRefresh::Mappings,
+            trames_vfs::ProcRefresh::Environment,
+            trames_vfs::ProcRefresh::Auxiliary,
+        ] {
             let projected = k.process_info(1, &p, 0, demand);
             assert_eq!(projected.maps.is_empty(), !demand.mappings());
             assert_eq!(projected.environment.is_empty(), !demand.environment());
@@ -6452,26 +6504,54 @@ mod tests {
         p.memory.write(0x3000, &header).unwrap();
         write_u64(&mut p.memory, 0x3100, 0x10000).unwrap();
         write_u64(&mut p.memory, 0x3108, 2 << 20).unwrap();
-        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
+        k.call(
+            1,
+            &mut p,
+            212,
+            [receiver as u64, 0x3000, 0, 0, 0, 0],
+            &mut io,
+        );
         assert_eq!(
-            p.cpu.x(0), 1,
+            p.cpu.x(0),
+            1,
             "a receive capacity is not a packet size; stream reads may complete short"
         );
         assert_eq!(p.memory.read_array::<1>(0x10000).unwrap(), *b"x");
         k.call(1, &mut p, 206, [sender as u64, 0x2000, 1, 0, 0, 0], &mut io);
         assert_eq!(p.cpu.x(0), 1);
         write_u64(&mut p.memory, 0x3108, u64::MAX).unwrap();
-        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
+        k.call(
+            1,
+            &mut p,
+            212,
+            [receiver as u64, 0x3000, 0, 0, 0, 0],
+            &mut io,
+        );
         assert_eq!(p.cpu.x(0), error(Errno(22)));
         write_u64(&mut p.memory, 0x3108, 2 << 20).unwrap();
-        k.call(1, &mut p, 212, [receiver as u64, 0x3000, 0, 0, 0, 0], &mut io);
-        assert_eq!(p.cpu.x(0), 1, "invalid iovecs must not consume the queued byte");
+        k.call(
+            1,
+            &mut p,
+            212,
+            [receiver as u64, 0x3000, 0, 0, 0, 0],
+            &mut io,
+        );
+        assert_eq!(
+            p.cpu.x(0),
+            1,
+            "invalid iovecs must not consume the queued byte"
+        );
     }
 
     #[test]
     fn cmdline_observations_keep_live_bytes_through_aliases_and_unseen_pids() {
         use trames_linux::CapturedOutput;
-        fn read(k: &mut Kernel, p: &mut Process, path: &[u8], after_open: Option<&[u8]>) -> Vec<u8> {
+        fn read(
+            k: &mut Kernel,
+            p: &mut Process,
+            path: &[u8],
+            after_open: Option<&[u8]>,
+        ) -> Vec<u8> {
             let mut name = path.to_vec();
             name.push(0);
             p.memory.write(0x1000, &name).unwrap();
@@ -6496,18 +6576,41 @@ mod tests {
         p.linux.argument_pointers = vec![0x2000];
         p.memory.write(0x2000, b"before\0").unwrap();
         k.refresh_proc(1, &mut p, None);
-        p.linux.vfs.symlink_at(b"/proc/self/cmdline", AT_FDCWD, b"/argv-alias").unwrap();
+        p.linux
+            .vfs
+            .symlink_at(b"/proc/self/cmdline", AT_FDCWD, b"/argv-alias")
+            .unwrap();
         p.memory.write(0x2000, b"first\0").unwrap();
-        assert_eq!(read(&mut k, &mut p, b"/proc/self/cmdline", None), b"first\0");
+        assert_eq!(
+            read(&mut k, &mut p, b"/proc/self/cmdline", None),
+            b"first\0"
+        );
         p.memory.write(0x2000, b"second\0").unwrap();
-        assert_eq!(read(&mut k, &mut p, b"/argv-alias", Some(b"third\0")), b"third\0");
+        assert_eq!(
+            read(&mut k, &mut p, b"/argv-alias", Some(b"third\0")),
+            b"third\0"
+        );
         p.memory.write(0x1000, b"/proc/self/cmdline\0").unwrap();
         let mut io = CapturedOutput::default();
-        k.call(1, &mut p, 56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0], &mut io);
+        k.call(
+            1,
+            &mut p,
+            56,
+            [(-100i64) as u64, 0x1000, 0, 0, 0, 0],
+            &mut io,
+        );
         let fd = p.cpu.x(0);
         assert!(fd < 256);
         p.memory.write(0x2000, b"fourth\0").unwrap();
-        assert_eq!(read(&mut k, &mut p, format!("/proc/self/fd/{fd}").as_bytes(), None), b"fourth\0");
+        assert_eq!(
+            read(
+                &mut k,
+                &mut p,
+                format!("/proc/self/fd/{fd}").as_bytes(),
+                None
+            ),
+            b"fourth\0"
+        );
         k.call(1, &mut p, 57, [fd, 0, 0, 0, 0, 0], &mut io);
         let mut child = process();
         child.tgid = 2;

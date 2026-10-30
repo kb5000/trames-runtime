@@ -59,13 +59,28 @@ mod tests {
     #[test]
     fn selected_features_preserve_legacy_bits_and_require_native_support() {
         let native = vk::PhysicalDeviceFeatures::default()
-            .sampler_anisotropy(true).shader_storage_image_extended_formats(true)
-            .shader_storage_image_write_without_format(true).fragment_stores_and_atomics(true)
-            .texture_compression_astc_ldr(true).geometry_shader(true);
+            .sampler_anisotropy(true)
+            .shader_storage_image_extended_formats(true)
+            .shader_storage_image_write_without_format(true)
+            .fragment_stores_and_atomics(true)
+            .texture_compression_astc_ldr(true)
+            .geometry_shader(true);
         let bytes = encode(native);
         let field = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        assert_eq!(field(std::mem::offset_of!(vk::PhysicalDeviceFeatures, geometry_shader)), 0);
-        assert_eq!(field(std::mem::offset_of!(vk::PhysicalDeviceFeatures, shader_storage_image_extended_formats)), vk::TRUE);
+        assert_eq!(
+            field(std::mem::offset_of!(
+                vk::PhysicalDeviceFeatures,
+                geometry_shader
+            )),
+            0
+        );
+        assert_eq!(
+            field(std::mem::offset_of!(
+                vk::PhysicalDeviceFeatures,
+                shader_storage_image_extended_formats
+            )),
+            vk::TRUE
+        );
         let enabled = select(native, 1 | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 20)).unwrap();
         assert_eq!(enabled.sampler_anisotropy, vk::TRUE);
         assert_eq!(enabled.fragment_stores_and_atomics, vk::TRUE);

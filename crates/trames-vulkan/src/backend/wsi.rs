@@ -510,7 +510,7 @@ impl Backend {
                     descriptor_sets: Vec::new(),
                     _resources: resources,
                     timeline_completion: Vec::new(),
-                            commands_complete: false,
+                    commands_complete: false,
                     coherent_scope: Default::default(),
                 });
                 if let Err(error) = write(m, a[4], &index.to_le_bytes()) {

@@ -172,18 +172,30 @@ fn object_budget_case(budget: Budget, accepted: usize) {
         pools.push(pool);
         let result = request(&mut b, &mut m, 31, &[device, pool, 0x3000, 4096, 0xc000]);
         if i < accepted {
-            assert_eq!(result, 0, "native descriptor batch {i} must fit selected object policy");
+            assert_eq!(
+                result, 0,
+                "native descriptor batch {i} must fit selected object policy"
+            );
         } else {
-            assert_eq!(result, (-1i64) as u64, "explicit object budget must remain bounded");
+            assert_eq!(
+                result,
+                (-1i64) as u64,
+                "explicit object budget must remain bounded"
+            );
             break;
         }
     }
     let create_ms = started.elapsed().as_secs_f64() * 1000.0;
-    for pool in pools { call(&mut b, &mut m, 30, &[device, pool]); }
+    for pool in pools {
+        call(&mut b, &mut m, 30, &[device, pool]);
+    }
     call(&mut b, &mut m, 24, &[device, layout]);
     call(&mut b, &mut m, 9, &[device]);
     call(&mut b, &mut m, 2, &[instance]);
-    println!("native descriptor objects: {} sets, create_ms={create_ms:.3}, pools and layouts released", accepted * 4096);
+    println!(
+        "native descriptor objects: {} sets, create_ms={create_ms:.3}, pools and layouts released",
+        accepted * 4096
+    );
 }
 fn object_budget() {
     object_budget_case(Budget::default(), 3);
@@ -308,7 +320,6 @@ fn coherent_scope_oracle() {
     println!("native-coherent-scope-ok: nonzero pooled binding, unrelated PROT_NONE mappings, partial remap, 256 GPU words, empty-submit fence and zero rescan on repeated fence status");
 }
 
-
 fn shared_mapping_oracle() {
     let budget = Budget::host_managed();
     let mut b = Backend::with_budget(budget.clone());
@@ -380,7 +391,7 @@ fn shared_mapping_oracle() {
     )
     .unwrap();
     let code_before = m.instruction_page_identity(0x30000 + offset + 256).unwrap();
-    let code_epoch_before=m.instruction_identity();
+    let code_epoch_before = m.instruction_identity();
     call(&mut b, &mut m, 34, &[dev, 0, 2, OUT]);
     let pool = word(&m, OUT);
     call(&mut b, &mut m, 36, &[dev, pool, OUT]);
@@ -447,7 +458,7 @@ fn shared_mapping_oracle() {
         m.instruction_page_identity(0x30000 + offset + 256).unwrap(),
         code_before
     );
-    assert_ne!(m.instruction_identity(),code_epoch_before);
+    assert_ne!(m.instruction_identity(), code_epoch_before);
     assert_eq!(b.transfers.coherent_download_scanned_bytes, 0);
     call(&mut b, &mut m, 18, &[dev, memory]);
     // Unmapping/releasing the Vulkan object cannot invalidate retained guest pages.
@@ -464,7 +475,10 @@ fn shared_mapping_oracle() {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--shared-only") { shared_mapping_oracle(); return; }
+    if std::env::args().nth(1).as_deref() == Some("--shared-only") {
+        shared_mapping_oracle();
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--objects-only") {
         object_budget();
         return;

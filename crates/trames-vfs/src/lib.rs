@@ -438,7 +438,10 @@ impl ProcRefresh {
         {
             return Self::Independent;
         }
-        if path.split(|&c| c == b'/').any(|part| matches!(part, b"fd" | b"fdinfo" | b"net")) {
+        if path
+            .split(|&c| c == b'/')
+            .any(|part| matches!(part, b"fd" | b"fdinfo" | b"net"))
+        {
             return Self::Descriptors;
         }
         if path.ends_with(b"/cmdline") {
@@ -454,20 +457,22 @@ impl ProcRefresh {
             return Self::Auxiliary;
         }
         if matches!(path, b"/proc/stat" | b"/proc/uptime" | b"/proc/loadavg")
-            || [
-                b"/comm".as_slice(),
-                b"/limits",
-                b"/mounts",
-                b"/mountinfo",
-            ]
-            .iter()
-            .any(|tail| path.ends_with(tail))
+            || [b"/comm".as_slice(), b"/limits", b"/mounts", b"/mountinfo"]
+                .iter()
+                .any(|tail| path.ends_with(tail))
         {
             return Self::Metadata;
         }
         if path == b"/proc/meminfo"
-            || [b"/stat".as_slice(), b"/statm", b"/status", b"/smaps", b"/smaps_rollup"]
-                .iter().any(|tail| path.ends_with(tail))
+            || [
+                b"/stat".as_slice(),
+                b"/statm",
+                b"/status",
+                b"/smaps",
+                b"/smaps_rollup",
+            ]
+            .iter()
+            .any(|tail| path.ends_with(tail))
         {
             return Self::Residency;
         }

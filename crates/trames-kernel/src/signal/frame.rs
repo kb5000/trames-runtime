@@ -444,11 +444,9 @@ mod sme_tests {
                     .write_array(state.sp + 1168 + 16 + 2208 + 8, 32u16.to_le_bytes())
                     .unwrap(),
             }
-            assert!(
-                signals
-                    .restore_sme(&mut state, &memory, SmeConfig::default(), true)
-                    .is_err()
-            );
+            assert!(signals
+                .restore_sme(&mut state, &memory, SmeConfig::default(), true)
+                .is_err());
             assert_eq!(state, saved);
             assert_eq!(signals.frames, 1);
         }
@@ -472,12 +470,10 @@ mod sme_tests {
             .unwrap();
         assert_eq!(state.sp, saved.sp - FRAME_SIZE as u64);
         assert_eq!(state.tpidr2_el0, 0);
-        assert!(
-            signals
-                .restore_sme(&mut state, &memory, SmeConfig::default(), true)
-                .unwrap()
-                .is_none()
-        );
+        assert!(signals
+            .restore_sme(&mut state, &memory, SmeConfig::default(), true)
+            .unwrap()
+            .is_none());
         assert_eq!(state, saved);
     }
     #[test]
@@ -489,22 +485,20 @@ mod sme_tests {
             size: 5000,
             flags: 0,
         };
-        assert!(
-            signals
-                .enter_sme(
-                    &mut state,
-                    &mut memory,
-                    10,
-                    Info::default(),
-                    Action {
-                        handler: 0x5000,
-                        flags: 0x08000000,
-                        ..Default::default()
-                    },
-                    Some((SmeConfig::default(), Some(&registers), true))
-                )
-                .is_err()
-        );
+        assert!(signals
+            .enter_sme(
+                &mut state,
+                &mut memory,
+                10,
+                Info::default(),
+                Action {
+                    handler: 0x5000,
+                    flags: 0x08000000,
+                    ..Default::default()
+                },
+                Some((SmeConfig::default(), Some(&registers), true))
+            )
+            .is_err());
         assert_eq!(state, saved);
         assert_eq!(signals.frames, 0);
     }

@@ -3,8 +3,12 @@
 use super::*;
 static BACKING_REVISION: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_REVISION: AtomicU64 = AtomicU64::new(0);
-pub fn external_memory_changed() { EXTERNAL_REVISION.fetch_add(1, Ordering::Relaxed); }
-pub(super) fn external_revision() -> u64 { EXTERNAL_REVISION.load(Ordering::Relaxed) }
+pub fn external_memory_changed() {
+    EXTERNAL_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+pub(super) fn external_revision() -> u64 {
+    EXTERNAL_REVISION.load(Ordering::Relaxed)
+}
 /// Notify decoder caches and exclusive monitors about externally visible changes.
 pub fn backing_changed() {
     BACKING_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -21,7 +25,9 @@ pub trait PageSource: Send + Sync {
 pub trait PageBacking {
     /// Device publications can change executable bytes outside CPU write hooks.
     /// Only address spaces that map such storage executable watch its code epoch.
-    fn external_code_updates(&self) -> bool { false }
+    fn external_code_updates(&self) -> bool {
+        false
+    }
     /// Anonymous shared zeros need a charge only on writes; file data is charged
     /// on the first actual read or write, never on VMA/permission metadata.
     fn charge_reads(&self) -> bool {
@@ -98,7 +104,10 @@ pub trait PageBacking {
     }
     /// Range hints use the selected metadata domain's token. Providers with a
     /// separate metadata generation must not interpret it as a byte generation.
-    fn parallel_metadata_changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+    fn parallel_metadata_changes_since(
+        &self,
+        generation: u64,
+    ) -> Option<Vec<std::ops::Range<u64>>> {
         self.parallel_changes_since(generation)
     }
     /// Publish dirty metadata after this address space's workers have joined,
@@ -154,7 +163,10 @@ pub(super) struct Backed {
     pub private_copy: bool,
 }
 impl Page {
-    pub(super) fn parallel_changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+    pub(super) fn parallel_changes_since(
+        &self,
+        generation: u64,
+    ) -> Option<Vec<std::ops::Range<u64>>> {
         let backing = self.backing.as_ref()?.object.as_ref();
         if self.permissions.execute {
             backing.parallel_changes_since(generation)
@@ -265,7 +277,8 @@ impl Memory {
             });
         }
         let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
-        let external_code = permissions.execute && objects.iter().any(|object|object.external_code_updates());
+        let external_code =
+            permissions.execute && objects.iter().any(|object| object.external_code_updates());
         self.check_backed_mapping(address, len, fixed)?;
         let charges: Vec<_> = (0..objects.len())
             .map(|_| Charge::new(&self.account))

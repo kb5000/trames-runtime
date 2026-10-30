@@ -730,7 +730,9 @@ impl PageBacking for FileMapping {
             // A distinct identity keeps executable aliases on byte versions.
             Some((
                 self.state.metadata_identity,
-                self.state.metadata_generation.load(Ordering::Relaxed)
+                self.state
+                    .metadata_generation
+                    .load(Ordering::Relaxed)
                     .wrapping_add(self.state.metadata_length.revision()),
             ))
         } else {
@@ -1553,7 +1555,10 @@ mod tests {
     #[test]
     fn changed_ranges_visit_only_touched_offsets_and_all_their_aliases() {
         use trames_memory::{parallel::Registry, CpuMemory};
-        for (pages, executable) in [8, 256, 1024].into_iter().flat_map(|n| [(n, false), (n, true)]) {
+        for (pages, executable) in [8, 256, 1024]
+            .into_iter()
+            .flat_map(|n| [(n, false), (n, true)])
+        {
             let mut v = Vfs::default();
             let fd = v.memfd_create(b"large-mapped-buffer", 0).unwrap();
             v.truncate_fd(fd, PAGE_SIZE * pages).unwrap();
@@ -1561,7 +1566,10 @@ mod tests {
             // changes inherit its range indefinitely.
             v.write(fd, &vec![0; (PAGE_SIZE * pages) as usize]).unwrap();
             let mut m = Memory::default();
-            let permissions = Permissions { execute: executable, ..Permissions::RW };
+            let permissions = Permissions {
+                execute: executable,
+                ..Permissions::RW
+            };
             mapped(
                 &v,
                 &mut m,
@@ -2306,7 +2314,15 @@ mod tests {
         v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
         let file = v.shared_file(fd).unwrap();
         let mut memory = Memory::default();
-        mapped(&v, &mut memory, fd, 0x10000, PAGE_SIZE * 2, true, Permissions::RW);
+        mapped(
+            &v,
+            &mut memory,
+            fd,
+            0x10000,
+            PAGE_SIZE * 2,
+            true,
+            Permissions::RW,
+        );
         let mut registry = Registry::default();
         drop(memory.parallel_view(&mut registry).unwrap());
         file.write_at(0, b"live").unwrap();
@@ -2318,7 +2334,10 @@ mod tests {
         // invalidates EOF metadata; ordinary writes above needed no refresh.
         file.set_len(0).unwrap();
         let view = memory.parallel_view(&mut registry).unwrap();
-        assert_eq!(view.read_array::<1>(0x10000), Err(MemoryError::Bus(0x10000)));
+        assert_eq!(
+            view.read_array::<1>(0x10000),
+            Err(MemoryError::Bus(0x10000))
+        );
         drop(view);
         file.set_len((PAGE_SIZE * 2) as usize).unwrap();
         let view = memory.parallel_view(&mut registry).unwrap();

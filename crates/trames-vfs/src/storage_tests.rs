@@ -251,7 +251,10 @@ fn disk_sync_jobs_share_one_manifest_transaction_and_retain_original_resources()
     v.write(reused, b"other").unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let ready = barrier.clone();
-    let worker = std::thread::spawn(move || { ready.wait(); a.run() });
+    let worker = std::thread::spawn(move || {
+        ready.wait();
+        a.run()
+    });
     barrier.wait();
     b.run().unwrap();
     worker.join().unwrap().unwrap();

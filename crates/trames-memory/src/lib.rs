@@ -8,7 +8,9 @@ pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
 mod imported;
 pub use hardware_shared::{HardwareRange, HardwareStorage, HardwareWait, SharedMapping};
-pub fn host_mapping_granule() -> usize { mmu::host_mapping_granule() }
+pub fn host_mapping_granule() -> usize {
+    mmu::host_mapping_granule()
+}
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -643,7 +645,11 @@ impl Memory {
                 0u64
             })
             .wrapping_add(self.parallel_cache.as_ref().map_or(0, |c| c.code_epoch()))
-                .wrapping_add(if self.has_external_code { backing::external_revision() } else { 0 }),
+            .wrapping_add(if self.has_external_code {
+                backing::external_revision()
+            } else {
+                0
+            }),
         )
     }
 
@@ -925,7 +931,11 @@ impl Memory {
             let page = self.frames[frame].as_mut().expect("validated page");
             page.permissions = permissions;
             page.instruction_revision = self.code_revision;
-            self.has_external_code |= permissions.execute && page.backing.as_ref().is_some_and(|b|b.object.external_code_updates());
+            self.has_external_code |= permissions.execute
+                && page
+                    .backing
+                    .as_ref()
+                    .is_some_and(|b| b.object.external_code_updates());
         }
         self.revision = self.revision.wrapping_add(1);
         self.refresh_mapping_mmu(address, len);

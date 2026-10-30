@@ -88,7 +88,11 @@ impl Backend {
         }
         .limits;
         if a[1..=3].iter().any(|&x| x > 1)
-            || a[4..=6].iter().any(|&x| x > 4 || x == 4 && device.compute_features & compute::SAMPLER_MIRROR_CLAMP_TO_EDGE == 0)
+            || a[4..=6].iter().any(|&x| {
+                x > 4
+                    || x == 4
+                        && device.compute_features & compute::SAMPLER_MIRROR_CLAMP_TO_EDGE == 0
+            })
             || a[7] > 5
             || lod.iter().any(|x| !x.is_finite())
             || lod[0].abs() > limits.max_sampler_lod_bias
@@ -125,8 +129,14 @@ impl Backend {
         {
             return unsupported();
         }
-        if a[14] > 2 || a[14] != 0 && (device.compute_features & compute::SAMPLER_FILTER_MINMAX == 0 || a[12] != 0) { return unsupported(); }
-        let mut reduction = vk::SamplerReductionModeCreateInfo::default().reduction_mode(vk::SamplerReductionMode::from_raw(a[14] as i32));
+        if a[14] > 2
+            || a[14] != 0
+                && (device.compute_features & compute::SAMPLER_FILTER_MINMAX == 0 || a[12] != 0)
+        {
+            return unsupported();
+        }
+        let mut reduction = vk::SamplerReductionModeCreateInfo::default()
+            .reduction_mode(vk::SamplerReductionMode::from_raw(a[14] as i32));
         let mut info = vk::SamplerCreateInfo::default()
             .anisotropy_enable(a[10] != 0)
             .max_anisotropy(if a[10] != 0 { anisotropy } else { 1.0 })
@@ -142,12 +152,27 @@ impl Backend {
             .max_lod(lod[2])
             .compare_enable(a[12] != 0)
             .compare_op(vk::CompareOp::from_raw(a[13] as i32));
-        if a[14] != 0 { info = info.push_next(&mut reduction); }
-        let conversion=if a[15]!=0{Some(self.object(a[15],Kind::YcbcrConversion)?)}else{None};
-        let mut converted=vk::SamplerYcbcrConversionInfo::default();
-        if let Some(value)=&conversion{converted.conversion=vk::SamplerYcbcrConversion::from_raw(value.raw);info=info.push_next(&mut converted);}
+        if a[14] != 0 {
+            info = info.push_next(&mut reduction);
+        }
+        let conversion = if a[15] != 0 {
+            Some(self.object(a[15], Kind::YcbcrConversion)?)
+        } else {
+            None
+        };
+        let mut converted = vk::SamplerYcbcrConversionInfo::default();
+        if let Some(value) = &conversion {
+            converted.conversion = vk::SamplerYcbcrConversion::from_raw(value.raw);
+            info = info.push_next(&mut converted);
+        }
         let raw = unsafe { device.native.create_sampler(&info, None) }?;
-        let id = self.put(Kind::Sampler, raw.as_raw(), conversion.into_iter().collect(), 0, 0);
+        let id = self.put(
+            Kind::Sampler,
+            raw.as_raw(),
+            conversion.into_iter().collect(),
+            0,
+            0,
+        );
         self.publish(m, a[9], id)
     }
 
@@ -161,18 +186,28 @@ impl Backend {
         let shape = metadata
             .get(&(a[2] as u32))
             .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
-        if a[2] > u32::MAX as u64
-            || a[4] == 0
-            || shape.ty as u64 != a[5]
-        {
+        if a[2] > u32::MAX as u64 || a[4] == 0 || shape.ty as u64 != a[5] {
             return invalid();
         }
-        let spans=descriptors::spans(&layout,&set,a[2] as u32,a[3] as u32,a[4] as u32,a[5] as u32)?;
-        if spans.len()!=1 || spans[0].0!=a[2] as u32 || spans[0].1!=a[3] as u32 {
-            drop(metadata);let mut at=0;
-            for (binding,offset,count) in spans {
-                let mut part=a;part[2]=binding as u64;part[3]=offset as u64;part[4]=count as u64;part[6]+=at*24;
-                self.write_descriptors(m,part)?;at+=count as u64;
+        let spans = descriptors::spans(
+            &layout,
+            &set,
+            a[2] as u32,
+            a[3] as u32,
+            a[4] as u32,
+            a[5] as u32,
+        )?;
+        if spans.len() != 1 || spans[0].0 != a[2] as u32 || spans[0].1 != a[3] as u32 {
+            drop(metadata);
+            let mut at = 0;
+            for (binding, offset, count) in spans {
+                let mut part = a;
+                part[2] = binding as u64;
+                part[3] = offset as u64;
+                part[4] = count as u64;
+                part[6] += at * 24;
+                self.write_descriptors(m, part)?;
+                at += count as u64;
             }
             return Ok(());
         }
@@ -255,10 +290,17 @@ impl Backend {
                     let image = view.deps.borrow()[0].clone();
                     let wanted = if a[5] == 3 {
                         vk::ImageUsageFlags::STORAGE
-                    } else if a[5] == 10 {vk::ImageUsageFlags::INPUT_ATTACHMENT} else {
+                    } else if a[5] == 10 {
+                        vk::ImageUsageFlags::INPUT_ATTACHMENT
+                    } else {
                         vk::ImageUsageFlags::SAMPLED
                     };
-                    if (if view.size==0{image.flags}else{view.size as u32}) & wanted.as_raw() == 0
+                    if (if view.size == 0 {
+                        image.flags
+                    } else {
+                        view.size as u32
+                    }) & wanted.as_raw()
+                        == 0
                         || view.flags.count_ones() != 1
                         || (if a[5] == 3 {
                             x[2] != 1
@@ -268,7 +310,7 @@ impl Backend {
                             // layout. Do not require shader-read layout before
                             // the descriptor is used. Preserve the native enum;
                             // object identity, usage and retention stay checked.
-                            self.native_layout(x[2],false).is_err()
+                            self.native_layout(x[2], false).is_err()
                         })
                     {
                         return invalid();
@@ -293,8 +335,10 @@ impl Backend {
         } else {
             write.image_info(&images)
         };
-        self.descriptor_pending(m,&set,dependencies.iter().flatten().cloned().collect())?;
-        unsafe { d.update_descriptor_sets(&[write], &[]); }
+        self.descriptor_pending(m, &set, dependencies.iter().flatten().cloned().collect())?;
+        unsafe {
+            d.update_descriptor_sets(&[write], &[]);
+        }
         for (i, range) in dynamic_ranges.into_iter().enumerate() {
             set.dynamic_ranges
                 .borrow_mut()

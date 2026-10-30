@@ -128,7 +128,10 @@ impl ConcurrentPage {
         self.mutable().map_or(&self.version, |bytes| &bytes.version)
     }
     fn instruction_revision(&self) -> u64 {
-        self.mutable().map_or_else(|| self.version.load(Ordering::Acquire), |bytes|bytes.revision())
+        self.mutable().map_or_else(
+            || self.version.load(Ordering::Acquire),
+            |bytes| bytes.revision(),
+        )
     }
     fn new(
         bytes: [u8; PAGE_SIZE as usize],
@@ -1150,7 +1153,11 @@ impl CpuMemory for View {
                 0
             })
             .wrapping_add(self.snapshot.backing_revision)
-            .wrapping_add(if self.snapshot.external_code { backing::external_revision() } else { 0 }),
+            .wrapping_add(if self.snapshot.external_code {
+                backing::external_revision()
+            } else {
+                0
+            }),
         )
     }
     fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64, u64), MemoryError> {
@@ -1907,10 +1914,7 @@ impl View {
             permissions: frame.permissions,
             storage_id: frame.bytes.identity,
             instruction_revision: if frame.permissions.execute {
-                (
-                    frame.code_revision,
-                    frame.bytes.instruction_revision(),
-                )
+                (frame.code_revision, frame.bytes.instruction_revision())
             } else {
                 (0, 0)
             },

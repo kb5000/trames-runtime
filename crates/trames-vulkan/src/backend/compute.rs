@@ -134,13 +134,32 @@ impl Capabilities {
         }
         caps
     }
-    pub fn resolve_modes(&self,depth:u32,stencil:u32)->Result<()> {
-        let p=self.properties.get(&(vk::StructureType::PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES.as_raw() as u32)).ok_or(Failure::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
-        if depth&!p[0]!=0 || stencil&!p[1]!=0 || depth!=0&&!depth.is_power_of_two() || stencil!=0&&!stencil.is_power_of_two()
-            || depth!=stencil && (if depth==0||stencil==0 {p[2]==0}else{p[3]==0}) {return unsupported();}Ok(())
+    pub fn resolve_modes(&self, depth: u32, stencil: u32) -> Result<()> {
+        let p = self
+            .properties
+            .get(
+                &(vk::StructureType::PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES.as_raw()
+                    as u32),
+            )
+            .ok_or(Failure::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        if depth & !p[0] != 0
+            || stencil & !p[1] != 0
+            || depth != 0 && !depth.is_power_of_two()
+            || stencil != 0 && !stencil.is_power_of_two()
+            || depth != stencil
+                && (if depth == 0 || stencil == 0 {
+                    p[2] == 0
+                } else {
+                    p[3] == 0
+                })
+        {
+            return unsupported();
+        }
+        Ok(())
     }
     pub fn multiview_count(&self) -> u32 {
-        self.properties.get(&(vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES.as_raw() as u32))
+        self.properties
+            .get(&(vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES.as_raw() as u32))
             .map_or(0, |p| p[0])
     }
     pub fn write_property(&self, m: &mut impl CpuMemory, kind: u32, at: u64) -> Result<()> {
@@ -164,7 +183,12 @@ impl Capabilities {
         }
         for &(bit, name, _) in EXTENSIONS {
             if bits & bit != 0 {
-                if !names.iter().any(|&n| unsafe { std::ffi::CStr::from_ptr(n) == name }) { names.push(name.as_ptr()); }
+                if !names
+                    .iter()
+                    .any(|&n| unsafe { std::ffi::CStr::from_ptr(n) == name })
+                {
+                    names.push(name.as_ptr());
+                }
             }
         }
         Ok(())

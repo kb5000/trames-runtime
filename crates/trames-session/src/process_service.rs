@@ -104,17 +104,27 @@ impl<C: Cpu> Kernel<C> {
             && !p.linux.trace
             && matches!(p.state, State::Ready)
         {
-            match p.linux.vfs.prepare_disk_sync(a[0] as u32, request.number == 83) {
+            match p
+                .linux
+                .vfs
+                .prepare_disk_sync(a[0] as u32, request.number == 83)
+            {
                 Ok(Some((sync, job))) => {
                     if disk.in_flight >= self.cpu_count {
                         disk.waiting.push_back(request);
                         return true;
                     }
-                    let id = disk.insert_sync(PendingDiskSync { request, _sync: sync });
+                    let id = disk.insert_sync(PendingDiskSync {
+                        request,
+                        _sync: sync,
+                    });
                     self.workers.disk_sync(id, job);
                     return true;
                 }
-                Err(e) => { request.respond(Some(error(e))); return true; }
+                Err(e) => {
+                    request.respond(Some(error(e)));
+                    return true;
+                }
                 Ok(None) => {}
             }
         }
@@ -196,10 +206,17 @@ impl<C: Cpu> Kernel<C> {
         }
         pending.request.respond(Some(result.unwrap_or_else(error)));
     }
-    pub(super) fn finish_disk_sync(&mut self, id: usize, result: Result<(), Errno>, disk: &mut DiskEpoch<C>) {
+    pub(super) fn finish_disk_sync(
+        &mut self,
+        id: usize,
+        result: Result<(), Errno>,
+        disk: &mut DiskEpoch<C>,
+    ) {
         let pending = disk.syncs[id].take().expect("submitted disk sync");
         disk.in_flight -= 1;
-        pending.request.respond(Some(result.map_or_else(error, |()| 0)));
+        pending
+            .request
+            .respond(Some(result.map_or_else(error, |()| 0)));
     }
     pub(super) fn resume_disk_waiters(
         &mut self,
@@ -786,14 +803,19 @@ mod tests {
             let mut io = trames_linux::CapturedOutput::default();
             assert!(k.epoch_request(request, &mut disk, &mut io));
             assert_eq!(disk.in_flight, 1);
-            let Some(Event::DiskSync(id, result)) = k.workers.event_timeout(Duration::from_secs(5)).unwrap()
-            else { panic!("missing disk sync") };
+            let Some(Event::DiskSync(id, result)) =
+                k.workers.event_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("missing disk sync")
+            };
             assert_eq!(result, Ok(()));
             // Retain completion while serving an unrelated caller: the sync
             // caller is still parked, without occupying coordinator execution.
-            let (mut peer_kernel, mut request, peer_control) = pending(peer, 63, [r as u64, 0x2000, 2, 0, 0, 0]);
+            let (mut peer_kernel, mut request, peer_control) =
+                pending(peer, 63, [r as u64, 0x2000, 2, 0, 0, 0]);
             request.pid = 2;
-            k.processes.insert(2, peer_kernel.processes.remove(&1).unwrap());
+            k.processes
+                .insert(2, peer_kernel.processes.remove(&1).unwrap());
             peer_control.stop();
             assert!(k.epoch_request(request, &mut disk, &mut io));
             assert_eq!(disk.in_flight, 1);
@@ -804,8 +826,18 @@ mod tests {
             assert_eq!(disk.in_flight, 0);
             let done = k.workers.complete().unwrap();
             assert_eq!((done.cpu.x(0), done.serviced_syscalls), (0, 1));
-            k.processes.get_mut(&1).unwrap().memory.commit_parallel().unwrap();
-            k.processes.get_mut(&2).unwrap().memory.commit_parallel().unwrap();
+            k.processes
+                .get_mut(&1)
+                .unwrap()
+                .memory
+                .commit_parallel()
+                .unwrap();
+            k.processes
+                .get_mut(&2)
+                .unwrap()
+                .memory
+                .commit_parallel()
+                .unwrap();
             drop((k, peer_kernel));
             std::fs::remove_dir_all(path).unwrap();
         }

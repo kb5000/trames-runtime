@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Optional AArch64 Linux clock vDSO, independent of the execution backend.
 //! Immutable guest RX code and R calibration data use ordinary guest memory.
-use trames_memory::{Access, Memory, MemoryError, PAGE_SIZE, Permissions};
+use trames_memory::{Access, Memory, MemoryError, Permissions, PAGE_SIZE};
 #[path = "vdso/code.rs"]
 mod code;
 pub const AUXV: u64 = 33; // AT_SYSINFO_EHDR
@@ -229,17 +229,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.read_array::<8>(base + DATA + 8).unwrap(), [0; 8]);
-        assert!(
-            initialize(
-                &mut m,
-                base,
-                TimeBase {
-                    frequency: u64::MAX,
-                    ..time()
-                }
-            )
-            .is_err()
-        );
+        assert!(initialize(
+            &mut m,
+            base,
+            TimeBase {
+                frequency: u64::MAX,
+                ..time()
+            }
+        )
+        .is_err());
     }
     #[test]
     fn a_removed_or_replaced_optional_mapping_is_not_overwritten_on_resume() {

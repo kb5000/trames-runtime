@@ -304,7 +304,7 @@ mod tests {
 
     use super::*;
     use trames_memory::{
-        CpuMemory, Memory, MemoryError, PAGE_SIZE, PageBacking, Permissions, SharedPage,
+        CpuMemory, Memory, MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE,
     };
     use trames_vfs::Errno;
 

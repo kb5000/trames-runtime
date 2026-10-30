@@ -321,12 +321,18 @@ enum DiskJob {
 impl DiskJob {
     fn run<C: Cpu>(self, cache: &mut trames_vfs::DiskReadCache) -> Event<C> {
         match self {
-            Self::Read(id, job, bytes) => Event::DiskRead(id,
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run_cached(cache, bytes)))
-                    .unwrap_or(Err(trames_vfs::Errno(5)))),
-            Self::Sync(id, job) => Event::DiskSync(id,
+            Self::Read(id, job, bytes) => Event::DiskRead(
+                id,
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job.run_cached(cache, bytes)
+                }))
+                .unwrap_or(Err(trames_vfs::Errno(5))),
+            ),
+            Self::Sync(id, job) => Event::DiskSync(
+                id,
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
-                    .unwrap_or(Err(trames_vfs::Errno(5)))),
+                    .unwrap_or(Err(trames_vfs::Errno(5))),
+            ),
         }
     }
 }
@@ -969,7 +975,9 @@ impl<C: Cpu> Pool<C> {
             job
         };
         // Thread resource failure preserves one execution and one completion.
-        let _ = self.send.send(job.run::<C>(&mut trames_vfs::DiskReadCache::default()));
+        let _ = self
+            .send
+            .send(job.run::<C>(&mut trames_vfs::DiskReadCache::default()));
     }
     pub fn recycle_disk_buffer(&mut self, bytes: Vec<u8>) {
         // Keep initialized lengths so equal-size reads need no repeated zeroing.
@@ -1050,7 +1058,12 @@ impl<C: Cpu> Drop for Pool<C> {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
-                Ok(Some(Event::<C>::DiskRead(_, _) | Event::<C>::DiskSync(_, _) | Event::<C>::VmReady | Event::<C>::Idle)) => {}
+                Ok(Some(
+                    Event::<C>::DiskRead(_, _)
+                    | Event::<C>::DiskSync(_, _)
+                    | Event::<C>::VmReady
+                    | Event::<C>::Idle,
+                )) => {}
                 Ok(None) => {
                     for worker in self.workers.iter_mut().flatten() {
                         if worker.join.is_finished() {

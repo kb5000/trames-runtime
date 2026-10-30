@@ -1099,15 +1099,11 @@ mod native_tests {
         m.write_array(0x203000, 713u64.to_le_bytes()).unwrap();
         let mut v = m.parallel_view(&mut r).unwrap();
         v.enable_hardware();
-        assert!(
-            unsafe {
-                v.export_hardware_range(0x200000, || {
-                    panic!("never replace reached canonical bytes")
-                })
-            }
-            .unwrap()
-            .is_none()
-        );
+        assert!(unsafe {
+            v.export_hardware_range(0x200000, || panic!("never replace reached canonical bytes"))
+        }
+        .unwrap()
+        .is_none());
         assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
     }
     #[test]

@@ -247,7 +247,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
-    use trames_memory::{MemoryError, PAGE_SIZE, PageBacking, Permissions, SharedPage};
+    use trames_memory::{MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE};
 
     struct Page {
         bytes: Arc<SharedPage>,
@@ -665,11 +665,10 @@ mod tests {
         assert_eq!(k.parallel_rounds, 1);
         assert_eq!(k.vm_checkpoint_groups, 0);
         assert_eq!(k.parallel_memory.metrics.full_rebuilds, 2);
-        assert!(
-            k.processes
-                .values()
-                .all(|p| p.memory.parallel_views_quiescent())
-        );
+        assert!(k
+            .processes
+            .values()
+            .all(|p| p.memory.parallel_views_quiescent()));
         let limit = k.instructions + 1000;
         assert!(matches!(
             k.drive(&mut trames_linux::CapturedOutput::default(), limit),

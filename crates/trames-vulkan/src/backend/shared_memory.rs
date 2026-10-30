@@ -95,13 +95,18 @@ impl Backend {
             let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
                 .host_pointer(owner.pointer().cast());
-            let mut allocation_flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::from_raw(flags));
+            let mut allocation_flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::from_raw(flags));
             let mut info = vk::MemoryAllocateInfo::default()
                 .allocation_size(owner.len() as u64)
                 .memory_type_index(ty)
                 .push_next(&mut import);
-            if flags != 0 { info = info.push_next(&mut allocation_flags); }
-            if !dedicated.buffer.is_null() || !dedicated.image.is_null(){info=info.push_next(&mut dedicated);}
+            if flags != 0 {
+                info = info.push_next(&mut allocation_flags);
+            }
+            if !dedicated.buffer.is_null() || !dedicated.image.is_null() {
+                info = info.push_next(&mut dedicated);
+            }
             let raw = unsafe { dev.native.allocate_memory(&info, None) }?;
             Ok((raw, owner))
         })())

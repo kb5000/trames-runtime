@@ -567,7 +567,8 @@ impl Vfs {
         let mut entries = self.fds.entries();
         // Resource identities cannot be reused while old grants remain.
         // Connection changes matter even without an FD-table mutation.
-        if let Some(auth) = entries.cached_wayland(services.identity, services.connection_revision) {
+        if let Some(auth) = entries.cached_wayland(services.identity, services.connection_revision)
+        {
             return auth;
         }
         let mut fds = BTreeMap::new();
@@ -592,7 +593,11 @@ impl Vfs {
             server: services.server.clone(),
             fds,
         })));
-        entries.cache_wayland(services.identity, services.connection_revision, auth.clone());
+        entries.cache_wayland(
+            services.identity,
+            services.connection_revision,
+            auth.clone(),
+        );
         auth
     }
     fn native_file_description(&self, fd: OwnedFd, owner: (u32, u32)) -> Result<OpenHandle> {
@@ -715,10 +720,16 @@ mod tests {
         let token = vfs.wayland_connection(fd).unwrap().1;
         let first = vfs.wayland_auth_snapshot();
         let repeated = vfs.wayland_auth_snapshot();
-        assert!(Arc::ptr_eq(first.0.as_ref().unwrap(), repeated.0.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            repeated.0.as_ref().unwrap()
+        ));
         let peer = vfs.clone_with_files(true);
         let shared = peer.wayland_auth_snapshot();
-        assert!(Arc::ptr_eq(first.0.as_ref().unwrap(), shared.0.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            first.0.as_ref().unwrap(),
+            shared.0.as_ref().unwrap()
+        ));
         drop(peer);
         let alias = vfs.dup(fd, 0, false).unwrap();
         let pair = vfs.socketpair(1, 1, 0).unwrap();
@@ -748,18 +759,23 @@ mod tests {
         let second = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
         let mut address = vec![1, 0];
         address.extend_from_slice(b"/run/user/0/wayland-0\0");
-        vfs.local_connect(&vfs.local_socket(first).unwrap().unwrap(), &address).unwrap();
+        vfs.local_connect(&vfs.local_socket(first).unwrap().unwrap(), &address)
+            .unwrap();
         let token = vfs.wayland_connection(first).unwrap().1;
         let before = vfs.wayland_auth_snapshot();
         assert!(before.resolve(second).is_none());
         let membership = vfs.shared_files().capture_identity();
-        vfs.local_connect(&vfs.local_socket(second).unwrap().unwrap(), &address).unwrap();
+        vfs.local_connect(&vfs.local_socket(second).unwrap().unwrap(), &address)
+            .unwrap();
         let other = vfs.wayland_connection(second).unwrap().1;
         assert_eq!(vfs.shared_files().capture_identity(), membership);
         let after = vfs.wayland_auth_snapshot();
         assert_eq!(after.resolve(first).unwrap().1, token);
         assert_eq!(after.resolve(second).unwrap().1, other);
-        assert!(!Arc::ptr_eq(before.0.as_ref().unwrap(), after.0.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(
+            before.0.as_ref().unwrap(),
+            after.0.as_ref().unwrap()
+        ));
     }
     #[test]
     fn retired_auth_cache_does_not_retain_closed_worker_file_quota() {
@@ -768,7 +784,8 @@ mod tests {
         let socket = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
         let mut address = vec![1, 0];
         address.extend_from_slice(b"/run/user/0/wayland-0\0");
-        vfs.local_connect(&vfs.local_socket(socket).unwrap().unwrap(), &address).unwrap();
+        vfs.local_connect(&vfs.local_socket(socket).unwrap().unwrap(), &address)
+            .unwrap();
         vfs.wayland_connection(socket).unwrap();
         let before = vfs.memfd_available();
         let fd = vfs.memfd_create(b"retire-auth", 0).unwrap();
@@ -781,11 +798,19 @@ mod tests {
         drop(snapshot);
         let membership = vfs.shared_files();
         std::thread::spawn(move || assert_eq!(membership.close(pipe[0], 0), Some(Ok(()))))
-            .join().unwrap();
-        assert!(retired.upgrade().is_none(), "worker membership changes must retire inactive auth grants");
+            .join()
+            .unwrap();
+        assert!(
+            retired.upgrade().is_none(),
+            "worker membership changes must retire inactive auth grants"
+        );
         drop(vfs.wayland_auth_snapshot());
         vfs.close(fd).unwrap();
-        assert_eq!(vfs.memfd_available(), before, "inactive authorization caches cannot retain closed file allocations");
+        assert_eq!(
+            vfs.memfd_available(),
+            before,
+            "inactive authorization caches cannot retain closed file allocations"
+        );
     }
     #[test]
     fn guest_unix_stream_reaches_the_native_wayland_server_with_standard_wire_messages() {

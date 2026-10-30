@@ -3,7 +3,7 @@
 //! inside each engine, with static dispatch and its existing memory model.
 use std::fmt;
 use trames_execution::{Aarch64State, Features, Registers, SmeConfig, SmeState};
-use trames_memory::{Memory, MemoryError, parallel::View};
+use trames_memory::{parallel::View, Memory, MemoryError};
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct DecodeStats {

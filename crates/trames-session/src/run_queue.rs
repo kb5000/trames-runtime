@@ -935,17 +935,20 @@ mod tests {
     }
     #[test]
     fn gpu_timeout_returns_its_slot_and_wakes_without_a_completion_or_poll_timer() {
-        let epoch=Epoch::new(Arc::new(Control::new(100)));
-        epoch.add(job(1,&epoch));epoch.add(job(2,&epoch));
-        let gpu=epoch.take(0).unwrap();
-        let began=Instant::now();
-        let deadline=began+Duration::from_millis(30);
-        let pending=crate::gpu::Pending::timed_for_test(deadline,1,&epoch.io_target);
-        epoch.park_gpu(gpu,pending);
-        let peer=epoch.take(0).unwrap();assert_eq!(peer.work.pid,2);
-        epoch.park_hardware(peer,Arc::new(trames_memory::HardwareWait::default()));
-        let resumed=epoch.take(0).unwrap();assert_eq!(resumed.work.pid,1);
-        assert!(Instant::now()>=deadline && began.elapsed()<Duration::from_secs(2));
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1, &epoch));
+        epoch.add(job(2, &epoch));
+        let gpu = epoch.take(0).unwrap();
+        let began = Instant::now();
+        let deadline = began + Duration::from_millis(30);
+        let pending = crate::gpu::Pending::timed_for_test(deadline, 1, &epoch.io_target);
+        epoch.park_gpu(gpu, pending);
+        let peer = epoch.take(0).unwrap();
+        assert_eq!(peer.work.pid, 2);
+        epoch.park_hardware(peer, Arc::new(trames_memory::HardwareWait::default()));
+        let resumed = epoch.take(0).unwrap();
+        assert_eq!(resumed.work.pid, 1);
+        assert!(Instant::now() >= deadline && began.elapsed() < Duration::from_secs(2));
         assert!(!resumed.gpu_pending.as_ref().unwrap().waiting());
     }
     fn job(pid: u32, epoch: &Arc<Epoch>) -> Box<Job> {

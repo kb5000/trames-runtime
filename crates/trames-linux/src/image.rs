@@ -2,7 +2,7 @@
 //! Linux process-entry ABI shared by interpreter and hardware execution.
 use trames_elf::LoadedElf;
 use trames_execution::Features;
-use trames_memory::{Memory, MemoryError, PAGE_SIZE, Permissions};
+use trames_memory::{Memory, MemoryError, Permissions, PAGE_SIZE};
 pub const STACK_TOP: u64 = 0x0000_7fff_fff0_0000;
 pub const STACK_SIZE: u64 = 1024 * 1024;
 const INITIAL_ARGUMENT_BYTES: u64 = 64 * 1024;

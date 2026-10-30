@@ -367,7 +367,11 @@ impl DiskStore {
         {
             return Err(Errno(22));
         }
-        Ok(Arc::new(Self { root, _lock: lock, checkpoint: std::sync::Mutex::new(()) }))
+        Ok(Arc::new(Self {
+            root,
+            _lock: lock,
+            checkpoint: std::sync::Mutex::new(()),
+        }))
     }
     fn object_path(&self, inode: u64) -> PathBuf {
         self.root.join("objects").join(format!("{inode:016x}.dat"))

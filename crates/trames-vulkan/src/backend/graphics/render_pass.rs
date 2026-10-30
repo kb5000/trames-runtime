@@ -26,7 +26,7 @@ pub(super) fn decode(backend: &Backend, m: &impl CpuMemory, at: u64) -> Result<D
             && x[2] == 1
             || aspects.contains(vk::ImageAspectFlags::STENCIL) && x[4] == 1
         {
-            pass.clear_count = pass.clear_count.max(i+1);
+            pass.clear_count = pass.clear_count.max(i + 1);
         }
         attachments.push(
             vk::AttachmentDescription::default()

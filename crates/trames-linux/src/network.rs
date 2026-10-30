@@ -151,8 +151,10 @@ impl Vectors {
             let length = u64_at(memory, pointer + i * 16 + 8)?;
             // Keep the Linux signed-iovec total valid even when only a short
             // transport prefix will be copied from a large receive capacity.
-            requested = requested.checked_add(length)
-                .filter(|&n| n <= i64::MAX as u64).ok_or(Errno(22))?;
+            requested = requested
+                .checked_add(length)
+                .filter(|&n| n <= i64::MAX as u64)
+                .ok_or(Errno(22))?;
             // A receive capacity may exceed one transport chunk. Complete a
             // bounded short receive instead of rejecting the caller's buffer.
             // Sends preserve message lengths so datagrams are never shortened.
