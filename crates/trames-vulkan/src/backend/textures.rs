@@ -88,7 +88,7 @@ impl Backend {
         }
         .limits;
         if a[1..=3].iter().any(|&x| x > 1)
-            || a[4..=6].iter().any(|&x| x > 3)
+            || a[4..=6].iter().any(|&x| x > 4 || x == 4 && device.compute_features & compute::SAMPLER_MIRROR_CLAMP_TO_EDGE == 0)
             || a[7] > 5
             || lod.iter().any(|x| !x.is_finite())
             || lod[0].abs() > limits.max_sampler_lod_bias
@@ -125,7 +125,9 @@ impl Backend {
         {
             return unsupported();
         }
-        let info = vk::SamplerCreateInfo::default()
+        if a[14] > 2 || a[14] != 0 && (device.compute_features & compute::SAMPLER_FILTER_MINMAX == 0 || a[12] != 0) { return unsupported(); }
+        let mut reduction = vk::SamplerReductionModeCreateInfo::default().reduction_mode(vk::SamplerReductionMode::from_raw(a[14] as i32));
+        let mut info = vk::SamplerCreateInfo::default()
             .anisotropy_enable(a[10] != 0)
             .max_anisotropy(if a[10] != 0 { anisotropy } else { 1.0 })
             .mag_filter(vk::Filter::from_raw(a[1] as i32))
@@ -140,6 +142,7 @@ impl Backend {
             .max_lod(lod[2])
             .compare_enable(a[12] != 0)
             .compare_op(vk::CompareOp::from_raw(a[13] as i32));
+        if a[14] != 0 { info = info.push_next(&mut reduction); }
         let raw = unsafe { device.native.create_sampler(&info, None) }?;
         let id = self.put(Kind::Sampler, raw.as_raw(), vec![], 0, 0);
         self.publish(m, a[9], id)

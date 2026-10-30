@@ -9,17 +9,17 @@ pub(super) struct Capabilities {
     pub features: u64,
     pub api: u32,
     properties: BTreeMap<u32, Vec<u32>>,
+    aggregate_properties: BTreeMap<u32, Vec<u8>>,
 }
 macro_rules! compute_features {
-    ($($member:ident: $ty:ident, $extension:literal, $first:literal => [$($bit:literal => $field:ident : $expose:literal),+];)+) => {
+    ($($member:ident: $ty:ident, $extension:literal, $promoted:literal => [$($bit:literal => $field:ident : $expose:literal),+];)+) => {
         #[derive(Default)]
-        pub(super) struct Selected { $( $member: vk::$ty<'static>, )+ }
+        pub(super) struct Selected { $( $member: vk::$ty<'static>, )+ vulkan12: vk::PhysicalDeviceVulkan12Features<'static>, core12: bool }
         impl Selected {
             pub fn new(caps: &Capabilities, extensions: u64, features: u64) -> Result<Self> {
                 if extensions & !caps.extensions != 0 || features & !caps.features != 0 { return unsupported(); }
-                let mut selected = Self::default();
-                $(const _: () = assert!($first < 64);
-                let mask = 0 $(| (1 << $bit))+;
+                let mut selected = Self { core12: caps.api >= vk::API_VERSION_1_2, ..Self::default() };
+                $(let mask = 0 $(| (1 << $bit))+;
                 if features & mask != 0 && extensions & (1 << $extension) == 0 { return unsupported(); }
                 $(selected.$member.$field = ((features >> $bit) & 1) as u32;)+)+
                 // StorageBuffer storage class is a dependency of low-bit storage.
@@ -27,7 +27,8 @@ macro_rules! compute_features {
                 Ok(selected)
             }
             pub fn chain<'a>(&'a mut self, extensions: u64, mut info: vk::DeviceCreateInfo<'a>) -> vk::DeviceCreateInfo<'a> {
-                $(if extensions & (1 << $extension) != 0 { info = info.push_next(&mut self.$member); })+
+                $(if extensions & (1 << $extension) != 0 && !(self.core12 && $promoted == 12) { info = info.push_next(&mut self.$member); })+
+                if self.core12 { info = info.push_next(&mut self.vulkan12); }
                 info
             }
         }
@@ -78,7 +79,7 @@ impl Capabilities {
             return caps;
         }
         let native = unsafe { instance.native.get_physical_device_properties(physical) };
-        caps.api = native.api_version.min(vk::API_VERSION_1_1);
+        caps.api = native.api_version.min(vk::API_VERSION_1_2);
         for &(bit, name, minimum) in EXTENSIONS {
             if caps.api >= minimum
                 && ext
@@ -93,11 +94,13 @@ impl Capabilities {
             &instance.native,
         );
         query_features(&mut caps, &query, physical);
+        query_core12(&mut caps, &query, physical);
         // The pinned Apple MoltenVK advertises this field, but native MSL
         // compilation rejects threadgroup atomic_float add and exchange.
         // Buffer atomics stay driver-backed; no CPU/CAS emulation.
         caps.features = executable_features(caps.features, cfg!(trames_moltenvk), native.vendor_id);
         query_properties(&mut caps, &query, physical);
+        query_aggregate_properties(&mut caps, &query, physical);
         if let Some(p) = caps
             .properties
             .get_mut(&(vk::StructureType::PHYSICAL_DEVICE_SUBGROUP_PROPERTIES.as_raw() as u32))
@@ -132,6 +135,9 @@ impl Capabilities {
         caps
     }
     pub fn write_property(&self, m: &mut impl CpuMemory, kind: u32, at: u64) -> Result<()> {
+        if let Some(bytes) = self.aggregate_properties.get(&kind) {
+            return write(m, at, bytes);
+        }
         let words = self
             .properties
             .get(&kind)
@@ -186,6 +192,75 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn core12_promotion_merges_aliases_without_duplicate_native_nodes() {
+        let bits = (1 << 4) | (1 << 7) | HOST_QUERY_RESET | SUBGROUP_BROADCAST_DYNAMIC_ID;
+        let extensions = EXT_STORAGE_CLASS | (1 << 2) | (1 << 3) | (1 << 17);
+        let caps = Capabilities {
+            api: vk::API_VERSION_1_2,
+            extensions,
+            features: bits,
+            ..Default::default()
+        };
+        let mut selected = Selected::new(&caps, extensions, bits).unwrap();
+        selected.core12_features(bits, 2 | 512 | 2048);
+        let info = selected.chain(extensions, vk::DeviceCreateInfo::default());
+        let mut node = info.p_next.cast::<vk::BaseInStructure>();
+        let mut types = Vec::new();
+        // SAFETY: the owned Selected nodes outlive info and have the Vulkan
+        // base header layout. Read only the initialized matching concrete type.
+        unsafe {
+            while !node.is_null() {
+                types.push((*node).s_type);
+                if (*node).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+                    let v = &*node.cast::<vk::PhysicalDeviceVulkan12Features>();
+                    assert_eq!(
+                        (
+                            v.storage_buffer8_bit_access,
+                            v.shader_float16,
+                            v.host_query_reset,
+                            v.subgroup_broadcast_dynamic_id
+                        ),
+                        (1, 1, 1, 1)
+                    );
+                    assert_eq!(
+                        (
+                            v.timeline_semaphore,
+                            v.imageless_framebuffer,
+                            v.scalar_block_layout
+                        ),
+                        (1, 1, 1)
+                    );
+                    assert_eq!(v.descriptor_indexing, 0);
+                }
+                node = (*node).p_next;
+            }
+        }
+        assert_eq!(
+            types,
+            vec![vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES]
+        );
+    }
+    #[test]
+    fn core11_keeps_original_individual_feature_nodes() {
+        let extensions = EXT_STORAGE_CLASS | (1 << 2);
+        let caps = Capabilities {
+            api: vk::API_VERSION_1_1,
+            extensions,
+            features: 1 << 4,
+            ..Default::default()
+        };
+        let mut selected = Selected::new(&caps, extensions, 1 << 4).unwrap();
+        selected.core12_features(1 << 4, 0);
+        let info = selected.chain(extensions, vk::DeviceCreateInfo::default());
+        // SAFETY: info points into the live Selected storage8 node.
+        let node = unsafe { &*info.p_next.cast::<vk::BaseInStructure>() };
+        assert_eq!(
+            node.s_type,
+            vk::StructureType::PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES
+        );
+        assert!(node.p_next.is_null());
+    }
     #[test]
     fn apple_atomic_quirk_preserves_buffer_atomics_and_other_drivers() {
         let removed = SHADER_SHARED_FLOAT32_ATOMICS | SHADER_SHARED_FLOAT32_ATOMIC_ADD;

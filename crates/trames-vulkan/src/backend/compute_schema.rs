@@ -18,32 +18,296 @@ pub(super) const EXTENSIONS: &[(u64, &std::ffi::CStr, u32)] = &[
     (1 << 14, c"VK_KHR_shader_subgroup_rotate", vk::API_VERSION_1_1),
     (1 << 15, c"VK_KHR_bind_memory2", vk::API_VERSION_1_0),
     (1 << 16, c"VK_KHR_maintenance3", vk::API_VERSION_1_0),
+    (1 << 17, c"VK_EXT_host_query_reset", vk::API_VERSION_1_2),
+    (1 << 18, c"VK_KHR_shader_draw_parameters", vk::API_VERSION_1_1),
+    (1 << 19, c"VK_KHR_sampler_mirror_clamp_to_edge", vk::API_VERSION_1_2),
+    (1 << 20, c"VK_EXT_sampler_filter_minmax", vk::API_VERSION_1_2),
+    (1 << 21, c"VK_KHR_spirv_1_4", vk::API_VERSION_1_2),
+    (1 << 22, c"VK_KHR_shader_non_semantic_info", vk::API_VERSION_1_0),
 ];
 pub(super) const EXT_STORAGE_CLASS: u64 = 1 << 0;
 pub(super) const EXT_MAINTENANCE3: u64 = 1 << 16;
 compute_features! {
-    storage16: PhysicalDevice16BitStorageFeatures, 1, 0 => [0 => storage_buffer16_bit_access : true, 1 => uniform_and_storage_buffer16_bit_access : true, 2 => storage_push_constant16 : true, 3 => storage_input_output16 : true];
-    storage8: PhysicalDevice8BitStorageFeatures, 2, 4 => [4 => storage_buffer8_bit_access : true, 5 => uniform_and_storage_buffer8_bit_access : true, 6 => storage_push_constant8 : true];
-    arithmetic: PhysicalDeviceShaderFloat16Int8Features, 3, 7 => [7 => shader_float16 : true, 8 => shader_int8 : true];
-    atomic_float: PhysicalDeviceShaderAtomicFloatFeaturesEXT, 5, 9 => [9 => shader_buffer_float32_atomics : true, 10 => shader_buffer_float32_atomic_add : true, 11 => shader_buffer_float64_atomics : false, 12 => shader_buffer_float64_atomic_add : false, 13 => shader_shared_float32_atomics : true, 14 => shader_shared_float32_atomic_add : true, 15 => shader_shared_float64_atomics : false, 16 => shader_shared_float64_atomic_add : false, 17 => shader_image_float32_atomics : true, 18 => shader_image_float32_atomic_add : true, 19 => sparse_image_float32_atomics : false, 20 => sparse_image_float32_atomic_add : false];
-    integer_dot: PhysicalDeviceShaderIntegerDotProductFeatures, 6, 21 => [21 => shader_integer_dot_product : true];
-    subgroup_types: PhysicalDeviceShaderSubgroupExtendedTypesFeatures, 7, 22 => [22 => shader_subgroup_extended_types : true];
-    subgroup_size: PhysicalDeviceSubgroupSizeControlFeatures, 8, 23 => [23 => subgroup_size_control : true, 24 => compute_full_subgroups : true];
-    address: PhysicalDeviceBufferDeviceAddressFeatures, 9, 25 => [25 => buffer_device_address : true, 26 => buffer_device_address_capture_replay : false, 27 => buffer_device_address_multi_device : false];
-    memory_model: PhysicalDeviceVulkanMemoryModelFeatures, 10, 28 => [28 => vulkan_memory_model : true, 29 => vulkan_memory_model_device_scope : true, 30 => vulkan_memory_model_availability_visibility_chains : true];
-    uniform_layout: PhysicalDeviceUniformBufferStandardLayoutFeatures, 11, 31 => [31 => uniform_buffer_standard_layout : true];
-    variable_pointers: PhysicalDeviceVariablePointersFeatures, 12, 32 => [32 => variable_pointers_storage_buffer : true, 33 => variable_pointers : true];
-    subgroup_flow: PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR, 13, 34 => [34 => shader_subgroup_uniform_control_flow : true];
-    subgroup_rotate: PhysicalDeviceShaderSubgroupRotateFeaturesKHR, 14, 35 => [35 => shader_subgroup_rotate : true, 36 => shader_subgroup_rotate_clustered : true];
+    storage16: PhysicalDevice16BitStorageFeatures, 1, 11 => [0 => storage_buffer16_bit_access : true, 1 => uniform_and_storage_buffer16_bit_access : true, 2 => storage_push_constant16 : true, 3 => storage_input_output16 : true];
+    storage8: PhysicalDevice8BitStorageFeatures, 2, 12 => [4 => storage_buffer8_bit_access : true, 5 => uniform_and_storage_buffer8_bit_access : true, 6 => storage_push_constant8 : true];
+    arithmetic: PhysicalDeviceShaderFloat16Int8Features, 3, 12 => [7 => shader_float16 : true, 8 => shader_int8 : true];
+    atomic_float: PhysicalDeviceShaderAtomicFloatFeaturesEXT, 5, 0 => [9 => shader_buffer_float32_atomics : true, 10 => shader_buffer_float32_atomic_add : true, 11 => shader_buffer_float64_atomics : false, 12 => shader_buffer_float64_atomic_add : false, 13 => shader_shared_float32_atomics : true, 14 => shader_shared_float32_atomic_add : true, 15 => shader_shared_float64_atomics : false, 16 => shader_shared_float64_atomic_add : false, 17 => shader_image_float32_atomics : true, 18 => shader_image_float32_atomic_add : true, 19 => sparse_image_float32_atomics : false, 20 => sparse_image_float32_atomic_add : false];
+    integer_dot: PhysicalDeviceShaderIntegerDotProductFeatures, 6, 13 => [21 => shader_integer_dot_product : true];
+    subgroup_types: PhysicalDeviceShaderSubgroupExtendedTypesFeatures, 7, 12 => [22 => shader_subgroup_extended_types : true];
+    subgroup_size: PhysicalDeviceSubgroupSizeControlFeatures, 8, 13 => [23 => subgroup_size_control : true, 24 => compute_full_subgroups : true];
+    address: PhysicalDeviceBufferDeviceAddressFeatures, 9, 12 => [25 => buffer_device_address : true, 26 => buffer_device_address_capture_replay : false, 27 => buffer_device_address_multi_device : false];
+    memory_model: PhysicalDeviceVulkanMemoryModelFeatures, 10, 12 => [28 => vulkan_memory_model : true, 29 => vulkan_memory_model_device_scope : true, 30 => vulkan_memory_model_availability_visibility_chains : true];
+    uniform_layout: PhysicalDeviceUniformBufferStandardLayoutFeatures, 11, 12 => [31 => uniform_buffer_standard_layout : true];
+    variable_pointers: PhysicalDeviceVariablePointersFeatures, 12, 11 => [32 => variable_pointers_storage_buffer : true, 33 => variable_pointers : true];
+    subgroup_flow: PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR, 13, 0 => [34 => shader_subgroup_uniform_control_flow : true];
+    subgroup_rotate: PhysicalDeviceShaderSubgroupRotateFeaturesKHR, 14, 0 => [35 => shader_subgroup_rotate : true, 36 => shader_subgroup_rotate_clustered : true];
+    host_query_reset: PhysicalDeviceHostQueryResetFeatures, 17, 12 => [37 => host_query_reset : true];
+    draw_parameters: PhysicalDeviceShaderDrawParametersFeatures, 18, 11 => [38 => shader_draw_parameters : true];
 }
 pub(super) const SHADER_SHARED_FLOAT32_ATOMICS: u64 = 1 << 13;
 pub(super) const SHADER_SHARED_FLOAT32_ATOMIC_ADD: u64 = 1 << 14;
 pub(super) const SUBGROUP_SIZE_CONTROL: u64 = 1 << 23;
 pub(super) const COMPUTE_FULL_SUBGROUPS: u64 = 1 << 24;
 pub(super) const BUFFER_DEVICE_ADDRESS: u64 = 1 << 25;
+pub(super) const HOST_QUERY_RESET: u64 = 1 << 37;
+pub(super) const SUBGROUP_BROADCAST_DYNAMIC_ID: u64 = 1 << 39;
+pub(super) const SAMPLER_MIRROR_CLAMP_TO_EDGE: u64 = 1 << 40;
+pub(super) const SAMPLER_FILTER_MINMAX: u64 = 1 << 41;
+impl Selected {
+    pub fn core12_features(&mut self, features: u64, legacy: u64) {
+        self.vulkan12.storage_buffer8_bit_access = self.storage8.storage_buffer8_bit_access;
+        self.vulkan12.uniform_and_storage_buffer8_bit_access = self.storage8.uniform_and_storage_buffer8_bit_access;
+        self.vulkan12.storage_push_constant8 = self.storage8.storage_push_constant8;
+        self.vulkan12.shader_float16 = self.arithmetic.shader_float16;
+        self.vulkan12.shader_int8 = self.arithmetic.shader_int8;
+        self.vulkan12.shader_subgroup_extended_types = self.subgroup_types.shader_subgroup_extended_types;
+        self.vulkan12.buffer_device_address = self.address.buffer_device_address;
+        self.vulkan12.buffer_device_address_capture_replay = self.address.buffer_device_address_capture_replay;
+        self.vulkan12.buffer_device_address_multi_device = self.address.buffer_device_address_multi_device;
+        self.vulkan12.vulkan_memory_model = self.memory_model.vulkan_memory_model;
+        self.vulkan12.vulkan_memory_model_device_scope = self.memory_model.vulkan_memory_model_device_scope;
+        self.vulkan12.vulkan_memory_model_availability_visibility_chains = self.memory_model.vulkan_memory_model_availability_visibility_chains;
+        self.vulkan12.uniform_buffer_standard_layout = self.uniform_layout.uniform_buffer_standard_layout;
+        self.vulkan12.host_query_reset = self.host_query_reset.host_query_reset;
+        self.vulkan12.subgroup_broadcast_dynamic_id = u32::from(features & (1 << 39) != 0);
+        self.vulkan12.sampler_mirror_clamp_to_edge = u32::from(features & (1 << 40) != 0);
+        self.vulkan12.sampler_filter_minmax = u32::from(features & (1 << 41) != 0);
+        self.vulkan12.scalar_block_layout = u32::from(legacy & (1 << 11) != 0);
+        self.vulkan12.imageless_framebuffer = u32::from(legacy & (1 << 9) != 0);
+        self.vulkan12.timeline_semaphore = u32::from(legacy & (1 << 1) != 0);
+    }
+}
+fn query_core12(caps: &mut Capabilities, query: &ash::khr::get_physical_device_properties2::Instance, physical: vk::PhysicalDevice) {
+    if caps.api < vk::API_VERSION_1_2 { return; }
+    let mut native = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut native);
+    unsafe { query.get_physical_device_features2(physical, &mut features); }
+    if native.subgroup_broadcast_dynamic_id != 0 { caps.features |= SUBGROUP_BROADCAST_DYNAMIC_ID; }
+    if native.sampler_mirror_clamp_to_edge != 0 { caps.features |= SAMPLER_MIRROR_CLAMP_TO_EDGE; }
+    if native.sampler_filter_minmax != 0 { caps.features |= SAMPLER_FILTER_MINMAX; }
+}
 compute_properties! {
     PhysicalDeviceSubgroupProperties, 0 => [subgroup_size, supported_stages.as_raw(), supported_operations.as_raw(), quad_operations_in_all_stages];
     PhysicalDeviceFloatControlsProperties, 1 << 4 => [denorm_behavior_independence.as_raw() as u32, rounding_mode_independence.as_raw() as u32, shader_signed_zero_inf_nan_preserve_float16, shader_signed_zero_inf_nan_preserve_float32, shader_signed_zero_inf_nan_preserve_float64, shader_denorm_preserve_float16, shader_denorm_preserve_float32, shader_denorm_preserve_float64, shader_denorm_flush_to_zero_float16, shader_denorm_flush_to_zero_float32, shader_denorm_flush_to_zero_float64, shader_rounding_mode_rte_float16, shader_rounding_mode_rte_float32, shader_rounding_mode_rte_float64, shader_rounding_mode_rtz_float16, shader_rounding_mode_rtz_float32, shader_rounding_mode_rtz_float64];
     PhysicalDeviceShaderIntegerDotProductProperties, 1 << 6 => [integer_dot_product8_bit_unsigned_accelerated, integer_dot_product8_bit_signed_accelerated, integer_dot_product8_bit_mixed_signedness_accelerated, integer_dot_product4x8_bit_packed_unsigned_accelerated, integer_dot_product4x8_bit_packed_signed_accelerated, integer_dot_product4x8_bit_packed_mixed_signedness_accelerated, integer_dot_product16_bit_unsigned_accelerated, integer_dot_product16_bit_signed_accelerated, integer_dot_product16_bit_mixed_signedness_accelerated, integer_dot_product32_bit_unsigned_accelerated, integer_dot_product32_bit_signed_accelerated, integer_dot_product32_bit_mixed_signedness_accelerated, integer_dot_product64_bit_unsigned_accelerated, integer_dot_product64_bit_signed_accelerated, integer_dot_product64_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating8_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating8_bit_signed_accelerated, integer_dot_product_accumulating_saturating8_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_unsigned_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating16_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating16_bit_signed_accelerated, integer_dot_product_accumulating_saturating16_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating32_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating32_bit_signed_accelerated, integer_dot_product_accumulating_saturating32_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating64_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating64_bit_signed_accelerated, integer_dot_product_accumulating_saturating64_bit_mixed_signedness_accelerated];
     PhysicalDeviceSubgroupSizeControlProperties, 1 << 8 => [min_subgroup_size, max_subgroup_size, max_compute_workgroup_subgroups, required_subgroup_size_stages.as_raw()];
+}
+fn query_aggregate_properties(caps: &mut Capabilities, query: &ash::khr::get_physical_device_properties2::Instance, physical: vk::PhysicalDevice) {
+    if caps.api >= vk::API_VERSION_1_1 {
+        let mut native = vk::PhysicalDeviceVulkan11Properties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut native);
+        unsafe { query.get_physical_device_properties2(physical, &mut properties); }
+        native.subgroup_supported_stages &= vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
+        native.max_multiview_view_count = 0;
+        native.max_multiview_instance_index = 0;
+        let start = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_uuid);
+        let mut bytes = vec![0; std::mem::size_of::<vk::PhysicalDeviceVulkan11Properties>() - start];
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_uuid) - start;
+        let value = native.device_uuid.to_vec();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, driver_uuid) - start;
+        let value = native.driver_uuid.to_vec();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_luid) - start;
+        let value = native.device_luid.to_vec();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_node_mask) - start;
+        let value = native.device_node_mask.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_luid_valid) - start;
+        let value = native.device_luid_valid.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, subgroup_size) - start;
+        let value = native.subgroup_size.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, subgroup_supported_stages) - start;
+        let value = native.subgroup_supported_stages.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, subgroup_supported_operations) - start;
+        let value = native.subgroup_supported_operations.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, subgroup_quad_operations_in_all_stages) - start;
+        let value = native.subgroup_quad_operations_in_all_stages.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, point_clipping_behavior) - start;
+        let value = native.point_clipping_behavior.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, max_multiview_view_count) - start;
+        let value = native.max_multiview_view_count.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, max_multiview_instance_index) - start;
+        let value = native.max_multiview_instance_index.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, protected_no_fault) - start;
+        let value = native.protected_no_fault.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, max_per_set_descriptors) - start;
+        let value = native.max_per_set_descriptors.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, max_memory_allocation_size) - start;
+        let value = native.max_memory_allocation_size.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        caps.aggregate_properties.insert(native.s_type.as_raw() as u32, bytes);
+    }
+    if caps.api >= vk::API_VERSION_1_2 {
+        let mut native = vk::PhysicalDeviceVulkan12Properties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut native);
+        unsafe { query.get_physical_device_properties2(physical, &mut properties); }
+        let start = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, driver_id);
+        let mut bytes = vec![0; std::mem::size_of::<vk::PhysicalDeviceVulkan12Properties>() - start];
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, driver_id) - start;
+        let value = native.driver_id.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, driver_name) - start;
+        let value = native.driver_name.iter().map(|&v| v as u8).collect::<Vec<_>>();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, driver_info) - start;
+        let value = native.driver_info.iter().map(|&v| v as u8).collect::<Vec<_>>();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, denorm_behavior_independence) - start;
+        let value = native.denorm_behavior_independence.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, rounding_mode_independence) - start;
+        let value = native.rounding_mode_independence.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_signed_zero_inf_nan_preserve_float16) - start;
+        let value = native.shader_signed_zero_inf_nan_preserve_float16.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_signed_zero_inf_nan_preserve_float32) - start;
+        let value = native.shader_signed_zero_inf_nan_preserve_float32.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_signed_zero_inf_nan_preserve_float64) - start;
+        let value = native.shader_signed_zero_inf_nan_preserve_float64.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_preserve_float16) - start;
+        let value = native.shader_denorm_preserve_float16.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_preserve_float32) - start;
+        let value = native.shader_denorm_preserve_float32.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_preserve_float64) - start;
+        let value = native.shader_denorm_preserve_float64.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_flush_to_zero_float16) - start;
+        let value = native.shader_denorm_flush_to_zero_float16.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_flush_to_zero_float32) - start;
+        let value = native.shader_denorm_flush_to_zero_float32.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_denorm_flush_to_zero_float64) - start;
+        let value = native.shader_denorm_flush_to_zero_float64.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rte_float16) - start;
+        let value = native.shader_rounding_mode_rte_float16.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rte_float32) - start;
+        let value = native.shader_rounding_mode_rte_float32.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rte_float64) - start;
+        let value = native.shader_rounding_mode_rte_float64.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rtz_float16) - start;
+        let value = native.shader_rounding_mode_rtz_float16.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rtz_float32) - start;
+        let value = native.shader_rounding_mode_rtz_float32.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_rounding_mode_rtz_float64) - start;
+        let value = native.shader_rounding_mode_rtz_float64.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_update_after_bind_descriptors_in_all_pools) - start;
+        let value = native.max_update_after_bind_descriptors_in_all_pools.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_uniform_buffer_array_non_uniform_indexing_native) - start;
+        let value = native.shader_uniform_buffer_array_non_uniform_indexing_native.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_sampled_image_array_non_uniform_indexing_native) - start;
+        let value = native.shader_sampled_image_array_non_uniform_indexing_native.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_storage_buffer_array_non_uniform_indexing_native) - start;
+        let value = native.shader_storage_buffer_array_non_uniform_indexing_native.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_storage_image_array_non_uniform_indexing_native) - start;
+        let value = native.shader_storage_image_array_non_uniform_indexing_native.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, shader_input_attachment_array_non_uniform_indexing_native) - start;
+        let value = native.shader_input_attachment_array_non_uniform_indexing_native.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, robust_buffer_access_update_after_bind) - start;
+        let value = native.robust_buffer_access_update_after_bind.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, quad_divergent_implicit_lod) - start;
+        let value = native.quad_divergent_implicit_lod.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_samplers) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_samplers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_uniform_buffers) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_uniform_buffers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_storage_buffers) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_storage_buffers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_sampled_images) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_sampled_images.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_storage_images) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_storage_images.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_descriptor_update_after_bind_input_attachments) - start;
+        let value = native.max_per_stage_descriptor_update_after_bind_input_attachments.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_per_stage_update_after_bind_resources) - start;
+        let value = native.max_per_stage_update_after_bind_resources.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_samplers) - start;
+        let value = native.max_descriptor_set_update_after_bind_samplers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_uniform_buffers) - start;
+        let value = native.max_descriptor_set_update_after_bind_uniform_buffers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_uniform_buffers_dynamic) - start;
+        let value = native.max_descriptor_set_update_after_bind_uniform_buffers_dynamic.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_storage_buffers) - start;
+        let value = native.max_descriptor_set_update_after_bind_storage_buffers.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_storage_buffers_dynamic) - start;
+        let value = native.max_descriptor_set_update_after_bind_storage_buffers_dynamic.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_sampled_images) - start;
+        let value = native.max_descriptor_set_update_after_bind_sampled_images.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_storage_images) - start;
+        let value = native.max_descriptor_set_update_after_bind_storage_images.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_descriptor_set_update_after_bind_input_attachments) - start;
+        let value = native.max_descriptor_set_update_after_bind_input_attachments.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, supported_depth_resolve_modes) - start;
+        let value = native.supported_depth_resolve_modes.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, supported_stencil_resolve_modes) - start;
+        let value = native.supported_stencil_resolve_modes.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, independent_resolve_none) - start;
+        let value = native.independent_resolve_none.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, independent_resolve) - start;
+        let value = native.independent_resolve.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, filter_minmax_single_component_formats) - start;
+        let value = native.filter_minmax_single_component_formats.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, filter_minmax_image_component_mapping) - start;
+        let value = native.filter_minmax_image_component_mapping.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, max_timeline_semaphore_value_difference) - start;
+        let value = native.max_timeline_semaphore_value_difference.to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan12Properties, framebuffer_integer_color_sample_counts) - start;
+        let value = native.framebuffer_integer_color_sample_counts.as_raw().to_le_bytes();
+        bytes[at..at + value.len()].copy_from_slice(&value);
+        caps.aggregate_properties.insert(native.s_type.as_raw() as u32, bytes);
+    }
 }

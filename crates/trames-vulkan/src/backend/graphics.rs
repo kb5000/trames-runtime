@@ -918,6 +918,7 @@ impl Backend {
                     d
                 },
                 bind_point: vk::PipelineBindPoint::GRAPHICS,
+                creation_flags: 0,
                 vertex_inputs: inputs,
                 static_states,
                 output: a[7],

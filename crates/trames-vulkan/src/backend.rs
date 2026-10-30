@@ -16,6 +16,7 @@ use trames_memory::{Access, CpuMemory, MemoryError};
 use vk::Handle;
 mod coherent;
 mod core_features;
+mod core_commands;
 mod compute;
 mod completion;
 mod shared_memory;
@@ -99,6 +100,7 @@ struct Device {
     viewport_dimensions: [u32; 2],
     viewport_bounds: [f32; 2],
     max_indirect_draw_count: u32,
+    compute_workgroup_count: [u32; 3],
     compute_features: u64,
 }
 impl Drop for Device {
@@ -171,6 +173,7 @@ struct Object {
     state: Cell<u8>,
     command_usage: Cell<u32>,
     allocation_flags: Cell<u32>,
+    pipeline_flags: Cell<u32>,
     pending_submissions: Cell<u32>,
     mapped: Cell<usize>,
     memory_binding: Cell<Option<coherent::Binding>>,
@@ -375,6 +378,7 @@ struct Compile {
     task: crate::task::Task<std::result::Result<CompiledPipeline, vk::Result>>,
     dependencies: Vec<Rc<Object>>,
     bind_point: vk::PipelineBindPoint,
+    creation_flags: u32,
     vertex_inputs: Vec<graphics::VertexBinding>,
     static_states: u8,
     output: u64,
@@ -517,6 +521,7 @@ impl Backend {
             state: Cell::new(0),
             command_usage: Cell::new(0),
             allocation_flags: Cell::new(0),
+            pipeline_flags: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
             memory_binding: Cell::new(None),
@@ -794,6 +799,7 @@ impl Backend {
             state: Cell::new(0),
             command_usage: Cell::new(0),
             allocation_flags: Cell::new(0),
+            pipeline_flags: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
             memory_binding: Cell::new(None),
@@ -919,6 +925,7 @@ impl Backend {
         if data_size != 0 {
             m.read(a[7], &mut data)?;
         }
+        if a[10] & !(vk::PipelineCreateFlags::DISPATCH_BASE.as_raw() as u64) != 0 { return unsupported(); }
         let permit = self
             .budget
             .compile()
@@ -948,6 +955,7 @@ impl Backend {
                 .specialization_info(&specialization);
             if a[12] != 0 { stage = stage.push_next(&mut subgroup); }
             let info = [vk::ComputePipelineCreateInfo::default()
+                .flags(vk::PipelineCreateFlags::from_raw(a[10] as u32))
                 .stage(stage)
                 .layout(raw_layout)];
             match unsafe {
@@ -978,6 +986,7 @@ impl Backend {
                     d
                 },
                 bind_point: vk::PipelineBindPoint::COMPUTE,
+                creation_flags: a[10] as u32,
                 vertex_inputs: Vec::new(),
                 static_states: 0,
                 output: a[4],
@@ -1051,6 +1060,7 @@ impl Backend {
             0,
             c.bind_point.as_raw() as u32,
         );
+        self.objects[&id].pipeline_flags.set(c.creation_flags);
         *self.objects[&id].vertex_inputs.borrow_mut() = c.vertex_inputs;
         self.objects[&id].static_states.set(c.static_states);
         pipeline.raw = vk::Pipeline::null();
@@ -1131,7 +1141,7 @@ impl Backend {
                     .ty(vk::LayerSettingTypeEXT::BOOL32)
             }];
             let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
-            let api = unsafe { entry.try_enumerate_instance_version() }?.unwrap_or(vk::API_VERSION_1_0).min(vk::API_VERSION_1_1);
+            let api = unsafe { entry.try_enumerate_instance_version() }?.unwrap_or(vk::API_VERSION_1_0).min(vk::API_VERSION_1_2);
             let app = vk::ApplicationInfo::default().api_version(api);
             let mut info = vk::InstanceCreateInfo::default()
                 .application_info(&app)
@@ -1444,6 +1454,8 @@ impl Backend {
                 zink::device_extensions(a[5], &self.capabilities, &mut names)?;
                 self.capabilities.compute.extension_names(a[6], &mut names)?;
                 let mut compute = compute::Selected::new(&self.capabilities.compute, a[6], a[7])?;
+                compute.core12_features(a[7], a[5]);
+                let core12 = self.capabilities.compute.api >= vk::API_VERSION_1_2;
                 let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default()
                     .timeline_semaphore(a[5] & 2 != 0);
                 let mut imageless = vk::PhysicalDeviceImagelessFramebufferFeatures::default()
@@ -1460,13 +1472,13 @@ impl Backend {
                     .queue_create_infos(&queue)
                     .enabled_features(&features)
                     .enabled_extension_names(&names);
-                if a[5] & 2 != 0 {
+                if a[5] & 2 != 0 && !core12 {
                     info = info.push_next(&mut timeline);
                 }
-                if a[5] & 512 != 0 {
+                if a[5] & 512 != 0 && !core12 {
                     info = info.push_next(&mut imageless);
                 }
-                if a[5] & 2048 != 0 {
+                if a[5] & 2048 != 0 && !core12 {
                     info = info.push_next(&mut scalar);
                 }
                 if a[5] & 8192 != 0 {
@@ -1516,6 +1528,7 @@ impl Backend {
                     viewport_dimensions: limits.max_viewport_dimensions,
                     viewport_bounds: limits.viewport_bounds_range,
                     max_indirect_draw_count: limits.max_draw_indirect_count,
+                    compute_workgroup_count: limits.max_compute_work_group_count,
                     compute_features: a[7],
                 }));
                 self.device_id = self.id();
@@ -2341,13 +2354,7 @@ impl Backend {
                         {
                             return invalid();
                         }
-                        let lim = unsafe {
-                            dev.instance
-                                .native
-                                .get_physical_device_properties(self.physical)
-                        }
-                        .limits
-                        .max_compute_work_group_count;
+                        let lim = dev.compute_workgroup_count;
                         if (0..3).any(|i| a[2 + i] > lim[i] as u64) {
                             return invalid();
                         }
@@ -2584,6 +2591,7 @@ impl Backend {
             }
             132 => self.dynamic_call(m, a)?,
             203..=205 => self.indirect_call(op, a)?,
+            209..=214 => self.core_command(m, op, a, &dev)?,
             127..=128 => self.texel_view_call(m, op, a)?,
             92..=93 => self.sampler_call(m, op, a)?,
             87..=91 => self.wsi_device(m, op, a)?,
