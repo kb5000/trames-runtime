@@ -6,7 +6,7 @@ use super::*;
 #[derive(Default)]
 pub(super) struct Capabilities {
     pub extensions: u64,
-    pub features: u64,
+    pub features: u128,
     pub api: u32,
     properties: BTreeMap<u32, Vec<u32>>,
     aggregate_properties: BTreeMap<u32, Vec<u8>>,
@@ -16,7 +16,7 @@ macro_rules! compute_features {
         #[derive(Default)]
         pub(super) struct Selected { $( $member: vk::$ty<'static>, )+ vulkan12: vk::PhysicalDeviceVulkan12Features<'static>, core12: bool }
         impl Selected {
-            pub fn new(caps: &Capabilities, extensions: u64, features: u64) -> Result<Self> {
+            pub fn new(caps: &Capabilities, extensions: u64, features: u128) -> Result<Self> {
                 if extensions & !caps.extensions != 0 || features & !caps.features != 0 { return unsupported(); }
                 let mut selected = Self { core12: caps.api >= vk::API_VERSION_1_2, ..Self::default() };
                 $(let mask = 0 $(| (1 << $bit))+;
@@ -57,7 +57,7 @@ macro_rules! compute_properties {
 }
 include!("compute_schema.rs");
 
-fn executable_features(features: u64, moltenvk: bool, vendor: u32) -> u64 {
+fn executable_features(features: u128, moltenvk: bool, vendor: u32) -> u128 {
     if moltenvk && vendor == 0x106b {
         features & !(SHADER_SHARED_FLOAT32_ATOMICS | SHADER_SHARED_FLOAT32_ATOMIC_ADD)
     } else {
@@ -134,6 +134,15 @@ impl Capabilities {
         }
         caps
     }
+    pub fn resolve_modes(&self,depth:u32,stencil:u32)->Result<()> {
+        let p=self.properties.get(&(vk::StructureType::PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES.as_raw() as u32)).ok_or(Failure::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+        if depth&!p[0]!=0 || stencil&!p[1]!=0 || depth!=0&&!depth.is_power_of_two() || stencil!=0&&!stencil.is_power_of_two()
+            || depth!=stencil && (if depth==0||stencil==0 {p[2]==0}else{p[3]==0}) {return unsupported();}Ok(())
+    }
+    pub fn multiview_count(&self) -> u32 {
+        self.properties.get(&(vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES.as_raw() as u32))
+            .map_or(0, |p| p[0])
+    }
     pub fn write_property(&self, m: &mut impl CpuMemory, kind: u32, at: u64) -> Result<()> {
         if let Some(bytes) = self.aggregate_properties.get(&kind) {
             return write(m, at, bytes);
@@ -155,12 +164,12 @@ impl Capabilities {
         }
         for &(bit, name, _) in EXTENSIONS {
             if bits & bit != 0 {
-                names.push(name.as_ptr());
+                if !names.iter().any(|&n| unsafe { std::ffi::CStr::from_ptr(n) == name }) { names.push(name.as_ptr()); }
             }
         }
         Ok(())
     }
-    pub fn stage_controls(&self, features: u64, flags: u64, size: u64) -> Result<()> {
+    pub fn stage_controls(&self, features: u128, flags: u64, size: u64) -> Result<()> {
         if flags & !3 != 0
             || flags & 1 != 0 && features & SUBGROUP_SIZE_CONTROL == 0
             || flags & 2 != 0 && features & COMPUTE_FULL_SUBGROUPS == 0
@@ -264,9 +273,9 @@ mod tests {
     #[test]
     fn apple_atomic_quirk_preserves_buffer_atomics_and_other_drivers() {
         let removed = SHADER_SHARED_FLOAT32_ATOMICS | SHADER_SHARED_FLOAT32_ATOMIC_ADD;
-        assert_eq!(executable_features(u64::MAX, true, 0x106b), !removed);
-        assert_eq!(executable_features(u64::MAX, false, 0x106b), u64::MAX);
-        assert_eq!(executable_features(u64::MAX, true, 0x1002), u64::MAX);
+        assert_eq!(executable_features(u128::MAX, true, 0x106b), !removed);
+        assert_eq!(executable_features(u128::MAX, false, 0x106b), u128::MAX);
+        assert_eq!(executable_features(u128::MAX, true, 0x1002), u128::MAX);
     }
     #[test]
     fn compute_features_require_native_support_and_enabled_extensions() {

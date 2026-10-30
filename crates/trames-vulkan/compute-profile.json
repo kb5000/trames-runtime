@@ -1,5 +1,5 @@
 {
-  "wire_revision": 12,
+  "wire_revision": 13,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -23,7 +23,17 @@
     {"index": 19, "name": "mirror_clamp", "extension": "VK_KHR_sampler_mirror_clamp_to_edge", "minimum_api": 12, "promoted": 12},
     {"index": 20, "name": "filter_minmax", "extension": "VK_EXT_sampler_filter_minmax", "minimum_api": 12, "promoted": 12},
     {"index": 21, "name": "spirv14", "extension": "VK_KHR_spirv_1_4", "minimum_api": 12, "promoted": 12},
-    {"index": 22, "name": "non_semantic", "extension": "VK_KHR_shader_non_semantic_info", "minimum_api": 0, "promoted": 13}
+    {"index": 22, "name": "non_semantic", "extension": "VK_KHR_shader_non_semantic_info", "minimum_api": 0, "promoted": 13},
+    {"index": 23, "name": "descriptor_indexing", "extension": "VK_EXT_descriptor_indexing", "minimum_api": 11, "promoted": 12},
+    {"index": 24, "name": "multiview", "extension": "VK_KHR_multiview", "minimum_api": 11, "promoted": 11},
+    {"index": 25, "name": "separate_depth_stencil_layouts", "extension": "VK_KHR_separate_depth_stencil_layouts", "minimum_api": 11, "promoted": 12},
+    {"index": 26, "name": "depth_stencil_resolve", "extension": "VK_KHR_depth_stencil_resolve", "minimum_api": 12, "promoted": 12},
+    {"index": 27, "name": "ycbcr", "extension": "VK_KHR_sampler_ycbcr_conversion", "minimum_api": 11, "promoted": 11},
+    {"index": 28, "name": "atomic64", "extension": "VK_KHR_shader_atomic_int64", "minimum_api": 11, "promoted": 12},
+    {"index": 29, "name": "draw_count", "extension": "VK_KHR_draw_indirect_count", "minimum_api": 12, "promoted": 12},
+    {"index": 30, "name": "stencil_usage", "extension": "VK_EXT_separate_stencil_usage", "minimum_api": 12, "promoted": 12},
+    {"index": 31, "name": "dedicated", "extension": "VK_KHR_dedicated_allocation", "minimum_api": 11, "promoted": 11},
+    {"index": 32, "name": "viewport_layer", "extension": "VK_EXT_shader_viewport_index_layer", "minimum_api": 12, "promoted": 12}
   ],
   "features": [
     {
@@ -199,7 +209,60 @@
       "fields": [
         {"c": "shaderDrawParameters", "rust": "shader_draw_parameters", "kind": "Bool32"}
       ]
-    }
+    },
+    {
+      "extension": 23,
+      "name": "descriptor_indexing",
+      "type": "PhysicalDeviceDescriptorIndexingFeatures",
+      "structure_type": "PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES",
+      "bit": 42,
+      "fields": [
+        {"c": "shaderInputAttachmentArrayDynamicIndexing", "rust": "shader_input_attachment_array_dynamic_indexing", "kind": "Bool32"},
+        {"c": "shaderUniformTexelBufferArrayDynamicIndexing", "rust": "shader_uniform_texel_buffer_array_dynamic_indexing", "kind": "Bool32"},
+        {"c": "shaderStorageTexelBufferArrayDynamicIndexing", "rust": "shader_storage_texel_buffer_array_dynamic_indexing", "kind": "Bool32"},
+        {"c": "shaderUniformBufferArrayNonUniformIndexing", "rust": "shader_uniform_buffer_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderSampledImageArrayNonUniformIndexing", "rust": "shader_sampled_image_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderStorageBufferArrayNonUniformIndexing", "rust": "shader_storage_buffer_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderStorageImageArrayNonUniformIndexing", "rust": "shader_storage_image_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderInputAttachmentArrayNonUniformIndexing", "rust": "shader_input_attachment_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderUniformTexelBufferArrayNonUniformIndexing", "rust": "shader_uniform_texel_buffer_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "shaderStorageTexelBufferArrayNonUniformIndexing", "rust": "shader_storage_texel_buffer_array_non_uniform_indexing", "kind": "Bool32"},
+        {"c": "descriptorBindingUniformBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_buffer_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingSampledImageUpdateAfterBind", "rust": "descriptor_binding_sampled_image_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingStorageImageUpdateAfterBind", "rust": "descriptor_binding_storage_image_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingStorageBufferUpdateAfterBind", "rust": "descriptor_binding_storage_buffer_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingUniformTexelBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_texel_buffer_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingStorageTexelBufferUpdateAfterBind", "rust": "descriptor_binding_storage_texel_buffer_update_after_bind", "kind": "Bool32"},
+        {"c": "descriptorBindingUpdateUnusedWhilePending", "rust": "descriptor_binding_update_unused_while_pending", "kind": "Bool32"},
+        {"c": "descriptorBindingPartiallyBound", "rust": "descriptor_binding_partially_bound", "kind": "Bool32"},
+        {"c": "descriptorBindingVariableDescriptorCount", "rust": "descriptor_binding_variable_descriptor_count", "kind": "Bool32"},
+        {"c": "runtimeDescriptorArray", "rust": "runtime_descriptor_array", "kind": "Bool32"}
+      ]
+    },
+    {
+      "extension": 24,
+      "name": "multiview",
+      "type": "PhysicalDeviceMultiviewFeatures",
+      "structure_type": "PHYSICAL_DEVICE_MULTIVIEW_FEATURES",
+      "bit": 62,
+      "fields": [
+        {"c": "multiview", "rust": "multiview", "kind": "Bool32"},
+        {"c": "multiviewGeometryShader", "rust": "multiview_geometry_shader", "kind": "Bool32", "expose": false},
+        {"c": "multiviewTessellationShader", "rust": "multiview_tessellation_shader", "kind": "Bool32", "expose": false}
+      ]
+    },
+    {
+      "extension": 25,
+      "name": "separate_depth_stencil",
+      "type": "PhysicalDeviceSeparateDepthStencilLayoutsFeatures",
+      "structure_type": "PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES",
+      "bit": 65,
+      "fields": [
+        {"c": "separateDepthStencilLayouts", "rust": "separate_depth_stencil_layouts", "kind": "Bool32"}
+      ]
+    },
+    {"extension": 27, "name": "ycbcr", "type": "PhysicalDeviceSamplerYcbcrConversionFeatures", "structure_type": "PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES", "bit": 70, "fields": [{"c": "samplerYcbcrConversion", "rust": "sampler_ycbcr_conversion", "kind": "Bool32", "expose": true}]},
+    {"extension": 28, "name": "atomic64", "type": "PhysicalDeviceShaderAtomicInt64Features", "structure_type": "PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES", "bit": 71, "fields": [{"c": "shaderBufferInt64Atomics", "rust": "shader_buffer_int64_atomics", "kind": "Bool32"}, {"c": "shaderSharedInt64Atomics", "rust": "shader_shared_int64_atomics", "kind": "Bool32"}]}
   ],
   "properties": [
     {
@@ -284,6 +347,56 @@
         {"c": "maxComputeWorkgroupSubgroups", "rust": "max_compute_workgroup_subgroups", "kind": "u32"},
         {"c": "requiredSubgroupSizeStages", "rust": "required_subgroup_size_stages", "kind": "ShaderStageFlags"}
       ]
+    },
+    {
+      "type": "PhysicalDeviceDescriptorIndexingProperties",
+      "structure_type": "PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES",
+      "extension": 23,
+      "fields": [
+        {"c": "maxUpdateAfterBindDescriptorsInAllPools", "rust": "max_update_after_bind_descriptors_in_all_pools", "kind": "u32"},
+        {"c": "shaderUniformBufferArrayNonUniformIndexingNative", "rust": "shader_uniform_buffer_array_non_uniform_indexing_native", "kind": "Bool32"},
+        {"c": "shaderSampledImageArrayNonUniformIndexingNative", "rust": "shader_sampled_image_array_non_uniform_indexing_native", "kind": "Bool32"},
+        {"c": "shaderStorageBufferArrayNonUniformIndexingNative", "rust": "shader_storage_buffer_array_non_uniform_indexing_native", "kind": "Bool32"},
+        {"c": "shaderStorageImageArrayNonUniformIndexingNative", "rust": "shader_storage_image_array_non_uniform_indexing_native", "kind": "Bool32"},
+        {"c": "shaderInputAttachmentArrayNonUniformIndexingNative", "rust": "shader_input_attachment_array_non_uniform_indexing_native", "kind": "Bool32"},
+        {"c": "robustBufferAccessUpdateAfterBind", "rust": "robust_buffer_access_update_after_bind", "kind": "Bool32"},
+        {"c": "quadDivergentImplicitLod", "rust": "quad_divergent_implicit_lod", "kind": "Bool32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindSamplers", "rust": "max_per_stage_descriptor_update_after_bind_samplers", "kind": "u32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindUniformBuffers", "rust": "max_per_stage_descriptor_update_after_bind_uniform_buffers", "kind": "u32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindStorageBuffers", "rust": "max_per_stage_descriptor_update_after_bind_storage_buffers", "kind": "u32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindSampledImages", "rust": "max_per_stage_descriptor_update_after_bind_sampled_images", "kind": "u32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindStorageImages", "rust": "max_per_stage_descriptor_update_after_bind_storage_images", "kind": "u32"},
+        {"c": "maxPerStageDescriptorUpdateAfterBindInputAttachments", "rust": "max_per_stage_descriptor_update_after_bind_input_attachments", "kind": "u32"},
+        {"c": "maxPerStageUpdateAfterBindResources", "rust": "max_per_stage_update_after_bind_resources", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindSamplers", "rust": "max_descriptor_set_update_after_bind_samplers", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindUniformBuffers", "rust": "max_descriptor_set_update_after_bind_uniform_buffers", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindUniformBuffersDynamic", "rust": "max_descriptor_set_update_after_bind_uniform_buffers_dynamic", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindStorageBuffers", "rust": "max_descriptor_set_update_after_bind_storage_buffers", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindStorageBuffersDynamic", "rust": "max_descriptor_set_update_after_bind_storage_buffers_dynamic", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindSampledImages", "rust": "max_descriptor_set_update_after_bind_sampled_images", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindStorageImages", "rust": "max_descriptor_set_update_after_bind_storage_images", "kind": "u32"},
+        {"c": "maxDescriptorSetUpdateAfterBindInputAttachments", "rust": "max_descriptor_set_update_after_bind_input_attachments", "kind": "u32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceMultiviewProperties",
+      "structure_type": "PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES",
+      "extension": 24,
+      "fields": [
+        {"c": "maxMultiviewViewCount", "rust": "max_multiview_view_count", "kind": "u32"},
+        {"c": "maxMultiviewInstanceIndex", "rust": "max_multiview_instance_index", "kind": "u32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceDepthStencilResolveProperties",
+      "structure_type": "PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES",
+      "extension": 26,
+      "fields": [
+        {"c": "supportedDepthResolveModes", "rust": "supported_depth_resolve_modes", "kind": "ResolveModeFlags"},
+        {"c": "supportedStencilResolveModes", "rust": "supported_stencil_resolve_modes", "kind": "ResolveModeFlags"},
+        {"c": "independentResolveNone", "rust": "independent_resolve_none", "kind": "Bool32"},
+        {"c": "independentResolve", "rust": "independent_resolve", "kind": "Bool32"}
+      ]
     }
   ],
   "aggregates": [
@@ -295,57 +408,57 @@
         {"c": "uniformAndStorageBuffer16BitAccess", "rust": "uniform_and_storage_buffer16_bit_access", "kind": "Bool32", "bit": 1, "legacy": -1, "capability": -1},
         {"c": "storagePushConstant16", "rust": "storage_push_constant16", "kind": "Bool32", "bit": 2, "legacy": -1, "capability": -1},
         {"c": "storageInputOutput16", "rust": "storage_input_output16", "kind": "Bool32", "bit": 3, "legacy": -1, "capability": -1},
-        {"c": "multiview", "rust": "multiview", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "multiviewGeometryShader", "rust": "multiview_geometry_shader", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "multiviewTessellationShader", "rust": "multiview_tessellation_shader", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "multiview", "rust": "multiview", "kind": "Bool32", "bit": 62, "legacy": -1, "capability": -1},
+        {"c": "multiviewGeometryShader", "rust": "multiview_geometry_shader", "kind": "Bool32", "bit": 63, "legacy": -1, "capability": -1},
+        {"c": "multiviewTessellationShader", "rust": "multiview_tessellation_shader", "kind": "Bool32", "bit": 64, "legacy": -1, "capability": -1},
         {"c": "variablePointersStorageBuffer", "rust": "variable_pointers_storage_buffer", "kind": "Bool32", "bit": 32, "legacy": -1, "capability": -1},
         {"c": "variablePointers", "rust": "variable_pointers", "kind": "Bool32", "bit": 33, "legacy": -1, "capability": -1},
         {"c": "protectedMemory", "rust": "protected_memory", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "samplerYcbcrConversion", "rust": "sampler_ycbcr_conversion", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "samplerYcbcrConversion", "rust": "sampler_ycbcr_conversion", "kind": "Bool32", "bit": 70, "legacy": -1, "capability": -1},
         {"c": "shaderDrawParameters", "rust": "shader_draw_parameters", "kind": "Bool32", "bit": 38, "legacy": -1, "capability": -1}
       ],
-      "seen_mask": 9223372036854793217
+      "seen_mask": 9223372036855120897
     },
     {
       "type": "PhysicalDeviceVulkan12Features",
       "structure_type": "PHYSICAL_DEVICE_VULKAN_1_2_FEATURES",
       "fields": [
         {"c": "samplerMirrorClampToEdge", "rust": "sampler_mirror_clamp_to_edge", "kind": "Bool32", "bit": 40, "legacy": -1, "capability": -1},
-        {"c": "drawIndirectCount", "rust": "draw_indirect_count", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "drawIndirectCount", "rust": "draw_indirect_count", "kind": "Bool32", "bit": 67, "legacy": -1, "capability": -1},
         {"c": "storageBuffer8BitAccess", "rust": "storage_buffer8_bit_access", "kind": "Bool32", "bit": 4, "legacy": -1, "capability": -1},
         {"c": "uniformAndStorageBuffer8BitAccess", "rust": "uniform_and_storage_buffer8_bit_access", "kind": "Bool32", "bit": 5, "legacy": -1, "capability": -1},
         {"c": "storagePushConstant8", "rust": "storage_push_constant8", "kind": "Bool32", "bit": 6, "legacy": -1, "capability": -1},
-        {"c": "shaderBufferInt64Atomics", "rust": "shader_buffer_int64_atomics", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderSharedInt64Atomics", "rust": "shader_shared_int64_atomics", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "shaderBufferInt64Atomics", "rust": "shader_buffer_int64_atomics", "kind": "Bool32", "bit": 71, "legacy": -1, "capability": -1},
+        {"c": "shaderSharedInt64Atomics", "rust": "shader_shared_int64_atomics", "kind": "Bool32", "bit": 72, "legacy": -1, "capability": -1},
         {"c": "shaderFloat16", "rust": "shader_float16", "kind": "Bool32", "bit": 7, "legacy": -1, "capability": -1},
         {"c": "shaderInt8", "rust": "shader_int8", "kind": "Bool32", "bit": 8, "legacy": -1, "capability": -1},
-        {"c": "descriptorIndexing", "rust": "descriptor_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderInputAttachmentArrayDynamicIndexing", "rust": "shader_input_attachment_array_dynamic_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderUniformTexelBufferArrayDynamicIndexing", "rust": "shader_uniform_texel_buffer_array_dynamic_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderStorageTexelBufferArrayDynamicIndexing", "rust": "shader_storage_texel_buffer_array_dynamic_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderUniformBufferArrayNonUniformIndexing", "rust": "shader_uniform_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderSampledImageArrayNonUniformIndexing", "rust": "shader_sampled_image_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderStorageBufferArrayNonUniformIndexing", "rust": "shader_storage_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderStorageImageArrayNonUniformIndexing", "rust": "shader_storage_image_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderInputAttachmentArrayNonUniformIndexing", "rust": "shader_input_attachment_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderUniformTexelBufferArrayNonUniformIndexing", "rust": "shader_uniform_texel_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderStorageTexelBufferArrayNonUniformIndexing", "rust": "shader_storage_texel_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingUniformBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_buffer_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingSampledImageUpdateAfterBind", "rust": "descriptor_binding_sampled_image_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingStorageImageUpdateAfterBind", "rust": "descriptor_binding_storage_image_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingStorageBufferUpdateAfterBind", "rust": "descriptor_binding_storage_buffer_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingUniformTexelBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_texel_buffer_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingStorageTexelBufferUpdateAfterBind", "rust": "descriptor_binding_storage_texel_buffer_update_after_bind", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingUpdateUnusedWhilePending", "rust": "descriptor_binding_update_unused_while_pending", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingPartiallyBound", "rust": "descriptor_binding_partially_bound", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "descriptorBindingVariableDescriptorCount", "rust": "descriptor_binding_variable_descriptor_count", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "runtimeDescriptorArray", "rust": "runtime_descriptor_array", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "descriptorIndexing", "rust": "descriptor_indexing", "kind": "Bool32", "bit": 66, "legacy": -1, "capability": -1},
+        {"c": "shaderInputAttachmentArrayDynamicIndexing", "rust": "shader_input_attachment_array_dynamic_indexing", "kind": "Bool32", "bit": 42, "legacy": -1, "capability": -1},
+        {"c": "shaderUniformTexelBufferArrayDynamicIndexing", "rust": "shader_uniform_texel_buffer_array_dynamic_indexing", "kind": "Bool32", "bit": 43, "legacy": -1, "capability": -1},
+        {"c": "shaderStorageTexelBufferArrayDynamicIndexing", "rust": "shader_storage_texel_buffer_array_dynamic_indexing", "kind": "Bool32", "bit": 44, "legacy": -1, "capability": -1},
+        {"c": "shaderUniformBufferArrayNonUniformIndexing", "rust": "shader_uniform_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": 45, "legacy": -1, "capability": -1},
+        {"c": "shaderSampledImageArrayNonUniformIndexing", "rust": "shader_sampled_image_array_non_uniform_indexing", "kind": "Bool32", "bit": 46, "legacy": -1, "capability": -1},
+        {"c": "shaderStorageBufferArrayNonUniformIndexing", "rust": "shader_storage_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": 47, "legacy": -1, "capability": -1},
+        {"c": "shaderStorageImageArrayNonUniformIndexing", "rust": "shader_storage_image_array_non_uniform_indexing", "kind": "Bool32", "bit": 48, "legacy": -1, "capability": -1},
+        {"c": "shaderInputAttachmentArrayNonUniformIndexing", "rust": "shader_input_attachment_array_non_uniform_indexing", "kind": "Bool32", "bit": 49, "legacy": -1, "capability": -1},
+        {"c": "shaderUniformTexelBufferArrayNonUniformIndexing", "rust": "shader_uniform_texel_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": 50, "legacy": -1, "capability": -1},
+        {"c": "shaderStorageTexelBufferArrayNonUniformIndexing", "rust": "shader_storage_texel_buffer_array_non_uniform_indexing", "kind": "Bool32", "bit": 51, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingUniformBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_buffer_update_after_bind", "kind": "Bool32", "bit": 52, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingSampledImageUpdateAfterBind", "rust": "descriptor_binding_sampled_image_update_after_bind", "kind": "Bool32", "bit": 53, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingStorageImageUpdateAfterBind", "rust": "descriptor_binding_storage_image_update_after_bind", "kind": "Bool32", "bit": 54, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingStorageBufferUpdateAfterBind", "rust": "descriptor_binding_storage_buffer_update_after_bind", "kind": "Bool32", "bit": 55, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingUniformTexelBufferUpdateAfterBind", "rust": "descriptor_binding_uniform_texel_buffer_update_after_bind", "kind": "Bool32", "bit": 56, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingStorageTexelBufferUpdateAfterBind", "rust": "descriptor_binding_storage_texel_buffer_update_after_bind", "kind": "Bool32", "bit": 57, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingUpdateUnusedWhilePending", "rust": "descriptor_binding_update_unused_while_pending", "kind": "Bool32", "bit": 58, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingPartiallyBound", "rust": "descriptor_binding_partially_bound", "kind": "Bool32", "bit": 59, "legacy": -1, "capability": -1},
+        {"c": "descriptorBindingVariableDescriptorCount", "rust": "descriptor_binding_variable_descriptor_count", "kind": "Bool32", "bit": 60, "legacy": -1, "capability": -1},
+        {"c": "runtimeDescriptorArray", "rust": "runtime_descriptor_array", "kind": "Bool32", "bit": 61, "legacy": -1, "capability": -1},
         {"c": "samplerFilterMinmax", "rust": "sampler_filter_minmax", "kind": "Bool32", "bit": 41, "legacy": -1, "capability": -1},
         {"c": "scalarBlockLayout", "rust": "scalar_block_layout", "kind": "Bool32", "bit": -1, "legacy": 11, "capability": 8},
         {"c": "imagelessFramebuffer", "rust": "imageless_framebuffer", "kind": "Bool32", "bit": -1, "legacy": 9, "capability": 7},
         {"c": "uniformBufferStandardLayout", "rust": "uniform_buffer_standard_layout", "kind": "Bool32", "bit": 31, "legacy": -1, "capability": -1},
         {"c": "shaderSubgroupExtendedTypes", "rust": "shader_subgroup_extended_types", "kind": "Bool32", "bit": 22, "legacy": -1, "capability": -1},
-        {"c": "separateDepthStencilLayouts", "rust": "separate_depth_stencil_layouts", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "separateDepthStencilLayouts", "rust": "separate_depth_stencil_layouts", "kind": "Bool32", "bit": 65, "legacy": -1, "capability": -1},
         {"c": "hostQueryReset", "rust": "host_query_reset", "kind": "Bool32", "bit": 37, "legacy": -1, "capability": -1},
         {"c": "timelineSemaphore", "rust": "timeline_semaphore", "kind": "Bool32", "bit": -1, "legacy": 1, "capability": 1},
         {"c": "bufferDeviceAddress", "rust": "buffer_device_address", "kind": "Bool32", "bit": 25, "legacy": -1, "capability": -1},
@@ -354,17 +467,21 @@
         {"c": "vulkanMemoryModel", "rust": "vulkan_memory_model", "kind": "Bool32", "bit": 28, "legacy": -1, "capability": -1},
         {"c": "vulkanMemoryModelDeviceScope", "rust": "vulkan_memory_model_device_scope", "kind": "Bool32", "bit": 29, "legacy": -1, "capability": -1},
         {"c": "vulkanMemoryModelAvailabilityVisibilityChains", "rust": "vulkan_memory_model_availability_visibility_chains", "kind": "Bool32", "bit": 30, "legacy": -1, "capability": -1},
-        {"c": "shaderOutputViewportIndex", "rust": "shader_output_viewport_index", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
-        {"c": "shaderOutputLayer", "rust": "shader_output_layer", "kind": "Bool32", "bit": -1, "legacy": -1, "capability": -1},
+        {"c": "shaderOutputViewportIndex", "rust": "shader_output_viewport_index", "kind": "Bool32", "bit": 68, "legacy": -1, "capability": -1},
+        {"c": "shaderOutputLayer", "rust": "shader_output_layer", "kind": "Bool32", "bit": 69, "legacy": -1, "capability": -1},
         {"c": "subgroupBroadcastDynamicId", "rust": "subgroup_broadcast_dynamic_id", "kind": "Bool32", "bit": 39, "legacy": -1, "capability": -1}
       ],
-      "seen_mask": 4611686018427397030
+      "seen_mask": 4611686018428085158
     }
   ],
   "core12": [
     {"bit": 39, "rust": "subgroup_broadcast_dynamic_id", "c": "subgroupBroadcastDynamicId", "extension": null},
     {"bit": 40, "rust": "sampler_mirror_clamp_to_edge", "c": "samplerMirrorClampToEdge", "extension": 19},
-    {"bit": 41, "rust": "sampler_filter_minmax", "c": "samplerFilterMinmax", "extension": 20}
+    {"bit": 41, "rust": "sampler_filter_minmax", "c": "samplerFilterMinmax", "extension": 20},
+    {"bit": 66, "rust": "descriptor_indexing", "c": "descriptorIndexing", "extension": null},
+    {"bit": 67, "rust": "draw_indirect_count", "c": "drawIndirectCount", "extension": 29},
+    {"bit": 68, "rust": "shader_output_viewport_index", "c": "shaderOutputViewportIndex", "extension": 32},
+    {"bit": 69, "rust": "shader_output_layer", "c": "shaderOutputLayer", "extension": 32}
   ],
   "aggregate_properties": [
     {

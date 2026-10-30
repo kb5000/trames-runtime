@@ -669,10 +669,11 @@ impl Backend {
                 self.submissions.push(Submission {
                     fence,
                     commands: vec![],
+                    resource_ids: Default::default(),
+                    descriptor_sets: Vec::new(),
                     _resources: resources,
                     timeline_completion: Vec::new(),
-                    timeline_signals: Vec::new(),
-                    commands_complete: false,
+                            commands_complete: false,
                     coherent_scope: Default::default(),
                 });
                 self.wayland.chains.get_mut(&a[1]).unwrap().acquired[index] = true;

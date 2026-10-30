@@ -43,7 +43,7 @@ impl Scope {
         }
         ranges.splice(first..last, [(start, end)]);
     }
-    fn extend(&mut self, other: &Self) {
+    pub(super) fn extend(&mut self, other: &Self) {
         for (&memory, ranges) in &other.0 {
             for &(start, end) in ranges {
                 self.insert(memory, start, end);

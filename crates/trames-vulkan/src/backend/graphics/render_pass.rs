@@ -26,7 +26,7 @@ pub(super) fn decode(backend: &Backend, m: &impl CpuMemory, at: u64) -> Result<D
             && x[2] == 1
             || aspects.contains(vk::ImageAspectFlags::STENCIL) && x[4] == 1
         {
-            pass.clear_mask |= 1 << i;
+            pass.clear_count = pass.clear_count.max(i+1);
         }
         attachments.push(
             vk::AttachmentDescription::default()
@@ -115,7 +115,7 @@ mod tests {
             (vk::SampleCountFlags::TYPE_4, vk::SampleCountFlags::TYPE_1)
         );
         assert_eq!(p.depth, Some(vk::Format::D32_SFLOAT));
-        assert_eq!(p.clear_mask, 6);
+        assert_eq!(p.clear_count, 3);
         // Resolve targets must be single-sampled and color formats must match.
         put(&mut m, 0x1208, &[4]);
         assert!(decode(&b, &m, 0x1000).is_err());

@@ -143,14 +143,17 @@ impl Backend {
             .compare_enable(a[12] != 0)
             .compare_op(vk::CompareOp::from_raw(a[13] as i32));
         if a[14] != 0 { info = info.push_next(&mut reduction); }
+        let conversion=if a[15]!=0{Some(self.object(a[15],Kind::YcbcrConversion)?)}else{None};
+        let mut converted=vk::SamplerYcbcrConversionInfo::default();
+        if let Some(value)=&conversion{converted.conversion=vk::SamplerYcbcrConversion::from_raw(value.raw);info=info.push_next(&mut converted);}
         let raw = unsafe { device.native.create_sampler(&info, None) }?;
-        let id = self.put(Kind::Sampler, raw.as_raw(), vec![], 0, 0);
+        let id = self.put(Kind::Sampler, raw.as_raw(), conversion.into_iter().collect(), 0, 0);
         self.publish(m, a[9], id)
     }
 
-    pub(super) fn write_descriptors(&self, m: &impl CpuMemory, a: [u64; 16]) -> Result<()> {
+    pub(super) fn write_descriptors(&mut self, m: &mut impl CpuMemory, a: [u64; 16]) -> Result<()> {
         let set = self.object(a[1], Kind::DescriptorSet)?;
-        if a[5] > 9 {
+        if a[5] > 10 {
             return unsupported();
         }
         let layout = set.deps.borrow()[1].clone();
@@ -160,10 +163,18 @@ impl Backend {
             .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
         if a[2] > u32::MAX as u64
             || a[4] == 0
-            || shape.0 as u64 != a[5]
-            || a[3].checked_add(a[4]).is_none_or(|n| n > shape.1 as u64)
+            || shape.ty as u64 != a[5]
         {
             return invalid();
+        }
+        let spans=descriptors::spans(&layout,&set,a[2] as u32,a[3] as u32,a[4] as u32,a[5] as u32)?;
+        if spans.len()!=1 || spans[0].0!=a[2] as u32 || spans[0].1!=a[3] as u32 {
+            drop(metadata);let mut at=0;
+            for (binding,offset,count) in spans {
+                let mut part=a;part[2]=binding as u64;part[3]=offset as u64;part[4]=count as u64;part[6]+=at*24;
+                self.write_descriptors(m,part)?;at+=count as u64;
+            }
+            return Ok(());
         }
         let wire = words64(m, a[6], bounded(a[4], 64)? * 3)?;
         let d = &set.device.native;
@@ -181,7 +192,7 @@ impl Backend {
         let mut dependencies = Vec::new();
         for x in wire.chunks_exact(3) {
             let mut deps = Vec::new();
-            if a[5] >= 6 {
+            if (6..=9).contains(&a[5]) {
                 let buffer = self.object(x[0], Kind::Buffer)?;
                 let (usage, alignment, max_range) = if matches!(a[5], 6 | 8) {
                     (
@@ -234,7 +245,7 @@ impl Backend {
                 deps.push(view);
             } else {
                 let mut info = vk::DescriptorImageInfo::default();
-                if a[5] <= 1 {
+                if a[5] <= 1 && shape.immutable.is_empty() {
                     let sampler = self.object(x[0], Kind::Sampler)?;
                     info.sampler = vk::Sampler::from_raw(sampler.raw);
                     deps.push(sampler);
@@ -244,10 +255,10 @@ impl Backend {
                     let image = view.deps.borrow()[0].clone();
                     let wanted = if a[5] == 3 {
                         vk::ImageUsageFlags::STORAGE
-                    } else {
+                    } else if a[5] == 10 {vk::ImageUsageFlags::INPUT_ATTACHMENT} else {
                         vk::ImageUsageFlags::SAMPLED
                     };
-                    if image.flags & wanted.as_raw() == 0
+                    if (if view.size==0{image.flags}else{view.size as u32}) & wanted.as_raw() == 0
                         || view.flags.count_ones() != 1
                         || (if a[5] == 3 {
                             x[2] != 1
@@ -257,7 +268,7 @@ impl Backend {
                             // layout. Do not require shader-read layout before
                             // the descriptor is used. Preserve the native enum;
                             // object identity, usage and retention stay checked.
-                            !(1..=7).contains(&x[2])
+                            self.native_layout(x[2],false).is_err()
                         })
                     {
                         return invalid();
@@ -275,16 +286,15 @@ impl Backend {
             .dst_binding(a[2] as u32)
             .dst_array_element(a[3] as u32)
             .descriptor_type(vk::DescriptorType::from_raw(a[5] as i32));
-        let write = if a[5] >= 6 {
+        let write = if (6..=9).contains(&a[5]) {
             write.buffer_info(&buffers)
         } else if matches!(a[5], 4 | 5) {
             write.texel_buffer_view(&texels)
         } else {
             write.image_info(&images)
         };
-        unsafe {
-            d.update_descriptor_sets(&[write], &[]);
-        }
+        self.descriptor_pending(m,&set,dependencies.iter().flatten().cloned().collect())?;
+        unsafe { d.update_descriptor_sets(&[write], &[]); }
         for (i, range) in dynamic_ranges.into_iter().enumerate() {
             set.dynamic_ranges
                 .borrow_mut()
@@ -293,10 +303,6 @@ impl Backend {
         let mut slots = set.bound_resources.borrow_mut();
         for (i, deps) in dependencies.into_iter().enumerate() {
             slots.insert((a[2] as u32, a[3] as u32 + i as u32), deps);
-        }
-        set.deps.borrow_mut().truncate(2);
-        for resource in slots.values().flatten() {
-            set.retain(resource.clone());
         }
         Ok(())
     }

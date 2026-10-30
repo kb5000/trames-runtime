@@ -49,6 +49,8 @@ core_features! {
     22 => shader_int16,
     23 => shader_int64,
     24 => alpha_to_one,
+    25 => robust_buffer_access,
+    26 => full_draw_index_uint32,
 }
 
 #[cfg(test)]

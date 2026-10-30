@@ -53,7 +53,7 @@ impl Capabilities {
         if instance.queries2 && has(ash::khr::maintenance2::NAME) {
             result.bits |= MAINTENANCE2;
         }
-        // Multiview remains disabled in the selected single-layer profile.
+        // Both renderpass APIs retain native multiview masks and array views.
         if has(ash::khr::multiview::NAME) {
             result.bits |= MULTIVIEW;
         }
@@ -128,6 +128,7 @@ impl Capabilities {
                     )
                     .image_view_format_swizzle(native.image_view_format_swizzle != 0)
                     .image_view2_d_on3_d_image(native.image_view2_d_on3_d_image != 0)
+                    .multisample_array_image(native.multisample_array_image != 0)
                     .mutable_comparison_samplers(native.mutable_comparison_samplers != 0)
                     .point_polygons(native.point_polygons != 0)
                     .sampler_mip_lod_bias(native.sampler_mip_lod_bias != 0)
@@ -215,7 +216,7 @@ impl Capabilities {
             0,
             p.image_view_format_swizzle,
             p.image_view2_d_on3_d_image,
-            0,
+            p.multisample_array_image,
             p.mutable_comparison_samplers,
             p.point_polygons,
             p.sampler_mip_lod_bias,
@@ -263,7 +264,7 @@ pub(super) fn device_extensions(
 ) -> Result<()> {
     // Native dependencies can be promoted by a client's API version. Resolve
     // them on the host rather than requiring duplicated guest extension names;
-    // no multiview feature is enabled or exposed by this single-layer profile.
+    // Feature selection is handled by the generated common capability schema.
     let mut flags = flags;
     if flags & 128 != 0 {
         flags |= 16 | 32;

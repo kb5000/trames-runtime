@@ -24,6 +24,16 @@ pub(super) const EXTENSIONS: &[(u64, &std::ffi::CStr, u32)] = &[
     (1 << 20, c"VK_EXT_sampler_filter_minmax", vk::API_VERSION_1_2),
     (1 << 21, c"VK_KHR_spirv_1_4", vk::API_VERSION_1_2),
     (1 << 22, c"VK_KHR_shader_non_semantic_info", vk::API_VERSION_1_0),
+    (1 << 23, c"VK_EXT_descriptor_indexing", vk::API_VERSION_1_1),
+    (1 << 24, c"VK_KHR_multiview", vk::API_VERSION_1_1),
+    (1 << 25, c"VK_KHR_separate_depth_stencil_layouts", vk::API_VERSION_1_1),
+    (1 << 26, c"VK_KHR_depth_stencil_resolve", vk::API_VERSION_1_2),
+    (1 << 27, c"VK_KHR_sampler_ycbcr_conversion", vk::API_VERSION_1_1),
+    (1 << 28, c"VK_KHR_shader_atomic_int64", vk::API_VERSION_1_1),
+    (1 << 29, c"VK_KHR_draw_indirect_count", vk::API_VERSION_1_2),
+    (1 << 30, c"VK_EXT_separate_stencil_usage", vk::API_VERSION_1_2),
+    (1 << 31, c"VK_KHR_dedicated_allocation", vk::API_VERSION_1_1),
+    (1 << 32, c"VK_EXT_shader_viewport_index_layer", vk::API_VERSION_1_2),
 ];
 pub(super) const EXT_STORAGE_CLASS: u64 = 1 << 0;
 pub(super) const EXT_MAINTENANCE3: u64 = 1 << 16;
@@ -43,18 +53,39 @@ compute_features! {
     subgroup_rotate: PhysicalDeviceShaderSubgroupRotateFeaturesKHR, 14, 0 => [35 => shader_subgroup_rotate : true, 36 => shader_subgroup_rotate_clustered : true];
     host_query_reset: PhysicalDeviceHostQueryResetFeatures, 17, 12 => [37 => host_query_reset : true];
     draw_parameters: PhysicalDeviceShaderDrawParametersFeatures, 18, 11 => [38 => shader_draw_parameters : true];
+    descriptor_indexing: PhysicalDeviceDescriptorIndexingFeatures, 23, 12 => [42 => shader_input_attachment_array_dynamic_indexing : true, 43 => shader_uniform_texel_buffer_array_dynamic_indexing : true, 44 => shader_storage_texel_buffer_array_dynamic_indexing : true, 45 => shader_uniform_buffer_array_non_uniform_indexing : true, 46 => shader_sampled_image_array_non_uniform_indexing : true, 47 => shader_storage_buffer_array_non_uniform_indexing : true, 48 => shader_storage_image_array_non_uniform_indexing : true, 49 => shader_input_attachment_array_non_uniform_indexing : true, 50 => shader_uniform_texel_buffer_array_non_uniform_indexing : true, 51 => shader_storage_texel_buffer_array_non_uniform_indexing : true, 52 => descriptor_binding_uniform_buffer_update_after_bind : true, 53 => descriptor_binding_sampled_image_update_after_bind : true, 54 => descriptor_binding_storage_image_update_after_bind : true, 55 => descriptor_binding_storage_buffer_update_after_bind : true, 56 => descriptor_binding_uniform_texel_buffer_update_after_bind : true, 57 => descriptor_binding_storage_texel_buffer_update_after_bind : true, 58 => descriptor_binding_update_unused_while_pending : true, 59 => descriptor_binding_partially_bound : true, 60 => descriptor_binding_variable_descriptor_count : true, 61 => runtime_descriptor_array : true];
+    multiview: PhysicalDeviceMultiviewFeatures, 24, 11 => [62 => multiview : true, 63 => multiview_geometry_shader : false, 64 => multiview_tessellation_shader : false];
+    separate_depth_stencil: PhysicalDeviceSeparateDepthStencilLayoutsFeatures, 25, 12 => [65 => separate_depth_stencil_layouts : true];
+    ycbcr: PhysicalDeviceSamplerYcbcrConversionFeatures, 27, 11 => [70 => sampler_ycbcr_conversion : true];
+    atomic64: PhysicalDeviceShaderAtomicInt64Features, 28, 12 => [71 => shader_buffer_int64_atomics : true, 72 => shader_shared_int64_atomics : true];
 }
-pub(super) const SHADER_SHARED_FLOAT32_ATOMICS: u64 = 1 << 13;
-pub(super) const SHADER_SHARED_FLOAT32_ATOMIC_ADD: u64 = 1 << 14;
-pub(super) const SUBGROUP_SIZE_CONTROL: u64 = 1 << 23;
-pub(super) const COMPUTE_FULL_SUBGROUPS: u64 = 1 << 24;
-pub(super) const BUFFER_DEVICE_ADDRESS: u64 = 1 << 25;
-pub(super) const HOST_QUERY_RESET: u64 = 1 << 37;
-pub(super) const SUBGROUP_BROADCAST_DYNAMIC_ID: u64 = 1 << 39;
-pub(super) const SAMPLER_MIRROR_CLAMP_TO_EDGE: u64 = 1 << 40;
-pub(super) const SAMPLER_FILTER_MINMAX: u64 = 1 << 41;
+pub(super) const SHADER_SHARED_FLOAT32_ATOMICS: u128 = 1 << 13;
+pub(super) const SHADER_SHARED_FLOAT32_ATOMIC_ADD: u128 = 1 << 14;
+pub(super) const SUBGROUP_SIZE_CONTROL: u128 = 1 << 23;
+pub(super) const COMPUTE_FULL_SUBGROUPS: u128 = 1 << 24;
+pub(super) const BUFFER_DEVICE_ADDRESS: u128 = 1 << 25;
+pub(super) const HOST_QUERY_RESET: u128 = 1 << 37;
+pub(super) const DESCRIPTOR_BINDING_UNIFORM_BUFFER_UPDATE_AFTER_BIND: u128 = 1 << 52;
+pub(super) const DESCRIPTOR_BINDING_SAMPLED_IMAGE_UPDATE_AFTER_BIND: u128 = 1 << 53;
+pub(super) const DESCRIPTOR_BINDING_STORAGE_IMAGE_UPDATE_AFTER_BIND: u128 = 1 << 54;
+pub(super) const DESCRIPTOR_BINDING_STORAGE_BUFFER_UPDATE_AFTER_BIND: u128 = 1 << 55;
+pub(super) const DESCRIPTOR_BINDING_UNIFORM_TEXEL_BUFFER_UPDATE_AFTER_BIND: u128 = 1 << 56;
+pub(super) const DESCRIPTOR_BINDING_STORAGE_TEXEL_BUFFER_UPDATE_AFTER_BIND: u128 = 1 << 57;
+pub(super) const DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING: u128 = 1 << 58;
+pub(super) const DESCRIPTOR_BINDING_PARTIALLY_BOUND: u128 = 1 << 59;
+pub(super) const DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT: u128 = 1 << 60;
+pub(super) const MULTIVIEW: u128 = 1 << 62;
+pub(super) const SEPARATE_DEPTH_STENCIL_LAYOUTS: u128 = 1 << 65;
+pub(super) const SAMPLER_YCBCR_CONVERSION: u128 = 1 << 70;
+pub(super) const SUBGROUP_BROADCAST_DYNAMIC_ID: u128 = 1 << 39;
+pub(super) const SAMPLER_MIRROR_CLAMP_TO_EDGE: u128 = 1 << 40;
+pub(super) const SAMPLER_FILTER_MINMAX: u128 = 1 << 41;
+pub(super) const DESCRIPTOR_INDEXING: u128 = 1 << 66;
+pub(super) const DRAW_INDIRECT_COUNT: u128 = 1 << 67;
+pub(super) const SHADER_OUTPUT_VIEWPORT_INDEX: u128 = 1 << 68;
+pub(super) const SHADER_OUTPUT_LAYER: u128 = 1 << 69;
 impl Selected {
-    pub fn core12_features(&mut self, features: u64, legacy: u64) {
+    pub fn core12_features(&mut self, features: u128, legacy: u64) {
         self.vulkan12.storage_buffer8_bit_access = self.storage8.storage_buffer8_bit_access;
         self.vulkan12.uniform_and_storage_buffer8_bit_access = self.storage8.uniform_and_storage_buffer8_bit_access;
         self.vulkan12.storage_push_constant8 = self.storage8.storage_push_constant8;
@@ -69,9 +100,36 @@ impl Selected {
         self.vulkan12.vulkan_memory_model_availability_visibility_chains = self.memory_model.vulkan_memory_model_availability_visibility_chains;
         self.vulkan12.uniform_buffer_standard_layout = self.uniform_layout.uniform_buffer_standard_layout;
         self.vulkan12.host_query_reset = self.host_query_reset.host_query_reset;
+        self.vulkan12.shader_input_attachment_array_dynamic_indexing = self.descriptor_indexing.shader_input_attachment_array_dynamic_indexing;
+        self.vulkan12.shader_uniform_texel_buffer_array_dynamic_indexing = self.descriptor_indexing.shader_uniform_texel_buffer_array_dynamic_indexing;
+        self.vulkan12.shader_storage_texel_buffer_array_dynamic_indexing = self.descriptor_indexing.shader_storage_texel_buffer_array_dynamic_indexing;
+        self.vulkan12.shader_uniform_buffer_array_non_uniform_indexing = self.descriptor_indexing.shader_uniform_buffer_array_non_uniform_indexing;
+        self.vulkan12.shader_sampled_image_array_non_uniform_indexing = self.descriptor_indexing.shader_sampled_image_array_non_uniform_indexing;
+        self.vulkan12.shader_storage_buffer_array_non_uniform_indexing = self.descriptor_indexing.shader_storage_buffer_array_non_uniform_indexing;
+        self.vulkan12.shader_storage_image_array_non_uniform_indexing = self.descriptor_indexing.shader_storage_image_array_non_uniform_indexing;
+        self.vulkan12.shader_input_attachment_array_non_uniform_indexing = self.descriptor_indexing.shader_input_attachment_array_non_uniform_indexing;
+        self.vulkan12.shader_uniform_texel_buffer_array_non_uniform_indexing = self.descriptor_indexing.shader_uniform_texel_buffer_array_non_uniform_indexing;
+        self.vulkan12.shader_storage_texel_buffer_array_non_uniform_indexing = self.descriptor_indexing.shader_storage_texel_buffer_array_non_uniform_indexing;
+        self.vulkan12.descriptor_binding_uniform_buffer_update_after_bind = self.descriptor_indexing.descriptor_binding_uniform_buffer_update_after_bind;
+        self.vulkan12.descriptor_binding_sampled_image_update_after_bind = self.descriptor_indexing.descriptor_binding_sampled_image_update_after_bind;
+        self.vulkan12.descriptor_binding_storage_image_update_after_bind = self.descriptor_indexing.descriptor_binding_storage_image_update_after_bind;
+        self.vulkan12.descriptor_binding_storage_buffer_update_after_bind = self.descriptor_indexing.descriptor_binding_storage_buffer_update_after_bind;
+        self.vulkan12.descriptor_binding_uniform_texel_buffer_update_after_bind = self.descriptor_indexing.descriptor_binding_uniform_texel_buffer_update_after_bind;
+        self.vulkan12.descriptor_binding_storage_texel_buffer_update_after_bind = self.descriptor_indexing.descriptor_binding_storage_texel_buffer_update_after_bind;
+        self.vulkan12.descriptor_binding_update_unused_while_pending = self.descriptor_indexing.descriptor_binding_update_unused_while_pending;
+        self.vulkan12.descriptor_binding_partially_bound = self.descriptor_indexing.descriptor_binding_partially_bound;
+        self.vulkan12.descriptor_binding_variable_descriptor_count = self.descriptor_indexing.descriptor_binding_variable_descriptor_count;
+        self.vulkan12.runtime_descriptor_array = self.descriptor_indexing.runtime_descriptor_array;
+        self.vulkan12.separate_depth_stencil_layouts = self.separate_depth_stencil.separate_depth_stencil_layouts;
+        self.vulkan12.shader_buffer_int64_atomics = self.atomic64.shader_buffer_int64_atomics;
+        self.vulkan12.shader_shared_int64_atomics = self.atomic64.shader_shared_int64_atomics;
         self.vulkan12.subgroup_broadcast_dynamic_id = u32::from(features & (1 << 39) != 0);
         self.vulkan12.sampler_mirror_clamp_to_edge = u32::from(features & (1 << 40) != 0);
         self.vulkan12.sampler_filter_minmax = u32::from(features & (1 << 41) != 0);
+        self.vulkan12.descriptor_indexing = u32::from(features & (1 << 66) != 0);
+        self.vulkan12.draw_indirect_count = u32::from(features & (1 << 67) != 0);
+        self.vulkan12.shader_output_viewport_index = u32::from(features & (1 << 68) != 0);
+        self.vulkan12.shader_output_layer = u32::from(features & (1 << 69) != 0);
         self.vulkan12.scalar_block_layout = u32::from(legacy & (1 << 11) != 0);
         self.vulkan12.imageless_framebuffer = u32::from(legacy & (1 << 9) != 0);
         self.vulkan12.timeline_semaphore = u32::from(legacy & (1 << 1) != 0);
@@ -85,12 +143,19 @@ fn query_core12(caps: &mut Capabilities, query: &ash::khr::get_physical_device_p
     if native.subgroup_broadcast_dynamic_id != 0 { caps.features |= SUBGROUP_BROADCAST_DYNAMIC_ID; }
     if native.sampler_mirror_clamp_to_edge != 0 { caps.features |= SAMPLER_MIRROR_CLAMP_TO_EDGE; }
     if native.sampler_filter_minmax != 0 { caps.features |= SAMPLER_FILTER_MINMAX; }
+    if native.descriptor_indexing != 0 { caps.features |= DESCRIPTOR_INDEXING; }
+    if native.draw_indirect_count != 0 { caps.features |= DRAW_INDIRECT_COUNT; }
+    if native.shader_output_viewport_index != 0 { caps.features |= SHADER_OUTPUT_VIEWPORT_INDEX; }
+    if native.shader_output_layer != 0 { caps.features |= SHADER_OUTPUT_LAYER; }
 }
 compute_properties! {
     PhysicalDeviceSubgroupProperties, 0 => [subgroup_size, supported_stages.as_raw(), supported_operations.as_raw(), quad_operations_in_all_stages];
     PhysicalDeviceFloatControlsProperties, 1 << 4 => [denorm_behavior_independence.as_raw() as u32, rounding_mode_independence.as_raw() as u32, shader_signed_zero_inf_nan_preserve_float16, shader_signed_zero_inf_nan_preserve_float32, shader_signed_zero_inf_nan_preserve_float64, shader_denorm_preserve_float16, shader_denorm_preserve_float32, shader_denorm_preserve_float64, shader_denorm_flush_to_zero_float16, shader_denorm_flush_to_zero_float32, shader_denorm_flush_to_zero_float64, shader_rounding_mode_rte_float16, shader_rounding_mode_rte_float32, shader_rounding_mode_rte_float64, shader_rounding_mode_rtz_float16, shader_rounding_mode_rtz_float32, shader_rounding_mode_rtz_float64];
     PhysicalDeviceShaderIntegerDotProductProperties, 1 << 6 => [integer_dot_product8_bit_unsigned_accelerated, integer_dot_product8_bit_signed_accelerated, integer_dot_product8_bit_mixed_signedness_accelerated, integer_dot_product4x8_bit_packed_unsigned_accelerated, integer_dot_product4x8_bit_packed_signed_accelerated, integer_dot_product4x8_bit_packed_mixed_signedness_accelerated, integer_dot_product16_bit_unsigned_accelerated, integer_dot_product16_bit_signed_accelerated, integer_dot_product16_bit_mixed_signedness_accelerated, integer_dot_product32_bit_unsigned_accelerated, integer_dot_product32_bit_signed_accelerated, integer_dot_product32_bit_mixed_signedness_accelerated, integer_dot_product64_bit_unsigned_accelerated, integer_dot_product64_bit_signed_accelerated, integer_dot_product64_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating8_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating8_bit_signed_accelerated, integer_dot_product_accumulating_saturating8_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_unsigned_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated, integer_dot_product_accumulating_saturating4x8_bit_packed_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating16_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating16_bit_signed_accelerated, integer_dot_product_accumulating_saturating16_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating32_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating32_bit_signed_accelerated, integer_dot_product_accumulating_saturating32_bit_mixed_signedness_accelerated, integer_dot_product_accumulating_saturating64_bit_unsigned_accelerated, integer_dot_product_accumulating_saturating64_bit_signed_accelerated, integer_dot_product_accumulating_saturating64_bit_mixed_signedness_accelerated];
     PhysicalDeviceSubgroupSizeControlProperties, 1 << 8 => [min_subgroup_size, max_subgroup_size, max_compute_workgroup_subgroups, required_subgroup_size_stages.as_raw()];
+    PhysicalDeviceDescriptorIndexingProperties, 1 << 23 => [max_update_after_bind_descriptors_in_all_pools, shader_uniform_buffer_array_non_uniform_indexing_native, shader_sampled_image_array_non_uniform_indexing_native, shader_storage_buffer_array_non_uniform_indexing_native, shader_storage_image_array_non_uniform_indexing_native, shader_input_attachment_array_non_uniform_indexing_native, robust_buffer_access_update_after_bind, quad_divergent_implicit_lod, max_per_stage_descriptor_update_after_bind_samplers, max_per_stage_descriptor_update_after_bind_uniform_buffers, max_per_stage_descriptor_update_after_bind_storage_buffers, max_per_stage_descriptor_update_after_bind_sampled_images, max_per_stage_descriptor_update_after_bind_storage_images, max_per_stage_descriptor_update_after_bind_input_attachments, max_per_stage_update_after_bind_resources, max_descriptor_set_update_after_bind_samplers, max_descriptor_set_update_after_bind_uniform_buffers, max_descriptor_set_update_after_bind_uniform_buffers_dynamic, max_descriptor_set_update_after_bind_storage_buffers, max_descriptor_set_update_after_bind_storage_buffers_dynamic, max_descriptor_set_update_after_bind_sampled_images, max_descriptor_set_update_after_bind_storage_images, max_descriptor_set_update_after_bind_input_attachments];
+    PhysicalDeviceMultiviewProperties, 1 << 24 => [max_multiview_view_count, max_multiview_instance_index];
+    PhysicalDeviceDepthStencilResolveProperties, 1 << 26 => [supported_depth_resolve_modes.as_raw(), supported_stencil_resolve_modes.as_raw(), independent_resolve_none, independent_resolve];
 }
 fn query_aggregate_properties(caps: &mut Capabilities, query: &ash::khr::get_physical_device_properties2::Instance, physical: vk::PhysicalDevice) {
     if caps.api >= vk::API_VERSION_1_1 {
@@ -98,8 +163,6 @@ fn query_aggregate_properties(caps: &mut Capabilities, query: &ash::khr::get_phy
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut native);
         unsafe { query.get_physical_device_properties2(physical, &mut properties); }
         native.subgroup_supported_stages &= vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
-        native.max_multiview_view_count = 0;
-        native.max_multiview_instance_index = 0;
         let start = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_uuid);
         let mut bytes = vec![0; std::mem::size_of::<vk::PhysicalDeviceVulkan11Properties>() - start];
         let at = std::mem::offset_of!(vk::PhysicalDeviceVulkan11Properties, device_uuid) - start;

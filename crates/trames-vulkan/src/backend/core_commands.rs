@@ -24,36 +24,6 @@ impl Backend {
                     d.reset_query_pool(vk::QueryPool::from_raw(pool.raw), a[2] as u32, a[3] as u32);
                 }
             }
-            212 => {
-                output(m, a[3], 4)?;
-                let words = words64(m, a[1], bounded(a[2], 64)? * 4)?;
-                let mut bindings = Vec::new();
-                let mut seen = std::collections::BTreeSet::new();
-                for row in words.chunks_exact(4) {
-                    if row[0] > u32::MAX as u64
-                        || !seen.insert(row[0])
-                        || row[1] > 9
-                        || row[2] == 0
-                        || row[2] > 64
-                        || visibility_stages(row[3]).is_err()
-                    {
-                        return write(m, a[3], &vk::FALSE.to_le_bytes());
-                    }
-                    bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(row[0] as u32)
-                            .descriptor_type(vk::DescriptorType::from_raw(row[1] as i32))
-                            .descriptor_count(row[2] as u32)
-                            .stage_flags(visibility_stages(row[3])?),
-                    );
-                }
-                let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-                let mut supported = vk::DescriptorSetLayoutSupport::default();
-                unsafe {
-                    d.get_descriptor_set_layout_support(&info, &mut supported);
-                }
-                write(m, a[3], &supported.supported.to_le_bytes())?;
-            }
             214 => {
                 let pass = self.object(a[1], Kind::RenderPass)?;
                 let extent =

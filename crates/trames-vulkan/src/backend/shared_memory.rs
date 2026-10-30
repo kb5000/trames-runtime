@@ -70,6 +70,7 @@ impl Backend {
         size: u64,
         ty: u32,
         flags: u32,
+        mut dedicated: vk::MemoryDedicatedAllocateInfo<'_>,
     ) -> Option<Result<(vk::DeviceMemory, Arc<Allocation>)>> {
         if dev.host_alignment == 0 {
             return None;
@@ -100,6 +101,7 @@ impl Backend {
                 .memory_type_index(ty)
                 .push_next(&mut import);
             if flags != 0 { info = info.push_next(&mut allocation_flags); }
+            if !dedicated.buffer.is_null() || !dedicated.image.is_null(){info=info.push_next(&mut dedicated);}
             let raw = unsafe { dev.native.allocate_memory(&info, None) }?;
             Ok((raw, owner))
         })())
