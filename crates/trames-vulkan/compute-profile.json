@@ -1,0 +1,284 @@
+{
+  "wire_revision": 10,
+  "extensions": [
+    {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
+    {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
+    {"index": 2, "name": "storage8", "extension": "VK_KHR_8bit_storage", "minimum_api": 0, "promoted": 12},
+    {"index": 3, "name": "arithmetic", "extension": "VK_KHR_shader_float16_int8", "minimum_api": 0, "promoted": 12},
+    {"index": 4, "name": "float_controls", "extension": "VK_KHR_shader_float_controls", "minimum_api": 0, "promoted": 12},
+    {"index": 5, "name": "atomic_float", "extension": "VK_EXT_shader_atomic_float", "minimum_api": 0, "promoted": 0},
+    {"index": 6, "name": "integer_dot", "extension": "VK_KHR_shader_integer_dot_product", "minimum_api": 0, "promoted": 13},
+    {"index": 7, "name": "subgroup_types", "extension": "VK_KHR_shader_subgroup_extended_types", "minimum_api": 11, "promoted": 12},
+    {"index": 8, "name": "subgroup_size", "extension": "VK_EXT_subgroup_size_control", "minimum_api": 11, "promoted": 13},
+    {"index": 9, "name": "address", "extension": "VK_KHR_buffer_device_address", "minimum_api": 11, "promoted": 12},
+    {"index": 10, "name": "memory_model", "extension": "VK_KHR_vulkan_memory_model", "minimum_api": 11, "promoted": 12},
+    {"index": 11, "name": "uniform_layout", "extension": "VK_KHR_uniform_buffer_standard_layout", "minimum_api": 0, "promoted": 12},
+    {"index": 12, "name": "variable_pointers", "extension": "VK_KHR_variable_pointers", "minimum_api": 0, "promoted": 11},
+    {"index": 13, "name": "subgroup_flow", "extension": "VK_KHR_shader_subgroup_uniform_control_flow", "minimum_api": 11, "promoted": 0},
+    {"index": 14, "name": "subgroup_rotate", "extension": "VK_KHR_shader_subgroup_rotate", "minimum_api": 11, "promoted": 0},
+    {"index": 15, "name": "bind_memory2", "extension": "VK_KHR_bind_memory2", "minimum_api": 0, "promoted": 11},
+    {"index": 16, "name": "maintenance3", "extension": "VK_KHR_maintenance3", "minimum_api": 0, "promoted": 11}
+  ],
+  "features": [
+    {
+      "extension": 1,
+      "name": "storage16",
+      "type": "PhysicalDevice16BitStorageFeatures",
+      "structure_type": "PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES",
+      "bit": 0,
+      "fields": [
+        {"c": "storageBuffer16BitAccess", "rust": "storage_buffer16_bit_access", "kind": "Bool32", "expose": true},
+        {"c": "uniformAndStorageBuffer16BitAccess", "rust": "uniform_and_storage_buffer16_bit_access", "kind": "Bool32", "expose": true},
+        {"c": "storagePushConstant16", "rust": "storage_push_constant16", "kind": "Bool32", "expose": true},
+        {"c": "storageInputOutput16", "rust": "storage_input_output16", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 2,
+      "name": "storage8",
+      "type": "PhysicalDevice8BitStorageFeatures",
+      "structure_type": "PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES",
+      "bit": 4,
+      "fields": [
+        {"c": "storageBuffer8BitAccess", "rust": "storage_buffer8_bit_access", "kind": "Bool32", "expose": true},
+        {"c": "uniformAndStorageBuffer8BitAccess", "rust": "uniform_and_storage_buffer8_bit_access", "kind": "Bool32", "expose": true},
+        {"c": "storagePushConstant8", "rust": "storage_push_constant8", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 3,
+      "name": "arithmetic",
+      "type": "PhysicalDeviceShaderFloat16Int8Features",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES",
+      "bit": 7,
+      "fields": [
+        {"c": "shaderFloat16", "rust": "shader_float16", "kind": "Bool32", "expose": true},
+        {"c": "shaderInt8", "rust": "shader_int8", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 5,
+      "name": "atomic_float",
+      "type": "PhysicalDeviceShaderAtomicFloatFeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT",
+      "bit": 9,
+      "fields": [
+        {"c": "shaderBufferFloat32Atomics", "rust": "shader_buffer_float32_atomics", "kind": "Bool32", "expose": true},
+        {"c": "shaderBufferFloat32AtomicAdd", "rust": "shader_buffer_float32_atomic_add", "kind": "Bool32", "expose": true},
+        {"c": "shaderBufferFloat64Atomics", "rust": "shader_buffer_float64_atomics", "kind": "Bool32", "expose": false},
+        {"c": "shaderBufferFloat64AtomicAdd", "rust": "shader_buffer_float64_atomic_add", "kind": "Bool32", "expose": false},
+        {"c": "shaderSharedFloat32Atomics", "rust": "shader_shared_float32_atomics", "kind": "Bool32", "expose": true},
+        {"c": "shaderSharedFloat32AtomicAdd", "rust": "shader_shared_float32_atomic_add", "kind": "Bool32", "expose": true},
+        {"c": "shaderSharedFloat64Atomics", "rust": "shader_shared_float64_atomics", "kind": "Bool32", "expose": false},
+        {"c": "shaderSharedFloat64AtomicAdd", "rust": "shader_shared_float64_atomic_add", "kind": "Bool32", "expose": false},
+        {"c": "shaderImageFloat32Atomics", "rust": "shader_image_float32_atomics", "kind": "Bool32", "expose": true},
+        {"c": "shaderImageFloat32AtomicAdd", "rust": "shader_image_float32_atomic_add", "kind": "Bool32", "expose": true},
+        {"c": "sparseImageFloat32Atomics", "rust": "sparse_image_float32_atomics", "kind": "Bool32", "expose": false},
+        {"c": "sparseImageFloat32AtomicAdd", "rust": "sparse_image_float32_atomic_add", "kind": "Bool32", "expose": false}
+      ]
+    },
+    {
+      "extension": 6,
+      "name": "integer_dot",
+      "type": "PhysicalDeviceShaderIntegerDotProductFeatures",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES",
+      "bit": 21,
+      "fields": [
+        {"c": "shaderIntegerDotProduct", "rust": "shader_integer_dot_product", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 7,
+      "name": "subgroup_types",
+      "type": "PhysicalDeviceShaderSubgroupExtendedTypesFeatures",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES",
+      "bit": 22,
+      "fields": [
+        {"c": "shaderSubgroupExtendedTypes", "rust": "shader_subgroup_extended_types", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 8,
+      "name": "subgroup_size",
+      "type": "PhysicalDeviceSubgroupSizeControlFeatures",
+      "structure_type": "PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES",
+      "bit": 23,
+      "fields": [
+        {"c": "subgroupSizeControl", "rust": "subgroup_size_control", "kind": "Bool32", "expose": true},
+        {"c": "computeFullSubgroups", "rust": "compute_full_subgroups", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 9,
+      "name": "address",
+      "type": "PhysicalDeviceBufferDeviceAddressFeatures",
+      "structure_type": "PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES",
+      "bit": 25,
+      "fields": [
+        {"c": "bufferDeviceAddress", "rust": "buffer_device_address", "kind": "Bool32", "expose": true},
+        {"c": "bufferDeviceAddressCaptureReplay", "rust": "buffer_device_address_capture_replay", "kind": "Bool32", "expose": false},
+        {"c": "bufferDeviceAddressMultiDevice", "rust": "buffer_device_address_multi_device", "kind": "Bool32", "expose": false}
+      ]
+    },
+    {
+      "extension": 10,
+      "name": "memory_model",
+      "type": "PhysicalDeviceVulkanMemoryModelFeatures",
+      "structure_type": "PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES",
+      "bit": 28,
+      "fields": [
+        {"c": "vulkanMemoryModel", "rust": "vulkan_memory_model", "kind": "Bool32", "expose": true},
+        {"c": "vulkanMemoryModelDeviceScope", "rust": "vulkan_memory_model_device_scope", "kind": "Bool32", "expose": true},
+        {"c": "vulkanMemoryModelAvailabilityVisibilityChains", "rust": "vulkan_memory_model_availability_visibility_chains", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 11,
+      "name": "uniform_layout",
+      "type": "PhysicalDeviceUniformBufferStandardLayoutFeatures",
+      "structure_type": "PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES",
+      "bit": 31,
+      "fields": [
+        {"c": "uniformBufferStandardLayout", "rust": "uniform_buffer_standard_layout", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 12,
+      "name": "variable_pointers",
+      "type": "PhysicalDeviceVariablePointersFeatures",
+      "structure_type": "PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES",
+      "bit": 32,
+      "fields": [
+        {"c": "variablePointersStorageBuffer", "rust": "variable_pointers_storage_buffer", "kind": "Bool32", "expose": true},
+        {"c": "variablePointers", "rust": "variable_pointers", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 13,
+      "name": "subgroup_flow",
+      "type": "PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR",
+      "bit": 34,
+      "fields": [
+        {"c": "shaderSubgroupUniformControlFlow", "rust": "shader_subgroup_uniform_control_flow", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 14,
+      "name": "subgroup_rotate",
+      "type": "PhysicalDeviceShaderSubgroupRotateFeaturesKHR",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR",
+      "bit": 35,
+      "fields": [
+        {"c": "shaderSubgroupRotate", "rust": "shader_subgroup_rotate", "kind": "Bool32", "expose": true},
+        {"c": "shaderSubgroupRotateClustered", "rust": "shader_subgroup_rotate_clustered", "kind": "Bool32", "expose": true}
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "type": "PhysicalDeviceSubgroupProperties",
+      "structure_type": "PHYSICAL_DEVICE_SUBGROUP_PROPERTIES",
+      "extension": null,
+      "fields": [
+        {"c": "subgroupSize", "rust": "subgroup_size", "kind": "u32"},
+        {"c": "supportedStages", "rust": "supported_stages", "kind": "ShaderStageFlags"},
+        {"c": "supportedOperations", "rust": "supported_operations", "kind": "SubgroupFeatureFlags"},
+        {"c": "quadOperationsInAllStages", "rust": "quad_operations_in_all_stages", "kind": "Bool32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceFloatControlsProperties",
+      "structure_type": "PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES",
+      "extension": 4,
+      "fields": [
+        {"c": "denormBehaviorIndependence", "rust": "denorm_behavior_independence", "kind": "ShaderFloatControlsIndependence"},
+        {"c": "roundingModeIndependence", "rust": "rounding_mode_independence", "kind": "ShaderFloatControlsIndependence"},
+        {"c": "shaderSignedZeroInfNanPreserveFloat16", "rust": "shader_signed_zero_inf_nan_preserve_float16", "kind": "Bool32"},
+        {"c": "shaderSignedZeroInfNanPreserveFloat32", "rust": "shader_signed_zero_inf_nan_preserve_float32", "kind": "Bool32"},
+        {"c": "shaderSignedZeroInfNanPreserveFloat64", "rust": "shader_signed_zero_inf_nan_preserve_float64", "kind": "Bool32"},
+        {"c": "shaderDenormPreserveFloat16", "rust": "shader_denorm_preserve_float16", "kind": "Bool32"},
+        {"c": "shaderDenormPreserveFloat32", "rust": "shader_denorm_preserve_float32", "kind": "Bool32"},
+        {"c": "shaderDenormPreserveFloat64", "rust": "shader_denorm_preserve_float64", "kind": "Bool32"},
+        {"c": "shaderDenormFlushToZeroFloat16", "rust": "shader_denorm_flush_to_zero_float16", "kind": "Bool32"},
+        {"c": "shaderDenormFlushToZeroFloat32", "rust": "shader_denorm_flush_to_zero_float32", "kind": "Bool32"},
+        {"c": "shaderDenormFlushToZeroFloat64", "rust": "shader_denorm_flush_to_zero_float64", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTEFloat16", "rust": "shader_rounding_mode_rte_float16", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTEFloat32", "rust": "shader_rounding_mode_rte_float32", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTEFloat64", "rust": "shader_rounding_mode_rte_float64", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTZFloat16", "rust": "shader_rounding_mode_rtz_float16", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTZFloat32", "rust": "shader_rounding_mode_rtz_float32", "kind": "Bool32"},
+        {"c": "shaderRoundingModeRTZFloat64", "rust": "shader_rounding_mode_rtz_float64", "kind": "Bool32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceShaderIntegerDotProductProperties",
+      "structure_type": "PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES",
+      "extension": 6,
+      "fields": [
+        {"c": "integerDotProduct8BitUnsignedAccelerated", "rust": "integer_dot_product8_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct8BitSignedAccelerated", "rust": "integer_dot_product8_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct8BitMixedSignednessAccelerated", "rust": "integer_dot_product8_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct4x8BitPackedUnsignedAccelerated", "rust": "integer_dot_product4x8_bit_packed_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct4x8BitPackedSignedAccelerated", "rust": "integer_dot_product4x8_bit_packed_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct4x8BitPackedMixedSignednessAccelerated", "rust": "integer_dot_product4x8_bit_packed_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct16BitUnsignedAccelerated", "rust": "integer_dot_product16_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct16BitSignedAccelerated", "rust": "integer_dot_product16_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct16BitMixedSignednessAccelerated", "rust": "integer_dot_product16_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct32BitUnsignedAccelerated", "rust": "integer_dot_product32_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct32BitSignedAccelerated", "rust": "integer_dot_product32_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct32BitMixedSignednessAccelerated", "rust": "integer_dot_product32_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct64BitUnsignedAccelerated", "rust": "integer_dot_product64_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct64BitSignedAccelerated", "rust": "integer_dot_product64_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProduct64BitMixedSignednessAccelerated", "rust": "integer_dot_product64_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating8BitUnsignedAccelerated", "rust": "integer_dot_product_accumulating_saturating8_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating8BitSignedAccelerated", "rust": "integer_dot_product_accumulating_saturating8_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating8BitMixedSignednessAccelerated", "rust": "integer_dot_product_accumulating_saturating8_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating4x8BitPackedUnsignedAccelerated", "rust": "integer_dot_product_accumulating_saturating4x8_bit_packed_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated", "rust": "integer_dot_product_accumulating_saturating4x8_bit_packed_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating4x8BitPackedMixedSignednessAccelerated", "rust": "integer_dot_product_accumulating_saturating4x8_bit_packed_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating16BitUnsignedAccelerated", "rust": "integer_dot_product_accumulating_saturating16_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating16BitSignedAccelerated", "rust": "integer_dot_product_accumulating_saturating16_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating16BitMixedSignednessAccelerated", "rust": "integer_dot_product_accumulating_saturating16_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating32BitUnsignedAccelerated", "rust": "integer_dot_product_accumulating_saturating32_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating32BitSignedAccelerated", "rust": "integer_dot_product_accumulating_saturating32_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating32BitMixedSignednessAccelerated", "rust": "integer_dot_product_accumulating_saturating32_bit_mixed_signedness_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating64BitUnsignedAccelerated", "rust": "integer_dot_product_accumulating_saturating64_bit_unsigned_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating64BitSignedAccelerated", "rust": "integer_dot_product_accumulating_saturating64_bit_signed_accelerated", "kind": "Bool32"},
+        {"c": "integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated", "rust": "integer_dot_product_accumulating_saturating64_bit_mixed_signedness_accelerated", "kind": "Bool32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceSubgroupSizeControlProperties",
+      "structure_type": "PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES",
+      "extension": 8,
+      "fields": [
+        {"c": "minSubgroupSize", "rust": "min_subgroup_size", "kind": "u32"},
+        {"c": "maxSubgroupSize", "rust": "max_subgroup_size", "kind": "u32"},
+        {"c": "maxComputeWorkgroupSubgroups", "rust": "max_compute_workgroup_subgroups", "kind": "u32"},
+        {"c": "requiredSubgroupSizeStages", "rust": "required_subgroup_size_stages", "kind": "ShaderStageFlags"}
+      ]
+    }
+  ],
+  "aggregates": [
+    {
+      "type": "PhysicalDeviceVulkan11Features",
+      "structure_type": "PHYSICAL_DEVICE_VULKAN_1_1_FEATURES",
+      "fields": [
+        {"c": "storageBuffer16BitAccess", "rust": "storage_buffer16_bit_access", "bit": 0},
+        {"c": "uniformAndStorageBuffer16BitAccess", "rust": "uniform_and_storage_buffer16_bit_access", "bit": 1},
+        {"c": "storagePushConstant16", "rust": "storage_push_constant16", "bit": 2},
+        {"c": "storageInputOutput16", "rust": "storage_input_output16", "bit": 3},
+        {"c": "multiview", "rust": "multiview", "bit": -1},
+        {"c": "multiviewGeometryShader", "rust": "multiview_geometry_shader", "bit": -1},
+        {"c": "multiviewTessellationShader", "rust": "multiview_tessellation_shader", "bit": -1},
+        {"c": "variablePointersStorageBuffer", "rust": "variable_pointers_storage_buffer", "bit": 32},
+        {"c": "variablePointers", "rust": "variable_pointers", "bit": 33},
+        {"c": "protectedMemory", "rust": "protected_memory", "bit": -1},
+        {"c": "samplerYcbcrConversion", "rust": "sampler_ycbcr_conversion", "bit": -1},
+        {"c": "shaderDrawParameters", "rust": "shader_draw_parameters", "bit": -1}
+      ],
+      "seen_mask": 9223372036854776833
+    }
+  ]
+}

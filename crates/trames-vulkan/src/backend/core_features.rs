@@ -46,6 +46,8 @@ core_features! {
     19 => texture_compression_etc2,
     20 => texture_compression_astc_ldr,
     21 => texture_compression_bc,
+    22 => shader_int16,
+    23 => shader_int64,
 }
 
 #[cfg(test)]

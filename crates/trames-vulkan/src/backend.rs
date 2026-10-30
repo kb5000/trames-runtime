@@ -4,7 +4,7 @@ use ash::{vk, Entry};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,6 +16,7 @@ use trames_memory::{Access, CpuMemory, MemoryError};
 use vk::Handle;
 mod coherent;
 mod core_features;
+mod compute;
 mod completion;
 mod shared_memory;
 mod feedback;
@@ -98,6 +99,7 @@ struct Device {
     viewport_dimensions: [u32; 2],
     viewport_bounds: [f32; 2],
     max_indirect_draw_count: u32,
+    compute_features: u64,
 }
 impl Drop for Device {
     fn drop(&mut self) {
@@ -168,6 +170,7 @@ struct Object {
     flags: u32,
     state: Cell<u8>,
     command_usage: Cell<u32>,
+    allocation_flags: Cell<u32>,
     pending_submissions: Cell<u32>,
     mapped: Cell<usize>,
     memory_binding: Cell<Option<coherent::Binding>>,
@@ -388,6 +391,7 @@ pub struct Backend {
     physical: vk::PhysicalDevice,
     instance_id: u64,
     physical_id: u64,
+    address_resources: BTreeMap<u64, Weak<Object>>,
     device_id: u64,
     queue_id: u64,
     device: Option<Arc<Device>>,
@@ -425,6 +429,7 @@ impl Backend {
             physical: vk::PhysicalDevice::null(),
             instance_id: 0,
             physical_id: 0,
+            address_resources: BTreeMap::new(),
             device_id: 0,
             queue_id: 0,
             device: None,
@@ -511,6 +516,7 @@ impl Backend {
             flags,
             state: Cell::new(0),
             command_usage: Cell::new(0),
+            allocation_flags: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
             memory_binding: Cell::new(None),
@@ -731,6 +737,11 @@ impl Backend {
             pending.extend(object.deps.borrow().iter().cloned());
             resources.push(object);
         }
+        // Device addresses can alias buffers without a descriptor. Their live
+        // owners join the existing graph; no GPU argument or tensor scan occurs.
+        self.address_resources.retain(|_, weak| {
+            if let Some(object) = weak.upgrade() { resources.push(object); true } else { false }
+        });
         let coherent_scope = coherent::Scope::resources(&resources);
         self.coherent_sync_scope(m, &coherent_scope, true)?;
         unsafe { d.queue_submit(self.queue, &infos, vk::Fence::from_raw(fence.raw)) }?;
@@ -782,6 +793,7 @@ impl Backend {
             flags: 0,
             state: Cell::new(0),
             command_usage: Cell::new(0),
+            allocation_flags: Cell::new(0),
             pending_submissions: Cell::new(0),
             mapped: Cell::new(0),
             memory_binding: Cell::new(None),
@@ -921,16 +933,20 @@ impl Backend {
         let raw_cache = cache.as_ref().map_or(vk::PipelineCache::null(), |c| {
             vk::PipelineCache::from_raw(c.raw)
         });
+        self.capabilities.compute.stage_controls(device.compute_features, a[11], a[12])?;
         let task = crate::task::Task::spawn(move || {
             let _permit = permit;
             let specialization = vk::SpecializationInfo::default()
                 .map_entries(&entries)
                 .data(&data);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+            let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(a[12] as u32);
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                .flags(vk::PipelineShaderStageCreateFlags::from_raw(a[11] as u32))
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(raw_shader)
                 .name(&name)
                 .specialization_info(&specialization);
+            if a[12] != 0 { stage = stage.push_next(&mut subgroup); }
             let info = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(raw_layout)];
@@ -1115,7 +1131,8 @@ impl Backend {
                     .ty(vk::LayerSettingTypeEXT::BOOL32)
             }];
             let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
-            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+            let api = unsafe { entry.try_enumerate_instance_version() }?.unwrap_or(vk::API_VERSION_1_0).min(vk::API_VERSION_1_1);
+            let app = vk::ApplicationInfo::default().api_version(api);
             let mut info = vk::InstanceCreateInfo::default()
                 .application_info(&app)
                 .enabled_extension_names(&names)
@@ -1179,7 +1196,7 @@ impl Backend {
             || op == 126
             || op == 133
             || op == 137
-            || op == 150)
+            || op == 150 || op == 206 || op == 207)
             && a[0]
                 != if op == 3 {
                     self.instance_id
@@ -1190,6 +1207,8 @@ impl Backend {
             return invalid();
         }
         match op {
+            206 => write_words(m, a[1], &[self.capabilities.compute.extensions, self.capabilities.compute.features, self.capabilities.compute.api as u64], 24)?,
+            207 => self.capabilities.compute.write_property(m, a[1] as u32, a[2])?,
             115 => {
                 write_words(
                     m,
@@ -1236,9 +1255,9 @@ impl Backend {
                         b.as_mut_ptr().cast(),
                     );
                 }
-                // This is an experimental 1.0 compute profile, not a complete
-                // Vulkan conformance claim or the host driver's extension set.
-                b[0] = (b[0] & 0xffffffff00000000) | vk::API_VERSION_1_0 as u64;
+                // Selected Vulkan 1.1 compute/query paths; no full conformance
+                // claim or automatic exposure of the host extension set.
+                b[0] = (b[0] & 0xffffffff00000000) | self.capabilities.compute.api as u64;
                 // Bound the implemented MRT profile by the real native limit.
                 let properties =
                     unsafe { &mut *b.as_mut_ptr().cast::<vk::PhysicalDeviceProperties>() };
@@ -1423,6 +1442,8 @@ impl Backend {
                 let features = core_features::select(native_features, a[4])?;
                 self.wsi.device_enabled = a[3] != 0;
                 zink::device_extensions(a[5], &self.capabilities, &mut names)?;
+                self.capabilities.compute.extension_names(a[6], &mut names)?;
+                let mut compute = compute::Selected::new(&self.capabilities.compute, a[6], a[7])?;
                 let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default()
                     .timeline_semaphore(a[5] & 2 != 0);
                 let mut imageless = vk::PhysicalDeviceImagelessFramebufferFeatures::default()
@@ -1457,6 +1478,7 @@ impl Backend {
                 if let Some(ref mut subset) = portability {
                     info = info.push_next(subset);
                 }
+                let info = compute.chain(a[6], info);
                 let native = unsafe { instance.native.create_device(self.physical, &info, None) }?;
                 self.queue = unsafe { native.get_device_queue(a[1] as u32, 0) };
                 self.family = a[1] as u32;
@@ -1494,6 +1516,7 @@ impl Backend {
                     viewport_dimensions: limits.max_viewport_dimensions,
                     viewport_bounds: limits.viewport_bounds_range,
                     max_indirect_draw_count: limits.max_draw_indirect_count,
+                    compute_features: a[7],
                 }));
                 self.device_id = self.id();
                 self.queue_id = self.id();
@@ -1531,6 +1554,7 @@ impl Backend {
         self.mappings.clear();
         self.waits.clear();
         self.coherent_pending = Default::default();
+        self.address_resources.clear();
         self.objects.clear();
         self.device = None;
         self.device_id = 0;
@@ -1610,6 +1634,16 @@ impl Backend {
                 }
                 unsafe { d.merge_pipeline_caches(vk::PipelineCache::from_raw(dest.raw), &native) }?;
             }
+            208 => {
+                if dev.compute_features & compute::BUFFER_DEVICE_ADDRESS == 0 { return unsupported(); }
+                let buffer = self.object(a[1], Kind::Buffer)?;
+                if buffer.flags & vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw() == 0 || buffer.memory_binding.get().is_none() { return invalid(); }
+                let api = ash::khr::buffer_device_address::Device::new(&dev.instance.native, d);
+                let info = vk::BufferDeviceAddressInfo::default().buffer(vk::Buffer::from_raw(buffer.raw));
+                let address = unsafe { api.get_buffer_device_address(&info) };
+                write(m, a[2], &address.to_le_bytes())?;
+                self.address_resources.insert(a[1], Rc::downgrade(&buffer));
+            }
             200 => write(m, a[1], &(u64::from(dev.host_alignment != 0) | (u64::from(completion::available()) << 1)).to_le_bytes())?,
             11 => {
                 self.room(1)?;
@@ -1626,6 +1660,7 @@ impl Backend {
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST;
+                if dev.compute_features & compute::BUFFER_DEVICE_ADDRESS != 0 { allowed |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS; }
                 if dev.feedback.is_some() {
                     allowed |= vk::BufferUsageFlags::TRANSFORM_FEEDBACK_BUFFER_EXT
                         | vk::BufferUsageFlags::TRANSFORM_FEEDBACK_COUNTER_BUFFER_EXT;
@@ -1640,7 +1675,7 @@ impl Backend {
                 let id = self.put(Kind::Buffer, raw.as_raw(), vec![], a[1], a[2] as u32);
                 write(m, a[3], &id.to_le_bytes())?;
             }
-            12 => self.remove(a[1], Kind::Buffer)?,
+            12 => { self.address_resources.remove(&a[1]); self.remove(a[1], Kind::Buffer)?; }
             13 => {
                 let b = self.object(a[1], Kind::Buffer)?;
                 let r = unsafe { d.get_buffer_memory_requirements(vk::Buffer::from_raw(b.raw)) };
@@ -1665,15 +1700,19 @@ impl Backend {
                 if a[2] >= props.memory_type_count as u64 {
                     return invalid();
                 }
-                let info = vk::MemoryAllocateInfo::default()
+                if a[4] & !2 != 0 || a[4] != 0 && dev.compute_features & compute::BUFFER_DEVICE_ADDRESS == 0 { return unsupported(); }
+                let mut allocation_flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::from_raw(a[4] as u32));
+                let mut info = vk::MemoryAllocateInfo::default()
                     .allocation_size(a[1])
                     .memory_type_index(a[2] as u32);
+                if a[4] != 0 { info = info.push_next(&mut allocation_flags); }
                 let flags = props.memory_types[a[2] as usize].property_flags;
                 if flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE) {
-                    if let Some(Ok((raw, owner))) = self.allocate_shared(&dev, a[1], a[2] as u32) {
+                    if let Some(Ok((raw, owner))) = self.allocate_shared(&dev, a[1], a[2] as u32, a[4] as u32) {
                         let id = self.put(Kind::Memory, raw.as_raw(), vec![], a[1], flags.as_raw());
                         let object = &self.objects[&id];
                         object.state.set(a[2] as u8);
+                        object.allocation_flags.set(a[4] as u32);
                         *object.host_allocation.borrow_mut() = Some(owner);
                         write(m, a[3], &id.to_le_bytes())?;
                         return Ok(());
@@ -1697,6 +1736,7 @@ impl Backend {
                     props.memory_types[a[2] as usize].property_flags.as_raw(),
                 );
                 self.objects[&id].state.set(a[2] as u8);
+                self.objects[&id].allocation_flags.set(a[4] as u32);
                 write(m, a[3], &id.to_le_bytes())?;
             }
             15 => {
@@ -1717,6 +1757,7 @@ impl Backend {
                     || r.memory_type_bits & (1u32 << mem.state.get()) == 0
                     || a[3].checked_add(r.size).is_none_or(|n| n > mem.size)
                     || !b.deps.borrow().is_empty()
+                    || b.flags & vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw() != 0 && mem.allocation_flags.get() & 2 == 0
                 {
                     return invalid();
                 }

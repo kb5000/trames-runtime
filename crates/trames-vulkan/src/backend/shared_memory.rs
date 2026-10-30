@@ -69,6 +69,7 @@ impl Backend {
         dev: &Device,
         size: u64,
         ty: u32,
+        flags: u32,
     ) -> Option<Result<(vk::DeviceMemory, Arc<Allocation>)>> {
         if dev.host_alignment == 0 {
             return None;
@@ -93,10 +94,12 @@ impl Backend {
             let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
                 .host_pointer(owner.pointer().cast());
-            let info = vk::MemoryAllocateInfo::default()
+            let mut allocation_flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::from_raw(flags));
+            let mut info = vk::MemoryAllocateInfo::default()
                 .allocation_size(owner.len() as u64)
                 .memory_type_index(ty)
                 .push_next(&mut import);
+            if flags != 0 { info = info.push_next(&mut allocation_flags); }
             let raw = unsafe { dev.native.allocate_memory(&info, None) }?;
             Ok((raw, owner))
         })())

@@ -26,6 +26,7 @@ pub(super) struct Divisor {
 #[derive(Default)]
 pub(super) struct Capabilities {
     pub bits: u64,
+    pub compute: compute::Capabilities,
     pub max_timeline_difference: u64,
     point_clipping: u32,
     pub portability: Option<vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static>>,
@@ -45,7 +46,7 @@ impl Capabilities {
             ext.iter()
                 .any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name })
         };
-        let mut result = Self::default();
+        let mut result = Self { compute: compute::Capabilities::query(instance, physical, &ext), ..Self::default() };
         if has(ash::khr::maintenance1::NAME) {
             result.bits |= MAINTENANCE1;
         }
