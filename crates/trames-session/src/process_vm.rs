@@ -167,11 +167,11 @@ impl<C: Cpu> Kernel<C> {
             {
                 return Ok(true);
             }
-            // Native SCM_RIGHTS and namespace adapters retain their explicit
-            // owner boundary. Their FD/control graph is not a worker authority.
-            if root.linux.vfs.has_native_services() {
-                return Ok(true);
-            }
+            // Keep Rc/SCM_RIGHTS bookkeeping on this owner, while workers use
+            // the same shared byte queues and pipe readiness. Pumping imports
+            // owned host resources; it neither accesses guest memory nor
+            // installs guest FDs, so it does not require returning their Views.
+            root.linux.vfs.pump_native_services();
             if root.linux.vfs.live_ptys().iter().any(|pair| {
                 pair.host_resize_pending.get()
                     || pair.host_signals.get() != 0
@@ -601,6 +601,122 @@ mod tests {
             Err(RuntimeError::BudgetExceeded(_))
         ));
         assert_eq!(k.instructions, limit);
+    }
+    fn native_bridge_retains_cohort(idle_peer: bool, start_parked: bool) {
+        struct Roundtrip {
+            checks: usize,
+            sender: trames_vfs::DirectFd,
+            completed: Arc<SharedPage>,
+            deadline: Instant,
+            finished: bool,
+        }
+        impl GuestOutput for Roundtrip {
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                self.checks += 1;
+                if self.checks == 3 {
+                    // wl_display.sync(new_id=2), sent after workers have parked.
+                    let request = [1u32, 12u32 << 16, 2u32]
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect::<Vec<_>>();
+                    assert_eq!(self.sender.write(&request), Ok(12));
+                }
+                self.finished = self.checks >= 8 && count(&self.completed) == 24
+                    || Instant::now() >= self.deadline;
+                Ok(self.finished)
+            }
+            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(!self.finished && Instant::now() < self.deadline)
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+        }
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        let mut a = super::super::tests::process();
+        let _server = a.linux.vfs.enable_wayland(b"/run/user/0").unwrap();
+        let fd = a.linux.vfs.local_create(1, 0).unwrap();
+        let socket = a.linux.vfs.local_socket(fd).unwrap().unwrap();
+        a.linux
+            .vfs
+            .local_connect(&socket, b"\x01\x00/run/user/0/wayland-0\0")
+            .unwrap();
+        a.linux.vfs.pump_native_services();
+        assert!(a.linux.vfs.has_native_services());
+        let sender = a.linux.vfs.direct_descriptors().get(fd).unwrap();
+        let completed = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+        map(&mut a, 0x2000, completed.clone(), None);
+        code(&mut a, &[0xd4000001, 0xf9000120, 0x14000000]); // read, save result, spin
+        a.cpu.set_x(9, 0x2000);
+        a.cpu.set_x(8, 63);
+        put_args(&mut a.cpu, [fd as u64, 0x1000, 24, 0, 0, 0]);
+        let mut b = a.fork();
+        b.tgid = 2;
+        b.vm_id = 2;
+        b.affinity = 2;
+        let progress = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+        map(&mut b, 0x2000, progress.clone(), None);
+        b.cpu.set_x(1, 0x2000);
+        b.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        code(&mut b, &[0xf9400020, 0x91000400, 0xf9000020, 0x17fffffd]);
+        if idle_peer {
+            // No runnable CPU: retain the native source until its response wakes a.
+            let [reader, _writer] = b.linux.vfs.pipe(0).unwrap();
+            b.memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RW)
+                .unwrap();
+            code(&mut b, &[0xd4000001, 0x14000000]);
+            b.cpu.set_x(8, 63);
+            put_args(&mut b.cpu, [reader as u64, 0x1000, 1, 0, 0, 0]);
+        }
+        let mut io = Roundtrip {
+            checks: 0,
+            sender,
+            completed: completed.clone(),
+            deadline: Instant::now() + Duration::from_secs(3),
+            finished: false,
+        };
+        if start_parked {
+            for (id, p) in [(1, &mut a), (2, &mut b)] {
+                let arguments = args(&p.cpu);
+                p.cpu.pc += 4; // as if the read SVC has already retired
+                k.call(id, p, 63, arguments, &mut io);
+                assert!(matches!(p.state, State::Blocked(63, _)));
+            }
+        }
+        k.processes.insert(1, a);
+        k.processes.insert(2, b);
+        assert!(matches!(
+            k.drive(&mut io, u64::MAX),
+            Err(RuntimeError::Cancelled)
+        ));
+        assert_eq!(count(&completed), 24);
+        assert_eq!(
+            k.processes[&1].memory.read_array::<4>(0x1000).unwrap(),
+            2u32.to_ne_bytes()
+        );
+        assert_eq!(k.parallel_rounds, 1);
+        assert_eq!(k.vm_checkpoint_groups, 0);
+        if !idle_peer {
+            assert!(count(&progress) > 0);
+        }
+    }
+    #[test]
+    fn native_wayland_roundtrip_keeps_an_unrelated_cpu_running() {
+        native_bridge_retains_cohort(false, false);
+    }
+    #[test]
+    fn native_wayland_response_wakes_an_idle_cohort_without_rebuilding() {
+        native_bridge_retains_cohort(true, false);
+    }
+    #[test]
+    fn native_wayland_admits_an_already_idle_cohort() {
+        native_bridge_retains_cohort(true, true);
     }
     #[test]
     fn persistent_idle_waits_survive_fd_reuse_and_wake_without_rebuilding_the_cohort() {

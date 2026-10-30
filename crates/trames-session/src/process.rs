@@ -3581,7 +3581,11 @@ impl<C: Cpu> Kernel<C> {
         let Some((&id, first)) = active.next() else {
             // Interactive transports can wake retained I/O while every CPU is
             // parked. The solo-CPU admission branch below remains unchanged.
-            if self.terminal.is_some()
+            if (self.terminal.is_some()
+                || self
+                    .processes
+                    .get(&1)
+                    .is_some_and(|p| p.linux.vfs.has_native_services()))
                 && self
                     .processes
                     .iter()
@@ -3987,7 +3991,13 @@ impl<C: Cpu> Kernel<C> {
                             break;
                         }
                     }
-                    if self.terminal.is_none() && epoch.idle() {
+                    if self.terminal.is_none()
+                        && !self
+                            .processes
+                            .get(&1)
+                            .is_some_and(|p| p.linux.vfs.has_native_services())
+                        && epoch.idle()
+                    {
                         break;
                     }
                 }

@@ -529,6 +529,32 @@ coverage checks stable private RWX metadata across joined rounds, real guest
 IC/DC publication between two host-thread-affine vCPUs, host code writes,
 permission revocation, physical replacement and preserved page-out/page-in.
 
+## Native display bridges without cohort joins
+
+An active native Wayland/XWM connection is an external progress source, not a
+request to stop every guest CPU. Persistent cohort control pumps the bounded
+native adapter on its existing owner thread while CPU workers keep their Views
+and translations. The adapter handles owned bytes, host FDs and resource leases;
+its Rc connection graph and SCM_RIGHTS ledger never move to a worker. Shared
+Unix byte queues and clipboard pipes retain their existing object locks and
+readiness notifications. Importing a native resource creates an owner-side
+anonymous description; it does not install a guest FD or access guest memory.
+Guest recvmsg rights installation retains its ordinary joined boundary.
+
+A cohort can also stay parked when all its tasks wait on I/O and the native
+connection can provide progress, just as for an interactive terminal. Already
+blocked tasks use the same admission gate. The existing bounded host-control
+wait services the bridge without another coordinator/service thread or a busy
+loop. Cancellation, pressure, task/FD lifecycle, pending signals and necessary
+mapping changes keep their existing synchronization boundaries. This removes
+an unconditional display-related stop; it does not make every syscall local or
+remove required same-mm checkpoints.
+
+Real-worker conformance sends wl_display.sync after dispatch and verifies the
+24-byte callback response with one retained cohort, both with a running peer
+and with every CPU parked. A third case starts with already-blocked tasks. The
+old active-peer case rebuilds eight cohorts for eight host control checks.
+
 ## Local mapping commits and backing range history
 
 A content-change domain is separate from a quiescence dependency. Local mapping
