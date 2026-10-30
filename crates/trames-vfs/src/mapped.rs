@@ -227,15 +227,23 @@ struct RangeChange {
 struct MappingState {
     identity: u64,
     generation: AtomicU64,
+    metadata_identity: u64,
+    metadata_generation: AtomicU64,
+    metadata_length: trames_shared::LogicalSize,
     length: LiveLength,
     stable: bool,
     changes: SharedCell<VecDeque<RangeChange>>,
 }
 impl MappingState {
     fn new(data: &FileData, stable: bool, inode: Option<trames_shared::LogicalSize>) -> Arc<Self> {
+        let metadata_length = data.logical_size();
+        metadata_length.on_change(trames_memory::backing_changed);
         Arc::new(Self {
             identity: trames_memory::new_backing_identity(),
             generation: AtomicU64::new(0),
+            metadata_identity: trames_memory::new_backing_identity(),
+            metadata_generation: AtomicU64::new(0),
+            metadata_length,
             stable,
             changes: SharedCell::default(),
             length: match data {
@@ -267,6 +275,9 @@ impl MappingState {
         )
     }
     fn changed(&self, bytes: Option<Range<u64>>) {
+        if bytes.is_none() {
+            self.metadata_generation.fetch_add(1, Ordering::Relaxed);
+        }
         // Only metadata publication uses this object lock. CPU/native ordinary
         // stores keep their original byte-access path and hardware ordering.
         let before = self.domain().1;
@@ -711,6 +722,27 @@ impl PageBacking for FileMapping {
             };
         }
         Some(self.state.domain())
+    }
+    fn parallel_metadata_domain(&self) -> Option<(u64, u64)> {
+        if self.state.stable && !self.page.deferred() {
+            // Resident data already shares its canonical physical bytes. Only
+            // EOF/source/layout changes require another mapping preparation.
+            // A distinct identity keeps executable aliases on byte versions.
+            Some((
+                self.state.metadata_identity,
+                self.state.metadata_generation.load(Ordering::Relaxed)
+                    .wrapping_add(self.state.metadata_length.revision()),
+            ))
+        } else {
+            self.parallel_change_domain()
+        }
+    }
+    fn parallel_metadata_changes_since(&self, generation: u64) -> Option<Vec<Range<u64>>> {
+        if self.state.stable && !self.page.deferred() {
+            None // rare EOF/layout changes revisit every alias, including COW
+        } else {
+            self.parallel_changes_since(generation)
+        }
     }
     fn parallel_commit_isolated(&self) -> bool {
         // No provider Rc crosses to workers. Published bytes retain SharedPage
@@ -1521,7 +1553,7 @@ mod tests {
     #[test]
     fn changed_ranges_visit_only_touched_offsets_and_all_their_aliases() {
         use trames_memory::{parallel::Registry, CpuMemory};
-        for pages in [8, 256, 1024] {
+        for (pages, executable) in [8, 256, 1024].into_iter().flat_map(|n| [(n, false), (n, true)]) {
             let mut v = Vfs::default();
             let fd = v.memfd_create(b"large-mapped-buffer", 0).unwrap();
             v.truncate_fd(fd, PAGE_SIZE * pages).unwrap();
@@ -1529,6 +1561,7 @@ mod tests {
             // changes inherit its range indefinitely.
             v.write(fd, &vec![0; (PAGE_SIZE * pages) as usize]).unwrap();
             let mut m = Memory::default();
+            let permissions = Permissions { execute: executable, ..Permissions::RW };
             mapped(
                 &v,
                 &mut m,
@@ -1536,17 +1569,17 @@ mod tests {
                 0x1000000,
                 PAGE_SIZE * pages,
                 true,
-                Permissions::RW,
+                permissions,
             );
             let aliases = v
                 .mapping_pages(fd, 3 * PAGE_SIZE, PAGE_SIZE, true, true)
                 .unwrap();
-            m.map_backed(0x2000000, aliases, true, Permissions::RW, false)
+            m.map_backed(0x2000000, aliases, true, permissions, false)
                 .unwrap();
             let cow = v
                 .mapping_pages(fd, 3 * PAGE_SIZE, PAGE_SIZE, false, false)
                 .unwrap();
-            m.map_backed(0x3000000, cow, false, Permissions::RW, false)
+            m.map_backed(0x3000000, cow, false, permissions, false)
                 .unwrap();
             m.write_array(0x3000000, [99u8]).unwrap();
             let mut registry = Registry::default();
@@ -1560,8 +1593,8 @@ mod tests {
             assert_eq!(view.read_array::<1>(0x3000000), Ok([99]));
             assert_eq!(
                 registry.metrics.backing_page_checks - before,
-                3,
-                "mapped pages={pages}"
+                if executable { 3 } else { 0 },
+                "mapped pages={pages}, executable={executable}"
             );
             assert_eq!(registry.metrics.full_rebuilds, 1);
             assert!(view.commit_domains().is_empty());
@@ -1658,10 +1691,10 @@ mod tests {
             drop(view);
         }
         assert_eq!(registry.metrics.full_rebuilds, 1);
-        assert_eq!(registry.metrics.incremental_pages, 8);
+        assert_eq!(registry.metrics.incremental_pages, 0);
         // Display-buffer writes must not revisit all 257 unrelated ELF/COW
         // mappings. File versions and EOF checks remain live for changed files.
-        assert_eq!(registry.metrics.backing_page_checks, 8);
+        assert_eq!(registry.metrics.backing_page_checks, 0);
         v.seek(cold, 0, 0).unwrap();
         v.write(cold, &0xd503201fu32.to_le_bytes()).unwrap();
         let view = m.parallel_view(&mut registry).unwrap();
@@ -2233,7 +2266,8 @@ mod tests {
             assert_eq!(view.read_array::<1>(0x10000).unwrap(), [value]);
             drop(view);
         }
-        assert!(registry.metrics.direct_frame_refreshes >= 8);
+        assert_eq!(registry.metrics.direct_frame_refreshes, 0);
+        assert_eq!(registry.metrics.backing_page_checks, 0);
         v.truncate_fd(fd, 0).unwrap();
         let view = memory.parallel_view(&mut registry).unwrap();
         assert_ne!(view.hardware_view_version().0, original);
@@ -2263,6 +2297,32 @@ mod tests {
         view.enable_hardware();
         assert_eq!(view.read_array::<1>(0x10000).unwrap(), [99]);
         assert_eq!(view.read_array::<1>(0x20000).unwrap(), [71]);
+    }
+    #[test]
+    fn resident_metadata_domain_observes_external_shared_file_eof() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"external-eof", 0).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        let file = v.shared_file(fd).unwrap();
+        let mut memory = Memory::default();
+        mapped(&v, &mut memory, fd, 0x10000, PAGE_SIZE * 2, true, Permissions::RW);
+        let mut registry = Registry::default();
+        drop(memory.parallel_view(&mut registry).unwrap());
+        file.write_at(0, b"live").unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<4>(0x10000), Ok(*b"live"));
+        assert_eq!(registry.metrics.backing_page_checks, 0);
+        drop(view);
+        // Bypass MappedData::truncate: the retained size capability itself
+        // invalidates EOF metadata; ordinary writes above needed no refresh.
+        file.set_len(0).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(0x10000), Err(MemoryError::Bus(0x10000)));
+        drop(view);
+        file.set_len((PAGE_SIZE * 2) as usize).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<1>(0x10000), Ok([0]));
     }
 }
 

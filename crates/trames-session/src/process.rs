@@ -4021,12 +4021,16 @@ impl<C: Cpu> Kernel<C> {
                         break;
                     }
                 }
+                Some(crate::workers::Event::<C>::DiskSync(id, result)) => {
+                    self.finish_disk_sync(id, result, &mut disk);
+                    if !self.resume_disk_waiters(&mut disk, io) { break; }
+                }
                 None => {}
             }
         }
         epoch.stop();
         let began = Instant::now();
-        // An already submitted read must finish/commit exactly once before
+        // Submitted disk I/O must finish/commit exactly once before
         // mapping, process or FD mutation. Do not wait in Pool::complete while
         // its caller is parked awaiting a disk completion on this same channel.
         for request in disk.waiting.drain(..) {
@@ -4044,6 +4048,9 @@ impl<C: Cpu> Kernel<C> {
                 Some(crate::workers::Event::<C>::Service(request)) => request.respond(None),
                 Some(crate::workers::Event::<C>::DiskRead(id, result)) => {
                     self.finish_disk_read(id, result, &mut disk);
+                }
+                Some(crate::workers::Event::<C>::DiskSync(id, result)) => {
+                    self.finish_disk_sync(id, result, &mut disk);
                 }
                 None => {}
             }

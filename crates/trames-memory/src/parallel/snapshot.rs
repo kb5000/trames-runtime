@@ -307,7 +307,6 @@ impl Memory {
                 let page = self.frames[frame.root_frame]
                     .as_ref()
                     .expect("backed frame");
-                let backing = page.backing.as_ref().expect("indexed backing");
                 registry.metrics.backing_domain_checks += 1;
                 let mut ranges = None;
                 match page.parallel_domain() {
@@ -315,7 +314,7 @@ impl Memory {
                         if generation == group.generation {
                             continue;
                         }
-                        ranges = backing.object.parallel_changes_since(group.generation);
+                        ranges = page.parallel_changes_since(group.generation);
                         group.generation = generation;
                     }
                     // A provider changing its declared domain is conservative.

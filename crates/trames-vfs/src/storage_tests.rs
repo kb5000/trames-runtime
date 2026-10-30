@@ -235,6 +235,49 @@ fn disk_read_lease_retains_unlinked_object_and_store_without_vfs() {
     assert_eq!(reopened.stat_at(AT_FDCWD, b"/data"), Err(Errno(2)));
 }
 #[test]
+fn disk_sync_jobs_share_one_manifest_transaction_and_retain_original_resources() {
+    fn send<T: Send>() {}
+    send::<DiskSyncJob>();
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"payload".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
+    v.pwrite(fd, b"updated", 0).unwrap();
+    let (first, a) = v.prepare_disk_sync(fd, false).unwrap().unwrap();
+    let (second, b) = v.prepare_disk_sync(fd, true).unwrap().unwrap();
+    v.close(fd).unwrap();
+    let reused = v.open_at(AT_FDCWD, b"/other", 0x42, 0o600).unwrap();
+    assert_eq!(fd, reused);
+    v.write(reused, b"other").unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let ready = barrier.clone();
+    let worker = std::thread::spawn(move || { ready.wait(); a.run() });
+    barrier.wait();
+    b.run().unwrap();
+    worker.join().unwrap().unwrap();
+    drop((first, second, v));
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    assert_eq!(reopened.read(fd, 32).unwrap(), b"updated");
+    let fd = reopened.open_at(AT_FDCWD, b"/other", 0, 0).unwrap();
+    assert_eq!(reopened.read(fd, 32).unwrap(), b"other");
+}
+#[test]
+fn disk_sync_admission_keeps_ram_and_mapped_writeback_on_original_path() {
+    let mut ram = Vfs::default();
+    let fd = ram.open_at(AT_FDCWD, b"/ram", 0x42, 0o600).unwrap();
+    assert!(ram.prepare_disk_sync(fd, false).unwrap().is_none());
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/mapped", vec![0; 4096]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/mapped", 2, 0).unwrap();
+    let mappings = v.mapping_pages(fd, 0, 4096, true, true).unwrap();
+    mappings[0].write(0, b"mapped").unwrap();
+    assert!(v.prepare_disk_sync(fd, false).unwrap().is_none());
+    v.sync_fd(fd, false).unwrap();
+    assert_eq!(v.pread(fd, 6, 0).unwrap(), b"mapped");
+}
+#[test]
 fn disk_read_offsets_conflicts_short_reads_and_errors_commit_once() {
     let dir = Temp::new();
     let mut v = dir.open();

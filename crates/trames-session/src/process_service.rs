@@ -7,12 +7,25 @@ use super::*;
 #[derive(Default)]
 pub(super) struct DiskEpoch<C: Cpu> {
     pending: Vec<Option<PendingDiskRead<C>>>,
+    syncs: Vec<Option<PendingDiskSync<C>>>,
+    reads: usize,
     pub(super) in_flight: usize,
     pub(super) waiting: std::collections::VecDeque<Box<crate::workers::Request<C>>>,
 }
 impl<C: Cpu> DiskEpoch<C> {
+    fn insert_sync(&mut self, pending: PendingDiskSync<C>) -> usize {
+        self.in_flight += 1;
+        if let Some(index) = self.syncs.iter().position(Option::is_none) {
+            self.syncs[index] = Some(pending);
+            index
+        } else {
+            self.syncs.push(Some(pending));
+            self.syncs.len() - 1
+        }
+    }
     fn insert(&mut self, pending: PendingDiskRead<C>) -> usize {
         self.in_flight += 1;
+        self.reads += 1;
         if let Some(index) = self.pending.iter().position(Option::is_none) {
             self.pending[index] = Some(pending);
             index
@@ -24,8 +37,13 @@ impl<C: Cpu> DiskEpoch<C> {
     fn take(&mut self, id: usize) -> PendingDiskRead<C> {
         let pending = self.pending[id].take().expect("submitted disk read");
         self.in_flight -= 1;
+        self.reads -= 1;
         pending
     }
+}
+struct PendingDiskSync<C: Cpu> {
+    request: Box<crate::workers::Request<C>>,
+    _sync: trames_vfs::DiskSync,
 }
 pub(super) struct PendingDiskRead<C: Cpu> {
     request: Box<crate::workers::Request<C>>,
@@ -61,7 +79,7 @@ impl<C: Cpu> Kernel<C> {
             || matches!(request.number, 63 | 67) && request.args[2] >= 16 * 1024;
         // Most services have no pending disk conflict or bulk-read admission.
         // Keep their single process lookup and original helpers intact.
-        if disk.in_flight == 0 && !bulk {
+        if disk.in_flight == 0 && !bulk && !matches!(request.number, 82 | 83) {
             let value = self.service_request(&mut request, io);
             request.respond(value);
             return value.is_some();
@@ -81,6 +99,25 @@ impl<C: Cpu> Kernel<C> {
         // Small reads remain inline: a host queue roundtrip would cost more
         // than their cached read. Memory/mapped files retain the old helpers.
         let a = request.args;
+        if matches!(request.number, 82 | 83)
+            && p.seccomp.allows(request.number, request.pc, request.args)
+            && !p.linux.trace
+            && matches!(p.state, State::Ready)
+        {
+            match p.linux.vfs.prepare_disk_sync(a[0] as u32, request.number == 83) {
+                Ok(Some((sync, job))) => {
+                    if disk.in_flight >= self.cpu_count {
+                        disk.waiting.push_back(request);
+                        return true;
+                    }
+                    let id = disk.insert_sync(PendingDiskSync { request, _sync: sync });
+                    self.workers.disk_sync(id, job);
+                    return true;
+                }
+                Err(e) => { request.respond(Some(error(e))); return true; }
+                Ok(None) => {}
+            }
+        }
         if matches!(request.number, 63 | 65 | 67 | 69)
             && p.seccomp.allows(request.number, request.pc, request.args)
             && !p.linux.trace
@@ -124,7 +161,7 @@ impl<C: Cpu> Kernel<C> {
                         parts,
                     });
                     self.disk_reads += 1;
-                    self.peak_disk_reads = self.peak_disk_reads.max(disk.in_flight);
+                    self.peak_disk_reads = self.peak_disk_reads.max(disk.reads);
                     self.workers.disk_read(id, job);
                     return true;
                 }
@@ -158,6 +195,11 @@ impl<C: Cpu> Kernel<C> {
             self.syscall_total += began.elapsed();
         }
         pending.request.respond(Some(result.unwrap_or_else(error)));
+    }
+    pub(super) fn finish_disk_sync(&mut self, id: usize, result: Result<(), Errno>, disk: &mut DiskEpoch<C>) {
+        let pending = disk.syncs[id].take().expect("submitted disk sync");
+        disk.in_flight -= 1;
+        pending.request.respond(Some(result.map_or_else(error, |()| 0)));
     }
     pub(super) fn resume_disk_waiters(
         &mut self,
@@ -373,13 +415,11 @@ mod tests {
         done
     }
     fn disk_process() -> (std::path::PathBuf, Box<Process>, u32) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "trames-epoch-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut p = super::super::tests::process();
         p.linux.vfs = trames_vfs::Vfs::open_disk(&path, Default::default()).unwrap();
@@ -731,6 +771,43 @@ mod tests {
                 k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
             assert_eq!(value, Some(0));
             finish(&mut k, request, control, value);
+        }
+    }
+    #[test]
+    fn pending_disk_sync_allows_pipe_service_and_completes_once_after_stop() {
+        for sync in [82, 83] {
+            let (path, p, fd) = disk_process();
+            let mut peer = super::super::tests::process();
+            peer.linux.vfs = p.linux.vfs.clone();
+            let [r, w] = peer.linux.vfs.pipe(0).unwrap();
+            peer.linux.vfs.write(w, b"ok").unwrap();
+            let (mut k, request, control) = pending(p, sync, [fd as u64, 0, 0, 0, 0, 0]);
+            let mut disk = DiskEpoch::default();
+            let mut io = trames_linux::CapturedOutput::default();
+            assert!(k.epoch_request(request, &mut disk, &mut io));
+            assert_eq!(disk.in_flight, 1);
+            let Some(Event::DiskSync(id, result)) = k.workers.event_timeout(Duration::from_secs(5)).unwrap()
+            else { panic!("missing disk sync") };
+            assert_eq!(result, Ok(()));
+            // Retain completion while serving an unrelated caller: the sync
+            // caller is still parked, without occupying coordinator execution.
+            let (mut peer_kernel, mut request, peer_control) = pending(peer, 63, [r as u64, 0x2000, 2, 0, 0, 0]);
+            request.pid = 2;
+            k.processes.insert(2, peer_kernel.processes.remove(&1).unwrap());
+            peer_control.stop();
+            assert!(k.epoch_request(request, &mut disk, &mut io));
+            assert_eq!(disk.in_flight, 1);
+            let peer_done = peer_kernel.workers.complete().unwrap();
+            assert_eq!(peer_done.cpu.x(0), 2);
+            control.stop();
+            k.finish_disk_sync(id, result, &mut disk);
+            assert_eq!(disk.in_flight, 0);
+            let done = k.workers.complete().unwrap();
+            assert_eq!((done.cpu.x(0), done.serviced_syscalls), (0, 1));
+            k.processes.get_mut(&1).unwrap().memory.commit_parallel().unwrap();
+            k.processes.get_mut(&2).unwrap().memory.commit_parallel().unwrap();
+            drop((k, peer_kernel));
+            std::fs::remove_dir_all(path).unwrap();
         }
     }
     #[test]

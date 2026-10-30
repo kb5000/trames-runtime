@@ -152,6 +152,7 @@ pub(super) enum Event<C: Cpu> {
     Done(Box<Done<C>>),
     Service(Box<Request<C>>),
     DiskRead(usize, Result<Vec<u8>, trames_vfs::Errno>),
+    DiskSync(usize, Result<(), trames_vfs::Errno>),
     EpochStopped(usize),
     VmReady,
     Idle,
@@ -310,8 +311,24 @@ struct Worker<C: Cpu> {
     epoch: Option<Arc<crate::run_queue::Epoch<C>>>,
 }
 struct DiskWorker {
-    send: mpsc::Sender<(usize, trames_vfs::DiskReadJob, Vec<u8>)>,
+    send: mpsc::Sender<DiskJob>,
     join: thread::JoinHandle<()>,
+}
+enum DiskJob {
+    Read(usize, trames_vfs::DiskReadJob, Vec<u8>),
+    Sync(usize, trames_vfs::DiskSyncJob),
+}
+impl DiskJob {
+    fn run<C: Cpu>(self, cache: &mut trames_vfs::DiskReadCache) -> Event<C> {
+        match self {
+            Self::Read(id, job, bytes) => Event::DiskRead(id,
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run_cached(cache, bytes)))
+                    .unwrap_or(Err(trames_vfs::Errno(5)))),
+            Self::Sync(id, job) => Event::DiskSync(id,
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                    .unwrap_or(Err(trames_vfs::Errno(5)))),
+        }
+    }
 }
 pub(super) struct Pool<C: Cpu> {
     workers: Vec<Option<Worker<C>>>,
@@ -900,12 +917,19 @@ impl<C: Cpu> Pool<C> {
         worker.send.send(Command::<C>::Epoch(epoch)).map_err(|_| ())
     }
     pub fn disk_read(&mut self, id: usize, job: trames_vfs::DiskReadJob) {
+        let bytes = self.disk_buffers.pop().unwrap_or_default();
+        self.disk_job(DiskJob::Read(id, job, bytes));
+    }
+    pub fn disk_sync(&mut self, id: usize, job: trames_vfs::DiskSyncJob) {
+        self.disk_job(DiskJob::Sync(id, job));
+    }
+    fn disk_job(&mut self, job: DiskJob) {
         // Lazy persistent workers; at most one outstanding request per guest
         // CPU bounds queued jobs/buffers. Never create a thread per syscall.
         let index = self.next_disk_worker % self.workers.len().clamp(1, 2);
         self.next_disk_worker = self.next_disk_worker.wrapping_add(1);
         if index >= self.disk_workers.len() {
-            let (send, receive) = mpsc::channel::<(usize, trames_vfs::DiskReadJob, Vec<u8>)>();
+            let (send, receive) = mpsc::channel::<DiskJob>();
             let done = self.send.clone();
             if let Ok(join) = thread::Builder::new()
                 .name("trames-disk".into())
@@ -927,12 +951,7 @@ impl<C: Cpu> Pool<C> {
                                 }
                             }
                         };
-                        let (id, job, bytes) = work;
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            job.run_cached(&mut cache, bytes)
-                        }))
-                        .unwrap_or(Err(trames_vfs::Errno(5)));
-                        if done.send(Event::<C>::DiskRead(id, result)).is_err() {
+                        if done.send(work.run::<C>(&mut cache)).is_err() {
                             break;
                         }
                     }
@@ -941,18 +960,16 @@ impl<C: Cpu> Pool<C> {
                 self.disk_workers.push(DiskWorker { send, join });
             }
         }
-        let bytes = self.disk_buffers.pop().unwrap_or_default();
-        let (job, bytes) = if let Some(worker) = self.disk_workers.get(index) {
-            match worker.send.send((id, job, bytes)) {
+        let job = if let Some(worker) = self.disk_workers.get(index) {
+            match worker.send.send(job) {
                 Ok(()) => return,
-                Err(error) => (error.0 .1, error.0 .2),
+                Err(error) => error.0,
             }
         } else {
-            (job, bytes)
+            job
         };
         // Thread resource failure preserves one execution and one completion.
-        let result = job.run_cached(&mut trames_vfs::DiskReadCache::default(), bytes);
-        let _ = self.send.send(Event::<C>::DiskRead(id, result));
+        let _ = self.send.send(job.run::<C>(&mut trames_vfs::DiskReadCache::default()));
     }
     pub fn recycle_disk_buffer(&mut self, bytes: Vec<u8>) {
         // Keep initialized lengths so equal-size reads need no repeated zeroing.
@@ -990,6 +1007,7 @@ impl<C: Cpu> Pool<C> {
                 Event::<C>::Done(done) => return Ok(*done),
                 Event::<C>::Service(request) => request.respond(None),
                 Event::<C>::DiskRead(_, _)
+                | Event::<C>::DiskSync(_, _)
                 | Event::<C>::EpochStopped(_)
                 | Event::<C>::VmReady
                 | Event::<C>::Idle => return Err(()),
@@ -1005,6 +1023,7 @@ impl<C: Cpu> Pool<C> {
                 Some(Event::<C>::Service(request)) => request.respond(None),
                 Some(
                     Event::<C>::DiskRead(_, _)
+                    | Event::<C>::DiskSync(_, _)
                     | Event::<C>::EpochStopped(_)
                     | Event::<C>::VmReady
                     | Event::<C>::Idle,
@@ -1031,7 +1050,7 @@ impl<C: Cpu> Drop for Pool<C> {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
-                Ok(Some(Event::<C>::DiskRead(_, _) | Event::<C>::VmReady | Event::<C>::Idle)) => {}
+                Ok(Some(Event::<C>::DiskRead(_, _) | Event::<C>::DiskSync(_, _) | Event::<C>::VmReady | Event::<C>::Idle)) => {}
                 Ok(None) => {
                     for worker in self.workers.iter_mut().flatten() {
                         if worker.join.is_finished() {

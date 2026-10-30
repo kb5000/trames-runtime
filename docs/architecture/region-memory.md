@@ -66,7 +66,8 @@ snapshot generations. A VM-level lifetime counter changes only when a View is
 created/dropped; ordinary CPU/native byte accesses do not update it. This keeps
 retired physical slots from being zeroed/reused under an older reader/writer.
 Normal joined runtime mapping paths reuse their existing windows. Remap/protect/
-truncate/discard and persistence still use joined checkpoints.
+truncate/discard and mapped writeback still use joined checkpoints. Eligible
+ordinary disk-file sync uses the bounded disk workers described below.
 
 Anonymous zeros remain unpaid and physically sparse in mapped storage. If the
 optional MMU arena is unavailable, a shared zero page's software allocation is
@@ -85,7 +86,7 @@ than busy-loop indefinitely. This is a region lock, not a claim of lock-free or
 starvation-free execution. A bulk operation touching the whole page needs every
 bit, but acquires that mask in one operation. Different regions of one page can
 progress while a smaller native borrow is held. Native functions remain bounded;
-kernel mutation and persistence still use joined checkpoints.
+kernel mutation and mapped persistence still use joined checkpoints.
 
 The module's `unsafe impl Sync` has one invariant: every non-atomic byte and local
 reservation-row access has exclusive or immutable range ownership, from a live
@@ -1039,3 +1040,41 @@ remain observable. The global sync API is unchanged. Required persistent-root
 manifest serialization/durable commits and joined memory-view preparation remain
 separate costs. The [Mac validation](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-firefox-gpu.md#resource-scoped-runtime-projections-2026-10-30)
 retains all public-page observations, including mixed/slower prototypes.
+
+## Resident data metadata and disk sync scheduling (2026-10-30)
+
+Resident, stable file data pages now have a distinct metadata domain. Retained
+canonical shared bytes already expose ordinary writes; a byte-version change
+does not require another per-page version/EOF scan or hardware-frame refresh.
+Only storage-layout/source changes and the live logical-size capability advance
+this domain. The size observer also covers an external SharedFile resize that
+bypasses the mapped-file wrapper. Generations are relaxed metadata tokens, not
+ordinary-access fences. Executable aliases retain the original content domain
+and range history, using a separate identity so a data representative cannot
+hide code changes. Deferred, volatile and unknown backings stay conservative.
+Range hints are interpreted against the chosen domain, never across token types.
+
+Regression cases cover 8/256/1024-page files with shared and detached private
+aliases: a resident data write needs zero backing-page checks; executable aliases
+visit the three affected aliases. Truncation still revisits every alias and
+reports SIGBUS, then observes regrowth. External shared-file resize, code tokens,
+retained hardware mappings, COW, physical replacement and cold page-in retain
+their original tests. This removes redundant metadata work without changing byte
+ownership, permissions, atomic/exclusive behavior or ordinary memory ordering.
+
+In-epoch fsync/fdatasync on ordinary PlainFile disk storage submits owned backing
+and filesystem resources to the existing two-worker bounded disk pool. The guest
+caller parks and returns its execution slot; the coordinator continues unrelated
+requests. No guest pointer, VFS Rc or file-data guard crosses to the disk worker.
+The original OFD is retained until completion; errors return once and submitted
+work drains before joined mapping/namespace/process changes. Admission is bounded
+by the existing per-epoch I/O limit. RAM files keep their immediate path; mapped
+and overlay writeback retain joined semantics. An unrelated required checkpoint
+can still wait for outstanding disk work; this does not remove every cohort stop.
+
+Data sync, namespace serialization and durable manifest commit keep the original
+semantics. Concurrent manifest transactions use one mutex per actual disk store,
+covering snapshot construction through rename, rather than a global byte-I/O lock
+or another resource thread. Tests run concurrent sync jobs on one store, reopen
+their data/namespace, retain the original resources through FD reuse, and service
+a pipe while a sync caller is pending. No polling bus or wait thread is added.

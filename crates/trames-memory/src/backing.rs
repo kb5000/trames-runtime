@@ -96,6 +96,11 @@ pub trait PageBacking {
     fn parallel_changes_since(&self, _generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
         None
     }
+    /// Range hints use the selected metadata domain's token. Providers with a
+    /// separate metadata generation must not interpret it as a byte generation.
+    fn parallel_metadata_changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+        self.parallel_changes_since(generation)
+    }
     /// Publish dirty metadata after this address space's workers have joined,
     /// without copying bytes. Isolated providers may have live other-VM users.
     /// Called only for a provider that returned shared_page().
@@ -149,6 +154,14 @@ pub(super) struct Backed {
     pub private_copy: bool,
 }
 impl Page {
+    pub(super) fn parallel_changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+        let backing = self.backing.as_ref()?.object.as_ref();
+        if self.permissions.execute {
+            backing.parallel_changes_since(generation)
+        } else {
+            backing.parallel_metadata_changes_since(generation)
+        }
+    }
     pub(super) fn parallel_domain(&self) -> Option<(u64, u64)> {
         let backing = self.backing.as_ref()?.object.as_ref();
         if !backing.parallel_versioned() {

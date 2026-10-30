@@ -309,6 +309,7 @@ impl FileData {
 pub(super) struct DiskStore {
     root: PathBuf,
     _lock: File,
+    checkpoint: std::sync::Mutex<()>,
 }
 fn regular(path: &Path) -> Result<()> {
     if !fs::symlink_metadata(path)
@@ -366,7 +367,7 @@ impl DiskStore {
         {
             return Err(Errno(22));
         }
-        Ok(Arc::new(Self { root, _lock: lock }))
+        Ok(Arc::new(Self { root, _lock: lock, checkpoint: std::sync::Mutex::new(()) }))
     }
     fn object_path(&self, inode: u64) -> PathBuf {
         self.root.join("objects").join(format!("{inode:016x}.dat"))
@@ -426,7 +427,7 @@ impl DiskStore {
         let _ = self.sync_directory();
         Ok(())
     }
-    fn sync_directory(&self) -> Result<()> {
+    pub(super) fn sync_directory(&self) -> Result<()> {
         File::open(&self.root)
             .and_then(|f| f.sync_all())
             .map_err(host_errno)
@@ -477,6 +478,9 @@ impl Filesystem {
         let Some(disk) = &self.disk else {
             return Ok(());
         };
+        // One manifest transaction per store, including snapshot construction.
+        // Other filesystems and ordinary byte I/O remain independent.
+        let _commit = disk.checkpoint.lock().unwrap();
         let mut nodes = BTreeMap::new();
         for n in self.paths.values() {
             nodes.insert(n.borrow().inode, n.clone());

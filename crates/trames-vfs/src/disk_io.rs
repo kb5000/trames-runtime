@@ -52,6 +52,32 @@ pub struct DiskReadJob {
     offset: u64,
     count: usize,
 }
+/// Coordinator lifetime only; the original OFD survives close/reuse until the
+/// submitted operation completes. No file-data guard spans host durability I/O.
+pub struct DiskSync {
+    _open: OpenHandle,
+}
+/// Owned host resources only, shared with the existing bounded disk workers.
+pub struct DiskSyncJob {
+    backing: Arc<storage::DiskBacking>,
+    filesystem: Option<Arc<SharedCell<Filesystem>>>,
+    data_only: bool,
+}
+impl DiskSyncJob {
+    pub fn run(self) -> Result<()> {
+        let file = self.backing.open(false)?;
+        if self.data_only { file.sync_data() } else { file.sync_all() }
+            .map_err(storage::host_errno)?;
+        if let Some(filesystem) = self.filesystem {
+            let fs = filesystem.borrow();
+            fs.checkpoint(None)?;
+            if let Some(disk) = &fs.disk {
+                disk.sync_directory()?;
+            }
+        }
+        Ok(())
+    }
+}
 impl DiskReadJob {
     pub fn run(self) -> Result<Vec<u8>> {
         self.run_cached(&mut DiskReadCache::default(), Vec::new())
@@ -118,6 +144,24 @@ impl DiskRead {
     }
 }
 impl Vfs {
+    /// Admission has no effects. Mapped/overlay providers keep their existing
+    /// joined writeback; ordinary disk files need only retained host resources.
+    pub fn prepare_disk_sync(&self, fd: u32, data_only: bool) -> Result<Option<(DiskSync, DiskSyncJob)>> {
+        let descriptor = self.descriptor(fd)?;
+        let o = descriptor.open.borrow();
+        let Some(node) = Self::ordinary_file(&o, false) else { return Ok(None) };
+        let n = node.borrow();
+        let Content::File(storage::FileData::Plain(data)) = &n.content else { return Ok(None) };
+        let Some((backing, _)) = data.disk_source() else { return Ok(None) };
+        let filesystem = o.mount.as_ref().map_or(&self.fs, |mount| &mount.fs);
+        if filesystem.has_overlay() { return Ok(None) }
+        let job = DiskSyncJob {
+            backing,
+            filesystem: (n.links != 0).then(|| filesystem.shared.clone()),
+            data_only,
+        };
+        Ok(Some((DiskSync { _open: descriptor.open.clone() }, job)))
+    }
     pub fn disk_read_candidate(&self, fd: u32) -> bool {
         self.descriptor(fd).is_ok_and(|d| {
             Self::ordinary_file(&d.open.borrow(), false).is_some_and(

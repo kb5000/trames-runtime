@@ -26,7 +26,7 @@ pub use fd_table::{SharedFd, SharedFiles};
 pub use flock::FlockRequest;
 mod directory;
 mod disk_io;
-pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob};
+pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob, DiskSync, DiskSyncJob};
 mod direct_io;
 mod file_data;
 mod file_io;
