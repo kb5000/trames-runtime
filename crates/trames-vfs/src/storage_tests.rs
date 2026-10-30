@@ -1222,6 +1222,8 @@ fn anonymous_inode_metadata_does_not_commit_or_search_the_disk_namespace() {
     v.chown_fd(fd, 1000, 1000).unwrap();
     v.set_xattr(fd as i32, None, true, b"user.test", Some(b"memory"), 0)
         .unwrap();
+    v.sync_fd(fd, false).unwrap();
+    v.sync_fd(fd, true).unwrap();
     let _ = v.fd_snapshot(); // Warm the unrelated named control's hint.
     let before_paths = PATH_SEARCHES.with(Cell::get);
     for _ in 0..32 {
@@ -1273,6 +1275,32 @@ fn tmpfs_resize_commits_only_its_own_namespace() {
     let before = fs::read(dir.0.join("manifest")).unwrap();
     fs::create_dir(dir.0.join("manifest.new")).unwrap();
     v.truncate_fd(fd, 65536).unwrap();
+    v.sync_fd(fd, false).unwrap();
+    v.sync_fd(fd, true).unwrap();
     assert_eq!(size(v.stat_fd(fd).unwrap()), 65536);
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+}
+
+#[test]
+fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/ram", 0o755).unwrap();
+    v.mount(None, b"/ram", Some(b"tmpfs"), 0, None).unwrap();
+    let ram = v.open_at(AT_FDCWD, b"/ram/buffer", 0o102, 0o600).unwrap();
+    let named = v.open_at(AT_FDCWD, b"/control", 0o102, 0o600).unwrap();
+    let deleted = v.open_at(AT_FDCWD, b"/deleted", 0o102, 0o600).unwrap();
+    v.unlink_at(AT_FDCWD, b"/deleted", false).unwrap();
+    v.umount(b"/ram", 2).unwrap();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    for fd in [ram, deleted] {
+        v.write(fd, b"retained").unwrap();
+        v.sync_fd(fd, false).unwrap();
+        v.sync_fd(fd, true).unwrap();
+        assert_eq!(v.pread(fd, 8, 0).unwrap(), b"retained");
+    }
+    assert!(v.sync_fd(named, false).is_err());
+    assert!(v.sync_fd(named, true).is_err());
     assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
 }

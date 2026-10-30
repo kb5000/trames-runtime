@@ -2462,7 +2462,7 @@ mod proc_probe_tests {
             processes: vec![ProcessInfo { pid: 1, tgid: 1, fds: v.fd_snapshot(), ..Default::default() }],
             ..Default::default()
         });
-        assert_eq!(v.proc_observation(AT_FDCWD, format!("/proc/self/fd/{argv}").as_bytes()), Some(ProcRefresh::Full));
+        assert_eq!(v.proc_observation(AT_FDCWD, format!("/proc/self/fd/{argv}").as_bytes()), Some(ProcRefresh::Arguments.merge(ProcRefresh::Descriptors)));
         v.chdir(b"/proc/self").unwrap();
         assert_eq!(v.proc_observation(AT_FDCWD, b"cmdline"), Some(ProcRefresh::Arguments));
     }
@@ -2502,7 +2502,7 @@ mod proc_probe_tests {
         assert_eq!(v.proc_observation(AT_FDCWD, b"/ordinary"), None);
         assert_eq!(
             ProcRefresh::for_path(b"/proc/1/maps"),
-            ProcRefresh::Metadata
+            ProcRefresh::Mappings
         );
         assert_eq!(
             ProcRefresh::for_path(b"/proc/1/statm"),
@@ -2512,6 +2512,21 @@ mod proc_probe_tests {
             ProcRefresh::for_path(b"/proc/sys/fs/file-nr"),
             ProcRefresh::Descriptors
         );
+        for (path, demand) in [
+            (b"/proc/1/maps".as_slice(), ProcRefresh::Mappings),
+            (b"/proc/1/environ", ProcRefresh::Environment),
+            (b"/proc/1/auxv", ProcRefresh::Auxiliary),
+        ] {
+            assert_eq!(ProcRefresh::for_path(path), demand);
+            let combined = demand.merge(ProcRefresh::Descriptors);
+            assert!(combined.descriptors());
+            assert_eq!(combined.mappings(), demand.mappings());
+            assert_eq!(combined.environment(), demand.environment());
+            assert_eq!(combined.auxiliary(), demand.auxiliary());
+            assert!(!combined.arguments());
+            assert!(!combined.residency());
+            assert_eq!(ProcRefresh::Metadata.merge(demand), demand);
+        }
     }
 
     #[test]

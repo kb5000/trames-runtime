@@ -403,16 +403,22 @@ impl Filesystem {
 /// Process snapshot fields actually consumed by a proc lookup. Unknown paths
 /// stay conservative; independent kernel endpoints never enumerate tasks/RSS.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ProcRefresh {
-    #[default]
-    Independent,
-    Metadata,
-    Arguments,
-    Descriptors,
-    Residency,
-    Full,
-}
+pub struct ProcRefresh(u8);
+#[allow(non_upper_case_globals)]
 impl ProcRefresh {
+    pub const Independent: Self = Self(0);
+    pub const Metadata: Self = Self(1);
+    pub const Mappings: Self = Self(1 | 1 << 1);
+    pub const Environment: Self = Self(1 | 1 << 2);
+    pub const Auxiliary: Self = Self(1 | 1 << 3);
+    pub const Arguments: Self = Self(1 | 1 << 4);
+    pub const Descriptors: Self = Self(1 | 1 << 5);
+    pub const Residency: Self = Self(1 | 1 << 6);
+    pub const Full: Self = Self((1 << 7) - 1);
+
+    fn includes(self, fields: Self) -> bool {
+        self.0 & fields.0 == fields.0
+    }
     pub fn for_path(path: &[u8]) -> Self {
         if path == b"/proc/sys/fs/file-nr" {
             return Self::Descriptors;
@@ -438,12 +444,18 @@ impl ProcRefresh {
         if path.ends_with(b"/cmdline") {
             return Self::Arguments;
         }
+        if path.ends_with(b"/maps") {
+            return Self::Mappings;
+        }
+        if path.ends_with(b"/environ") {
+            return Self::Environment;
+        }
+        if path.ends_with(b"/auxv") {
+            return Self::Auxiliary;
+        }
         if matches!(path, b"/proc/stat" | b"/proc/uptime" | b"/proc/loadavg")
             || [
-                b"/maps".as_slice(),
-                b"/environ",
-                b"/auxv",
-                b"/comm",
+                b"/comm".as_slice(),
                 b"/limits",
                 b"/mounts",
                 b"/mountinfo",
@@ -464,22 +476,28 @@ impl ProcRefresh {
         Self::Metadata
     }
     /// A syscall can traverse a proc FD link into a different live payload.
-    /// Keep both dependencies; these uncommon mixed observations use a full
-    /// refresh rather than dropping one field through enum ordering.
+    /// Keep exactly the union of dependencies. A descriptor-link traversal into
+    /// maps/status must not also read unrelated argv/environment/auxiliary data.
     pub fn merge(self, other: Self) -> Self {
-        if self == other { self }
-        else if self <= Self::Metadata { other }
-        else if other <= Self::Metadata { self }
-        else { Self::Full }
+        Self(self.0 | other.0)
     }
     pub fn arguments(self) -> bool {
-        matches!(self, Self::Arguments | Self::Full)
+        self.includes(Self::Arguments)
+    }
+    pub fn mappings(self) -> bool {
+        self.includes(Self::Mappings)
+    }
+    pub fn environment(self) -> bool {
+        self.includes(Self::Environment)
+    }
+    pub fn auxiliary(self) -> bool {
+        self.includes(Self::Auxiliary)
     }
     pub fn descriptors(self) -> bool {
-        matches!(self, Self::Descriptors | Self::Full)
+        self.includes(Self::Descriptors)
     }
     pub fn residency(self) -> bool {
-        matches!(self, Self::Residency | Self::Full)
+        self.includes(Self::Residency)
     }
 }
 

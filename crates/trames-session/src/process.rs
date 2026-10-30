@@ -699,7 +699,11 @@ impl<C: Cpu> Kernel<C> {
         resident_bytes: usize,
         demand: trames_vfs::ProcRefresh,
     ) -> trames_vfs::ProcessInfo {
-        let maps = self.process_maps(p);
+        let maps = if demand.mappings() {
+            self.process_maps(p)
+        } else {
+            Vec::new()
+        };
         // Argument bytes are mutable guest memory, so read them live only for
         // an actual cmdline observation. Unrelated proc files never consume
         // this payload; their next cmdline lookup requests its own refresh.
@@ -743,7 +747,7 @@ impl<C: Cpu> Kernel<C> {
             seccomp: p.seccomp.mode(),
             seccomp_filters: p.seccomp.count(),
             arguments,
-            environment: p.linux.environment.clone(),
+            environment: if demand.environment() { p.linux.environment.clone() } else { Vec::new() },
             executable: p.linux.executable_file.as_ref().map_or_else(
                 || p.linux.executable_path.clone(),
                 |file| p.linux.vfs.executable_display(file),
@@ -766,7 +770,7 @@ impl<C: Cpu> Kernel<C> {
             terminal: p.linux.vfs.controlling_terminal.is_some(),
             terminal_number: p.linux.vfs.controlling_terminal.unwrap_or(0),
             fds: if demand.descriptors() { p.linux.vfs.fd_snapshot() } else { Vec::new() },
-            auxiliary: p.linux.auxiliary.clone(),
+            auxiliary: if demand.auxiliary() { p.linux.auxiliary.clone() } else { Vec::new() },
             file_size_limits: Some(p.file_size_limit.get()),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
                 u64::MAX
@@ -6214,6 +6218,8 @@ mod tests {
         let k = kernel();
         let mut p = process();
         p.linux.arguments = vec![b"first".to_vec()];
+        p.linux.environment = vec![b"LIVE=value".to_vec()];
+        p.linux.auxiliary = vec![23; 32];
         p.linux.argument_pointers = vec![0x1000];
         p.memory.write(0x1000, b"first\0").unwrap();
         let before = k.process_info(1, &p, p.memory.resident_bytes(), trames_vfs::ProcRefresh::Full);
@@ -6229,6 +6235,17 @@ mod tests {
             let projected = k.process_info(1, &p, p.memory.resident_bytes(), demand);
             assert!(projected.arguments.is_empty());
             assert!(projected.fds.is_empty(), "unrelated proc reads must not enumerate descriptors");
+            assert!(projected.maps.is_empty(), "status and metadata reads must not build mapping text");
+            assert!(projected.environment.is_empty());
+            assert!(projected.auxiliary.is_empty());
+        }
+        for demand in [trames_vfs::ProcRefresh::Mappings, trames_vfs::ProcRefresh::Environment, trames_vfs::ProcRefresh::Auxiliary] {
+            let projected = k.process_info(1, &p, 0, demand);
+            assert_eq!(projected.maps.is_empty(), !demand.mappings());
+            assert_eq!(projected.environment.is_empty(), !demand.environment());
+            assert_eq!(projected.auxiliary.is_empty(), !demand.auxiliary());
+            assert!(projected.arguments.is_empty());
+            assert!(projected.fds.is_empty());
         }
         let descriptors = k.process_info(1, &p, 0, trames_vfs::ProcRefresh::Descriptors);
         assert_eq!(descriptors.fds.len(), after.fds.len());

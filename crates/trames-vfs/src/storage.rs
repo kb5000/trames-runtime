@@ -1126,11 +1126,19 @@ impl Vfs {
         } else if !matches!(n.content, Content::Directory) {
             return Err(Errno(22));
         }
+        let linked = n.links != 0;
+        let filesystem = o.mount.as_ref().map_or(&self.fs, |mount| &mount.fs).clone();
         drop(n);
         drop(o);
-        self.checkpoint()?;
-        if let Some(disk) = &self.fs.borrow().disk {
-            disk.sync_directory()?;
+        if linked {
+            // fsync observes this inode's filesystem, including a retained
+            // detached mount. Anonymous/unlinked files have no namespace entry
+            // to commit; their data sync above is still required.
+            let fs = filesystem.borrow();
+            fs.checkpoint()?;
+            if let Some(disk) = &fs.disk {
+                disk.sync_directory()?;
+            }
         }
         Ok(())
     }

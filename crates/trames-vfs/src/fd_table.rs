@@ -39,8 +39,20 @@ impl Slot {
 }
 #[derive(Default)]
 struct Membership {
-    entries: Mutex<BTreeMap<u32, Slot>>,
+    entries: Mutex<MembershipEntries>,
     revision: AtomicU64,
+}
+#[derive(Default)]
+struct MembershipEntries {
+    slots: BTreeMap<u32, Slot>,
+    wayland: Option<PreparedWayland>,
+}
+impl std::ops::Deref for MembershipEntries {
+    type Target = BTreeMap<u32, Slot>;
+    fn deref(&self) -> &Self::Target { &self.slots }
+}
+impl std::ops::DerefMut for MembershipEntries {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.slots }
 }
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
 /// owner slots carry no worker endpoint/control authority.
@@ -134,8 +146,12 @@ impl SharedFiles {
         )?;
         Ok(0)
     }
-    fn changed(&self) {
+    fn changed(&self, entries: &mut MembershipEntries) {
         self.0.revision.fetch_add(1, Ordering::Relaxed);
+        // Called under the membership lock by owner and worker mutations.
+        // Only retained host capabilities are retired here; no VFS callback.
+        let retired = entries.wayland.take();
+        drop(retired);
     }
     /// None means owner control is required, before any effects. A missing FD
     /// is an ordinary guest EBADF, not a concurrency-specific error.
@@ -169,7 +185,7 @@ impl SharedFiles {
                 cloexec: cloexec.into(),
             },
         );
-        self.changed();
+        self.changed(&mut entries);
         Some(Ok(fd))
     }
     pub fn duplicate_to(
@@ -206,7 +222,7 @@ impl SharedFiles {
                     cloexec: (flags & O_CLOEXEC != 0).into(),
                 },
             );
-            self.changed();
+            self.changed(&mut entries);
             old
         };
         if let Some(Slot {
@@ -228,7 +244,7 @@ impl SharedFiles {
                 return Some(Err(error));
             }
             let old = entries.remove(&fd).expect("validated membership");
-            self.changed();
+            self.changed(&mut entries);
             old
         };
         if let SlotOpen::Shared(open) = removed.open {
@@ -271,10 +287,18 @@ impl Entry<'_> {
 /// A bounded metadata inspection, with no allocation or extra OFD ownership.
 /// Resource I/O and callbacks must use a separate retained lookup lease.
 pub(super) struct Entries<'a> {
-    membership: std::sync::MutexGuard<'a, BTreeMap<u32, Slot>>,
+    membership: std::sync::MutexGuard<'a, MembershipEntries>,
     owners: std::cell::Ref<'a, TableState>,
 }
 impl Entries<'_> {
+    pub(super) fn cached_wayland(&self, identity: u64, revision: u64) -> Option<WaylandAuth> {
+        self.membership.wayland.as_ref()
+            .filter(|(owner, generation, _)| *owner == identity && *generation == revision)
+            .map(|(_, _, auth)| auth.clone())
+    }
+    pub(super) fn cache_wayland(&mut self, identity: u64, revision: u64, auth: WaylandAuth) {
+        self.membership.wayland = Some((identity, revision, auth));
+    }
     fn entry<'a>(&'a self, fd: u32, slot: &'a Slot) -> Entry<'a> {
         Entry {
             open: match &slot.open {
@@ -354,6 +378,7 @@ pub(super) struct DescriptorMetadata {
     pub(super) flags: RefCell<Option<(u64, FdFlags)>>,
 }
 type PreparedBytes = Arc<[Option<DirectFd>]>;
+type PreparedWayland = (u64, u64, WaylandAuth);
 #[derive(Clone, Default)]
 pub(super) struct DescriptorVersion {
     pub(super) io: OnceCell<(FdMask, FdMask)>,
@@ -438,7 +463,7 @@ impl DescriptorTable {
         &self,
         fd: u32,
         descriptor: Descriptor,
-        entries: &mut BTreeMap<u32, Slot>,
+        entries: &mut MembershipEntries,
     ) -> Option<Descriptor> {
         let old = entries.get(&fd).map(|slot| self.descriptor(fd, slot));
         let slot = Slot::from_descriptor(&descriptor);
@@ -449,7 +474,7 @@ impl DescriptorTable {
             state.entries.remove(&fd);
         }
         entries.insert(fd, slot);
-        self.1.changed();
+        self.1.changed(entries);
         old
     }
     pub(super) fn remove(&mut self, fd: &u32) -> Option<Descriptor> {
@@ -457,7 +482,7 @@ impl DescriptorTable {
         let descriptor = entries.get(fd).map(|slot| self.descriptor(*fd, slot))?;
         entries.remove(fd);
         self.0.borrow_mut().entries.remove(fd);
-        self.1.changed();
+        self.1.changed(&mut entries);
         Some(descriptor)
     }
     pub(super) fn close(&mut self, fd: u32) -> Result<Descriptor> {
@@ -466,7 +491,7 @@ impl DescriptorTable {
         descriptor.ready()?;
         entries.remove(&fd);
         self.0.borrow_mut().entries.remove(&fd);
-        self.1.changed();
+        self.1.changed(&mut entries);
         Ok(descriptor)
     }
     pub(super) fn duplicate(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
@@ -513,7 +538,7 @@ impl DescriptorTable {
             .map(|(&fd, slot)| (fd, self.descriptor(fd, slot)))
             .collect();
         if !entries.is_empty() {
-            self.1.changed();
+            self.1.changed(&mut entries);
         }
         entries.clear();
         self.0.borrow_mut().entries.clear();
@@ -576,7 +601,7 @@ impl Clone for DescriptorTable {
                 metadata: Rc::default(),
             })),
             SharedFiles(Arc::new(Membership {
-                entries: Mutex::new(entries),
+                entries: Mutex::new(MembershipEntries { slots: entries, wayland: None }),
                 revision: AtomicU64::new(0),
             })),
         )

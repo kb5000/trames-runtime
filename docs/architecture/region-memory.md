@@ -1012,3 +1012,30 @@ access and GPU ownership. Native-driver source/SDK adapters stay isolated. The
 [Mac validation record](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-firefox-gpu.md)
 contains source hashes, all Firefox trials, native ownership/transfer checks and
 the observed performance limits. Uniform near-native browser speed is not claimed.
+
+## Cold kernel resource projections (2026-10-30)
+
+Proc lookups keep the exact union of payload dependencies discovered by actual
+path/FD/alias traversal. Maps, environment, auxiliary data and mutable arguments
+are constructed only when requested; combining a descriptor traversal with one
+payload does not imply every payload. Required argument bytes remain live at each
+observation. This changes neither guest byte access nor permission boundaries.
+
+Wayland authorization captures reuse validated grants in the real SharedFiles
+membership. The existing FD-table object mutex protects slots and cached grants
+together; every owner/worker membership mutation retires inactive grants before
+returning. Active accepted captures retain their original capabilities until
+release. Native service identity and connection generation cover topology changes
+without an FD edit, while compositor shared-inode registration stays live.
+No extra FD-mutation lock, ordinary-data barrier or service thread is introduced.
+A negative control omitting retirement fails the worker-close regression; the
+production path releases inactive grants and closed memfd page charges.
+
+File sync keeps its original data operation, then checkpoints the retained owning
+filesystem only when the inode is linked. Anonymous/unlinked files have no
+namespace entry; tmpfs and detached mounts cannot force the unrelated persistent
+root to commit. Named persistent checkpoint errors and synchronous durability
+remain observable. The global sync API is unchanged. Required persistent-root
+manifest serialization/durable commits and joined memory-view preparation remain
+separate costs. The [Mac validation](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-firefox-gpu.md#resource-scoped-runtime-projections-2026-10-30)
+retains all public-page observations, including mixed/slower prototypes.
