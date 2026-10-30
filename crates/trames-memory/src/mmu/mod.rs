@@ -8,6 +8,9 @@ pub(crate) mod host;
 mod worker;
 use super::*;
 use host::WINDOW;
+pub(super) fn host_mapping_granule() -> usize {
+    host::page_size().unwrap_or(PAGE_SIZE as usize)
+}
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::{
     ops::{Deref, DerefMut},

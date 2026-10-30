@@ -290,7 +290,11 @@ impl Backend {
     /// still in flight keep their ranges dirty even if an earlier wait succeeds.
     pub(super) fn coherent_submitted(&mut self, scope: &Scope) {
         for (&memory, ranges) in &scope.0 {
-            if let Some(map) = self.mappings.get(&memory).filter(|m| m.coherent.is_some()) {
+            if let Some(map) = self
+                .mappings
+                .get(&memory)
+                .filter(|m| m.coherent.is_some() || m.direct)
+            {
                 for &(start, end) in ranges {
                     self.coherent_pending.insert(
                         memory,
@@ -317,6 +321,18 @@ impl Backend {
     }
     pub(super) fn coherent_download(&mut self, m: &mut impl CpuMemory) -> Result<()> {
         let mut scope = std::mem::take(&mut self.coherent_pending);
+        let mut external = false;
+        for memory in scope.0.keys() {
+            if let Some(map) = self.mappings.get(memory).filter(|map| map.direct) {
+                if let Some(allocation) = map.memory.host_allocation.borrow().as_ref() {
+                    allocation.revision.fetch_add(1, Ordering::Relaxed);
+                    external = true;
+                }
+            }
+        }
+        if external {
+            trames_memory::external_memory_changed();
+        }
         let result = self.coherent_sync_scope(m, &scope, false);
         scope.downloaded(result.is_ok(), &self.coherent_producers());
         // On failure, earlier baseline runs may already have committed. Retain

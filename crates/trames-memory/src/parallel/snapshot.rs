@@ -310,7 +310,7 @@ impl Memory {
                 let backing = page.backing.as_ref().expect("indexed backing");
                 registry.metrics.backing_domain_checks += 1;
                 let mut ranges = None;
-                match backing.object.parallel_change_domain() {
+                match page.parallel_domain() {
                     Some((id, generation)) if id == identity => {
                         if generation == group.generation {
                             continue;
@@ -378,7 +378,7 @@ impl Memory {
             };
             let stable_domain = page.backing.as_ref().is_none_or(|backing| {
                 backing.object.parallel_versioned()
-                    && backing.object.parallel_change_domain().map(|(id, _)| id)
+                    && page.parallel_domain().map(|(id, _)| id)
                         == frame.backing_domain.map(|(id, _)| id)
             });
             if !frame.direct
@@ -496,6 +496,7 @@ impl Memory {
         snapshot.dynamic_code = snapshot.dynamic_code_pages != 0 || snapshot.anonymous.executable();
         snapshot.identity = self.identity;
         snapshot.code_revision = self.code_revision;
+        snapshot.external_code = self.has_external_code;
         if executable_changed {
             snapshot.backing_revision = backing_revision;
         }

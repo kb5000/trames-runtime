@@ -42,6 +42,7 @@ pub(super) struct Pending {
     context_subscription: Option<IoSubscription>,
     task_subscription: Option<IoSubscription>,
     peer_started: u64,
+    deadline: Option<Instant>,
 }
 pub(super) enum Attempt {
     Complete(Result<Return, Error>),
@@ -57,6 +58,7 @@ impl Pending {
             context_subscription: None,
             task_subscription: None,
             peer_started: 0,
+            deadline: None,
         }
     }
     pub fn adopted(compile: Compile) -> Self {
@@ -72,6 +74,27 @@ impl Pending {
         // An adopted compile has not registered a wake yet. Give it a worker
         // turn to subscribe and poll before any VM checkpoint can park it.
         self.signal.as_ref().is_some_and(|signal| !signal.ready())
+            && self
+                .deadline()
+                .is_none_or(|deadline| Instant::now() < deadline)
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        if self.context_subscription.is_some() {
+            None
+        } else {
+            self.deadline
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn timed_for_test(deadline: Instant, pid: u32, target: &Weak<dyn IoWake>) -> Self {
+        let mut pending = Self::new(Call {
+            pc: 0,
+            operation: 201,
+            args: [0; 3],
+        });
+        pending.arm(pid, target);
+        pending.deadline = Some(deadline);
+        pending
     }
     pub fn checkpoint(&self, peer: u64) -> Option<Compile> {
         self.compile.map(|mut c| {
@@ -140,6 +163,7 @@ impl Pending {
             );
             stats.record(self.call.pc, self.call.operation, &value, transfers);
             match value {
+                Ok(Invocation::Checkpoint) => return Attempt::Checkpoint,
                 Ok(Invocation::Complete(value)) => {
                     return Attempt::Complete(Ok(Return {
                         value,
@@ -148,7 +172,7 @@ impl Pending {
                 }
                 Err(e) => return Attempt::Complete(Err(Error::Memory(e))),
                 Ok(Invocation::Pending(job)) => {
-                    stats.compiles += 1;
+                    stats.compiles += u64::from(lease.is_compile(job));
                     self.compile = Some(Compile {
                         call: self.call,
                         job,
@@ -161,6 +185,7 @@ impl Pending {
         }
         self.arm(pid, target);
         let compile = self.compile.unwrap();
+        self.deadline = lease.job_deadline(compile.job);
         // Subscription and the deciding result check share the same context
         // lease; publish/disconnect also wakes on panic or owner cancellation.
         self.task_subscription = lease.subscribe_compile(compile.job, self.signal());

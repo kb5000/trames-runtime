@@ -26,6 +26,18 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Structural replacement requires the same joined mapping boundary as mmap.
+    fn can_import_mapping(&self) -> bool {
+        false
+    }
+    fn import_mapping(
+        &mut self,
+        _address: u64,
+        _len: u64,
+        _mapping: crate::SharedMapping,
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::BackingIo(95))
+    }
     /// A slice-scoped local borrow; no guard survives its owned CPU outcome.
     #[inline]
     fn cpu_slice(&mut self) -> CpuSlice<'_, Self>
@@ -113,6 +125,17 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn can_import_mapping(&self) -> bool {
+        true
+    }
+    fn import_mapping(
+        &mut self,
+        address: u64,
+        len: u64,
+        mapping: crate::SharedMapping,
+    ) -> Result<(), MemoryError> {
+        self.import_mapping(address, len, mapping)
+    }
     fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
         Memory::shared_futex_key(self, address)
     }

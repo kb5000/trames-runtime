@@ -58,6 +58,7 @@ impl Bytes {
     }
 }
 pub struct MutablePage {
+    external_revision: Option<std::sync::Arc<AtomicU64>>,
     pub(crate) identity: u64,
     pub(crate) version: AtomicU64,
     bytes: UnsafeCell<Bytes>,
@@ -171,6 +172,7 @@ impl MutablePage {
                 _owner,
                 mapping: Some((base, length)),
             } => Some(crate::SharedMapping {
+                external_revision: self.external_revision.clone(),
                 base: *base,
                 length: *length,
                 offset: pointer - base,
@@ -222,12 +224,12 @@ impl MutablePage {
             mapping: None,
         })
     }
-    /// Retain a complete file-backed mapping with explicit allocation geometry.
+    /// Retain a complete host resource mapping with explicit allocation geometry.
     ///
     /// # Safety
-    /// The allocation is initialized RW mmap storage retained by owner; offset
+    /// The allocation is initialized RW storage retained by owner; offset
     /// covers one guest page. CPU accesses use this page's guards. External raw
-    /// display readers obey their frame leases and create no Rust byte refs.
+    /// display/GPU actors obey their API dependencies and create no Rust byte refs.
     pub unsafe fn from_shared_mapping(
         base: *mut u8,
         length: usize,
@@ -241,6 +243,21 @@ impl MutablePage {
             _owner: std::sync::Arc::new(owner),
             mapping: Some((base as usize, length)),
         })
+    }
+    /// # Safety
+    /// Same initialized-storage and foreign-access contract as from_shared_mapping.
+    pub unsafe fn from_resource_mapping(mapping: crate::SharedMapping) -> Self {
+        let revision = mapping.external_revision.clone();
+        let mut page = unsafe {
+            Self::from_shared_mapping(
+                mapping.allocation_pointer(),
+                mapping.allocation_len(),
+                mapping.allocation_offset(),
+                mapping,
+            )
+        };
+        page.external_revision = revision;
+        page
     }
     /// Move a coordinator allocation into the shared byte domain without copying.
     pub fn from_box(bytes: Box<[u8; PAGE]>) -> Self {
@@ -333,7 +350,14 @@ impl MutablePage {
         guard.invalidate(offset, len, version);
     }
     pub fn revision(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+        self.version.load(Ordering::Acquire).wrapping_add(
+            self.external_revision
+                .as_ref()
+                .map_or(0, |v| v.load(Ordering::Relaxed)),
+        )
+    }
+    pub(crate) fn has_external_revision(&self) -> bool {
+        self.external_revision.is_some()
     }
     pub(crate) fn snapshot(&self) -> [u8; PAGE] {
         let mut bytes = [0; PAGE];
@@ -373,6 +397,7 @@ impl MutablePage {
     fn with_storage(bytes: Bytes) -> Self {
         let unmaterialized = matches!(&bytes, Bytes::Zero(storage) if storage.get().is_none());
         Self {
+            external_revision: None,
             unmaterialized: AtomicBool::new(unmaterialized),
             bytes: UnsafeCell::new(bytes),
             identity: crate::new_backing_identity(),
@@ -608,6 +633,11 @@ impl<'a> Guard<'a> {
     }
     pub fn reservation(&self, slot: usize) -> u64 {
         self.covers(slot * 16, 16);
+        let external = self
+            .page()
+            .external_revision
+            .as_ref()
+            .map_or(0, |v| v.load(Ordering::Relaxed));
         let rows = self.page().reservations.get_or_init(|| {
             self.page().reservation_base.store(
                 self.page().version.load(Ordering::Relaxed),
@@ -620,7 +650,11 @@ impl<'a> Guard<'a> {
         });
         let region = slot / 4;
         if self.page().reservation_written.load(Ordering::Relaxed) & (1 << region) == 0 {
-            return self.page().reservation_base.load(Ordering::Relaxed);
+            return self
+                .page()
+                .reservation_base
+                .load(Ordering::Relaxed)
+                .wrapping_add(external);
         }
         // SAFETY: this region's ownership also protects its reservation row and
         // override byte. Immutable epochs have no invalidators; OnceLock above
@@ -634,6 +668,7 @@ impl<'a> Guard<'a> {
         } else {
             0
         }]
+        .wrapping_add(external)
     }
     pub fn invalidate(&mut self, offset: usize, len: usize, version: u64) {
         debug_assert!(

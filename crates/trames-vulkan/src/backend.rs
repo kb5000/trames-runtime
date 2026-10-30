@@ -15,6 +15,8 @@ use trames_memory::Memory;
 use trames_memory::{Access, CpuMemory, MemoryError};
 use vk::Handle;
 mod coherent;
+mod completion;
+mod shared_memory;
 mod feedback;
 mod graphics;
 mod textures;
@@ -75,6 +77,7 @@ impl Drop for Instance {
     }
 }
 struct Device {
+    host_alignment: u64,
     anisotropy: bool,
     features: vk::PhysicalDeviceFeatures,
     maintenance1: bool,
@@ -149,6 +152,7 @@ impl Drop for ObjectLease {
     }
 }
 struct Object {
+    host_allocation: RefCell<Option<Arc<shared_memory::Allocation>>>,
     kind: Kind,
     raw: u64,
     device: Arc<Device>,
@@ -211,7 +215,7 @@ impl Drop for Object {
                         d.unmap_memory(vk::DeviceMemory::from_raw(self.raw));
                     }
                     d.free_memory(vk::DeviceMemory::from_raw(self.raw), None);
-                    self.budget.release(self.size);
+                    if self.host_allocation.borrow().is_none() { self.budget.release(self.size); }
                 }
                 Kind::Shader => d.destroy_shader_module(vk::ShaderModule::from_raw(self.raw), None),
                 Kind::DescriptorLayout => d.destroy_descriptor_set_layout(
@@ -281,6 +285,7 @@ impl Submission {
     }
 }
 struct Mapping {
+    direct: bool,
     memory: Rc<Object>,
     guest: u64,
     offset: u64,
@@ -300,9 +305,12 @@ struct SubmitBatch {
 pub enum Invocation {
     Complete(u64),
     Pending(u64),
+    Checkpoint,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TransferMetrics {
+    pub shared_maps: u64,
+    pub shared_map_bytes: u64,
     pub upload_bytes: u64,
     pub download_bytes: u64,
     pub direct_bytes: u64,
@@ -316,6 +324,8 @@ pub struct TransferMetrics {
 }
 impl TransferMetrics {
     pub fn merge(&mut self, other: Self) {
+        self.shared_maps += other.shared_maps;
+        self.shared_map_bytes += other.shared_map_bytes;
         self.upload_bytes += other.upload_bytes;
         self.download_bytes += other.download_bytes;
         self.direct_bytes += other.direct_bytes;
@@ -327,6 +337,8 @@ impl TransferMetrics {
     }
     pub(crate) fn since(self, before: Self) -> Self {
         Self {
+            shared_maps: self.shared_maps - before.shared_maps,
+            shared_map_bytes: self.shared_map_bytes - before.shared_map_bytes,
             upload_bytes: self.upload_bytes - before.upload_bytes,
             download_bytes: self.download_bytes - before.download_bytes,
             direct_bytes: self.direct_bytes - before.direct_bytes,
@@ -365,6 +377,8 @@ struct Compile {
 }
 
 pub struct Backend {
+    completion: Arc<trames_shared::Readiness>,
+    waits: BTreeMap<u64, completion::Wait>,
     budget: crate::Budget,
     domain: u64,
     next: u64,
@@ -417,6 +431,8 @@ impl Backend {
             objects: BTreeMap::new(),
             live_objects: ObjectCount::default(),
             mappings: BTreeMap::new(),
+            completion: Arc::default(),
+            waits: BTreeMap::new(),
             coherent_pending: Default::default(),
             submissions: Vec::new(),
             compiles: BTreeMap::new(),
@@ -479,6 +495,7 @@ impl Backend {
     }
     fn put(&mut self, kind: Kind, raw: u64, deps: Vec<Rc<Object>>, size: u64, flags: u32) -> u64 {
         let object = Rc::new(Object {
+            host_allocation: Default::default(),
             kind,
             raw,
             device: self.device.as_ref().unwrap().clone(),
@@ -723,6 +740,7 @@ impl Backend {
             semaphore.state.set(semaphore_states[id]);
         }
         self.coherent_submitted(&coherent_scope);
+        if a[4] != 0 { self.observe_fence(&fence); }
         self.submissions.push(Submission {
             coherent_scope,
             fence,
@@ -747,7 +765,8 @@ impl Backend {
     fn private_fence(&self, device: Arc<Device>) -> Result<Rc<Object>> {
         let d = &device.native;
         let raw = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-        Ok(Rc::new(Object {
+        let fence = Rc::new(Object {
+            host_allocation: Default::default(),
             kind: Kind::Fence,
             raw: raw.as_raw(),
             device,
@@ -776,7 +795,9 @@ impl Backend {
             acquisition: RefCell::new(None),
             budget: self.budget.clone(),
             _count: None, // Internal submission fences were never quota objects.
-        }))
+        });
+        self.observe_fence(&fence);
+        Ok(fence)
     }
     fn collect(&mut self) {
         self.reap_abandoned();
@@ -839,7 +860,13 @@ impl Backend {
             eprintln!("trames-vulkan op={operation} args={a:x?}");
         }
         self.collect();
-        let result = if operation == 27 {
+        if operation == 17 && a[5] == shared_memory::MAP_SHARED && !memory.can_import_mapping()
+            && self.objects.get(&a[1]).is_some_and(|o| o.host_allocation.borrow().is_some()) {
+            return Ok(Invocation::Checkpoint);
+        }
+        let result = if matches!(operation,201 | 202) {
+            self.start_wait(memory,operation,a)
+        } else if operation == 27 {
             self.start_compile(memory, a).map(Invocation::Pending)
         } else if operation == 70 {
             self.start_graphics_compile(memory, a)
@@ -942,22 +969,32 @@ impl Backend {
         Ok(job)
     }
     pub fn abandon(&mut self, job: u64) {
+        self.waits.remove(&job);
         if let Some(c) = self.compiles.get_mut(&job) {
             c.abandoned = true;
         }
     }
-    pub(crate) fn subscribe_compile(
+    pub fn subscribe_job(
         &self,
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
     ) -> Option<trames_shared::IoSubscription> {
-        self.compiles.get(&job).map(|c| c.task.subscribe(signal))
+        if self.waits.contains_key(&job) { Some(self.completion.subscribe(signal)) }
+        else { self.compiles.get(&job).map(|c| c.task.subscribe(signal)) }
     }
+    pub(crate) fn job_deadline(&self, job: u64) -> Option<std::time::Instant> { self.waits.get(&job).and_then(|w|w.deadline) }
+    pub(crate) fn is_compile(&self, job: u64) -> bool { self.compiles.contains_key(&job) }
     pub fn poll(
         &mut self,
         m: &mut impl CpuMemory,
         job: u64,
     ) -> std::result::Result<Option<u64>, MemoryError> {
+        if self.waits.contains_key(&job) {
+            return match self.poll_wait(m,job) {
+                Ok(value) => Ok(value), Err(Failure::Vk(e)) => Ok(Some(e.as_raw() as i64 as u64)),
+                Err(Failure::Memory(e)) => Err(e),
+            };
+        }
         let result = match self.compiles.get_mut(&job) {
             Some(c) => c.task.poll(),
             None => return Ok(Some(vk::Result::ERROR_DEVICE_LOST.as_raw() as i64 as u64)),
@@ -1400,6 +1437,17 @@ impl Backend {
                     if !ext.iter().any(|e|unsafe {std::ffi::CStr::from_ptr(e.extension_name.as_ptr())}==ash::ext::metal_objects::NAME){return unsupported();}
                     names.push(ash::ext::metal_objects::NAME.as_ptr());
                 }
+                let mut host_alignment = 0;
+                if instance.queries2 && ext.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == ash::ext::external_memory_host::NAME) {
+                    let queries = ash::khr::get_physical_device_properties2::Instance::new(&instance._entry, &instance.native);
+                    let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+                    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+                    unsafe { queries.get_physical_device_properties2(self.physical, &mut props) };
+                    if host.min_imported_host_pointer_alignment.is_power_of_two() {
+                        host_alignment = host.min_imported_host_pointer_alignment;
+                        names.push(ash::ext::external_memory_host::NAME.as_ptr());
+                    }
+                }
                 let native_features =
                     unsafe { instance.native.get_physical_device_features(self.physical) };
                 if a[4] & !127 != 0
@@ -1472,6 +1520,7 @@ impl Backend {
                 }
                 .limits;
                 self.device = Some(Arc::new(Device {
+                    host_alignment,
                     anisotropy: a[4] & 1 != 0,
                     features,
                     maintenance1: a[5] & 1 != 0,
@@ -1532,6 +1581,7 @@ impl Backend {
         self.wayland.clear_device();
         self.wsi.clear_device();
         self.mappings.clear();
+        self.waits.clear();
         self.coherent_pending = Default::default();
         self.objects.clear();
         self.device = None;
@@ -1612,6 +1662,7 @@ impl Backend {
                 }
                 unsafe { d.merge_pipeline_caches(vk::PipelineCache::from_raw(dest.raw), &native) }?;
             }
+            200 => write(m, a[1], &(u64::from(dev.host_alignment != 0) | (u64::from(completion::available()) << 1)).to_le_bytes())?,
             11 => {
                 self.room(1)?;
                 output(m, a[3], 8)?;
@@ -1669,6 +1720,17 @@ impl Backend {
                 let info = vk::MemoryAllocateInfo::default()
                     .allocation_size(a[1])
                     .memory_type_index(a[2] as u32);
+                let flags = props.memory_types[a[2] as usize].property_flags;
+                if flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                    if let Some(Ok((raw, owner))) = self.allocate_shared(&dev, a[1], a[2] as u32) {
+                        let id = self.put(Kind::Memory, raw.as_raw(), vec![], a[1], flags.as_raw());
+                        let object = &self.objects[&id];
+                        object.state.set(a[2] as u8);
+                        *object.host_allocation.borrow_mut() = Some(owner);
+                        write(m, a[3], &id.to_le_bytes())?;
+                        return Ok(());
+                    }
+                }
                 if !self.budget.reserve(a[1]) {
                     return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
                 }
@@ -1740,6 +1802,20 @@ impl Backend {
                     return invalid();
                 }
                 output(m, a[4], len as usize)?;
+                let shared = if a[5] == shared_memory::MAP_SHARED {
+                    mem.host_allocation.borrow().clone()
+                } else { None };
+                let direct = if let Some(owner) = shared {
+                    let page = trames_memory::PAGE_SIZE;
+                    let padding = a[2] % page;
+                    if a[4] % page != padding { return invalid(); }
+                    let length = (padding + len).checked_next_multiple_of(page).ok_or(Failure::Vk(vk::Result::ERROR_MEMORY_MAP_FAILED))?;
+                    let mapping = owner.mapping((a[2] - padding) as usize).ok_or(Failure::Vk(vk::Result::ERROR_MEMORY_MAP_FAILED))?;
+                    m.import_mapping(a[4] - padding, length, mapping)?;
+                    self.transfers.shared_maps += 1;
+                    self.transfers.shared_map_bytes += len;
+                    true
+                } else { false };
                 let ptr = unsafe {
                     d.map_memory(
                         vk::DeviceMemory::from_raw(mem.raw),
@@ -1750,7 +1826,7 @@ impl Backend {
                 }?;
                 mem.mapped.set(ptr as usize);
                 let initialized = (|| -> Result<Option<coherent::CoherentBytes>> {
-                    if mem.flags & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw() == 0 {
+                    if direct || mem.flags & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw() == 0 {
                         return Ok(None);
                     }
                     let mut baseline =
@@ -1787,6 +1863,7 @@ impl Backend {
                         offset: a[2],
                         size: len,
                         coherent,
+                        direct,
                     },
                 );
                 self.coherent_mapped(a[1]);
@@ -1830,6 +1907,7 @@ impl Backend {
                 {
                     return invalid();
                 }
+                if map.direct { return Ok(()); }
                 if map.coherent.is_some() {
                     let t = coherent::synchronize(map, m, a[2], len, true)?;
                     let down = if op == 20 {

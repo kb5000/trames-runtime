@@ -39,6 +39,12 @@ impl Drop for Lease<'_> {
     }
 }
 impl Lease<'_> {
+    pub fn job_deadline(&self, job: u64) -> Option<std::time::Instant> {
+        self.backend.as_ref().unwrap().0.job_deadline(job)
+    }
+    pub fn is_compile(&self, job: u64) -> bool {
+        self.backend.as_ref().unwrap().0.is_compile(job)
+    }
     pub fn invoke(
         &mut self,
         memory: &mut impl CpuMemory,
@@ -68,11 +74,7 @@ impl Lease<'_> {
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
     ) -> Option<trames_shared::IoSubscription> {
-        self.backend
-            .as_ref()
-            .unwrap()
-            .0
-            .subscribe_compile(job, signal)
+        self.backend.as_ref().unwrap().0.subscribe_job(job, signal)
     }
 }
 impl Context {

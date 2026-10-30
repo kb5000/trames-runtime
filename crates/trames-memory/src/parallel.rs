@@ -127,6 +127,9 @@ impl ConcurrentPage {
     fn version(&self) -> &AtomicU64 {
         self.mutable().map_or(&self.version, |bytes| &bytes.version)
     }
+    fn instruction_revision(&self) -> u64 {
+        self.mutable().map_or_else(|| self.version.load(Ordering::Acquire), |bytes|bytes.revision())
+    }
     fn new(
         bytes: [u8; PAGE_SIZE as usize],
         zero: bool,
@@ -515,12 +518,7 @@ fn prepare_frame(
         code_revision: page.instruction_revision,
         data_revision: AtomicU64::new(page.data_revision),
         backing_version: AtomicU64::new(backing_version),
-        backing_domain: page.backing.as_ref().and_then(|b| {
-            b.object
-                .parallel_versioned()
-                .then(|| b.object.parallel_change_domain())
-                .flatten()
-        }),
+        backing_domain: page.parallel_domain(),
         native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
         native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
         native_live_private: std::sync::atomic::AtomicBool::new(
@@ -570,6 +568,7 @@ pub(super) struct Snapshot {
     has_aliases: bool,
     dynamic_code: bool,
     dynamic_code_pages: usize,
+    external_code: bool,
     identities: BTreeMap<u64, usize>,
     alias_count: usize,
     backed_pages: BTreeSet<u64>,
@@ -1150,7 +1149,8 @@ impl CpuMemory for View {
             } else {
                 0
             })
-            .wrapping_add(self.snapshot.backing_revision),
+            .wrapping_add(self.snapshot.backing_revision)
+            .wrapping_add(if self.snapshot.external_code { backing::external_revision() } else { 0 }),
         )
     }
     fn instruction_page_identity(&self, address: u64) -> Result<(u64, u64, u64), MemoryError> {
@@ -1162,7 +1162,7 @@ impl CpuMemory for View {
         Ok((
             self.snapshot.identity,
             frame.bytes.identity,
-            frame.bytes.version().load(Ordering::Acquire),
+            frame.bytes.instruction_revision(),
         ))
     }
     fn atomic_update<T>(
@@ -1480,6 +1480,7 @@ impl Memory {
             has_aliases: alias_count != 0,
             dynamic_code: dynamic_code_pages != 0 || anonymous_executable,
             dynamic_code_pages,
+            external_code: self.has_external_code,
             identities,
             alias_count,
             backed_pages,
@@ -1908,7 +1909,7 @@ impl View {
             instruction_revision: if frame.permissions.execute {
                 (
                     frame.code_revision,
-                    frame.bytes.version().load(Ordering::Acquire),
+                    frame.bytes.instruction_revision(),
                 )
             } else {
                 (0, 0)

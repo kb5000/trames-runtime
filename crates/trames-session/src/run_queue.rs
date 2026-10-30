@@ -454,7 +454,8 @@ impl<C: Cpu> Epoch<C> {
                     job.waiting
                         .as_ref()
                         .and_then(|w| w.deadline)
-                        .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline())),
+                        .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
+                        .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline())),
                 );
                 assert!(q.parked.insert(job.work.pid, job).is_none());
             } else {
@@ -500,6 +501,7 @@ impl<C: Cpu> Epoch<C> {
                         .as_ref()
                         .and_then(|w| w.deadline)
                         .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
+                        .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
                         .is_some_and(|d| d <= now))
                     .then_some(pid)
                 })
@@ -527,6 +529,7 @@ impl<C: Cpu> Epoch<C> {
                         .as_ref()
                         .and_then(|w| w.deadline)
                         .or_else(|| j.io.as_ref().and_then(|io| io.wake_deadline()))
+                        .or_else(|| j.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
                 })
                 .min();
             self.next_deadline.store(
@@ -725,7 +728,8 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.stats.gpu.waits += 1;
-        let ready = pending.signal().ready();
+        let ready = !pending.waiting();
+        self.publish_deadline(pending.deadline());
         job.gpu_pending = Some(pending);
         if q.domains.paused(job.work.pid) {
             q.domains.hold(job);
@@ -928,6 +932,21 @@ mod tests {
         assert!(!unpreempted.should_yield(0, old, true));
         unpreempted.publish_deadline(Some(old));
         assert!(unpreempted.should_yield(0, old, true));
+    }
+    #[test]
+    fn gpu_timeout_returns_its_slot_and_wakes_without_a_completion_or_poll_timer() {
+        let epoch=Epoch::new(Arc::new(Control::new(100)));
+        epoch.add(job(1,&epoch));epoch.add(job(2,&epoch));
+        let gpu=epoch.take(0).unwrap();
+        let began=Instant::now();
+        let deadline=began+Duration::from_millis(30);
+        let pending=crate::gpu::Pending::timed_for_test(deadline,1,&epoch.io_target);
+        epoch.park_gpu(gpu,pending);
+        let peer=epoch.take(0).unwrap();assert_eq!(peer.work.pid,2);
+        epoch.park_hardware(peer,Arc::new(trames_memory::HardwareWait::default()));
+        let resumed=epoch.take(0).unwrap();assert_eq!(resumed.work.pid,1);
+        assert!(Instant::now()>=deadline && began.elapsed()<Duration::from_secs(2));
+        assert!(!resumed.gpu_pending.as_ref().unwrap().waiting());
     }
     fn job(pid: u32, epoch: &Arc<Epoch>) -> Box<Job> {
         let mut memory = Memory::default();

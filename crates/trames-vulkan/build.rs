@@ -7,6 +7,11 @@ use std::{
 fn archive_directory(archive: &Path, name: &str, arch: &str) -> PathBuf {
     println!("cargo:rerun-if-changed={}", archive.display());
     let bytes = std::fs::read(archive).expect("read native archive");
+    if name == "moltenvk" {
+        let observer = b"_trames_mvk_observe_fence";
+        assert!(bytes.windows(observer.len()).any(|symbol| symbol == observer),
+            "MoltenVK lacks the host completion adapter; rebuild with trames-ipad/scripts/build-moltenvk.py (patch 0007)");
+    }
     if bytes.starts_with(b"!<arch>\n") {
         return archive.parent().unwrap().to_owned();
     }

@@ -2,6 +2,9 @@
 //! Page-sized virtual backing objects, with no host pointers exposed to guests.
 use super::*;
 static BACKING_REVISION: AtomicU64 = AtomicU64::new(0);
+static EXTERNAL_REVISION: AtomicU64 = AtomicU64::new(0);
+pub fn external_memory_changed() { EXTERNAL_REVISION.fetch_add(1, Ordering::Relaxed); }
+pub(super) fn external_revision() -> u64 { EXTERNAL_REVISION.load(Ordering::Relaxed) }
 /// Notify decoder caches and exclusive monitors about externally visible changes.
 pub fn backing_changed() {
     BACKING_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -16,6 +19,9 @@ pub trait PageSource: Send + Sync {
 }
 
 pub trait PageBacking {
+    /// Device publications can change executable bytes outside CPU write hooks.
+    /// Only address spaces that map such storage executable watch its code epoch.
+    fn external_code_updates(&self) -> bool { false }
     /// Anonymous shared zeros need a charge only on writes; file data is charged
     /// on the first actual read or write, never on VMA/permission metadata.
     fn charge_reads(&self) -> bool {
@@ -59,6 +65,15 @@ pub trait PageBacking {
     /// Unknown providers retain individual page checks; no Rc reaches workers.
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
         None
+    }
+    /// Data-frame metadata may have a cheaper stable domain than byte versions.
+    /// An unchanged generation guarantees infallible unchanged check results,
+    /// the same retained canonical shared_page, keys and native capabilities.
+    /// Byte writes must remain visible through that shared page and its live
+    /// version. This override is never used for executable mappings. Unknown
+    /// providers retain the original version/check domain above.
+    fn parallel_metadata_domain(&self) -> Option<(u64, u64)> {
+        self.parallel_change_domain()
     }
     /// Local mapping commits may run while other address spaces retain this
     /// provider's exported pages. Opt-in requires retained physical owners and
@@ -134,6 +149,17 @@ pub(super) struct Backed {
     pub private_copy: bool,
 }
 impl Page {
+    pub(super) fn parallel_domain(&self) -> Option<(u64, u64)> {
+        let backing = self.backing.as_ref()?.object.as_ref();
+        if !backing.parallel_versioned() {
+            return None;
+        }
+        if self.permissions.execute {
+            backing.parallel_change_domain()
+        } else {
+            backing.parallel_metadata_domain()
+        }
+    }
     #[inline]
     pub(super) fn check_backing(&self, address: u64) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
@@ -226,6 +252,7 @@ impl Memory {
             });
         }
         let cpu_safe = objects.iter().all(|object| object.cpu_borrow_safe());
+        let external_code = permissions.execute && objects.iter().any(|object|object.external_code_updates());
         self.check_backed_mapping(address, len, fixed)?;
         let charges: Vec<_> = (0..objects.len())
             .map(|_| Charge::new(&self.account))
@@ -252,6 +279,7 @@ impl Memory {
         self.invalidate_translations();
         self.has_backings = true;
         self.cpu_borrow_safe &= cpu_safe;
+        self.has_external_code |= external_code;
         Ok(())
     }
     pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {

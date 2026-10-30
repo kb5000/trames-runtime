@@ -937,3 +937,78 @@ and [synchronization specification](https://docs.vulkan.org/spec/latest/chapters
 The resource-interval optimization is this bridge's implementation for its exposed
 API and retained ownership graph, not an additional synchronization rule imposed
 on guest applications.
+
+## Shared GPU resource mappings and completion waits (2026-10-30)
+
+Native drivers with VK_EXT_external_memory_host may import a stable initialized
+host allocation for HOST_VISIBLE | HOST_COHERENT memory. Allocation size/alignment
+covers complete host granules and the driver's required import alignment; the
+existing GPU account charges the rounded allocation once, with no new quota.
+The driver and guest mappings retain that same payload independently. Successful
+free/device teardown cannot invalidate a still-retained guest page or View.
+Final release returns the account to zero. Failed/unsupported imports fall back
+to the original native allocation and resource-scoped coherent shadows.
+
+A negotiated dedicated vkMapMemory reservation aligns guest and allocation page
+offsets, including partial/nonzero maps. The backend returns a checkpoint before
+mapping effects when invoked on a frozen worker View. The joined Memory handler
+preflights the complete reserved RW span, then installs ordinary shared backing
+pages with explicit retained allocation geometry. CPU/interpreter/native access,
+permissions, hardware import gates and structural unmap/protect/remap use the
+existing common model. CLONE_VM and fork share the explicit resource mapping;
+unrelated private anonymous RAM keeps COW. This is not a host pointer handed to
+the guest, or a new native-only permission layer. Foreign GPU actors retain
+Vulkan's original application-owned execution/memory dependency requirements.
+No Rust guest reference crosses submission or a wait. Real GPU operations can
+still copy resources internally; zero bridge transfer does not mean no GPU work.
+
+Imported data pages publish one immutable metadata domain per mapping. Physical
+page/key/native-capability/check metadata never changes for that retained owner;
+live SharedPage bytes and byte versions remain canonical. This avoids individual
+backing checks after unrelated changes. The distinct parallel_metadata_domain
+contract defaults to the existing conservative domain for other providers and
+is never used for executable pages. Map/protect changes still rebuild the affected
+frames. A regression verifies zero data-page checks after a byte write, live
+bytes, executable invalidation and conservative executable-page observations.
+The first prototype lacked this distinction and produced excessive per-page
+metadata checks in Firefox; that measured intermediate is retained in validation.
+
+At the original successful Vulkan host-observation boundaries, touched shared
+allocations advance a relaxed external version token. SharedPage, worker decoder
+identities and exclusive reservations incorporate it where needed. Ordinary data
+loads/stores do not inspect this token or acquire a new fence. The driver/application
+still supplies data ordering; the token only invalidates cached code/monitors.
+Published intervals retire through the existing completion ledger, and still-inflight
+producers retain eligibility. Serial/worker tests and the native GPU oracle cover
+this publication; a device copy changes code identity without shadow writeback.
+Address spaces that have mapped imported storage executable also watch its
+publication epoch, so the decoder fast path rechecks page identities. Ordinary
+data mappings do not enable that code-epoch watch; the data-only regression
+verifies that device publication does not invalidate its instruction epoch.
+
+The optional bridge query is operation 200: bit 0 selects shared resource maps,
+bit 1 selects resumable fence/timeline waits. The map hint is 0x534841524544 in
+operation 17; old zero-hint maps remain supported. Operations 201/202 capture
+validated retained native resources, deadlines and wait-any/all conditions as
+owned pending jobs. They subscribe, then check readiness under the existing
+context lease, eliminating the wake-before-park gap. A waiter retains no guest
+pointer, page guard or CPU execution slot. Cancellation drops the job resources;
+accepted jobs and their original deadline survive mapping checkpoints.
+
+Source-built MoltenVK invokes a one-shot host observer after releasing its fence
+mutex. It retains only a weak readiness capability, with exactly-once disposal
+on completion or unsignaled destruction. The observer uses the driver's existing
+completion threads, not a new coordinator/service/wait thread. Private submission
+and acquisition fences notify the same context readiness; host timeline signals
+also notify it. Waiters perform the deciding native check before returning success.
+Finite waits use the existing run-queue deadline source; a single-CPU regression
+verifies that another task can run and that timeout needs no polling timer.
+The matching native archive must include patch 0007; stale static archives fail
+at build time. Dynamic/older drivers retain the legacy guest polling path.
+Future-host-signal submission and image-acquisition retries are not replaced here.
+
+The common implementation is shared by Mac and iPad, including interpreter page
+access and GPU ownership. Native-driver source/SDK adapters stay isolated. The
+[Mac validation record](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-firefox-gpu.md)
+contains source hashes, all Firefox trials, native ownership/transfer checks and
+the observed performance limits. Uniform near-native browser speed is not claimed.

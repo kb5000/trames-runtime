@@ -308,7 +308,163 @@ fn coherent_scope_oracle() {
     println!("native-coherent-scope-ok: nonzero pooled binding, unrelated PROT_NONE mappings, partial remap, 256 GPU words, empty-submit fence and zero rescan on repeated fence status");
 }
 
+
+fn shared_mapping_oracle() {
+    let budget = Budget::host_managed();
+    let mut b = Backend::with_budget(budget.clone());
+    let mut m = Memory::new(2 << 20);
+    m.map(0x1000, 256 * PAGE_SIZE, Permissions::RW).unwrap();
+    call(&mut b, &mut m, 1, &[OUT]);
+    let instance = word(&m, OUT);
+    m.write(0x2080, &1u32.to_le_bytes()).unwrap();
+    call(&mut b, &mut m, 3, &[instance, 0x2080, OUT]);
+    let physical = word(&m, OUT);
+    call(&mut b, &mut m, 8, &[physical, 0, OUT]);
+    let dev = word(&m, OUT);
+    call(&mut b, &mut m, 10, &[dev, 0, 0, OUT]);
+    let queue = word(&m, OUT);
+    call(&mut b, &mut m, 11, &[dev, 512, 3, OUT]);
+    let used = word(&m, OUT);
+    call(&mut b, &mut m, 13, &[dev, used, 0x2100]);
+    let size = word(&m, 0x2100);
+    let align = word(&m, 0x2108);
+    let bits = word(&m, 0x2110) as u32;
+    let offset = (size.div_ceil(align) * align * 2).max(PAGE_SIZE * 2);
+    let allocation = offset + size * 2;
+    assert!(allocation < 0x40000);
+    call(&mut b, &mut m, 5, &[physical, 0x2500]);
+    let count = word(&m, 0x2500) as u32;
+    let ty = (0..count)
+        .find(|i| {
+            bits & (1 << i) != 0
+                && m.read_array::<4>(0x2504 + *i as u64 * 8)
+                    .is_ok_and(|b| u32::from_le_bytes(b) & 6 == 6)
+        })
+        .unwrap();
+    call(&mut b, &mut m, 14, &[dev, allocation, ty as u64, OUT]);
+    let memory = word(&m, OUT);
+    call(&mut b, &mut m, 16, &[dev, used, memory, offset]);
+
+    call(&mut b, &mut m, 200, &[dev, OUT]);
+    assert_eq!(
+        word(&m, OUT) & 3,
+        3,
+        "native shared memory and completion adapter required"
+    );
+    call(
+        &mut b,
+        &mut m,
+        17,
+        &[dev, memory, 64, allocation - 64, 0x30040, 0x534841524544],
+    );
+    assert_eq!(
+        b.transfers.shared_maps, 1,
+        "actual imported mapping required"
+    );
+    assert_eq!(b.transfers.coherent_ranges, 0);
+    for i in 0..64 {
+        m.write(
+            0x30000 + offset + i * 4,
+            &(0x12340000 + i as u32).to_le_bytes(),
+        )
+        .unwrap();
+    }
+    let code_page = (0x30000 + offset + 256) & !(PAGE_SIZE - 1);
+    m.protect(
+        code_page,
+        PAGE_SIZE,
+        Permissions {
+            execute: true,
+            ..Permissions::RW
+        },
+    )
+    .unwrap();
+    let code_before = m.instruction_page_identity(0x30000 + offset + 256).unwrap();
+    let code_epoch_before=m.instruction_identity();
+    call(&mut b, &mut m, 34, &[dev, 0, 2, OUT]);
+    let pool = word(&m, OUT);
+    call(&mut b, &mut m, 36, &[dev, pool, OUT]);
+    let cmd = word(&m, OUT);
+    call(&mut b, &mut m, 48, &[dev, 0, OUT]);
+    let fence = word(&m, OUT);
+    call(&mut b, &mut m, 38, &[dev, cmd, 0]);
+    words(&mut m, 0x3b00, &[0, 256, 256]);
+    call(&mut b, &mut m, 45, &[dev, cmd, used, used, 0x3b00, 1]);
+    call(
+        &mut b,
+        &mut m,
+        44,
+        &[dev, cmd, 4096, 16384, 4096, 8192, 0, 0, 6],
+    );
+    call(&mut b, &mut m, 39, &[dev, cmd]);
+    words(&mut m, 0x3c00, &[cmd]);
+    words(&mut m, 0x3d00, &[0, 0, 0, 0x3c00, 1, 0, 0]);
+    call(&mut b, &mut m, 56, &[dev, queue, 0x3d00, 1, fence]);
+    words(&mut m, 0x3300, &[fence]);
+    let mut packet = [0; 128];
+    for (i, v) in [dev, 0x3300, 1, 1, 5_000_000_000].iter().enumerate() {
+        packet[i * 8..i * 8 + 8].copy_from_slice(&u64::to_le_bytes(*v));
+    }
+    m.write(PACKET, &packet).unwrap();
+    let began = Instant::now();
+    match b.invoke(&mut m, 201, PACKET, 128).unwrap() {
+        Invocation::Complete(value) => assert_eq!(value, 0),
+        Invocation::Pending(job) => {
+            use std::sync::{mpsc, Arc};
+            struct Wake(mpsc::Sender<()>);
+            impl trames_shared::IoWake for Wake {
+                fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+                    self.0.send(()).unwrap();
+                }
+            }
+            let (send, receive) = mpsc::channel();
+            let target: Arc<dyn trames_shared::IoWake> = Arc::new(Wake(send));
+            let signal = trames_shared::IoSignal::new(1, Arc::downgrade(&target));
+            loop {
+                signal.reset();
+                let subscription = b.subscribe_job(job, &signal).unwrap();
+                if let Some(value) = b.poll(&mut m, job).unwrap() {
+                    assert_eq!(value, 0);
+                    break;
+                }
+                receive
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("native fence completion must wake without polling");
+                drop(subscription);
+                assert!(began.elapsed() < Duration::from_secs(5));
+            }
+        }
+        Invocation::Checkpoint => panic!("joined mapping boundary"),
+    }
+    for i in 0..64 {
+        assert_eq!(
+            m.read_array::<4>(0x30000 + offset + 256 + i * 4).unwrap(),
+            (0x12340000 + i as u32).to_le_bytes()
+        );
+    }
+    assert_eq!(b.transfers.coherent_upload_scanned_bytes, 0);
+    assert_ne!(
+        m.instruction_page_identity(0x30000 + offset + 256).unwrap(),
+        code_before
+    );
+    assert_ne!(m.instruction_identity(),code_epoch_before);
+    assert_eq!(b.transfers.coherent_download_scanned_bytes, 0);
+    call(&mut b, &mut m, 18, &[dev, memory]);
+    // Unmapping/releasing the Vulkan object cannot invalidate retained guest pages.
+    call(&mut b, &mut m, 9, &[dev]);
+    call(&mut b, &mut m, 2, &[instance]);
+    assert!(budget.used() > 0);
+    assert_eq!(
+        m.read_array::<4>(0x30000 + offset + 256).unwrap(),
+        0x12340000u32.to_le_bytes()
+    );
+    drop(m);
+    assert_eq!(budget.used(), 0);
+    println!("native-shared-mapping-ok: partial map, 64 GPU copy results, zero coherent scanning and retained ownership after device teardown");
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--shared-only") { shared_mapping_oracle(); return; }
     if std::env::args().nth(1).as_deref() == Some("--objects-only") {
         object_budget();
         return;

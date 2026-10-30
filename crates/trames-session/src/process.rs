@@ -520,9 +520,12 @@ impl<C: Cpu> Kernel<C> {
         self.gpu_transfers.merge(transfers);
         let value = value.map_err(trames_accel::native::Error::Memory)?;
         let value = match value {
+            trames_vulkan::Invocation::Checkpoint => unreachable!("joined GPU call requested a mapping checkpoint"),
             trames_vulkan::Invocation::Complete(value) => value,
             trames_vulkan::Invocation::Pending(job) => {
-                self.gpu_compiles += 1;
+                self.gpu_compiles += u64::from(matches!(a[0], 27 | 70));
+                let retired = matches!(a[0], 201 | 202);
+                if retired { self.instructions += 1; }
                 let pending = 1 + self
                     .processes
                     .values()
@@ -530,7 +533,7 @@ impl<C: Cpu> Kernel<C> {
                     .count();
                 self.gpu_peak_pending = self.gpu_peak_pending.max(pending);
                 p.state = State::Gpu {
-                    retired: false,
+                    retired,
                     peer_instructions: 0,
                     job,
                     pc,

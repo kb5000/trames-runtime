@@ -708,7 +708,7 @@ impl<C: Cpu> Pool<C> {
                             {
                                 work.cpu.clear_exclusive();
                                 let args = [work.cpu.x(0), work.cpu.x(1), work.cpu.x(2)];
-                                let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && trames_vulkan::Context::worker_operation(args[0]) && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111)));
+                                let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && trames_vulkan::Context::worker_operation(args[0]) && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
                                 let native = if let Some(authority) = gpu {
                                     match registry.authorize_stateful(work.memory.as_deref().expect("worker view"), *pc, *module, *function) {
                                         Err(error) => Err(error),

@@ -6,7 +6,9 @@ mod cpu_memory;
 mod hardware;
 pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
+mod imported;
 pub use hardware_shared::{HardwareRange, HardwareStorage, HardwareWait, SharedMapping};
+pub fn host_mapping_granule() -> usize { mmu::host_mapping_granule() }
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -19,7 +21,7 @@ mod reservations;
 mod residency;
 mod slots;
 use backing::Backed;
-pub use backing::{backing_changed, PageBacking, PageSource};
+pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource};
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
@@ -238,6 +240,7 @@ pub struct Memory {
     identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
     has_backings: bool,
+    has_external_code: bool,
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
     pinned: BTreeMap<u64, std::sync::Weak<pinned::PinnedPage>>,
@@ -299,6 +302,7 @@ impl Clone for Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: self.has_backings,
+            has_external_code: self.has_external_code,
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
             pinned: BTreeMap::new(),
@@ -400,6 +404,7 @@ impl Memory {
             identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
             shared: None,
             has_backings: false,
+            has_external_code: false,
             cpu_borrow_safe: true,
             parallel_cache: None,
             pinned: BTreeMap::new(),
@@ -637,7 +642,8 @@ impl Memory {
             } else {
                 0u64
             })
-            .wrapping_add(self.parallel_cache.as_ref().map_or(0, |c| c.code_epoch())),
+            .wrapping_add(self.parallel_cache.as_ref().map_or(0, |c| c.code_epoch()))
+                .wrapping_add(if self.has_external_code { backing::external_revision() } else { 0 }),
         )
     }
 
@@ -919,6 +925,7 @@ impl Memory {
             let page = self.frames[frame].as_mut().expect("validated page");
             page.permissions = permissions;
             page.instruction_revision = self.code_revision;
+            self.has_external_code |= permissions.execute && page.backing.as_ref().is_some_and(|b|b.object.external_code_updates());
         }
         self.revision = self.revision.wrapping_add(1);
         self.refresh_mapping_mmu(address, len);

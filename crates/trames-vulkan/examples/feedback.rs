@@ -25,6 +25,7 @@ impl Lab {
             v
         });
         match self.b.invoke(&mut self.m, op, 0x1000, 128).unwrap() {
+            Invocation::Checkpoint => panic!("joined example requested a mapping checkpoint"),
             Invocation::Complete(n) => n,
             Invocation::Pending(job) => {
                 let began = Instant::now();

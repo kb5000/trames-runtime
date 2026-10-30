@@ -6,18 +6,48 @@ use std::sync::{
     Mutex,
 };
 
-/// Retained file-backed host mapping. Geometry is explicit: an executor may
+/// Retained host resource mapping. Geometry is explicit: an executor may
 /// import complete host granules without moving bytes observed by a presenter.
 #[derive(Clone)]
 pub struct SharedMapping {
+    pub(crate) external_revision: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) base: usize,
     pub(crate) length: usize,
     pub(crate) offset: usize,
     pub(crate) _owner: std::sync::Arc<dyn Send + Sync>,
 }
 impl SharedMapping {
+    /// Retain initialized host storage, including complete host-page granules.
+    ///
+    /// # Safety
+    /// base..base+length is stable initialized RW storage until owner drops.
+    /// Foreign actors use raw accesses and their API's synchronization contract;
+    /// guest CPU accesses use the existing region/hardware borrow protocol.
+    pub unsafe fn from_allocation(
+        base: *mut u8,
+        length: usize,
+        owner: impl Send + Sync + 'static,
+    ) -> Self {
+        assert!(!base.is_null() && length >= crate::PAGE_SIZE as usize);
+        Self {
+            external_revision: None,
+            base: base as usize,
+            length,
+            offset: 0,
+            _owner: std::sync::Arc::new(owner),
+        }
+    }
     pub fn allocation_pointer(&self) -> *mut u8 {
         self.base as *mut u8
+    }
+    /// Optional code-version publication by an external device at its original
+    /// synchronization boundaries. Data loads/stores never inspect this token.
+    pub fn with_external_revision(
+        mut self,
+        revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.external_revision = Some(revision);
+        self
     }
     pub fn allocation_len(&self) -> usize {
         self.length

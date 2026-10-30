@@ -397,6 +397,7 @@ impl Backend {
                         .semaphore(native)
                         .value(a[2]);
                     unsafe { api.signal_semaphore(&info) }?;
+                    self.completion.notify_atomic();
                 }
                 _ => return unsupported(),
             }
