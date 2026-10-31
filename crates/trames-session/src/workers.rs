@@ -110,6 +110,7 @@ impl GpuStats {
     }
 }
 pub(super) struct Done<C: Cpu> {
+    pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
     pub pid: u32,
     pub cpu: C,
     pub outcome: Option<SliceOutcome>,
@@ -578,6 +579,30 @@ impl<C: Cpu> Pool<C> {
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
+                                if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
+                                    snapshot.seccomp.mode() != 0
+                                        && (matches!(work.cpu.x(8) as u32, 23 | 24 | 57)
+                                            || work.cpu.x(8) as u32 == 25
+                                                && matches!(work.cpu.x(1), 0 | 1030))
+                                }) {
+                                    let began = snapshot.profile.then(Instant::now);
+                                    let number = work.cpu.x(8) as u32;
+                                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                                    let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
+                                    if entry.allowed() {
+                                        if let Some(value) = snapshot.direct.invoke_membership(number, args) {
+                                            if let Some(began) = began { syscall_time += began.elapsed(); }
+                                            work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                            syscalls += 1;
+                                            continue;
+                                        }
+                                    }
+                                    // Owner-only resources and denials retain
+                                    // their normal joined effects. The entry
+                                    // token binds this exact ABI and policy.
+                                    job.seccomp_entry = Some(entry);
+                                    break result;
+                                }
                                 // A filtered mapping entry has no worker-side
                                 // effects. Evaluate BPF once on its mm owner;
                                 // only an allowed call may mutate that domain.

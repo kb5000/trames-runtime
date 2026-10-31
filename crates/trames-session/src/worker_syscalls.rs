@@ -242,9 +242,8 @@ impl Snapshot {
         if self.seccomp.mode() == 0 {
             return true;
         }
-        // Membership can change after admission. Until an allowed-call token
-        // is retained through fallback, filtered structural calls stay joined
-        // and evaluate their filter once.
+        // Filtered membership entries use the dedicated worker path, which
+        // carries their exact decision through an owner-resource fallback.
         if matches!(cpu.x(8) as u32, 23 | 24 | 57)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {

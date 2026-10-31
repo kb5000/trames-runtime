@@ -99,3 +99,21 @@ create host threads. Existing CPU-worker and aggregate memory limits remain
 independent. Regression coverage creates 299 shared-VM children at capacity 300,
 checks the next rejection and reported limits, and executes a real guest
 getrlimit at session startup with a product capacity of 1,024.
+
+## Filtered descriptor membership operations
+
+Worker-local dup, dup3, close and fcntl duplication use the actual shared
+files_struct even when a guest installs seccomp. The worker evaluates the
+immutable entry policy once, then lets the existing membership operation make
+its resource decision under the table's mutex. A successful operation retains
+its ordinary Linux result and does not checkpoint peer CPUs.
+
+An owner-only resource or denied entry returns through the existing joined
+path. The job carries the original entry decision through completion; the owner
+consumes it only when the syscall number, post-SVC PC, arguments and filter-chain
+identity still match. Denial actions and owner-resource effects remain on their
+normal owner. No decision cache or filter bypass is introduced.
+
+Conformance covers accepted shared operations, effect-free deferral, denied
+operations and exactly one filter evaluation after deferral. A four-worker
+dup/close loop checks that these allowed operations do not checkpoint peers.

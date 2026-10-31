@@ -3,38 +3,22 @@
 use std::time::{Duration, Instant};
 
 pub(crate) const REFRESH_MILLIHERTZ: i32 = 60_000;
-// Keep fast producers at the advertised refresh. Callback-only commits do not
-// repaint; idle clients still get callbacks so animations can restart.
-const IDLE_INTERVAL: Duration = Duration::from_millis(100);
-const IDLE_RESET: Duration = Duration::from_millis(250);
+// A requested callback is a frame-clock subscription even when this surface's
+// pixels are unchanged (for example, a browser's vsync surface). Callback-only
+// commits do not repaint, and clients without requests schedule no work.
 const INTERVAL: Duration = Duration::from_nanos(1_000_000_000_000 / REFRESH_MILLIHERTZ as u64);
 
 #[derive(Default)]
 pub(crate) struct Pacer {
     presented: Option<(u64, u32, Instant)>,
     sent: Option<(Instant, u32, u64)>,
-    cooldown: Option<Instant>,
 }
 impl Pacer {
     pub fn presented(&mut self, revision: u64, milliseconds: u32, now: Instant) {
         if self.presented.is_none_or(|(old, ..)| revision >= old) {
-            if self.presented.is_some_and(|(old, ..)| revision > old) {
-                if let Some((at, _, sent_revision)) = self.sent {
-                    let produced = now.saturating_duration_since(at);
-                    // A slow producer that just consumed a callback should not
-                    // immediately receive another high-priority vsync task. Give
-                    // its normal event queue one production interval to run.
-                    // Do not move this deadline for unsolicited intermediate
-                    // frames, and do not mistake a long idle for render work.
-                    if revision > sent_revision
-                        && self.cooldown.is_none()
-                        && produced > INTERVAL * 2
-                        && produced <= IDLE_RESET
-                    {
-                        self.cooldown = Some(now + produced);
-                    }
-                }
-            }
+            // Presentation already paid for producer/GPU/scanout latency.
+            // Do not add that latency again as an adaptive cooldown: it halves
+            // a slow producer's throughput and makes transient stalls persist.
             self.presented = Some((revision, milliseconds, now));
         }
     }
@@ -44,15 +28,8 @@ impl Pacer {
         if revision > presented {
             return None;
         }
-        Some(self.sent.map_or(Duration::ZERO, |(at, _, sent_revision)| {
-            let interval = if presented <= sent_revision {
-                IDLE_INTERVAL
-            } else {
-                INTERVAL
-            };
-            (at + interval)
-                .max(self.cooldown.unwrap_or(at))
-                .saturating_duration_since(now)
+        Some(self.sent.map_or(Duration::ZERO, |(at, _, _)| {
+            (at + INTERVAL).saturating_duration_since(now)
         }))
     }
     pub fn take(&mut self, now: Instant) -> (u64, u32) {
@@ -67,7 +44,6 @@ impl Pacer {
             }
         }
         self.sent = Some((now, stamp, revision));
-        self.cooldown = None;
         (revision, stamp)
     }
 }
@@ -127,30 +103,33 @@ mod tests {
         assert_eq!(p.take(now + Duration::from_millis(20)), (1, 14));
         assert_eq!(
             p.delay(1, now + Duration::from_millis(21)),
-            Some(IDLE_INTERVAL - Duration::from_millis(1))
+            Some(INTERVAL - Duration::from_millis(1))
         );
         p.presented(2, 10, now + Duration::from_secs(1));
         assert_eq!(p.take(now + Duration::from_secs(1)), (2, 14));
-        assert_eq!(
-            p.delay(2, now + Duration::from_secs(1)),
-            Some(IDLE_INTERVAL)
-        );
+        assert_eq!(p.delay(2, now + Duration::from_secs(1)), Some(INTERVAL));
     }
 
     #[test]
-    fn slow_producer_leaves_room_for_normal_tasks_without_delaying_fast_frames() {
+    fn slow_producer_is_not_delayed_again_after_its_frame_was_presented() {
         let now = Instant::now();
         let mut p = Pacer::default();
         p.presented(1, 0, now);
         p.take(now);
         let produced = now + Duration::from_millis(40);
         p.presented(2, 40, produced);
-        assert_eq!(p.delay(2, produced), Some(Duration::from_millis(40)));
-        // More frames before the next callback cannot postpone it forever.
+        assert_eq!(p.delay(2, produced), Some(Duration::ZERO));
+        assert_eq!(p.take(produced), (2, 40));
+        // A new image still obeys the advertised refresh interval.
+        p.presented(3, 50, now + Duration::from_millis(50));
+        assert_eq!(
+            p.delay(3, now + Duration::from_millis(50)),
+            Some(INTERVAL - Duration::from_millis(10))
+        );
         p.presented(3, 60, now + Duration::from_millis(60));
         assert_eq!(
             p.delay(3, now + Duration::from_millis(60)),
-            Some(Duration::from_millis(20))
+            Some(Duration::ZERO)
         );
         assert_eq!(
             p.delay(3, now + Duration::from_millis(80)),
@@ -171,15 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_content_remains_live_without_busy_callback_feedback() {
+    fn callback_only_commits_use_the_advertised_frame_clock() {
         let now = Instant::now();
         let mut p = Pacer::default();
         p.presented(7, 1000, now);
         p.take(now);
         p.presented(7, 1017, now + INTERVAL);
-        assert_eq!(p.delay(7, now + INTERVAL), Some(IDLE_INTERVAL - INTERVAL));
-        assert_eq!(p.delay(7, now + IDLE_INTERVAL), Some(Duration::ZERO));
-        assert_eq!(p.take(now + IDLE_INTERVAL), (7, 1100));
-        assert_eq!(p.delay(8, now + IDLE_INTERVAL), None);
+        assert_eq!(p.delay(7, now + INTERVAL), Some(Duration::ZERO));
+        assert_eq!(p.take(now + INTERVAL), (7, 1017));
+        assert_eq!(p.delay(7, now + INTERVAL), Some(INTERVAL));
+        assert_eq!(p.delay(8, now + INTERVAL), None);
     }
 }

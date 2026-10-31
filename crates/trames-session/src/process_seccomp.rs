@@ -29,7 +29,7 @@ pub(crate) struct Seccomp {
 }
 /// A single immutable BPF result, bound to its exact architectural entry and
 /// filter chain. A deferred denial must not rerun BPF or apply actions locally.
-pub(super) struct EntryDecision {
+pub(crate) struct EntryDecision {
     policy: Seccomp,
     number: u32,
     pc: u64,
@@ -37,7 +37,7 @@ pub(super) struct EntryDecision {
     value: u32,
 }
 impl EntryDecision {
-    pub(super) fn allowed(&self) -> bool {
+    pub(crate) fn allowed(&self) -> bool {
         self.value & 0xffff_0000 == ALLOW
     }
     fn value_for(self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
@@ -77,7 +77,7 @@ impl Seccomp {
                 .zip(other.filters.iter())
                 .all(|(a, b)| Arc::ptr_eq(a, b))
     }
-    pub(super) fn entry_decision(&self, number: u32, pc: u64, args: [u64; 6]) -> EntryDecision {
+    pub(crate) fn entry_decision(&self, number: u32, pc: u64, args: [u64; 6]) -> EntryDecision {
         EntryDecision {
             policy: self.clone(),
             number,
@@ -443,7 +443,7 @@ mod tests {
         assert!(p.seccomp_entry.is_none());
     }
     #[test]
-    fn filtered_membership_changes_stay_joined_before_filter_evaluation_or_effects() {
+    fn general_admission_does_not_evaluate_filtered_membership_entries() {
         for decision in [ALLOW, 0x5007b] {
             let mut p = super::super::tests::process();
             let [fd, _] = p.linux.vfs.pipe(0).unwrap();
@@ -482,6 +482,168 @@ mod tests {
                 assert!(p.linux.vfs.flags(fd).is_ok());
             }
             assert_eq!(snapshot.direct.fd_control_completed(), 0);
+        }
+    }
+    #[test]
+    fn filtered_fd_workers_complete_shared_operations_and_preserve_deferred_decisions() {
+        for (number, owner, decision) in [
+            (23, false, ALLOW),
+            (24, false, ALLOW),
+            (25, false, ALLOW),
+            (57, false, ALLOW),
+            (23, true, ALLOW),
+            (57, true, ALLOW),
+            (23, false, 0x5007b),
+            (57, false, 0x5007b),
+        ] {
+            let mut p = super::super::tests::process();
+            let [shared, _] = p.linux.vfs.pipe(0).unwrap();
+            let fd = if owner { 0 } else { shared };
+            let args = match number {
+                24 => [fd as u64, 200, 0, 0, 0, 0],
+                25 => [fd as u64, 1030, 160, 0, 0, 0],
+                _ => [fd as u64, 0, 0, 0, 0, 0],
+            };
+            p.memory
+                .write_array(0x4000, 0xd4000001u32.to_le_bytes())
+                .unwrap();
+            p.memory
+                .write_array(0x4004, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu = Cpu::new(0x4000, 0);
+            p.cpu.set_x(8, number);
+            put_args(&mut p.cpu, args);
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+            ));
+            let snapshot = crate::worker_syscalls::Snapshot {
+                seccomp: p.seccomp.clone(),
+                identities: [0; 7],
+                started: Instant::now(),
+                processor: 0,
+                profile: false,
+                streams: p.linux.vfs.stream_descriptors(),
+                files: p.linux.vfs.file_descriptors(),
+                fd_flags: p.linux.vfs.fd_flags_snapshot(),
+                umask: p.linux.vfs.umask_capability(),
+                actions: p.signals.actions.shared(),
+                program_break: p.linux.program_break(),
+                uts: None,
+                direct: trames_linux::DirectSyscalls::default()
+                    .with_membership(p.linux.vfs.shared_files())
+                    .with_lock_context(p.linux.vfs.record_lock_context(1)),
+                futex: Default::default(),
+            };
+            let work = crate::workers::Work {
+                pid: 1,
+                cpu: std::mem::take(&mut p.cpu),
+                memory: Some(Box::new(
+                    p.memory.parallel_view(&mut Default::default()).unwrap(),
+                )),
+                control: Arc::new(crate::workers::Control::new(1000)),
+                syscalls: Some(snapshot),
+                gpu: None,
+            };
+            let mut pool = crate::workers::Pool::new(1);
+            pool.ensure(0).unwrap();
+            pool.dispatch(0, work).unwrap();
+            let done = pool.complete().unwrap();
+            assert_eq!(p.seccomp.evaluations(), 1, "one entry decision");
+            p.memory.commit_parallel().unwrap();
+            p.cpu = done.cpu;
+            if owner || decision != ALLOW {
+                assert!(matches!(done.outcome, Some(SliceOutcome::Syscall { .. })));
+                assert!(p.linux.vfs.flags(fd).is_ok(), "no deferred FD effect");
+                p.seccomp_entry = Some(done.seccomp_entry.expect("exact deferred entry"));
+                super::super::tests::kernel().call(
+                    1,
+                    &mut p,
+                    number as u32,
+                    args,
+                    &mut trames_linux::CapturedOutput::default(),
+                );
+                assert_eq!(p.seccomp.evaluations(), 1, "owner must consume decision");
+                assert!(p.seccomp_entry.is_none());
+            } else {
+                assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
+                assert!(done.seccomp_entry.is_none());
+                assert_eq!(done.syscalls, 1);
+                assert_eq!(done.fd_syscalls, 1);
+            }
+            if decision != ALLOW {
+                assert_eq!(p.cpu.x(0), error(Errno(123)));
+                assert!(p.linux.vfs.flags(fd).is_ok());
+            } else if number == 57 {
+                assert_eq!(p.linux.vfs.flags(fd), Err(Errno(9)));
+            } else {
+                assert!(p.linux.vfs.flags(p.cpu.x(0) as u32).is_ok());
+            }
+        }
+    }
+    #[test]
+    fn allowed_filtered_dup_close_loops_do_not_checkpoint_peer_cpus() {
+        let mut p = super::super::tests::process();
+        let [fd, _] = p.linux.vfs.pipe(0).unwrap();
+        let code = [
+            0xd2800000u32 | (fd << 5), // mov x0, original FD
+            0xd28002e8,                // mov x8, dup
+            0xd4000001,
+            0xd2800728, // mov x8, close
+            0xd4000001,
+            0x17fffffb, // loop
+        ];
+        for (index, word) in code.into_iter().enumerate() {
+            p.memory
+                .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        p.memory
+            .protect(
+                0x4000,
+                trames_memory::PAGE_SIZE,
+                trames_memory::Permissions::RX,
+            )
+            .unwrap();
+        p.cpu = Cpu::new(0x4000, 0);
+        p.affinity = 15;
+        p.seccomp
+            .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+        let mut kernel = super::super::tests::kernel();
+        kernel.cpu_count = 4;
+        kernel.workers = crate::workers::Pool::new(4);
+        kernel.per_cpu = vec![Duration::ZERO; 4];
+        for id in 2..=4 {
+            let mut peer = p.fork();
+            peer.parent = 1;
+            kernel.processes.insert(id, peer);
+        }
+        kernel.processes.insert(1, p);
+        for _ in 0..4 {
+            assert!(kernel
+                .parallel_round(&mut trames_linux::CapturedOutput::default(), 100_000)
+                .unwrap());
+            if kernel.worker_syscalls > 100 {
+                break;
+            }
+        }
+        assert!(kernel.worker_syscalls > 100);
+        assert_eq!(
+            kernel.syscalls, kernel.worker_syscalls,
+            "shared FD calls must not join peers"
+        );
+        for p in kernel.processes.values() {
+            assert!(p.linux.vfs.flags(fd).is_ok());
+            assert!(
+                p.linux.vfs.fd_snapshot().len() <= 6,
+                "at most one in-flight duplicate per task"
+            );
         }
     }
     #[test]

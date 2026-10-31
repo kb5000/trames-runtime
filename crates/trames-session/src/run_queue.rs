@@ -90,6 +90,9 @@ pub(super) struct Job<C: Cpu> {
     /// Guest code reached this exit during a bounded exclusive-mm window.
     /// Its syscall/native/fault handling still belongs to normal dispatch.
     pub pending_cpu: Option<SliceOutcome>,
+    /// A filtered FD entry may defer before membership effects. Carry its
+    /// decision to the owner instead of evaluating the same BPF entry twice.
+    pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
 }
 impl<C: Cpu> Job<C> {
     pub fn new(
@@ -110,6 +113,7 @@ impl<C: Cpu> Job<C> {
             domain: None,
             checkpoint: None,
             pending_cpu: None,
+            seccomp_entry: None,
             stats: Stats {
                 before,
                 after: before,
@@ -129,8 +133,11 @@ impl<C: Cpu> Job<C> {
         let work = self.work;
         // Drop the retained View before any coordinator mapping operation.
         drop(work.memory);
-        self.stats
-            .finish(work.pid, work.cpu, outcome, self.waiting, io, gpu_pending)
+        let mut done =
+            self.stats
+                .finish(work.pid, work.cpu, outcome, self.waiting, io, gpu_pending);
+        done.seccomp_entry = self.seccomp_entry;
+        done
     }
 }
 
@@ -181,6 +188,7 @@ impl Stats {
             fd_syscalls: self.fd_syscalls,
             gpu: self.gpu,
             gpu_pending,
+            seccomp_entry: None,
         }
     }
 }

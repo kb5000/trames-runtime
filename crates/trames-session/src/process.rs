@@ -4272,6 +4272,9 @@ impl<C: Cpu> Kernel<C> {
                 .get_mut(&done.pid)
                 .expect("dispatched process");
             p.cpu = done.cpu;
+            if let Some(entry) = done.seccomp_entry {
+                p.seccomp_entry = Some(entry);
+            }
             p.retain_worker_flock(done.io.as_ref());
             p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
             p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
