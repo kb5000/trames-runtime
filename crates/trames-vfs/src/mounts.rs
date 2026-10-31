@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
+pub(super) mod watch;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -319,6 +320,7 @@ pub(super) struct Table {
     pub id: u64,
     pub root: Rc<Mount>,
     pub mounts: Vec<Rc<Mount>>,
+    pub events: Arc<watch::MountEvents>,
 }
 #[derive(Clone)]
 pub struct MountNamespace(pub(super) Rc<RefCell<Table>>);
@@ -501,6 +503,7 @@ impl Vfs {
         }
         self.register_mounts(&mounts)?;
         self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
+            events: Arc::default(),
             id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
@@ -728,6 +731,7 @@ impl Vfs {
             remap(&mut paths.root_mount);
         }
         self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
+            events: Arc::default(),
             id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
@@ -898,6 +902,43 @@ impl Vfs {
                 return Err(Errno(16));
             }
             parent.flags.set(flags & ATTRS);
+            let events = self.mounts.as_ref().unwrap().0.borrow().events.clone();
+            events.changed();
+            return Ok(());
+        }
+        if flags & 8192 != 0 && flags & BIND == 0 {
+            if flags & !8192 != 0 {
+                return Err(Errno(95));
+            }
+            let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
+            let moved = source.mount.as_ref().ok_or(Errno(22))?;
+            let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
+            if !self.is_mount_root(&source)
+                || Rc::ptr_eq(moved, &table.root)
+                || !table.mounts.iter().any(|mount| Rc::ptr_eq(mount, moved))
+            {
+                return Err(Errno(22));
+            }
+            if matches!(moved.root.borrow().content, Content::Directory)
+                != matches!(target_node.borrow().content, Content::Directory)
+            {
+                return Err(Errno(20));
+            }
+            let mut ancestor = Some(parent.clone());
+            while let Some(mount) = ancestor {
+                if Rc::ptr_eq(&mount, moved) {
+                    return Err(Errno(40));
+                }
+                ancestor = mount.parent.borrow().as_ref().map(|a| a.parent.clone());
+            }
+            *moved.parent.borrow_mut() = Some(Attachment {
+                parent,
+                node: target_node,
+                fallback: target.key,
+            });
+            let events = table.events.clone();
+            drop(table);
+            events.changed();
             return Ok(());
         }
         if flags & !(ATTRS | BIND | REC) != 0 {
@@ -1170,6 +1211,9 @@ impl Vfs {
         self.register_mounts(&added)?;
         let mut table = ns.0.borrow_mut();
         table.mounts.extend(added);
+        let events = table.events.clone();
+        drop(table);
+        events.changed();
         Ok(())
     }
     pub fn umount(&mut self, target: &[u8], flags: u64) -> Result<()> {
@@ -1224,11 +1268,13 @@ impl Vfs {
             .cloned()
             .collect();
         table.mounts.retain(|m| !ids.contains(&m.id));
+        let events = table.events.clone();
         if flags & 2 != 0 {
             self.detached_mounts.borrow_mut().push(detached);
         }
         *mount.parent.borrow_mut() = None;
         drop(table);
+        events.changed();
         drop(target);
         self.reap_detached_mounts();
         Ok(())
@@ -1273,7 +1319,9 @@ impl Vfs {
             fallback: old.key,
         });
         table.root = new_mount.clone();
+        let events = table.events.clone();
         drop(table);
+        events.changed();
         self.rebase_pivot_context(&previous, &new_mount);
         Ok(())
     }

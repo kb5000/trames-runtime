@@ -131,6 +131,7 @@ impl Vfs {
                     pty: None,
                     namespace: None,
                     network_control: None,
+                    mount_file: None,
                     oom: None,
                     mount: None,
                 }),

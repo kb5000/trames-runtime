@@ -466,6 +466,7 @@ impl Vfs {
             pty: None,
             namespace: Some(ns),
             network_control: None,
+            mount_file: None,
             oom: None,
             mount: None,
         })

@@ -410,6 +410,9 @@ impl Vfs {
         }
     }
     pub fn inotify_add(&self, fd: u32, path: &[u8], mask: u32) -> Result<i32> {
+        // Linux accepts this output annotation in an add-watch request but it
+        // does not become an event selector (libmount uses IN_CREATE|IN_ISDIR).
+        let mask = mask & !ISDIR;
         let instance = self.inotify_instance(fd)?;
         if mask & ALL == 0
             || mask

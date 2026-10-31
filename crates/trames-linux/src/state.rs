@@ -421,7 +421,7 @@ impl Linux {
         memory: &Memory,
     ) -> (Result<[u8; 128]>, Option<trames_vfs::ProcRefresh>) {
         let query = || {
-            if a[3] & !0x1100 != 0 {
+            if a[3] & !0x1900 != 0 {
                 return Err(Errno(22));
             }
             let path = Self::path(memory, a[1])?;
@@ -931,8 +931,8 @@ impl Linux {
         }
         if self.trace {
             eprintln!(
-                "trames syscall {number}({:#x}, {:#x}, {:#x}) = {}",
-                a[0], a[1], a[2], raw as i64
+                "trames syscall {number}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {}",
+                a[0], a[1], a[2], a[3], a[4], a[5], raw as i64
             );
         }
         cpu.set_x(0, raw);
@@ -946,6 +946,12 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            92 => match a[0] as u32 {
+                // Only the native AArch64 Linux execution domain exists.
+                // Query and reselect it; other personality modes stay unsupported.
+                0 | u32::MAX => Ok(0),
+                _ => Err(Errno(22)),
+            },
             425 => self.uring_setup(a, memory),
             426 => self
                 .uring_enter(a, memory, None, 0)

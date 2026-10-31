@@ -92,6 +92,11 @@ impl Linux {
                 if (a[4] as u32) < 4 || a[4] as u32 > i32::MAX as u32 {
                     return Err(Errno(22));
                 }
+                if matches!(a[2], 32 | 33)
+                    && !vfs.credentials.has_cap(trames_vfs::capabilities::NET_ADMIN)
+                {
+                    return Err(Errno(1));
+                }
                 socket.set_reuse(a[2] as u32, u32_at(memory, a[3])?)?;
                 Ok(0)
             }
@@ -119,10 +124,10 @@ impl Linux {
                     return Ok(0);
                 }
                 let value: u32 = match a[2] {
-                    2 | 15 | 16 => socket.reuse(a[2] as u32),
+                    2 | 15 | 16 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
                     3 => socket.kind(),
                     4 => 0,
-                    7 | 8 => trames_vfs::PIPE_CAPACITY as u32,
+                    7 | 8 => socket.buffer_size(a[2] == 8) as u32,
                     30 => u32::from(socket.listening()),
                     38 => 0,
                     39 => 1,
@@ -171,6 +176,21 @@ impl Linux {
                             ancillary[..8].copy_from_slice(&length.to_le_bytes());
                         } else {
                             ancillary.clear();
+                        }
+                    }
+                    if let Some((kind, stamp)) = received.timestamp {
+                        let remaining = control_size as usize - ancillary.len();
+                        let value: Vec<_> = stamp.into_iter().flat_map(u64::to_le_bytes).collect();
+                        let mut bytes = Vec::new();
+                        push_control(&mut bytes, 1, kind, &value);
+                        if remaining < bytes.len() {
+                            control_truncated = true;
+                        }
+                        bytes.truncate(remaining);
+                        if bytes.len() >= 16 {
+                            let length = bytes.len() as u64;
+                            bytes[..8].copy_from_slice(&length.to_le_bytes());
+                            ancillary.extend_from_slice(&bytes);
                         }
                     }
                     let remaining = control_size as usize - ancillary.len();

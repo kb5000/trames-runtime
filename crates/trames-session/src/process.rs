@@ -1873,6 +1873,7 @@ impl<C: Cpu> Kernel<C> {
             140 | 141 => self.priority(pid, p, number, a),
             236 => Self::mempolicy(p, a),
             90 | 91 => self.capcall(pid, p, number == 91, a).map(Some),
+            142 => self.reboot_guest(pid, p, a),
             93 | 94 => {
                 if number == 93 {
                     self.exit_one(pid, p, (a[0] as u8 as i32) << 8);
@@ -2744,7 +2745,7 @@ impl<C: Cpu> Kernel<C> {
                 proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
         }
-        let second_mount_path = if number == 40 && a[3] & 4096 != 0 {
+        let second_mount_path = if number == 40 && a[3] & (4096 | 8192) != 0 {
             Some(a[0])
         } else if number == 41 {
             Some(a[1])
@@ -2908,10 +2909,13 @@ impl<C: Cpu> Kernel<C> {
         if p.linux.trace && !(raw.is_none() && matches!(p.state, State::Blocked(..)) && was_blocked)
         {
             eprintln!(
-                "trames pid {pid} syscall {number}({:#x}, {:#x}, {:#x}) = {}",
+                "trames pid {pid} syscall {number}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {}",
                 a[0],
                 a[1],
                 a[2],
+                a[3],
+                a[4],
+                a[5],
                 raw.map_or_else(|| "suspended/replaced".into(), |v| (v as i64).to_string())
             );
         }

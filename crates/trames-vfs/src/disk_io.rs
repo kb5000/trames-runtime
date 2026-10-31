@@ -258,11 +258,12 @@ impl Vfs {
         result: &Result<Vec<u8>>,
         access: bool,
     ) {
-        if access && result.is_ok() {
+        if access && result.is_ok() && o.flags.get() & O_NOATIME == 0 {
             mounts::accessed(&mut node.borrow_mut(), o.mount.as_deref());
         }
         let notification_node = o.node.as_ref().unwrap_or(node);
-        if !Arc::ptr_eq(notification_node, node) && result.is_ok() {
+        if !Arc::ptr_eq(notification_node, node) && result.is_ok() && o.flags.get() & O_NOATIME == 0
+        {
             mounts::accessed(&mut notification_node.borrow_mut(), o.mount.as_deref());
         }
         if result.as_ref().is_ok_and(|b| !b.is_empty())

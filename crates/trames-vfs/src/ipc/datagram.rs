@@ -42,6 +42,9 @@ impl Vfs {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
+        if bytes.len() > socket.buffer_size(false) {
+            return Err(Errno(90));
+        }
         if socket
             .channel
             .borrow()

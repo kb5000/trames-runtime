@@ -44,7 +44,7 @@ pub(super) struct StatusFlags {
     fixed: u32,
     mutable: Arc<AtomicU32>,
 }
-const CHANGEABLE: u32 = 0x400 | O_NONBLOCK;
+const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME;
 impl From<u32> for StatusFlags {
     fn from(flags: u32) -> Self {
         Self {

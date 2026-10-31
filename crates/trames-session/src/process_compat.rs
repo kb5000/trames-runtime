@@ -6,6 +6,46 @@ use super::*;
 use trames_kernel::signal::SS_DISABLE;
 
 impl<C: Cpu> Kernel<C> {
+    pub(super) fn reboot_guest(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        a: [u64; 6],
+    ) -> Result<Option<u64>, Errno> {
+        if !p.linux.vfs.credentials.has_cap(capabilities::SYS_BOOT) {
+            return Err(Errno(1));
+        }
+        if a[0] as u32 != 0xfee1_dead
+            || !matches!(
+                a[1] as u32,
+                0x2812_1969 | 0x0512_1996 | 0x1604_1998 | 0x2011_2000
+            )
+        {
+            return Err(Errno(22));
+        }
+        match a[2] as u32 {
+            0xcdef_0123 | 0x4321_fedc => {}
+            0x0123_4567 | 0xa1b2_c3d4 | 0x4558_4543 | 0xd000_fce2 | 0x89ab_cdef | 0 => {
+                return Err(Errno(95))
+            }
+            _ => return Err(Errno(22)),
+        }
+        // Nested PID namespace restart/status translation is not implemented.
+        // Never let its init stop the containing guest environment.
+        if p.linux.vfs.pid_namespace().is_nested() {
+            return Err(Errno(95));
+        }
+        // A guest halt/poweroff ends this userspace kernel using the existing
+        // root-exit teardown. No host reboot, signal or device API is invoked.
+        if p.tgid != 1 {
+            if let Some(mut root) = self.processes.remove(&1) {
+                self.exit(1, &mut root, 0);
+                self.processes.insert(1, root);
+            }
+        }
+        self.exit(pid, p, 0);
+        Ok(None)
+    }
     pub(super) fn sigaltstack(p: &mut Process<C>, new: u64, old: u64) -> Result<u64, Errno> {
         p.signals
             .alt_stack
@@ -139,6 +179,47 @@ mod tests {
 
     use super::super::tests::{kernel, process};
     use super::*;
+    #[test]
+    fn guest_poweroff_checks_authority_magic_and_stops_the_whole_root_group() {
+        let mut k = kernel();
+        let mut p = process();
+        let halt = [0xfee1_dead, 0x2812_1969, 0xcdef_0123, 0, 0, 0];
+        p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        assert_eq!(k.reboot_guest(1, &mut p, [0; 6]), Err(Errno(1)));
+        p.linux.vfs.credentials = trames_vfs::Credentials::default();
+        assert_eq!(k.reboot_guest(1, &mut p, [0; 6]), Err(Errno(22)));
+        assert_eq!(
+            k.reboot_guest(1, &mut p, [halt[0], halt[1], 0x01234567, 0, 0, 0]),
+            Err(Errno(95))
+        );
+        assert!(matches!(p.state, State::Ready));
+        let memory = p.memory.share();
+        let mut thread = p.fork_with_memory(memory);
+        thread.tgid = 1;
+        k.processes.insert(2, thread);
+        assert_eq!(k.reboot_guest(1, &mut p, halt), Ok(None));
+        assert!(matches!(p.state, State::Zombie(0)));
+        assert!(!k.processes.contains_key(&2));
+    }
+    #[test]
+    fn privileged_child_poweroff_finishes_guest_init_instead_of_only_the_caller() {
+        let mut k = kernel();
+        let root = process();
+        let mut child = root.fork();
+        child.tgid = 2;
+        child.parent = 1;
+        k.processes.insert(1, root);
+        assert_eq!(
+            k.reboot_guest(
+                2,
+                &mut child,
+                [0xfee1_dead, 0x2812_1969, 0x4321_fedc, 0, 0, 0]
+            ),
+            Ok(None)
+        );
+        assert!(matches!(child.state, State::Zombie(0)));
+        assert!(matches!(k.processes[&1].state, State::Zombie(0)));
+    }
     #[test]
     fn core_limits_are_process_owned_capability_checked_and_reported() {
         let k = kernel();

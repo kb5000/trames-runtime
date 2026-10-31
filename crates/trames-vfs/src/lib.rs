@@ -132,6 +132,7 @@ pub const AT_FDCWD: i32 = -100;
 pub const O_DIRECTORY: u32 = 0x4000;
 pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_LARGEFILE: u32 = 0x20000;
+pub const O_NOATIME: u32 = 0x40000;
 pub const O_CLOEXEC: u32 = 0x80000;
 pub const O_NONBLOCK: u32 = 0x800;
 pub const O_PATH: u32 = 0x200000;
@@ -166,6 +167,7 @@ struct OpenDescription {
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<std::sync::Weak<OomTask>>,
     network_control: Option<network::Control>,
+    mount_file: Option<Rc<mounts::watch::MountFile>>,
     mount: Option<OpenMount>,
 }
 // The actual file, pipe and lock/notification lifetimes share one allocation.
@@ -729,6 +731,7 @@ impl Default for Vfs {
                         pty: None,
                         namespace: None,
                         network_control: None,
+                        mount_file: None,
                         oom: None,
                         mount: None,
                     }),
@@ -944,7 +947,16 @@ impl Vfs {
         let open = d.open.borrow();
         Self::poll_open(&open, events, pending)
     }
+    fn peek_poll_open(o: &OpenDescription, events: u16, pending: u64) -> u16 {
+        o.mount_file.as_ref().map_or_else(
+            || Self::poll_open(o, events, pending),
+            |file| file.watch.peek(events).0,
+        )
+    }
     fn poll_open(o: &OpenDescription, events: u16, pending: u64) -> u16 {
+        if let Some(file) = &o.mount_file {
+            return file.watch.poll(events).0;
+        }
         if let Some(end) = &o.pty {
             return end.pair.poll(end.master, events);
         }
@@ -1027,6 +1039,7 @@ impl Vfs {
                         pty: None,
                         namespace: None,
                         network_control: None,
+                        mount_file: None,
                         oom: None,
                         mount: None,
                     }),
@@ -1844,6 +1857,7 @@ impl Vfs {
             | O_DIRECTORY
             | O_NOFOLLOW
             | O_LARGEFILE
+            | O_NOATIME
             | O_CLOEXEC
             | O_PATH
             | 0x101000;
@@ -1942,6 +1956,12 @@ impl Vfs {
         {
             let n = node.borrow();
             self.check_device_open(&n, flags)?;
+            if flags & O_NOATIME != 0
+                && self.credentials.fsuid != n.uid
+                && !self.credentials.has_cap(capabilities::FOWNER)
+            {
+                return Err(Errno(1));
+            }
             if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
                 return Err(Errno(6));
             }
@@ -2077,6 +2097,11 @@ impl Vfs {
         } else {
             None
         };
+        let mount_file = if flags & O_PATH == 0 {
+            self.proc_mount_file(&p)
+        } else {
+            None
+        };
         let notification = self.notification_open(&p, &node, flags);
         let read_node = if flags & O_PATH == 0 && flags & 3 == 0 {
             match &node.borrow().content {
@@ -2132,6 +2157,7 @@ impl Vfs {
                     pty,
                     namespace: None,
                     network_control,
+                    mount_file,
                     oom,
                 }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
@@ -2245,7 +2271,17 @@ impl Vfs {
         Ok(())
     }
     pub fn set_status_flags(&mut self, fd: u32, flags: u32) -> Result<()> {
-        self.descriptor(fd)?.open.borrow().flags.set(flags)
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
+            let uid = open
+                .metadata_node()
+                .map_or(open.owner.0, |node| node.borrow().uid);
+            if self.credentials.fsuid != uid && !self.credentials.has_cap(capabilities::FOWNER) {
+                return Err(Errno(1));
+            }
+        }
+        open.flags.set(flags)
     }
     pub fn set_nonblocking(&self, fd: u32, enabled: bool) -> Result<()> {
         self.descriptor(fd)?
@@ -2323,6 +2359,7 @@ impl Vfs {
                         pty: None,
                         namespace: None,
                         network_control: None,
+                        mount_file: None,
                         oom: None,
                         mount: None,
                     }),
@@ -2461,6 +2498,11 @@ impl Vfs {
         let mut o = o_descriptor.open.borrow_mut();
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(file) = &o.mount_file {
+            let bytes = file.read(o.position, count);
+            o.position += bytes.len() as u64;
+            return Ok(bytes);
         }
         if let Some(control) = &o.network_control {
             let data = control.read(o.position, count);
@@ -2721,6 +2763,9 @@ impl Vfs {
         }
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(file) = &o.mount_file {
+            return Ok(file.read(offset, count));
         }
         if let Some(control) = &o.network_control {
             return Ok(control.read(offset, count));

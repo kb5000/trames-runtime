@@ -8,6 +8,9 @@ use super::*;
 #[derive(Clone)]
 pub struct OfdIdentity(std::sync::Weak<SharedOpenDescription>);
 impl OfdIdentity {
+    pub(super) fn is_live(&self) -> bool {
+        self.0.strong_count() != 0
+    }
     pub(super) fn new(open: &Arc<SharedOpenDescription>) -> Self {
         Self(Arc::downgrade(open))
     }
@@ -106,6 +109,7 @@ impl OpenDescription {
             namespace: None,
             oom: None,
             network_control: None,
+            mount_file: None,
             mount,
         }
     }
@@ -117,6 +121,7 @@ impl OpenDescription {
             || self.namespace.is_some()
             || self.oom.is_some()
             || self.network_control.is_some()
+            || self.mount_file.is_some()
             || self.bridge.is_some()
             || self.kernel_log.is_some()
         {

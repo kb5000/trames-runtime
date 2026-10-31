@@ -9,6 +9,7 @@ struct Packet {
     data: Vec<u8>,
     rights: Option<u64>,
     credentials: Option<[u32; 3]>,
+    timestamp: Option<[u64; 2]>,
 }
 struct Data {
     queues: [VecDeque<Packet>; 2],
@@ -18,6 +19,9 @@ struct Data {
     write_closed: [bool; 2],
     epochs: [[u64; 2]; 2],
     passcred: [bool; 2],
+    timestamp: [bool; 2],
+    send_limit: [usize; 2],
+    receive_limit: [usize; 2],
 }
 pub(crate) struct Received {
     pub data: Vec<u8>,
@@ -25,6 +29,7 @@ pub(crate) struct Received {
     pub truncated: bool,
     pub rights: Option<u64>,
     pub credentials: Option<[u32; 3]>,
+    pub timestamp: Option<[u64; 2]>,
 }
 pub(crate) struct Resource {
     kind: u32,
@@ -38,11 +43,21 @@ impl Resource {
             data: Mutex::new(Data {
                 queues: [VecDeque::new(), VecDeque::new()],
                 used: [0; 2],
-                alive: [connected; 2],
+                alive: [connected || kind == 2; 2],
                 read_closed: [false; 2],
                 write_closed: [false; 2],
                 epochs: [[0; 2]; 2],
                 passcred: [false; 2],
+                timestamp: [false; 2],
+                send_limit: [
+                    PIPE_CAPACITY,
+                    if kind == 2 && !connected {
+                        usize::MAX
+                    } else {
+                        PIPE_CAPACITY
+                    },
+                ],
+                receive_limit: [PIPE_CAPACITY; 2],
             }),
             readiness: Arc::default(),
         })
@@ -69,6 +84,32 @@ impl Resource {
     }
     pub fn set_passcred(&self, side: usize, enabled: bool) {
         self.data.lock().unwrap().passcred[side] = enabled;
+    }
+    pub fn set_timestamp(&self, side: usize, enabled: bool) {
+        self.data.lock().unwrap().timestamp[side] = enabled;
+    }
+    pub fn buffer_size(&self, side: usize, receive: bool) -> usize {
+        let data = self.data.lock().unwrap();
+        if receive {
+            data.receive_limit[side]
+        } else {
+            data.send_limit[side]
+        }
+    }
+    pub fn set_buffer(&self, side: usize, receive: bool, requested: u32) {
+        // Linux reports doubled accounting space. The ceiling is an ABI
+        // integer limit; queues allocate payload only as it arrives.
+        let bytes = (u64::from(requested) * 2)
+            .clamp(if receive { 256 } else { 2048 }, i32::MAX as u64) as usize;
+        self.change(|data| {
+            if receive {
+                data.receive_limit[side] = bytes;
+            } else {
+                data.send_limit[side] = bytes;
+            }
+            data.epochs[side][1] = data.epochs[side][1].wrapping_add(1);
+            data.epochs[1 - side][1] = data.epochs[1 - side][1].wrapping_add(1);
+        });
     }
     pub fn right_ids(&self, side: usize) -> Vec<u64> {
         self.data.lock().unwrap().queues[side]
@@ -136,11 +177,19 @@ impl Resource {
             } else {
                 None
             };
+            let timestamp = data.timestamp[peer].then(|| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                [now.as_secs(), u64::from(now.subsec_nanos())]
+            });
             let queue = &mut data.queues[peer];
-            if self.kind != 1 && bytes.len() > PIPE_CAPACITY {
+            if self.kind != 1 && bytes.len() > data.send_limit[side] {
                 return Err(Errno(90));
             }
-            let room = PIPE_CAPACITY - data.used[peer];
+            let room = data.send_limit[side]
+                .min(data.receive_limit[peer])
+                .saturating_sub(data.used[peer]);
             if (self.kind != 1 && (room < bytes.len() || queue.len() >= 128))
                 || (self.kind == 1 && room == 0 && !bytes.is_empty())
             {
@@ -149,9 +198,9 @@ impl Resource {
             let count = room.min(bytes.len());
             let merge = self.kind == 1
                 && rights.is_none()
-                && queue
-                    .back()
-                    .is_some_and(|p| p.rights.is_none() && p.credentials == credentials);
+                && queue.back().is_some_and(|p| {
+                    p.rights.is_none() && p.credentials == credentials && p.timestamp == timestamp
+                });
             if !merge && queue.len() >= 128 {
                 return Err(Errno(11));
             }
@@ -166,6 +215,7 @@ impl Resource {
                     data: bytes[..count].to_vec(),
                     rights,
                     credentials,
+                    timestamp,
                 });
             }
             data.used[peer] += count;
@@ -199,6 +249,7 @@ impl Resource {
                     truncated: false,
                     rights: None,
                     credentials: None,
+                    timestamp: None,
                 }));
             }
             if queue.is_empty() {
@@ -206,7 +257,11 @@ impl Resource {
             }
             if self.kind != 1 {
                 let packet = queue.front().expect("packet");
-                if !allow_rights && (packet.rights.is_some() || packet.credentials.is_some()) {
+                if !allow_rights
+                    && (packet.rights.is_some()
+                        || packet.credentials.is_some()
+                        || packet.timestamp.is_some())
+                {
                     return None;
                 }
                 let length = packet.data.len();
@@ -216,6 +271,7 @@ impl Resource {
                     truncated: count < length,
                     rights: packet.rights,
                     credentials: packet.credentials,
+                    timestamp: packet.timestamp,
                 };
                 if flags & 2 == 0 {
                     queue.pop_front();
@@ -227,11 +283,12 @@ impl Resource {
             let mut bytes = Vec::new();
             let mut rights = None;
             let credentials = queue.front().and_then(|p| p.credentials);
+            let timestamp = queue.front().and_then(|p| p.timestamp);
             for packet in queue.iter() {
-                if packet.credentials != credentials {
+                if packet.credentials != credentials || packet.timestamp != timestamp {
                     break;
                 }
-                if !allow_rights && packet.credentials.is_some() {
+                if !allow_rights && (packet.credentials.is_some() || packet.timestamp.is_some()) {
                     return None;
                 }
                 let n = (count - bytes.len()).min(packet.data.len());
@@ -282,6 +339,7 @@ impl Resource {
                 truncated: false,
                 rights,
                 credentials,
+                timestamp,
             }))
         })
     }
@@ -291,7 +349,9 @@ impl Resource {
         let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
         let queue = &data.queues[side];
         let send_queue = &data.queues[peer];
-        let room = PIPE_CAPACITY - data.used[peer];
+        let room = data.send_limit[side]
+            .min(data.receive_limit[peer])
+            .saturating_sub(data.used[peer]);
         let ready = (if !queue.is_empty() || (eof && self.kind != 2) {
             events & 1
         } else {

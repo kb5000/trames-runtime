@@ -75,6 +75,7 @@ pub struct LocalSocket {
     kind: u32,
     reuse: Cell<[u32; 2]>,
     passcred: Cell<bool>,
+    timestamp: Cell<u32>,
     datagram_peer: RefCell<Weak<LocalSocket>>,
 }
 struct Listener {
@@ -93,6 +94,8 @@ pub struct LocalReceived {
     pub rights: LocalRights,
     pub credentials: Option<[u32; 3]>,
     pub source: Vec<u8>,
+    /// Linux cmsg type and (seconds, fractional units) at queue admission.
+    pub timestamp: Option<(u32, [u64; 2])>,
 }
 impl LocalSocket {
     pub fn readable_bytes(&self) -> Result<usize> {
@@ -115,7 +118,7 @@ impl LocalSocket {
             network,
             pathname_binding: OnceCell::new(),
             channel: RefCell::new(Rc::new(Channel {
-                resource: channel::Resource::new(kind, kind == 2),
+                resource: channel::Resource::new(kind, false),
                 ends: [Weak::new(), Weak::new()],
                 rights: RefCell::default(),
                 next_right: Cell::new(0),
@@ -131,6 +134,7 @@ impl LocalSocket {
             kind,
             reuse: Cell::new([0; 2]),
             passcred: Cell::new(false),
+            timestamp: Cell::new(0),
             datagram_peer: RefCell::new(Weak::new()),
         })
     }
@@ -148,6 +152,9 @@ impl LocalSocket {
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
             channel.resource.set_passcred(side, end.passcred.get());
+            channel
+                .resource
+                .set_timestamp(side, end.timestamp.get() != 0);
         }
         // Connect changes direct-resource eligibility without changing the FD
         // table; another forked table may already have cached this description.
@@ -209,6 +216,22 @@ impl LocalSocket {
     }
 
     pub fn set_reuse(&self, option: u32, value: u32) -> Result<()> {
+        if matches!(option, 29 | 35 | 63 | 64) {
+            self.timestamp.set(if value == 0 { 0 } else { option });
+            self.channel
+                .borrow()
+                .resource
+                .set_timestamp(self.side.get(), value != 0);
+            return Ok(());
+        }
+        if matches!(option, 7 | 8 | 32 | 33) {
+            self.channel.borrow().resource.set_buffer(
+                self.side.get(),
+                matches!(option, 8 | 33),
+                value,
+            );
+            return Ok(());
+        }
         if option == 16 {
             self.passcred.set(value != 0);
             self.channel
@@ -228,10 +251,19 @@ impl LocalSocket {
         Ok(())
     }
     pub fn reuse(&self, option: u32) -> u32 {
+        if matches!(option, 29 | 35 | 63 | 64) {
+            return u32::from(self.timestamp.get() == option);
+        }
         if option == 16 {
             return u32::from(self.passcred.get());
         }
         self.reuse.get()[usize::from(option == 15)]
+    }
+    pub fn buffer_size(&self, receive: bool) -> usize {
+        self.channel
+            .borrow()
+            .resource
+            .buffer_size(self.side.get(), receive)
     }
     pub fn kind(&self) -> u32 {
         self.kind
@@ -391,6 +423,15 @@ impl LocalSocket {
                 None
             },
             source: ancillary.source,
+            timestamp: (self.timestamp.get() != 0)
+                .then_some(received.timestamp)
+                .flatten()
+                .map(|mut stamp| {
+                    if matches!(self.timestamp.get(), 29 | 63) {
+                        stamp[1] /= 1000;
+                    }
+                    (self.timestamp.get(), stamp)
+                }),
         })
     }
     pub fn poll(&self, events: u16) -> u16 {
@@ -490,6 +531,7 @@ impl Vfs {
                     pty: None,
                     namespace: None,
                     network_control: None,
+                    mount_file: None,
                     oom: None,
                     mount: None,
                 }),
@@ -636,6 +678,9 @@ impl Vfs {
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
         LocalSocket::pair(socket, &accepted);
         accepted.set_reuse(16, peer.reuse(16))?;
+        if peer.timestamp.get() != 0 {
+            accepted.set_reuse(peer.timestamp.get(), 1)?;
+        }
         l.pending.push_back(accepted);
         peer.listen_epoch
             .set(peer.listen_epoch.get().wrapping_add(1));

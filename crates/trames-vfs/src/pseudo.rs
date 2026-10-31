@@ -1055,6 +1055,7 @@ impl Vfs {
             pty: None,
             namespace: None,
             network_control: None,
+            mount_file: None,
             oom: None,
             mount: mount.map(OpenMount::Owner),
         })))
@@ -1267,6 +1268,7 @@ impl Vfs {
             original.pty.clone()
         };
         let descriptor = OpenDescription {
+            mount_file: None,
             shared: Arc::new(SharedOpenDescription {
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]

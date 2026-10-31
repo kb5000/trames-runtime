@@ -204,6 +204,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     Kmsg(Arc<kernel_log::Kmsg>),
     PollOnly(Arc<dyn DirectPoll>),
@@ -251,7 +252,11 @@ impl WatchResource {
     fn resolve(&self) -> Option<DirectFd> {
         match self {
             Self::Shared(open) => SharedFd::new(open.upgrade()?).direct_byte(),
-            Self::Owner(fd) => Some(fd.clone()),
+            Self::Owner(fd) => fd
+                .origin
+                .as_ref()
+                .is_none_or(OfdIdentity::is_live)
+                .then(|| fd.clone()),
         }
     }
 }
@@ -368,6 +373,7 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Regular => Vec::new(),
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
@@ -390,7 +396,9 @@ impl DirectFd {
         }
     }
     pub(super) fn snapshot(open: &OpenDescription) -> Option<Self> {
-        let resource = if let Some(log) = &open.kernel_log {
+        let resource = if let Some(file) = &open.mount_file {
+            ByteResource::Mounts(file.watch.clone())
+        } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
         } else if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
             ByteResource::Event(counter.clone())
@@ -457,6 +465,15 @@ impl DirectFd {
         open: &OpenDescription,
         polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
     ) -> Option<Self> {
+        if let Some(file) = &open.mount_file {
+            return Some(Self {
+                resource: ByteResource::Mounts(file.watch.clone()),
+                flags: open.flags.get(),
+                status: open.flags.clone(),
+                _file: None,
+                origin: Some(OfdIdentity::new(&open.shared)),
+            });
+        }
         let resource = match &open.anonymous {
             Some(events::Anonymous::Uring(ring)) => {
                 ByteResource::PollOnly(polls.get(&(Rc::as_ptr(ring) as usize))?.clone())
@@ -490,7 +507,7 @@ impl DirectFd {
     pub fn is_poll_only(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::PollOnly(_) | ByteResource::Regular
+            ByteResource::PollOnly(_) | ByteResource::Regular | ByteResource::Mounts(_)
         )
     }
     pub fn poll_identities(&self) -> Vec<usize> {
@@ -621,7 +638,17 @@ impl DirectFd {
         }
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
+        let ready = self.peek_poll(events);
+        if let ByteResource::Mounts(watch) = &self.resource {
+            if events != 0 {
+                watch.acknowledge(ready.1[0]);
+            }
+        }
+        ready
+    }
+    fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
+            ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular => (events & 5, [0; 2]),
             ByteResource::Kmsg(log) => log.poll(events),
             ByteResource::PollOnly(poll) => poll.poll(events),
@@ -653,7 +680,21 @@ impl DirectFd {
                 };
                 (ready, data.io_epoch)
             }
-            ByteResource::Epoll(_) => unreachable!("nested epoll is rejected at registration"),
+            ByteResource::Epoll(epoll) => {
+                let mut ready = false;
+                let mut generation = 0u64;
+                for (_, state, resource) in &epoll.watches {
+                    let state = state.lock().unwrap();
+                    if state.armed {
+                        if let Some(fd) = resource.resolve() {
+                            let (events, epoch) = fd.peek_poll(state.events as u16);
+                            generation = generation.wrapping_add(epoch[0]).wrapping_add(epoch[1]);
+                            ready |= events != 0 && state.ready(events, epoch);
+                        }
+                    }
+                }
+                (if ready { events & 1 } else { 0 }, [generation, 0])
+            }
         }
     }
     pub fn epoll_wait(&self, max: usize) -> Result<Vec<(u32, u64)>> {
@@ -673,8 +714,11 @@ impl DirectFd {
             if !state.armed {
                 continue;
             }
-            let (ready, epoch) = fd.poll(state.events as u16);
+            let (ready, epoch) = fd.peek_poll(state.events as u16);
             if let Some(event) = state.observe(ready, epoch) {
+                if let ByteResource::Mounts(watch) = &fd.resource {
+                    watch.acknowledge(epoch[0]);
+                }
                 *cursor = Some(*key);
                 result.push(event);
                 if result.len() == max {
@@ -724,9 +768,10 @@ impl DirectFd {
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Timer(timer) => timer.read(count),
             ByteResource::Inotify(queue) => queue.read(count),
-            ByteResource::Epoll(_) | ByteResource::PollOnly(_) | ByteResource::Regular => {
-                Err(Errno(22))
-            }
+            ByteResource::Epoll(_)
+            | ByteResource::PollOnly(_)
+            | ByteResource::Regular
+            | ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Pipe { data, read, .. } => {
                 if !read {
                     return Some(Err(Errno(9)));
@@ -786,6 +831,7 @@ impl DirectFd {
         }
         match &self.resource {
             ByteResource::Kmsg(log) => log.write(bytes),
+            ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
             | ByteResource::PollOnly(_)

@@ -236,6 +236,9 @@ impl Snapshot {
         cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4)
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
+        if cpu.x(8) as u32 == 25 && cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
+            return false;
+        }
         if self.seccomp.mode() == 0 {
             return true;
         }
@@ -312,6 +315,9 @@ impl Snapshot {
                 effect.total()
             }),
             25 if matches!(cpu.x(1), 1..=4) => {
+                if cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
+                    return None;
+                }
                 let result = self.fd_flags.fcntl(cpu.x(0) as u32, cpu.x(1), cpu.x(2));
                 self.direct.record_fd_control();
                 result

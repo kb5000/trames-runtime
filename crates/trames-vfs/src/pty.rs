@@ -212,6 +212,7 @@ impl Vfs {
                     local: None,
                     namespace: None,
                     network_control: None,
+                    mount_file: None,
                     oom: None,
                     mount: end.pair.mount.clone().map(OpenMount::Owner),
                     pty: Some(PtyEnd::new(end.pair.clone(), false)),

@@ -124,7 +124,7 @@ impl Anonymous {
                     state.armed
                         && w.open.upgrade().is_some_and(|o| {
                             let o = o.borrow();
-                            let ready = Vfs::poll_open(&o, state.events as u16, pending);
+                            let ready = Vfs::peek_poll_open(&o, state.events as u16, pending);
                             ready != 0 && state.ready(ready, Vfs::poll_epoch(&o))
                         })
                 }) {
@@ -223,6 +223,7 @@ impl Vfs {
                     pty: None,
                     namespace: None,
                     network_control: None,
+                    mount_file: None,
                     oom: None,
                     mount: None,
                 }),
@@ -319,6 +320,7 @@ impl Vfs {
                 && t.bridge.is_none()
                 && t.pipe.is_none()
                 && t.kernel_log.is_none()
+                && t.mount_file.is_none()
         {
             return Err(Errno(1));
         }
@@ -329,6 +331,7 @@ impl Vfs {
             && t.local.is_none()
             && t.pipe.is_none()
             && t.kernel_log.is_none()
+            && t.mount_file.is_none()
             && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
             && !matches!(
                 t.anonymous,
@@ -337,6 +340,7 @@ impl Vfs {
                         | Anonymous::Timer(_)
                         | Anonymous::Inotify(_)
                         | Anonymous::Uring(_)
+                        | Anonymous::Epoll { .. }
                 )
             )
         {
@@ -345,12 +349,37 @@ impl Vfs {
         if matches!(t.anonymous, Some(Anonymous::Bpf(_))) {
             return Err(Errno(1));
         }
-        if matches!(t.anonymous, Some(Anonymous::Epoll { .. })) {
-            return Err(Errno(95));
-        }
         let key = (target_number, t.id);
+        let nested = matches!(t.anonymous, Some(Anonymous::Epoll { .. }));
         // The caller's descriptor number distinguishes separate dup registrations.
         drop(t);
+        if op == 1 && nested {
+            fn check(
+                at: &OpenHandle,
+                source: &OpenHandle,
+                target: &OpenHandle,
+                chain: &mut Vec<usize>,
+            ) -> Result<()> {
+                let open = at.borrow();
+                if let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous {
+                    if chain.contains(&at.identity()) || chain.len() >= 5 {
+                        return Err(Errno(40));
+                    }
+                    chain.push(at.identity());
+                    for child in watches.values().filter_map(|w| w.open.upgrade()) {
+                        check(&child, source, target, chain)?;
+                    }
+                    if OpenHandle::ptr_eq(at, source) {
+                        check(target, source, target, chain)?;
+                    }
+                    chain.pop();
+                }
+                Ok(())
+            }
+            for descriptor in self.fds.entries().values() {
+                check(&descriptor.open.owned(), &epoll, &target, &mut Vec::new())?;
+            }
+        }
         self.epoll_ctl_key(epoll, target, key, op, events, data)?;
         // Cached worker snapshots include the complete frozen watch set.
         FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -415,6 +444,9 @@ impl Vfs {
         })
     }
     pub(super) fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+        if let Some(file) = &o.mount_file {
+            return file.watch.poll(0).1;
+        }
         if let Some(log) = &o.kernel_log {
             return log.poll(0).1;
         }
@@ -438,6 +470,16 @@ impl Vfs {
         }
         if let Some(Anonymous::Timer(timer)) = &o.anonymous {
             return timer.epoch();
+        }
+        if let Some(Anonymous::Epoll { watches, .. }) = &o.anonymous {
+            let generation = watches
+                .values()
+                .filter_map(|watch| watch.open.upgrade())
+                .map(|open| Self::poll_epoch(&open.borrow()))
+                .fold(0u64, |sum, epoch| {
+                    sum.wrapping_add(epoch[0]).wrapping_add(epoch[1])
+                });
+            return [generation, 0];
         }
         o.pty
             .as_ref()
@@ -494,11 +536,14 @@ impl Vfs {
             };
             let (ready, epoch) = override_ready.unwrap_or_else(|| {
                 (
-                    Self::poll_open(&o, requested, pending),
+                    Self::peek_poll_open(&o, requested, pending),
                     Self::poll_epoch(&o),
                 )
             });
             if let Some(event) = state.observe(ready, epoch) {
+                if let Some(file) = &o.mount_file {
+                    file.watch.acknowledge(epoch[0]);
+                }
                 result.push(event);
                 *cursor = Some(key);
                 if result.len() == max {

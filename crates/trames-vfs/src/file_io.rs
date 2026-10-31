@@ -337,7 +337,7 @@ impl DirectFile {
             }
             result
         };
-        if result.is_ok() && count != 0 {
+        if result.is_ok() && count != 0 && self.prepared.0.status.get() & O_NOATIME == 0 {
             self.data
                 .accessed(self.prepared.0.readonly, self.prepared.0.relatime);
         }
