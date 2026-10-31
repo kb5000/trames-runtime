@@ -52,6 +52,9 @@ pub struct Readiness {
 pub struct IoSubscription {
     source: Arc<Readiness>,
     id: u64,
+    host: Option<crate::HostSubscription>,
+    host_failed: bool,
+    external: bool,
 }
 impl Readiness {
     pub fn subscribe(self: &Arc<Self>, signal: &Arc<IoSignal>) -> IoSubscription {
@@ -66,6 +69,9 @@ impl Readiness {
         IoSubscription {
             source: self.clone(),
             id,
+            host: None,
+            host_failed: false,
+            external: false,
         }
     }
     pub fn notify_atomic(&self) {
@@ -92,6 +98,36 @@ impl Readiness {
         for signal in signals {
             signal.fire();
         }
+    }
+}
+impl IoSubscription {
+    /// Retain a native readiness registration on the existing executor's poller.
+    /// The normal subscribe-then-retry protocol also covers readiness arriving
+    /// before this registration; no service thread is introduced.
+    pub fn with_host(mut self, fd: impl Into<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
+        // A joined single-task executor waits on its descriptor set directly;
+        // it has no HostEvents hub but must still retry after a native wake.
+        self.external = true;
+        if let Some(events) = signal
+            .target
+            .upgrade()
+            .and_then(|target| target.host_events())
+        {
+            match events.subscribe(fd, false, signal) {
+                Ok(host) => self.host = Some(host),
+                Err(_) => self.host_failed = true,
+            }
+        }
+        self
+    }
+    pub fn external(&self) -> bool {
+        self.external
+    }
+    pub fn rearm_host(&self) -> std::io::Result<()> {
+        if self.host_failed {
+            return Err(std::io::Error::other("native subscription failed"));
+        }
+        self.host.as_ref().map_or(Ok(()), |host| host.rearm())
     }
 }
 impl Drop for IoSubscription {

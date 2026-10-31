@@ -1250,6 +1250,12 @@ impl Linux {
             .iter()
             .any(|r| !r.state.borrow().pending.is_empty())
     }
+    pub fn uring_native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
+        self.uring_rings()
+            .iter()
+            .flat_map(|ring| ring.native_wait_fds())
+            .collect()
+    }
     pub fn uring_sockets(&self) -> Vec<(Rc<trames_net::Socket>, u16)> {
         self.uring_rings()
             .iter()

@@ -62,6 +62,10 @@ impl WaitSources {
     }
     pub(super) fn external(&self) -> bool {
         !self.hosts.is_empty()
+            || self
+                .local
+                .values()
+                .any(|entry| entry.value.iter().any(|s| s.external()))
     }
     pub(super) fn refresh(
         &mut self,
@@ -86,7 +90,10 @@ impl WaitSources {
         // remove interests. Do not retain their duplicate FDs or stale wakes.
         self.local.retain(|_, s| s.used);
         self.hosts.retain(|_, s| s.used);
-        true
+        !self
+            .local
+            .values()
+            .any(|entry| entry.value.iter().any(|s| s.rearm_host().is_err()))
     }
 }
 

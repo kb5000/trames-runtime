@@ -29,7 +29,7 @@ pub(super) struct Marks {
     links: Vec<Arc<Link>>,
 }
 #[derive(Default)]
-struct Source {
+pub(super) struct Source {
     watchers: std::sync::Mutex<Vec<(std::sync::Weak<Queue>, i32)>>,
     deleted: std::sync::atomic::AtomicBool,
 }
@@ -434,8 +434,20 @@ impl Vfs {
             return Err(Errno(13));
         }
         let source = n.notifications.source().clone();
+        #[cfg(all(feature = "hostfs", unix))]
+        let native = self
+            .host_for_node(&node)
+            .map(|host| (host, matches!(n.content, Content::Directory)));
         drop(n);
-        instance.add(&source, mask)
+        let wd = instance.add(&source, mask)?;
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some((host, directory)) = native {
+            if let Err(error) = instance.queue.attach_native(wd, &host, source, directory) {
+                let _ = instance.remove(wd);
+                return Err(error);
+            }
+        }
+        Ok(wd)
     }
     pub fn inotify_remove(&self, fd: u32, wd: i32) -> Result<()> {
         self.inotify_instance(fd)?.remove(wd)

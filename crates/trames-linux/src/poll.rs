@@ -34,6 +34,15 @@ struct Entry {
     source: Source,
 }
 impl Entry {
+    fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
+        match &self.source {
+            Source::Direct(fd) => fd.native_wait_fds(),
+            Source::Owner(id) if vfs.matches_open_description(self.fd, id) => {
+                vfs.native_wait_fds_for(self.fd)
+            }
+            _ => Vec::new(),
+        }
+    }
     fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
         matches!(&self.source, Source::Owner(id)
             if vfs.matches_open_description(self.fd, id)
@@ -173,6 +182,13 @@ impl Poll {
     }
 }
 impl RetainedPoll {
+    pub fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
+        self.0
+            .entries
+            .iter()
+            .flat_map(|entry| entry.native_wait_fds(vfs))
+            .collect()
+    }
     /// Query accepted descriptors, never re-import the guest poll buffer.
     pub fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
         self.0
@@ -269,6 +285,13 @@ impl RetainedPoll {
     }
 }
 impl RetainedSelect {
+    pub fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
+        self.sets
+            .iter()
+            .flat_map(|set| set.entries.iter())
+            .flat_map(|entry| entry.native_wait_fds(vfs))
+            .collect()
+    }
     /// Host input remains an event source even with no native socket or PTY.
     pub fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
         self.sets

@@ -2,6 +2,8 @@
 //! Shared event queue and watch admission. No inode/path/owner Rc lives here.
 use super::*;
 use crate::readiness::Readiness;
+#[cfg(all(feature = "hostfs", unix))]
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -10,11 +12,19 @@ struct State {
     queue: VecDeque<Vec<u8>>,
     bytes: usize,
     epoch: u64,
+    #[cfg(all(feature = "hostfs", unix))]
+    native_wds: BTreeSet<i32>,
+    // Native vnode events coalesce. Remember guest events until the next drain
+    // so the host echo does not duplicate an event already emitted by the VFS.
+    #[cfg(all(feature = "hostfs", unix))]
+    echoes: BTreeSet<(i32, u32, Vec<u8>)>,
 }
 #[derive(Default)]
 pub(crate) struct Queue {
     state: Mutex<State>,
     pub(crate) readiness: Arc<Readiness>,
+    #[cfg(all(feature = "hostfs", unix))]
+    native: std::sync::OnceLock<Arc<hostfs::notify::Native>>,
 }
 impl Queue {
     fn change<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -62,12 +72,43 @@ impl Queue {
         Ok(())
     }
     pub(crate) fn remove(&self, wd: i32) -> bool {
-        self.change(|state| state.remove(wd))
+        let removed = self.change(|state| state.remove(wd));
+        #[cfg(all(feature = "hostfs", unix))]
+        if removed {
+            self.retire_native(wd);
+        }
+        removed
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    fn retire_native(&self, wd: i32) {
+        let mut state = self.state.lock().unwrap();
+        let registered = state.native_wds.remove(&wd);
+        state.echoes.retain(|event| event.0 != wd);
+        drop(state);
+        // Closing a native backend can drop the last Source, which re-enters
+        // watch retirement. The already-retired descriptor must not lock that
+        // backend again while its source is being destroyed.
+        if registered {
+            if let Some(native) = self.native.get() {
+                native.remove(wd);
+            }
+        }
     }
     pub(super) fn close(&self) {
         // Final OFD release retires registrations. Weak prepared caches and
         // queue-only capabilities cannot keep the instance active.
-        self.state.lock().unwrap().watches.clear();
+        let mut state = self.state.lock().unwrap();
+        state.watches.clear();
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            state.native_wds.clear();
+            state.echoes.clear();
+        }
+        drop(state);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = self.native.get() {
+            native.close();
+        }
     }
     pub(super) fn send(
         &self,
@@ -77,12 +118,19 @@ impl Queue {
         name: &[u8],
         unlinked: bool,
     ) -> bool {
-        self.change(|state| {
+        let alive = self.change(|state| {
             let Some(&watch) = state.watches.get(&wd) else {
                 return false;
             };
             if mask & watch & ALL == 0 || unlinked && watch & 0x04000000 != 0 {
                 return true;
+            }
+            #[cfg(all(feature = "hostfs", unix))]
+            if state.native_wds.contains(&wd)
+                && mask & hostfs::notify::NATIVE_MASK != 0
+                && state.echoes.len() < MAX_EVENTS
+            {
+                state.echoes.insert((wd, mask & ALL, name.to_vec()));
             }
             state.push(wd, mask, cookie, name);
             if watch & 0x80000000 != 0 {
@@ -91,12 +139,132 @@ impl Queue {
             } else {
                 true
             }
-        })
+        });
+        #[cfg(all(feature = "hostfs", unix))]
+        if !alive {
+            self.retire_native(wd);
+        }
+        alive
+    }
+    pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        let subscription = self.readiness.subscribe(signal);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(fd) = self.native_fd() {
+            return subscription.with_host(fd, signal);
+        }
+        subscription
+    }
+    pub(crate) fn has_native(&self) -> bool {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = self.native.get() {
+            return native.active();
+        }
+        false
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(crate) fn native_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.native
+            .get()
+            .and_then(|n| if n.active() { n.fd() } else { None })
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) fn attach_native(
+        &self,
+        wd: i32,
+        host: &hostfs::HostFile,
+        source: Arc<Source>,
+        directory: bool,
+    ) -> Result<()> {
+        let mask = *self
+            .state
+            .lock()
+            .unwrap()
+            .watches
+            .get(&wd)
+            .ok_or(Errno(22))?;
+        if mask & hostfs::notify::NATIVE_MASK == 0 {
+            self.retire_native(wd);
+            return Ok(());
+        }
+        if self.native.get().is_none() {
+            let _ = self.native.set(Arc::new(hostfs::notify::Native::new()?));
+        }
+        self.native
+            .get()
+            .unwrap()
+            .add(wd, host, source, directory, mask)?;
+        let mut state = self.state.lock().unwrap();
+        if state.watches.contains_key(&wd) {
+            state.native_wds.insert(wd);
+        } else {
+            drop(state);
+            self.native.get().unwrap().remove(wd);
+        }
+        Ok(())
+    }
+    fn pump_native(&self) {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = self.native.get() {
+            // Backend/source drops and scheduler callbacks never run under the
+            // queue mutex. Native state is separate from guest queue state.
+            let events = native.drain().unwrap_or_else(|_| {
+                vec![hostfs::notify::Event {
+                    wd: -1,
+                    mask: 0x4000,
+                    cookie: 0,
+                    name: Vec::new(),
+                }]
+            });
+            let retired = self.change(|state| {
+                for event in events {
+                    if event.wd == -1 {
+                        state.push(-1, 0x4000, 0, b"");
+                        continue;
+                    }
+                    if event.mask & IGNORED != 0 {
+                        state.remove(event.wd);
+                        continue;
+                    }
+                    let Some(&watch) = state.watches.get(&event.wd) else {
+                        continue;
+                    };
+                    if event.mask & watch & ALL == 0 {
+                        continue;
+                    }
+                    if state
+                        .echoes
+                        .contains(&(event.wd, event.mask & ALL, event.name.clone()))
+                    {
+                        continue;
+                    }
+                    state.push(event.wd, event.mask, event.cookie, &event.name);
+                    if watch & 0x80000000 != 0 {
+                        state.remove(event.wd);
+                    }
+                }
+                state.echoes.clear();
+                let retired: Vec<_> = state
+                    .native_wds
+                    .iter()
+                    .filter(|wd| !state.watches.contains_key(wd))
+                    .copied()
+                    .collect();
+                for wd in &retired {
+                    state.native_wds.remove(wd);
+                }
+                retired
+            });
+            for wd in retired {
+                native.remove(wd);
+            }
+        }
     }
     pub(crate) fn available(&self) -> usize {
+        self.pump_native();
         self.state.lock().unwrap().bytes
     }
     pub(crate) fn poll(&self, events: u16) -> (u16, [u64; 2]) {
+        self.pump_native();
         let state = self.state.lock().unwrap();
         (
             if state.bytes != 0 { events & 1 } else { 0 },
@@ -104,6 +272,7 @@ impl Queue {
         )
     }
     pub(crate) fn read(&self, count: usize) -> Result<Vec<u8>> {
+        self.pump_native();
         self.state.lock().unwrap().read(count)
     }
 }

@@ -498,6 +498,14 @@ impl Socket {
     }
 }
 pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
+    wait_with_fds(sockets, &[], timeout)
+}
+/// Wait on native resources and network transports in the same idle executor.
+pub fn wait_with_fds(
+    sockets: &[(Rc<Socket>, u16)],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+    timeout: Duration,
+) -> Result<()> {
     let mut native = Vec::new();
     let mut fabrics: Vec<Fabric> = Vec::new();
     for (s, events) in sockets {
@@ -529,10 +537,10 @@ pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
         duration = duration.min(f.next_wait());
         native.extend(f.native_waiters());
     }
-    if native.is_empty() {
+    if native.is_empty() && fds.is_empty() {
         std::thread::sleep(duration);
     } else {
-        native::wait(&native, duration)?;
+        native::wait_with_fds(&native, fds, duration)?;
     }
     for f in &fabrics {
         f.tick();

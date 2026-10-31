@@ -350,6 +350,21 @@ impl DirectFd {
             _ => false,
         }
     }
+    /// Native interests of this accepted resource, not every open watch.
+    pub fn native_wait_fds(&self) -> Vec<HostFd> {
+        match &self.resource {
+            #[cfg(all(feature = "hostfs", unix))]
+            ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
+            ByteResource::Epoll(epoll) => epoll
+                .watches
+                .iter()
+                .filter(|(_, state, _)| state.lock().unwrap().armed)
+                .filter_map(|(_, _, fd)| fd.resolve())
+                .flat_map(|fd| fd.native_wait_fds())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
             ByteResource::Regular => Vec::new(),
@@ -357,7 +372,7 @@ impl DirectFd {
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => vec![timer.readiness.subscribe(signal)],
-            ByteResource::Inotify(queue) => vec![queue.readiness.subscribe(signal)],
+            ByteResource::Inotify(queue) => vec![queue.subscribe(signal)],
             ByteResource::Pipe { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Unix { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Pty { data, .. } => vec![data.subscribe(signal)],
@@ -841,11 +856,39 @@ impl Vfs {
     }
     /// Live eventfds with retained native producers are external event sources,
     /// just like open native sockets. A plain guest eventfd is not one.
+    pub fn native_wait_fds_for(&self, fd: u32) -> Vec<HostFd> {
+        self.descriptor(fd)
+            .map_or_else(|_| Vec::new(), |d| native_wait_open(&d.open.borrow()))
+    }
+    pub fn native_wait_fds(&self) -> Vec<HostFd> {
+        #[cfg(all(feature = "hostfs", unix))]
+        return self
+            .fds
+            .entries()
+            .values()
+            .filter_map(|descriptor| {
+                let open = descriptor.open.borrow();
+                match &open.control {
+                    Some(events::SharedControl::Inotify(instance)) => {
+                        instance.queue.native_fd().map(Into::into)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        #[cfg(not(all(feature = "hostfs", unix)))]
+        Vec::new()
+    }
     pub fn has_native_event_sources(&self) -> bool {
         self.fds.entries().values().any(|descriptor| {
             let open = descriptor.open.borrow();
-            matches!(&open.control, Some(events::SharedControl::Event(counter))
-                if counter.native_writers.load(Ordering::Relaxed) != 0)
+            match &open.control {
+                Some(events::SharedControl::Event(counter)) => {
+                    counter.native_writers.load(Ordering::Relaxed) != 0
+                }
+                Some(events::SharedControl::Inotify(instance)) => instance.queue.has_native(),
+                _ => false,
+            }
         })
     }
     /// Legacy record readers consume each nonempty iovec independently.
@@ -882,6 +925,30 @@ impl Vfs {
     }
     pub fn direct_descriptors(&self) -> DirectFds {
         self.descriptor_snapshots().1
+    }
+}
+
+fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
+    match &open.anonymous {
+        #[cfg(all(feature = "hostfs", unix))]
+        Some(events::Anonymous::Inotify(instance)) => instance
+            .queue
+            .native_fd()
+            .map(Into::into)
+            .into_iter()
+            .collect(),
+        Some(events::Anonymous::Epoll { watches, .. }) => watches
+            .values()
+            .filter(|watch| watch.state.lock().unwrap().armed)
+            .filter_map(|watch| watch.open.upgrade())
+            .flat_map(|open| native_wait_open(&open.borrow()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+impl RetainedFd {
+    pub fn native_wait_fds(&self) -> Vec<HostFd> {
+        native_wait_open(&self.0.open.borrow())
     }
 }
 

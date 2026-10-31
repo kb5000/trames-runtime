@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! AArch64 Linux syscall ABI. No host syscall is forwarded blindly.
+// Nested io_uring/resource subscriptions retain native readiness capabilities.
+#![recursion_limit = "256"]
 use std::io;
 use trames_execution::Registers;
 pub mod image;

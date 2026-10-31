@@ -947,7 +947,14 @@ impl Vfs {
                 .as_ref()
                 .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
             let host = node.host.get().ok_or(Errno(19))?.clone();
-            return hostfs::private_pages(file.clone(), host, offset, len, executable);
+            return hostfs::private_pages(
+                o_descriptor.open.clone(),
+                file.clone(),
+                host,
+                offset,
+                len,
+                executable,
+            );
         }
         let may_write =
             !readonly && shared && o.flags.get() & 3 == 2 && !sealed && !node.borrow().volatile;

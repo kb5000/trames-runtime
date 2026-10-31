@@ -8,6 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{atomic::AtomicBool, Mutex};
+pub(super) mod native_wait;
+pub(super) mod notify;
 mod private_map;
 pub(super) use private_map::pages as private_pages;
 
@@ -1025,9 +1027,9 @@ impl Vfs {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    struct Fixture(std::path::PathBuf);
+    pub(super) struct Fixture(pub(super) std::path::PathBuf);
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let name = format!(
                 "trames-hostfs-{}-{}",
                 std::process::id(),
@@ -1037,7 +1039,7 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
-        fn vfs(&self, readonly: bool) -> Vfs {
+        pub(super) fn vfs(&self, readonly: bool) -> Vfs {
             let mut vfs = Vfs::default();
             vfs.mkdir_at(AT_FDCWD, b"/host", 0o755).unwrap();
             vfs.mount_host(b"/host", &self.0, readonly).unwrap();
@@ -1414,3 +1416,6 @@ mod tests {
     }
     use std::io::Write;
 }
+
+#[cfg(test)]
+mod interop_tests;

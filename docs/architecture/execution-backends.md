@@ -95,9 +95,39 @@ file has read-only mode bits; cached weak handles preserve older open files
 when the newest same-access description closes.
 
 Current limits are explicit: host MAP_SHARED returns ENODEV, extended attributes
-and special host files are unsupported, and external host edits do not produce
-guest inotify events. Resident private pages do not monitor external native
-changes/truncation, and advisory locks remain local to the guest runtime.
+and special host files are unsupported. Resident private pages do not monitor
+external native changes/truncation. A coherent MAP_SHARED backend additionally
+needs bounded host-fault handling for external truncate and aliases usable by
+both executors; simply exposing a raw file mapping is insufficient.
+
+Host-file flock delegates to the native OFD. Its retained request, dup/fork and
+mapping lifetime is independent of weak byte caches; final OFD release unlocks.
+On macOS, contended blocking flock subscribes to NOTE_FUNLOCK before the deciding
+retry. The existing worker poller or joined executor waits on that descriptor,
+without a blocking worker thread or a periodic lock retry service. On Linux the
+optional adapter supports native nonblocking flock; a contended blocking call
+returns EOPNOTSUPP because this adapter has no Linux unlock notification source.
+POSIX fcntl range locks remain guest-local. Forwarding them unchanged would merge
+all guest owners into one native process; native interoperability needs a
+separate guest-owner/OFD interval representation.
+
+Host inotify instances lazily allocate a native event queue. Apple uses kqueue
+vnode interests and shallow snapshots on directory namespace events; Linux uses
+native inotify through retained descriptor paths. Directory child descriptors
+are allocated only for content/attribute monitoring. Normal unwatched byte I/O
+does not inspect native queues. The original guest event stream remains intact;
+matching native echoes are suppressed during drain. Native events wake existing
+read/poll/epoll/io_uring subscribers through HostEvents. The joined executor also
+waits on the accepted pending resources alongside sockets and retries external
+byte waits, including after numeric FD close/reuse. Unrelated unread watchers do
+not become idle-loop wake interests. No coordinator, service thread or periodic tree scan is added.
+
+External macOS notifications are coalesced observations: transient names may be
+missed, moves across separately watched directories may appear as delete/create,
+and external open/access/close events are unavailable. This is not complete
+Linux inotify history conformance. Native overflow/admission errors remain
+visible. Removing/consuming watches or closing the original OFD retires native
+interests even if prepared queue capabilities survive.
 Ordinary native reads/writes, offsets, append, sparse size,
 fsync, metadata, hard links and namespace operations use the selected host
 filesystem. Its case, ownership and native access rules remain applicable.

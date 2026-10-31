@@ -35,14 +35,22 @@ impl PageSource for Source {
     }
 }
 struct PrivatePage {
+    open: OpenHandle,
     source: Arc<Source>,
     identity: u64,
     host: Arc<HostFile>,
     executable: bool,
 }
 impl PrivatePage {
-    fn new(file: Arc<OpenFile>, host: Arc<HostFile>, offset: u64, executable: bool) -> Rc<Self> {
+    fn new(
+        open: OpenHandle,
+        file: Arc<OpenFile>,
+        host: Arc<HostFile>,
+        offset: u64,
+        executable: bool,
+    ) -> Rc<Self> {
         Rc::new(Self {
+            open,
             source: Arc::new(Source {
                 file,
                 offset,
@@ -125,6 +133,7 @@ impl PageBacking for PrivatePage {
             .and_then(|n| self.source.offset.checked_add(n))
             .ok_or(MemoryError::InvalidRange)?;
         Ok(Self::new(
+            self.open.clone(),
             self.source.file.clone(),
             self.host.clone(),
             offset,
@@ -133,6 +142,7 @@ impl PageBacking for PrivatePage {
     }
 }
 pub(crate) fn pages(
+    open: OpenHandle,
     file: Arc<OpenFile>,
     host: Arc<HostFile>,
     offset: u64,
@@ -147,7 +157,8 @@ pub(crate) fn pages(
     Ok((offset..end)
         .step_by(PAGE_SIZE as usize)
         .map(|at| {
-            PrivatePage::new(file.clone(), host.clone(), at, executable) as Rc<dyn PageBacking>
+            PrivatePage::new(open.clone(), file.clone(), host.clone(), at, executable)
+                as Rc<dyn PageBacking>
         })
         .collect())
 }

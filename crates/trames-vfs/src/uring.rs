@@ -341,6 +341,21 @@ impl Uring {
             .filter_map(|r| r.deadline)
             .min()
     }
+    pub fn native_wait_fds(&self) -> Vec<HostFd> {
+        let state = self.state.borrow();
+        let blocked = self.backpressured(&state);
+        state
+            .pending
+            .iter()
+            .filter(|r| {
+                r.started
+                    && !(blocked && r.sqe.multishot())
+                    && !(r.sqe.opcode() == 6 && r.sqe.multishot() && r.poll_ready != 0)
+            })
+            .filter_map(|r| r.file.as_ref())
+            .flat_map(|file| file.native_wait_fds())
+            .collect()
+    }
     pub fn sockets(&self) -> Vec<(Rc<NetSocket>, u16)> {
         let state = self.state.borrow();
         let blocked = self.backpressured(&state);

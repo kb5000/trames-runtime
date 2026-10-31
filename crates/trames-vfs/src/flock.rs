@@ -11,6 +11,8 @@ pub(super) struct Whole {
 pub(super) struct Owner {
     id: u64,
     whole: Arc<Whole>,
+    #[cfg(all(feature = "hostfs", unix))]
+    native: Option<hostfs::native_wait::Flock>,
 }
 pub(super) fn validate(operation: u32) -> Result<u32> {
     if operation & !15 != 0 || !matches!(operation & !4, 1 | 2 | 8) {
@@ -45,6 +47,13 @@ impl FlockRequest {
     pub fn try_lock(&self) -> Result<()> {
         self.owner.apply(self.operation)
     }
+    pub fn native_wait_fd(&self) -> Option<HostFd> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = &self.owner.native {
+            return native.fd().map(Into::into);
+        }
+        None
+    }
     pub fn nonblocking(&self) -> bool {
         self.operation & 4 != 0
     }
@@ -52,7 +61,12 @@ impl FlockRequest {
         Arc::ptr_eq(&self.owner, &other.owner)
     }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
-        self.owner.whole.readiness.subscribe(signal)
+        let subscription = self.owner.whole.readiness.subscribe(signal);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = &self.owner.native {
+            return native.subscribe(subscription, signal);
+        }
+        subscription
     }
 }
 impl RetainedFd {
@@ -71,6 +85,14 @@ impl RetainedFd {
 impl Owner {
     pub(super) fn apply(&self, operation: u32) -> Result<()> {
         let kind = validate(operation)?;
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = &self.native {
+            let result = native.apply(operation);
+            if kind == 8 {
+                self.whole.readiness.notify_locked();
+            }
+            return result;
+        }
         let mut owners = self.whole.owners.lock().unwrap();
         if owners.get(&self.id) == Some(&kind) {
             return Ok(());
@@ -94,6 +116,12 @@ impl Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(native) = self.native.take() {
+            drop(native);
+            self.whole.readiness.notify_locked();
+            return;
+        }
         let removed = self.whole.owners.lock().unwrap().remove(&self.id).is_some();
         // Last-close can run on any worker. Wake after releasing the inode lock;
         // no owner map scan or acknowledgement is needed to unlock the file.
@@ -112,6 +140,8 @@ impl OpenDescription {
             Arc::new(Owner {
                 id: self.id,
                 whole: node.whole_locks.get_or_init(Arc::default).clone(),
+                #[cfg(all(feature = "hostfs", unix))]
+                native: self.host_file.clone().map(hostfs::native_wait::Flock::new),
             })
         }))
     }

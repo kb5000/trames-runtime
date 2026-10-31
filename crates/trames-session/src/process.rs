@@ -2667,6 +2667,7 @@ impl<C: Cpu> Kernel<C> {
     ) {
         if p.byte_wait.as_ref().is_some_and(|wait| {
             !wait.signal.ready()
+                && !wait.external_wait()
                 && !wait
                     .wake_deadline()
                     .is_some_and(|deadline| Instant::now() >= deadline)
@@ -4610,6 +4611,9 @@ impl<C: Cpu> Kernel<C> {
                         || p.linux.vfs.has_bridge_descriptors()
                         || p.linux.vfs.has_native_services()
                         || p.linux.vfs.has_native_event_sources()
+                        || p.byte_wait.as_ref().is_some_and(|wait|wait.external_wait())
+                        || !p.linux.uring_native_wait_fds().is_empty()
+                        || p.flock_wait.as_ref().is_some_and(|(r,_)| r.native_wait_fd().is_some())
                 }) || self.terminal.is_some() || self.timers.values().any(|t| t.deadline.is_some());
                 if !external {
                     return Err(RuntimeError::Deadlock);
@@ -4621,6 +4625,7 @@ impl<C: Cpu> Kernel<C> {
     fn wait_external(&mut self) {
         let began = Instant::now();
         let mut sockets = Vec::new();
+        let mut native_fds = Vec::new();
         let now = Instant::now();
         let mut timeout = Duration::from_millis(20);
         if self.terminal.is_some() {
@@ -4634,6 +4639,24 @@ impl<C: Cpu> Kernel<C> {
         for (&id, p) in &self.processes {
             if p.frozen(id) {
                 continue;
+            }
+            // Only accepted pending interests can wake this wait. An unread
+            // event on an unrelated inotify FD must not keep the executor hot.
+            if let Some(wait) = &p.byte_wait {
+                native_fds.extend(wait.native_wait_fds());
+            }
+            if let Some(wait) = &p.retained_poll {
+                native_fds.extend(wait.native_wait_fds(&p.linux.vfs));
+            }
+            if let Some(wait) = &p.retained_select {
+                native_fds.extend(wait.native_wait_fds(&p.linux.vfs));
+            }
+            if let State::Blocked(22 | 441, args) = p.state {
+                native_fds.extend(p.linux.vfs.native_wait_fds_for(args[0] as u32));
+            }
+            native_fds.extend(p.linux.uring_native_wait_fds());
+            if let Some((request, _)) = &p.flock_wait {
+                native_fds.extend(request.native_wait_fd());
             }
             sockets.extend(p.linux.uring_sockets());
             for deadline in [
@@ -4728,6 +4751,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         if sockets.is_empty()
+            && native_fds.is_empty()
             && self
                 .processes
                 .values()
@@ -4736,11 +4760,17 @@ impl<C: Cpu> Kernel<C> {
             // Native completion retains an unpark token, including when it
             // arrives after the last ready check but before this park.
             std::thread::park_timeout(timeout);
-        } else if sockets.is_empty() || timeout < Duration::from_millis(1) {
+        } else if (sockets.is_empty() && native_fds.is_empty())
+            || timeout < Duration::from_millis(1)
+        {
             std::thread::sleep(timeout.min(Duration::from_millis(1)));
-        } else if trames_net::wait(&sockets, timeout).is_err() {
-            // Native adapter failures are surfaced by the next guest IO/poll.
-            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            use std::os::fd::AsFd;
+            let fds: Vec<_> = native_fds.iter().map(|fd| fd.as_fd()).collect();
+            if trames_net::wait_with_fds(&sockets, &fds, timeout).is_err() {
+                // Native adapter failures are surfaced by the next guest IO/poll.
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         self.idle += began.elapsed();
     }

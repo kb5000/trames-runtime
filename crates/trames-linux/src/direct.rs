@@ -47,8 +47,14 @@ impl RetainedByte {
     }
 }
 impl PendingIo {
+    pub fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
+        self.retained_byte
+            .as_ref()
+            .map_or_else(Vec::new, |file| file.fd.native_wait_fds())
+    }
     pub fn external_wait(&self) -> bool {
         self.host_subscription.is_some()
+            || self._subscriptions.iter().any(|s| s.external())
             || self.uring.as_ref().is_some_and(|w| w.external())
             || self.poll_uring.as_ref().is_some_and(|w| w.external())
     }
@@ -956,6 +962,14 @@ impl DirectSyscalls {
             return self.urings.resume(pending, memory);
         }
         pending.signal.reset();
+        if pending
+            ._subscriptions
+            .iter()
+            .any(|s| s.rearm_host().is_err())
+        {
+            return IoAttempt::Checkpoint;
+        }
+
         if let Some(request) = &pending.flock {
             return match request.try_lock() {
                 Err(Errno(11)) => IoAttempt::Blocked(pending),

@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::{
@@ -35,6 +35,11 @@ impl HostFd {
 impl From<OwnedFd> for HostFd {
     fn from(fd: OwnedFd) -> Self {
         Self { fd, _lease: None }
+    }
+}
+impl AsFd for HostFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 impl AsRawFd for HostFd {

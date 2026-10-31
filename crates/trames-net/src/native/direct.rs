@@ -197,7 +197,7 @@ mod tests {
         let direct = socket.direct_tcp().unwrap();
         assert_eq!(direct.recv(1, 0), Err(NetError(11)));
         peer.write_all(b"hello").unwrap();
-        wait(&[(socket.clone(), 1)], Duration::from_secs(2)).unwrap();
+        wait_with_fds(&[(socket.clone(), 1)], &[], Duration::from_secs(2)).unwrap();
         assert_eq!(direct.recv(5, MSG_PEEK).unwrap(), b"hello");
         assert_eq!(network.links()[0].rx_bytes, 0);
         assert_eq!(socket.recv(5, 0).unwrap().data, b"hello");
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(direct.recv(MAX_TRANSFER + 1, 0), Err(NetError(22)));
         assert_eq!(direct.send(b"x", MSG_PEEK), Err(NetError(95)));
         peer.shutdown(Shutdown::Write).unwrap();
-        wait(&[(socket.clone(), 1)], Duration::from_secs(2)).unwrap();
+        wait_with_fds(&[(socket.clone(), 1)], &[], Duration::from_secs(2)).unwrap();
         assert_eq!(direct.recv(1, 0), Ok(vec![]));
     }
     #[test]
@@ -279,7 +279,7 @@ mod tests {
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         // Darwin may complete connect before the nonblocking listener's accept
         // queue is readable. Preserve the assertion after its real readiness.
-        wait(&[(listener.clone(), 1)], Duration::from_secs(2)).unwrap();
+        wait_with_fds(&[(listener.clone(), 1)], &[], Duration::from_secs(2)).unwrap();
         let (accepted, _) = listener.accept().unwrap();
         let direct = accepted.direct_tcp().unwrap();
         let lease = direct.retain().unwrap();
@@ -296,7 +296,7 @@ mod tests {
         let direct = socket.direct_tcp().unwrap();
         let before = socket.poll_epoch().unwrap()[0];
         peer.write_all(b"first").unwrap();
-        wait(&[(socket.clone(), 1)], Duration::from_secs(2)).unwrap();
+        wait_with_fds(&[(socket.clone(), 1)], &[], Duration::from_secs(2)).unwrap();
         let worker = direct.clone();
         let first = std::thread::spawn(move || worker.poll_epoch().unwrap()[0])
             .join()
@@ -311,7 +311,7 @@ mod tests {
         });
         assert_eq!(direct.recv(5, 0).unwrap(), b"first");
         peer.write_all(b"second").unwrap();
-        wait(&[(socket.clone(), 1)], Duration::from_secs(2)).unwrap();
+        wait_with_fds(&[(socket.clone(), 1)], &[], Duration::from_secs(2)).unwrap();
         let second = socket.poll_epoch().unwrap()[0];
         assert_ne!(second, first);
         assert_eq!(direct.poll_epoch().unwrap()[0], second);

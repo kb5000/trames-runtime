@@ -58,7 +58,11 @@ pub enum NetworkMode {
 }
 /// The scheduler waits on a bounded, deduplicated set of opaque socket handles.
 /// No guest descriptor number is used as a host descriptor.
-pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
+pub fn wait_with_fds(
+    sockets: &[(Rc<Socket>, u16)],
+    extra: &[std::os::fd::BorrowedFd<'_>],
+    timeout: Duration,
+) -> Result<()> {
     let has_dns = sockets.iter().any(|(s, _)| !s.dns.borrow().is_empty());
     let timeout = if has_dns {
         timeout.min(Duration::from_millis(2))
@@ -95,6 +99,7 @@ pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
             PollFd::new(socket.native.as_fd(), flags)
         })
         .collect();
+    fds.extend(extra.iter().map(|fd| PollFd::new(*fd, PollFlags::POLLIN)));
     let timeout = PollTimeout::try_from(timeout).map_err(|_| NetError(22))?;
     match poll(&mut fds, timeout) {
         Ok(_) | Err(HostErrno::EINTR) => Ok(()),
