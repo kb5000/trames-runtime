@@ -8,16 +8,30 @@ use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 /// A retained event object for native asynchronous completions. It carries no
 /// guest descriptor-table borrow or guest pointer, and does not resolve a reused FD.
 #[derive(Clone)]
-pub struct NativeEvent(Arc<EventCounter>);
+pub struct NativeEvent(Arc<NativeWriter>);
+struct NativeWriter {
+    counter: Arc<EventCounter>,
+    owner: std::thread::Thread,
+}
+impl Drop for NativeWriter {
+    fn drop(&mut self) {
+        self.counter.native_writers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 impl NativeEvent {
     pub fn notify(&self) {
         // Saturation already leaves the level-triggered descriptor readable.
-        let _ = self.0.write(&1u64.to_le_bytes());
+        let _ = self.0.counter.write(&1u64.to_le_bytes());
+        // Workers use ordinary resource subscriptions. The joined owner may
+        // instead be parked with every guest task blocked; retain its wake
+        // token even if completion wins the race with park_timeout().
+        self.0.owner.unpark();
     }
 }
 
 pub(super) struct EventCounter {
     count: AtomicU64,
+    native_writers: AtomicU64,
     semaphore: bool,
     readiness: Arc<Readiness>,
     epoch: [AtomicU64; 2],
@@ -26,6 +40,7 @@ impl EventCounter {
     pub(super) fn new(count: u64, semaphore: bool) -> Self {
         Self {
             count: AtomicU64::new(count),
+            native_writers: AtomicU64::new(0),
             semaphore,
             readiness: Arc::default(),
             epoch: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -815,10 +830,23 @@ impl Vfs {
         let open = descriptor.open.borrow();
         match &open.control {
             Some(events::SharedControl::Event(counter)) if open.flags.get() & O_PATH == 0 => {
-                Ok(NativeEvent(counter.clone()))
+                counter.native_writers.fetch_add(1, Ordering::Relaxed);
+                Ok(NativeEvent(Arc::new(NativeWriter {
+                    counter: counter.clone(),
+                    owner: std::thread::current(),
+                })))
             }
             _ => Err(Errno(22)),
         }
+    }
+    /// Live eventfds with retained native producers are external event sources,
+    /// just like open native sockets. A plain guest eventfd is not one.
+    pub fn has_native_event_sources(&self) -> bool {
+        self.fds.entries().values().any(|descriptor| {
+            let open = descriptor.open.borrow();
+            matches!(&open.control, Some(events::SharedControl::Event(counter))
+                if counter.native_writers.load(Ordering::Relaxed) != 0)
+        })
     }
     /// Legacy record readers consume each nonempty iovec independently.
     /// A single inotify event cannot be split across two short destinations.
@@ -1062,6 +1090,43 @@ mod tests {
             vfs.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(),
             vec![(1, 123)]
         );
+    }
+    #[test]
+    fn native_producer_liveness_follows_the_retained_event_and_its_live_descriptors() {
+        let mut vfs = Vfs::default();
+        let fd = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        assert!(!vfs.has_native_event_sources());
+        let event = vfs.native_event(fd).unwrap();
+        let alias = vfs.dup(fd, 0, false).unwrap();
+        assert!(vfs.has_native_event_sources());
+        let copy = event.clone();
+        drop(event);
+        assert!(vfs.has_native_event_sources());
+        vfs.close(fd).unwrap();
+        assert!(vfs.has_native_event_sources());
+        vfs.close(alias).unwrap();
+        let reused = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        assert_eq!(fd, reused);
+        assert!(!vfs.has_native_event_sources());
+        drop(copy);
+        let event = vfs.native_event(reused).unwrap();
+        assert!(vfs.has_native_event_sources());
+        drop(event);
+        assert!(!vfs.has_native_event_sources());
+    }
+    #[test]
+    fn native_completion_preserves_a_joined_owner_wake_before_park() {
+        let mut vfs = Vfs::default();
+        let fd = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        let event = vfs.native_event(fd).unwrap();
+        // Consume any pre-existing park token; completion then wins the race
+        // with the owner's idle park, with no subscription/CPU worker running.
+        std::thread::park_timeout(std::time::Duration::ZERO);
+        std::thread::spawn(move || event.notify()).join().unwrap();
+        let began = std::time::Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_secs(2));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(vfs.read(fd, 8).unwrap(), 1u64.to_le_bytes());
     }
     #[test]
     fn native_completion_retains_the_original_event_after_close_and_fd_reuse() {

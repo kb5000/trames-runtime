@@ -4631,6 +4631,7 @@ impl<C: Cpu> Kernel<C> {
                             && p.linux.vfs.live_sockets() != 0)
                         || p.linux.vfs.has_bridge_descriptors()
                         || p.linux.vfs.has_native_services()
+                        || p.linux.vfs.has_native_event_sources()
                 }) || self.terminal.is_some() || self.timers.values().any(|t| t.deadline.is_some());
                 if !external {
                     return Err(RuntimeError::Deadlock);
@@ -4748,7 +4749,16 @@ impl<C: Cpu> Kernel<C> {
                 _ => {}
             }
         }
-        if sockets.is_empty() || timeout < Duration::from_millis(1) {
+        if sockets.is_empty()
+            && self
+                .processes
+                .values()
+                .any(|p| p.linux.vfs.has_native_event_sources())
+        {
+            // Native completion retains an unpark token, including when it
+            // arrives after the last ready check but before this park.
+            std::thread::park_timeout(timeout);
+        } else if sockets.is_empty() || timeout < Duration::from_millis(1) {
             std::thread::sleep(timeout.min(Duration::from_millis(1)));
         } else if trames_net::wait(&sockets, timeout).is_err() {
             // Native adapter failures are surfaced by the next guest IO/poll.
@@ -5702,6 +5712,38 @@ mod tests {
         assert!(p.byte_wait.is_none());
         assert!(p.retained_byte.is_none());
         assert_eq!(p.linux.vfs.read(replacement, 1).unwrap(), b"n");
+    }
+
+    #[test]
+    fn joined_native_event_wait_is_external_until_completion() {
+        let mut k = kernel();
+        let mut p = process();
+        let fd = p.linux.vfs.eventfd(0, 0).unwrap();
+        let event = p.linux.vfs.native_event(fd).unwrap();
+        let mut io = trames_linux::CapturedOutput::default();
+        k.call(1, &mut p, 63, [fd as u64, 0x1000, 8, 0, 0, 0], &mut io);
+        assert!(matches!(p.state, State::Blocked(63, _)));
+        let code: Vec<_> = [0xd2800000u32, 0xd2800ba8, 0xd4000001]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        p.memory.write(0x4000, &code).unwrap();
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RX)
+            .unwrap();
+        k.processes.insert(1, p);
+        let completion = event.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            completion.notify();
+        });
+        // No native socket, terminal, guest producer or timer can wake this task.
+        // The old idle liveness test returned Deadlock before the callback.
+        let result = k.drive(&mut io, 1000);
+        producer.join().unwrap();
+        assert_eq!(result.unwrap().code, 0);
+        assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 1);
+        drop(event); // The native surface retains its producer through the wait.
     }
 
     #[test]

@@ -38,6 +38,25 @@ and caller-supplied extension auxv entries. Mac must not advertise the
 interpreter's larger emulated ISA. Hardware reports instruction count as
 unavailable; it does not invent an exact software instruction budget.
 
+## External native completions
+
+An asynchronous native producer retains the actual eventfd object, independently
+of its descriptor number. A shared producer lease marks that event as an external
+source while a live descriptor still refers to it. Plain guest eventfds do not
+prevent deadlock detection; closing/reusing a descriptor does not make an old
+callback signal its replacement. Cloning a callback shares the existing lease,
+without changing per-frame liveness counters.
+
+Completion uses the event counter's ordinary readiness subscriptions for workers
+and unparks the joined owner captured when it created the native producer. The
+park token survives completion between the final readiness check and idle wait.
+With no native sockets to wait on, the joined scheduler parks until completion
+or its existing deadline instead of sleeping in one-millisecond increments. Mixed
+native-socket waits retain the existing bounded network wait. No new service
+thread, polling bus or guest-wide lock is introduced. This fixes FFmpeg reporting
+`all virtual processes are blocked without an event source` while VideoToolbox
+still owns an outstanding hardware decode.
+
 ## Mac hardware path
 
 The Mac adapter creates a hardware VM/vCPU object without booting a Linux kernel,
