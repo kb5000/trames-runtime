@@ -1509,3 +1509,41 @@ fn staged_population_publishes_once_and_restores_checkpointing_after_error_or_pa
     drop(v);
     assert!(dir.open().stat_at(AT_FDCWD, b"/normal").is_ok());
 }
+
+#[test]
+fn hardlinked_symlinks_keep_inode_identity_and_resolve_relative_to_each_parent() {
+    let root = Temp::new();
+    {
+        let mut v = root.open();
+        v.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/b", 0o755).unwrap();
+        v.import_file(b"/a/target", b"a".to_vec()).unwrap();
+        v.import_file(b"/b/target", b"b".to_vec()).unwrap();
+        v.symlink_at(b"target", AT_FDCWD, b"/a/link").unwrap();
+        v.link_at(AT_FDCWD, b"/a/link", AT_FDCWD, b"/b/link")
+            .unwrap();
+        let a = v.stat_at_flags(AT_FDCWD, b"/a/link", true).unwrap();
+        let b = v.stat_at_flags(AT_FDCWD, b"/b/link", true).unwrap();
+        assert_eq!(&a[8..16], &b[8..16]);
+        assert_eq!(v.readlink_at(AT_FDCWD, b"/b/link").unwrap(), b"target");
+        v.sync().unwrap();
+    }
+    {
+        let mut v = root.open();
+        for (path, expected) in [(b"/a/link", b"a"), (b"/b/link", b"b")] {
+            let fd = v.open_at(AT_FDCWD, path, 0, 0).unwrap();
+            assert_eq!(v.read(fd, 1).unwrap(), expected);
+            v.close(fd).unwrap();
+        }
+        v.unlink_at(AT_FDCWD, b"/a/link", false).unwrap();
+        assert_eq!(v.readlink_at(AT_FDCWD, b"/b/link").unwrap(), b"target");
+        assert_eq!(
+            u32::from_le_bytes(
+                v.stat_at_flags(AT_FDCWD, b"/b/link", true).unwrap()[20..24]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+    }
+}

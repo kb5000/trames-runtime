@@ -1647,6 +1647,7 @@ impl Vfs {
             || !matches!(
                 source.borrow().content,
                 Content::File(_)
+                    | Content::Symlink(_)
                     | Content::Null
                     | Content::Terminal
                     | Content::Device(_)
