@@ -25,6 +25,8 @@ impl Umask {
 
 #[derive(Clone, Default)]
 pub(super) struct Paths {
+    #[cfg(all(feature = "hostfs", unix))]
+    pub host_cwd: Option<Arc<hostfs::OpenFile>>,
     pub cwd_node: Option<NodeRef>,
     pub root_node: Option<NodeRef>,
     pub cwd_mount: Option<Rc<Mount>>,

@@ -22,6 +22,10 @@ impl Vfs {
     ) -> Result<AttributeNode> {
         if let Some(path) = path {
             let at = self.resolve_final(fd, path, follow)?;
+            #[cfg(all(feature = "hostfs", unix))]
+            if at.filesystem(self).host.is_some() {
+                return Err(Errno(95));
+            }
             if write {
                 at.writable()?;
             }
@@ -29,6 +33,10 @@ impl Vfs {
         } else {
             let open_descriptor = self.descriptor(fd as u32)?;
             let open = open_descriptor.open.borrow();
+            #[cfg(all(feature = "hostfs", unix))]
+            if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
+                return Err(Errno(95));
+            }
             if open.flags.get() & O_PATH != 0 {
                 return Err(Errno(9));
             }

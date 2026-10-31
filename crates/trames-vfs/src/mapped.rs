@@ -901,6 +901,12 @@ impl Vfs {
     ) -> Result<Vec<Rc<dyn PageBacking>>> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
+        #[cfg(all(feature = "hostfs", unix))]
+        if o.host_file.is_some() {
+            // A copied guest page is not a coherent native MAP_SHARED alias.
+            // Keep host mapping authority explicit until that backend exists.
+            return Err(Errno(19));
+        }
         let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
             ring.mapping_offset(offset, len, shared)?
         } else {

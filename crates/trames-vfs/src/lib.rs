@@ -5,6 +5,8 @@ pub mod capabilities;
 mod cgroup;
 mod fs_context;
 mod fs_data;
+#[cfg(all(feature = "hostfs", unix))]
+mod hostfs;
 use fs_context::FsContext;
 pub use fs_context::Umask;
 use fs_data::{FsBorrow, FsHandle};
@@ -168,6 +170,8 @@ struct OpenDescription {
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Endpoint/namespace control projections above still retain owner ownership.
 struct SharedOpenDescription {
+    #[cfg(all(feature = "hostfs", unix))]
+    host_file: Option<Arc<hostfs::OpenFile>>,
     native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
     control: Option<events::SharedControl>,
@@ -258,6 +262,10 @@ enum Content {
 }
 type NodeRef = Arc<Inode>;
 struct Inode {
+    #[cfg(all(feature = "hostfs", unix))]
+    mount_target: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "hostfs", unix))]
+    host: std::sync::OnceLock<Arc<hostfs::HostFile>>,
     identity: u64,
     state: SharedCell<Node>,
     length: std::sync::OnceLock<trames_shared::LogicalSize>,
@@ -266,6 +274,10 @@ impl Inode {
     fn new(mut node: Node) -> Self {
         node.identity = trames_memory::new_backing_identity();
         Self {
+            #[cfg(all(feature = "hostfs", unix))]
+            mount_target: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(feature = "hostfs", unix))]
+            host: std::sync::OnceLock::new(),
             identity: node.identity,
             state: SharedCell::new(node),
             length: std::sync::OnceLock::new(),
@@ -677,6 +689,8 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            #[cfg(all(feature = "hostfs", unix))]
+                            host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
@@ -971,6 +985,8 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            #[cfg(all(feature = "hostfs", unix))]
+                            host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
@@ -1011,6 +1027,18 @@ impl Vfs {
     ) -> Result<()> {
         let path = path.into();
         let filesystem = path.filesystem(self);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &filesystem.host {
+            let node = host.create(&filesystem, &path.key, &content, mode)?;
+            self.notification_link(&path, &node, true);
+            self.notification_entry(
+                &path,
+                inotify::CREATE,
+                0,
+                matches!(content, Content::Directory),
+            );
+            return Ok(());
+        }
         let parent = if path == b"/" {
             None
         } else {
@@ -1117,6 +1145,12 @@ impl Vfs {
             }
             if let Some(node) = self.pseudo_node(path)? {
                 return Ok(node);
+            }
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(mount) = path.mount() {
+            if let Some(host) = &mount.fs.host {
+                return host.lookup(&mount.fs, key);
             }
         }
         path.mount()
@@ -1575,6 +1609,8 @@ impl Vfs {
             return Err(Errno(18));
         }
         let filesystem = dest.filesystem(self);
+        #[cfg(all(feature = "hostfs", unix))]
+        let host_source = source.key.clone();
         let source = self.node(source)?;
         if self.node(dest).is_ok() {
             return Err(Errno(17));
@@ -1596,6 +1632,10 @@ impl Vfs {
         }
         if filesystem.borrow().paths.len() >= filesystem.borrow().limits.nodes {
             return Err(Errno(28));
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &filesystem.host {
+            host.link(&host_source, &dest.key)?;
         }
         let old_mode = source.borrow().mode;
         {
@@ -1694,6 +1734,35 @@ impl Vfs {
         }
         self.check_parent_write(&p)?;
         let filesystem = p.filesystem(self);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &filesystem.host {
+            host.unlink(&p.key, directory)?;
+            let mut fs = filesystem.borrow_mut();
+            fs.paths.remove(&p.key);
+            if is_dir {
+                let mut prefix = p.key.clone();
+                prefix.push(b'/');
+                let stale: Vec<_> = fs
+                    .paths
+                    .range(prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in stale {
+                    fs.paths.remove(&key);
+                }
+            }
+            drop(fs);
+            let links = if is_dir {
+                0
+            } else {
+                node.borrow().links.saturating_sub(1)
+            };
+            node.borrow_mut().links = links;
+            self.notification_entry(&p, inotify::DELETE, 0, is_dir);
+            self.notification_link(&p, &node, false);
+            return Ok(());
+        }
         if is_dir {
             let mut prefix = p.clone();
             prefix.push(b'/');
@@ -1880,6 +1949,14 @@ impl Vfs {
         if flags & O_PATH == 0 && flags & 3 != 0 {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
         }
+        #[cfg(all(feature = "hostfs", unix))]
+        let host_file = p
+            .filesystem(self)
+            .host
+            .as_ref()
+            .map(|host| host.lease(&node, flags))
+            .transpose()?
+            .flatten();
         {
             let mut n = node.borrow_mut();
             if flags & 0x200 != 0
@@ -1973,6 +2050,8 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        #[cfg(all(feature = "hostfs", unix))]
+                        host_file,
                         native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
                         control: None,
@@ -2174,6 +2253,8 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            #[cfg(all(feature = "hostfs", unix))]
+                            host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             control: None,
@@ -2525,9 +2606,22 @@ impl Vfs {
                 if b.growth_charge(end) > available {
                     return Err(Errno(28));
                 }
-                let written = b.write_at(position, bytes)?;
+                #[cfg(all(feature = "hostfs", unix))]
+                let native_append = if o.flags.get() & 0x400 != 0 {
+                    b.append_host(bytes).transpose()?
+                } else {
+                    None
+                };
+                #[cfg(not(all(feature = "hostfs", unix)))]
+                let native_append: Option<(usize, u64)> = None;
+                let (written, end) = if let Some((written, end)) = native_append {
+                    (written, end)
+                } else {
+                    let written = b.write_at(position, bytes)?;
+                    (written, position + written as u64)
+                };
                 if offset.is_none() {
-                    file_position.value = position + written as u64;
+                    file_position.value = end;
                 }
                 Ok(written)
             }
@@ -2856,6 +2950,10 @@ impl Vfs {
             }
         }
         let p = self.resolve_final(dirfd, path, !nofollow)?;
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &p.filesystem(self).host {
+            return host.stat_at(&p.key);
+        }
         let n = self.node(&p)?;
         let mount = p.mount.map(OpenMount::Owner);
         let out = self.stat_node(&n.borrow(), mount.as_ref());
@@ -2867,6 +2965,10 @@ impl Vfs {
         self.stat_open(&open)
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(file) = &o.host_file {
+            return file.stat();
+        }
         if let Some(image) = &o.native_image {
             let mut stat = [0; 128];
             let info = image.info();
@@ -2959,6 +3061,10 @@ impl Vfs {
         }
         let mount = self.mount_for_path(self.descriptor(fd)?.open.borrow().mount.as_ref());
         let mut paths = self.context.paths.borrow_mut();
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            paths.host_cwd = self.descriptor(fd)?.open.borrow().host_file.clone();
+        }
         paths.cwd_mount = mount;
         paths.cwd_node = Some(node);
         Ok(())
@@ -2972,7 +3078,19 @@ impl Vfs {
         if !self.allowed(&n.borrow(), 1) {
             return Err(Errno(13));
         }
+        #[cfg(all(feature = "hostfs", unix))]
+        let host_cwd = p
+            .filesystem(self)
+            .host
+            .as_ref()
+            .map(|host| host.lease(&n, 0))
+            .transpose()?
+            .flatten();
         let mut paths = self.context.paths.borrow_mut();
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            paths.host_cwd = host_cwd;
+        }
         paths.cwd_mount = p.mount;
         paths.cwd_node = Some(n);
         Ok(())
@@ -2986,6 +3104,13 @@ impl Vfs {
         }
         let p = self.location(node, &self.mount_for_path(o.mount.as_ref()))?;
         let filesystem = p.filesystem(self);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &filesystem.host {
+            let children = host.children(&p.key)?;
+            let inode = node.borrow().inode;
+            let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
+            return Self::encode_host_directory(&mut o, count, children, inode, parent);
+        }
         let fs = filesystem.borrow();
         let inode = node.borrow().inode;
         let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;

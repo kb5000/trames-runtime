@@ -292,6 +292,14 @@ impl Vfs {
             return Err(Errno(1));
         }
         let old = (n.uid, n.gid, n.mode, n.times[2]);
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            drop(n);
+            if let Some(host) = self.host_for_node(&node) {
+                host.chown(&node, uid, gid)?;
+            }
+            n = node.borrow_mut();
+        }
         if uid != u32::MAX {
             n.uid = uid;
         }

@@ -405,6 +405,10 @@ impl DirectFile {
         }))
     }
     pub fn stat(&self) -> Result<[u8; 128]> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(result) = self.data.host_stat() {
+            return result;
+        }
         let mut out = self.prepared.0.stat;
         out[48..56].copy_from_slice(&self.data.len().to_le_bytes());
         out[64..72].copy_from_slice(&self.data.blocks()?.to_le_bytes());

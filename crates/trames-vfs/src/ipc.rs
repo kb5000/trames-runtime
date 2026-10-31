@@ -396,6 +396,8 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        #[cfg(all(feature = "hostfs", unix))]
+                        host_file: None,
                         native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
                         control: None,

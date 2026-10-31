@@ -57,6 +57,37 @@ thread, polling bus or guest-wide lock is introduced. This fixes FFmpeg reportin
 `all virtual processes are blocked without an event source` while VideoToolbox
 still owns an outstanding hardware decode.
 
+## Optional host directory capabilities
+
+`trames-vfs` exposes `Vfs::mount_host(target, directory, readonly)` with the
+opt-in `hostfs` feature on Apple/ARM64 Linux. The embedding product selects the
+directory; Linux `mount(2)` cannot manufacture a host pathname grant. Mounts are
+session-local and do not change the private object-store manifest. The iPad
+product does not enable this feature by default.
+
+Each mount retains an authorized native directory descriptor. Parent lookup
+never follows native symlinks: Apple uses `O_NOFOLLOW_ANY`, while Linux walks
+anchored components. Symbolic-link targets are interpreted by the guest path
+resolver. Native inode handles are retained by open descriptions, cwd/directory
+contexts and pending I/O, including across rename/unlink/FD reuse.
+Closed cached metadata does not retain one native file descriptor per inode.
+Bulk reads use the existing bounded disk pool. Native data is neither copied
+into the private store nor charged to its logical-byte budget.
+
+Normal files do not query the host backend or participate in a polling mirror.
+Monotonic mount/target markers bypass unrelated mount-table scans; mount moves
+and namespace copies mark new attachments and conservative positives remain safe.
+The host identity index never spans native lookup or namespace-lock acquisition.
+Metadata admission reconciles concurrent candidates, and dead weak registrations
+are collected at allocation boundaries rather than on ordinary reads.
+
+Current limits are explicit: host-file mmap returns ENODEV, extended attributes
+and special host files are unsupported, and external host edits do not produce
+guest inotify events. Ordinary native reads/writes, offsets, append, sparse size,
+fsync, metadata, hard links and namespace operations use the selected host
+filesystem. Its case, ownership and native access rules remain applicable.
+See the [Mac usage and native comparison](https://github.com/kb5000/trames-mac/blob/main/docs/guides/file-sharing.md).
+
 ## Mac hardware path
 
 The Mac adapter creates a hardware VM/vCPU object without booting a Linux kernel,

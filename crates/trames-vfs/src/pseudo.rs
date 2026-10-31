@@ -1013,6 +1013,8 @@ impl Vfs {
         };
         Ok(Some(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
@@ -1249,6 +1251,8 @@ impl Vfs {
         };
         let descriptor = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 control: None,
@@ -1318,12 +1322,12 @@ impl Vfs {
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
         let path = self.resolve(AT_FDCWD, path)?;
         self.node(&path)?;
-        Ok(self.mount_statfs(path.mount.as_ref().map(|m| &*m.shared)))
+        self.mount_statfs(path.mount.as_ref().map(|m| &*m.shared))
     }
     pub fn statfs_fd(&self, fd: u32) -> Result<[u8; 120]> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
-        let mut out = self.mount_statfs(o.mount.as_deref());
+        let mut out = self.mount_statfs(o.mount.as_deref())?;
         if o.namespace.is_some()
             || o.socket.is_some()
             || o.local.is_some()

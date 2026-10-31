@@ -25,6 +25,8 @@ pub(super) enum Kind {
     Nsfs,
     Mqueue,
     Overlay,
+    #[cfg(all(feature = "hostfs", unix))]
+    Host,
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -66,6 +68,8 @@ pub(super) struct MountInit {
 // Resource identity is independent of parent topology. Overlay layers must
 // retain this identity rather than the old root's parent chain after pivot.
 pub(super) struct MountIdentity {
+    #[cfg(all(feature = "hostfs", unix))]
+    has_children: std::sync::atomic::AtomicBool,
     pub id: u64,
     pub fs: FsHandle,
     pub root: NodeRef,
@@ -144,6 +148,14 @@ impl SharedAttachment {
 }
 impl Drop for ParentWrite<'_> {
     fn drop(&mut self) {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(attachment) = &*self.owner {
+            attachment.node.mount_target.store(true, Ordering::Relaxed);
+            attachment
+                .parent
+                .has_children
+                .store(true, Ordering::Relaxed);
+        }
         let parent = self.owner.as_ref().map(SharedAttachment::from_owner);
         let old = std::mem::replace(&mut *self.shared.borrow_mut(), parent);
         drop(old);
@@ -177,7 +189,15 @@ impl Mount {
         }
         None
     }
-    fn new(init: MountInit) -> Self {
+    pub(super) fn new(init: MountInit) -> Self {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(attachment) = init.parent.borrow().as_ref() {
+            attachment.node.mount_target.store(true, Ordering::Relaxed);
+            attachment
+                .parent
+                .has_children
+                .store(true, Ordering::Relaxed);
+        }
         let parent = Arc::new(SharedCell::new(
             init.parent
                 .borrow()
@@ -186,6 +206,8 @@ impl Mount {
         ));
         let owner_control = init.namespace.is_some();
         let identity = Arc::new(MountIdentity {
+            #[cfg(all(feature = "hostfs", unix))]
+            has_children: std::sync::atomic::AtomicBool::new(false),
             id: init.id,
             fs: init.fs,
             root: init.root,
@@ -266,6 +288,10 @@ impl MountData {
     pub fn key_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
         if Arc::ptr_eq(node, &self.root) {
             return Some(self.root_path());
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &self.fs.host {
+            return host.key_of(&self.fs, node).ok();
         }
         let root = self.root_path();
         node.borrow().path_in(&self.fs.borrow().paths, &root)
@@ -547,6 +573,21 @@ impl Vfs {
             let Some(current) = &path.mount else {
                 return Ok(path);
             };
+            #[cfg(all(feature = "hostfs", unix))]
+            if !current.has_children.load(Ordering::Relaxed) {
+                return Ok(path);
+            }
+            #[cfg(all(feature = "hostfs", unix))]
+            if current.fs.host.is_none()
+                && self
+                    .node(&path)
+                    .is_ok_and(|node| !node.mount_target.load(Ordering::Relaxed))
+            {
+                // A monotonic inode marker avoids scanning unrelated mounts.
+                // Rename keeps inode identity; another namespace may mark a
+                // false positive, which simply uses the existing full lookup.
+                return Ok(path);
+            }
             let next =
                 self.mount_registry
                     .borrow()
@@ -703,6 +744,8 @@ impl Vfs {
         }
         match path.mount().map(|m| m.kind) {
             Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue | Kind::Overlay) => false,
+            #[cfg(all(feature = "hostfs", unix))]
+            Some(Kind::Host) => false,
             Some(Kind::Root) => {
                 let p = path.key();
                 !p.starts_with(b"/proc/")
@@ -731,6 +774,12 @@ impl Vfs {
     pub(super) fn fd_available_bytes(&self, fd: u32) -> Result<u64> {
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
+        #[cfg(all(feature = "hostfs", unix))]
+        if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
+            // Native volume/quota admission belongs to the actual write. Never
+            // scan cached host inodes or charge them to the private store.
+            return Ok(u64::MAX);
+        }
         let bytes =
             Self::filesystem_capacity(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow())
                 .available_bytes;
@@ -817,6 +866,11 @@ impl Vfs {
             return Ok(());
         }
         if flags & REMOUNT != 0 {
+            #[cfg(all(feature = "hostfs", unix))]
+            if flags & MS_RDONLY == 0 && parent.fs.host.as_ref().is_some_and(|host| host.readonly())
+            {
+                return Err(Errno(30));
+            }
             if parent.devpts.is_some() && data.is_some_and(|d| !d.is_empty()) {
                 return Err(Errno(95));
             }
@@ -1299,7 +1353,7 @@ impl Vfs {
         self.pseudo_children(path)
     }
 }
-fn new_mount_id() -> Result<u64> {
+pub(super) fn new_mount_id() -> Result<u64> {
     NEXT_MOUNT
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             n.checked_add(1).filter(|n| *n < 0x1000_0000)
@@ -1393,6 +1447,8 @@ impl Mount {
             Kind::Nsfs => "nsfs",
             Kind::Mqueue => "mqueue",
             Kind::Overlay => "overlay",
+            #[cfg(all(feature = "hostfs", unix))]
+            Kind::Host => "trames-host",
         }
     }
     fn options(&self) -> String {
@@ -1501,10 +1557,14 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
     text.into_bytes()
 }
 impl Vfs {
-    pub(super) fn mount_statfs(&self, mount: Option<&MountData>) -> [u8; 120] {
+    pub(super) fn mount_statfs(&self, mount: Option<&MountData>) -> Result<[u8; 120]> {
         let Some(m) = mount else {
-            return self.storage_stat();
+            return Ok(self.storage_stat());
         };
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &m.fs.host {
+            return host.statfs(m.flags.get());
+        }
         let mut out = [0; 120];
         let magic = match m.kind {
             Kind::Root => 0x5452414d4553u64,
@@ -1516,6 +1576,8 @@ impl Vfs {
             Kind::Nsfs => 0x6e736673,
             Kind::Mqueue => 0x19800202,
             Kind::Overlay => 0x794c7630,
+            #[cfg(all(feature = "hostfs", unix))]
+            Kind::Host => 0x686f7374,
         };
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
         if matches!(m.kind, Kind::Root | Kind::Tmpfs | Kind::Overlay) {
@@ -1550,7 +1612,7 @@ impl Vfs {
         ] {
             out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1759,7 +1821,7 @@ mod tests {
 }
 
 impl Vfs {
-    fn register_mounts(&self, mounts: &[Rc<Mount>]) -> Result<()> {
+    pub(super) fn register_mounts(&self, mounts: &[Rc<Mount>]) -> Result<()> {
         self.reap_detached_mounts();
         let mut resources = self.mount_resources.borrow_mut();
         resources.retain(|m| m.strong_count() != 0);
@@ -2032,7 +2094,7 @@ mod boundary_tests {
         let fd = v.open_at(AT_FDCWD, b"/a", O_DIRECTORY, 0).unwrap();
         let descriptor = v.descriptor(fd).unwrap();
         let open = descriptor.open.borrow();
-        let fs = v.mount_statfs(open.mount.as_deref());
+        let fs = v.mount_statfs(open.mount.as_deref()).unwrap();
         assert_eq!(u64::from_le_bytes(fs[..8].try_into().unwrap()), 0x19800202);
         drop(open);
         assert_eq!(v.open_at(AT_FDCWD, b"/a/queue", 0x42, 0o600), Err(Errno(1)));

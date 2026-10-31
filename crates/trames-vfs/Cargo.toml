@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+hostfs = ["dep:libc"]
+
 [dependencies]
 trames-graphics = { path = "../trames-graphics" }
 trames-wayland = { path = "../trames-wayland" }
@@ -13,6 +16,7 @@ trames-memory = { path = "../trames-memory" }
 getrandom = "=0.3.4"
 trames-net = { path = "../trames-net" }
 trames-bridge = { path = "../trames-bridge" }
+libc = { version = "=0.2.190", optional = true }
 
 [lints]
 workspace = true

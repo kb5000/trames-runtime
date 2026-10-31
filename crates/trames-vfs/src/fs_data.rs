@@ -7,6 +7,8 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 #[derive(Clone)]
 pub(super) struct FsHandle {
     pub shared: Arc<SharedCell<Filesystem>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    pub host: Option<Arc<hostfs::HostFs>>,
     overlay: Option<Arc<overlay::Overlay>>,
 }
 pub(super) struct FsBorrow<'a, G> {
@@ -16,12 +18,16 @@ pub(super) struct FsBorrow<'a, G> {
 impl FsHandle {
     pub fn new(data: Filesystem) -> Self {
         Self {
+            #[cfg(all(feature = "hostfs", unix))]
+            host: None,
             shared: Arc::new(SharedCell::new(data)),
             overlay: None,
         }
     }
     pub fn with_overlay(data: Filesystem, overlay: Arc<overlay::Overlay>) -> Self {
         Self {
+            #[cfg(all(feature = "hostfs", unix))]
+            host: None,
             shared: Arc::new(SharedCell::new(data)),
             overlay: Some(overlay),
         }

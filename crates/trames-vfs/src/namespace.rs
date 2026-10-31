@@ -66,13 +66,18 @@ impl Vfs {
                 return Err(Errno(if is_dir { 20 } else { 21 }));
             }
             if target_dir {
+                #[cfg(all(feature = "hostfs", unix))]
+                let check_cached_children = filesystem.host.is_none();
+                #[cfg(not(all(feature = "hostfs", unix)))]
+                let check_cached_children = true;
                 let mut dest_prefix = dest.clone();
                 dest_prefix.push(b'/');
-                if filesystem
-                    .borrow()
-                    .paths
-                    .keys()
-                    .any(|p| p.starts_with(&dest_prefix))
+                if check_cached_children
+                    && filesystem
+                        .borrow()
+                        .paths
+                        .keys()
+                        .any(|p| p.starts_with(&dest_prefix))
                 {
                     return Err(Errno(39));
                 }
@@ -91,6 +96,10 @@ impl Vfs {
             }
         }
         let old_paths = fs.paths.clone();
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &filesystem.host {
+            host.rename(&source.key, &dest.key, flags == 1)?;
+        }
         if let Some(n) = &target {
             n.borrow_mut().links -= 1;
             fs.paths.remove(&dest.key);
@@ -147,6 +156,14 @@ impl Vfs {
         }
         let old_mode = n.mode;
         let old_time = n.times[2];
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            drop(n);
+            if let Some(host) = self.host_for_node(&node) {
+                host.chmod(&node, mode)?;
+            }
+            n = node.borrow_mut();
+        }
         n.mode = (n.mode & !0o7777) | (mode & 0o7777);
         if !self.credentials.has_cap(capabilities::FSETID) && !self.credentials.in_group(n.gid) {
             n.mode &= !0o2000;
@@ -255,6 +272,10 @@ impl Vfs {
         self.pseudo_immutable(&node)?;
         if values.iter().all(Option::is_none) {
             return Ok(());
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = self.host_for_node(&node) {
+            host.times(&node, values)?;
         }
         let mut n = node.borrow_mut();
         let old = n.times;

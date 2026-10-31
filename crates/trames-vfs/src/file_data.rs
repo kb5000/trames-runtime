@@ -14,6 +14,8 @@ pub(super) enum Bytes {
     Disk(DiskObject),
 }
 pub(super) struct PlainFile {
+    #[cfg(all(feature = "hostfs", unix))]
+    host: Option<Arc<hostfs::HostFile>>,
     bytes: RwLock<Bytes>,
     length: AtomicU64,
     logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
@@ -41,13 +43,32 @@ impl Drop for ReadLease {
     }
 }
 impl PlainFile {
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
+        let host = self.host.as_ref()?;
+        let _data = self.bytes.write().unwrap();
+        let result = host.append(bytes);
+        if let Ok((_, end)) = result {
+            self.publish_length(end);
+        }
+        Some(result)
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) fn host_stat(&self) -> Option<Result<[u8; 128]>> {
+        self.host.as_ref().map(|host| host.any_file()?.stat())
+    }
     pub fn new(bytes: Bytes) -> Arc<Self> {
-        let length = bytes.len();
+        let length = match &bytes {
+            Bytes::Memory(data) => data.len() as u64,
+            Bytes::Disk(data) => data.length,
+        };
         let backing = match &bytes {
             Bytes::Disk(d) => Some(d.backing.clone()),
             _ => None,
         };
         Arc::new(Self {
+            #[cfg(all(feature = "hostfs", unix))]
+            host: backing.as_ref().and_then(|b| b.host.clone()),
             bytes: RwLock::new(bytes),
             length: AtomicU64::new(length),
             logical_size: std::sync::OnceLock::new(),
@@ -105,6 +126,14 @@ impl PlainFile {
     // Metadata/quota scans need only a scalar, not a byte-data lock. Relaxed
     // length does not publish file bytes; their access still uses the RwLock.
     pub fn len(&self) -> u64 {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &self.host {
+            let size = host.len();
+            if self.length.load(Ordering::Relaxed) != size {
+                self.publish_length(size);
+            }
+            return size;
+        }
         self.length.load(Ordering::Relaxed)
     }
     pub fn logical_size(&self) -> trames_shared::LogicalSize {
@@ -135,6 +164,10 @@ impl PlainFile {
             .map(|backing| (backing.clone(), self.len()))
     }
     pub fn blocks(&self) -> Result<u64> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &self.host {
+            return Ok(host.metadata()?.blocks());
+        }
         #[cfg(unix)]
         if let Some(backing) = &self.backing {
             return Ok(std::fs::symlink_metadata(&backing.path)
@@ -237,6 +270,10 @@ impl PlainFile {
         Ok(())
     }
     pub fn orphan(&self, value: bool) {
+        #[cfg(all(feature = "hostfs", unix))]
+        if self.host.is_some() {
+            return;
+        }
         if let Bytes::Disk(d) = &*self.bytes.read().unwrap() {
             d.backing.remove_on_drop.store(value, Ordering::Relaxed);
         }
@@ -246,7 +283,13 @@ impl Bytes {
     fn len(&self) -> u64 {
         match self {
             Self::Memory(b) => b.len() as u64,
-            Self::Disk(d) => d.length,
+            Self::Disk(d) => {
+                #[cfg(all(feature = "hostfs", unix))]
+                if let Some(host) = &d.backing.host {
+                    return host.len();
+                }
+                d.length
+            }
         }
     }
     fn read_at(

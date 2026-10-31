@@ -125,7 +125,9 @@ pub(super) struct DiskBacking {
     pub(super) path: PathBuf,
     pub(super) remove_on_drop: std::sync::atomic::AtomicBool,
     // An open-unlinked file must keep the store's exclusive lock alive.
-    _store: Arc<DiskStore>,
+    pub(super) _store: Option<Arc<DiskStore>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) host: Option<Arc<hostfs::HostFile>>,
     pub(super) inode: u64,
 }
 impl DiskObject {
@@ -138,6 +140,10 @@ impl DiskObject {
 }
 impl DiskBacking {
     pub(super) fn open(&self, write: bool) -> Result<File> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &self.host {
+            return host.file(write)?.file.try_clone().map_err(host_errno);
+        }
         regular(&self.path)?;
         let mut options = OpenOptions::new();
         options.read(true).write(write);
@@ -154,18 +160,29 @@ impl DiskBacking {
 }
 impl Drop for DiskBacking {
     fn drop(&mut self) {
+        #[cfg(all(feature = "hostfs", unix))]
+        if self.host.is_some() {
+            return;
+        }
         if self.remove_on_drop.load(Ordering::Relaxed) {
             let _ = fs::remove_file(&self.path);
         }
     }
 }
 impl FileData {
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
+        match self {
+            Self::Plain(data) => data.append_host(bytes),
+            _ => None,
+        }
+    }
     pub(super) fn memory(bytes: Vec<u8>) -> Self {
         Self::Plain(crate::file_data::PlainFile::new(
             crate::file_data::Bytes::Memory(bytes),
         ))
     }
-    fn disk(data: DiskObject) -> Self {
+    pub(super) fn disk(data: DiskObject) -> Self {
         Self::Plain(crate::file_data::PlainFile::new(
             crate::file_data::Bytes::Disk(data),
         ))
@@ -388,7 +405,9 @@ impl DiskStore {
             backing: Arc::new(DiskBacking {
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(true),
-                _store: self.clone(),
+                _store: Some(self.clone()),
+                #[cfg(all(feature = "hostfs", unix))]
+                host: None,
                 inode,
             }),
         }))
@@ -402,7 +421,9 @@ impl DiskStore {
             backing: Arc::new(DiskBacking {
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(false),
-                _store: self.clone(),
+                _store: Some(self.clone()),
+                #[cfg(all(feature = "hostfs", unix))]
+                host: None,
                 inode,
             }),
         }))
@@ -1128,6 +1149,15 @@ impl Vfs {
     pub fn sync_fd(&self, fd: u32, data_only: bool) -> Result<()> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(file) = &o.host_file {
+            return if data_only {
+                file.file.sync_data()
+            } else {
+                file.file.sync_all()
+            }
+            .map_err(host_errno);
+        }
         let n = o.node.as_ref().ok_or(Errno(22))?.borrow();
         if let Content::File(data) = &n.content {
             data.sync(data_only)?;
