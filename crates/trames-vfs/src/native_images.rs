@@ -41,6 +41,7 @@ impl ImageFds for Images {
             flags: (0).into(),
             file_position: Arc::default(),
             flock: Default::default(),
+            ofd_records: Default::default(),
             node: None,
             read_node: None,
             pipe: None,

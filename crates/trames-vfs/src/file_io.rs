@@ -280,6 +280,21 @@ impl DirectFile {
         };
         Some(locks::normalize(kind, start, length, base, owner))
     }
+    pub fn normalize_ofd_lock(
+        &self,
+        kind: u16,
+        whence: u16,
+        start: i64,
+        length: i64,
+    ) -> Option<Result<RecordLock>> {
+        let file = self.file.as_ref()?;
+        let mut requested = match self.normalize_lock(kind, whence, start, length, 0)? {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        requested.owner = file.open.ofd_record_owner(&self.locks);
+        Some(Ok(requested))
+    }
     pub fn record_lock_conflict(&self, requested: RecordLock) -> Option<RecordLock> {
         self.locks.conflict(requested)
     }

@@ -89,6 +89,19 @@ mod tests {
         out
     }
     #[test]
+    fn boot_id_is_stable_across_tasks_but_fresh_in_a_new_session() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let first = read(&mut v, b"/proc/sys/kernel/random/boot_id");
+        assert_eq!(first.len(), 37);
+        assert_eq!(read(&mut v, b"/proc/sys/kernel/random/boot_id"), first);
+        let mut child = v.clone();
+        assert_eq!(read(&mut child, b"/proc/sys/kernel/random/boot_id"), first);
+        let mut next = Vfs::default();
+        snapshot(&mut next);
+        assert_ne!(read(&mut next, b"/proc/sys/kernel/random/boot_id"), first);
+    }
+    #[test]
     fn random_uuid_is_fresh_v4_readonly_and_discoverable() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -582,6 +595,7 @@ pub struct ProcessInfo {
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
+    pub core_limits: Option<(u64, u64)>,
     pub address_space_limit: Option<u64>,
     pub oom: std::sync::Weak<OomTask>,
     pub pending: u64,
@@ -612,6 +626,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    boot_id: std::cell::OnceCell<Result<Vec<u8>>>,
     pub(super) video_device: bool,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
@@ -1026,6 +1041,7 @@ impl Vfs {
                 flags: (0).into(),
                 file_position: Arc::default(),
                 flock: std::sync::OnceLock::new(),
+                ofd_records: Default::default(),
                 node: Some(node),
                 pipe: None,
                 bridge: None,
@@ -1279,6 +1295,7 @@ impl Vfs {
                 flags: (flags & !O_CLOEXEC).into(),
                 file_position: Arc::default(),
                 flock: std::sync::OnceLock::new(),
+                ofd_records: Default::default(),
                 node: original.node.clone(),
                 pipe,
                 bridge: original.bridge.clone(),
@@ -1561,6 +1578,7 @@ impl Vfs {
                 return Ok(regular(format!("{:.2} {:.2} {:.2} {running}/{} {}\n", r.load[0],r.load[1],r.load[2],r.processes.len(),r.processes_created).into_bytes()));
             }
             b"/proc/sys/kernel/random/uuid" => return Ok(regular(proc_uuid()?)),
+            b"/proc/sys/kernel/random/boot_id" => return Ok(regular(pseudo.boot_id.get_or_init(proc_uuid).clone()?)),
             b"/proc/sys/kernel/ostype" => return Ok(regular(b"Linux\n".to_vec())),
             b"/proc/sys/kernel/osrelease" => return Ok(regular(b"6.0.0-trames\n".to_vec())),
             b"/proc/sys/kernel/version" => return Ok(regular(b"Trames userspace runtime\n".to_vec())),
@@ -1746,7 +1764,8 @@ impl Vfs {
                                 }
                             };
                             let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\n", limit(soft), limit(hard)).into_bytes()
+                            let (core_soft, core_hard) = p.core_limits.unwrap_or((0, u64::MAX));
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };
@@ -2292,7 +2311,7 @@ impl Vfs {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
-            b"/proc/sys/kernel/random" => vec![b"uuid".to_vec()],
+            b"/proc/sys/kernel/random" => vec![b"uuid".to_vec(), b"boot_id".to_vec()],
             b"/proc/sys/fs" => vec![b"file-max".to_vec(), b"file-nr".to_vec()],
             b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],

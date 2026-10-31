@@ -64,7 +64,7 @@ impl std::ops::DerefMut for MembershipEntries {
 pub struct SharedFiles(pub(super) Arc<Membership>);
 #[derive(Clone)]
 pub struct SharedFd {
-    open: Arc<SharedOpenDescription>,
+    pub(super) open: Arc<SharedOpenDescription>,
 }
 impl SharedFd {
     pub(super) fn native_image(&self) -> Option<Arc<dyn trames_graphics::Image>> {

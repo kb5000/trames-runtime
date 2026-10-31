@@ -10,7 +10,6 @@ pub(super) const MS_NODEV: u64 = 4;
 pub(super) const MS_NOEXEC: u64 = 8;
 pub(super) const MS_RELATIME: u64 = 1 << 21;
 const MAX_MOUNTS: usize = 128;
-const MAX_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(16);
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
 
@@ -1024,7 +1023,10 @@ impl Vfs {
                         }
                         (0, 1, 0o1777)
                     } else {
-                        tmpfs_options(data.unwrap_or_default())?
+                        tmpfs_options(
+                            data.unwrap_or_default(),
+                            self.pseudo.borrow().runtime.memory_limit as u64,
+                        )?
                     };
                     let id = new_mount_id()?;
                     let inode = id << 32;
@@ -1377,7 +1379,23 @@ fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
 pub(super) fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
 }
-fn tmpfs_options(data: &[u8]) -> Result<(u64, usize, u32)> {
+fn tmpfs_quantity(value: &str) -> Result<u64> {
+    let (number, shift) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 10),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 20),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 30),
+        Some(b't' | b'T') => (&value[..value.len() - 1], 40),
+        Some(b'p' | b'P') => (&value[..value.len() - 1], 50),
+        Some(b'e' | b'E') => (&value[..value.len() - 1], 60),
+        _ => (value, 0),
+    };
+    number
+        .parse::<u64>()
+        .map_err(|_| Errno(22))?
+        .checked_mul(1u64 << shift)
+        .ok_or(Errno(22))
+}
+fn tmpfs_options(data: &[u8], memory: u64) -> Result<(u64, usize, u32)> {
     let mut size = MAX_FILE_BYTES as u64;
     let mut nodes = MAX_NODES;
     let mut mode = 0o1777;
@@ -1393,26 +1411,31 @@ fn tmpfs_options(data: &[u8]) -> Result<(u64, usize, u32)> {
                 }
             }
             b"size" => {
-                let (number, scale) = match value.as_bytes().last() {
-                    Some(b'k' | b'K') => (&value[..value.len() - 1], 1024),
-                    Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
-                    Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-                    _ => (value, 1),
+                let bytes = if let Some(percent) = value.strip_suffix('%') {
+                    let percent = percent.parse::<u64>().map_err(|_| Errno(22))?;
+                    // Use the same session capacity reported by /proc/meminfo.
+                    // The mount records a ceiling; it does not reserve memory.
+                    u64::try_from((memory as u128 * percent as u128) / 100)
+                        .map_err(|_| Errno(22))?
+                } else {
+                    tmpfs_quantity(value)?
                 };
-                size = number
-                    .parse::<u64>()
-                    .map_err(|_| Errno(22))?
-                    .checked_mul(scale)
-                    .ok_or(Errno(22))?;
-                if size == 0 || size > MAX_TMPFS_BYTES {
-                    return Err(Errno(28));
+                size = if bytes == 0 {
+                    i64::MAX as u64
+                } else {
+                    bytes.checked_add(4095).ok_or(Errno(22))? & !4095
+                };
+                if size > i64::MAX as u64 {
+                    return Err(Errno(22));
                 }
             }
             b"nr_inodes" => {
-                nodes = value.parse().map_err(|_| Errno(22))?;
-                if nodes == 0 || nodes > MAX_NODES {
-                    return Err(Errno(28));
-                }
+                let quantity = tmpfs_quantity(value)?;
+                nodes = if quantity == 0 {
+                    usize::MAX
+                } else {
+                    usize::try_from(quantity).map_err(|_| Errno(22))?
+                };
             }
             _ => return Err(Errno(95)),
         }
@@ -2048,6 +2071,42 @@ mod boundary_tests {
         assert!(!text.contains(" /proc "));
     }
     #[test]
+    fn systemd_tmpfs_percentage_and_inode_suffix_are_lazy_limits() {
+        let mut v = vfs();
+        v.pseudo.borrow_mut().runtime.memory_limit = 8usize << 30;
+        v.mount(
+            None,
+            b"/a",
+            Some(b"tmpfs"),
+            6,
+            Some(b"mode=01777,size=20%,nr_inodes=800k"),
+        )
+        .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/a/f", 0x42, 0o600).unwrap();
+        let open = v.descriptor(fd).unwrap().open.clone();
+        let mount = open.borrow().mount.clone().unwrap();
+        let capacity = Vfs::filesystem_capacity(&mount.fs.borrow());
+        assert_eq!(
+            capacity.budget_bytes,
+            ((8u64 << 30) / 5).div_ceil(4096) * 4096
+        );
+        assert_eq!(capacity.node_limit, 800 * 1024);
+        assert_eq!(capacity.used_bytes, 0);
+        v.write(fd, b"x").unwrap();
+        assert_eq!(Vfs::filesystem_capacity(&mount.fs.borrow()).used_bytes, 1);
+        assert_eq!(tmpfs_options(b"size=invalid%", 1 << 30), Err(Errno(22)));
+        assert_eq!(tmpfs_options(b"size=200%", 1 << 30).unwrap().0, 2 << 30);
+        assert_eq!(
+            tmpfs_options(b"size=18446744073709551615k", 0),
+            Err(Errno(22))
+        );
+        assert_eq!(tmpfs_options(b"nr_inodes=1%", 0), Err(Errno(22)));
+        assert_eq!(
+            tmpfs_options(b"size=0,nr_inodes=0", 0),
+            Ok((i64::MAX as u64, usize::MAX, 0o1777))
+        );
+    }
+    #[test]
     fn docker_tmpfs_size_is_lazy_and_strictatime_overrides_relatime() {
         let mut v = vfs();
         v.mount(
@@ -2063,7 +2122,7 @@ mod boundary_tests {
         let open = v.descriptor(fd).unwrap().open.clone();
         let mount = open.borrow().mount.clone().unwrap();
         let capacity = Vfs::filesystem_capacity(&mount.fs.borrow());
-        assert_eq!(capacity.budget_bytes, MAX_TMPFS_BYTES);
+        assert_eq!(capacity.budget_bytes, 64 * 1024 * 1024);
         assert_eq!(capacity.used_bytes, 1);
         let node = open.borrow().node.clone().unwrap();
         let future = storage::Timestamp {

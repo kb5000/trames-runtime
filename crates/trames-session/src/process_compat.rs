@@ -89,6 +89,8 @@ impl<C: Cpu> Kernel<C> {
         };
         let previous = if resource == 1 {
             p.file_size_limit.get()
+        } else if resource == 4 {
+            p.core_limit.get()
         } else {
             (fixed, fixed)
         };
@@ -105,10 +107,10 @@ impl<C: Cpu> Kernel<C> {
             {
                 return Err(Errno(1));
             }
-            if resource != 1 && limits.1 > fixed {
+            if !matches!(resource, 1 | 4) && limits.1 > fixed {
                 return Err(Errno(1));
             }
-            if resource != 1 && limits != previous {
+            if !matches!(resource, 1 | 4) && limits != previous {
                 return Err(Errno(95));
             }
             Some(limits)
@@ -122,6 +124,8 @@ impl<C: Cpu> Kernel<C> {
         if let Some(next) = next {
             if resource == 1 {
                 p.file_size_limit.set(next);
+            } else if resource == 4 {
+                p.core_limit.set(next);
             }
         }
         Ok(0)
@@ -135,6 +139,26 @@ mod tests {
 
     use super::super::tests::{kernel, process};
     use super::*;
+    #[test]
+    fn core_limits_are_process_owned_capability_checked_and_reported() {
+        let k = kernel();
+        let mut p = process();
+        write_u64(&mut p.memory, 0x1000, u64::MAX).unwrap();
+        write_u64(&mut p.memory, 0x1008, u64::MAX).unwrap();
+        assert_eq!(k.rlimit(&mut p, 261, [0, 4, 0x1000, 0x1100, 0, 0]), Ok(0));
+        assert_eq!(p.core_limit.get(), (u64::MAX, u64::MAX));
+        assert_eq!(read_u64(&p.memory, 0x1100).unwrap(), 0);
+        let child = p.fork();
+        child.core_limit.set((1, 2));
+        assert_eq!(p.core_limit.get(), (u64::MAX, u64::MAX));
+        p.core_limit.set((0, 0));
+        p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        assert_eq!(
+            k.rlimit(&mut p, 261, [0, 4, 0x1000, 0, 0, 0]),
+            Err(Errno(1))
+        );
+        assert_eq!(p.core_limit.get(), (0, 0));
+    }
     #[test]
     fn compatibility_state_and_fault_preflight() {
         let mut p = process();

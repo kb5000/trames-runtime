@@ -94,6 +94,7 @@ pub(crate) struct Process<C: Cpu> {
     poll_mask: Option<u64>,
     uring_wait: Option<(u32, Rc<trames_vfs::Uring>, Option<Instant>)>,
     flock_wait: Option<(trames_vfs::FlockRequest, Option<trames_vfs::RetainedFd>)>,
+    record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
     retained_byte: Option<trames_linux::RetainedByte>,
     retained_poll: Option<trames_linux::RetainedPoll>,
@@ -109,6 +110,7 @@ pub(crate) struct Process<C: Cpu> {
     subreaper: bool,
     membarrier_registered: Rc<Cell<bool>>,
     file_size_limit: Rc<Cell<(u64, u64)>>,
+    core_limit: Rc<Cell<(u64, u64)>>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
     seccomp_entry: Option<seccomp::EntryDecision>,
@@ -309,6 +311,7 @@ impl<C: Cpu> Process<C> {
             poll_mask: None,
             uring_wait: None,
             flock_wait: None,
+            record_wait: None,
             byte_wait: None,
             retained_byte: None,
             retained_poll: None,
@@ -324,6 +327,7 @@ impl<C: Cpu> Process<C> {
             subreaper: false,
             membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
             file_size_limit: Rc::new(Cell::new(self.file_size_limit.get())),
+            core_limit: Rc::new(Cell::new(self.core_limit.get())),
             oom: Arc::new(self.oom.fork()),
             seccomp: self.seccomp.clone(),
             seccomp_entry: None,
@@ -857,6 +861,7 @@ impl<C: Cpu> Kernel<C> {
                 Vec::new()
             },
             file_size_limits: Some(p.file_size_limit.get()),
+            core_limits: Some(p.core_limit.get()),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
                 u64::MAX
             } else {
@@ -1017,6 +1022,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.cancel_uring(&mut p.memory, pid);
         p.uring_wait = None;
         p.flock_wait = None;
+        p.record_wait = None;
         p.byte_wait = None;
         p.retained_byte = None;
         p.retained_poll = None;
@@ -1454,6 +1460,7 @@ impl<C: Cpu> Kernel<C> {
                 p.poll_deadline = None;
                 p.uring_wait = None;
                 p.flock_wait = None;
+                p.record_wait = None;
                 p.byte_wait = None;
                 p.retained_byte = None;
                 p.retained_poll = None;
@@ -1679,6 +1686,7 @@ impl<C: Cpu> Kernel<C> {
             p.linux.cancel_uring(&mut p.memory, task);
             p.uring_wait = None;
             p.flock_wait = None;
+            p.record_wait = None;
             p.byte_wait = None;
             p.retained_byte = None;
             p.retained_poll = None;
@@ -2197,6 +2205,7 @@ impl<C: Cpu> Kernel<C> {
                     child.signals.shared_pending = p.signals.shared_pending.clone();
                     child.subreaper = p.subreaper;
                     child.file_size_limit = p.file_size_limit.clone();
+                    child.core_limit = p.core_limit.clone();
                 }
                 child
                     .linux
@@ -2549,6 +2558,37 @@ impl<C: Cpu> Kernel<C> {
                     Ok(None)
                 }
             }
+            25 if matches!(a[1], 7 | 38) => {
+                let request = match p.record_wait.take() {
+                    Some(r) => r,
+                    None => p.linux.prepare_record_lock(&mut p.memory, a)?,
+                };
+                match request.try_lock() {
+                    Ok(()) => Ok(Some(0)),
+                    Err(Errno(11)) => {
+                        if a[1] == 7 {
+                            let mut holder = request.holder();
+                            let mut seen = Vec::new();
+                            while let Some(id) = holder {
+                                if id == p.tgid {
+                                    return Err(Errno(35));
+                                }
+                                if seen.contains(&id) {
+                                    break;
+                                }
+                                seen.push(id);
+                                holder = self.processes.values()
+                                    .find(|other|other.tgid == id && matches!(other.state, State::Blocked(25,args) if args[1] == 7))
+                                    .and_then(|other|other.record_wait.as_ref())
+                                    .and_then(trames_vfs::RecordLockRequest::holder);
+                            }
+                        }
+                        p.record_wait = Some(request);
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             63 | 65 if p.linux.vfs.signalfd_mask(a[0] as u32)?.is_some() => {
                 self.read_signalfd(p, number, a)
             }
@@ -2602,33 +2642,6 @@ impl<C: Cpu> Kernel<C> {
                         }
                     }
                 }
-                if number == 25 && a[1] == 7 && raw == error(Errno(11)) {
-                    let mut owner = p.linux.record_lock_holder(&p.memory, a)?;
-                    let mut visited = Vec::new();
-                    while let Some(id) = owner {
-                        if id == p.tgid {
-                            return Err(Errno(35));
-                        }
-                        if visited.contains(&id) {
-                            break;
-                        }
-                        visited.push(id);
-                        owner = self.processes.values().find_map(|other| {
-                            if other.tgid == id {
-                                if let State::Blocked(25, a) = other.state {
-                                    if a[1] == 7 {
-                                        return other
-                                            .linux
-                                            .record_lock_holder(&other.memory, a)
-                                            .ok()
-                                            .flatten();
-                                    }
-                                }
-                            }
-                            None
-                        });
-                    }
-                }
                 let per_call_nonblock = match number {
                     76 => a[5] & 2 != 0 || p.linux.vfs.flags(a[2] as u32)? & O_NONBLOCK != 0,
                     206 => a[3] & 0x40 != 0,
@@ -2647,8 +2660,7 @@ impl<C: Cpu> Kernel<C> {
                         63 | 64 | 65 | 66 | 71 | 76 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269
                     )
                     && !per_call_nonblock)
-                    || (raw == error(Errno(115)) && number == 203)
-                    || (raw == error(Errno(11)) && number == 25 && a[1] == 7))
+                    || (raw == error(Errno(115)) && number == 203))
                     && (number == 25 || p.linux.vfs.flags(a[0] as u32)? & O_NONBLOCK == 0)
                 {
                     if !matches!(p.state, State::Blocked(..)) {
@@ -2706,7 +2718,8 @@ impl<C: Cpu> Kernel<C> {
         let mut prepared_stat = (number == 79).then(|| p.linux.prepare_stat(a, &p.memory));
         let proc_path = match number {
             27 => Some((trames_vfs::AT_FDCWD, a[1])),
-            43 | 45 | 221 => Some((trames_vfs::AT_FDCWD, a[0])),
+            39 | 41 | 43 | 45 | 221 => Some((trames_vfs::AT_FDCWD, a[0])),
+            40 => Some((trames_vfs::AT_FDCWD, a[1])),
             48 | 53 | 54 | 56 | 78 | 79 | 88 | 281 | 291 | 437 | 439 | 452 => {
                 Some((a[0] as i32, a[1]))
             }
@@ -2728,6 +2741,20 @@ impl<C: Cpu> Kernel<C> {
             });
         if let Some((dirfd, path)) = proc_lookup.as_ref().filter(|_| number != 79) {
             if let Some(demand) = p.linux.vfs.proc_observation(*dirfd, path) {
+                proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
+            }
+        }
+        let second_mount_path = if number == 40 && a[3] & 4096 != 0 {
+            Some(a[0])
+        } else if number == 41 {
+            Some(a[1])
+        } else {
+            None
+        };
+        if let Some(path) =
+            second_mount_path.and_then(|address| p.memory.read_c_string(address, 4096).ok())
+        {
+            if let Some(demand) = p.linux.vfs.proc_observation(trames_vfs::AT_FDCWD, &path) {
                 proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
         }
@@ -2776,8 +2803,13 @@ impl<C: Cpu> Kernel<C> {
         let ids = |c: &trames_vfs::Credentials| [c.euid, c.egid, c.fsuid, c.fsgid];
         let before_ids = ids(&p.linux.vfs.credentials);
         let byte = if matches!(number, 63..=66) {
-            let direct =
-                trames_linux::DirectSyscalls::default().with_membership(p.linux.vfs.shared_files());
+            let direct = trames_linux::DirectSyscalls::default()
+                .with_membership(p.linux.vfs.shared_files())
+                .with_local_identity([
+                    p.tgid,
+                    p.linux.vfs.credentials.uid,
+                    p.linux.vfs.credentials.gid,
+                ]);
             if let Some(wait) = p.byte_wait.take() {
                 Some(direct.resume_owned_byte(wait, &mut p.memory))
             } else {
@@ -3965,6 +3997,11 @@ impl<C: Cpu> Kernel<C> {
                     program_break: p.linux.program_break(),
                     uts: Some(p.linux.vfs.uts_capability()),
                     direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                        .with_local_identity([
+                            p.tgid,
+                            p.linux.vfs.credentials.uid,
+                            p.linux.vfs.credentials.gid,
+                        ])
                         .with_membership(p.linux.vfs.shared_files())
                         .with_kernel_log(p.linux.vfs.kernel_log_capability())
                         .with_urings(uring_epoch.capture_all(
@@ -4853,6 +4890,7 @@ pub(super) fn run<C: Cpu>(
         poll_mask: None,
         uring_wait: None,
         flock_wait: None,
+        record_wait: None,
         byte_wait: None,
         retained_byte: None,
         retained_poll: None,
@@ -4868,6 +4906,7 @@ pub(super) fn run<C: Cpu>(
         subreaper: false,
         membarrier_registered: Rc::new(Cell::new(false)),
         file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
+        core_limit: Rc::new(Cell::new((0, u64::MAX))),
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
@@ -5062,6 +5101,43 @@ mod tests {
 
     use super::*;
     use trames_memory::{Permissions, PAGE_SIZE};
+    #[test]
+    fn mount_through_a_fresh_proc_fd_refreshes_descriptor_identity() {
+        let mut k = kernel();
+        let mut p = process();
+        let mut io = trames_linux::CapturedOutput::default();
+        p.linux
+            .vfs
+            .mkdir_at(trames_vfs::AT_FDCWD, b"/target", 0o755)
+            .unwrap();
+        let fd = p
+            .linux
+            .vfs
+            .open_at(
+                trames_vfs::AT_FDCWD,
+                b"/target",
+                trames_vfs::O_PATH | trames_vfs::O_DIRECTORY,
+                0,
+            )
+            .unwrap();
+        let path = format!("/proc/self/fd/{fd}\0");
+        p.memory.write(0x1000, path.as_bytes()).unwrap();
+        p.memory.write(0x1100, b"tmpfs\0").unwrap();
+        k.call(1, &mut p, 40, [0x1100, 0x1000, 0x1100, 6, 0, 0], &mut io);
+        assert_eq!(p.cpu.x(0), 0);
+        let file = p
+            .linux
+            .vfs
+            .open_at(trames_vfs::AT_FDCWD, b"/target/new", 0x42, 0o600)
+            .unwrap();
+        p.linux.vfs.write(file, b"mounted").unwrap();
+        p.linux.vfs.close(file).unwrap();
+        p.linux.vfs.umount(b"/target", 0).unwrap();
+        assert_eq!(
+            p.linux.vfs.stat_at(trames_vfs::AT_FDCWD, b"/target/new"),
+            Err(Errno(2))
+        );
+    }
     #[test]
     fn shared_resources_are_visible_without_propagation_and_private_domains_remain_separate() {
         let mut k = kernel();
@@ -6096,6 +6172,7 @@ mod tests {
             poll_mask: None,
             uring_wait: None,
             flock_wait: None,
+            record_wait: None,
             byte_wait: None,
             retained_byte: None,
             retained_poll: None,
@@ -6111,6 +6188,7 @@ mod tests {
             subreaper: false,
             membarrier_registered: Rc::new(Cell::new(false)),
             file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
+            core_limit: Rc::new(Cell::new((0, u64::MAX))),
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,
@@ -6623,7 +6701,7 @@ mod tests {
         );
         p.memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let before_arguments = range.argument_accesses.load(Ordering::Relaxed);
-        let mut io = CapturedOutput::default();
+        let mut io = trames_linux::CapturedOutput::default();
         for path in [
             b"/proc/sys/kernel/random/uuid".as_slice(),
             b"/proc/sys/kernel/random/trames-absent",
@@ -6755,7 +6833,7 @@ mod tests {
             let mut name = path.to_vec();
             name.push(0);
             p.memory.write(0x1000, &name).unwrap();
-            let mut io = CapturedOutput::default();
+            let mut io = trames_linux::CapturedOutput::default();
             k.call(1, p, 56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0], &mut io);
             let fd = p.cpu.x(0);
             assert!(fd < 256, "proc open {path:?}: {fd}");
@@ -6791,7 +6869,7 @@ mod tests {
             b"third\0"
         );
         p.memory.write(0x1000, b"/proc/self/cmdline\0").unwrap();
-        let mut io = CapturedOutput::default();
+        let mut io = trames_linux::CapturedOutput::default();
         k.call(
             1,
             &mut p,
@@ -7609,7 +7687,7 @@ mod tests {
         let peer = p.fork_with_memory(memory);
         k.processes.insert(2, peer);
         let old = p.linux.vfs.fd_flags_snapshot();
-        let mut io = CapturedOutput::default();
+        let mut io = trames_linux::CapturedOutput::default();
         assert_eq!(
             k.syscall(1, &mut p, 97, [0x200, 0, 0, 0, 0, 0], &mut io),
             Ok(Some(0))

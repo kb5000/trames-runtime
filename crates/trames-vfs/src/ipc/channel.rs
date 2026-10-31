@@ -8,6 +8,7 @@ use std::sync::Mutex;
 struct Packet {
     data: Vec<u8>,
     rights: Option<u64>,
+    credentials: Option<[u32; 3]>,
 }
 struct Data {
     queues: [VecDeque<Packet>; 2],
@@ -16,12 +17,14 @@ struct Data {
     read_closed: [bool; 2],
     write_closed: [bool; 2],
     epochs: [[u64; 2]; 2],
+    passcred: [bool; 2],
 }
 pub(crate) struct Received {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
     pub rights: Option<u64>,
+    pub credentials: Option<[u32; 3]>,
 }
 pub(crate) struct Resource {
     kind: u32,
@@ -39,6 +42,7 @@ impl Resource {
                 read_closed: [false; 2],
                 write_closed: [false; 2],
                 epochs: [[0; 2]; 2],
+                passcred: [false; 2],
             }),
             readiness: Arc::default(),
         })
@@ -62,6 +66,9 @@ impl Resource {
         } else {
             data.used[side]
         }
+    }
+    pub fn set_passcred(&self, side: usize, enabled: bool) {
+        self.data.lock().unwrap().passcred[side] = enabled;
     }
     pub fn right_ids(&self, side: usize) -> Vec<u64> {
         self.data.lock().unwrap().queues[side]
@@ -107,12 +114,13 @@ impl Resource {
         }
         self.data.lock().unwrap().send_check(side, self.kind)
     }
-    pub fn send(
+    pub fn send_credentials(
         &self,
         side: usize,
         bytes: &[u8],
         flags: u32,
         rights: Option<u64>,
+        identity: Option<[u32; 3]>,
     ) -> Result<usize> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
@@ -123,6 +131,11 @@ impl Resource {
                 return Ok(0);
             }
             let peer = 1 - side;
+            let credentials = if data.passcred[peer] {
+                Some(identity.ok_or(Errno(95))?)
+            } else {
+                None
+            };
             let queue = &mut data.queues[peer];
             if self.kind != 1 && bytes.len() > PIPE_CAPACITY {
                 return Err(Errno(90));
@@ -136,7 +149,9 @@ impl Resource {
             let count = room.min(bytes.len());
             let merge = self.kind == 1
                 && rights.is_none()
-                && queue.back().is_some_and(|p| p.rights.is_none());
+                && queue
+                    .back()
+                    .is_some_and(|p| p.rights.is_none() && p.credentials == credentials);
             if !merge && queue.len() >= 128 {
                 return Err(Errno(11));
             }
@@ -150,6 +165,7 @@ impl Resource {
                 queue.push_back(Packet {
                     data: bytes[..count].to_vec(),
                     rights,
+                    credentials,
                 });
             }
             data.used[peer] += count;
@@ -182,6 +198,7 @@ impl Resource {
                     length: 0,
                     truncated: false,
                     rights: None,
+                    credentials: None,
                 }));
             }
             if queue.is_empty() {
@@ -189,7 +206,7 @@ impl Resource {
             }
             if self.kind != 1 {
                 let packet = queue.front().expect("packet");
-                if !allow_rights && packet.rights.is_some() {
+                if !allow_rights && (packet.rights.is_some() || packet.credentials.is_some()) {
                     return None;
                 }
                 let length = packet.data.len();
@@ -198,6 +215,7 @@ impl Resource {
                     length,
                     truncated: count < length,
                     rights: packet.rights,
+                    credentials: packet.credentials,
                 };
                 if flags & 2 == 0 {
                     queue.pop_front();
@@ -208,7 +226,14 @@ impl Resource {
             }
             let mut bytes = Vec::new();
             let mut rights = None;
+            let credentials = queue.front().and_then(|p| p.credentials);
             for packet in queue.iter() {
+                if packet.credentials != credentials {
+                    break;
+                }
+                if !allow_rights && packet.credentials.is_some() {
+                    return None;
+                }
                 let n = (count - bytes.len()).min(packet.data.len());
                 bytes.extend_from_slice(&packet.data[..n]);
                 if packet.rights.is_some() {
@@ -256,6 +281,7 @@ impl Resource {
                 length,
                 truncated: false,
                 rights,
+                credentials,
             }))
         })
     }
@@ -307,6 +333,36 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credentials_survive_partial_reads_and_cached_worker_capabilities() {
+        let mut vfs = Vfs::default();
+        let [a, b] = vfs.socketpair(1, 1, 0).unwrap();
+        let direct = vfs.direct_descriptors();
+        let tx = direct.get(a).unwrap();
+        let rx = direct.get(b).unwrap();
+        let receiver = vfs.local_socket(b).unwrap().unwrap();
+        receiver.set_reuse(16, 1).unwrap();
+        assert_eq!(
+            tx.send_credentials(b"abc", 0, Some([42, 1000, 1001])),
+            Ok(3)
+        );
+        assert_eq!(
+            tx.send_credentials(b"def", 0, Some([43, 1002, 1003])),
+            Ok(3)
+        );
+        assert_eq!(rx.read_attempt(9), None);
+        let first = receiver.recv(1, 0).unwrap();
+        assert_eq!(first.data, b"a");
+        assert_eq!(first.credentials, Some([42, 1000, 1001]));
+        let rest = receiver.recv(9, 0).unwrap();
+        assert_eq!(rest.data, b"bc");
+        assert_eq!(rest.credentials, first.credentials);
+        let next = receiver.recv(9, 0).unwrap();
+        assert_eq!(next.data, b"def");
+        assert_eq!(next.credentials, Some([43, 1002, 1003]));
+        assert_eq!(tx.send(b"missing-identity", 0), Err(Errno(95)));
+        assert_eq!(vfs.readable_bytes(b), Ok(Some(0)));
+    }
     #[test]
     fn worker_and_owner_share_bytes_offsets_and_shutdown_without_endpoint_leases() {
         let mut vfs = Vfs::default();

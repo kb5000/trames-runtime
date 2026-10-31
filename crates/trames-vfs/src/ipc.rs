@@ -4,6 +4,7 @@ use super::*;
 mod binding;
 pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
+mod datagram;
 mod native;
 pub(crate) use native::Services as NativeServices;
 pub use native::WaylandAuth;
@@ -49,8 +50,14 @@ impl LocalRights {
 struct Channel {
     resource: Arc<channel::Resource>,
     ends: [Weak<LocalSocket>; 2],
-    rights: RefCell<BTreeMap<u64, LocalRights>>,
+    rights: RefCell<BTreeMap<u64, Ancillary>>,
     next_right: Cell<u64>,
+}
+#[derive(Clone)]
+struct Ancillary {
+    rights: LocalRights,
+    credentials: Option<[u32; 3]>,
+    source: Vec<u8>,
 }
 pub struct LocalSocket {
     namespace: Rc<RefCell<LocalNamespace>>,
@@ -67,6 +74,8 @@ pub struct LocalSocket {
     listen_epoch: Cell<u64>,
     kind: u32,
     reuse: Cell<[u32; 2]>,
+    passcred: Cell<bool>,
+    datagram_peer: RefCell<Weak<LocalSocket>>,
 }
 struct Listener {
     backlog: usize,
@@ -82,6 +91,8 @@ pub struct LocalReceived {
     pub length: usize,
     pub truncated: bool,
     pub rights: LocalRights,
+    pub credentials: Option<[u32; 3]>,
+    pub source: Vec<u8>,
 }
 impl LocalSocket {
     pub fn readable_bytes(&self) -> Result<usize> {
@@ -104,7 +115,7 @@ impl LocalSocket {
             network,
             pathname_binding: OnceCell::new(),
             channel: RefCell::new(Rc::new(Channel {
-                resource: channel::Resource::new(kind, false),
+                resource: channel::Resource::new(kind, kind == 2),
                 ends: [Weak::new(), Weak::new()],
                 rights: RefCell::default(),
                 next_right: Cell::new(0),
@@ -119,6 +130,8 @@ impl LocalSocket {
             listen_epoch: Cell::new(0),
             kind,
             reuse: Cell::new([0; 2]),
+            passcred: Cell::new(false),
+            datagram_peer: RefCell::new(Weak::new()),
         })
     }
     fn pair(a: &Rc<Self>, b: &Rc<Self>) {
@@ -134,6 +147,7 @@ impl LocalSocket {
             end.connected.set(true);
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
+            channel.resource.set_passcred(side, end.passcred.get());
         }
         // Connect changes direct-resource eligibility without changing the FD
         // table; another forked table may already have cached this description.
@@ -195,6 +209,14 @@ impl LocalSocket {
     }
 
     pub fn set_reuse(&self, option: u32, value: u32) -> Result<()> {
+        if option == 16 {
+            self.passcred.set(value != 0);
+            self.channel
+                .borrow()
+                .resource
+                .set_passcred(self.side.get(), value != 0);
+            return Ok(());
+        }
         let i = match option {
             2 => 0,
             15 => 1,
@@ -206,6 +228,9 @@ impl LocalSocket {
         Ok(())
     }
     pub fn reuse(&self, option: u32) -> u32 {
+        if option == 16 {
+            return u32::from(self.passcred.get());
+        }
         self.reuse.get()[usize::from(option == 15)]
     }
     pub fn kind(&self) -> u32 {
@@ -216,7 +241,10 @@ impl LocalSocket {
             .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
     }
     pub(super) fn direct_message(&self) -> Option<(Arc<channel::Resource>, usize)> {
-        (matches!(self.kind, 2 | 5) && self.connected.get() && !self.listening())
+        (matches!(self.kind, 2 | 5)
+            && self.connected.get()
+            && !self.listening()
+            && self.channel.borrow().ends[0].strong_count() != 0)
             .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
     }
     pub fn shutdown(&self, how: u32) -> Result<()> {
@@ -229,6 +257,15 @@ impl LocalSocket {
         self.send_rights(bytes, flags, LocalRights::default())
     }
     pub fn send_rights(&self, bytes: &[u8], flags: u32, rights: LocalRights) -> Result<usize> {
+        self.send_rights_credentials(bytes, flags, rights, self.credentials.get())
+    }
+    fn send_rights_credentials(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: LocalRights,
+        credentials: [u32; 3],
+    ) -> Result<usize> {
         // Preserve the original flags/connection/state checks before rights
         // graph traversal. Pure bytes need no owner rights-map operation.
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -239,7 +276,13 @@ impl LocalSocket {
         }
         let binding = self.channel.borrow();
         if rights.is_empty() {
-            return binding.resource.send(self.side.get(), bytes, flags, None);
+            return binding.resource.send_credentials(
+                self.side.get(),
+                bytes,
+                flags,
+                None,
+                Some(credentials),
+            );
         }
         binding.resource.send_check(self.side.get(), flags)?;
         let peer = binding.ends[1 - self.side.get()]
@@ -264,7 +307,7 @@ impl LocalSocket {
             let ids = channel.resource.right_ids(socket.side.get());
             let ledger = channel.rights.borrow();
             for id in ids {
-                for open in &ledger.get(&id).expect("queued rights").0 {
+                for open in &ledger.get(&id).expect("queued rights").rights.0 {
                     if let Some(socket) = &open.borrow().local {
                         pending.push(socket.clone());
                     }
@@ -276,10 +319,21 @@ impl LocalSocket {
         }
         let id = binding.next_right.get();
         binding.next_right.set(id.checked_add(1).ok_or(Errno(75))?);
-        binding.rights.borrow_mut().insert(id, rights);
-        let result = binding
-            .resource
-            .send(self.side.get(), bytes, flags, Some(id));
+        binding.rights.borrow_mut().insert(
+            id,
+            Ancillary {
+                rights,
+                credentials: None,
+                source: vec![1, 0],
+            },
+        );
+        let result = binding.resource.send_credentials(
+            self.side.get(),
+            bytes,
+            flags,
+            Some(id),
+            Some(credentials),
+        );
         if result.is_err() {
             let unused = binding.rights.borrow_mut().remove(&id);
             drop(unused); // Never destroy rights while borrowing their ledger.
@@ -293,7 +347,7 @@ impl LocalSocket {
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
             return Err(Errno(95));
         }
-        if !self.connected.get() {
+        if !self.connected.get() && self.kind != 2 {
             return Err(Errno(if self.kind == 2 { 11 } else { 22 }));
         }
         let binding = self.channel.borrow();
@@ -301,7 +355,7 @@ impl LocalSocket {
             .resource
             .recv(self.side.get(), count, flags, true)
             .expect("owner may receive rights")?;
-        let rights = if let Some(id) = received.rights {
+        let ancillary = if let Some(id) = received.rights {
             if flags & 2 != 0 {
                 binding
                     .rights
@@ -317,13 +371,26 @@ impl LocalSocket {
                     .expect("received rights")
             }
         } else {
-            LocalRights::default()
+            Ancillary {
+                rights: LocalRights::default(),
+                credentials: None,
+                source: vec![1, 0],
+            }
         };
         Ok(LocalReceived {
             data: received.data,
             length: received.length,
             truncated: received.truncated,
-            rights,
+            rights: ancillary.rights,
+            credentials: if self.passcred.get() {
+                received
+                    .credentials
+                    .or(ancillary.credentials)
+                    .or(Some([0, 65534, 65534]))
+            } else {
+                None
+            },
+            source: ancillary.source,
         })
     }
     pub fn poll(&self, events: u16) -> u16 {
@@ -334,7 +401,7 @@ impl LocalSocket {
                 events & 1
             };
         }
-        if !self.connected.get() {
+        if !self.connected.get() && self.kind != 2 {
             return (events & 4) | if self.kind == 2 { 0 } else { 16 };
         }
         self.channel
@@ -409,6 +476,7 @@ impl Vfs {
                         flags: (2 | (flags & O_NONBLOCK)).into(),
                         file_position: Arc::default(),
                         flock: std::sync::OnceLock::new(),
+                        ofd_records: Default::default(),
                         node: None,
                         pipe: None,
                         bridge: None,
@@ -509,18 +577,8 @@ impl Vfs {
         *socket.name.borrow_mut() = name;
         Ok(())
     }
-    pub fn local_connect(&self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
+    fn local_destination(&self, socket: &LocalSocket, bytes: &[u8]) -> Result<Rc<LocalSocket>> {
         let (name, abstract_) = Self::local_address(bytes)?;
-        if socket.connected.get() {
-            return Err(Errno(106));
-        }
-        if socket.listening() {
-            return Err(Errno(22));
-        }
-        // Unconnected datagrams need per-message destinations and credentials.
-        if socket.kind == 2 {
-            return Err(Errno(95));
-        }
         let peer = if abstract_ {
             socket
                 .namespace
@@ -544,6 +602,25 @@ impl Vfs {
         if peer.kind != socket.kind {
             return Err(Errno(91));
         }
+        Ok(peer)
+    }
+    pub fn local_connect(&self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
+        if socket.connected.get() {
+            return Err(Errno(106));
+        }
+        if socket.listening() {
+            return Err(Errno(22));
+        }
+        let peer = self.local_destination(socket, bytes)?;
+        if socket.kind == 2 {
+            *socket.datagram_peer.borrow_mut() = Rc::downgrade(&peer);
+            *socket.peer_name.borrow_mut() = peer.name.borrow().clone();
+            socket.connected.set(true);
+            return Ok(());
+        }
+        if peer.kind != socket.kind {
+            return Err(Errno(91));
+        }
         let mut listener = peer.listener.borrow_mut();
         let l = listener.as_mut().ok_or(Errno(111))?;
         if l.pending.len() > l.backlog {
@@ -558,6 +635,7 @@ impl Vfs {
         ]);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
         LocalSocket::pair(socket, &accepted);
+        accepted.set_reuse(16, peer.reuse(16))?;
         l.pending.push_back(accepted);
         peer.listen_epoch
             .set(peer.listen_epoch.get().wrapping_add(1));

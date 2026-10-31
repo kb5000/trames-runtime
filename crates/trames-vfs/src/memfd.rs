@@ -117,6 +117,7 @@ impl Vfs {
                         flags: (2).into(),
                         file_position: Arc::default(),
                         flock: std::sync::OnceLock::new(),
+                        ofd_records: Default::default(),
                         node: Some(node),
                         pipe: None,
                         bridge: None,

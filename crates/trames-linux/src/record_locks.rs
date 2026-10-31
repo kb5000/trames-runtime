@@ -16,7 +16,7 @@ pub(crate) fn call(
 ) -> Option<Result<u64>> {
     let parameters = (|| {
         Linux::check(memory, address, 32, Access::Read)?;
-        if command == 5 {
+        if matches!(command, 5 | 36) {
             Linux::check(memory, address, 32, Access::Write)?;
         }
         memory.read_array::<32>(address).map_err(|_| Errno(14))
@@ -25,6 +25,9 @@ pub(crate) fn call(
         Ok(bytes) => bytes,
         Err(e) => return Some(Err(e)),
     };
+    if matches!(command, 36..=38) && bytes[24..28] != [0; 4] {
+        return Some(Err(Errno(22)));
+    }
     let kind = u16::from_le_bytes(bytes[..2].try_into().unwrap());
     let requested = normalize(
         kind,
@@ -34,7 +37,7 @@ pub(crate) fn call(
     )?;
     Some((|| {
         let requested = requested?;
-        if command == 5 {
+        if matches!(command, 5 | 36) {
             if kind == 2 {
                 return Err(Errno(22));
             }
@@ -50,7 +53,14 @@ pub(crate) fn call(
                     })
                     .to_le_bytes(),
                 );
-                bytes[24..28].copy_from_slice(&visible_pid(conflict.owner).to_le_bytes());
+                bytes[24..28].copy_from_slice(
+                    &(if conflict.owner & trames_vfs::OFD_LOCK_OWNER != 0 {
+                        u32::MAX
+                    } else {
+                        visible_pid(conflict.owner as u32)
+                    })
+                    .to_le_bytes(),
+                );
             } else {
                 bytes[..2].copy_from_slice(&2u16.to_le_bytes());
             }

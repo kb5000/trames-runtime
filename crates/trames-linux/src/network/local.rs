@@ -3,7 +3,6 @@
 use super::*;
 
 pub(super) struct Message {
-    pub control: u64,
     pub control_size: u64,
     pub output: Option<AddressOutput>,
     pub vectors: Vectors,
@@ -43,7 +42,6 @@ impl Message {
             if receive { Access::Write } else { Access::Read },
         )?;
         Ok(Self {
-            control,
             control_size,
             output,
             vectors,

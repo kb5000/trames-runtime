@@ -64,7 +64,7 @@ use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
 pub use ipc::{LocalReceived, LocalRights, LocalSocket, WaylandAuth};
-pub use locks::{RecordLock, RecordLockContext};
+pub use locks::{RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER};
 mod linux_namespace;
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
@@ -183,6 +183,7 @@ struct SharedOpenDescription {
     flags: StatusFlags,
     file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
     flock: std::sync::OnceLock<Arc<flock::Owner>>,
+    ofd_records: std::sync::OnceLock<locks::OfdOwner>,
     node: Option<NodeRef>,
     // Overlay read descriptions retain the real lower file selected at open.
     read_node: Option<NodeRef>,
@@ -714,6 +715,7 @@ impl Default for Vfs {
                             flags: flags.into(),
                             file_position: Arc::default(),
                             flock: std::sync::OnceLock::new(),
+                            ofd_records: Default::default(),
                             node: None,
                             pipe: None,
                             bridge: None,
@@ -1011,6 +1013,7 @@ impl Vfs {
                             flags: (2).into(),
                             file_position: Arc::default(),
                             flock: std::sync::OnceLock::new(),
+                            ofd_records: Default::default(),
                             node: None,
                             pipe: None,
                             bridge: None,
@@ -2114,6 +2117,7 @@ impl Vfs {
                             pending: 0,
                         })),
                         flock: std::sync::OnceLock::new(),
+                        ofd_records: Default::default(),
                         node: Some(node),
                         pipe,
                         bridge,
@@ -2305,6 +2309,7 @@ impl Vfs {
                             flags: ((flags & O_NONBLOCK) | access).into(),
                             file_position: Arc::default(),
                             flock: std::sync::OnceLock::new(),
+                            ofd_records: Default::default(),
                             node: None,
                             pipe: Some(end),
                             bridge: None,
@@ -2537,7 +2542,7 @@ impl Vfs {
             return log.write(bytes);
         }
         if let Some(local) = &o.local {
-            return local.send(bytes, 0);
+            return self.local_send_to(local, bytes, 0, None, LocalRights::default());
         }
         if o.namespace.is_some() {
             return Err(Errno(22));

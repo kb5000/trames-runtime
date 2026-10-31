@@ -128,6 +128,7 @@ pub struct DirectSyscalls {
     files: trames_vfs::DirectFiles,
     membership: Option<trames_vfs::SharedFiles>,
     lock_context: Option<trames_vfs::RecordLockContext>,
+    local_identity: Option<[u32; 3]>,
     disk_cache: RefCell<trames_vfs::DiskReadCache>,
     file_completed: Cell<u64>,
     socket_completed: Cell<u64>,
@@ -150,6 +151,7 @@ impl DirectSyscalls {
             files: Default::default(),
             membership,
             lock_context: None,
+            local_identity: None,
             disk_cache: Default::default(),
             file_completed: Cell::new(0),
             socket_completed: Cell::new(0),
@@ -163,6 +165,10 @@ impl DirectSyscalls {
     }
     pub fn with_lock_context(mut self, context: trames_vfs::RecordLockContext) -> Self {
         self.lock_context = Some(context);
+        self
+    }
+    pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
+        self.local_identity = Some(identity);
         self
     }
     pub fn with_files(mut self, files: trames_vfs::DirectFiles) -> Self {
@@ -258,7 +264,7 @@ impl DirectSyscalls {
             self.record_fd_control();
             return Some(result);
         }
-        if number == 25 && matches!(a[1], 5 | 6) {
+        if number == 25 && matches!(a[1], 5 | 6 | 36 | 37) {
             let context = self.lock_context.as_ref()?;
             let file = self.files.get(a[0] as u32)?;
             let result = if !file.allows_record_locks() {
@@ -269,7 +275,11 @@ impl DirectSyscalls {
                     a[1],
                     a[2],
                     |kind, whence, start, length| {
-                        file.normalize_lock(kind, whence, start, length, context.owner)
+                        if a[1] >= 36 {
+                            file.normalize_ofd_lock(kind, whence, start, length)
+                        } else {
+                            file.normalize_lock(kind, whence, start, length, context.owner)
+                        }
                     },
                     |requested| Ok(file.record_lock_conflict(requested)),
                     |requested| file.record_lock_set(requested),
@@ -501,8 +511,16 @@ impl DirectSyscalls {
         let write = |bytes: &[u8]| {
             let result = if fd.is_pty() {
                 fd.terminal_write(bytes, self.terminal)
-            } else if matches!(number, 206 | 211) {
-                Some(fd.send(bytes, flags))
+            } else if fd.is_unix() {
+                Some(fd.send_credentials(
+                    bytes,
+                    if matches!(number, 206 | 211) {
+                        flags
+                    } else {
+                        0
+                    },
+                    self.local_identity,
+                ))
             } else {
                 Some(fd.write(bytes))
             };
@@ -1680,7 +1698,7 @@ mod tests {
         assert!(vfs.timerfd_get(fd).unwrap().1.as_secs() >= 3599);
         assert_eq!(
             direct.invoke(86, [fd as u64, 2, 0x1100, 0, 0, 0], &mut m),
-            Some(Err(Errno(95)))
+            Some(Ok(0))
         );
         assert_eq!(
             direct.invoke(86, [fd as u64, 1, 0x1100, 0, 0, 0], &mut m),

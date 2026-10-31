@@ -30,9 +30,6 @@ pub fn timerfd_control(
         if a[1] & !3 != 0 {
             return Err(Errno(22));
         }
-        if a[1] & 2 != 0 {
-            return Err(Errno(95));
-        }
         let interval = duration(memory, a[2])?;
         let value = duration(memory, a[2].checked_add(16).ok_or(Errno(14))?)?;
         let delta = if a[1] & 1 == 0 {
@@ -52,11 +49,15 @@ pub fn timerfd_control(
         } else {
             Some(Instant::now().checked_add(delta).ok_or(Errno(22))?)
         };
-        Some((interval, deadline))
+        Some((
+            interval,
+            deadline,
+            (timer.clock == 0 && a[1] & 3 == 3).then_some(value),
+        ))
     } else {
         None
     };
-    let (interval, remaining) = timer.update(new);
+    let (interval, remaining) = timer.update_mode(new)?;
     if number == 87 || output != 0 {
         let mut bytes = [0; 32];
         for (offset, d) in [(0, interval), (16, remaining)] {

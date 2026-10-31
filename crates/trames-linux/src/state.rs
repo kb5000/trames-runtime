@@ -127,6 +127,38 @@ impl Linux {
             }
         })
     }
+    pub fn prepare_record_lock(
+        &self,
+        memory: &mut impl CpuMemory,
+        a: [u64; 6],
+    ) -> Result<trames_vfs::RecordLockRequest> {
+        if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        let mut request = None;
+        crate::record_locks::call(
+            memory,
+            a[1],
+            a[2],
+            |kind, whence, start, length| {
+                Some(if a[1] >= 36 {
+                    self.vfs
+                        .normalize_ofd_lock(a[0] as u32, kind, whence, start, length)
+                } else {
+                    self.vfs
+                        .normalize_lock(a[0] as u32, kind, whence, start, length)
+                })
+            },
+            |r| self.vfs.record_lock_conflict(a[0] as u32, r),
+            |r| {
+                request = Some(self.vfs.retain_record_lock(a[0] as u32, r)?);
+                Ok(())
+            },
+            |owner| self.vfs.visible_pid(owner),
+        )
+        .expect("owner lock cannot defer")?;
+        request.ok_or(Errno(22))
+    }
     pub fn record_lock_holder(&self, memory: &Memory, a: [u64; 6]) -> Result<Option<u32>> {
         Self::check(memory, a[2], 32, Access::Read)?;
         let mut bytes = [0; 32];
@@ -141,7 +173,7 @@ impl Linux {
         Ok(self
             .vfs
             .record_lock_conflict(a[0] as u32, requested)?
-            .map(|lock| lock.owner))
+            .and_then(|lock| u32::try_from(lock.owner).ok()))
     }
     pub fn check(
         memory: &impl CpuMemory,
@@ -1199,15 +1231,23 @@ impl Linux {
                         self.vfs.set_status_flags(a[0] as u32, a[2] as u32)?;
                         Ok(0)
                     }
-                    5..=7 => crate::record_locks::call(
+                    5..=7 | 36..=38 => crate::record_locks::call(
                         memory,
                         a[1],
                         a[2],
                         |kind, whence, start, length| {
-                            Some(
+                            Some(if a[1] >= 36 {
+                                self.vfs.normalize_ofd_lock(
+                                    a[0] as u32,
+                                    kind,
+                                    whence,
+                                    start,
+                                    length,
+                                )
+                            } else {
                                 self.vfs
-                                    .normalize_lock(a[0] as u32, kind, whence, start, length),
-                            )
+                                    .normalize_lock(a[0] as u32, kind, whence, start, length)
+                            })
                         },
                         |requested| self.vfs.record_lock_conflict(a[0] as u32, requested),
                         |requested| self.vfs.record_lock_set(a[0] as u32, requested),

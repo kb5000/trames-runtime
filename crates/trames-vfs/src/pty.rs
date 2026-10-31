@@ -199,6 +199,7 @@ impl Vfs {
                         flags: (flags & !O_CLOEXEC).into(),
                         file_position: Arc::default(),
                         flock: std::sync::OnceLock::new(),
+                        ofd_records: Default::default(),
                         node: Some(node),
                         pipe: None,
                         bridge: None,

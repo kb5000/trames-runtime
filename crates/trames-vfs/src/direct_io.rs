@@ -353,6 +353,7 @@ impl DirectFd {
     /// Native interests of this accepted resource, not every open watch.
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
         match &self.resource {
+            ByteResource::Timer(timer) => timer.native_fd().into_iter().collect(),
             #[cfg(all(feature = "hostfs", unix))]
             ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
             ByteResource::Epoll(epoll) => epoll
@@ -371,7 +372,7 @@ impl DirectFd {
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
-            ByteResource::Timer(timer) => vec![timer.readiness.subscribe(signal)],
+            ByteResource::Timer(timer) => vec![timer.subscribe(signal)],
             ByteResource::Inotify(queue) => vec![queue.subscribe(signal)],
             ByteResource::Pipe { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Unix { data, .. } => vec![data.readiness.subscribe(signal)],
@@ -761,11 +762,21 @@ impl DirectFd {
         })
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
+        self.send_credentials(bytes, flags, None)
+    }
+    pub fn send_credentials(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        credentials: Option<[u32; 3]>,
+    ) -> Result<usize> {
         if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
             return Err(Errno(9));
         }
         match &self.resource {
-            ByteResource::Unix { data, side } => data.send(*side, bytes, flags, None),
+            ByteResource::Unix { data, side } => {
+                data.send_credentials(*side, bytes, flags, None, credentials)
+            }
             _ => Err(Errno(88)),
         }
     }
@@ -930,6 +941,7 @@ impl Vfs {
 
 fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
     match &open.anonymous {
+        Some(events::Anonymous::Timer(timer)) => timer.native_fd().into_iter().collect(),
         #[cfg(all(feature = "hostfs", unix))]
         Some(events::Anonymous::Inotify(instance)) => instance
             .queue

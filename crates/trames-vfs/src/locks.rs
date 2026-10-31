@@ -8,7 +8,7 @@ pub struct RecordLock {
     pub kind: u16,
     pub start: u64,
     pub end: u64,
-    pub owner: u32,
+    pub owner: u64,
 }
 
 /// Only inode registration and process exit visit the registry. Ordinary lock
@@ -51,14 +51,14 @@ impl Registry {
             live
         };
         for records in live {
-            records.release(owner);
+            records.release(owner as u64);
         }
     }
 }
 #[derive(Default)]
 pub(super) struct Records(Mutex<Vec<RecordLock>>);
 impl Records {
-    fn release(&self, owner: u32) {
+    fn release(&self, owner: u64) {
         self.0.lock().unwrap().retain(|lock| lock.owner != owner);
     }
     pub(super) fn conflict(&self, requested: RecordLock) -> Option<RecordLock> {
@@ -164,10 +164,85 @@ pub(super) fn normalize(
         kind,
         start: low as u64,
         end: high,
-        owner,
+        owner: owner as u64,
     })
 }
 
+pub const OFD_LOCK_OWNER: u64 = 1 << 63;
+pub(super) struct OfdOwner {
+    records: Arc<Records>,
+    owner: u64,
+}
+impl Drop for OfdOwner {
+    fn drop(&mut self) {
+        self.records.release(self.owner);
+    }
+}
+impl SharedOpenDescription {
+    pub(super) fn ofd_record_owner(&self, records: &Arc<Records>) -> u64 {
+        self.ofd_records
+            .get_or_init(|| OfdOwner {
+                records: records.clone(),
+                owner: OFD_LOCK_OWNER | self.id,
+            })
+            .owner
+    }
+}
+/// An accepted blocking fcntl owns the original OFD and normalized range, even
+/// when a sibling closes/reuses its descriptor or mutates the input structure.
+#[derive(Clone)]
+pub struct RecordLockRequest {
+    records: Arc<Records>,
+    requested: RecordLock,
+    _file: RetainedFd,
+}
+impl RecordLockRequest {
+    pub fn try_lock(&self) -> Result<()> {
+        self.records.set(self.requested)
+    }
+    pub fn holder(&self) -> Option<u32> {
+        self.records
+            .conflict(self.requested)
+            .and_then(|r| u32::try_from(r.owner).ok())
+    }
+}
+impl Vfs {
+    pub fn normalize_ofd_lock(
+        &self,
+        fd: u32,
+        kind: u16,
+        whence: u16,
+        start: i64,
+        length: i64,
+    ) -> Result<RecordLock> {
+        let mut lock = self.normalize_lock(fd, kind, whence, start, length)?;
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
+        lock.owner = open
+            .shared
+            .ofd_record_owner(&self.inode_record_locks(&node));
+        Ok(lock)
+    }
+    pub fn retain_record_lock(&self, fd: u32, requested: RecordLock) -> Result<RecordLockRequest> {
+        let file = RetainedFd(self.descriptor(fd)?);
+        let open = file.0.open.borrow();
+        if (requested.kind == 0 && open.flags.get() & 3 == 1)
+            || (requested.kind == 1 && open.flags.get() & 3 == 0)
+        {
+            return Err(Errno(9));
+        }
+        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
+        let records = self.inode_record_locks(&node);
+        drop(node);
+        drop(open);
+        Ok(RecordLockRequest {
+            records,
+            requested,
+            _file: file,
+        })
+    }
+}
 /// Frozen PID visibility while task/namespace changes still checkpoint. This
 /// owns only copied IDs, never the Rc namespace or a process/VFS reference.
 #[derive(Clone, Default)]
@@ -215,7 +290,7 @@ impl SharedOpenDescription {
             // acquired a lock object. Close releases this process's locks even
             // when dup/another process retains the open description.
             if let Some(records) = node.borrow().record_locks.get() {
-                records.release(owner);
+                records.release(owner as u64);
             }
         }
     }
@@ -272,6 +347,39 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ofd_ranges_share_dup_fork_and_retained_lifetime_but_conflict_with_posix() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(AT_FDCWD, b"/ofd", 0x42, 0o600).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let mut child = v.clone();
+        child.set_lock_owner(2);
+        let other = v.open_at(AT_FDCWD, b"/ofd", 2, 0).unwrap();
+        let lock = v.normalize_ofd_lock(fd, 1, 0, 0, 8).unwrap();
+        v.record_lock_set(fd, lock).unwrap();
+        assert_eq!(child.normalize_ofd_lock(alias, 1, 0, 0, 8).unwrap(), lock);
+        let distinct = v.normalize_ofd_lock(other, 1, 0, 0, 8).unwrap();
+        assert_ne!(distinct.owner, lock.owner);
+        assert_eq!(v.record_lock_set(other, distinct), Err(Errno(11)));
+        let posix = v.normalize_lock(fd, 1, 0, 0, 8).unwrap();
+        assert_eq!(v.record_lock_set(fd, posix), Err(Errno(11)));
+        v.close(alias).unwrap();
+        v.release_process_locks();
+        assert_eq!(v.record_lock_conflict(other, distinct).unwrap(), Some(lock));
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&child, true);
+        let accepted = files.get(fd).unwrap();
+        v.close(fd).unwrap();
+        child.close(fd).unwrap();
+        child.close(alias).unwrap();
+        assert_eq!(v.record_lock_conflict(other, distinct).unwrap(), Some(lock));
+        drop(accepted);
+        assert_eq!(v.record_lock_conflict(other, distinct).unwrap(), None);
+        v.record_lock_set(other, distinct).unwrap();
+        // A prepared weak cache cannot keep a closed OFD's ranges alive.
+        v.close(other).unwrap();
+        child.close(other).ok();
+    }
     #[test]
     fn backward_ranges_readers_and_overflow_are_checked() {
         let mut v = Vfs::default();
