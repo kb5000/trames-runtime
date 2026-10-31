@@ -79,7 +79,21 @@ Monotonic mount/target markers bypass unrelated mount-table scans; mount moves
 and namespace copies mark new attachments and conservative positives remain safe.
 The host identity index never spans native lookup or namespace-lock acquisition.
 Metadata admission reconciles concurrent candidates, and dead weak registrations
-are collected at allocation boundaries rather than on ordinary reads.
+are collected at allocation boundaries rather than on ordinary reads. Apple host
+metadata lookup uses fstatat relative to the grant with AT_SYMLINK_NOFOLLOW_ANY,
+avoiding an open/stat/close of each parent. Linux retains its component capability
+walk, and older Darwin kernels rejecting the flag use the established path.
+Final symlinks are reported as links and interpreted by the guest resolver, never
+followed by the native lookup. See Apple's [flag contract](https://developer.apple.com/documentation/system/stat/flags-swift.struct/symlinknofollowany).
+
+Joined newfstatat prepares the real query while observing its proc dependency.
+An ordinary result is copied out directly; queries that touch proc are discarded
+and repeated after the existing publication/refinement step. This avoids a
+separate discovery-only pathname walk without caching results across syscalls,
+namespace/credential changes or independent host mutations. Failed queries do
+not change output memory. Joined positioned writes also reuse the existing
+bounded service buffer instead of allocating and zeroing a buffer for every call;
+no per-process cache, new service thread or additional I/O lock is introduced.
 
 Host MAP_PRIVATE pages use retained native descriptors and the existing guest
 COW/page-source model. Page bytes are read only on demand; no native writable

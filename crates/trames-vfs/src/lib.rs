@@ -1263,12 +1263,20 @@ impl Vfs {
     /// first refresh identities; the caller re-probes the final data dependency
     /// after publishing newly-created tasks.
     pub fn proc_observation(&self, dirfd: i32, path: &[u8]) -> Option<ProcRefresh> {
+        self.observe_proc(|vfs| vfs.resolve(dirfd, path)).1
+    }
+    /// Observe the actual operation when its result can be prepared before a
+    /// possible proc refresh. Ordinary paths then need no discovery-only walk.
+    /// A caller that refreshes proc must repeat the query before publishing it.
+    pub fn observe_proc<T>(&self, operation: impl FnOnce(&Self) -> T) -> (T, Option<ProcRefresh>) {
         self.proc_accessed.set(false);
         self.proc_refresh.set(ProcRefresh::Independent);
-        let _ = self.resolve(dirfd, path);
-        self.proc_accessed
+        let result = operation(self);
+        let demand = self
+            .proc_accessed
             .replace(false)
-            .then(|| self.proc_refresh.get())
+            .then(|| self.proc_refresh.get());
+        (result, demand)
     }
     pub fn resolve_final(
         &self,

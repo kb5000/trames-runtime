@@ -381,6 +381,41 @@ impl Linux {
             Ok(bytes.len() as u64)
         }
     }
+    /// Resolve/stat once while recording whether proc publication is needed.
+    /// No guest output is written until the owner has handled that dependency.
+    pub fn prepare_stat(
+        &self,
+        a: [u64; 6],
+        memory: &Memory,
+    ) -> (Result<[u8; 128]>, Option<trames_vfs::ProcRefresh>) {
+        let query = || {
+            if a[3] & !0x1100 != 0 {
+                return Err(Errno(22));
+            }
+            let path = Self::path(memory, a[1])?;
+            Self::check(memory, a[2], 128, Access::Write)?;
+            Ok(path)
+        };
+        let path = match query() {
+            Ok(path) => path,
+            Err(error) => return (Err(error), None),
+        };
+        self.vfs.observe_proc(|vfs| {
+            if path.is_empty() && a[3] & 0x1000 != 0 {
+                vfs.stat_fd(a[0] as u32)
+            } else {
+                vfs.stat_at_flags(a[0] as i32, &path, a[3] & 0x100 != 0)
+            }
+        })
+    }
+    pub fn finish_stat(
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        stat: Result<[u8; 128]>,
+    ) -> Result<u64> {
+        memory.write(a[2], &stat?).map_err(|_| Errno(14))?;
+        Ok(0)
+    }
     /// Metadata/offset queries do not change mappings or file contents. The
     /// coordinator and in-epoch service use the same ABI and memory validation.
     pub fn fd_query(
@@ -1122,19 +1157,8 @@ impl Linux {
                 Ok(bytes.len() as u64)
             }
             79 => {
-                if a[3] & !0x1100 != 0 {
-                    return Err(Errno(22));
-                }
-                let path = Self::path(memory, a[1])?;
-                Self::check(memory, a[2], 128, Access::Write)?;
-                let stat = if path.is_empty() && a[3] & 0x1000 != 0 {
-                    self.vfs.stat_fd(a[0] as u32)?
-                } else {
-                    self.vfs
-                        .stat_at_flags(a[0] as i32, &path, a[3] & 0x100 != 0)?
-                };
-                memory.write(a[2], &stat).map_err(|_| Errno(14))?;
-                Ok(0)
+                let (stat, _) = self.prepare_stat(a, memory);
+                Self::finish_stat(a, memory, stat)
             }
             80 => self.fd_query(80, a, memory),
             17 => {

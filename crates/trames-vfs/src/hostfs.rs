@@ -68,16 +68,12 @@ fn open_at(parent: &File, name: &CString, flags: i32, mode: u32) -> Result<File>
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 fn meta_at(parent: &File, name: &CString) -> Result<libc::stat> {
+    meta_at_flags(parent, name, libc::AT_SYMLINK_NOFOLLOW)
+}
+fn meta_at_flags(parent: &File, name: &CString, flags: i32) -> Result<libc::stat> {
     let mut out = std::mem::MaybeUninit::uninit();
     // SAFETY: one initialized stat on success, retained directory, valid name.
-    status(unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            out.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })?;
+    status(unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), out.as_mut_ptr(), flags) })?;
     // SAFETY: successful fstatat initialized all fields.
     Ok(unsafe { out.assume_init() })
 }
@@ -101,6 +97,37 @@ impl std::ops::Deref for Parent<'_> {
     }
 }
 impl Root {
+    fn metadata(&self, key: &[u8]) -> Result<libc::stat> {
+        #[cfg(target_vendor = "apple")]
+        {
+            // The SDK's AT_SYMLINK_NOFOLLOW_ANY rejects native symlinks in
+            // ancestors while still reporting a final link itself. Resolve
+            // relative to the retained grant in one syscall, not open+stat+close
+            // per lookup. Guest symlink interpretation remains in the VFS.
+            const AT_SYMLINK_NOFOLLOW_ANY: i32 = 0x0800;
+            let key = &key[key.iter().position(|&b| b != b'/').unwrap_or(key.len())..];
+            if key
+                .split(|&b| b == b'/')
+                .any(|part| part == b"." || part == b"..")
+            {
+                return Err(Errno(22));
+            }
+            let name =
+                CString::new(if key.is_empty() { b"." } else { key }).map_err(|_| Errno(22))?;
+            match meta_at_flags(
+                &self.directory,
+                &name,
+                libc::AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY,
+            ) {
+                // Older Darwin kernels can keep the established capability
+                // walk when they do not recognize this flag.
+                Err(Errno(22)) => {}
+                result => return result,
+            }
+        }
+        let (parent, name) = self.parent(key)?;
+        meta_at(&parent, &name)
+    }
     fn parent(&self, key: &[u8]) -> Result<(Parent<'_>, CString)> {
         let mut pieces = key
             .split(|&b| b == b'/')
@@ -446,8 +473,7 @@ fn native_path(file: &File) -> Result<std::path::PathBuf> {
 }
 impl HostFs {
     pub fn stat_at(&self, key: &[u8]) -> Result<[u8; 128]> {
-        let (parent, name) = self.root.parent(key)?;
-        Ok(encode_stat(&self.root, &meta_at(&parent, &name)?))
+        Ok(encode_stat(&self.root, &self.root.metadata(key)?))
     }
     pub fn key_of(&self, filesystem: &FsHandle, node: &NodeRef) -> Result<Vec<u8>> {
         let file = node.host.get().ok_or(Errno(2))?;
@@ -521,8 +547,7 @@ impl HostFs {
     }
     #[allow(clippy::unnecessary_cast)]
     pub fn lookup(&self, filesystem: &FsHandle, key: &[u8]) -> Result<NodeRef> {
-        let (parent, name) = self.root.parent(key)?;
-        let meta = match meta_at(&parent, &name) {
+        let meta = match self.root.metadata(key) {
             Ok(meta) => meta,
             Err(error) => {
                 filesystem.borrow_mut().paths.remove(key);
@@ -560,6 +585,7 @@ impl HostFs {
                 let content = match kind {
                     0o40000 => Content::Directory,
                     0o120000 => {
+                        let (parent, name) = self.root.parent(key)?;
                         let mut target = vec![0; MAX_PATH];
                         // SAFETY: retained parent, valid name and writable output buffer.
                         let count = unsafe {

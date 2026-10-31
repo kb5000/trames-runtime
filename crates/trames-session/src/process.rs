@@ -1780,6 +1780,27 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
         match number {
+            // The joined path uses the same bounded scratch as an existing
+            // service call. Keep capacity across syscalls instead of allocating
+            // and zeroing a new transfer buffer for every positioned write.
+            67 | 68 => p
+                .linux
+                .positioned_scratch(
+                    a,
+                    &mut p.memory,
+                    number == 68,
+                    &mut self.service_write_buffer,
+                )
+                .map(Some),
+            69 | 70 => p
+                .linux
+                .positioned_vector_scratch(
+                    a,
+                    &mut p.memory,
+                    number == 70,
+                    &mut self.service_write_buffer,
+                )
+                .map(Some),
             32 => {
                 let (request, file) = match p.flock_wait.take() {
                     Some(wait) => wait,
@@ -2682,6 +2703,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.set_process_context(pid);
         p.linux.vfs.set_lock_owner(p.tgid);
         p.linux.vfs.set_file_size_limit(p.file_size_limit.get().0);
+        let mut prepared_stat = (number == 79).then(|| p.linux.prepare_stat(a, &p.memory));
         let proc_path = match number {
             27 => Some((trames_vfs::AT_FDCWD, a[1])),
             43 | 45 | 221 => Some((trames_vfs::AT_FDCWD, a[0])),
@@ -2691,14 +2713,20 @@ impl<C: Cpu> Kernel<C> {
             _ => None,
         };
         use trames_vfs::ProcRefresh;
-        let mut proc_observation = matches!(number, 39..=41).then_some(ProcRefresh::Metadata);
-        let proc_lookup = proc_path.and_then(|(dirfd, address)| {
-            p.memory
-                .read_c_string(address, 4096)
-                .ok()
-                .map(|path| (dirfd, path))
-        });
-        if let Some((dirfd, path)) = &proc_lookup {
+        let mut proc_observation = if number == 79 {
+            prepared_stat.as_ref().and_then(|(_, demand)| *demand)
+        } else {
+            matches!(number, 39..=41).then_some(ProcRefresh::Metadata)
+        };
+        let proc_lookup = proc_path
+            .filter(|_| number != 79 || proc_observation.is_some())
+            .and_then(|(dirfd, address)| {
+                p.memory
+                    .read_c_string(address, 4096)
+                    .ok()
+                    .map(|path| (dirfd, path))
+            });
+        if let Some((dirfd, path)) = proc_lookup.as_ref().filter(|_| number != 79) {
             if let Some(demand) = p.linux.vfs.proc_observation(*dirfd, path) {
                 proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
@@ -2713,6 +2741,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         if let Some(demand) = proc_observation.filter(|d| *d != ProcRefresh::Independent) {
+            prepared_stat = None;
             self.proc_refreshes += 1;
             self.refresh_proc_observed(
                 pid,
@@ -2773,7 +2802,10 @@ impl<C: Cpu> Kernel<C> {
             Some(trames_linux::IoAttempt::Checkpoint) => {
                 unreachable!("joined shared byte call")
             }
-            None => self.syscall(pid, p, number, a, io),
+            None => match prepared_stat {
+                Some((stat, _)) => Linux::finish_stat(a, &mut p.memory, stat).map(Some),
+                None => self.syscall(pid, p, number, a, io),
+            },
         };
         if ids(&p.linux.vfs.credentials) != before_ids {
             p.pdeath_signal = 0;
@@ -6328,6 +6360,44 @@ mod tests {
             gpu_wait_time: Duration::ZERO,
             gpu_transfers: trames_vulkan::TransferMetrics::default(),
         }
+    }
+    #[test]
+    fn prepared_stat_refreshes_new_proc_aliases_but_reuses_ordinary_results() {
+        let mut k = kernel();
+        let mut p = process();
+        k.refresh_proc(1, &mut p, None);
+        k.processes.insert(2, process());
+        p.linux
+            .vfs
+            .symlink_at(b"/proc/2/status", -100, b"/alias")
+            .unwrap();
+        p.memory.write(0x1000, b"/alias\0").unwrap();
+        let args = [(-100i64) as u64, 0x1000, 0x2000, 0, 0, 0];
+        let mut output = trames_linux::CapturedOutput::default();
+        let before = k.proc_refreshes;
+        k.call(1, &mut p, 79, args, &mut output);
+        assert_eq!(p.cpu.x(0), 0);
+        assert!(k.proc_refreshes > before);
+        assert_eq!(read_u32(&p.memory, 0x2010).unwrap() & 0o170000, 0o100000);
+
+        let fd = p
+            .linux
+            .vfs
+            .open_at(-100, b"/ordinary", 0x42, 0o600)
+            .unwrap();
+        p.linux.vfs.write(fd, b"hello").unwrap();
+        p.memory.write(0x1000, b"/ordinary\0").unwrap();
+        let before = k.proc_refreshes;
+        k.call(1, &mut p, 79, args, &mut output);
+        assert_eq!(p.cpu.x(0), 0);
+        assert_eq!(read_u64(&p.memory, 0x2030).unwrap(), 5);
+        assert_eq!(k.proc_refreshes, before);
+
+        p.memory.write(0x1000, b"/missing\0").unwrap();
+        p.memory.write(0x2000, &[0x5c; 128]).unwrap();
+        k.call(1, &mut p, 79, args, &mut output);
+        assert_eq!(p.cpu.x(0), error(Errno(2)));
+        assert_eq!(p.memory.read_array::<128>(0x2000).unwrap(), [0x5c; 128]);
     }
     #[test]
     fn proc_maps_refresh_after_shared_protect_reserve_unmap_and_fork() {

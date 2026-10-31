@@ -15,7 +15,29 @@ pub(crate) unsafe fn copy(mut source: *const u8, mut destination: *mut u8, len: 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         use core::arch::asm;
-        let words = len / 8;
+        #[cfg(target_arch = "aarch64")]
+        let remaining = {
+            let blocks = len / 64;
+            if blocks != 0 {
+                // SAFETY: each iteration touches exactly 64 live bytes. SIMD
+                // operands stay inside asm, without references/LLVM race UB.
+                // Bulk copies have no atomicity promise; scalar CPU accesses
+                // below 64 bytes retain their existing instruction widths.
+                unsafe {
+                    asm!("2:",
+                        "ldp q0, q1, [{source}], #32", "ldp q2, q3, [{source}], #32",
+                        "stp q0, q1, [{destination}], #32", "stp q2, q3, [{destination}], #32",
+                        "subs {blocks}, {blocks}, #1", "b.ne 2b",
+                        source=inout(reg) source, destination=inout(reg) destination,
+                        blocks=inout(reg) blocks => _,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _, options(nostack));
+                }
+            }
+            len % 64
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let remaining = len;
+        let words = remaining / 8;
         if words != 0 {
             #[cfg(target_arch = "aarch64")]
             unsafe {

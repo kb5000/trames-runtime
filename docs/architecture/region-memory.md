@@ -424,7 +424,12 @@ stores over the exact checked range. Guest bytes never become LLVM loads/stores
 or Rust references, including scalar read results. Host input/output buffers
 retain normal Rust ownership. Aligned 64-bit transfers use one ordinary host
 load/store; longer transfers may observe normal guest races and are not promised
-an atomic snapshot. There is no added fence, global native-call lock or guest
+an atomic snapshot. AArch64 bulk copies now use paired SIMD loads/stores in
+exact 64-byte blocks, followed by the existing 8/4/2/1-byte tail. They never read
+or write outside the requested range. Scalar CPU accesses below 64 bytes retain
+their original instruction widths; a bulk transfer has no whole-range atomicity
+promise. No guest references, speculative overreads, barriers or additional
+exclusion are introduced. There is no added fence, global native-call lock or guest
 race error. Other architectures retain exclusion and the original copy path.
 
 Region ownership still stabilizes storage and excludes overlapping host slice
