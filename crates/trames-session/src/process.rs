@@ -1586,38 +1586,16 @@ impl<C: Cpu> Kernel<C> {
         }
         for depth in 0..5 {
             let bytes = file.bytes()?;
-            if bytes.starts_with(b"#!") {
+            if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
                 if depth == 0 && inaccessible {
                     return Err(Errno(2));
                 }
                 if depth == 4 {
                     return Err(Errno(40));
                 }
-                let line = bytes[2..].split(|&b| b == b'\n').next().ok_or(Errno(8))?;
-                if line.len() > 254 {
-                    return Err(Errno(8));
-                }
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
-                let start = line
-                    .iter()
-                    .position(|b| !b.is_ascii_whitespace())
-                    .ok_or(Errno(8))?;
-                let line = &line[start..];
-                let mut parts = line.splitn(2, |b| b.is_ascii_whitespace());
-                let interpreter = parts.next().unwrap_or_default();
-                if interpreter.is_empty() {
-                    return Err(Errno(8));
-                }
-                let mut next = vec![interpreter.to_vec()];
-                if let Some(optional) = parts.next() {
-                    let trimmed = optional
-                        .iter()
-                        .position(|b| !b.is_ascii_whitespace())
-                        .map(|i| &optional[i..])
-                        .unwrap_or_default();
-                    if !trimmed.is_empty() {
-                        next.push(trimmed.to_vec());
-                    }
+                let mut next = vec![interpreter.clone()];
+                if let Some(argument) = optional {
+                    next.push(argument);
                 }
                 next.push(if depth == 0 {
                     filename.clone()
@@ -1626,7 +1604,7 @@ impl<C: Cpu> Kernel<C> {
                 });
                 next.extend(argv.into_iter().skip(1));
                 argv = next;
-                path = interpreter.to_vec();
+                path = interpreter;
                 file = p.linux.vfs.executable_file_at(AT_FDCWD, &path, 0)?;
                 continue;
             }

@@ -8,6 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{atomic::AtomicBool, Mutex};
+mod private_map;
+pub(super) use private_map::pages as private_pages;
 
 fn errno(error: std::io::Error) -> Errno {
     let code = match error.raw_os_error() {
@@ -166,7 +168,6 @@ impl Root {
 }
 pub(super) struct OpenFile {
     pub file: File,
-    access: u32,
     root: Arc<Root>,
 }
 impl OpenFile {
@@ -220,8 +221,25 @@ fn encode_stat(root: &Root, meta: &libc::stat) -> [u8; 128] {
 
 struct FileState {
     key: Vec<u8>,
-    handles: [std::sync::Weak<OpenFile>; 3],
+    handles: [Vec<std::sync::Weak<OpenFile>>; 3],
     metadata: std::sync::Weak<OpenFile>,
+}
+impl FileState {
+    fn retained(&mut self, write: Option<bool>) -> Option<Arc<OpenFile>> {
+        for access in [2, 0, 1] {
+            if write.is_some_and(|write| if write { access == 0 } else { access == 1 }) {
+                continue;
+            }
+            let handles = &mut self.handles[access];
+            while let Some(handle) = handles.last() {
+                if let Some(file) = handle.upgrade() {
+                    return Some(file);
+                }
+                handles.pop();
+            }
+        }
+        None
+    }
 }
 pub(super) struct HostFile {
     root: Arc<Root>,
@@ -229,6 +247,7 @@ pub(super) struct HostFile {
     directory: bool,
     state: Mutex<FileState>,
     length: AtomicU64,
+    length_generation: AtomicU64,
 }
 impl HostFile {
     pub fn chmod(&self, _node: &NodeRef, mode: u32) -> Result<()> {
@@ -326,6 +345,9 @@ impl HostFile {
     pub fn acquire(&self, access: u32) -> Result<Arc<OpenFile>> {
         let key = self.state.lock().unwrap().key.clone();
         let file = self.root.open(&key, access, self.directory)?;
+        self.retain(file, access)
+    }
+    fn retain(&self, file: File, access: u32) -> Result<Arc<OpenFile>> {
         let meta = file.metadata().map_err(errno)?;
         if (meta.dev(), meta.ino()) != self.identity {
             return Err(Errno(2));
@@ -333,30 +355,19 @@ impl HostFile {
         if !meta.is_file() && !meta.is_dir() {
             return Err(Errno(95));
         }
-        self.length.store(meta.len(), Ordering::Relaxed);
+        self.publish_length(meta.len());
         let handle = Arc::new(OpenFile {
             file,
-            access,
             root: self.root.clone(),
         });
-        self.state.lock().unwrap().handles[access as usize] = Arc::downgrade(&handle);
+        let mut state = self.state.lock().unwrap();
+        let handles = &mut state.handles[access as usize];
+        handles.retain(|file| file.strong_count() != 0);
+        handles.push(Arc::downgrade(&handle));
         Ok(handle)
     }
     pub fn file(&self, write: bool) -> Result<Arc<OpenFile>> {
-        let found = self
-            .state
-            .lock()
-            .unwrap()
-            .handles
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|file| {
-                if write {
-                    file.access != 0
-                } else {
-                    file.access != 1
-                }
-            });
+        let found = self.state.lock().unwrap().retained(Some(write));
         match found {
             Some(file) => Ok(file),
             None => self.acquire(u32::from(write)),
@@ -364,20 +375,24 @@ impl HostFile {
     }
     pub fn len(&self) -> u64 {
         if let Ok(meta) = self.metadata() {
-            self.length.store(meta.len(), Ordering::Relaxed);
+            self.publish_length(meta.len());
         }
         self.length.load(Ordering::Relaxed)
+    }
+    pub(super) fn publish_length(&self, length: u64) {
+        if self.length.load(Ordering::Relaxed) != length
+            && self.length.swap(length, Ordering::Relaxed) != length
+        {
+            self.length_generation.fetch_add(1, Ordering::Relaxed);
+            trames_memory::backing_changed();
+        }
     }
     pub fn metadata(&self) -> Result<Metadata> {
         self.any_file()?.file.metadata().map_err(errno)
     }
     pub fn any_file(&self) -> Result<Arc<OpenFile>> {
-        let state = self.state.lock().unwrap();
-        let handle = state
-            .handles
-            .iter()
-            .find_map(std::sync::Weak::upgrade)
-            .or_else(|| state.metadata.upgrade());
+        let mut state = self.state.lock().unwrap();
+        let handle = state.retained(None).or_else(|| state.metadata.upgrade());
         drop(state);
         match handle {
             Some(handle) => Ok(handle),
@@ -397,7 +412,6 @@ impl HostFile {
         }
         let handle = Arc::new(OpenFile {
             file,
-            access: 3,
             root: self.root.clone(),
         });
         self.state.lock().unwrap().metadata = Arc::downgrade(&handle);
@@ -535,10 +549,11 @@ impl HostFs {
                     directory: kind == 0o40000,
                     state: Mutex::new(FileState {
                         key: key.to_vec(),
-                        handles: std::array::from_fn(|_| std::sync::Weak::new()),
+                        handles: std::array::from_fn(|_| Vec::new()),
                         metadata: std::sync::Weak::new(),
                     }),
                     length: AtomicU64::new(meta.st_size.max(0) as u64),
+                    length_generation: AtomicU64::new(0),
                 });
                 let content = match kind {
                     0o40000 => Content::Directory,
@@ -721,6 +736,31 @@ impl HostFs {
             _ => return Err(Errno(95)),
         }
         self.lookup(filesystem, key)
+    }
+    pub fn create_open(
+        &self,
+        filesystem: &FsHandle,
+        key: &[u8],
+        flags: u32,
+        mode: u32,
+    ) -> Result<(NodeRef, Arc<OpenFile>)> {
+        self.root.writable()?;
+        let (parent, name) = self.root.parent(key)?;
+        let access = flags & 3;
+        let native = match access {
+            0 => libc::O_RDONLY,
+            1 => libc::O_WRONLY,
+            _ => libc::O_RDWR,
+        };
+        let file = open_at(
+            &parent,
+            &name,
+            native | libc::O_CREAT | libc::O_EXCL,
+            mode & 0o7777,
+        )?;
+        let node = self.lookup(filesystem, key)?;
+        let lease = node.host.get().ok_or(Errno(2))?.retain(file, access)?;
+        Ok((node, lease))
     }
     pub fn unlink(&self, key: &[u8], directory: bool) -> Result<()> {
         self.root.writable()?;
@@ -1037,6 +1077,18 @@ mod tests {
         assert!(!fixture.0.join("file").exists());
     }
     #[test]
+    fn closing_the_newest_handle_does_not_lose_an_older_open_inode() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), b"original").unwrap();
+        let mut v = fixture.vfs(false);
+        let old = v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap();
+        let newest = v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap();
+        v.close(newest).unwrap();
+        v.unlink_at(AT_FDCWD, b"/host/file", false).unwrap();
+        assert_eq!(v.pread(old, 8, 0).unwrap(), b"original");
+        v.close(old).unwrap();
+    }
+    #[test]
     fn namespace_metadata_append_and_directory_refresh() {
         let fixture = Fixture::new();
         let mut v = fixture.vfs(false);
@@ -1095,6 +1147,24 @@ mod tests {
         );
     }
     #[test]
+    fn creating_readonly_files_preserves_the_original_write_description() {
+        let fixture = Fixture::new();
+        let mut v = fixture.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/object", 0xc2, 0o444).unwrap();
+        v.write(fd, b"git object").unwrap();
+        assert_eq!(v.pread(fd, 10, 0).unwrap(), b"git object");
+        assert_eq!(
+            std::fs::metadata(fixture.0.join("object")).unwrap().mode() & 0o777,
+            0o444
+        );
+        v.sync_fd(fd, false).unwrap();
+        v.close(fd).unwrap();
+        assert_eq!(
+            std::fs::read(fixture.0.join("object")).unwrap(),
+            b"git object"
+        );
+    }
+    #[test]
     fn readonly_is_an_immutable_host_capability_and_shared_mmap_is_explicit() {
         let fixture = Fixture::new();
         std::fs::write(fixture.0.join("file"), b"readonly").unwrap();
@@ -1109,6 +1179,86 @@ mod tests {
             Some(Errno(19))
         );
         assert_eq!(v.read(fd, 30).unwrap(), b"readonly");
+    }
+    #[test]
+    fn private_mapping_is_lazy_cow_and_does_not_shadow_native_file_io() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), vec![7; PAGE_SIZE as usize * 2]).unwrap();
+        let mut v = fixture.vfs(true);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap();
+        let pages = v
+            .mapping_pages(fd, PAGE_SIZE, PAGE_SIZE, false, true)
+            .unwrap();
+        assert!(pages[0].shared_page().is_none());
+        let mut memory = Memory::new(1 << 20);
+        memory
+            .map_backed(0x10000, pages, false, Permissions::RW, false)
+            .unwrap();
+        assert_eq!(memory.read_array::<4>(0x10000).unwrap(), [7; 4]);
+        memory.write(0x10000, b"COW!").unwrap();
+        assert_eq!(memory.read_array::<4>(0x10000).unwrap(), *b"COW!");
+        std::fs::write(fixture.0.join("file"), vec![9; PAGE_SIZE as usize * 2]).unwrap();
+        assert_eq!(v.pread(fd, 4, PAGE_SIZE).unwrap(), [9; 4]);
+        assert_eq!(memory.read_array::<4>(0x10000).unwrap(), *b"COW!");
+        assert_eq!(v.allocated_bytes(), 0);
+        assert_eq!(
+            &std::fs::read(fixture.0.join("file")).unwrap()[4096..4100],
+            &[9; 4]
+        );
+    }
+    #[test]
+    fn private_mapping_and_exec_keep_the_original_inode_after_native_replacement() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), vec![5; 100]).unwrap();
+        std::fs::set_permissions(
+            fixture.0.join("file"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut v = fixture.vfs(false);
+        let executable = v.executable_file_at(AT_FDCWD, b"/host/file", 0).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap();
+        let pages = v.mapping_pages(fd, 0, 2 * PAGE_SIZE, false, false).unwrap();
+        assert!(matches!(
+            pages[1].check(0x11000),
+            Err(trames_memory::MemoryError::Bus(0x11000))
+        ));
+        let first = pages[0].clone();
+        let mut memory = Memory::new(1 << 20);
+        memory
+            .map_backed(0x10000, vec![first], false, Permissions::R, false)
+            .unwrap();
+        v.close(fd).unwrap();
+        std::fs::write(fixture.0.join("new"), vec![8; 100]).unwrap();
+        std::fs::rename(fixture.0.join("new"), fixture.0.join("file")).unwrap();
+        assert_eq!(executable.bytes().unwrap(), vec![5; 100]);
+        assert_eq!(memory.read_array::<4>(0x10000).unwrap(), [5; 4]);
+        assert_eq!(memory.read_array::<4>(0x10000 + 100).unwrap(), [0; 4]);
+        pages[0].sync().unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 0, 0).unwrap();
+        assert_eq!(v.read(fd, 4).unwrap(), [8; 4]);
+    }
+    #[test]
+    fn private_mapping_faults_after_guest_truncates_a_resident_page() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), vec![3; PAGE_SIZE as usize]).unwrap();
+        let mut v = fixture.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 2, 0).unwrap();
+        let pages = v.mapping_pages(fd, 0, PAGE_SIZE, false, true).unwrap();
+        let mut memory = Memory::new(1 << 20);
+        memory
+            .map_backed(0x10000, pages, false, Permissions::RW, false)
+            .unwrap();
+        assert_eq!(memory.read_array::<4>(0x10000).unwrap(), [3; 4]);
+        memory.write(0x10000, b"COW!").unwrap();
+        v.truncate_fd(fd, 0).unwrap();
+        assert!(matches!(
+            memory.read_array::<4>(0x10000),
+            Err(trames_memory::MemoryError::Bus(_))
+        ));
     }
     #[test]
     fn symlinks_resolve_in_guest_and_native_ancestor_replacement_cannot_escape() {

@@ -907,12 +907,6 @@ impl Vfs {
     ) -> Result<Vec<Rc<dyn PageBacking>>> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
-        #[cfg(all(feature = "hostfs", unix))]
-        if o.host_file.is_some() {
-            // A copied guest page is not a coherent native MAP_SHARED alias.
-            // Keep host mapping authority explicit until that backend exists.
-            return Err(Errno(19));
-        }
         let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
             ring.mapping_offset(offset, len, shared)?
         } else {
@@ -942,6 +936,18 @@ impl Vfs {
         let sealed = node.borrow().seals.is_some_and(|s| s & 8 != 0);
         if shared && writable && sealed {
             return Err(Errno(1));
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(file) = &o.host_file {
+            if shared {
+                return Err(Errno(19));
+            }
+            let executable = o
+                .mount
+                .as_ref()
+                .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
+            let host = node.host.get().ok_or(Errno(19))?.clone();
+            return hostfs::private_pages(file.clone(), host, offset, len, executable);
         }
         let may_write =
             !readonly && shared && o.flags.get() & 3 == 2 && !sealed && !node.borrow().volatile;

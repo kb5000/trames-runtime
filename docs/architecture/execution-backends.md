@@ -81,9 +81,24 @@ The host identity index never spans native lookup or namespace-lock acquisition.
 Metadata admission reconciles concurrent candidates, and dead weak registrations
 are collected at allocation boundaries rather than on ordinary reads.
 
-Current limits are explicit: host-file mmap returns ENODEV, extended attributes
+Host MAP_PRIVATE pages use retained native descriptors and the existing guest
+COW/page-source model. Page bytes are read only on demand; no native writable
+mapping, background mirror or shared-byte coherence is implied. Ordinary inode
+I/O keeps its live native data path. Guest-known length changes invalidate EOF
+checks through a relaxed metadata generation.
+
+Initial session launch and guest exec share one shebang parser, including the
+single optional interpreter argument and bounded recursion. Native executable
+capabilities and mapping sources retain their original inode across replacement.
+Native create/open also retains the creation descriptor, including when a new
+file has read-only mode bits; cached weak handles preserve older open files
+when the newest same-access description closes.
+
+Current limits are explicit: host MAP_SHARED returns ENODEV, extended attributes
 and special host files are unsupported, and external host edits do not produce
-guest inotify events. Ordinary native reads/writes, offsets, append, sparse size,
+guest inotify events. Resident private pages do not monitor external native
+changes/truncation, and advisory locks remain local to the guest runtime.
+Ordinary native reads/writes, offsets, append, sparse size,
 fsync, metadata, hard links and namespace operations use the selected host
 filesystem. Its case, ownership and native access rules remain applicable.
 See the [Mac usage and native comparison](https://github.com/kb5000/trames-mac/blob/main/docs/guides/file-sharing.md).

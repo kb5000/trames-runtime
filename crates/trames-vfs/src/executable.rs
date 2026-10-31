@@ -3,6 +3,8 @@
 use super::*;
 
 pub struct ExecutableFile {
+    #[cfg(all(feature = "hostfs", unix))]
+    _host_file: Option<Arc<hostfs::OpenFile>>,
     pub(super) node: NodeRef,
     pub(super) label: Vec<u8>,
     pub(super) mount: Option<Rc<Mount>>,
@@ -62,7 +64,15 @@ impl Vfs {
             return Err(Errno(13));
         }
         drop(n);
-        Ok(Rc::new(ExecutableFile { node, label, mount }))
+        #[cfg(all(feature = "hostfs", unix))]
+        let host_file = node.host.get().map(|file| file.file(false)).transpose()?;
+        Ok(Rc::new(ExecutableFile {
+            #[cfg(all(feature = "hostfs", unix))]
+            _host_file: host_file,
+            node,
+            label,
+            mount,
+        }))
     }
     pub fn executable_display(&self, file: &ExecutableFile) -> Vec<u8> {
         self.location(&file.node, &file.mount)
@@ -73,6 +83,31 @@ impl Vfs {
                 label
             })
     }
+}
+
+/// Linux shebang argument rules shared by initial launch and execve/execveat.
+pub type ScriptInterpreter = (Vec<u8>, Option<Vec<u8>>);
+pub fn script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>> {
+    let Some(bytes) = bytes.strip_prefix(b"#!") else {
+        return Ok(None);
+    };
+    let line = bytes.split(|&b| b == b'\n').next().ok_or(Errno(8))?;
+    if line.len() > 254 {
+        return Err(Errno(8));
+    }
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let start = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .ok_or(Errno(8))?;
+    let mut parts = line[start..].splitn(2, |b| b.is_ascii_whitespace());
+    let interpreter = parts.next().unwrap_or_default().to_vec();
+    let argument = parts.next().and_then(|tail| {
+        tail.iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|i| tail[i..].to_vec())
+    });
+    Ok(Some((interpreter, argument)))
 }
 
 impl ExecutableFile {
@@ -87,6 +122,23 @@ impl ExecutableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shebang_parser_keeps_one_optional_argument_and_rejects_invalid_headers() {
+        assert_eq!(script_interpreter(b"ELF").unwrap(), None);
+        assert_eq!(
+            script_interpreter(b"#! /bin/env  python -u\r\nbody").unwrap(),
+            Some((b"/bin/env".to_vec(), Some(b"python -u".to_vec())))
+        );
+        assert_eq!(
+            script_interpreter(b"#!/bin/sh\n").unwrap(),
+            Some((b"/bin/sh".to_vec(), None))
+        );
+        assert_eq!(script_interpreter(b"#! \n"), Err(Errno(8)));
+        assert_eq!(
+            script_interpreter(&[b"#!".as_slice(), &[b'x'; 255]].concat()),
+            Err(Errno(8))
+        );
+    }
     fn snapshot(v: &mut Vfs) {
         v.set_runtime_info(
             1,

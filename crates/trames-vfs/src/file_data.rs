@@ -164,6 +164,10 @@ impl PlainFile {
     }
     fn publish_length(&self, length: u64) {
         self.length.store(length, Ordering::Relaxed);
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &self.host {
+            host.publish_length(length);
+        }
         if let Some(backing) = &self.backing {
             backing.update_size(length);
         }

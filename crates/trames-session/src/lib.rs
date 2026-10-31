@@ -498,9 +498,46 @@ impl<C: Cpu> Runtime<C> {
         vfs: trames_vfs::Vfs,
         options: RuntimeOptions,
     ) -> Result<Self, RuntimeError> {
-        let argv: Vec<_> = argv.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let mut argv: Vec<_> = argv.iter().map(|s| s.as_bytes().to_vec()).collect();
         let envp: Vec<_> = envp.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let mut runtime = Self::load_guest(bytes, &argv, &envp, &vfs, options)?;
+        let filename = bytes
+            .starts_with(b"#!")
+            .then(|| argv.first().cloned().unwrap_or_default());
+        let mut bytes = std::borrow::Cow::Borrowed(bytes);
+        for depth in 0..5 {
+            let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)
+                .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?
+            else {
+                break;
+            };
+            if depth == 4 {
+                return Err(RuntimeError::Elf(ElfError::Interpreter(40)));
+            }
+            let script =
+                argv.first()
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(RuntimeError::Arguments(
+                        "script launch requires a guest filename",
+                    ))?;
+            let file = vfs
+                .executable_file_at(trames_vfs::AT_FDCWD, &interpreter, 0)
+                .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?;
+            let mut next = vec![interpreter];
+            next.extend(optional);
+            next.push(script);
+            next.extend(argv.into_iter().skip(1));
+            argv = next;
+            bytes = std::borrow::Cow::Owned(
+                file.bytes()
+                    .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?,
+            );
+        }
+        let mut runtime = if let Some(filename) = filename {
+            Self::load_guest_execfn(&bytes, &argv, &envp, &vfs, options, Some(&filename))?
+        } else {
+            Self::load_guest(&bytes, &argv, &envp, &vfs, options)?
+        };
         runtime.linux.vfs = vfs;
         Ok(runtime)
     }

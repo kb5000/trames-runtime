@@ -50,6 +50,7 @@ pub use uring::{
 };
 mod executable;
 pub use executable::ExecutableFile;
+pub use executable::{script_interpreter, ScriptInterpreter};
 mod inotify;
 pub use inotify::{FileClose, InotifyInstance};
 mod ipc;
@@ -1898,16 +1899,33 @@ impl Vfs {
         if existed && flags & 0xc0 == 0xc0 {
             return Err(Errno(17));
         }
+        #[cfg(all(feature = "hostfs", unix))]
+        let mut created_host_file = None;
         if !existed {
             if flags & O_DIRECTORY != 0 || flags & 0x40 == 0 {
                 return Err(Errno(2));
             }
             self.check_parent_write(&p)?;
-            self.insert(
-                p.clone(),
-                Content::File(self.empty_data_at(&p)?),
-                0o100000 | (mode & 0o7777 & !self.umask()),
-            )?;
+            #[cfg(all(feature = "hostfs", unix))]
+            let native_created = if let Some(host) = &p.filesystem(self).host {
+                let (node, lease) =
+                    host.create_open(&p.filesystem(self), &p.key, flags, mode & !self.umask())?;
+                self.notification_link(&p, &node, true);
+                self.notification_entry(&p, inotify::CREATE, 0, false);
+                created_host_file = Some(lease);
+                true
+            } else {
+                false
+            };
+            #[cfg(not(all(feature = "hostfs", unix)))]
+            let native_created = false;
+            if !native_created {
+                self.insert(
+                    p.clone(),
+                    Content::File(self.empty_data_at(&p)?),
+                    0o100000 | (mode & 0o7777 & !self.umask()),
+                )?;
+            }
         }
         let node = self.node(&p)?;
         {
@@ -1959,13 +1977,16 @@ impl Vfs {
             None
         };
         #[cfg(all(feature = "hostfs", unix))]
-        let host_file = p
-            .filesystem(self)
-            .host
-            .as_ref()
-            .map(|host| host.lease(&node, flags))
-            .transpose()?
-            .flatten();
+        let host_file = match created_host_file {
+            Some(file) => Some(file),
+            None => p
+                .filesystem(self)
+                .host
+                .as_ref()
+                .map(|host| host.lease(&node, flags))
+                .transpose()?
+                .flatten(),
+        };
         {
             let mut n = node.borrow_mut();
             if flags & 0x200 != 0
