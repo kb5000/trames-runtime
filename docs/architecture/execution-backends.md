@@ -421,3 +421,21 @@ metadata state, real Linux libc/versioned symbol lookup, clock/syscall agreement
 concurrent callers, fork/exec, long elapsed-time arithmetic and realtime fallback.
 The Mac product records full-application and targeted measurements in its
 [execution design](https://github.com/kb5000/trames-mac/blob/main/docs/architecture/execution-backends.md).
+
+## Staged distribution population
+
+The Mac environment manager uses `Vfs::populate_staged` only while populating an
+unpublished private store, before any guest executes. It defers per-operation
+namespace checkpoints, retaining normal inode capacity, data ownership and sync
+rules, then flushes data and publishes one final manifest. A scope guard restores
+normal checkpointing on errors and unwinding. The caller discards the entire
+staging store on failure; this API is not a transaction for a running or shared
+filesystem. Normal private and hostfs runtime I/O use their existing paths.
+
+The shared distribution importer now also accepts the pinned official Debian
+13/trixie slim ARM64 OCI gzip layer. It retains SHA-256 verification, checked
+paths/types/capacity and guest-only extraction. Hard links use the VFS inode
+operation; merged-/usr symlinks remain guest symlinks. Debian's larger archive
+bounds apply only to that pinned image; Alpine keeps its existing input bounds.
+Mac setup normalizes the new environment's build-container DNS configuration;
+existing stores and iPad distribution selection are unchanged.

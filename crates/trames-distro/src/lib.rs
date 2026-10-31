@@ -15,6 +15,10 @@ pub use xwayland::{install_xwayland_launcher, install_xwayland_native};
 pub const ALPINE_VERSION: &str = "3.22.6";
 pub const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.6-aarch64.tar.gz";
 pub const ALPINE_SHA256: &str = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe";
+/// Official debuerreotype ARM64 slim OCI layer, immutable source revision.
+pub const DEBIAN_VERSION: &str = "13 (trixie), 20261027";
+pub const DEBIAN_URL: &str = "https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/e36653f9967231373aeba7cff2102fd004ac4f4a/trixie/slim/oci/blobs/rootfs.tar.gz";
+pub const DEBIAN_SHA256: &str = "2b70e040f7d132c8d366ee0223462552686510fb372ea5a83822973c30f19e36";
 const ARCHIVE_LIMIT: usize = 16 * 1024 * 1024;
 const EXPANDED_LIMIT: u64 = 128 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 16_384;
@@ -83,6 +87,7 @@ enum Content {
     Directory,
     File(Vec<u8>),
     Link(Vec<u8>),
+    HardLink(Vec<u8>),
 }
 struct Entry {
     path: Vec<u8>,
@@ -113,22 +118,42 @@ fn path(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// All archive bytes, paths, types and quotas are checked before namespace writes.
 /// Only the pinned upstream AArch64 minirootfs is accepted; no tar host extraction.
 pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Error> {
+    install(reader, vfs, ALPINE_SHA256, ARCHIVE_LIMIT, EXPANDED_LIMIT)
+}
+/// Install the pinned official Debian ARM64 slim rootfs using the same VFS
+/// ownership, permission and archive path model as Alpine. No host extraction.
+pub fn install_debian(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Error> {
+    install(
+        reader,
+        vfs,
+        DEBIAN_SHA256,
+        64 * 1024 * 1024,
+        512 * 1024 * 1024,
+    )
+}
+fn install(
+    reader: &mut impl Read,
+    vfs: &mut Vfs,
+    digest: &str,
+    compressed_limit: usize,
+    expanded_limit: u64,
+) -> Result<usize, Error> {
     let mut bytes = Vec::new();
     reader
-        .take(ARCHIVE_LIMIT as u64 + 1)
+        .take(compressed_limit as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > ARCHIVE_LIMIT {
+    if bytes.len() > compressed_limit {
         return Err(Error::Invalid("compressed size limit"));
     }
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    if hash != ALPINE_SHA256 {
+    if hash != digest {
         return Err(Error::Invalid("SHA-256 mismatch"));
     }
     let mut tar_bytes = Vec::new();
     flate2::read::GzDecoder::new(bytes.as_slice())
-        .take(EXPANDED_LIMIT + 1)
+        .take(expanded_limit + 1)
         .read_to_end(&mut tar_bytes)?;
-    if tar_bytes.len() as u64 > EXPANDED_LIMIT {
+    if tar_bytes.len() as u64 > expanded_limit {
         return Err(Error::Invalid("expanded size limit"));
     }
     let mut archive = tar::Archive::new(tar_bytes.as_slice());
@@ -162,6 +187,14 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
                     .ok_or(Error::Invalid("file size overflow"))?;
                 Content::File(data)
             }
+            tar::EntryType::Link => {
+                let target = self::path(
+                    &item
+                        .link_name_bytes()
+                        .ok_or(Error::Invalid("hardlink target missing"))?,
+                )?;
+                Content::HardLink(target)
+            }
             tar::EntryType::Symlink => {
                 let target = item
                     .link_name_bytes()
@@ -188,7 +221,9 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
     {
         return Err(Error::Invalid("storage capacity"));
     }
-    if vfs.stat_at(AT_FDCWD, b"/etc/alpine-release").is_ok() {
+    if vfs.stat_at(AT_FDCWD, b"/etc/alpine-release").is_ok()
+        || vfs.stat_at(AT_FDCWD, b"/etc/debian_version").is_ok()
+    {
         return Err(Error::Invalid("distribution already installed"));
     }
     for e in &entries {
@@ -209,6 +244,7 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
                 Content::Directory => 0,
                 Content::File(_) => 1,
                 Content::Link(_) => 2,
+                Content::HardLink(_) => 3,
             },
             e.path.len(),
         )
@@ -230,6 +266,7 @@ pub fn install_alpine(reader: &mut impl Read, vfs: &mut Vfs) -> Result<usize, Er
                 vfs.import_reader(&e.path, &mut data.as_slice(), e.mode & 0o111 != 0)?;
             }
             Content::Link(target) => vfs.symlink_at(&target, AT_FDCWD, &e.path)?,
+            Content::HardLink(target) => vfs.link_at(AT_FDCWD, &target, AT_FDCWD, &e.path)?,
         }
         vfs.chown_at(AT_FDCWD, &e.path, e.uid, e.gid, true)?;
         if regular {

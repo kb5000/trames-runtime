@@ -401,6 +401,7 @@ pub(super) struct DiskStore {
     root: PathBuf,
     _lock: File,
     checkpoint: std::sync::Mutex<()>,
+    initializing: std::sync::atomic::AtomicBool,
     used: AtomicU64,
 }
 fn regular(path: &Path) -> Result<()> {
@@ -463,6 +464,7 @@ impl DiskStore {
             root,
             _lock: lock,
             checkpoint: std::sync::Mutex::new(()),
+            initializing: std::sync::atomic::AtomicBool::new(false),
             used: AtomicU64::new(0),
         }))
     }
@@ -583,6 +585,9 @@ impl Filesystem {
         let Some(disk) = &self.disk else {
             return Ok(());
         };
+        if disk.initializing.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         // One manifest transaction per store, including snapshot construction.
         // Other filesystems and ordinary byte I/O remain independent.
         let _commit = disk.checkpoint.lock().unwrap();
@@ -1034,6 +1039,37 @@ impl Vfs {
             data.orphan(true);
         }
         Ok(())
+    }
+    /// Populate a private, unpublished staging store before creating a runtime.
+    /// The caller must discard the whole store on error. This is not a live
+    /// transaction: only the final namespace is published, and no guest may run
+    /// or share this VFS until the call returns. File data still uses normal
+    /// ownership, capacity and sync rules. The final sync commits every object
+    /// before its manifest; unwinding always restores normal checkpoints.
+    pub fn populate_staged<T, E: From<Errno>>(
+        &mut self,
+        populate: impl FnOnce(&mut Self) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let disk = self.fs.borrow().disk.clone().ok_or(Errno(22))?;
+        if disk.initializing.swap(true, Ordering::Relaxed) {
+            return Err(Errno(16).into());
+        }
+        struct Reset(Arc<DiskStore>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                self.0.initializing.store(false, Ordering::Relaxed);
+            }
+        }
+        let reset = Reset(disk);
+        let result = populate(self);
+        drop(reset);
+        match result {
+            Ok(value) => {
+                self.sync()?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
     }
     /// Open an app-owned store. Guest path bytes never become host file names.
     pub fn open_disk(path: impl AsRef<Path>, options: DiskOptions) -> Result<Self> {

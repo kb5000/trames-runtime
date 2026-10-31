@@ -1470,3 +1470,42 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
     assert!(v.sync_fd(named, true).is_err());
     assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
 }
+
+#[test]
+fn staged_population_publishes_once_and_restores_checkpointing_after_error_or_panic() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let original = fs::read(dir.0.join("manifest")).unwrap();
+    v.populate_staged::<_, Errno>(|v| {
+        v.import_reader(b"/one", &mut &b"first"[..], true)?;
+        assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), original);
+        v.link_at(AT_FDCWD, b"/one", AT_FDCWD, b"/two")?;
+        Ok(())
+    })
+    .unwrap();
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(v.executable(b"/one").unwrap(), b"first");
+    assert_eq!(
+        v.stat_at(AT_FDCWD, b"/one").unwrap()[..8],
+        v.stat_at(AT_FDCWD, b"/two").unwrap()[..8]
+    );
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    let failed = v.populate_staged::<(), Errno>(|v| {
+        v.import_reader(b"/not-published", &mut &b"partial"[..], false)?;
+        Err(Errno(28))
+    });
+    assert_eq!(failed, Err(Errno(28)));
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(v.stat_at(AT_FDCWD, b"/not-published"), Err(Errno(2)));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = v.populate_staged::<(), Errno>(|_| panic!("installer interrupted"));
+    }));
+    assert!(panicked.is_err());
+    v.import_reader(b"/normal", &mut &b"still durable"[..], false)
+        .unwrap();
+    drop(v);
+    assert!(dir.open().stat_at(AT_FDCWD, b"/normal").is_ok());
+}
