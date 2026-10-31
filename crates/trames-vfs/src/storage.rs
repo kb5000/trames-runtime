@@ -119,7 +119,7 @@ pub(super) struct DiskObject {
     pub(super) length: u64,
     pub(super) backing: Arc<DiskBacking>,
 }
-// Only immutable host paths/handles and an orphan flag cross the I/O boundary.
+// Backing identity, weak handles and its scalar charge cross the I/O boundary.
 // This lease retains both the object and the store lock until the last job ends.
 pub(super) struct DiskBacking {
     pub(super) path: PathBuf,
@@ -129,16 +129,67 @@ pub(super) struct DiskBacking {
     #[cfg(all(feature = "hostfs", unix))]
     pub(super) host: Option<Arc<hostfs::HostFile>>,
     pub(super) inode: u64,
+    // Open descriptions own strong leases; closed cached inodes own no FDs.
+    pub(super) files: std::sync::Mutex<[std::sync::Weak<File>; 2]>,
+    pub(super) charge: std::sync::OnceLock<AtomicU64>,
 }
 impl DiskObject {
     // Guest inode lifetime is independent of host descriptor lifetime. A store
     // with thousands of closed files must not consume thousands of iOS handles.
     // Orphans retain their private object path until the last guest reference dies.
-    pub(super) fn open(&self, write: bool) -> Result<File> {
-        self.backing.open(write)
+    pub(super) fn open(&self, write: bool) -> Result<Arc<File>> {
+        self.backing.file(write)
     }
 }
 impl DiskBacking {
+    pub(super) fn cached_file(&self) -> Option<Arc<File>> {
+        let files = self.files.lock().unwrap();
+        files[1].upgrade().or_else(|| files[0].upgrade())
+    }
+    pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<File>>> {
+        if self._store.is_none() {
+            return Ok(None);
+        }
+        self.file(write).map(Some)
+    }
+    pub(super) fn file(&self, write: bool) -> Result<Arc<File>> {
+        if self._store.is_none() {
+            return self.open(write).map(Arc::new);
+        }
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files[1]
+            .upgrade()
+            .or_else(|| (!write).then(|| files[0].upgrade()).flatten())
+        {
+            return Ok(file);
+        }
+        let file = Arc::new(self.open(write)?);
+        files[usize::from(write)] = Arc::downgrade(&file);
+        Ok(file)
+    }
+    // Called under PlainFile's existing byte ownership. Only length changes
+    // update this store-local scalar; ordinary reads and overwrites do not.
+    pub(super) fn register_size(&self, length: u64) {
+        if let Some(store) = &self._store {
+            self.charge.get_or_init(|| {
+                store.used.fetch_add(length, Ordering::Relaxed);
+                AtomicU64::new(length)
+            });
+        }
+    }
+    pub(super) fn update_size(&self, length: u64) {
+        if let (Some(store), Some(charge)) = (&self._store, self.charge.get()) {
+            if charge.load(Ordering::Relaxed) == length {
+                return;
+            }
+            let old = charge.swap(length, Ordering::Relaxed);
+            if length > old {
+                store.used.fetch_add(length - old, Ordering::Relaxed);
+            } else if old > length {
+                store.used.fetch_sub(old - length, Ordering::Relaxed);
+            }
+        }
+    }
     pub(super) fn open(&self, write: bool) -> Result<File> {
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &self.host {
@@ -160,6 +211,9 @@ impl DiskBacking {
 }
 impl Drop for DiskBacking {
     fn drop(&mut self) {
+        if let (Some(store), Some(charge)) = (&self._store, self.charge.get_mut()) {
+            store.used.fetch_sub(*charge.get_mut(), Ordering::Relaxed);
+        }
         #[cfg(all(feature = "hostfs", unix))]
         if self.host.is_some() {
             return;
@@ -170,6 +224,26 @@ impl Drop for DiskBacking {
     }
 }
 impl FileData {
+    pub(super) fn register_storage(&self) {
+        match self {
+            Self::Plain(data) => data.register_storage(),
+            Self::Mapped(data) => data.register_storage(),
+            // Lower data is already charged to its source store; copy-up
+            // registers its new private object when the inode changes source.
+            _ => (),
+        }
+    }
+    pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<File>>> {
+        match self {
+            Self::Plain(data) => data.private_lease(write),
+            Self::Mapped(data) => data.private_lease(write),
+            Self::Lower(node) => match &node.borrow().content {
+                Content::File(data) => data.private_lease(write),
+                _ => Err(Errno(22)),
+            },
+            Self::Shared(_) => Ok(None),
+        }
+    }
     #[cfg(all(feature = "hostfs", unix))]
     pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
         match self {
@@ -327,6 +401,7 @@ pub(super) struct DiskStore {
     root: PathBuf,
     _lock: File,
     checkpoint: std::sync::Mutex<()>,
+    used: AtomicU64,
 }
 fn regular(path: &Path) -> Result<()> {
     if !fs::symlink_metadata(path)
@@ -388,6 +463,7 @@ impl DiskStore {
             root,
             _lock: lock,
             checkpoint: std::sync::Mutex::new(()),
+            used: AtomicU64::new(0),
         }))
     }
     fn object_path(&self, inode: u64) -> PathBuf {
@@ -403,6 +479,8 @@ impl DiskStore {
         Ok(FileData::disk(DiskObject {
             length: 0,
             backing: Arc::new(DiskBacking {
+                files: std::sync::Mutex::default(),
+                charge: std::sync::OnceLock::new(),
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(true),
                 _store: Some(self.clone()),
@@ -419,6 +497,8 @@ impl DiskStore {
         Ok(FileData::disk(DiskObject {
             length,
             backing: Arc::new(DiskBacking {
+                files: std::sync::Mutex::default(),
+                charge: std::sync::OnceLock::new(),
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(false),
                 _store: Some(self.clone()),
@@ -1044,14 +1124,11 @@ impl Vfs {
     pub fn capacity(&self) -> StorageCapacity {
         Self::filesystem_capacity(&self.fs.borrow())
     }
-    pub(super) fn filesystem_capacity(
-        fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
-    ) -> StorageCapacity {
-        if let Some(overlay) = &fs.overlay {
-            return overlay.capacity();
+    pub(super) fn filesystem_used_bytes(fs: &Filesystem) -> u64 {
+        if let Some(disk) = &fs.disk {
+            return disk.used.load(Ordering::Relaxed);
         }
-        let used = fs
-            .inodes
+        fs.inodes
             .iter()
             .filter_map(std::sync::Weak::upgrade)
             .map(|n| {
@@ -1061,7 +1138,15 @@ impl Vfs {
                     _ => 0,
                 }
             })
-            .sum::<u64>();
+            .sum()
+    }
+    pub(super) fn filesystem_bytes(
+        fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
+    ) -> (u64, u64, u64) {
+        if let Some(overlay) = &fs.overlay {
+            return overlay.capacity_bytes();
+        }
+        let used = Self::filesystem_used_bytes(fs);
         let mut budget = fs.limits.file_bytes;
         let mut available = budget.saturating_sub(used);
         if let Some((volume, at_used)) = fs.volume {
@@ -1076,6 +1161,15 @@ impl Vfs {
             };
             available = budget.saturating_sub(used).min(host_free);
         }
+        (used, budget, available)
+    }
+    pub(super) fn filesystem_capacity(
+        fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
+    ) -> StorageCapacity {
+        if let Some(overlay) = &fs.overlay {
+            return overlay.capacity();
+        }
+        let (used, budget, available) = Self::filesystem_bytes(fs);
         StorageCapacity {
             budget_bytes: budget,
             used_bytes: used,
@@ -1095,7 +1189,7 @@ impl Vfs {
         if new > i64::MAX as u64 {
             return Err(Errno(27));
         }
-        if new.saturating_sub(old) > self.capacity().available_bytes {
+        if new.saturating_sub(old) > Self::filesystem_bytes(&self.fs.borrow()).2 {
             return Err(Errno(28));
         }
         Ok(())

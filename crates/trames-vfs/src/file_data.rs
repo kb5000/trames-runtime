@@ -43,6 +43,23 @@ impl Drop for ReadLease {
     }
 }
 impl PlainFile {
+    pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<std::fs::File>>> {
+        match &self.backing {
+            Some(backing) => backing.private_lease(write),
+            None => Ok(None),
+        }
+    }
+    pub(super) fn register_storage(&self) {
+        let Some(backing) = self
+            .backing
+            .as_ref()
+            .filter(|b| b._store.is_some() && b.charge.get().is_none())
+        else {
+            return;
+        };
+        let _bytes = self.bytes.read().unwrap();
+        backing.register_size(self.length.load(Ordering::Relaxed));
+    }
     #[cfg(all(feature = "hostfs", unix))]
     pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
         let host = self.host.as_ref()?;
@@ -147,6 +164,9 @@ impl PlainFile {
     }
     fn publish_length(&self, length: u64) {
         self.length.store(length, Ordering::Relaxed);
+        if let Some(backing) = &self.backing {
+            backing.update_size(length);
+        }
         if let Some(size) = self
             .logical_size
             .get()
@@ -170,9 +190,11 @@ impl PlainFile {
         }
         #[cfg(unix)]
         if let Some(backing) = &self.backing {
-            return Ok(std::fs::symlink_metadata(&backing.path)
-                .map_err(storage::host_errno)?
-                .blocks());
+            let metadata = match backing.cached_file() {
+                Some(file) => file.metadata(),
+                None => std::fs::symlink_metadata(&backing.path),
+            };
+            return Ok(metadata.map_err(storage::host_errno)?.blocks());
         }
         Ok(self.len().div_ceil(512))
     }

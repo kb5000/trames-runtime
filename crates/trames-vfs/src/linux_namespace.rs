@@ -439,6 +439,7 @@ impl Vfs {
     pub(super) fn namespace_description(&self, ns: NamespaceHandle) -> OpenHandle {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,

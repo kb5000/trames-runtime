@@ -565,6 +565,8 @@ impl HostFs {
                     _ => Content::File(storage::FileData::disk(storage::DiskObject {
                         length: meta.st_size.max(0) as u64,
                         backing: Arc::new(storage::DiskBacking {
+                            files: std::sync::Mutex::default(),
+                            charge: std::sync::OnceLock::new(),
                             path: Default::default(),
                             remove_on_drop: AtomicBool::new(false),
                             _store: None,

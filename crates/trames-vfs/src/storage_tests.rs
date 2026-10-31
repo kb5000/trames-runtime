@@ -521,6 +521,20 @@ fn closed_inodes_do_not_retain_native_file_descriptors() {
     assert_eq!(v.read(fd, 8).unwrap(), b"retained");
     v.pwrite(fd, b"X", 0).unwrap();
     v.sync_fd(fd, false).unwrap();
+    // Only the actively open inode owns a native handle. All 599 closed
+    // cached inodes remain descriptor-free, and final close releases this one.
+    let descriptors = || {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| {
+                fs::read_link(entry.unwrap().path())
+                    .ok()
+                    .filter(|path| path.starts_with(dir.0.join("objects")))
+            })
+            .count()
+    };
+    assert_eq!(descriptors(), 1);
+    v.close(fd).unwrap();
     for entry in fs::read_dir("/proc/self/fd").unwrap() {
         if let Ok(path) = fs::read_link(entry.unwrap().path()) {
             assert!(
@@ -529,7 +543,113 @@ fn closed_inodes_do_not_retain_native_file_descriptors() {
             );
         }
     }
+}
+
+#[test]
+fn private_usage_counts_live_objects_once_through_growth_replacement_and_rollback() {
+    fn exact(v: &Vfs, expected: u64) {
+        let fs = v.fs.borrow();
+        let scanned: u64 = fs
+            .inodes
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|node| {
+                let node = node.borrow();
+                match &node.content {
+                    Content::File(data) if node.seals.is_none() => data.len(),
+                    _ => 0,
+                }
+            })
+            .sum();
+        assert_eq!(scanned, expected);
+        assert_eq!(v.allocated_bytes(), scanned);
+        assert_eq!(v.capacity().used_bytes, scanned);
+    }
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.set_storage_limits(StorageLimits {
+        file_bytes: 100,
+        nodes: 100,
+    })
+    .unwrap();
+    v.import_file(b"/a", vec![7; 40]).unwrap();
+    v.link_at(AT_FDCWD, b"/a", AT_FDCWD, b"/alias").unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/a", 2, 0).unwrap();
+    exact(&v, 40);
+    v.pwrite(fd, b"X", 2).unwrap();
+    exact(&v, 40);
+    v.pwrite(fd, &[8; 10], 40).unwrap();
+    exact(&v, 50);
+    v.truncate_fd(fd, 20).unwrap();
+    exact(&v, 20);
+    v.import_reader_replace(b"/a", &mut &[9; 30][..]).unwrap();
+    exact(&v, 50); // Old inode still has its alias and open description.
+    v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+    exact(&v, 50);
     v.close(fd).unwrap();
+    exact(&v, 30);
+    assert_eq!(v.import_file(b"/over", vec![1; 71]), Err(Errno(28)));
+    exact(&v, 30);
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v.import_file(b"/failed", vec![1; 10]).is_err());
+    exact(&v, 30);
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    drop(v);
+    let mut v = dir.open();
+    exact(&v, 30);
+    v.import_file(b"/fill", vec![1; 70]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/a", 2, 0).unwrap();
+    v.pwrite(fd, b"overwrite", 0).unwrap();
+    assert_eq!(v.pwrite(fd, b"growth", 30), Err(Errno(28)));
+    exact(&v, 100);
+}
+
+#[test]
+fn private_usage_retains_mapped_and_pending_read_objects_until_release() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/mapped", vec![3; 4096]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/mapped", 2, 0).unwrap();
+    let pages = v.mapping_pages(fd, 0, 4096, true, true).unwrap();
+    v.truncate_fd(fd, 2048).unwrap();
+    assert_eq!(v.allocated_bytes(), 2048);
+    v.unlink_at(AT_FDCWD, b"/mapped", false).unwrap();
+    v.close(fd).unwrap();
+    assert_eq!(v.allocated_bytes(), 2048);
+    drop(pages);
+    assert_eq!(v.allocated_bytes(), 0);
+    v.import_file(b"/queued", vec![4; 32768]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/queued", 0, 0).unwrap();
+    let (read, job) = v.prepare_disk_read(fd, 32768, None).unwrap().unwrap();
+    v.unlink_at(AT_FDCWD, b"/queued", false).unwrap();
+    v.close(fd).unwrap();
+    assert_eq!(v.allocated_bytes(), 32768);
+    assert_eq!(read.finish(job.run()).unwrap(), vec![4; 32768]);
+    assert_eq!(v.allocated_bytes(), 0);
+}
+
+#[test]
+fn private_read_and_write_leases_follow_open_lifetime_and_guest_access() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"before".to_vec()).unwrap();
+    let read = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    let lease = {
+        let d = v.descriptor(read).unwrap();
+        let open = d.open.borrow();
+        Arc::downgrade(open._disk_file.as_ref().unwrap())
+    };
+    let write = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
+    assert_eq!(v.pwrite(read, b"denied", 0), Err(Errno(9)));
+    v.pwrite(write, b"after!", 0).unwrap();
+    assert_eq!(v.pread(read, 6, 0).unwrap(), b"after!");
+    v.close(write).unwrap();
+    assert!(lease.upgrade().is_some());
+    v.unlink_at(AT_FDCWD, b"/data", false).unwrap();
+    assert_eq!(v.pread(read, 6, 0).unwrap(), b"after!");
+    v.close(read).unwrap();
+    assert!(lease.upgrade().is_none());
+    assert_eq!(v.allocated_bytes(), 0);
 }
 #[test]
 fn recorded_limits_and_writable_usr_survive_reopen() {

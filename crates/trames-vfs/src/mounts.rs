@@ -781,8 +781,7 @@ impl Vfs {
             return Ok(u64::MAX);
         }
         let bytes =
-            Self::filesystem_capacity(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow())
-                .available_bytes;
+            Self::filesystem_bytes(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow()).2;
         Ok(bytes)
     }
     pub fn mapping_executable(&self, fd: u32) -> Result<bool> {

@@ -176,6 +176,10 @@ impl Overlay {
         let layer = self.upper.as_ref().unwrap_or(&self.lowers[0]);
         Vfs::filesystem_capacity(&layer.fs.borrow())
     }
+    pub(super) fn capacity_bytes(&self) -> (u64, u64, u64) {
+        let layer = self.upper.as_ref().unwrap_or(&self.lowers[0]);
+        Vfs::filesystem_bytes(&layer.fs.borrow())
+    }
     pub(super) fn allocate_inode(&self) -> Result<u64> {
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
         let mut fs = upper.fs.borrow_mut();

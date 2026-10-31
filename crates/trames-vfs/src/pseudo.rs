@@ -1013,6 +1013,7 @@ impl Vfs {
         };
         Ok(Some(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,
@@ -1251,6 +1252,7 @@ impl Vfs {
         };
         let descriptor = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,

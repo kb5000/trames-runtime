@@ -170,6 +170,7 @@ struct OpenDescription {
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Endpoint/namespace control projections above still retain owner ownership.
 struct SharedOpenDescription {
+    _disk_file: Option<Arc<std::fs::File>>,
     #[cfg(all(feature = "hostfs", unix))]
     host_file: Option<Arc<hostfs::OpenFile>>,
     native_image: Option<Arc<dyn trames_graphics::Image>>,
@@ -272,6 +273,11 @@ struct Inode {
 }
 impl Inode {
     fn new(mut node: Node) -> Self {
+        if node.seals.is_none() {
+            if let Content::File(data) = &node.content {
+                data.register_storage();
+            }
+        }
         node.identity = trames_memory::new_backing_identity();
         Self {
             #[cfg(all(feature = "hostfs", unix))]
@@ -329,6 +335,11 @@ impl std::ops::DerefMut for InodeWrite<'_> {
 }
 impl Drop for InodeWrite<'_> {
     fn drop(&mut self) {
+        if self.state_guard.seals.is_none() {
+            if let Content::File(data) = &self.state_guard.content {
+                data.register_storage();
+            }
+        }
         if let Some(size) = self.owner_cell.length.get() {
             if let Content::File(data) = &self.state_guard.content {
                 size.follow(&data.logical_size())
@@ -689,6 +700,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
                             native_image: None,
@@ -985,6 +997,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
                             native_image: None,
@@ -1165,19 +1178,7 @@ impl Vfs {
         self.fds.lookup(fd)
     }
     pub fn allocated_bytes(&self) -> u64 {
-        self.fs
-            .borrow()
-            .inodes
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .map(|n| {
-                let node = n.borrow();
-                match &node.content {
-                    Content::File(b) if node.seals.is_none() => b.len(),
-                    _ => 0,
-                }
-            })
-            .sum()
+        Self::filesystem_used_bytes(&self.fs.borrow())
     }
     pub fn cwd(&self) -> Result<Vec<u8>> {
         {
@@ -1949,6 +1950,14 @@ impl Vfs {
         if flags & O_PATH == 0 && flags & 3 != 0 {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
         }
+        let disk_file = if flags & O_PATH == 0 {
+            match &node.borrow().content {
+                Content::File(data) => data.private_lease(flags & 3 != 0)?,
+                _ => None,
+            }
+        } else {
+            None
+        };
         #[cfg(all(feature = "hostfs", unix))]
         let host_file = p
             .filesystem(self)
@@ -2050,6 +2059,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        _disk_file: disk_file,
                         #[cfg(all(feature = "hostfs", unix))]
                         host_file,
                         native_image: None,
@@ -2253,6 +2263,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
                             native_image: None,

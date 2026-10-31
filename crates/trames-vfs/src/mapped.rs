@@ -354,6 +354,12 @@ impl MappedData {
     pub(super) fn logical_size(&self) -> trames_shared::LogicalSize {
         self.data.borrow().logical_size()
     }
+    pub(super) fn register_storage(&self) {
+        self.data.borrow().register_storage();
+    }
+    pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<std::fs::File>>> {
+        self.data.borrow().private_lease(write)
+    }
     pub(super) fn len(&self) -> u64 {
         self.data.borrow().len()
     }
