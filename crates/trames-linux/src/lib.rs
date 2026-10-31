@@ -80,6 +80,11 @@ pub trait GuestOutput {
     fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
         Ok(true)
     }
+    /// One host-authorized Linux signal for guest PID 1, consumed only after
+    /// the stopped control hook. Terminal events still target foreground jobs.
+    fn root_signal(&mut self) -> Option<u32> {
+        None
+    }
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize>;
     fn read_stdin(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
         Ok(0)

@@ -808,7 +808,11 @@ impl Vfs {
         let (path, magic) = self.resolve_entry(AT_FDCWD, path, follow, true)?;
         match magic {
             Some((node, _, mount)) => self.location(&node, &mount),
-            None => Ok(path),
+            // Mount syscalls select the top mount even when pathname walking
+            // starts at a retained cwd and consumes only ".". In particular,
+            // pivot_root(".", ".") stacks the old root on that cwd until
+            // umount2(".", MNT_DETACH) reveals the new root.
+            None => self.follow_mounts(path),
         }
     }
     /// Mounts belong entirely to the guest. No host mount or pathname is used.
@@ -1845,6 +1849,22 @@ mod tests {
         v.umount(b"/old", 2).unwrap();
         assert!(v.stat_at(AT_FDCWD, b"/old/dst").is_err());
         assert_eq!(read(&mut v, b"/file"), b"shared");
+    }
+    #[test]
+    fn pivot_root_dot_dot_detaches_old_root_from_retained_cwd() {
+        let mut v = setup();
+        v.import_file(b"/outside", b"old root".to_vec()).unwrap();
+        bind(&mut v, b"/src", b"/new");
+        v.chdir(b"/new").unwrap();
+        let retained = v.open_at(AT_FDCWD, b".", O_DIRECTORY, 0).unwrap();
+        v.pivot_root(b".", b".").unwrap();
+        v.umount(b".", 2).unwrap();
+        v.chroot(b".").unwrap();
+        assert_eq!(read(&mut v, b"/file"), b"shared");
+        assert!(v.stat_at(AT_FDCWD, b"/outside").is_err());
+        assert_eq!(v.cwd().unwrap(), b"/");
+        v.chdir_fd(retained).unwrap();
+        assert_eq!(read(&mut v, b"file"), b"shared");
     }
     #[test]
     fn bind_remount_accepts_rec_without_changing_nested_or_source_mounts() {

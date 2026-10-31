@@ -729,7 +729,12 @@ impl<C: Cpu> Kernel<C> {
         };
         let result = io.control(&mut root.linux.vfs);
         match result {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                if let Some(signal @ 1..=64) = io.root_signal() {
+                    Self::queue_one(1, root, signal, 0);
+                }
+                Ok(())
+            }
             Ok(false) => Err(RuntimeError::Cancelled),
             Err(_) => Err(RuntimeError::Arguments("host session control failed")),
         }
@@ -5211,6 +5216,29 @@ mod tests {
         assert_eq!(k.deliver(1, &mut p), Ok(true));
         assert_eq!(p.cpu.pc, 0x4000);
         assert_eq!(k.processes[&2].signals.actions.get(10).handler, 0);
+    }
+
+    #[test]
+    fn host_root_signal_uses_guest_pending_delivery_without_signalling_other_jobs() {
+        struct Control(Option<u32>);
+        impl GuestOutput for Control {
+            fn root_signal(&mut self) -> Option<u32> {
+                self.0.take()
+            }
+            fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+        }
+        let mut k = kernel();
+        let mut root = process();
+        root.signals.mask |= 1 << 36;
+        k.processes
+            .insert(2, root.fork_with_memory(root.memory.clone()));
+        k.processes.insert(1, root);
+        k.control(&mut Control(Some(37))).unwrap();
+        assert_eq!(k.processes[&1].next_signal(u64::MAX).map(|s| s.0), Some(37));
+        assert!(k.processes[&2].next_signal(u64::MAX).is_none());
+        k.control(&mut Control(Some(65))).unwrap();
     }
 
     #[test]
