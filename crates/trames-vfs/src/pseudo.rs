@@ -618,6 +618,7 @@ pub struct ProcessInfo {
     pub auxiliary: Vec<u8>,
     pub file_size_limits: Option<(u64, u64)>,
     pub core_limits: Option<(u64, u64)>,
+    pub nofile_limits: Option<(u64, u64)>,
     pub address_space_limit: Option<u64>,
     pub oom: std::sync::Weak<OomTask>,
     pub pending: u64,
@@ -1798,7 +1799,8 @@ impl Vfs {
                             };
                             let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
                             let (core_soft, core_hard) = p.core_limits.unwrap_or((0, u64::MAX));
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            {MAX_FDS:<20} {MAX_FDS:<20} files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
+                            let (fd_soft, fd_hard) = p.nofile_limits.unwrap_or((MAX_FDS as u64, MAX_FDS as u64));
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            {fd_soft:<20} {fd_hard:<20} files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };

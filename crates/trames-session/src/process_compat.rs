@@ -129,6 +129,8 @@ impl<C: Cpu> Kernel<C> {
         };
         let previous = if resource == 1 {
             p.file_size_limit.get()
+        } else if resource == 7 {
+            p.nofile_limit.get()
         } else if resource == 4 {
             p.core_limit.get()
         } else {
@@ -150,7 +152,7 @@ impl<C: Cpu> Kernel<C> {
             if !matches!(resource, 1 | 4) && limits.1 > fixed {
                 return Err(Errno(1));
             }
-            if !matches!(resource, 1 | 4) && limits != previous {
+            if !matches!(resource, 1 | 4 | 7) && limits != previous {
                 return Err(Errno(95));
             }
             Some(limits)
@@ -164,6 +166,9 @@ impl<C: Cpu> Kernel<C> {
         if let Some(next) = next {
             if resource == 1 {
                 p.file_size_limit.set(next);
+            } else if resource == 7 {
+                p.nofile_limit.set(next);
+                p.linux.vfs.set_descriptor_limit(next.0 as u32);
             } else if resource == 4 {
                 p.core_limit.set(next);
             }
@@ -219,6 +224,23 @@ mod tests {
         );
         assert!(matches!(child.state, State::Zombie(0)));
         assert!(matches!(k.processes[&1].state, State::Zombie(0)));
+    }
+    #[test]
+    fn nofile_limits_apply_to_allocation_and_fork_independently() {
+        let k=kernel();let mut p=process();
+        write_u64(&mut p.memory,0x1000,8).unwrap();write_u64(&mut p.memory,0x1008,16).unwrap();
+        assert_eq!(k.rlimit(&mut p,261,[0,7,0x1000,0x1100,0,0]),Ok(0));
+        assert_eq!(read_u64(&p.memory,0x1100).unwrap(),trames_vfs::MAX_FDS as u64);
+        assert_eq!(p.linux.vfs.descriptor_limit(),8);
+        let mut child=p.fork();
+        write_u64(&mut child.memory,0x1000,4).unwrap();write_u64(&mut child.memory,0x1008,8).unwrap();
+        assert_eq!(k.rlimit(&mut child,261,[0,7,0x1000,0,0,0]),Ok(0));
+        assert_eq!(p.nofile_limit.get(),(8,16));assert_eq!(p.linux.vfs.descriptor_limit(),8);
+        assert_eq!(child.nofile_limit.get(),(4,8));assert_eq!(child.linux.vfs.descriptor_limit(),4);
+        child.linux.vfs.credentials=trames_vfs::Credentials::user(1000,1000);
+        write_u64(&mut child.memory,0x1008,16).unwrap();
+        assert_eq!(k.rlimit(&mut child,261,[0,7,0x1000,0,0,0]),Err(Errno(1)));
+        assert_eq!(child.nofile_limit.get(),(4,8));
     }
     #[test]
     fn core_limits_are_process_owned_capability_checked_and_reported() {

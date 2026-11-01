@@ -1228,7 +1228,10 @@ impl Linux {
                 match a[1] {
                     1033 => Ok(self.vfs.seals(a[0] as u32, Some(a[2] as u32))? as u64),
                     1034 => Ok(self.vfs.seals(a[0] as u32, None)? as u64),
-                    0 | 1030 => Ok(self.vfs.dup(a[0] as u32, a[2] as u32, a[1] == 1030)? as u64),
+                    0 | 1030 => {
+                        if a[2] >= self.vfs.descriptor_limit() as u64 { return Err(Errno(22)); }
+                        Ok(self.vfs.dup(a[0] as u32, a[2] as u32, a[1] == 1030)? as u64)
+                    }
                     2 => {
                         self.vfs.set_cloexec(a[0] as u32, a[2] & 1 != 0)?;
                         Ok(0)

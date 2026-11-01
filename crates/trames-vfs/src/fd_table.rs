@@ -79,8 +79,15 @@ impl MembershipEntries {
 }
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
 /// owner slots carry no worker endpoint/control authority.
-#[derive(Clone, Default)]
-pub struct SharedFiles(pub(super) Arc<Membership>);
+#[derive(Clone)]
+pub struct SharedFiles(pub(super) Arc<Membership>, Arc<std::sync::atomic::AtomicU32>);
+impl Default for SharedFiles {
+    fn default() -> Self { Self(Arc::default(), Arc::new(std::sync::atomic::AtomicU32::new(MAX_FDS))) }
+}
+impl SharedFiles {
+    pub fn descriptor_limit(&self) -> u32 { self.1.load(Ordering::Relaxed) }
+    fn copy_limit(&self) -> Self { Self(self.0.clone(), Arc::new(std::sync::atomic::AtomicU32::new(self.descriptor_limit()))) }
+}
 #[derive(Clone)]
 pub struct SharedFd {
     pub(super) open: Arc<SharedOpenDescription>,
@@ -202,7 +209,7 @@ impl SharedFiles {
         if min >= MAX_FDS {
             return Some(Err(Errno(22)));
         }
-        let Some(fd) = entries.available(min) else {
+        let Some(fd) = entries.available(min).filter(|&fd|fd < self.descriptor_limit()) else {
             return Some(Err(Errno(24)));
         };
         entries.insert(
@@ -225,7 +232,7 @@ impl SharedFiles {
         if old == new || flags & !O_CLOEXEC != 0 {
             return Some(Err(Errno(22)));
         }
-        if new >= MAX_FDS {
+        if new >= self.descriptor_limit() {
             return Some(Err(Errno(9)));
         }
         let removed = {
@@ -417,10 +424,10 @@ pub(super) struct DescriptorVersion {
 }
 impl DescriptorTable {
     pub(super) fn available(&self, min: u32) -> Option<u32> {
-        self.1 .0.entries.lock().unwrap().available(min)
+        self.1 .0.entries.lock().unwrap().available(min).filter(|&fd|fd < self.1.descriptor_limit())
     }
     pub(super) fn available_fds(&self, count: usize) -> Vec<u32> {
-        self.1 .0.entries.lock().unwrap().free.first(count)
+        self.1 .0.entries.lock().unwrap().free.first(count).into_iter().take_while(|&fd|fd < self.1.descriptor_limit()).collect()
     }
     #[cfg(test)]
     pub(super) fn set_test_capacity(&self, limit: u32) {
@@ -432,6 +439,9 @@ impl DescriptorTable {
         }
         entries.free = free;
     }
+    pub(super) fn set_limit(&self, limit:u32) {self.1.1.store(limit, Ordering::Relaxed);}
+    pub(super) fn limit(&self) -> u32 {self.1.descriptor_limit()}
+    pub(super) fn share_limit(&mut self, other:&Self) {self.1.1=other.1.1.clone();}
     pub(super) fn membership(&self) -> &SharedFiles {
         &self.1
     }
@@ -439,7 +449,7 @@ impl DescriptorTable {
         self.1.clone()
     }
     pub(super) fn shared(&self) -> Self {
-        Self(self.0.clone(), self.1.clone())
+        Self(self.0.clone(), self.1.copy_limit())
     }
     pub(super) fn shares_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.1 .0, &other.1 .0)
@@ -543,7 +553,7 @@ impl DescriptorTable {
         if min >= MAX_FDS {
             return Err(Errno(22));
         }
-        let fd = entries.available(min).ok_or(Errno(24))?;
+        let fd = entries.available(min).filter(|&fd|fd < self.1.descriptor_limit()).ok_or(Errno(24))?;
         descriptor.cloexec = cloexec.into();
         assert!(self.install(fd, descriptor, &mut entries).is_none());
         Ok(fd)
@@ -559,7 +569,7 @@ impl DescriptorTable {
         if old == new || flags & !O_CLOEXEC != 0 {
             return Err(Errno(22));
         }
-        if new >= MAX_FDS {
+        if new >= self.1.descriptor_limit() {
             return Err(Errno(9));
         }
         let mut entries = self.1 .0.entries.lock().unwrap();
@@ -648,7 +658,7 @@ impl Clone for DescriptorTable {
                     free,
                 }),
                 revision: AtomicU64::new(0),
-            })),
+            }), Arc::new(std::sync::atomic::AtomicU32::new(self.1.descriptor_limit()))),
         )
     }
 }
@@ -656,6 +666,24 @@ impl Clone for DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nofile_is_per_process_even_with_shared_files_and_threads_can_share_it() {
+        let mut parent=Vfs::default();
+        let [old,writer]=parent.pipe(O_NONBLOCK).unwrap();
+        let mut child=parent.clone_with_files(true);
+        child.set_descriptor_limit(old);
+        assert_eq!(child.open_at(AT_FDCWD,b"/dev/null",0,0),Err(Errno(24)));
+        assert_eq!(child.dup(old,0,false),Err(Errno(24)));
+        assert_eq!(child.shared_files().duplicate(old,0,false),Some(Err(Errno(24))));
+        assert_eq!(child.shared_files().duplicate_to(old,old+1,0,1),Some(Err(Errno(9))));
+        parent.write(writer,b"x").unwrap();
+        assert_eq!(child.read(old,1).unwrap(),b"x");
+        assert!(parent.open_at(AT_FDCWD,b"/dev/null",0,0).is_ok());
+        child.share_descriptor_limit(&parent);
+        child.set_descriptor_limit(old+8);
+        assert_eq!(parent.descriptor_limit(),old+8);
+        assert!(parent.open_at(AT_FDCWD,b"/dev/null",0,0).is_ok());
+    }
     #[test]
     fn forked_byte_cache_keeps_each_actual_membership_when_reusing_owner_capabilities() {
         let mut parent = Vfs::default();

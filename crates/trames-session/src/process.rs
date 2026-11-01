@@ -111,6 +111,7 @@ pub(crate) struct Process<C: Cpu> {
     membarrier_registered: Rc<Cell<bool>>,
     file_size_limit: Rc<Cell<(u64, u64)>>,
     core_limit: Rc<Cell<(u64, u64)>>,
+    nofile_limit: Rc<Cell<(u64, u64)>>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
     seccomp_entry: Option<seccomp::EntryDecision>,
@@ -328,6 +329,7 @@ impl<C: Cpu> Process<C> {
             membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
             file_size_limit: Rc::new(Cell::new(self.file_size_limit.get())),
             core_limit: Rc::new(Cell::new(self.core_limit.get())),
+            nofile_limit: Rc::new(Cell::new(self.nofile_limit.get())),
             oom: Arc::new(self.oom.fork()),
             seccomp: self.seccomp.clone(),
             seccomp_entry: None,
@@ -923,6 +925,7 @@ impl<C: Cpu> Kernel<C> {
             },
             file_size_limits: Some(p.file_size_limit.get()),
             core_limits: Some(p.core_limit.get()),
+            nofile_limits: Some(p.nofile_limit.get()),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
                 u64::MAX
             } else {
@@ -2277,6 +2280,8 @@ impl<C: Cpu> Kernel<C> {
                     child.subreaper = p.subreaper;
                     child.file_size_limit = p.file_size_limit.clone();
                     child.core_limit = p.core_limit.clone();
+                    child.nofile_limit = p.nofile_limit.clone();
+                    child.linux.vfs.share_descriptor_limit(&p.linux.vfs);
                 }
                 child
                     .linux
@@ -4994,6 +4999,7 @@ pub(super) fn run<C: Cpu>(
         membarrier_registered: Rc::new(Cell::new(false)),
         file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
         core_limit: Rc::new(Cell::new((0, u64::MAX))),
+        nofile_limit: Rc::new(Cell::new((trames_vfs::MAX_FDS as u64, trames_vfs::MAX_FDS as u64))),
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
@@ -6300,6 +6306,7 @@ mod tests {
             membarrier_registered: Rc::new(Cell::new(false)),
             file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
             core_limit: Rc::new(Cell::new((0, u64::MAX))),
+        nofile_limit: Rc::new(Cell::new((trames_vfs::MAX_FDS as u64, trames_vfs::MAX_FDS as u64))),
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,

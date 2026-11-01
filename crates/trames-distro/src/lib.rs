@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pinned distribution verification and checked import into the private VFS.
+pub mod packages;
+pub mod rootfs;
+pub mod systemd;
 mod timezone;
 mod vulkan;
 mod xwayland;
