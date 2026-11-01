@@ -139,7 +139,67 @@ impl Drop for ReservedFd {
         }
     }
 }
+pub(super) struct ReservedPair {
+    files: SharedFiles,
+    fds: [u32; 2],
+    pending: bool,
+}
+impl ReservedPair {
+    pub(super) fn numbers(&self) -> [u32; 2] {
+        self.fds
+    }
+    pub(super) fn publish(mut self, descriptions: [Descriptor; 2]) -> [u32; 2] {
+        let mut entries = self.files.0.entries.lock().unwrap();
+        for (fd, descriptor) in self.fds.into_iter().zip(descriptions) {
+            let OpenHandle::Shared(open) = descriptor.open else {
+                unreachable!("pipe descriptions are shared")
+            };
+            let reserved = entries.reserved.remove(&fd);
+            debug_assert!(reserved);
+            let previous = entries.insert(
+                fd,
+                Slot {
+                    open: SlotOpen::Shared(open),
+                    cloexec: descriptor.cloexec,
+                },
+            );
+            debug_assert!(previous.is_none());
+        }
+        self.files.changed(&mut entries);
+        self.pending = false;
+        self.fds
+    }
+}
+impl Drop for ReservedPair {
+    fn drop(&mut self) {
+        if self.pending {
+            let mut entries = self.files.0.entries.lock().unwrap();
+            for fd in self.fds {
+                let reserved = entries.reserved.remove(&fd);
+                debug_assert!(reserved);
+                entries.free.release(fd);
+            }
+        }
+    }
+}
 impl SharedFiles {
+    pub(super) fn reserve_pair(&self) -> Result<ReservedPair> {
+        let mut entries = self.0.entries.lock().unwrap();
+        let free = entries.free.first(2);
+        let fds: [u32; 2] = free.try_into().map_err(|_| Errno(24))?;
+        if fds[1] >= self.descriptor_limit() {
+            return Err(Errno(24));
+        }
+        for fd in fds {
+            entries.free.reserve(fd);
+            entries.reserved.insert(fd);
+        }
+        Ok(ReservedPair {
+            files: self.clone(),
+            fds,
+            pending: true,
+        })
+    }
     pub(super) fn reserve(&self) -> Result<ReservedFd> {
         let mut entries = self.0.entries.lock().unwrap();
         let fd = entries

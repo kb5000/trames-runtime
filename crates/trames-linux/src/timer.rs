@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared timerfd ABI. Creation/FD installation remains with the VFS owner.
+//! Shared timerfd ABI over retained timers, including worker-created resources.
 use crate::state::Linux;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use trames_memory::{Access, CpuMemory};

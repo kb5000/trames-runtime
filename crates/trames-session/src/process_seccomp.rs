@@ -840,6 +840,90 @@ mod tests {
         }
     }
     #[test]
+    fn anonymous_creation_and_close_complete_on_workers_with_one_seccomp_decision() {
+        for number in [19u32, 26, 59, 85] {
+            for decision in [None, Some(ALLOW), Some(0x5007b)] {
+                let mut p = super::super::tests::process();
+                p.memory.write(0x1800, &[0; 8]).unwrap();
+                let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
+                let initial = if number == 59 {
+                    0x1800
+                } else if number == 85 {
+                    1
+                } else {
+                    0
+                };
+                let mut code = vec![mov(0, initial), mov(1, 0), mov(8, number), 0xd4000001];
+                if number == 59 {
+                    code.extend([
+                        mov(9, 0x1800),
+                        0xb9400120,
+                        mov(8, 57),
+                        0xd4000001,
+                        0xb9400520,
+                        mov(8, 57),
+                        0xd4000001,
+                    ]);
+                } else {
+                    code.extend([mov(8, 57), 0xd4000001]);
+                }
+                code.push(0x14000000 | ((-(code.len() as i32) as u32) & 0x03ffffff));
+                for (i, word) in code.into_iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu = Cpu::new(0x4000, 0);
+                p.affinity = 3;
+                if let Some(decision) = decision {
+                    p.seccomp.push(Arc::new(
+                        Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                    ));
+                }
+                let mut peer = p.fork();
+                peer.parent = 1;
+                let mut kernel = super::super::tests::kernel();
+                kernel.cpu_count = 2;
+                kernel.workers = crate::workers::Pool::new(2);
+                kernel.per_cpu = vec![Duration::ZERO; 2];
+                kernel.processes.insert(1, p);
+                kernel.processes.insert(2, peer);
+                assert!(kernel
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                    .unwrap());
+                assert!(kernel.syscalls > 0);
+                if decision.is_some() {
+                    assert_eq!(
+                        kernel.processes[&1].seccomp.evaluations(),
+                        kernel.syscalls,
+                        "syscall {number}"
+                    );
+                }
+                if decision != Some(0x5007b) {
+                    assert!(
+                        kernel.worker_fd_syscalls > 100,
+                        "syscall {number}: {}",
+                        kernel.worker_fd_syscalls
+                    );
+                    assert_eq!(kernel.service_requests, 0);
+                    assert!(kernel.parallel_rounds <= 4);
+                } else {
+                    assert_eq!(kernel.worker_fd_syscalls, 0);
+                    for p in kernel.processes.values() {
+                        assert_eq!(p.linux.vfs.fd_snapshot().len(), 3);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn allowed_filtered_dup_close_loops_do_not_checkpoint_peer_cpus() {
         let mut p = super::super::tests::process();
         let [fd, _] = p.linux.vfs.pipe(0).unwrap();

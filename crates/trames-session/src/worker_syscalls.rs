@@ -305,7 +305,8 @@ impl Snapshot {
         }
         // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
-        if self.direct.supports_path_query(cpu.x(8) as u32)
+        if self.direct.supports_creation(cpu.x(8) as u32)
+            || self.direct.supports_path_query(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {
@@ -350,6 +351,10 @@ impl Snapshot {
             return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
         }
         let result = match cpu.x(8) as u32 {
+            number @ (19 | 26 | 59 | 85) => {
+                self.direct
+                    .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
+            }
             number @ (48 | 56 | 78..=80 | 291 | 437 | 439) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?

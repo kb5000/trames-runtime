@@ -987,7 +987,13 @@ impl Linux {
                 Ok(0)
             }
             116 => crate::syslog(&self.vfs.kernel_log_capability(), a, memory),
-            19 => Ok(self.vfs.eventfd(a[0] as u32, a[1] as u32)? as u64),
+            19 | 26 | 59 => crate::descriptor_create::call(
+                &self.vfs.descriptor_factory(),
+                number as u32,
+                a,
+                memory,
+            )
+            .expect("creation ABI"),
             20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
             21 => {
                 let (events, data) = if a[1] == 2 {
@@ -1005,7 +1011,6 @@ impl Linux {
                     .epoll_ctl(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
                 Ok(0)
             }
-            26 => Ok(self.vfs.inotify_init(a[0] as u32)? as u64),
             27 => {
                 let path = Self::path(memory, a[1])?;
                 Ok(self.vfs.inotify_add(a[0] as u32, &path, a[2] as u32)? as u64)
@@ -1145,13 +1150,6 @@ impl Linux {
             }
             23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),
             24 => Ok(self.vfs.dup3(a[0] as u32, a[1] as u32, a[2] as u32)? as u64),
-            59 => {
-                Self::check(memory, a[0], 8, Access::Write)?;
-                let fds = self.vfs.pipe(a[1] as u32)?;
-                let bytes: Vec<_> = fds.into_iter().flat_map(u32::to_le_bytes).collect();
-                memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
-                Ok(0)
-            }
             35 => {
                 if a[2] & !0x200 != 0 {
                     return Err(Errno(22));

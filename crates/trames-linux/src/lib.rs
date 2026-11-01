@@ -8,6 +8,7 @@ pub mod image;
 pub mod vdso;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
+mod descriptor_create;
 mod direct;
 pub use direct::{
     epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo, RetainedByte,

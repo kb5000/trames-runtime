@@ -18,8 +18,10 @@ use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
+mod descriptor_factory;
 mod fd_allocator;
 mod fd_table;
+pub use descriptor_factory::DescriptorFactory;
 mod open_handle;
 pub use open_handle::OfdIdentity;
 use open_handle::{OpenHandle, OpenMount, OpenWeak};
@@ -795,8 +797,7 @@ impl Vfs {
             .any(|d| d.open.borrow().bridge.is_some())
     }
     fn open_id(&self) -> u64 {
-        let id = self.next_open.fetch_add(1, Ordering::Relaxed);
-        (1u64 << 62) | id
+        descriptor_factory::next_id(&self.next_open)
     }
     /// CLONE_FILES joins the same membership object; later edits need no propagation.
     pub fn share_descriptors_from(&mut self, other: &Self) {
@@ -2401,81 +2402,7 @@ impl Vfs {
             .nonblocking(enabled)
     }
     pub fn pipe(&mut self, flags: u32) -> Result<[u32; 2]> {
-        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
-            return Err(Errno(22));
-        }
-        let free = self.fds.available_fds(2);
-        if free.len() != 2 {
-            return Err(Errno(24));
-        }
-        let p = Pipe::new(self.open_id());
-        let inode = p.inode;
-        let metadata = Arc::new(Inode::new(Node {
-            identity: 0,
-            record_locks: std::sync::OnceLock::new(),
-            whole_locks: std::sync::OnceLock::new(),
-            notifications: inotify::Marks::default(),
-            path_hint: SharedCell::default(),
-            device: 6,
-            content: Content::Null,
-            mode: 0o10600,
-            uid: self.credentials.fsuid,
-            gid: self.credentials.fsgid,
-            volatile: false,
-            inode,
-            links: 1,
-            times: [storage::Timestamp::now(); 3],
-            xattrs: BTreeMap::new(),
-            seals: None,
-        }));
-        let read = PipeEnd::new(p.clone(), true, false, Some(metadata.clone()));
-        let write = PipeEnd::new(p, false, true, Some(metadata));
-        for (fd, end, kind, access) in [
-            (free[0], read, FdKind::PipeRead, 0),
-            (free[1], write, FdKind::PipeWrite, 1),
-        ] {
-            self.fds.insert(
-                fd,
-                Descriptor {
-                    open: OpenHandle::new(OpenDescription {
-                        shared: Arc::new(SharedOpenDescription {
-                            _disk_file: None,
-                            #[cfg(all(feature = "hostfs", unix))]
-                            host_file: None,
-                            native_image: None,
-                            mount_resource: std::sync::OnceLock::new(),
-                            file_authority: Default::default(),
-                            control: None,
-                            read_node: None,
-                            id: self.open_id(),
-                            owner: (self.credentials.fsuid, self.credentials.fsgid),
-                            kind,
-                            flags: ((flags & O_NONBLOCK) | access).into(),
-                            file_position: Arc::default(),
-                            flock: std::sync::OnceLock::new(),
-                            ofd_records: Default::default(),
-                            node: None,
-                            pipe: Some(end),
-                            bridge: None,
-                            kernel_log: None,
-                            notification: None,
-                        }),
-                        position: 0,
-                        socket: None,
-                        anonymous: None,
-                        local: None,
-                        pty: None,
-                        namespace: None,
-                        network_control: None,
-                        mount_file: None,
-                        oom: None,
-                        mount: None,
-                    }),
-                    cloexec: (flags & O_CLOEXEC != 0).into(),
-                },
-            );
-        }
-        Ok([free[0], free[1]])
+        self.descriptor_factory().pipe(flags)
     }
     /// Bounded splice through a pipe. Commit pipe consumption only after the
     /// destination accepts bytes; EAGAIN must never lose buffered stream data.

@@ -396,10 +396,7 @@ pub(super) fn notify(node: &NodeRef, mask: u32, at: Option<&Arc<Link>>) {
 
 impl Vfs {
     pub fn inotify_init(&mut self, flags: u32) -> Result<u32> {
-        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        self.anonymous(flags, events::Anonymous::Inotify(Arc::default()))
+        self.descriptor_factory().inotify_init(flags)
     }
     fn inotify_instance(&self, fd: u32) -> Result<Arc<InotifyInstance>> {
         let open_descriptor = self.descriptor(fd)?;

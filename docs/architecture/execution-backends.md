@@ -573,3 +573,57 @@ the same fallible source/private-COW load contract before updating the bytes.
 A deterministic regression covers shared physical identity, private isolation and
 backing I/O errors. Unchanged, untouched pages remain deferred; no new ordinary
 CPU memory check or barrier is introduced.
+
+## Worker anonymous-resource creation (2026-11-02)
+
+`pipe2`, `eventfd2`, `timerfd_create` and `inotify_init1` now create and publish
+resources on existing execution workers. `DescriptorFactory` is an ordinary
+Send+Sync capability containing only the real SharedFiles membership, the shared
+relaxed OFD ID allocator and the caller's captured filesystem UID/GID. It has no
+VFS reference, Rc control, namespace projection or new resource-service thread.
+Credential and Files-domain changes still use their existing lifecycle boundary.
+
+The owner VFS and worker share the original pipe and anonymous-OFD constructors.
+Event counters, timers and inotify retain their existing shared control objects;
+pipe endpoints retain the same real reader/writer and last-close accounting.
+The factory publishes complete descriptions into actual Files membership rather
+than returning fake FDs or registering an additional endpoint for a snapshot.
+Existing DirectFds immediately accept the new objects and retain their original
+OFD during I/O, poll and blocked waits. Closing/reusing the numeric slot does not
+retarget an accepted operation. Timer rearm/disarm notifications, changing wait
+deadlines, pipe EOF and inotify notifications use the existing resource signals.
+No resource lock becomes a whole-function or global kernel lock.
+
+A pipe reserves both numeric slots under one Files transaction. Guest output is
+written before either endpoint is published, without holding the Files lock.
+Failure or unwinding drops both reservations and original endpoints. Successful
+publication installs both complete OFDs and their CLOEXEC bits under one lock and
+updates the normal membership revision once. Another allocator skips reservations;
+a peer that sees the output before installation can observe ordinary EBADF, as
+with the existing unpublished-open protocol. No deterministic racing winner is
+promised. FD-limit and flag errors leave no partial pair. Owner pipe2 uses the
+same checked CpuMemory transport and rollback implementation as workers.
+
+Creation syscalls use the existing dedicated seccomp entry-decision path.
+Allowed calls complete locally; denied entries retain their exact token for
+normal joined signal/tracing/rejection effects. No filter runs twice and no
+resource or output is created before permission to execute that entry. The
+existing worker FD counter includes completions; no production profiling counter,
+ordinary-memory barrier, polling bus or new coordinator is added.
+
+Byte-I/O admission now classifies the syscall number before resolving argument
+zero as an FD. Creation, pathname, clock and other non-I/O calls skip that unused
+shared-table lookup. Actual I/O still accepts the original OFD under the existing
+membership lock and releases that lock before resource handling.
+
+Validation covers existing-view visibility, actual pipe UID/GID, flags, failed
+copyout and unwind rollback, FD limits, concurrent unique slot/OFD allocation,
+owner/worker ABI and error ordering, once-only filtered/unfiltered creation, and
+blocked reads on all four resource kinds after close/reuse. The same source is
+built with Mac's hardware executor and iPad's interpreter. Fixed-work measurements
+and native references live in the product's coordinator audit.
+
+This does not migrate epoll creation/watch ownership, signalfd/task masks,
+socket/connect/accept/SCM_RIGHTS publication, inotify add-watch pathname control,
+signal-producing pipe operations, structural VM changes or native-device
+registration. Their existing owner/synchronization boundaries remain explicit.

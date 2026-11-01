@@ -121,6 +121,7 @@ pub fn epoll_scatter(
 #[derive(Default)]
 pub struct DirectSyscalls {
     paths: Option<trames_vfs::PathQueries>,
+    resources: Option<trames_vfs::DescriptorFactory>,
     urings: UringSnapshot,
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
@@ -145,6 +146,7 @@ impl DirectSyscalls {
         let membership = descriptors.shared_files();
         Self {
             paths: None,
+            resources: None,
             urings: Default::default(),
             descriptors,
             network: Default::default(),
@@ -164,6 +166,23 @@ impl DirectSyscalls {
             scratch: RefCell::new(Vec::new()),
             completed: Cell::new(0),
         }
+    }
+    pub fn with_resources(mut self, resources: trames_vfs::DescriptorFactory) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+    pub fn supports_creation(&self, number: u32) -> bool {
+        matches!(number, 19 | 26 | 59 | 85) && self.resources.is_some()
+    }
+    pub fn invoke_creation(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let result = crate::descriptor_create::call(self.resources.as_ref()?, number, a, memory)?;
+        self.record_fd_control();
+        Some(result)
     }
     pub fn with_paths(mut self, paths: trames_vfs::PathQueries) -> Self {
         self.paths = Some(paths);
@@ -399,6 +418,11 @@ impl DirectSyscalls {
         Some(result)
     }
     pub fn supports(&self, number: u32, fd: u32) -> bool {
+        // Classify the ABI before resolving an FD. Creation, pathname, clock
+        // and other non-I/O calls must not look up argument zero as a number.
+        if !matches!(number,22|28|29|62..=66|86|87|206|207|210..=212|441) {
+            return false;
+        }
         if self.network.get(fd).is_some() {
             return matches!(number, 63..=66);
         }
@@ -1761,6 +1785,83 @@ mod tests {
             Some(Ok(8))
         );
         assert_eq!(m.read_u64(0x1300).unwrap(), 1);
+    }
+    #[test]
+    fn worker_created_resources_wait_on_the_original_ofd_after_close_and_reuse() {
+        for kind in 0..4 {
+            let mut v = Vfs::default();
+            let direct =
+                DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory());
+            let mut m = memory();
+            let mut writer = None;
+            let fd = match kind {
+                0 => direct.invoke_creation(19, [0; 6], &mut m).unwrap().unwrap() as u32,
+                1 => direct
+                    .invoke_creation(85, [1, 0, 0, 0, 0, 0], &mut m)
+                    .unwrap()
+                    .unwrap() as u32,
+                2 => {
+                    assert_eq!(
+                        direct.invoke_creation(59, [0x1100, 0, 0, 0, 0, 0], &mut m),
+                        Some(Ok(0))
+                    );
+                    let r = m.read_array::<8>(0x1100).unwrap();
+                    writer = Some(u32::from_le_bytes(r[4..].try_into().unwrap()));
+                    u32::from_le_bytes(r[..4].try_into().unwrap())
+                }
+                _ => direct.invoke_creation(26, [0; 6], &mut m).unwrap().unwrap() as u32,
+            };
+            if kind == 3 {
+                v.inotify_add(fd, b"/", 0x100).unwrap();
+            }
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let wait = pending(
+                direct
+                    .start(
+                        63,
+                        [fd as u64, 0x1200, if kind == 3 { 128 } else { 8 }, 0, 0, 0],
+                        &mut m,
+                        1,
+                        &Arc::downgrade(&target),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let alias = v.dup(fd, 0, false).unwrap();
+            v.close(fd).unwrap();
+            assert_eq!(
+                direct.invoke_creation(19, [9, trames_vfs::O_NONBLOCK as u64, 0, 0, 0, 0], &mut m),
+                Some(Ok(fd as u64))
+            );
+            m.write_array(0x1100, 7u64.to_le_bytes()).unwrap();
+            match kind {
+                0 => assert_eq!(
+                    direct.invoke(64, [alias as u64, 0x1100, 8, 0, 0, 0], &mut m),
+                    Some(Ok(8))
+                ),
+                1 => {
+                    assert_eq!(v.next_timerfd_deadline(), None);
+                    v.timerfd_set(alias, Duration::ZERO, Some(Instant::now()))
+                        .unwrap();
+                    assert!(v.next_timerfd_deadline().is_some());
+                }
+                2 => assert_eq!(
+                    direct.invoke(64, [writer.unwrap() as u64, 0x1100, 1, 0, 0, 0], &mut m),
+                    Some(Ok(1))
+                ),
+                _ => v.import_file(b"/created", vec![]).unwrap(),
+            }
+            assert!(wait.signal.ready());
+            let IoAttempt::Complete(result) = direct.resume(wait, &mut m) else {
+                panic!("new resource wait did not wake")
+            };
+            assert!(result.unwrap() > 0);
+            v.close(alias).unwrap();
+            v.close(fd).unwrap();
+            if let Some(writer) = writer {
+                v.close(writer).unwrap();
+            }
+        }
     }
     #[test]
     fn timer_rearm_and_disarm_refresh_a_parked_reads_resource_deadline() {

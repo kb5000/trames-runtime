@@ -185,71 +185,15 @@ impl Vfs {
         })
     }
     pub(super) fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
-        let fd = self.available(0)?;
-        let access = if matches!(anonymous, Anonymous::Inotify(_)) {
-            0
-        } else {
-            2
-        };
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        _disk_file: None,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file: None,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        file_authority: Default::default(),
-                        control: SharedControl::capture(&anonymous),
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (0, 0),
-                        kind: FdKind::Anonymous,
-                        flags: (access | (flags & O_NONBLOCK)).into(),
-                        file_position: Arc::default(),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: None,
-                        pipe: None,
-                        bridge: None,
-                        kernel_log: None,
-                        notification: None,
-                    }),
-                    position: 0,
-                    socket: None,
-                    anonymous: Some(anonymous),
-                    local: None,
-                    pty: None,
-                    namespace: None,
-                    network_control: None,
-                    mount_file: None,
-                    oom: None,
-                    mount: None,
-                }),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
-        Ok(fd)
+        let reservation = self.shared_files().reserve()?;
+        let descriptor = anonymous_descriptor(self.open_id(), flags, anonymous);
+        Ok(reservation.publish(descriptor, Some(&self.fds)))
     }
     pub fn eventfd(&mut self, initial: u32, flags: u32) -> Result<u32> {
-        if flags & !(O_CLOEXEC | O_NONBLOCK | 1) != 0 {
-            return Err(Errno(22));
-        }
-        self.anonymous(
-            flags,
-            Anonymous::Event(Arc::new(direct_io::EventCounter::new(
-                initial as u64,
-                flags & 1 != 0,
-            ))),
-        )
+        self.descriptor_factory().eventfd(initial, flags)
     }
     pub fn timerfd(&mut self, clock: u32, flags: u32) -> Result<u32> {
-        if !matches!(clock, 0 | 1 | 7) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        self.anonymous(flags, Anonymous::Timer(TimerFd::new(clock)))
+        self.descriptor_factory().timerfd(clock, flags)
     }
     pub fn timerfd_resource(&self, fd: u32) -> Result<Arc<TimerFd>> {
         match &self.descriptor(fd)?.open.borrow().anonymous {
@@ -724,5 +668,50 @@ mod timer_index_tests {
         assert_eq!(v.next_timerfd_deadline(), Some(deadline));
         v.timerfd_set(timer, Duration::ZERO, None).unwrap();
         assert_eq!(v.next_timerfd_deadline(), None);
+    }
+}
+
+pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) -> Descriptor {
+    let access = if matches!(anonymous, Anonymous::Inotify(_)) {
+        0
+    } else {
+        2
+    };
+    Descriptor {
+        open: OpenHandle::new(OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                _disk_file: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
+                native_image: None,
+                mount_resource: std::sync::OnceLock::new(),
+                file_authority: Default::default(),
+                control: SharedControl::capture(&anonymous),
+                read_node: None,
+                id,
+                owner: (0, 0),
+                kind: FdKind::Anonymous,
+                flags: (access | (flags & O_NONBLOCK)).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                ofd_records: Default::default(),
+                node: None,
+                pipe: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
+            position: 0,
+            socket: None,
+            anonymous: Some(anonymous),
+            local: None,
+            pty: None,
+            namespace: None,
+            network_control: None,
+            mount_file: None,
+            oom: None,
+            mount: None,
+        }),
+        cloexec: (flags & O_CLOEXEC != 0).into(),
     }
 }
