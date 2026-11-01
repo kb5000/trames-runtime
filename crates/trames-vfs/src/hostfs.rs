@@ -1209,6 +1209,109 @@ mod tests {
         assert_eq!(v.read(fd, 30).unwrap(), b"readonly");
     }
     #[test]
+    fn private_page_in_checks_one_mapping_and_only_changed_offsets() {
+        use trames_memory::{parallel::Registry, CpuMemory, Memory, Permissions, PAGE_SIZE};
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), vec![7; PAGE_SIZE as usize * 512]).unwrap();
+        let mut v = fixture.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 2, 0).unwrap();
+        let pages = v
+            .mapping_pages(fd, 0, PAGE_SIZE * 512, false, true)
+            .unwrap();
+        let domain = pages[0].parallel_change_domain().unwrap().0;
+        assert!(pages
+            .iter()
+            .all(|p| p.parallel_change_domain().unwrap().0 == domain));
+        assert_ne!(pages[0].parallel_key(), pages[1].parallel_key());
+        let alias = pages[7].clone();
+        let sources: Vec<_> = [2, 7, 13, 21]
+            .map(|n| pages[n].page_source().unwrap())
+            .into();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(0x10000, pages, false, Permissions::RW, false)
+            .unwrap();
+        memory
+            .map_backed(0x400000, vec![alias], false, Permissions::R, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        drop(memory.parallel_view(&mut registry).unwrap());
+        let loaders: Vec<_> = sources
+            .into_iter()
+            .map(|source| std::thread::spawn(move || source.load().unwrap()))
+            .collect();
+        for loader in loaders {
+            loader.join().unwrap();
+        }
+        let before = registry.metrics;
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(
+            registry.metrics.backing_domain_checks - before.backing_domain_checks,
+            1
+        );
+        assert_eq!(
+            registry.metrics.backing_page_checks - before.backing_page_checks,
+            5
+        );
+        for n in [2, 7, 13, 21] {
+            assert_eq!(view.read_array::<1>(0x10000 + n * PAGE_SIZE), Ok([7]));
+        }
+        assert_eq!(view.read_array::<1>(0x400000), Ok([7]));
+        drop(view);
+        memory.commit_parallel().unwrap();
+        // COW is still per page, not per change domain or alias.
+        memory.write(0x17000, b"COW!").unwrap();
+        assert_eq!(memory.read_array::<4>(0x400000), Ok([7; 4]));
+        v.truncate_fd(fd, PAGE_SIZE * 7).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(matches!(
+            view.read_array::<1>(0x17000),
+            Err(trames_memory::MemoryError::Bus(_))
+        ));
+        assert!(matches!(
+            view.read_array::<1>(0x400000),
+            Err(trames_memory::MemoryError::Bus(_))
+        ));
+        drop(view);
+        v.truncate_fd(fd, PAGE_SIZE * 512).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.read_array::<4>(0x17000), Ok(*b"COW!"));
+    }
+    #[test]
+    fn private_page_in_history_expiry_and_eof_gaps_refresh_conservatively() {
+        use trames_memory::{parallel::Registry, CpuMemory, Memory, Permissions, PAGE_SIZE};
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), vec![9; PAGE_SIZE as usize * 512]).unwrap();
+        let mut v = fixture.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/file", 2, 0).unwrap();
+        let pages = v
+            .mapping_pages(fd, 0, PAGE_SIZE * 512, false, true)
+            .unwrap();
+        let original = pages[0].parallel_change_domain().unwrap().1;
+        for n in (0..260).step_by(2) {
+            pages[n].page_source().unwrap().load().unwrap();
+        }
+        assert_eq!(pages[0].parallel_changes_since(original), None);
+        let before_resize = pages[0].parallel_change_domain().unwrap().1;
+        v.truncate_fd(fd, PAGE_SIZE * 3).unwrap();
+        pages[1].page_source().unwrap().load().unwrap();
+        assert_eq!(pages[0].parallel_changes_since(before_resize), None);
+        let mut memory = Memory::default();
+        memory
+            .map_backed(0x10000, pages, false, Permissions::RX, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert!(matches!(
+            view.fetch_u32(0x14000),
+            Err(trames_memory::MemoryError::Bus(_))
+        ));
+        drop(view);
+        v.truncate_fd(fd, PAGE_SIZE * 512).unwrap();
+        let view = memory.parallel_view(&mut registry).unwrap();
+        assert_eq!(view.fetch_u32(0x14000), Ok(u32::from_le_bytes([9; 4])));
+    }
+    #[test]
     fn private_mapping_is_lazy_cow_and_does_not_shadow_native_file_io() {
         use trames_memory::{Memory, Permissions, PAGE_SIZE};
         let fixture = Fixture::new();

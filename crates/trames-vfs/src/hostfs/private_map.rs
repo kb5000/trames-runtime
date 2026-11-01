@@ -5,10 +5,76 @@ use super::*;
 use std::os::unix::fs::FileExt;
 use trames_memory::{MemoryError, PageBacking, PageSource, SharedPage, PAGE_SIZE};
 
+// One mapping's page-in metadata, not a byte-coherence mechanism. Physical
+// identities remain per page; immutable private source bytes never change.
+struct LoadDomain {
+    identity: u64,
+    host: Arc<HostFile>,
+    generation: AtomicU64,
+    changes: Mutex<VecDeque<LoadedRange>>,
+}
+struct LoadedRange {
+    before: u64,
+    after: u64,
+    bytes: std::ops::Range<u64>,
+}
+impl LoadDomain {
+    fn revision(&self) -> u64 {
+        self.generation
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.host.length_generation.load(Ordering::Relaxed))
+    }
+    fn loaded(&self, offset: u64) {
+        // Only first page-in records a range, under this mapping's own lock.
+        // Capture EOF once: a concurrent resize must leave a token gap, never
+        // be accidentally covered by a page-in range.
+        let mut changes = self.changes.lock().unwrap();
+        let before = self.revision();
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        let after = before.wrapping_add(1);
+        if let Some(last) = changes
+            .back_mut()
+            .filter(|c| c.after == before && c.bytes.end == offset)
+        {
+            last.after = after;
+            last.bytes.end = offset + PAGE_SIZE;
+        } else {
+            changes.push_back(LoadedRange {
+                before,
+                after,
+                bytes: offset..offset + PAGE_SIZE,
+            });
+            if changes.len() > 128 {
+                changes.pop_front();
+            }
+        }
+    }
+    fn changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+        let changes = self.changes.lock().unwrap();
+        let current = self.revision();
+        if current == generation {
+            return Some(Vec::new());
+        }
+        let start = changes.iter().position(|change| {
+            generation.wrapping_sub(change.before) < change.after.wrapping_sub(change.before)
+        })?;
+        let mut expected = changes[start].before;
+        let mut ranges = Vec::new();
+        for change in changes.iter().skip(start) {
+            if change.before != expected {
+                return None;
+            }
+            ranges.push(change.bytes.clone());
+            expected = change.after;
+        }
+        (expected == current).then_some(ranges)
+    }
+}
 struct Source {
     file: Arc<OpenFile>,
     offset: u64,
     bytes: std::sync::OnceLock<Arc<SharedPage>>,
+    domain: Arc<LoadDomain>,
 }
 impl PageSource for Source {
     fn load(&self) -> std::result::Result<Arc<SharedPage>, MemoryError> {
@@ -29,6 +95,7 @@ impl PageSource for Source {
             .set(Arc::new(SharedPage::from_box(bytes)))
             .is_ok()
         {
+            self.domain.loaded(self.offset);
             trames_memory::backing_changed();
         }
         Ok(self.bytes.get().expect("published private source").clone())
@@ -38,14 +105,13 @@ struct PrivatePage {
     open: OpenHandle,
     source: Arc<Source>,
     identity: u64,
-    host: Arc<HostFile>,
     executable: bool,
 }
 impl PrivatePage {
     fn new(
         open: OpenHandle,
         file: Arc<OpenFile>,
-        host: Arc<HostFile>,
+        domain: Arc<LoadDomain>,
         offset: u64,
         executable: bool,
     ) -> Rc<Self> {
@@ -55,9 +121,9 @@ impl PrivatePage {
                 file,
                 offset,
                 bytes: std::sync::OnceLock::new(),
+                domain,
             }),
             identity: trames_memory::new_backing_identity(),
-            host,
             executable,
         })
     }
@@ -73,7 +139,13 @@ impl PageBacking for PrivatePage {
         true
     }
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
-        Some((self.identity, self.version()))
+        Some((self.source.domain.identity, self.source.domain.revision()))
+    }
+    fn parallel_domain_offset(&self) -> Option<u64> {
+        Some(self.source.offset)
+    }
+    fn parallel_changes_since(&self, generation: u64) -> Option<Vec<std::ops::Range<u64>>> {
+        self.source.domain.changes_since(generation)
     }
     fn parallel_commit_isolated(&self) -> bool {
         true
@@ -89,7 +161,13 @@ impl PageBacking for PrivatePage {
     }
     fn check(&self, address: u64) -> std::result::Result<(), MemoryError> {
         if self.source.offset / PAGE_SIZE
-            >= self.host.length.load(Ordering::Relaxed).div_ceil(PAGE_SIZE)
+            >= self
+                .source
+                .domain
+                .host
+                .length
+                .load(Ordering::Relaxed)
+                .div_ceil(PAGE_SIZE)
         {
             return Err(MemoryError::Bus(address));
         }
@@ -115,7 +193,9 @@ impl PageBacking for PrivatePage {
         Ok(())
     }
     fn version(&self) -> u64 {
-        self.host
+        self.source
+            .domain
+            .host
             .length_generation
             .load(Ordering::Relaxed)
             .wrapping_mul(2)
@@ -135,7 +215,7 @@ impl PageBacking for PrivatePage {
         Ok(Self::new(
             self.open.clone(),
             self.source.file.clone(),
-            self.host.clone(),
+            self.source.domain.clone(),
             offset,
             self.executable,
         ))
@@ -154,10 +234,16 @@ pub(crate) fn pages(
         .filter(|&end| end <= i64::MAX as u64)
         .ok_or(Errno(22))?;
     host.publish_length(file.file.metadata().map_err(errno)?.len());
+    let domain = Arc::new(LoadDomain {
+        identity: trames_memory::new_backing_identity(),
+        host,
+        generation: AtomicU64::new(0),
+        changes: Mutex::default(),
+    });
     Ok((offset..end)
         .step_by(PAGE_SIZE as usize)
         .map(|at| {
-            PrivatePage::new(open.clone(), file.clone(), host.clone(), at, executable)
+            PrivatePage::new(open.clone(), file.clone(), domain.clone(), at, executable)
                 as Rc<dyn PageBacking>
         })
         .collect())

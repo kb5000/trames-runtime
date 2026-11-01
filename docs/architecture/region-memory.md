@@ -1083,3 +1083,34 @@ covering snapshot construction through rename, rather than a global byte-I/O loc
 or another resource thread. Tests run concurrent sync jobs on one store, reopen
 their data/namespace, retain the original resources through FD reuse, and service
 a pipe while a sync caller is pending. No polling bus or wait thread is added.
+
+## Host private page-in domains (2026-11-01)
+
+Host `MAP_PRIVATE` sources previously declared a distinct change domain for every
+page. An unrelated backing publication consequently revisited thousands of
+unchanged domains at joined view preparation. One Firefox startup/playback
+diagnostic recorded 243 million domain checks and 11.36 seconds of aggregate
+memory preparation; these totals include playback and are not a startup-only
+wall-time partition.
+
+Pages created by one host mapping now share a page-in change domain. Their
+physical identities and immutable source caches remain independent; COW, file
+replacement retention, demand reads, executable bytes and EOF checks keep their
+original paths. Materializing a source records only its file-offset range.
+Adjacent records coalesce; at most 128 records are retained. Expired history or
+an unrecorded EOF-generation gap requests the existing full-domain refresh.
+Adding an alias cannot acknowledge an earlier change to an existing member.
+
+Only successful first page-in records metadata under that mapping's object
+mutex. Ordinary reads/writes acquire no new lock and no byte barrier. Generations
+remain relaxed metadata tokens. The EOF token is sampled once when recording a
+load so a concurrent resize cannot be falsely covered by a page-in range. No
+coordinator, resource thread or software byte-coherence layer is added.
+
+Regressions cover concurrent source loads, unchanged domains, offset-limited
+refresh including aliases, independent physical identities/COW, retained private
+bytes after truncation/regrowth, executable EOF faults and history expiry. A
+512-page mapping with four newly loaded offsets and one alias requires one
+domain check and five page checks. The paired Firefox observation reduced checks
+to 37.4 million and aggregate preparation to 5.91 seconds; short ordered runs and
+remaining cold-start gaps are recorded in the integration validation record.
