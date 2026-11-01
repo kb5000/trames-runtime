@@ -16,6 +16,7 @@ use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
+mod fd_allocator;
 mod fd_table;
 mod open_handle;
 pub use open_handle::OfdIdentity;
@@ -123,8 +124,22 @@ pub fn kernel_log_capacity() -> usize {
 pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
-pub const MAX_FDS: u32 = 256;
-pub type FdMask = [u64; (MAX_FDS as usize).div_ceil(64)];
+/// Linux's default nr_open ceiling. Tables allocate only occupied slots.
+pub const MAX_FDS: u32 = 1 << 20;
+/// Cold descriptor classification, shared by epochs and sized to live numbers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FdMask(Arc<[u64]>);
+impl FdMask {
+    pub fn iter(&self) -> std::slice::Iter<'_, u64> {
+        self.0.iter()
+    }
+}
+impl std::ops::Index<usize> for FdMask {
+    type Output = u64;
+    fn index(&self, word: usize) -> &u64 {
+        self.0.get(word).unwrap_or(&0)
+    }
+}
 /// Scheduler task budget, also reported by procfs and RLIMIT_NPROC.
 pub const MAX_TASKS: usize = 256;
 pub const PIPE_CAPACITY: usize = 65536;
@@ -779,6 +794,14 @@ impl Vfs {
     pub fn stream_descriptors(&self) -> FdMask {
         self.descriptor_io_masks().0
     }
+    /// Actual membership only; consumers must not scan the numeric ceiling.
+    pub fn descriptor_numbers(&self) -> Vec<u32> {
+        self.fds
+            .entries()
+            .iter()
+            .filter_map(|(&fd, _)| (fd < MAX_FDS).then_some(fd))
+            .collect()
+    }
     /// Live admitted membership/status/CLOEXEC. Excluded owner controls keep
     /// their frozen epoch capabilities; those structural edits still join.
     pub fn fd_flags_snapshot(&self) -> FdFlags {
@@ -838,19 +861,33 @@ impl Vfs {
             .is_ok_and(|d| Self::ordinary_stream(&d.open.borrow()))
     }
     fn descriptor_io_masks(&self) -> (FdMask, FdMask) {
-        *self.fds.identity().io.get_or_init(|| {
-            let mut streams = [0; (MAX_FDS as usize).div_ceil(64)];
-            let mut files = streams;
-            for (&fd, d) in self.fds.entries().iter() {
-                let o = d.open.borrow();
-                if Self::ordinary_stream(&o) {
-                    streams[fd as usize / 64] |= 1 << (fd % 64);
-                } else if Self::ordinary_file(&o, false).is_some() {
-                    files[fd as usize / 64] |= 1 << (fd % 64);
+        self.fds
+            .identity()
+            .io
+            .get_or_init(|| {
+                let descriptors = self.fds.entries();
+                let words = descriptors
+                    .last_key_value()
+                    .map_or(0, |(&fd, _)| (fd as usize + 1).div_ceil(64));
+                let mut streams = vec![0; words];
+                let mut files = vec![0; words];
+                for (&fd, d) in descriptors.iter() {
+                    let o = d.open.borrow();
+                    if Self::ordinary_stream(&o) {
+                        streams[fd as usize / 64] |= 1 << (fd % 64);
+                    } else if Self::ordinary_file(&o, false).is_some() {
+                        files[fd as usize / 64] |= 1 << (fd % 64);
+                    }
                 }
-            }
-            (streams, files)
-        })
+                while streams.last() == Some(&0) {
+                    streams.pop();
+                }
+                while files.last() == Some(&0) {
+                    files.pop();
+                }
+                (FdMask(streams.into()), FdMask(files.into()))
+            })
+            .clone()
     }
     /// Candidate regular files, not a cached authorization or mapping decision.
     /// Recheck epoch_file_io before effects: mmap need not edit the FD table.
@@ -1826,9 +1863,7 @@ impl Vfs {
         Ok(())
     }
     fn available(&self, min: u32) -> Result<u32> {
-        (min..MAX_FDS)
-            .find(|n| !self.fds.contains_key(n))
-            .ok_or(Errno(24))
+        self.fds.available(min).ok_or(Errno(24))
     }
     pub fn open_at(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<u32> {
         self.open_at_resolve(dirfd, path, flags, mode, 0)
@@ -2295,10 +2330,7 @@ impl Vfs {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(Errno(22));
         }
-        let free: Vec<_> = (0..MAX_FDS)
-            .filter(|n| !self.fds.contains_key(n))
-            .take(2)
-            .collect();
+        let free = self.fds.available_fds(2);
         if free.len() != 2 {
             return Err(Errno(24));
         }

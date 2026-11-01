@@ -50,8 +50,8 @@ impl ImageFds for Images {
             notification: None,
         });
         let mut entries = self.files.0.entries.lock().unwrap();
-        let fd = (0..MAX_FDS)
-            .find(|fd| !entries.contains_key(fd))
+        let fd = entries
+            .available(0)
             .ok_or_else(|| io::Error::from_raw_os_error(24))?;
         entries.insert(
             fd,

@@ -89,6 +89,28 @@ mod tests {
         out
     }
     #[test]
+    fn descriptor_limits_and_status_match_dynamic_membership() {
+        let mut v = Vfs::default();
+        for _ in 0..300 {
+            v.eventfd(0, 0).unwrap();
+        }
+        snapshot(&mut v);
+        assert_eq!(
+            read(&mut v, b"/proc/sys/fs/nr_open"),
+            format!("{MAX_FDS}\n").into_bytes()
+        );
+        let limits = String::from_utf8(read(&mut v, b"/proc/self/limits")).unwrap();
+        let row = limits
+            .lines()
+            .find(|line| line.starts_with("Max open files"))
+            .unwrap();
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields[3], MAX_FDS.to_string());
+        assert_eq!(fields[4], MAX_FDS.to_string());
+        let status = String::from_utf8(read(&mut v, b"/proc/self/status")).unwrap();
+        assert!(status.contains("FDSize:\t512\n"));
+    }
+    #[test]
     fn boot_id_is_stable_across_tasks_but_fresh_in_a_new_session() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -1589,6 +1611,7 @@ impl Vfs {
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
+            b"/proc/sys/fs/nr_open" => return Ok(regular(format!("{MAX_FDS}\n").into_bytes())),
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
@@ -1753,7 +1776,15 @@ impl Vfs {
                                     ));
                                 }
                             }
-                            format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t256\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
+                            let fd_size = p
+                                .fds
+                                .iter()
+                                .map(|f| f.fd + 1)
+                                .max()
+                                .unwrap_or(0)
+                                .max(64)
+                                .next_power_of_two();
+                            format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => {
@@ -1767,7 +1798,7 @@ impl Vfs {
                             };
                             let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
                             let (core_soft, core_hard) = p.core_limits.unwrap_or((0, u64::MAX));
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            256                  256                  files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
+                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            {MAX_FDS:<20} {MAX_FDS:<20} files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
                         }
                         _ => return Ok(None),
                     };

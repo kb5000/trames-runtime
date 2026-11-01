@@ -721,10 +721,7 @@ impl Vfs {
         capacity: usize,
         cloexec: bool,
     ) -> (Vec<u32>, bool) {
-        let free: Vec<_> = (0..MAX_FDS)
-            .filter(|fd| !self.fds.contains_key(fd))
-            .take(capacity.min(rights.0.len()))
-            .collect();
+        let free = self.fds.available_fds(capacity.min(rights.0.len()));
         let truncated = free.len() < rights.0.len();
         for (&fd, open) in free.iter().zip(rights.0.drain(..free.len())) {
             self.fds.insert(
@@ -753,10 +750,7 @@ impl Vfs {
         if protocol != 0 {
             return Err(Errno(93));
         }
-        let free: Vec<_> = (0..MAX_FDS)
-            .filter(|n| !self.fds.contains_key(n))
-            .take(2)
-            .collect();
+        let free = self.fds.available_fds(2);
         if free.len() != 2 {
             return Err(Errno(24));
         }
@@ -772,6 +766,40 @@ impl Vfs {
 #[cfg(test)]
 mod waitall_tests {
     use super::*;
+    #[test]
+    fn rights_and_worker_masks_cross_the_old_256_descriptor_boundary() {
+        let mut v = Vfs::default();
+        let mut originals = Vec::new();
+        for n in 0..300 {
+            originals.push(v.eventfd(n + 1, 0).unwrap());
+        }
+        let initial = v.stream_descriptors();
+        let [reader, writer] = v.pipe(0).unwrap();
+        assert!(reader >= 300);
+        let before = v.stream_descriptors();
+        assert_ne!(before[reader as usize / 64] & (1 << (reader % 64)), 0);
+        assert_eq!(before[(MAX_FDS as usize - 1) / 64], 0);
+        assert!(
+            before.0.len() <= 6,
+            "mask must follow actual FD numbers, not the ceiling"
+        );
+        let rights = v.send_rights(&originals[..3]).unwrap();
+        let (received, truncated) = v.receive_rights(rights, 204, true);
+        assert!(!truncated);
+        assert_eq!(received.len(), 3);
+        for (n, fd) in received.into_iter().enumerate() {
+            assert_eq!(v.read(fd, 8).unwrap(), (n as u64 + 1).to_le_bytes());
+            assert_ne!(v.flags(fd).unwrap() & O_CLOEXEC, 0);
+        }
+        v.close(reader).unwrap();
+        v.close(writer).unwrap();
+        assert_eq!(v.stream_descriptors(), initial);
+        assert_ne!(
+            before[reader as usize / 64] & (1 << (reader % 64)),
+            0,
+            "old epoch keeps immutable classification"
+        );
+    }
     #[test]
     fn sender_self_rights_and_deep_queue_chains_release_without_recursive_borrows() {
         std::thread::Builder::new()
@@ -973,6 +1001,8 @@ mod named_tests {
         let client = v.socket(1, 1, 0).unwrap();
         let c = v.local_socket(client).unwrap().unwrap();
         v.local_connect(&c, b"\x01\x00\0quota").unwrap();
+        // Exercise real exhaustion without filling the normal million-FD space.
+        v.fds.set_test_capacity(32);
         let mut copies = Vec::new();
         while let Ok(fd) = v.dup(client, 0, false) {
             copies.push(fd);

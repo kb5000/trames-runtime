@@ -46,6 +46,7 @@ pub(super) struct Membership {
 pub(super) struct MembershipEntries {
     slots: BTreeMap<u32, Slot>,
     wayland: Option<PreparedWayland>,
+    free: crate::fd_allocator::FreeFds,
 }
 impl std::ops::Deref for MembershipEntries {
     type Target = BTreeMap<u32, Slot>;
@@ -53,9 +54,27 @@ impl std::ops::Deref for MembershipEntries {
         &self.slots
     }
 }
-impl std::ops::DerefMut for MembershipEntries {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slots
+impl MembershipEntries {
+    pub(super) fn available(&self, min: u32) -> Option<u32> {
+        self.free.next(min)
+    }
+    pub(super) fn insert(&mut self, fd: u32, slot: Slot) -> Option<Slot> {
+        let old = self.slots.insert(fd, slot);
+        if old.is_none() {
+            self.free.reserve(fd);
+        }
+        old
+    }
+    pub(super) fn remove(&mut self, fd: &u32) -> Option<Slot> {
+        let old = self.slots.remove(fd);
+        if old.is_some() {
+            self.free.release(*fd);
+        }
+        old
+    }
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
     }
 }
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
@@ -183,7 +202,7 @@ impl SharedFiles {
         if min >= MAX_FDS {
             return Some(Err(Errno(22)));
         }
-        let Some(fd) = (min..MAX_FDS).find(|fd| !entries.contains_key(fd)) else {
+        let Some(fd) = entries.available(min) else {
             return Some(Err(Errno(24)));
         };
         entries.insert(
@@ -397,6 +416,22 @@ pub(super) struct DescriptorVersion {
     pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
 }
 impl DescriptorTable {
+    pub(super) fn available(&self, min: u32) -> Option<u32> {
+        self.1 .0.entries.lock().unwrap().available(min)
+    }
+    pub(super) fn available_fds(&self, count: usize) -> Vec<u32> {
+        self.1 .0.entries.lock().unwrap().free.first(count)
+    }
+    #[cfg(test)]
+    pub(super) fn set_test_capacity(&self, limit: u32) {
+        let mut entries = self.1 .0.entries.lock().unwrap();
+        let mut free = crate::fd_allocator::FreeFds::new(limit);
+        for &fd in entries.keys() {
+            assert!(fd < limit);
+            free.reserve(fd);
+        }
+        entries.free = free;
+    }
     pub(super) fn membership(&self) -> &SharedFiles {
         &self.1
     }
@@ -446,9 +481,6 @@ impl DescriptorTable {
         let descriptor = self.get(&fd).ok_or(Errno(9))?;
         descriptor.ready()?;
         Ok(descriptor)
-    }
-    pub(super) fn contains_key(&self, fd: &u32) -> bool {
-        self.1 .0.entries.lock().unwrap().contains_key(fd)
     }
     fn sync_cache(&self) -> std::cell::RefMut<'_, TableState> {
         let mut state = self.0.borrow_mut();
@@ -511,9 +543,7 @@ impl DescriptorTable {
         if min >= MAX_FDS {
             return Err(Errno(22));
         }
-        let fd = (min..MAX_FDS)
-            .find(|fd| !entries.contains_key(fd))
-            .ok_or(Errno(24))?;
+        let fd = entries.available(min).ok_or(Errno(24))?;
         descriptor.cloexec = cloexec.into();
         assert!(self.install(fd, descriptor, &mut entries).is_none());
         Ok(fd)
@@ -586,6 +616,7 @@ impl TableState {
 impl Clone for DescriptorTable {
     fn clone(&self) -> Self {
         let source = self.entries();
+        let free = source.membership.free.clone();
         let mut owners = BTreeMap::new();
         let entries = source
             .iter()
@@ -614,6 +645,7 @@ impl Clone for DescriptorTable {
                 entries: Mutex::new(MembershipEntries {
                     slots: entries,
                     wayland: None,
+                    free,
                 }),
                 revision: AtomicU64::new(0),
             })),

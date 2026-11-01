@@ -139,3 +139,31 @@ launcher exposes this with `--host-profile`. This is an opt-in storage placement
 not a general private-store persistence fix. An experimental broader namespace
 service path did not establish a stable benefit and was reverted. No such
 experiment or sampling instrumentation remains in the common runtime.
+
+## Descriptor exhaustion during the actual browser launch
+
+The regular Firefox launcher reproduced another failure absent from the minimal
+initial playback measurements: the old 256-entry guest FD ceiling. The parent
+had 254 occupied slots when it received three SCM_RIGHTS handles; its ancillary
+buffer had room for 204, but only two handles were installed. Firefox rejected
+the truncated control message and restarted its video bridge. This can cause
+severe playback and hover stalls while decoding counters alone look healthy.
+
+The common runtime now uses Linux's default `nr_open` ceiling (1,048,576).
+Membership remains sparse; immutable epoch classification masks allocate only
+words actually needed and share their storage. No million-entry table, bitmap
+or host-FD reservation is made at startup. io_uring captures actual membership
+instead of walking every possible number. Proc limits, `nr_open` and `FDSize`
+reflect the new representation.
+
+The existing files_struct lock also protects a free-interval index, so lowest-FD
+allocation and reuse do not scan all earlier occupied numbers. Insert, replace,
+close, clear and fork maintain this same resource's index; no new service thread
+or global lock is added. A small test-only allocator domain exercises exhaustion
+and pending-accept retention without filling a million real slots. Separate
+regressions cross 300 descriptors, retain immutable old masks, verify complete
+SCM_RIGHTS transfer and compare split/merge allocation against a reference model.
+
+The extended ceiling follows [Linux's documented default](https://docs.kernel.org/admin-guide/sysctl/fs.html#nr-open).
+Actual host resource failures still return normal OS errors. The physical screen
+cadence remains separate from decoded-frame counts and JavaScript frame callbacks.

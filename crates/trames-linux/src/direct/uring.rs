@@ -1288,7 +1288,7 @@ impl UringEpoch {
             ..Default::default()
         };
         let mut retained = BTreeMap::new();
-        for fd in 0..trames_vfs::MAX_FDS {
+        for fd in vfs.descriptor_numbers() {
             if vfs.flags(fd).is_ok() {
                 snapshot.valid_fds.insert(fd);
             }

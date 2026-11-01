@@ -627,7 +627,7 @@ mod timer_index_tests {
     #[test]
     fn timer_index_reads_live_state_and_tracks_fork_shared_close_and_fd_reuse() {
         let mut parent = Vfs::default();
-        for _ in 0..MAX_FDS / 2 {
+        for _ in 0..128 {
             parent.eventfd(0, 0).unwrap();
         }
         let timer = parent.timerfd(1, 0).unwrap();
@@ -666,7 +666,7 @@ mod timer_index_tests {
     #[test]
     fn empty_timer_index_remains_empty_until_actual_membership_changes() {
         let mut v = Vfs::default();
-        for _ in 0..MAX_FDS / 2 {
+        for _ in 0..128 {
             v.eventfd(0, 0).unwrap();
         }
         assert_eq!(v.next_timerfd_deadline(), None);
