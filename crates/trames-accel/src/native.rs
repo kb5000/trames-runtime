@@ -14,6 +14,7 @@ pub const FEATURES: u64 = (1 << FUNCTION_COUNT) - 1;
 pub const PROFILE: u64 = 0x0001_0001; // protocol 1, pure module 1
 pub const INSTRUCTION: u32 = 0xd44a8a40; // HLT #0x5452, opt-in virtual encoding
 pub const VULKAN_PROFILE: u64 = 0x0001_0006;
+pub const AUDIO_PROFILE: u64 = 0x0001_0008;
 pub const VIDEO_PROFILE: u64 = 0x0001_0007;
 pub const MAX_BYTES: usize = 64 * 1024;
 /// Bulk operations remain bounded inside a joined NativeCall checkpoint.
@@ -218,7 +219,7 @@ impl Registry {
             || (module == crate::numeric::PROFILE && function == 1)
             || (module == crate::integer::PROFILE && function == 1)
             || (module == crate::allocator::PROFILE && (1..=3).contains(&function))
-            || (matches!(module, VULKAN_PROFILE | VIDEO_PROFILE) && function == 1);
+            || (matches!(module, VULKAN_PROFILE | VIDEO_PROFILE | AUDIO_PROFILE) && function == 1);
         if !allowed || pc < 12 {
             return Ok(false);
         }
@@ -283,7 +284,7 @@ impl Registry {
         module: u64,
         function: u64,
     ) -> Result<(), Error> {
-        if !matches!(module, VULKAN_PROFILE | VIDEO_PROFILE)
+        if !matches!(module, VULKAN_PROFILE | VIDEO_PROFILE | AUDIO_PROFILE)
             || function != 1
             || !self.valid(memory, pc, module, function)?
         {
@@ -301,7 +302,7 @@ impl Registry {
         function: u64,
         a: [u64; 3],
     ) -> Result<Return, Error> {
-        if matches!(module, VULKAN_PROFILE | VIDEO_PROFILE) {
+        if matches!(module, VULKAN_PROFILE | VIDEO_PROFILE | AUDIO_PROFILE) {
             return Err(Error::Checkpoint);
         }
         self.invoke_scoped(memory, pc, module, function, a, || ())
@@ -317,7 +318,7 @@ impl Registry {
         a: [u64; 3],
         scope: impl FnOnce() -> T,
     ) -> Result<Return, Error> {
-        if matches!(module, VULKAN_PROFILE | VIDEO_PROFILE) {
+        if matches!(module, VULKAN_PROFILE | VIDEO_PROFILE | AUDIO_PROFILE) {
             self.metrics.checkpoint_retries = self.metrics.checkpoint_retries.saturating_add(1);
             return Err(Error::Checkpoint);
         }
@@ -598,6 +599,16 @@ mod tests {
         registry
             .authorize_stateful(&m, 0x100c, VIDEO_PROFILE, 1)
             .unwrap();
+        m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write(0x1000, &0xd2800110u32.to_le_bytes()).unwrap();
+        m.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        registry
+            .authorize_stateful(&m, 0x100c, AUDIO_PROFILE, 1)
+            .unwrap();
+        assert!(matches!(
+            registry.authorize_stateful(&m, 0x100c, VIDEO_PROFILE, 1),
+            Err(Error::InvalidEntry)
+        ));
     }
     #[test]
     fn all_pure_entries_match_coordinator_on_parallel_views() {

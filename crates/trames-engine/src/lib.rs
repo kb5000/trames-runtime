@@ -143,6 +143,7 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn set_native_calls(&mut self, enabled: bool);
     fn set_vulkan_calls(&mut self, enabled: bool);
     fn set_video_calls(&mut self, _enabled: bool) {}
+    fn set_audio_calls(&mut self, _enabled: bool) {}
     fn clear_exclusive(&mut self);
     fn fault_retired(&self) -> u64;
     fn decode_stats(&self) -> DecodeStats;

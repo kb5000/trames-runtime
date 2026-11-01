@@ -105,6 +105,9 @@ pub struct RuntimeOptions {
     pub vulkan_accelerator: bool,
     /// VideoToolbox-backed guest VA-API; independent of the GPU execution profile.
     pub video_accelerator: bool,
+    /// Host opt-ins; capture still requires the platform microphone permission.
+    pub audio_output: bool,
+    pub audio_input: bool,
 }
 
 pub use trames_linux::image::{STACK_SIZE, STACK_TOP};
@@ -296,6 +299,18 @@ fn initial_stack_bytes<C: Cpu>(
 ) -> Result<u64, RuntimeError> {
     let mut extra = vec![
         (
+            trames_audio::AUXV_KEY,
+            if options.audio_output || options.audio_input {
+                trames_audio::PROFILE
+            } else {
+                0
+            },
+        ),
+        (
+            trames_audio::CAPS_KEY,
+            u64::from(options.audio_output) | (u64::from(options.audio_input) << 1),
+        ),
+        (
             trames_video::AUXV_KEY,
             if options.video_accelerator {
                 trames_video::PROFILE
@@ -465,6 +480,7 @@ impl<C: Cpu> Runtime<C> {
         cpu.set_native_calls(options.pure_accelerator);
         cpu.set_vulkan_calls(options.vulkan_accelerator);
         cpu.set_video_calls(options.video_accelerator);
+        cpu.set_audio_calls(options.audio_output || options.audio_input);
         Ok(Self {
             memory_limits: options.memory_limits,
             vulkan_display: VulkanDisplay::default(),

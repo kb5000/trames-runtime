@@ -66,6 +66,7 @@ pub(super) struct Work<C: Cpu> {
     pub control: Arc<Control>,
     pub syscalls: Option<crate::worker_syscalls::Snapshot>,
     pub gpu: Option<crate::gpu::Authority>,
+    pub audio: Option<trames_audio::Context>,
 }
 #[derive(Default)]
 pub(super) struct GpuStats {
@@ -772,7 +773,12 @@ impl<C: Cpu> Pool<C> {
                                 let args = [work.cpu.x(0), work.cpu.x(1), work.cpu.x(2)];
                                 let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && trames_vulkan::Context::worker_operation(args[0]) && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
                                 let video = work.gpu.as_ref().filter(|_| *module == trames_video::PROFILE && args[0] != trames_video::CREATE_SURFACE);
-                                let native = if let Some(authority) = video {
+                                let audio=work.audio.as_ref().filter(|_|*module==trames_audio::PROFILE && args[0]!=trames_audio::OPEN);
+                                let native = if let Some(authority)=audio {
+                                    registry.authorize_stateful(work.memory.as_deref().expect("worker view"),*pc,*module,*function)
+                                        .and_then(|()|authority.invoke(work.memory.as_deref_mut().expect("worker view"),args[0],args[1],args[2],None).map_err(trames_accel::native::Error::Memory))
+                                        .map(|value|trames_accel::native::Return {value,fallback:false})
+                                } else if let Some(authority) = video {
                                     registry.authorize_stateful(work.memory.as_deref().expect("worker view"), *pc, *module, *function)
                                         .and_then(|()| {
                                             let memory=work.memory.as_deref_mut().expect("worker view");
@@ -1189,6 +1195,7 @@ mod tests {
         snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
         let mut job = crate::run_queue::Job::new(
             Work {
+                audio: None,
                 gpu: None,
                 pid: 7,
                 cpu,
@@ -1291,6 +1298,7 @@ mod tests {
         cpu.set_x(0, count);
         cpu.set_native_calls(true);
         Work {
+            audio: None,
             gpu: None,
             pid,
             cpu,
@@ -1472,6 +1480,7 @@ mod tests {
             snapshot.futex = crate::futex::Authority::new(table.clone(), i as u64 + 10);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    audio: None,
                     gpu: None,
                     pid: i as u32 + 1,
                     cpu,
@@ -1561,6 +1570,7 @@ mod tests {
             snapshot.futex = crate::futex::Authority::new(table.clone(), 1);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    audio: None,
                     gpu: None,
                     pid,
                     cpu,
@@ -1686,6 +1696,7 @@ mod tests {
                 snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        audio: None,
                         gpu: None,
                         pid,
                         cpu,
@@ -1832,6 +1843,7 @@ mod tests {
                     .with_kernel_log(vfs.kernel_log_capability());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        audio: None,
                         gpu: None,
                         pid,
                         cpu,
@@ -1912,6 +1924,7 @@ mod tests {
                 .with_files(capabilities.clone());
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    audio: None,
                     gpu: None,
                     pid,
                     cpu,
@@ -1980,6 +1993,7 @@ mod tests {
             cpu.set_x(1, 0x3020);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    audio: None,
                     gpu: None,
                     pid,
                     cpu,
@@ -2094,6 +2108,7 @@ mod tests {
                 snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        audio: None,
                         gpu: None,
                         pid,
                         cpu,
@@ -2360,6 +2375,7 @@ mod tests {
         cpu.set_x(2, 8);
         (
             Work {
+                audio: None,
                 gpu: None,
                 pid: 1,
                 cpu,
@@ -2714,6 +2730,7 @@ mod tests {
         let memory_view = memory.parallel_view(&mut Default::default()).unwrap();
         (
             Work {
+                audio: None,
                 gpu: None,
                 pid: 1,
                 cpu,
@@ -2759,6 +2776,7 @@ mod tests {
             pool.dispatch(
                 0,
                 Work {
+                    audio: None,
                     gpu: context
                         .then(|| trames_vulkan::Context::new(trames_vulkan::Backend::new()).into()),
                     pid: 1,
@@ -2825,6 +2843,7 @@ mod tests {
         cpu.set_vulkan_calls(true);
         (
             Work {
+                audio: None,
                 gpu: Some(context.into()),
                 pid: 1,
                 cpu,
@@ -3016,6 +3035,7 @@ mod tests {
             .map_backed(0x2000, vec![live.clone()], false, Permissions::RW, true)
             .unwrap();
         let work = Work {
+            audio: None,
             gpu: None,
             pid: 1,
             cpu,
@@ -3108,6 +3128,7 @@ mod tests {
             peer_cpu.set_x(0, peer_address);
             peer_cpu.set_x(1, 0x52);
             let peer = Work {
+                audio: None,
                 gpu: None,
                 pid: 2,
                 cpu: peer_cpu,

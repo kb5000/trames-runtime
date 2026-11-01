@@ -539,6 +539,7 @@ mod tests {
                 let epoch = crate::run_queue::Epoch::new(control.clone());
                 epoch.add(crate::run_queue::Job::new(
                     crate::workers::Work {
+                        audio: None,
                         gpu: None,
                         pid: 1,
                         cpu: std::mem::take(&mut p.cpu),
@@ -644,6 +645,7 @@ mod tests {
                 futex: Default::default(),
             };
             let work = crate::workers::Work {
+                audio: None,
                 pid: 1,
                 cpu: std::mem::take(&mut p.cpu),
                 memory: Some(Box::new(

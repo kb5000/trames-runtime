@@ -457,6 +457,7 @@ mod tests {
     fn job(pid: u32, view: Box<trames_memory::parallel::View>, epoch: &Arc<Epoch>) -> Box<Job> {
         Job::new(
             Work {
+                audio: None,
                 pid,
                 cpu: Default::default(),
                 memory: Some(view),

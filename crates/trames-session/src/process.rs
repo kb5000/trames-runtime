@@ -427,6 +427,7 @@ pub(crate) struct Kernel<C: Cpu> {
     native: trames_accel::native::Registry,
     gpu: RefCell<BTreeMap<u64, trames_vulkan::Context>>,
     video: RefCell<BTreeMap<u64, trames_video::Context>>,
+    audio: RefCell<BTreeMap<u64, trames_audio::Context>>,
     gpu_budget: trames_vulkan::Budget,
     gpu_display: trames_vulkan::Display,
     gpu_compiles: u64,
@@ -495,6 +496,43 @@ impl<C: Cpu> Kernel<C> {
         function: u64,
         a: [u64; 3],
     ) -> Result<Option<trames_accel::native::Return>, trames_accel::native::Error> {
+        if module == trames_audio::PROFILE {
+            if !accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE) {
+                return Err(trames_accel::native::Error::InvalidEntry);
+            }
+            self.native
+                .authorize_stateful(&p.memory, pc, module, function)?;
+            let notify = if a[0] == trames_audio::OPEN && a[2] == 128 {
+                let fd = p
+                    .memory
+                    .read_u64(a[1])
+                    .map_err(trames_accel::native::Error::Memory)?;
+                match u32::try_from(fd)
+                    .ok()
+                    .and_then(|fd| p.linux.vfs.native_event(fd).ok())
+                {
+                    Some(event) => {
+                        Some(std::sync::Arc::new(move || event.notify()) as trames_audio::Notify)
+                    }
+                    None => {
+                        return Ok(Some(trames_accel::native::Return {
+                            value: (-22i64) as u64,
+                            fallback: false,
+                        }))
+                    }
+                }
+            } else {
+                None
+            };
+            let value = self
+                .audio_context(p)
+                .invoke(&mut p.memory, a[0], a[1], a[2], notify)
+                .map_err(trames_accel::native::Error::Memory)?;
+            return Ok(Some(trames_accel::native::Return {
+                value,
+                fallback: false,
+            }));
+        }
         if module == trames_video::PROFILE {
             if !accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE) {
                 return Err(trames_accel::native::Error::InvalidEntry);
@@ -633,6 +671,24 @@ impl<C: Cpu> Kernel<C> {
             value,
             fallback: false,
         }))
+    }
+    fn audio_context(&self, p: &Process<C>) -> trames_audio::Context {
+        self.audio
+            .borrow_mut()
+            .entry(p.vm_id)
+            .or_insert_with(|| {
+                let caps = p
+                    .linux
+                    .auxiliary
+                    .chunks_exact(16)
+                    .find_map(|pair| {
+                        (pair[..8] == trames_audio::CAPS_KEY.to_le_bytes())
+                            .then(|| u64::from_le_bytes(pair[8..].try_into().unwrap()))
+                    })
+                    .unwrap_or(0);
+                trames_audio::Context::new(caps)
+            })
+            .clone()
     }
     fn video_context(&self, p: &Process<C>) -> trames_video::Context {
         self.video.borrow_mut().entry(p.vm_id).or_default().clone()
@@ -1009,6 +1065,7 @@ impl<C: Cpu> Kernel<C> {
         {
             self.gpu.borrow_mut().remove(&p.vm_id);
             self.video.borrow_mut().remove(&p.vm_id);
+            self.audio.borrow_mut().remove(&p.vm_id);
         }
         p.linux.vfs.set_lock_owner(p.tgid);
         let live = |t: &&Process<C>| !matches!(t.state, State::Zombie(_));
@@ -1637,6 +1694,14 @@ impl<C: Cpu> Kernel<C> {
                         trames_accel::native::AUXV_KEY,
                         trames_accel::native::PROFILE,
                     ),
+                    audio_output: p.linux.auxiliary.chunks_exact(16).any(|pair| {
+                        pair[..8] == trames_audio::CAPS_KEY.to_le_bytes()
+                            && u64::from_le_bytes(pair[8..].try_into().unwrap()) & 1 != 0
+                    }),
+                    audio_input: p.linux.auxiliary.chunks_exact(16).any(|pair| {
+                        pair[..8] == trames_audio::CAPS_KEY.to_le_bytes()
+                            && u64::from_le_bytes(pair[8..].try_into().unwrap()) & 2 != 0
+                    }),
                     video_accelerator: accelerated(
                         p,
                         trames_video::AUXV_KEY,
@@ -2304,6 +2369,7 @@ impl<C: Cpu> Kernel<C> {
                 {
                     self.gpu.borrow_mut().remove(&old_vm);
                     self.video.borrow_mut().remove(&old_vm);
+                    self.audio.borrow_mut().remove(&old_vm);
                 }
                 Ok(None)
             }
@@ -3933,6 +3999,8 @@ impl<C: Cpu> Kernel<C> {
                 images: Some(p.linux.vfs.image_fds()),
                 auth: p.linux.vfs.wayland_auth_snapshot(),
             });
+            let audio = accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE)
+                .then(|| self.audio_context(p));
             let p = self.processes.get_mut(&id).expect("cohort process");
             let waiting = if let State::Futex { wait, deadline } = &p.state {
                 Some(crate::run_queue::WaitState::Futex {
@@ -3960,6 +4028,7 @@ impl<C: Cpu> Kernel<C> {
             };
             let work = crate::workers::Work::<C> {
                 gpu,
+                audio,
                 pid: id,
                 cpu: std::mem::take(&mut p.cpu),
                 memory: Some(view),
@@ -4457,8 +4526,16 @@ impl<C: Cpu> Kernel<C> {
             }
             if let State::Futex {
                 deadline: Some(d), ..
+            } = p.state
+            {
+                // Same-VM futex waiters are retained by the worker deadline
+                // queue. Their owner snapshot can already be expired while a
+                // live epoch runs; using it here makes control poll forever.
+                if !worker_vms.contains(&p.vm_id) {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
             }
-            | State::Sigwait {
+            if let State::Sigwait {
                 deadline: Some(d), ..
             } = p.state
             {
@@ -5004,6 +5081,7 @@ pub(super) fn run<C: Cpu>(
         native: trames_accel::native::Registry::default(),
         gpu: RefCell::new(BTreeMap::new()),
         video: RefCell::new(BTreeMap::new()),
+        audio: RefCell::new(BTreeMap::new()),
         gpu_budget: runtime.memory_limits.gpu_budget(),
         gpu_display: runtime.vulkan_display.clone(),
         gpu_compiles: 0,
@@ -6463,6 +6541,7 @@ mod tests {
             native: trames_accel::native::Registry::default(),
             gpu: RefCell::new(BTreeMap::new()),
             video: RefCell::new(BTreeMap::new()),
+            audio: RefCell::new(BTreeMap::new()),
             gpu_budget: trames_vulkan::Budget::default(),
             gpu_display: trames_vulkan::Display::default(),
             gpu_compiles: 0,
@@ -6634,7 +6713,6 @@ mod tests {
     #[test]
     fn proc_residency_queries_each_real_owner_once_and_refreshes_live_values() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use trames_linux::CapturedOutput;
         #[derive(Clone)]
         #[repr(align(4096))]
         struct AlignedPage([u8; 4096]);
@@ -6856,7 +6934,6 @@ mod tests {
 
     #[test]
     fn cmdline_observations_keep_live_bytes_through_aliases_and_unseen_pids() {
-        use trames_linux::CapturedOutput;
         fn read(
             k: &mut Kernel,
             p: &mut Process,
@@ -7320,6 +7397,28 @@ mod tests {
         assert!(k.parallel_timeout() <= Duration::from_millis(1));
     }
     #[test]
+    fn retained_futex_deadline_does_not_spin_the_live_cohort_owner() {
+        let mut k = spinning_peers();
+        let wait = k
+            .futexes
+            .wait((0, 1, 0x1000), 1, 1, || Ok::<_, ()>(()))
+            .unwrap();
+        k.processes.get_mut(&1).unwrap().state = State::Futex {
+            wait,
+            deadline: Some(Instant::now()),
+        };
+        assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
+        k.processes.get_mut(&1).unwrap().vm_id = 999;
+        assert_eq!(k.parallel_timeout(), Duration::ZERO);
+        k.processes.get_mut(&1).unwrap().vm_id = k.processes[&2].vm_id;
+        k.processes.get_mut(&1).unwrap().state = State::Sigwait {
+            mask: 0,
+            info: 0,
+            deadline: Some(Instant::now()),
+        };
+        assert_eq!(k.parallel_timeout(), Duration::ZERO);
+    }
+    #[test]
     fn worker_poll_deadlines_do_not_force_unrelated_cpus_to_checkpoint() {
         let mut k = spinning_peers();
         let p = k.processes.get_mut(&1).unwrap();
@@ -7714,7 +7813,6 @@ mod tests {
     }
     #[test]
     fn metadata_unshare_range_and_fs_only_unshare_preserve_table_domains() {
-        use trames_linux::CapturedOutput;
         let mut k = kernel();
         let mut p = process();
         let [fd, _] = p.linux.vfs.pipe(0).unwrap();

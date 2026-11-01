@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/trames-graphics",
     "crates/trames-video",
+    "crates/trames-audio",
     "crates/trames-vulkan",
     "crates/trames-accel",
     "crates/trames-native",

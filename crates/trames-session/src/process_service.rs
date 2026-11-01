@@ -396,6 +396,7 @@ mod tests {
             .dispatch(
                 0,
                 Work {
+                    audio: None,
                     gpu: None,
                     pid: 1,
                     cpu,

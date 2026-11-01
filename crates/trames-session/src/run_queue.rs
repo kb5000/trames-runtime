@@ -991,6 +991,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         Job::new(
             Work {
+                audio: None,
                 gpu: None,
                 pid,
                 cpu: trames_cpu::Cpu::default(),
