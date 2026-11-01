@@ -832,6 +832,10 @@ pruned, or permission-edited in place.
 Destructive generations rotate that publication owner. Retained Views keep their
 old immutable index and bytes; current snapshots receive the new owner. Shared
 publication frame caches are never reused by the unique-snapshot pruning path.
+Rotating the publication owner always marks the anonymous snapshot dirty, even
+when munmap removes only an inaccessible reservation or an unmapped hole. Without
+that metadata refresh, a later successful live mmap can publish to an owner that
+the caller's cached View no longer consults. This adds no CPU/native-access check.
 Permission withdrawal, unmap, discard, fixed/file/shared mappings, tracing and
 seccomp retain their joined boundaries. This removes the same-mm pause for pure
 additions, not every mapping synchronization operation.

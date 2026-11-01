@@ -599,6 +599,10 @@ impl Memory {
         // Destructive generations do not reuse the append-only publication
         // index. Retained Views keep the old immutable entries and byte owners.
         self.anonymous.live = Default::default();
+        // Even unmapping only a reservation/hole rotates the publication
+        // owner. Refresh cached snapshots before any later live mmap so its
+        // successful result is visible to the calling View.
+        self.parallel_anonymous_dirty = true;
         self.invalidate_translations();
         let pages = self.sparse_pages.get_mut();
         let keys: Vec<_> = pages.range(start..end).map(|(&base, _)| base).collect();
@@ -1190,6 +1194,29 @@ mod live_tests {
         drop(fresh);
         assert_eq!(m.read_array::<8>(0x201000).unwrap(), 73u64.to_le_bytes());
     }
+    #[test]
+    fn live_additions_after_unmapping_a_reservation_reach_refreshed_views() {
+        let mut m = Memory::default();
+        m.map(0x100000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.reserve(0x400000, PAGE_SIZE, false).unwrap();
+        let mut r = Registry::default();
+        let mut original = m.parallel_view(&mut r).unwrap();
+        original.write_array(0x100000, [17]).unwrap();
+        drop(original);
+        m.commit_parallel().unwrap();
+
+        // V8 trims inaccessible reservations before its next malloc. There
+        // need not be any anonymous page in the removed address range.
+        m.unmap(0x400000, PAGE_SIZE).unwrap();
+        let mut refreshed = m.parallel_view(&mut r).unwrap();
+        m.map_anonymous_live(0x200000, PAGE_SIZE).unwrap();
+        refreshed.write_array(0x200000, [37]).unwrap();
+        assert_eq!(refreshed.read_array::<1>(0x100000).unwrap(), [17]);
+        drop(refreshed);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.read_array::<1>(0x200000).unwrap(), [37]);
+    }
+
     #[test]
     fn live_range_tokens_survive_other_snapshot_refreshes_and_retirement() {
         let mut m = Memory::default();
