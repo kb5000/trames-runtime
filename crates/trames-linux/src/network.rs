@@ -140,6 +140,29 @@ struct Vectors {
 }
 impl Vectors {
     fn prepare(memory: &impl CpuMemory, pointer: u64, count: u64, access: Access) -> Result<Self> {
+        Self::prepare_prefix(
+            memory,
+            pointer,
+            count,
+            access,
+            matches!(access, Access::Write),
+        )
+    }
+    fn prepare_stream(
+        memory: &impl CpuMemory,
+        pointer: u64,
+        count: u64,
+        access: Access,
+    ) -> Result<Self> {
+        Self::prepare_prefix(memory, pointer, count, access, true)
+    }
+    fn prepare_prefix(
+        memory: &impl CpuMemory,
+        pointer: u64,
+        count: u64,
+        access: Access,
+        short: bool,
+    ) -> Result<Self> {
         if count > 1024 {
             return Err(Errno(90));
         }
@@ -156,11 +179,10 @@ impl Vectors {
                 .checked_add(length)
                 .filter(|&n| n <= i64::MAX as u64)
                 .ok_or(Errno(22))?;
-            // A receive capacity may exceed one transport chunk. Complete a
-            // bounded short receive instead of rejecting the caller's buffer.
-            // Sends preserve message lengths so datagrams are never shortened.
+            // Stream sends and receives can complete one transport prefix.
+            // Datagram sends must preserve the entire message or fail.
             let room = (trames_net::MAX_TRANSFER - size) as u64;
-            let length = if matches!(access, Access::Write) {
+            let length = if short {
                 length.min(room)
             } else if length > room {
                 return Err(Errno(90));

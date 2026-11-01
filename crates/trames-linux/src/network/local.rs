@@ -35,7 +35,7 @@ impl Message {
         } else {
             None
         };
-        let vectors = Vectors::prepare(
+        let vectors = Vectors::prepare_stream(
             memory,
             u64_at(memory, address + 16)?,
             u64_at(memory, address + 24)?,

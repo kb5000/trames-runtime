@@ -156,7 +156,7 @@ impl Linux {
                     output,
                     vectors,
                     destination,
-                } = Message::prepare(memory, a[1], receive)?;
+                } = Message::prepare(memory, a[1], receive, socket.kind() == 1)?;
                 if receive {
                     let received = socket.recv(vectors.size, a[2] as u32 | nonblocking)?;
                     vectors.write(memory, &received.data)?;
@@ -315,7 +315,7 @@ struct Message {
     destination: Option<Vec<u8>>,
 }
 impl Message {
-    fn prepare(memory: &Memory, pointer: u64, receive: bool) -> Result<Self> {
+    fn prepare(memory: &Memory, pointer: u64, receive: bool, stream: bool) -> Result<Self> {
         if receive {
             Linux::check(memory, pointer, 56, Access::Write)?;
         }
@@ -347,7 +347,12 @@ impl Message {
         } else {
             None
         };
-        let vectors = Vectors::prepare(
+        let prepare = if stream {
+            Vectors::prepare_stream
+        } else {
+            Vectors::prepare
+        };
+        let vectors = prepare(
             memory,
             word(16),
             word(24),
@@ -367,6 +372,106 @@ impl Message {
 mod tests {
     use super::*;
     use trames_memory::{Permissions, PAGE_SIZE};
+
+    #[test]
+    fn large_stream_messages_short_write_on_owner_and_worker_and_keep_rights_once() {
+        use crate::DirectSyscalls;
+        for worker in [false, true] {
+            let mut vfs = trames_vfs::Vfs::default();
+            let [sender, receiver] = vfs.socketpair(1, 1, 0).unwrap();
+            let event = vfs.eventfd(42, 0).unwrap();
+            let direct = DirectSyscalls::new(vfs.direct_descriptors());
+            let mut memory = Memory::default();
+            let total = crate::MAX_WRITE * 2 + 73;
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory
+                .map(
+                    0x10000,
+                    (total as u64).div_ceil(PAGE_SIZE) * PAGE_SIZE,
+                    Permissions::RW,
+                )
+                .unwrap();
+            let bytes: Vec<u8> = (0..total).map(|n| (n % 251) as u8).collect();
+            memory.write(0x10000, &bytes).unwrap();
+            let mut header = [0u8; 56];
+            for (at, value) in [(16, 0x1100u64), (24, 2), (32, 0x1300), (40, 24)] {
+                header[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            memory.write(0x1000, &header).unwrap();
+            let first = crate::MAX_WRITE / 2 + 17;
+            let iov: Vec<_> = [
+                0x10000u64,
+                first as u64,
+                0x10000 + first as u64,
+                (total - first) as u64,
+            ]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+            memory.write(0x1100, &iov).unwrap();
+            let mut control = Vec::new();
+            push_control(&mut control, 1, 1, &event.to_le_bytes());
+            memory.write(0x1300, &control).unwrap();
+            let args = [sender as u64, 0x1000, 0x40, 0, 0, 0];
+            let mut sent = Linux::network_vfs(&mut vfs, 211, args, &mut memory).unwrap() as usize;
+            assert!(sent > 0 && sent <= crate::MAX_WRITE);
+            let socket = vfs.local_socket(receiver).unwrap().unwrap();
+            let received = socket.recv(total, 0).unwrap();
+            assert_eq!(received.data, bytes[..sent]);
+            let (rights, truncated) = vfs.receive_rights(received.rights, 3, true);
+            assert!(!truncated);
+            assert_eq!(rights.len(), 1);
+            assert_eq!(vfs.read(rights[0], 8).unwrap(), 42u64.to_le_bytes());
+            memory.write_array(0x1018, 1u64.to_le_bytes()).unwrap();
+            memory.write_array(0x1028, 0u64.to_le_bytes()).unwrap();
+            while sent < total {
+                memory
+                    .write_array(0x1100, (0x10000 + sent as u64).to_le_bytes())
+                    .unwrap();
+                memory
+                    .write_array(0x1108, ((total - sent) as u64).to_le_bytes())
+                    .unwrap();
+                let count = if worker {
+                    direct
+                        .invoke(211, args, &mut memory)
+                        .expect("stream worker owns plain bytes")
+                } else {
+                    Linux::network_vfs(&mut vfs, 211, args, &mut memory)
+                }
+                .unwrap() as usize;
+                assert!(count > 0 && count <= crate::MAX_WRITE);
+                let received = socket.recv(total, 0).unwrap();
+                assert_eq!(received.data, bytes[sent..sent + count]);
+                assert_eq!(vfs.receive_rights(received.rights, 3, true).0.len(), 0);
+                sent += count;
+            }
+            // Message transports must still reject an oversized atomic packet.
+            for kind in [2, 5] {
+                let [sender, receiver] = vfs.socketpair(1, kind, 0).unwrap();
+                memory
+                    .write_array(0x1100, 0x10000u64.to_le_bytes())
+                    .unwrap();
+                memory
+                    .write_array(0x1108, (total as u64).to_le_bytes())
+                    .unwrap();
+                assert_eq!(
+                    Linux::network_vfs(
+                        &mut vfs,
+                        211,
+                        [sender as u64, 0x1000, 0x40, 0, 0, 0],
+                        &mut memory
+                    ),
+                    Err(Errno(90))
+                );
+                assert!(vfs
+                    .local_socket(receiver)
+                    .unwrap()
+                    .unwrap()
+                    .recv(1, 0)
+                    .is_err());
+            }
+        }
+    }
 
     #[test]
     fn explicit_credentials_enforce_authority_and_receive_faults_leave_packets_queued() {

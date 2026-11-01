@@ -167,3 +167,25 @@ SCM_RIGHTS transfer and compare split/merge allocation against a reference model
 The extended ceiling follows [Linux's documented default](https://docs.kernel.org/admin-guide/sysctl/fs.html#nr-open).
 Actual host resource failures still return normal OS errors. The physical screen
 cadence remains separate from decoded-frame counts and JavaScript frame callbacks.
+
+## Large stream IPC and content-process exits (2026-11-01)
+
+The same local video page later logged `pipe error: Message too large` from a
+content process's main and ImageBridge threads, followed by channel-error exit.
+This is a separate failure from FD exhaustion. The Linux iovec importer rejected
+sendmsg payloads over the 1 MiB transfer staging size even for AF_UNIX streams.
+Firefox treats this Linux send error as a broken IPC channel; its normal short
+write handling can instead continue a partially transferred message. See the
+[upstream channel implementation](https://searchfox.org/firefox-main/source/ipc/chromium/src/chrome/common/ipc_channel_posix.cc).
+
+Both owner and worker AF_UNIX stream sends now import a bounded prefix and return
+the actual short count. The staging size is not a maximum logical stream message.
+Signed iovec-total and descriptor-count validation remain; datagrams and
+SOCK_SEQPACKET preserve atomic-message behavior and reject oversized packets.
+The regression transfers more than 2 MiB through short writes, checks every byte,
+and verifies that SCM_RIGHTS is delivered once on the first successful send.
+It covers owner and worker continuations, backpressure and atomic-message errors.
+This fixes a deterministic transport bug consistent with the observed log; it
+does not prove that every intermittent browser exit has the same cause. A large
+document-title experiment did not reproduce the original exit and is not claimed
+as an end-to-end negative control.
