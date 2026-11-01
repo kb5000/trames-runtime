@@ -226,6 +226,36 @@ impl<C: Cpu> Kernel<C> {
                 return false;
             }
             match p.state {
+                // A masked epoll wait retains its signal-mask authority on the
+                // owner. Its blocked state alone is not a reason to stop peers.
+                State::Blocked(22 | 441, args) => {
+                    let pending = p.pending_bits();
+                    pending & !p.signals.mask != 0
+                        || p.poll_deadline.is_some_and(|d| d <= now)
+                        || p.linux
+                            .vfs
+                            .epoll_ready_signals(args[0] as u32, pending, |kind, events| {
+                                Ok(match kind {
+                                    FdKind::Stdin => Some((
+                                        if io.stdin_ready().map_err(|_| Errno(5))? {
+                                            events & 1
+                                        } else {
+                                            0
+                                        },
+                                        [0; 2],
+                                    )),
+                                    FdKind::Terminal => self.terminal.as_ref().map(|tty| {
+                                        (
+                                            (events & 4)
+                                                | if tty.readable() { events & 1 } else { 0 },
+                                            [tty.input_epoch, tty.output_space_epoch],
+                                        )
+                                    }),
+                                    _ => None,
+                                })
+                            })
+                            .unwrap_or(true)
+                }
                 State::Ready | State::Gpu { .. } | State::Blocked(..) => true,
                 State::Sleep(d, _) => d <= now,
                 State::Futex { deadline, .. } | State::Sigwait { deadline, .. } => {
@@ -248,6 +278,53 @@ mod tests {
         mpsc,
     };
     use trames_memory::{MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE};
+
+    #[test]
+    fn masked_owner_epoll_joins_only_for_events_signals_or_timeout_without_consuming_edges() {
+        let mut kernel = super::super::tests::kernel();
+        let mut owner = super::super::tests::process();
+        let event = owner.linux.vfs.eventfd(0, 0).unwrap();
+        let epoll = owner.linux.vfs.epoll_create(0).unwrap();
+        owner
+            .linux
+            .vfs
+            .epoll_ctl(epoll, 1, event, 0xc0000001, 42)
+            .unwrap();
+        owner.state = State::Blocked(22, [epoll as u64, 0x1000, 1, u64::MAX, 0x2000, 8]);
+        owner.poll_mask = Some(0);
+        owner.signals.mask = 1 << 11;
+        kernel.processes.insert(1, owner);
+        let mut output = trames_linux::CapturedOutput::default();
+        assert!(!kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
+        kernel
+            .processes
+            .get_mut(&1)
+            .unwrap()
+            .linux
+            .vfs
+            .write(event, &1u64.to_le_bytes())
+            .unwrap();
+        for _ in 0..3 {
+            assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
+        }
+        assert_eq!(
+            kernel.processes[&1]
+                .linux
+                .vfs
+                .epoll_wait(epoll, 1, |_, _| Ok(None))
+                .unwrap(),
+            vec![(1, 42)]
+        );
+        assert!(!kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
+        kernel.processes.get_mut(&1).unwrap().poll_deadline = Some(Instant::now());
+        assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
+        let owner = kernel.processes.get_mut(&1).unwrap();
+        owner.poll_deadline = None;
+        Kernel::<Cpu>::queue_one(1, owner, 10, 0);
+        assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
+        assert_eq!(kernel.processes[&1].poll_mask, Some(0));
+        assert_eq!(kernel.processes[&1].signals.mask, 1 << 11);
+    }
 
     struct Page {
         bytes: Arc<SharedPage>,

@@ -501,6 +501,46 @@ impl Vfs {
                     .is_some_and(|open| open.borrow().kind == FdKind::Stdin)
         }))
     }
+    /// Observe readiness without consuming edges, disarming one-shot watches,
+    /// acknowledging native notifications or advancing the delivery cursor.
+    pub fn epoll_ready_signals(
+        &self,
+        fd: u32,
+        pending: u64,
+        mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
+    ) -> Result<bool> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous else {
+            return Err(Errno(22));
+        };
+        for watch in watches.values() {
+            let state = watch.state.lock().unwrap();
+            if !state.armed {
+                continue;
+            }
+            let Some(target) = watch.open.upgrade() else {
+                continue;
+            };
+            let target = target.borrow();
+            let requested = state.events as u16;
+            let special = if target.pty.is_none() {
+                special(&target.kind, requested)?
+            } else {
+                None
+            };
+            let (ready, epoch) = special.unwrap_or_else(|| {
+                (
+                    Self::peek_poll_open(&target, requested, pending),
+                    Self::poll_epoch(&target),
+                )
+            });
+            if ready != 0 && state.ready(ready, epoch) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn epoll_wait_signals(
         &self,
         fd: u32,

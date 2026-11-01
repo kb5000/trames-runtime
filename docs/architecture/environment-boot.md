@@ -22,6 +22,13 @@ from the getty service, because PID 1 closes inherited numeric descriptors. This
 uses the existing PTY masters and guest `setsid` shells; data is not proxied through
 a new service thread. The app pauses the Linux scheduler in the background.
 
+Masked `epoll_pwait` continuations retain their signal-mask authority on the
+kernel owner. An asleep owner does not stop unrelated worker contexts: the
+existing control boundary peeks at events, unmasked signals and the timeout
+before joining. This observation preserves edge/one-shot watches and their
+delivery cursor. The normal owner call still consumes events and restores the
+temporary mask. No new polling loop, worker or syscall-filter exception is used.
+
 `RLIMIT_NOFILE` is process-owned and inherited across fork/exec, shared by threads
 independently of CLONE_FILES. The existing capability rules govern hard-limit
 increases. `/proc/PID/limits` reports the values. Descriptor membership retains its
