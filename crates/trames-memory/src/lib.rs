@@ -781,25 +781,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().read_c_string(address, limit);
         }
-        let mut bytes = Vec::new();
-        while bytes.len() < limit {
-            let current = address
-                .checked_add(bytes.len() as u64)
-                .ok_or(MemoryError::InvalidRange)?;
-            let offset = (current & (PAGE_SIZE - 1)) as usize;
-            let length = (limit - bytes.len()).min(PAGE_SIZE as usize - offset);
-            // Borrow resident bytes directly. Live backings retain the scoped
-            // snapshot and EOF checks; only the returned owned string allocates.
-            let (terminated, _) = self.with_read_chunk(current, length, |part| {
-                let end = part.iter().position(|&byte| byte == 0);
-                bytes.extend_from_slice(&part[..end.unwrap_or(part.len())]);
-                end.is_some()
-            })?;
-            if terminated {
-                return Ok(bytes);
-            }
-        }
-        Err(MemoryError::Limit)
+        cpu_memory::c_string(self, address, limit)
     }
 
     fn end(address: u64, len: u64) -> Result<u64, MemoryError> {

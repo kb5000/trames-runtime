@@ -439,3 +439,70 @@ operation; merged-/usr symlinks remain guest symlinks. Debian's larger archive
 bounds apply only to that pinned image; Alpine keeps its existing input bounds.
 Mac setup normalizes the new environment's build-container DNS configuration;
 existing stores and iPad distribution selection are unchanged.
+
+## Worker pathname metadata (2026-11-02)
+
+The shared process kernel admits `newfstatat`, `fstat`, `statx`, `faccessat`,
+`faccessat2` and `readlinkat` on existing CPU workers. The worker uses the same
+VFS path resolver, inode metadata, credentials, mount policy and guest-memory
+contract as the joined Linux implementation. Eligible calls complete without
+an owner RPC or a whole-cohort join. A lone runnable task can retain the ordinary
+serial path; worker counts therefore need not equal the workload's total calls.
+
+`PathQueries` retains the original `FsHandle`/inode objects and the actual shared
+FD membership. It does not copy the directory tree or cache stat results. Host
+lookups still observe host replacement/unlink and virtual queries read live file
+metadata. The source root/cwd/mount topology is captured at the existing epoch
+boundary: chdir/chroot, mount changes, credentials and namespace mutations still
+join before changing this authority. This step does not make these mutations
+concurrent with queries or remove their remaining owner dependency.
+
+The query capability builds an exclusively owned control view solely to reuse
+the existing resolver. Every Rc/RefCell/Cell in that view is private to the view;
+source filesystem, inode, mount resources, host handles and FD membership cross
+only as their existing Send+Sync Arc capabilities. The view has a fresh empty
+control FD table, so its destruction cannot drain the real process membership.
+Its sealed query API returns owned bytes/results and exposes no VFS reference,
+Rc or mutable control handle. `unsafe impl Send` moves this complete private
+control island between execution workers; the capability is neither Sync nor
+Clone. Tests assert Send+Sync on the captured resource types and move the query
+capability between real threads. Extending the API or capturing another owner
+field requires reviewing this ownership proof. No raw guest pointer/lifetime
+rule is changed by this control-view transport.
+
+Directory/O_PATH metadata admission is separate from byte/control admission.
+An owner FD slot can publish a weak metadata lease on its actual open description
+when its node and mount support it. Lookup accepts that current OFD under the
+existing Files membership lock, then releases the lock before resolving/statting.
+No numeric-FD snapshot or owner-Rc address cache is used. The lease does not keep
+an unlinked file open, move a directory cursor, or make directory I/O worker-local.
+Close/reuse and accepted-operation lifetime retain the existing OFD rules.
+
+Potentially dynamic proc/sys/dev endpoints, namespace controls and unsupported
+FD kinds defer before guest output. Traversal decides this, including symlink
+aliases and dirfd-relative paths; there is no new guest race errno or a textual
+admission bypass. An internal deferred marker is consumed by the query wrapper
+and never returned as a guest concurrency error. Filtered calls use the existing
+entry-decision token: successful queries run once, and a deferred/denied call
+returns its exact original entry to the joined kernel without repeating BPF.
+
+Owner and worker path strings use the same bounded page-fragment scan. It keeps
+address tagging, EOF, permission and NUL/length behavior, without a byte-at-a-time
+translation loop. `statx` obtains both stat fields and mount ID from one accepted
+path/FD query, then shares the owner's AArch64 output encoder. The ordinary
+memory and native-function concurrency model is unchanged.
+
+The production choice is direct shared resources with their existing object
+synchronization. Retaining an owner service would remove peer drain but keep two
+request/return handoffs per query. Sending these reads to another existing worker
+would retain those handoffs and add resource-owner scheduling without removing
+path lookup work. Neither alternative is used; no coordinator/resource thread,
+busy-poll mailbox, global VFS call lock or ordinary-memory barrier is added.
+
+Validation covers owner/worker ABI and untouched error buffers, non-UTF-8/page
+boundary strings, symlinks and permissions, rename/unlink and live FD reuse,
+mount/chroot/readonly rules, directory cursor and last-close lifetime, host
+replacement, deferred pseudo paths and one-time seccomp admission. Mac hardware
+and iPad interpreter checks share this source. The product's measured comparison
+and remaining migration work are maintained in the
+[coordinator audit](https://github.com/kb5000/trames-ipad/blob/main/docs/architecture/coordinator-removal.md).

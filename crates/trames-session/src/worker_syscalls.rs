@@ -302,7 +302,8 @@ impl Snapshot {
         }
         // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
-        if matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
+        if self.direct.supports_path_query(cpu.x(8) as u32)
+            || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {
             return false;
@@ -322,6 +323,7 @@ impl Snapshot {
             && !self
                 .direct
                 .supports_call(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))
+            && !self.direct.supports_path_query(cpu.x(8) as u32)
             && !service_candidate(cpu, self)
             && !self.futex_queue(cpu)
             && !self.futex_wait(cpu)
@@ -345,6 +347,10 @@ impl Snapshot {
             return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
         }
         let result = match cpu.x(8) as u32 {
+            number @ (48 | 78..=80 | 291 | 439) => {
+                self.direct
+                    .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
+            }
             29 if cpu.x(1) as u32 == 0x5421 => {
                 let result = (|| {
                     let flags = self.fd_flags.get(cpu.x(0) as u32)?;

@@ -120,6 +120,7 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    paths: Option<trames_vfs::PathQueries>,
     urings: UringSnapshot,
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
@@ -143,6 +144,7 @@ impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
         let membership = descriptors.shared_files();
         Self {
+            paths: None,
             urings: Default::default(),
             descriptors,
             network: Default::default(),
@@ -162,6 +164,24 @@ impl DirectSyscalls {
             scratch: RefCell::new(Vec::new()),
             completed: Cell::new(0),
         }
+    }
+    pub fn with_paths(mut self, paths: trames_vfs::PathQueries) -> Self {
+        self.paths = Some(paths);
+        self
+    }
+    pub fn supports_path_query(&self, number: u32) -> bool {
+        matches!(number, 48 | 78..=80 | 291 | 439) && self.paths.is_some()
+    }
+    pub fn invoke_path(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let result = crate::path_queries::call(self.paths.as_ref()?, number, a, memory)?;
+        self.completed.set(self.completed.get() + 1);
+        self.file_completed.set(self.file_completed.get() + 1);
+        Some(result)
     }
     pub fn with_lock_context(mut self, context: trames_vfs::RecordLockContext) -> Self {
         self.lock_context = Some(context);

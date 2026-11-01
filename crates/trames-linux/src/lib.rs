@@ -15,6 +15,7 @@ pub use direct::{
 };
 mod file_calls;
 mod heap;
+mod path_queries;
 mod render;
 pub use heap::ProgramBreak;
 mod network;

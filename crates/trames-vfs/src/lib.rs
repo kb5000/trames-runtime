@@ -4,6 +4,8 @@ mod bpf;
 pub mod capabilities;
 mod cgroup;
 mod fs_context;
+mod path_queries;
+pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
 mod hostfs;
@@ -556,6 +558,7 @@ impl ProcRefresh {
 }
 
 pub struct Vfs {
+    query: Option<path_queries::Authority>,
     network: trames_net::Network,
     native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
     fs: FsHandle,
@@ -616,6 +619,7 @@ impl Vfs {
     }
     pub fn clone_with_resources(&self, shared_files: bool, shared_fs: bool) -> Self {
         Self {
+            query: self.query.clone(),
             network: self.network.clone(),
             native_services: self.native_services.clone(),
             fs: self.fs.clone(),
@@ -662,23 +666,16 @@ impl Vfs {
     }
 }
 
-impl Default for Vfs {
-    fn default() -> Self {
+impl Vfs {
+    fn empty(fs: FsHandle) -> Self {
         let pid_ns = PidNamespace::default();
         let root_network = Rc::new(linux_namespace::RootNetwork::default());
         let network = root_network.network.borrow().clone();
-        let mut v = Self {
+        Self {
+            query: None,
             network,
             native_services: Rc::default(),
-            fs: FsHandle::new(Filesystem {
-                shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
-                paths: BTreeMap::new(),
-                inodes: Vec::new(),
-                next_inode: 1,
-                limits: StorageLimits::memory(),
-                disk: None,
-                volume: None,
-            }),
+            fs,
             fds: DescriptorTable::default(),
             context: FsContext::default(),
             uts: UtsNamespace::default(),
@@ -710,7 +707,21 @@ impl Default for Vfs {
             proc_accessed: Cell::new(false),
             proc_refresh: Cell::new(ProcRefresh::Independent),
             bridge: None,
-        };
+        }
+    }
+}
+
+impl Default for Vfs {
+    fn default() -> Self {
+        let mut v = Self::empty(FsHandle::new(Filesystem {
+            shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
+            paths: BTreeMap::new(),
+            inodes: Vec::new(),
+            next_inode: 1,
+            limits: StorageLimits::memory(),
+            disk: None,
+            volume: None,
+        }));
         v.insert(b"/".to_vec(), Content::Directory, 0o40755)
             .expect("root");
         v.context.paths.borrow_mut().cwd_node = Some(v.node(b"/").expect("root inode"));
@@ -1202,6 +1213,14 @@ impl Vfs {
     }
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<NodeRef> {
         let key = path.key();
+        if let Some(query) = &self.query {
+            if path
+                .mount()
+                .is_some_and(|m| !path_queries::ordinary_mount(m))
+            {
+                return query.defer();
+            }
+        }
         if path
             .mount()
             .is_some_and(|m| m.kind == mounts::Kind::Cgroup && m.root.borrow().links == 0)
@@ -1238,6 +1257,9 @@ impl Vfs {
             .ok_or(Errno(2))
     }
     fn descriptor(&self, fd: u32) -> Result<Descriptor> {
+        if let Some(query) = &self.query {
+            return query.descriptor(fd);
+        }
         self.fds.lookup(fd)
     }
     pub fn allocated_bytes(&self) -> u64 {
@@ -3076,25 +3098,44 @@ impl Vfs {
         self.stat_at_flags(dirfd, path, false)
     }
     pub fn stat_at_flags(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<[u8; 128]> {
+        self.stat_at_with_mount(dirfd, path, nofollow)
+            .map(|(stat, _)| stat)
+    }
+    /// One pathname resolution retains both metadata and its mount identity.
+    pub fn stat_at_with_mount(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        nofollow: bool,
+    ) -> Result<([u8; 128], u64)> {
         if !nofollow {
             if let Some(open) = self.proc_fd_description(dirfd, path)? {
-                return self.stat_open(&open.borrow());
+                let open = open.borrow();
+                return self
+                    .stat_open(&open)
+                    .map(|stat| (stat, open.mount.as_ref().map_or(17, |m| m.id)));
             }
         }
         let p = self.resolve_final(dirfd, path, !nofollow)?;
+        let id = p.mount.as_ref().map_or(1, |m| m.id);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &p.filesystem(self).host {
-            return host.stat_at(&p.key);
+            return host.stat_at(&p.key).map(|stat| (stat, id));
         }
         let n = self.node(&p)?;
         let mount = p.mount.map(OpenMount::Owner);
         let out = self.stat_node(&n.borrow(), mount.as_ref());
-        out
+        out.map(|stat| (stat, id))
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
-        let d = self.descriptor(fd)?;
-        let open = d.open.borrow();
+        self.stat_fd_with_mount(fd).map(|(stat, _)| stat)
+    }
+    /// One membership lookup accepts the original OFD for the entire query.
+    pub fn stat_fd_with_mount(&self, fd: u32) -> Result<([u8; 128], u64)> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
         self.stat_open(&open)
+            .map(|stat| (stat, Self::open_mount_id(&open)))
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
         #[cfg(all(feature = "hostfs", unix))]

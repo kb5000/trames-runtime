@@ -4066,6 +4066,7 @@ impl<C: Cpu> Kernel<C> {
                             p.linux.vfs.credentials.gid,
                         ])
                         .with_membership(p.linux.vfs.shared_files())
+                        .with_paths(p.linux.vfs.path_queries())
                         .with_kernel_log(p.linux.vfs.kernel_log_capability())
                         .with_urings(uring_epoch.capture_all(
                             &p.linux.vfs,

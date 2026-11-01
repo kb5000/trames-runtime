@@ -118,7 +118,7 @@ impl Linux {
             clear_child_tid: 0,
         }
     }
-    pub fn path(memory: &Memory, address: u64) -> Result<Vec<u8>> {
+    pub fn path(memory: &impl CpuMemory, address: u64) -> Result<Vec<u8>> {
         memory.read_c_string(address, MAX_PATH).map_err(|e| {
             if e == MemoryError::Limit {
                 Errno(36)
@@ -420,15 +420,7 @@ impl Linux {
         a: [u64; 6],
         memory: &Memory,
     ) -> (Result<[u8; 128]>, Option<trames_vfs::ProcRefresh>) {
-        let query = || {
-            if a[3] & !0x1900 != 0 {
-                return Err(Errno(22));
-            }
-            let path = Self::path(memory, a[1])?;
-            Self::check(memory, a[2], 128, Access::Write)?;
-            Ok(path)
-        };
-        let path = match query() {
+        let path = match Self::stat_parameters(a, memory) {
             Ok(path) => path,
             Err(error) => return (Err(error), None),
         };
@@ -439,6 +431,14 @@ impl Linux {
                 vfs.stat_at_flags(a[0] as i32, &path, a[3] & 0x100 != 0)
             }
         })
+    }
+    pub(crate) fn stat_parameters(a: [u64; 6], memory: &impl CpuMemory) -> Result<Vec<u8>> {
+        if a[3] & !0x1900 != 0 {
+            return Err(Errno(22));
+        }
+        let path = Self::path(memory, a[1])?;
+        Self::check(memory, a[2], 128, Access::Write)?;
+        Ok(path)
     }
     pub fn finish_stat(
         a: [u64; 6],
@@ -665,15 +665,23 @@ impl Linux {
             return Err(Errno(22));
         }
         Self::check(memory, a[4], 256, Access::Write)?;
-        let stat = if path.is_empty() && flags & 0x1000 != 0 {
+        let (stat, mount) = if path.is_empty() && flags & 0x1000 != 0 {
             if a[0] as i32 == -100 {
-                vfs.stat_at(-100, b".")?
+                vfs.stat_at_with_mount(-100, b".", false)?
             } else {
-                vfs.stat_fd(a[0] as u32)?
+                vfs.stat_fd_with_mount(a[0] as u32)?
             }
         } else {
-            vfs.stat_at_flags(a[0] as i32, path, flags & 0x100 != 0)?
+            vfs.stat_at_with_mount(a[0] as i32, path, flags & 0x100 != 0)?
         };
+        Self::finish_statx(a, memory, stat, mount)
+    }
+    pub(crate) fn finish_statx(
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        stat: [u8; 128],
+        mount: u64,
+    ) -> Result<u64> {
         let mut out = [0u8; 256];
         out[..4].copy_from_slice(&0x17ffu32.to_le_bytes()); // BASIC_STATS and MNT_ID; no birth time.
         out[4..8].copy_from_slice(&stat[56..60]);
@@ -696,15 +704,6 @@ impl Linux {
             out[offset..offset + 4].copy_from_slice(&(major as u32).to_le_bytes());
             out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
         }
-        let mount = if path.is_empty() && flags & 0x1000 != 0 {
-            if a[0] as i32 == -100 {
-                vfs.mount_id_at(-100, b".", false)?
-            } else {
-                vfs.mount_id_fd(a[0] as u32)?
-            }
-        } else {
-            vfs.mount_id_at(a[0] as i32, path, flags & 0x100 != 0)?
-        };
         out[144..152].copy_from_slice(&mount.to_le_bytes());
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
         Ok(0)
@@ -938,7 +937,7 @@ impl Linux {
         cpu.set_x(0, raw);
         SyscallOutcome::Continue
     }
-    fn syscall(
+    pub(crate) fn syscall(
         &mut self,
         number: u64,
         a: [u64; 6],

@@ -1000,6 +1000,11 @@ impl Vfs {
         dirfd: i32,
         path: &[u8],
     ) -> Result<Option<OpenHandle>> {
+        // A query view resolves once through the common walker. Traversing
+        // any pseudo/magic endpoint defers before returning metadata.
+        if self.query.is_some() {
+            return Ok(None);
+        }
         if !self.pseudo.borrow().enabled {
             return Ok(None);
         }
@@ -1425,6 +1430,9 @@ impl Vfs {
         }
         if !self.pseudo.borrow().enabled {
             return Ok(None);
+        }
+        if let Some(query) = &self.query {
+            return query.defer();
         }
         let content = self.pseudo_content(at)?;
         if let Some((content, mode)) = content {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! CPU workers retain state and run until an event or a requested checkpoint.
 //! Pure NativeCall and seccomp-allowed snapshot/clock syscalls run on workers.
-//! Task handoff uses a shared frozen-view cohort; lifecycle/maps and VFS
-//! metadata stay joined. No queue lock spans interpreter or native execution.
+//! Task handoff uses retained views; admitted path metadata uses the common
+//! resolver and shared inode objects. Lifecycle and namespace changes still join.
+//! No queue lock spans interpreter or native execution.
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "coordination_cost.rs"]
 mod coordination_cost;
@@ -582,7 +583,8 @@ impl<C: Cpu> Pool<C> {
                                 work.cpu.clear_exclusive();
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
-                                        && (matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
+                                        && (snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
+                                            || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
                                             || work.cpu.x(8) as u32 == 25
                                                 && matches!(work.cpu.x(1), 0 | 1030))
                                 }) {
@@ -591,6 +593,17 @@ impl<C: Cpu> Pool<C> {
                                     let args = std::array::from_fn(|i| work.cpu.x(i));
                                     let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if entry.allowed() {
+                                        if snapshot.direct.supports_path_query(number) {
+                                            let value = snapshot.direct.invoke_file(number,args,work.memory.as_deref_mut().expect("worker view"))
+                                                .or_else(||snapshot.direct.invoke_path(number,args,work.memory.as_deref_mut().expect("worker view")));
+                                            if let Some(value)=value {
+                                                if let Some(began)=began {syscall_time+=began.elapsed();}
+                                                work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                                syscalls+=1;continue;
+                                            }
+                                            job.seccomp_entry=Some(entry);break result;
+                                        }
+
                                         if matches!(number, 101 | 115) {
                                             if epoch.is_none() { job.seccomp_entry = Some(entry); break result; }
                                             let waiting = crate::worker_syscalls::sleep_parameters(

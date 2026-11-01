@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The interpreter's checked memory contract. Both views use the same CPU engine.
-use crate::{Access, Memory, MemoryError};
+use crate::{Access, Memory, MemoryError, PAGE_SIZE};
 use std::sync::atomic::Ordering;
 
 pub enum CpuSlice<'a, M> {
@@ -45,6 +45,13 @@ pub trait CpuMemory {
         Self: Sized,
     {
         CpuSlice::Direct(self)
+    }
+    /// Bounded NUL-terminated guest bytes, read once per page fragment.
+    fn read_c_string(&self, address: u64, limit: usize) -> Result<Vec<u8>, MemoryError>
+    where
+        Self: Sized,
+    {
+        c_string(self, address & 0x00ff_ffff_ffff_ffff, limit)
     }
     fn read(&self, address: u64, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
@@ -166,6 +173,10 @@ impl CpuMemory for Memory {
         } else {
             CpuSlice::Direct(self)
         }
+    }
+    #[inline]
+    fn read_c_string(&self, address: u64, limit: usize) -> Result<Vec<u8>, MemoryError> {
+        Memory::read_c_string(self, address, limit)
     }
     #[inline]
     fn read(&self, a: u64, b: &mut [u8]) -> Result<(), MemoryError> {
@@ -363,6 +374,33 @@ impl CpuMemory for Memory {
     fn fence(&self, order: Ordering) {
         std::sync::atomic::fence(order);
     }
+}
+
+/// Shared string scan; callers apply guest address tagging once.
+pub(crate) fn c_string(
+    memory: &impl CpuMemory,
+    address: u64,
+    limit: usize,
+) -> Result<Vec<u8>, MemoryError> {
+    let mut bytes = Vec::new();
+    while bytes.len() < limit {
+        let current = address
+            .checked_add(bytes.len() as u64)
+            .ok_or(MemoryError::InvalidRange)?;
+        let offset = (current & (PAGE_SIZE - 1)) as usize;
+        let length = (limit - bytes.len()).min(PAGE_SIZE as usize - offset);
+        // Borrow resident bytes directly. Live backings retain the scoped
+        // snapshot and EOF checks; only the returned owned string allocates.
+        let (terminated, _) = memory.cpu_read_chunk(current, length, |part| {
+            let end = part.iter().position(|&byte| byte == 0);
+            bytes.extend_from_slice(&part[..end.unwrap_or(part.len())]);
+            end.is_some()
+        })?;
+        if terminated {
+            return Ok(bytes);
+        }
+    }
+    Err(MemoryError::Limit)
 }
 
 #[cfg(test)]

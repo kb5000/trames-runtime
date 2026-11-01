@@ -7,7 +7,7 @@ use std::sync::Mutex;
 #[derive(Clone)]
 pub(super) enum SlotOpen {
     Shared(Arc<SharedOpenDescription>),
-    Owner(usize),
+    Owner(usize, Option<std::sync::Weak<SharedOpenDescription>>),
 }
 #[derive(Clone)]
 pub(super) struct Slot {
@@ -31,7 +31,9 @@ impl Slot {
         Self {
             open: match &d.open {
                 OpenHandle::Shared(open) => SlotOpen::Shared(open.clone()),
-                OpenHandle::Owner(_) => SlotOpen::Owner(d.open.identity()),
+                OpenHandle::Owner(_) => {
+                    SlotOpen::Owner(d.open.identity(), d.open.borrow().query_metadata())
+                }
             },
             cloexec: d.cloexec.clone(),
         }
@@ -212,6 +214,18 @@ impl SharedFiles {
         let file = SharedFd::from_slot(slot)?;
         Some(file.ready().map(|()| file))
     }
+    /// Current membership, with read-only metadata admission for owner OFDs.
+    pub(super) fn query_lookup(&self, fd: u32) -> Option<Result<SharedFd>> {
+        let entries = self.0.entries.lock().unwrap();
+        let Some(slot) = entries.get(&fd) else {
+            return Some(Err(Errno(9)));
+        };
+        let file = match &slot.open {
+            SlotOpen::Shared(open) => SharedFd::new(open.clone()),
+            SlotOpen::Owner(_, metadata) => SharedFd::new(metadata.as_ref()?.upgrade()?),
+        };
+        Some(file.ready().map(|()| file))
+    }
     pub fn duplicate(&self, old: u32, min: u32, cloexec: bool) -> Option<Result<u32>> {
         let mut entries = self.0.entries.lock().unwrap();
         let Some(slot) = entries.get(&old) else {
@@ -357,7 +371,7 @@ impl Entries<'_> {
         Entry {
             open: match &slot.open {
                 SlotOpen::Shared(open) => OpenView::Shared(open),
-                SlotOpen::Owner(identity) => {
+                SlotOpen::Owner(identity, _) => {
                     let descriptor = self
                         .owners
                         .entries
@@ -499,7 +513,7 @@ impl DescriptorTable {
     fn descriptor(&self, fd: u32, slot: &Slot) -> Descriptor {
         let open = match &slot.open {
             SlotOpen::Shared(open) => OpenHandle::Shared(open.clone()),
-            SlotOpen::Owner(identity) => {
+            SlotOpen::Owner(identity, _) => {
                 let state = self.0.borrow();
                 let descriptor = state
                     .entries

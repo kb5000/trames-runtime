@@ -250,6 +250,31 @@ impl Mount {
             },
         })
     }
+    /// A private Rc topology over shared resources. No owner Rc is retained.
+    pub(super) fn query_projection(
+        shared: Arc<MountData>,
+        cache: &mut BTreeMap<usize, Rc<Self>>,
+    ) -> Rc<Self> {
+        let key = Arc::as_ptr(&shared) as usize;
+        if let Some(mount) = cache.get(&key) {
+            return mount.clone();
+        }
+        let parent = shared.parent.borrow().as_ref().map(|a| Attachment {
+            parent: Self::query_projection(a._parent.clone(), cache),
+            node: a._node.clone(),
+            fallback: a._fallback.clone(),
+        });
+        let mount = Rc::new(Self {
+            parent: MountParent {
+                owner: RefCell::new(parent),
+                shared: shared.parent.clone(),
+            },
+            shared,
+            namespace: None,
+        });
+        cache.insert(key, mount.clone());
+        mount
+    }
     pub(super) fn resource_projection(shared: Arc<MountData>) -> Rc<Self> {
         debug_assert!(!shared._owner_control);
         let parent = shared.parent.borrow().as_ref().map(|a| Attachment {
@@ -532,6 +557,9 @@ impl Vfs {
         // Pseudo endpoints are stored separately. Looking in an unrelated disk
         // map first turns every proc FD snapshot into a full rootfs scan.
         if node.borrow().volatile {
+            if let Some(query) = &self.query {
+                return query.defer();
+            }
             if let Some(key) = self.pseudo.borrow().path_of(node) {
                 return Ok(ResolvedPath {
                     key,
@@ -1382,7 +1410,10 @@ impl Vfs {
     pub fn mount_id_fd(&self, fd: u32) -> Result<u64> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
-        Ok(o.mount.as_ref().map_or(
+        Ok(Self::open_mount_id(&o))
+    }
+    pub(super) fn open_mount_id(o: &OpenDescription) -> u64 {
+        o.mount.as_ref().map_or(
             if o.namespace.is_some() {
                 17
             } else if matches!(o.kind, FdKind::Terminal) {
@@ -1391,7 +1422,7 @@ impl Vfs {
                 1
             },
             |m| m.id,
-        ))
+        )
     }
     pub(super) fn mounted_pseudo_children(&self, path: &ResolvedPath) -> Result<Vec<Vec<u8>>> {
         if path.mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
