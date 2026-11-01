@@ -43,7 +43,15 @@ impl Pacer {
                 stamp = previous;
             }
         }
-        self.sent = Some((now, stamp, revision));
+        // Keep the advertised clock's phase. Re-arming from the actual wake
+        // time would accumulate dispatch latency every frame (for example,
+        // 1 ms of jitter turns 60 Hz into 56.6 Hz). Skip missed ticks once;
+        // never emit a backlog of callbacks after a delayed wakeup.
+        let phase = self.sent.map_or(now, |(at, _, _)| {
+            let late = now.saturating_duration_since(at);
+            now - Duration::from_nanos((late.as_nanos() % INTERVAL.as_nanos()) as u64)
+        });
+        self.sent = Some((phase, stamp, revision));
         (revision, stamp)
     }
 }
@@ -103,11 +111,11 @@ mod tests {
         assert_eq!(p.take(now + Duration::from_millis(20)), (1, 14));
         assert_eq!(
             p.delay(1, now + Duration::from_millis(21)),
-            Some(INTERVAL - Duration::from_millis(1))
+            Some(INTERVAL * 2 - Duration::from_millis(21))
         );
         p.presented(2, 10, now + Duration::from_secs(1));
         assert_eq!(p.take(now + Duration::from_secs(1)), (2, 14));
-        assert_eq!(p.delay(2, now + Duration::from_secs(1)), Some(INTERVAL));
+        assert!(p.delay(2, now + Duration::from_secs(1)).unwrap() <= INTERVAL);
     }
 
     #[test]
@@ -124,7 +132,7 @@ mod tests {
         p.presented(3, 50, now + Duration::from_millis(50));
         assert_eq!(
             p.delay(3, now + Duration::from_millis(50)),
-            Some(INTERVAL - Duration::from_millis(10))
+            Some(Duration::ZERO)
         );
         p.presented(3, 60, now + Duration::from_millis(60));
         assert_eq!(
@@ -139,13 +147,39 @@ mod tests {
         p.presented(4, 90, now + Duration::from_millis(90));
         assert_eq!(
             p.delay(4, now + Duration::from_millis(90)),
-            Some(INTERVAL - Duration::from_millis(10))
+            Some(Duration::ZERO)
         );
         // An idle client resumes immediately rather than paying its idle time.
         p.presented(5, 1000, now + Duration::from_secs(1));
         assert_eq!(
             p.delay(5, now + Duration::from_secs(1)),
             Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn dispatch_jitter_does_not_reduce_the_advertised_refresh_rate() {
+        let now = Instant::now();
+        let mut p = Pacer::default();
+        p.presented(7, 0, now);
+        p.take(now);
+        for tick in 1..=120 {
+            let due = now + INTERVAL * tick;
+            let wake = due + Duration::from_millis(1);
+            assert_eq!(
+                p.delay(7, due - Duration::from_micros(1)),
+                Some(Duration::from_micros(1))
+            );
+            assert_eq!(p.delay(7, wake), Some(Duration::ZERO));
+            p.take(wake);
+            assert_eq!(p.delay(7, wake), Some(INTERVAL - Duration::from_millis(1)));
+        }
+        // A long pause skips ticks, with only one callback at this dispatch.
+        let resumed = now + INTERVAL * 300 + Duration::from_millis(2);
+        p.take(resumed);
+        assert_eq!(
+            p.delay(7, resumed),
+            Some(INTERVAL - Duration::from_millis(2))
         );
     }
 

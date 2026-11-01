@@ -2481,37 +2481,9 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64))
             }
             101 | 115 => {
-                if number == 115 && (!matches!(a[0], 0 | 1) || a[1] & !1 != 0) {
-                    return Err(Errno(22));
-                }
-                let (request, remaining) = if number == 101 {
-                    (a[0], a[1])
-                } else {
-                    (a[2], if a[1] & 1 == 0 { a[3] } else { 0 })
-                };
-                let sec = read_u64(&p.memory, request)?;
-                let ns = read_u64(&p.memory, request + 8)?;
-                if ns >= 1_000_000_000 || sec > i64::MAX as u64 {
-                    return Err(Errno(22));
-                }
-                if remaining != 0 {
-                    Linux::check(&p.memory, remaining, 16, Access::Write)?;
-                }
-                let mut duration = Duration::new(sec, ns as u32);
-                if number == 115 && a[1] & 1 != 0 {
-                    let now = if a[0] == 0 {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_err(|_| Errno(5))?
-                    } else {
-                        self.started.elapsed()
-                    };
-                    duration = duration.saturating_sub(now);
-                }
-                p.state = State::Sleep(
-                    Instant::now().checked_add(duration).ok_or(Errno(22))?,
-                    remaining,
-                );
+                let (deadline, remaining) =
+                    crate::worker_syscalls::sleep_parameters(&p.memory, number, a, self.started)?;
+                p.state = State::Sleep(deadline, remaining);
                 Ok(None)
             }
             113 | 114 => {
@@ -3903,6 +3875,9 @@ impl<C: Cpu> Kernel<C> {
                 return None;
             }
             ((matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
+                || (matches!(p.state, State::Sleep(..))
+                    && !p.linux.trace
+                    && vms.contains(&p.vm_id))
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
         }));
@@ -3960,9 +3935,14 @@ impl<C: Cpu> Kernel<C> {
             });
             let p = self.processes.get_mut(&id).expect("cohort process");
             let waiting = if let State::Futex { wait, deadline } = &p.state {
-                Some(crate::run_queue::WaitState {
+                Some(crate::run_queue::WaitState::Futex {
                     wait: wait.clone(),
                     deadline: *deadline,
+                })
+            } else if let State::Sleep(deadline, remaining) = p.state {
+                Some(crate::run_queue::WaitState::Sleep {
+                    deadline,
+                    remaining,
                 })
             } else {
                 None
@@ -4297,9 +4277,14 @@ impl<C: Cpu> Kernel<C> {
                 State::Blocked(call.number, call.args)
             } else {
                 p.poll_deadline = None;
-                done.waiting.map_or(State::Ready, |w| State::Futex {
-                    wait: w.wait,
-                    deadline: w.deadline,
+                done.waiting.map_or(State::Ready, |w| match w {
+                    crate::run_queue::WaitState::Futex { wait, deadline } => {
+                        State::Futex { wait, deadline }
+                    }
+                    crate::run_queue::WaitState::Sleep {
+                        deadline,
+                        remaining,
+                    } => State::Sleep(deadline, remaining),
                 })
             };
             if let Some((pc, module, function)) = done.rejected_native {
@@ -4428,6 +4413,14 @@ impl<C: Cpu> Kernel<C> {
                 timeout = timeout.min(deadline.saturating_duration_since(now));
             }
         }
+        let worker_vms: std::collections::BTreeSet<_> = self
+            .processes
+            .iter()
+            .filter(|(id, p)| {
+                !p.frozen(**id) && (matches!(p.state, State::Ready) || p.worker_gpu_candidate())
+            })
+            .map(|(_, p)| p.vm_id)
+            .collect();
         for (&id, p) in &self.processes {
             if p.frozen(id) {
                 continue;
@@ -4467,10 +4460,15 @@ impl<C: Cpu> Kernel<C> {
             }
             | State::Sigwait {
                 deadline: Some(d), ..
-            }
-            | State::Sleep(d, _) = p.state
+            } = p.state
             {
                 timeout = timeout.min(d.saturating_duration_since(now));
+            }
+            if let State::Sleep(d, _) = p.state {
+                let retained = !p.linux.trace && worker_vms.contains(&p.vm_id);
+                if !retained {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
             }
             if !local_wait
                 && matches!(p.state, State::Blocked(..))
@@ -7317,6 +7315,8 @@ mod tests {
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
         k.processes.get_mut(&1).unwrap().state =
             State::Sleep(Instant::now() + Duration::from_millis(1), 0);
+        assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
+        k.processes.get_mut(&1).unwrap().linux.trace = true;
         assert!(k.parallel_timeout() <= Duration::from_millis(1));
     }
     #[test]

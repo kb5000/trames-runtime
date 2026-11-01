@@ -18,9 +18,40 @@ mod domains;
 pub(super) use domains::{Checkpoint, Domain};
 
 #[derive(Clone)]
-pub(super) struct WaitState {
-    pub wait: Arc<Wait>,
-    pub deadline: Option<Instant>,
+pub(super) enum WaitState {
+    Futex {
+        wait: Arc<Wait>,
+        deadline: Option<Instant>,
+    },
+    Sleep {
+        deadline: Instant,
+        remaining: u64,
+    },
+}
+impl WaitState {
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Futex { deadline, .. } => *deadline,
+            Self::Sleep { deadline, .. } => Some(*deadline),
+        }
+    }
+    fn woken(&self) -> bool {
+        matches!(self, Self::Futex { wait, .. } if wait.woken())
+    }
+    fn bind<C: Cpu>(&self, epoch: &Arc<Epoch<C>>) {
+        if let Self::Futex { wait, .. } = self {
+            wait.ticket.bind(epoch);
+        }
+    }
+    fn matches_ticket(&self, ticket: &Arc<Ticket>) -> bool {
+        matches!(self, Self::Futex { wait, .. } if Arc::ptr_eq(&wait.ticket, ticket))
+    }
+    fn expire(&self) -> u64 {
+        match self {
+            Self::Futex { wait, .. } if wait.timeout() => 0u64.wrapping_sub(110),
+            _ => 0,
+        }
+    }
 }
 #[derive(Clone)]
 pub(super) struct IoCall {
@@ -90,7 +121,7 @@ pub(super) struct Job<C: Cpu> {
     /// Guest code reached this exit during a bounded exclusive-mm window.
     /// Its syscall/native/fault handling still belongs to normal dispatch.
     pub pending_cpu: Option<SliceOutcome>,
-    /// A filtered FD entry may defer before membership effects. Carry its
+    /// A filtered syscall entry may defer before effects. Carry its
     /// decision to the owner instead of evaluating the same BPF entry twice.
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
 }
@@ -381,9 +412,9 @@ impl<C: Cpu> Epoch<C> {
         assert!(q.members.insert(pid), "duplicate cohort task");
         q.domains.register(&mut job);
         if let Some(waiting) = &job.waiting {
-            waiting.wait.ticket.bind(self);
-            if !waiting.wait.woken() {
-                self.publish_deadline(waiting.deadline);
+            waiting.bind(self);
+            if !waiting.woken() {
+                self.publish_deadline(waiting.deadline());
                 q.parked.insert(pid, job);
                 return;
             }
@@ -448,7 +479,7 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         let jobs = q.domains.restore(checkpoint, resume);
         for mut job in jobs {
-            if job.waiting.as_ref().is_some_and(|w| w.wait.woken()) {
+            if job.waiting.as_ref().is_some_and(|w| w.woken()) {
                 job.waiting = None;
                 job.work.cpu.set_x(0, 0);
                 job.stats.resumes += 1;
@@ -461,7 +492,7 @@ impl<C: Cpu> Epoch<C> {
                 self.publish_deadline(
                     job.waiting
                         .as_ref()
-                        .and_then(|w| w.deadline)
+                        .and_then(WaitState::deadline)
                         .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
                         .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline())),
                 );
@@ -481,7 +512,7 @@ impl<C: Cpu> Epoch<C> {
         if q.parked.get(&ticket.pid).is_some_and(|job| {
             job.waiting
                 .as_ref()
-                .is_some_and(|w| Arc::ptr_eq(&w.wait.ticket, ticket))
+                .is_some_and(|w| w.matches_ticket(ticket))
         }) {
             let mut job = q.parked.remove(&ticket.pid).unwrap();
             job.work.cpu.set_x(0, 0);
@@ -507,7 +538,7 @@ impl<C: Cpu> Epoch<C> {
                 .filter_map(|(&pid, job)| {
                     (job.waiting
                         .as_ref()
-                        .and_then(|w| w.deadline)
+                        .and_then(WaitState::deadline)
                         .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
                         .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
                         .is_some_and(|d| d <= now))
@@ -517,11 +548,7 @@ impl<C: Cpu> Epoch<C> {
             for pid in expired {
                 let mut job = q.parked.remove(&pid).unwrap();
                 if let Some(waiting) = job.waiting.take() {
-                    let value = if waiting.wait.timeout() {
-                        0u64.wrapping_sub(110)
-                    } else {
-                        0
-                    };
+                    let value = waiting.expire();
                     job.work.cpu.set_x(0, value);
                 }
                 // I/O must perform a final resource check and scatter, even on
@@ -535,7 +562,7 @@ impl<C: Cpu> Epoch<C> {
                 .filter_map(|j| {
                     j.waiting
                         .as_ref()
-                        .and_then(|w| w.deadline)
+                        .and_then(WaitState::deadline)
                         .or_else(|| j.io.as_ref().and_then(|io| io.wake_deadline()))
                         .or_else(|| j.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
                 })
@@ -660,12 +687,12 @@ impl<C: Cpu> Epoch<C> {
         }
         if let Some(waiting) = waiting {
             job.stats.waits += 1;
-            if waiting.wait.woken() {
+            if waiting.woken() {
                 job.work.cpu.set_x(0, 0);
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             } else {
-                self.publish_deadline(waiting.deadline);
+                self.publish_deadline(waiting.deadline());
                 job.waiting = Some(waiting);
                 assert!(q.parked.insert(pid, job).is_none());
             }
@@ -1398,7 +1425,7 @@ mod tests {
         assert!(!epoch.control.stopped());
         epoch.park(
             running,
-            Some(WaitState {
+            Some(WaitState::Futex {
                 wait,
                 deadline: None,
             }),
@@ -1420,7 +1447,7 @@ mod tests {
             .unwrap();
         epoch.park(
             running,
-            Some(WaitState {
+            Some(WaitState::Futex {
                 wait,
                 deadline: None,
             }),
@@ -1433,6 +1460,46 @@ mod tests {
         assert_eq!(table.wake((0, 1, 0x1000), 1, 1), 0);
     }
     #[test]
+    fn sleep_releases_its_slot_and_retains_deadline_and_remaining_on_stop() {
+        let epoch = Epoch::new(Arc::new(Control::new(100)));
+        let deadline = Instant::now() + Duration::from_millis(2);
+        let mut sleeper = job(1, &epoch);
+        sleeper.waiting = Some(WaitState::Sleep {
+            deadline,
+            remaining: 0x1080,
+        });
+        epoch.add(sleeper);
+        epoch.add(job(2, &epoch));
+        let peer = epoch.take(0).unwrap();
+        assert_eq!(peer.work.pid, 2);
+        epoch.park(
+            peer,
+            Some(WaitState::Sleep {
+                deadline: deadline + Duration::from_secs(3600),
+                remaining: 0,
+            }),
+        );
+        let sleeper = epoch.take(0).unwrap();
+        assert!(Instant::now() >= deadline);
+        assert_eq!(
+            sleeper.work.cpu.x(0),
+            0,
+            "sleep expiry is success, not ETIMEDOUT"
+        );
+        assert!(sleeper.waiting.is_none());
+        epoch.park(
+            sleeper,
+            Some(WaitState::Sleep {
+                deadline,
+                remaining: 0x1080,
+            }),
+        );
+        epoch.stop();
+        let done = epoch.drain();
+        assert!(done.iter().any(|d| matches!(d.waiting, Some(WaitState::Sleep { deadline: d, remaining: 0x1080 }) if d == deadline)));
+    }
+
+    #[test]
     fn expired_wait_resumes_on_eligible_cpu_without_a_coordinator() {
         let table = crate::futex::Futexes::default();
         let epoch = Epoch::new(Arc::new(Control::new(100)));
@@ -1441,7 +1508,7 @@ mod tests {
             .unwrap();
         let mut task = job(1, &epoch);
         task.affinity = 2;
-        task.waiting = Some(WaitState {
+        task.waiting = Some(WaitState::Futex {
             wait,
             deadline: Some(Instant::now() + Duration::from_millis(1)),
         });
@@ -1476,7 +1543,7 @@ mod tests {
         let epoch = Epoch::new(Arc::new(Control::new(100)));
         let table = crate::futex::Futexes::default();
         let mut task = job(1, &epoch);
-        task.waiting = Some(WaitState {
+        task.waiting = Some(WaitState::Futex {
             wait: table
                 .wait((0, 1, 0x1000), 1, 1, || Ok::<_, ()>(()))
                 .unwrap(),

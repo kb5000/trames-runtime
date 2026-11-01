@@ -117,3 +117,23 @@ normal owner. No decision cache or filter bypass is introduced.
 Conformance covers accepted shared operations, effect-free deferral, denied
 operations and exactly one filter evaluation after deferral. A four-worker
 dup/close loop checks that these allowed operations do not checkpoint peers.
+
+## Worker-owned sleep deadlines
+
+`nanosleep` and supported relative/absolute `clock_nanosleep` entries park only
+the calling task on the existing run queue. No execution slot, coordinator RPC,
+new timer thread or polling loop is retained while it sleeps. A deadline wake
+returns zero; futex timeout keeps its distinct `ETIMEDOUT` result. Both wait
+kinds share deadline scheduling, affinity, cancellation and checkpoint ownership.
+
+The owner and workers use one timespec/remaining-pointer parser. A joined sleep
+of an active address space can be readmitted with its original absolute deadline
+and remaining pointer. Checkpoint transfer reconstructs `State::Sleep`, so signal
+interruption still uses the existing owner-side `EINTR`/remaining-time path and
+does not restart the relative duration. Traced entries retain owner dispatch.
+Filtered entries use the exact entry-decision transfer already used for shared
+FD membership: allowed sleeps execute once on their worker; a denial or a job
+without a persistent epoch returns the bound decision without local effects.
+
+This removes whole-cohort exits caused by graphics libraries' short backoff
+sleeps. It does not change their polling algorithms or add a scheduling policy.

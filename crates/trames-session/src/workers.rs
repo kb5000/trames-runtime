@@ -581,7 +581,7 @@ impl<C: Cpu> Pool<C> {
                                 work.cpu.clear_exclusive();
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
-                                        && (matches!(work.cpu.x(8) as u32, 23 | 24 | 57)
+                                        && (matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
                                             || work.cpu.x(8) as u32 == 25
                                                 && matches!(work.cpu.x(1), 0 | 1030))
                                 }) {
@@ -590,6 +590,20 @@ impl<C: Cpu> Pool<C> {
                                     let args = std::array::from_fn(|i| work.cpu.x(i));
                                     let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if entry.allowed() {
+                                        if matches!(number, 101 | 115) {
+                                            if epoch.is_none() { job.seccomp_entry = Some(entry); break result; }
+                                            let waiting = crate::worker_syscalls::sleep_parameters(
+                                                work.memory.as_deref().expect("worker view"), number, args, snapshot.started);
+                                            if let Some(began) = began { syscall_time += began.elapsed(); }
+                                            syscalls += 1;
+                                            match waiting {
+                                                Ok((deadline, remaining)) => {
+                                                    parked = Some(crate::run_queue::WaitState::Sleep { deadline, remaining });
+                                                    break SliceOutcome::Yield { instructions: 0 };
+                                                }
+                                                Err(error) => { work.cpu.set_x(0, 0u64.wrapping_sub(error.0 as u64)); continue; }
+                                            }
+                                        }
                                         if let Some(value) = snapshot.direct.invoke_membership(number, args) {
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
@@ -597,7 +611,7 @@ impl<C: Cpu> Pool<C> {
                                             continue;
                                         }
                                     }
-                                    // Owner-only resources and denials retain
+                                    // Deferred entries and denials retain
                                     // their normal joined effects. The entry
                                     // token binds this exact ABI and policy.
                                     job.seccomp_entry = Some(entry);
@@ -1929,6 +1943,74 @@ mod tests {
             .all(|d| d.serviced_syscalls == 0 && d.io.is_none()));
         assert_eq!(vfs.flock(b, 6), Err(trames_vfs::Errno(11)));
         files.finish();
+    }
+
+    #[test]
+    fn nanosleep_resumes_with_success_while_a_peer_uses_the_same_host_slot() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, 3 * PAGE_SIZE, Permissions::RW).unwrap();
+        for (base, words) in [
+            (
+                0x1000,
+                &[0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001][..],
+            ),
+            (0x2000, &[0x91000694u32, 0x17ffffff][..]),
+        ] {
+            for (i, word) in words.iter().enumerate() {
+                memory
+                    .write_array(base + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+        }
+        memory
+            .write_array(0x3008, 2_000_000u64.to_le_bytes())
+            .unwrap();
+        memory.write_array(0x3020, [0xa5; 16]).unwrap();
+        memory
+            .protect(0x1000, 2 * PAGE_SIZE, Permissions::RX)
+            .unwrap();
+        let first = memory.parallel_view(&mut Default::default()).unwrap();
+        let second = first.clone();
+        let control = Arc::new(Control::new(100_000_000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        for (pid, pc, view) in [(1, 0x1000, first), (2, 0x2000, second)] {
+            let mut cpu = Cpu::new(pc, 0);
+            cpu.set_x(8, 101);
+            cpu.set_x(0, 0x3000);
+            cpu.set_x(1, 0x3020);
+            epoch.add(crate::run_queue::Job::new(
+                Work {
+                    gpu: None,
+                    pid,
+                    cpu,
+                    memory: Some(Box::new(view)),
+                    control: control.clone(),
+                    syscalls: Some(syscall_snapshot()),
+                },
+                1,
+                0,
+                None,
+            ));
+        }
+        epoch.assign(&[(1, 0)]);
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        let began = Instant::now();
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain();
+        let sleeper = done.iter().find(|d| d.pid == 1).unwrap();
+        assert_eq!(sleeper.cpu.x(19), 0);
+        assert_eq!(sleeper.cpu.x(8), 93);
+        assert_eq!((sleeper.waits, sleeper.resumes), (1, 1));
+        assert!(began.elapsed() >= Duration::from_millis(2));
+        assert!(done.iter().find(|d| d.pid == 2).unwrap().cpu.x(20) > 0);
+        assert!(done.iter().all(|d| d.serviced_syscalls == 0));
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<16>(0x3020).unwrap(), [0xa5; 16]);
     }
 
     #[test]

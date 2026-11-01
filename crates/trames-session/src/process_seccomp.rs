@@ -485,6 +485,108 @@ mod tests {
         }
     }
     #[test]
+    fn filtered_sleeps_wait_on_workers_and_denials_retain_the_exact_entry() {
+        for number in [101, 115] {
+            for decision in [ALLOW, 0x5007b] {
+                let mut p = super::super::tests::process();
+                for (offset, word) in [0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001]
+                    .into_iter()
+                    .enumerate()
+                {
+                    p.memory
+                        .write_array(0x4000 + offset as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.memory.write_array(0x8000, 0u64.to_le_bytes()).unwrap();
+                p.memory
+                    .write_array(0x8008, 100_000u64.to_le_bytes())
+                    .unwrap();
+                let args = if number == 101 {
+                    [0x8000, 0, 0, 0, 0, 0]
+                } else {
+                    [1, 0, 0x8000, 0, 0, 0]
+                };
+                p.cpu = Cpu::new(0x4000, 0);
+                p.cpu.set_x(8, number);
+                put_args(&mut p.cpu, args);
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                ));
+                let snapshot = crate::worker_syscalls::Snapshot {
+                    seccomp: p.seccomp.clone(),
+                    identities: [0; 7],
+                    started: Instant::now(),
+                    processor: 0,
+                    profile: false,
+                    streams: Default::default(),
+                    files: Default::default(),
+                    fd_flags: Default::default(),
+                    umask: Default::default(),
+                    actions: p.signals.actions.shared(),
+                    program_break: p.linux.program_break(),
+                    uts: None,
+                    direct: Default::default(),
+                    futex: Default::default(),
+                };
+                let control = Arc::new(crate::workers::Control::new(1000));
+                let epoch = crate::run_queue::Epoch::new(control.clone());
+                epoch.add(crate::run_queue::Job::new(
+                    crate::workers::Work {
+                        gpu: None,
+                        pid: 1,
+                        cpu: std::mem::take(&mut p.cpu),
+                        memory: Some(Box::new(
+                            p.memory.parallel_view(&mut Default::default()).unwrap(),
+                        )),
+                        control,
+                        syscalls: Some(snapshot),
+                    },
+                    1,
+                    0,
+                    None,
+                ));
+                let mut pool = crate::workers::Pool::new(1);
+                pool.ensure(0).unwrap();
+                pool.launch(0, epoch.clone()).unwrap();
+                assert!(matches!(
+                    pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                    Some(crate::workers::Event::EpochStopped(0))
+                ));
+                let done = epoch.drain().pop().unwrap();
+                assert_eq!(p.seccomp.evaluations(), 1);
+                p.memory.commit_parallel().unwrap();
+                p.cpu = done.cpu;
+                if decision == ALLOW {
+                    assert_eq!((done.waits, done.resumes, done.syscalls), (1, 1, 1));
+                    assert_eq!((p.cpu.x(19), p.cpu.x(8)), (0, 93));
+                    assert!(done.seccomp_entry.is_none());
+                } else {
+                    assert_eq!(done.waits, 0);
+                    p.seccomp_entry = done.seccomp_entry;
+                    assert!(p.seccomp_entry.is_some());
+                    super::super::tests::kernel().call(
+                        1,
+                        &mut p,
+                        number as u32,
+                        args,
+                        &mut trames_linux::CapturedOutput::default(),
+                    );
+                    assert_eq!(p.seccomp.evaluations(), 1);
+                    assert_eq!(p.cpu.x(0), error(Errno(123)));
+                    assert!(matches!(p.state, State::Ready));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn filtered_fd_workers_complete_shared_operations_and_preserve_deferred_decisions() {
         for (number, owner, decision) in [
             (23, false, ALLOW),

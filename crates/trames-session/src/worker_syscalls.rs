@@ -95,6 +95,50 @@ pub(super) fn clock(
     Ok(0)
 }
 
+/// Shared owner/worker sleep ABI. Deadline ownership survives checkpoints;
+/// normal expiry never writes rem, while the owner retains signal/EINTR effects.
+pub(super) fn sleep_parameters(
+    memory: &impl CpuMemory,
+    number: u32,
+    a: [u64; 6],
+    started: Instant,
+) -> Result<(Instant, u64), Errno> {
+    if number == 115 && (!matches!(a[0], 0 | 1) || a[1] & !1 != 0) {
+        return Err(Errno(22));
+    }
+    let (request, remaining) = if number == 101 {
+        (a[0], a[1])
+    } else {
+        (a[2], if a[1] & 1 == 0 { a[3] } else { 0 })
+    };
+    let value = memory.read_array::<16>(request).map_err(|_| Errno(14))?;
+    let sec = u64::from_le_bytes(value[..8].try_into().unwrap());
+    let ns = u64::from_le_bytes(value[8..].try_into().unwrap());
+    if ns >= 1_000_000_000 || sec > i64::MAX as u64 {
+        return Err(Errno(22));
+    }
+    if remaining != 0 {
+        memory
+            .check(remaining, 16, Access::Write)
+            .map_err(|_| Errno(14))?;
+    }
+    let mut duration = Duration::new(sec, ns as u32);
+    if number == 115 && a[1] & 1 != 0 {
+        let now = if a[0] == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Errno(5))?
+        } else {
+            started.elapsed()
+        };
+        duration = duration.saturating_sub(now);
+    }
+    Ok((
+        Instant::now().checked_add(duration).ok_or(Errno(22))?,
+        remaining,
+    ))
+}
+
 pub(super) fn futex_wait_parameters(
     memory: &impl CpuMemory,
     a: [u64; 6],
@@ -203,6 +247,20 @@ impl Snapshot {
         pid: u32,
         epoch: &Arc<crate::run_queue::Epoch<C>>,
     ) -> Option<Result<crate::run_queue::WaitState, Errno>> {
+        if matches!(cpu.x(8) as u32, 101 | 115) {
+            return Some(
+                sleep_parameters(
+                    memory,
+                    cpu.x(8) as u32,
+                    std::array::from_fn(|i| cpu.x(i)),
+                    self.started,
+                )
+                .map(|(deadline, remaining)| crate::run_queue::WaitState::Sleep {
+                    deadline,
+                    remaining,
+                }),
+            );
+        }
         if !self.futex_wait(cpu) {
             return None;
         }
@@ -229,7 +287,7 @@ impl Snapshot {
                     Ok(())
                 },
             )?;
-            Ok(crate::run_queue::WaitState { wait, deadline })
+            Ok(crate::run_queue::WaitState::Futex { wait, deadline })
         })())
     }
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
@@ -242,9 +300,9 @@ impl Snapshot {
         if self.seccomp.mode() == 0 {
             return true;
         }
-        // Filtered membership entries use the dedicated worker path, which
+        // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
-        if matches!(cpu.x(8) as u32, 23 | 24 | 57)
+        if matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {
             return false;
@@ -254,7 +312,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 113 | 114 | 124 | 166 | 168 | 172..=178
+            25 | 101 | 113..=115 | 124 | 166 | 168 | 172..=178
         ) && !(cpu.x(8) as u32 == 29 && cpu.x(1) as u32 == 0x5421)
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -529,6 +587,44 @@ mod tests {
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
         assert_eq!(view.read_array::<4>(0x1000).unwrap(), 17u32.to_le_bytes());
     }
+    #[test]
+    fn sleep_abi_checks_timespec_and_preserves_absolute_and_remaining_rules() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let started = Instant::now();
+        memory
+            .write_array(0x1008, 1_000_000_000u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            sleep_parameters(&memory, 101, [0x1000, 0, 0, 0, 0, 0], started),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            sleep_parameters(&memory, 101, [0, 0, 0, 0, 0, 0], started),
+            Err(Errno(14))
+        );
+        memory.write_array(0x1008, 0u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            sleep_parameters(&memory, 101, [0x1000, 0x9000, 0, 0, 0, 0], started),
+            Err(Errno(14))
+        );
+        for clock in [0, 1] {
+            let (deadline, remaining) =
+                sleep_parameters(&memory, 115, [clock, 1, 0x1000, u64::MAX, 0, 0], started)
+                    .unwrap();
+            assert!(deadline <= Instant::now());
+            assert_eq!(remaining, 0, "absolute sleeps ignore rem");
+        }
+        assert_eq!(
+            sleep_parameters(&memory, 115, [2, 0, 0x1000, 0, 0, 0], started),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            sleep_parameters(&memory, 115, [1, 2, 0x1000, 0, 0, 0], started),
+            Err(Errno(22))
+        );
+    }
+
     #[test]
     fn clockid_uses_the_linux_low_32_bit_argument_with_syscall_fallback() {
         let mut memory = Memory::default();
