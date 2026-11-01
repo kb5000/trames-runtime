@@ -13,9 +13,13 @@ impl Message {
         if receive {
             Linux::check(memory, address, 56, Access::Write)?;
         }
-        let name = u64_at(memory, address)?;
-        let control = u64_at(memory, address + 32)?;
-        let control_size = u64_at(memory, address + 40)?;
+        // Import the ABI record once. Each checked guest read can acquire a
+        // hardware byte borrow; separate scalar reads repeat that boundary.
+        let header = memory.read_array::<56>(address).map_err(|_| Errno(14))?;
+        let word = |offset| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+        let name = word(0);
+        let control = word(32);
+        let control_size = word(40);
         if !receive && name != 0 {
             return Err(Errno(106));
         }
@@ -37,8 +41,8 @@ impl Message {
         };
         let vectors = Vectors::prepare_stream(
             memory,
-            u64_at(memory, address + 16)?,
-            u64_at(memory, address + 24)?,
+            word(16),
+            word(24),
             if receive { Access::Write } else { Access::Read },
         )?;
         Ok(Self {
@@ -103,11 +107,9 @@ pub(crate) fn message(
                     .write_array(a[1] + 8, 0u32.to_le_bytes())
                     .map_err(|_| Errno(14))?;
             }
+            // msg_controllen and msg_flags are adjacent ABI output fields.
             memory
-                .write_array(a[1] + 40, 0u64.to_le_bytes())
-                .map_err(|_| Errno(14))?;
-            memory
-                .write_array(a[1] + 48, 0u32.to_le_bytes())
+                .write_array(a[1] + 40, [0; 12])
                 .map_err(|_| Errno(14))?;
             Ok(bytes.len() as u64)
         } else {
@@ -120,4 +122,87 @@ pub(crate) fn message(
             send(scratch)
         }
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use trames_memory::{Permissions, PAGE_SIZE};
+
+    #[test]
+    fn message_records_cross_pages_and_fault_before_transport_effects() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 4, Permissions::RW).unwrap();
+        let address = 0x1fe0;
+        let mut header = [0; 56];
+        header[16..24].copy_from_slice(&0x2ff8u64.to_le_bytes());
+        header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        let mut vector = [0; 16];
+        vector[..8].copy_from_slice(&0x4000u64.to_le_bytes());
+        vector[8..].copy_from_slice(&3u64.to_le_bytes());
+        memory.write(address, &header).unwrap();
+        memory.write(0x2ff8, &vector).unwrap();
+        memory.write(0x4000, b"abc").unwrap();
+        let args = [0, address, 0, 0, 0, 0];
+        let mut scratch = Vec::new();
+        let result = message(
+            211,
+            args,
+            &mut memory,
+            &mut scratch,
+            |_| panic!("send must not receive"),
+            |bytes| {
+                assert_eq!(bytes, b"abc");
+                Ok(bytes.len() as u64)
+            },
+        );
+        assert_eq!(result, Some(Ok(3)));
+        let result = message(
+            212,
+            args,
+            &mut memory,
+            &mut scratch,
+            |capacity| {
+                assert_eq!(capacity, 3);
+                Ok(b"xyz".to_vec())
+            },
+            |_| panic!("receive must not send"),
+        );
+        assert_eq!(result, Some(Ok(3)));
+        assert_eq!(memory.read_array::<3>(0x4000).unwrap(), *b"xyz");
+        assert_eq!(memory.read_array::<12>(address + 40).unwrap(), [0; 12]);
+
+        memory.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        let touched = Cell::new(false);
+        let result = message(
+            212,
+            args,
+            &mut memory,
+            &mut scratch,
+            |_| {
+                touched.set(true);
+                Ok(Vec::new())
+            },
+            |_| panic!("receive must not send"),
+        );
+        assert_eq!(result, Some(Err(Errno(14))));
+        assert!(!touched.get());
+
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.unmap(0x3000, PAGE_SIZE).unwrap();
+        let result = message(
+            211,
+            args,
+            &mut memory,
+            &mut scratch,
+            |_| panic!("send must not receive"),
+            |_| {
+                touched.set(true);
+                Ok(0)
+            },
+        );
+        assert_eq!(result, Some(Err(Errno(14))));
+        assert!(!touched.get());
+    }
 }

@@ -171,8 +171,11 @@ impl Vectors {
         let mut size = 0usize;
         let mut requested = 0u64;
         for i in 0..count {
-            let base = u64_at(memory, pointer + i * 16)?;
-            let length = u64_at(memory, pointer + i * 16 + 8)?;
+            let vector = memory
+                .read_array::<16>(pointer + i * 16)
+                .map_err(|_| Errno(14))?;
+            let base = u64::from_le_bytes(vector[..8].try_into().unwrap());
+            let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
             // Keep the Linux signed-iovec total valid even when only a short
             // transport prefix will be copied from a large receive capacity.
             requested = requested
