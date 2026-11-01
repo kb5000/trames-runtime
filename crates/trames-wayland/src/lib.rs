@@ -214,6 +214,98 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
+    fn host_managed_shm_pools_cross_old_128_mib_ceiling_without_protocol_disconnect() {
+        fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
+            [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]
+                .into_iter()
+                .chain(words.iter().copied())
+                .flat_map(u32::to_ne_bytes)
+                .collect()
+        }
+        for host_managed in [false, true] {
+            let mut compositor = Compositor::new().unwrap();
+            let (mut client, socket) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            compositor
+                .connect(
+                    socket,
+                    ClientIdentity {
+                        connection: 42,
+                        pid: 7,
+                        uid: 0,
+                        gid: 0,
+                    },
+                )
+                .unwrap();
+            client.write_all(&message(1, 1, &[2])).unwrap();
+            compositor.dispatch().unwrap();
+            let mut reply = [0; 4096];
+            assert!(client.read(&mut reply).unwrap() > 0);
+            let mut bind = vec![2, 7];
+            bind.extend(
+                b"wl_shm\0\0"
+                    .chunks_exact(4)
+                    .map(|b| u32::from_ne_bytes(b.try_into().unwrap())),
+            );
+            bind.extend([1, 3]);
+            client.write_all(&message(2, 0, &bind)).unwrap();
+            compositor.dispatch().unwrap();
+            let n = client.read(&mut reply).unwrap();
+            assert!(n > 0);
+            assert_eq!(
+                u32::from_ne_bytes(reply[..4].try_into().unwrap()),
+                3,
+                "{:?}",
+                &reply[..n]
+            );
+            let native = trames_shared::NativeSocket::from(client.try_clone().unwrap());
+            let old_limit = 128 << 20;
+            let budget = trames_shared::SharedBudget::new(old_limit);
+            for index in 0..9 {
+                if host_managed && index == 8 {
+                    budget.use_host_memory();
+                }
+                let file = trames_shared::SharedFile::anonymous_in(budget.clone()).unwrap();
+                file.set_len(16 << 20).unwrap();
+                let (fd, lease) = file.export().unwrap();
+                let pool = 4 + index * 2;
+                let bytes = [
+                    message(3, 0, &[pool, 16 << 20]),
+                    message(pool, 0, &[pool + 1, 0, 2048, 2048, 8192, 1]),
+                ]
+                .concat();
+                assert_eq!(native.send_msg(&bytes, &[fd]).unwrap(), bytes.len());
+                compositor.retain_exports(42, vec![lease]);
+                compositor.dispatch().unwrap();
+                if index == 7 {
+                    assert_eq!(budget.available(), 0);
+                }
+            }
+            if host_managed {
+                assert_eq!(budget.available(), usize::MAX - (144 << 20));
+                client.write_all(&message(1, 0, &[22])).unwrap();
+                compositor.dispatch().unwrap();
+                let n = client.read(&mut reply).unwrap();
+                assert!(n >= 12);
+                assert_eq!(u32::from_ne_bytes(reply[..4].try_into().unwrap()), 22);
+            } else {
+                let n = client.read(&mut reply).unwrap();
+                assert_eq!(u32::from_ne_bytes(reply[..4].try_into().unwrap()), 1);
+                assert!(reply[..n]
+                    .windows(28)
+                    .any(|s| s == b"shared memory mapping failed"));
+            }
+            drop(compositor);
+            assert_eq!(
+                budget.available(),
+                if host_managed { usize::MAX } else { old_limit }
+            );
+        }
+    }
+
+    #[test]
     fn excessive_frame_requests_disconnect_only_the_bad_client_without_panicking() {
         fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
             [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]

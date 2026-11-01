@@ -78,7 +78,7 @@ fn round(value: usize, alignment: usize) -> io::Result<usize> {
 #[derive(Clone)]
 pub struct SharedBudget(Arc<BudgetInner>);
 struct BudgetInner {
-    limit: usize,
+    limit: AtomicUsize,
     used: AtomicUsize,
 }
 impl Default for SharedBudget {
@@ -89,20 +89,27 @@ impl Default for SharedBudget {
 impl SharedBudget {
     pub fn new(limit: usize) -> Self {
         Self(Arc::new(BudgetInner {
-            limit,
+            limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
         }))
     }
     pub fn available(&self) -> usize {
         self.0
             .limit
+            .load(Ordering::Relaxed)
             .saturating_sub(self.0.used.load(Ordering::Acquire))
+    }
+    /// Host-managed sessions retain accounting/leases without a separate
+    /// shared-storage byte ceiling. No storage or mappings are allocated here.
+    pub fn use_host_memory(&self) {
+        self.0.limit.store(usize::MAX, Ordering::Relaxed);
     }
     fn reserve(&self, bytes: usize) -> io::Result<()> {
         self.0
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.0.limit)
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.0.limit.load(Ordering::Relaxed))
             })
             .map(|_| ())
             .map_err(|_| io::Error::from(io::ErrorKind::StorageFull))

@@ -2,6 +2,11 @@
 use super::*;
 pub const MEMFD_BYTES: u64 = 128 * 1024 * 1024;
 impl Vfs {
+    /// Apply the host-managed session policy to the existing resource budget,
+    /// including files already retained by FD transfers or native mappings.
+    pub fn use_host_shared_memory(&self) {
+        self.fs.borrow().shared_budget.use_host_memory();
+    }
     pub(super) fn memfd_available(&self) -> u64 {
         self.fs.borrow().shared_budget.available() as u64
     }

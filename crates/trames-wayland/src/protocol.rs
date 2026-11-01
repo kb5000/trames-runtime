@@ -439,7 +439,10 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                             },
                         );
                     }
-                    Err(_) => r.post_error(1u32, "shared memory mapping failed"),
+                    Err(error) => {
+                        eprintln!("trames Wayland SHM mapping failed: offset={offset} bytes={} pool={} length={} capacity={} allocated={} error={error:?}", bytes.unwrap(), pool.size, pool.file.len(), pool.file.capacity(), pool.file.allocated());
+                        r.post_error(1u32, "shared memory mapping failed");
+                    }
                 }
             }
             _ => r.post_error(1u32, "unsupported pool request"),

@@ -57,6 +57,11 @@ impl MemoryLimits {
             trames_vulkan::Budget::for_guest_memory(self.total)
         }
     }
+    fn configure_shared_memory(self, vfs: &trames_vfs::Vfs) {
+        if self.is_host_managed() {
+            vfs.use_host_shared_memory();
+        }
+    }
     fn reported(
         self,
         used: usize,
@@ -422,6 +427,7 @@ impl<C: Cpu> Runtime<C> {
         exec_filename: Option<&[u8]>,
     ) -> Result<Self, RuntimeError> {
         options.memory_limits.validate()?;
+        options.memory_limits.configure_shared_memory(vfs);
         if options.video_accelerator {
             vfs.enable_video_device();
         }
@@ -950,5 +956,28 @@ mod host_memory_reporting_tests {
             }
         );
         assert_eq!(limits.reported(5usize << 30, Some(host)).free, 0);
+    }
+}
+
+#[cfg(test)]
+mod shared_memory_policy_tests {
+    use super::*;
+    #[test]
+    fn host_managed_shared_memory_keeps_existing_inode_budget_and_removes_old_ceiling() {
+        let mut vfs = trames_vfs::Vfs::default();
+        let fd = vfs.memfd_create(b"wayland-pool", 0).unwrap();
+        let file = vfs.shared_file(fd).unwrap();
+        let old_limit = 128 << 20;
+        file.set_len(old_limit + 65536).unwrap();
+        file.reserve_range(0, old_limit).unwrap();
+        MemoryLimits::default().configure_shared_memory(&vfs);
+        assert_eq!(
+            file.map(old_limit, 65536).err().unwrap().kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        MemoryLimits::host_managed().configure_shared_memory(&vfs);
+        let mapping = file.map(old_limit, 65536).unwrap();
+        assert_eq!(file.allocated(), old_limit + 65536);
+        assert_eq!(mapping.len(), 65536);
     }
 }

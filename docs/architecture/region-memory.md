@@ -675,6 +675,25 @@ proc address-space limits now follow the same policy instead of a fixed 512 MiB.
 Common/iPad defaults remain bounded and unchanged. The Mac product's default is
 host-managed, with `--memory-mib N` retaining an explicit resident-byte cap.
 
+Host-managed sessions also remove the root memfd budget's separate 128 MiB
+ceiling. The existing shared budget is updated before guest loading, so memfds
+retained across fork, FD transfer and native Wayland/GPU leases keep one owner
+and accounting identity. Sparse growth still allocates no bytes; mapped/written
+ranges retain accounting and release their charges with the final owner.
+Explicitly bounded sessions and common/iPad defaults retain the original budget.
+The policy uses a relaxed limit field under the existing reservation path; it
+adds no byte-visibility barrier, mapping scan, service thread or global lock.
+
+This prevents a Wayland pool allocation from failing solely because aggregate
+shared buffers cross 128 MiB while host memory remains available. Firefox's
+Wayland log handler deliberately crashes on the resulting fatal protocol error.
+Pool failures retain the protocol error and now log the original I/O error and
+pool dimensions. Tests exercise real FD transfer and nine 16 MiB Wayland pools:
+the bounded control disconnects on pool nine, host-managed mode accepts all
+144 MiB and a sync round-trip, and dropping the compositor releases every charge.
+Per-file extent, mapping validity and actual host allocation failures remain
+separate constraints.
+
 Resident policy and mapping representation are independent. Large private
 anonymous mappings now have sparse accessible intervals as described below;
 file/shared mappings retain their descriptor ceiling. Host-managed sessions
