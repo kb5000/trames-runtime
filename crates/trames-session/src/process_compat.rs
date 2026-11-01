@@ -227,20 +227,31 @@ mod tests {
     }
     #[test]
     fn nofile_limits_apply_to_allocation_and_fork_independently() {
-        let k=kernel();let mut p=process();
-        write_u64(&mut p.memory,0x1000,8).unwrap();write_u64(&mut p.memory,0x1008,16).unwrap();
-        assert_eq!(k.rlimit(&mut p,261,[0,7,0x1000,0x1100,0,0]),Ok(0));
-        assert_eq!(read_u64(&p.memory,0x1100).unwrap(),trames_vfs::MAX_FDS as u64);
-        assert_eq!(p.linux.vfs.descriptor_limit(),8);
-        let mut child=p.fork();
-        write_u64(&mut child.memory,0x1000,4).unwrap();write_u64(&mut child.memory,0x1008,8).unwrap();
-        assert_eq!(k.rlimit(&mut child,261,[0,7,0x1000,0,0,0]),Ok(0));
-        assert_eq!(p.nofile_limit.get(),(8,16));assert_eq!(p.linux.vfs.descriptor_limit(),8);
-        assert_eq!(child.nofile_limit.get(),(4,8));assert_eq!(child.linux.vfs.descriptor_limit(),4);
-        child.linux.vfs.credentials=trames_vfs::Credentials::user(1000,1000);
-        write_u64(&mut child.memory,0x1008,16).unwrap();
-        assert_eq!(k.rlimit(&mut child,261,[0,7,0x1000,0,0,0]),Err(Errno(1)));
-        assert_eq!(child.nofile_limit.get(),(4,8));
+        let k = kernel();
+        let mut p = process();
+        write_u64(&mut p.memory, 0x1000, 8).unwrap();
+        write_u64(&mut p.memory, 0x1008, 16).unwrap();
+        assert_eq!(k.rlimit(&mut p, 261, [0, 7, 0x1000, 0x1100, 0, 0]), Ok(0));
+        assert_eq!(
+            read_u64(&p.memory, 0x1100).unwrap(),
+            trames_vfs::MAX_FDS as u64
+        );
+        assert_eq!(p.linux.vfs.descriptor_limit(), 8);
+        let mut child = p.fork();
+        write_u64(&mut child.memory, 0x1000, 4).unwrap();
+        write_u64(&mut child.memory, 0x1008, 8).unwrap();
+        assert_eq!(k.rlimit(&mut child, 261, [0, 7, 0x1000, 0, 0, 0]), Ok(0));
+        assert_eq!(p.nofile_limit.get(), (8, 16));
+        assert_eq!(p.linux.vfs.descriptor_limit(), 8);
+        assert_eq!(child.nofile_limit.get(), (4, 8));
+        assert_eq!(child.linux.vfs.descriptor_limit(), 4);
+        child.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        write_u64(&mut child.memory, 0x1008, 16).unwrap();
+        assert_eq!(
+            k.rlimit(&mut child, 261, [0, 7, 0x1000, 0, 0, 0]),
+            Err(Errno(1))
+        );
+        assert_eq!(child.nofile_limit.get(), (4, 8));
     }
     #[test]
     fn core_limits_are_process_owned_capability_checked_and_reported() {

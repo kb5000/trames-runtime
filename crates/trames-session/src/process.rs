@@ -4999,7 +4999,10 @@ pub(super) fn run<C: Cpu>(
         membarrier_registered: Rc::new(Cell::new(false)),
         file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
         core_limit: Rc::new(Cell::new((0, u64::MAX))),
-        nofile_limit: Rc::new(Cell::new((trames_vfs::MAX_FDS as u64, trames_vfs::MAX_FDS as u64))),
+        nofile_limit: Rc::new(Cell::new((
+            trames_vfs::MAX_FDS as u64,
+            trames_vfs::MAX_FDS as u64,
+        ))),
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
@@ -6306,7 +6309,10 @@ mod tests {
             membarrier_registered: Rc::new(Cell::new(false)),
             file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
             core_limit: Rc::new(Cell::new((0, u64::MAX))),
-        nofile_limit: Rc::new(Cell::new((trames_vfs::MAX_FDS as u64, trames_vfs::MAX_FDS as u64))),
+            nofile_limit: Rc::new(Cell::new((
+                trames_vfs::MAX_FDS as u64,
+                trames_vfs::MAX_FDS as u64,
+            ))),
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,

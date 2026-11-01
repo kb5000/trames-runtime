@@ -597,9 +597,15 @@ impl Clone for Vfs {
     }
 }
 impl Vfs {
-    pub fn descriptor_limit(&self) -> u32 {self.fds.limit()}
-    pub fn set_descriptor_limit(&self, limit:u32) {self.fds.set_limit(limit.min(MAX_FDS));}
-    pub fn share_descriptor_limit(&mut self, other:&Self) {self.fds.share_limit(&other.fds);}
+    pub fn descriptor_limit(&self) -> u32 {
+        self.fds.limit()
+    }
+    pub fn set_descriptor_limit(&self, limit: u32) {
+        self.fds.set_limit(limit.min(MAX_FDS));
+    }
+    pub fn share_descriptor_limit(&mut self, other: &Self) {
+        self.fds.share_limit(&other.fds);
+    }
     pub fn shared_files(&self) -> SharedFiles {
         self.fds.worker_membership()
     }

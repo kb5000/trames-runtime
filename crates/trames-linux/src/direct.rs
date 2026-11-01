@@ -195,7 +195,9 @@ impl DirectSyscalls {
                 .close(args[0] as u32, self.lock_context.as_ref()?.owner)
                 .map(|r| r.map(|()| 0)),
             25 if matches!(args[1], 0 | 1030) => {
-                if args[2] >= files.descriptor_limit() as u64 { return files.lookup(args[0] as u32).map(|r|r.and(Err(Errno(22)))); }
+                if args[2] >= files.descriptor_limit() as u64 {
+                    return files.lookup(args[0] as u32).map(|r| r.and(Err(Errno(22))));
+                }
                 files.duplicate(args[0] as u32, args[2] as u32, args[1] == 1030)
             }
             _ => return None,
