@@ -40,6 +40,9 @@ pub(super) struct FsContext {
     mask: Umask,
 }
 impl FsContext {
+    pub(super) fn share_mask(&mut self, other: &Self) {
+        self.mask = other.mask.clone();
+    }
     pub(super) fn shared(&self) -> Self {
         Self {
             paths: self.paths.clone(),

@@ -319,7 +319,9 @@ impl MountData {
             return host.key_of(&self.fs, node).ok();
         }
         let root = self.root_path();
-        node.borrow().path_in(&self.fs.borrow().paths, &root)
+        let fs = self.fs.borrow();
+        let result = node.borrow().path_in(&fs.paths, &root);
+        result
     }
     fn root_path(&self) -> Vec<u8> {
         // Proc/sysfs inodes live in PseudoFs, never in the backing disk's path

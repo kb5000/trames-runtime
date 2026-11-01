@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Read-only pathname authority over the original filesystem and inode objects.
+//! Pathname authority over the original filesystem and inode objects.
 //! The resolver is the owner VFS's resolver, in a sealed private control view.
+//! Ordinary file opens publish only complete shared OFDs into the live Files table.
 use super::*;
 
 #[derive(Clone)]
 pub(super) struct Authority {
-    files: SharedFiles,
+    pub(super) files: SharedFiles,
     deferred: Rc<Cell<bool>>,
     // Keep the private weak mount registry alive, including detached mounts.
     _mounts: Vec<Rc<Mount>>,
@@ -48,17 +49,18 @@ fn host_mount(_: &Mount) -> bool {
 }
 
 /// One exclusively owned control island, movable with a retained execution job.
-/// No &Vfs, Rc or mutable control handle can escape this type's query-only API.
+/// No &Vfs, Rc or mutable control handle can escape this type's sealed API.
 pub struct PathQueries {
-    view: Vfs,
+    view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
 // afresh, including mounts, fs context, pseudo state, dummy FD table and namespaces.
 // Source resources cross only as their existing Send+Sync Arc capabilities.
 // Query-local clones never escape a method. Send moves the entire private island
 // exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
-// All methods return owned bytes/results. They cannot publish owner controls or
-// mutate the dummy FD table into the real shared membership. Adding an API that
+// Methods return only owned bytes/results and numeric FDs. Ordinary opens publish
+// Arc-backed descriptions; no Rc-backed owner control enters shared membership.
+// The dummy FD table remains private and empty. Adding an API that
 // leaks/retains a local Rc outside this island requires revisiting this proof.
 unsafe impl Send for PathQueries {}
 
@@ -98,20 +100,45 @@ impl Vfs {
             .collect();
         *view.mount_registry.borrow_mut() = registry.iter().map(Rc::downgrade).collect();
         view.credentials = self.credentials.clone();
+        view.context.share_mask(&self.context);
+        view.record_locks = self.record_locks.clone();
+        view.next_open = self.next_open.clone();
         view.pseudo.borrow_mut().enabled = self.pseudo.borrow().enabled;
         view.query = Some(Authority {
             files: self.shared_files(),
             deferred: Rc::new(Cell::new(false)),
             _mounts: mounts.into_values().collect(),
         });
-        PathQueries { view }
+        PathQueries {
+            view: RefCell::new(view),
+        }
     }
 }
 impl PathQueries {
-    fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
-        let deferred = &self.view.query.as_ref().unwrap().deferred;
+    pub fn open_at_resolve(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        policy: u64,
+        files: &DirectFiles,
+    ) -> Option<Result<u32>> {
+        // Truncation can change mapped backing lifetimes and remains joined.
+        if flags & O_PATH == 0 && flags & 0x200 != 0 {
+            return None;
+        }
+        let mut view = self.view.borrow_mut();
+        let deferred = view.query.as_ref().unwrap().deferred.clone();
         deferred.set(false);
-        let result = operation(&self.view);
+        let result = view.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files));
+        (!deferred.replace(false)).then_some(result)
+    }
+    fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
+        let view = self.view.borrow();
+        let deferred = &view.query.as_ref().unwrap().deferred;
+        deferred.set(false);
+        let result = operation(&view);
         (!deferred.replace(false)).then_some(result)
     }
     pub fn stat_at_with_mount(
@@ -154,6 +181,249 @@ impl PathQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_open_publishes_live_membership_and_io_without_recapture() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"old".to_vec()).unwrap();
+        let mut epoch = FileEpoch::default();
+        let writer = epoch.capture(&owner, true);
+        let reader = epoch.capture(&owner, false);
+        let query = owner.path_queries();
+        owner.set_umask(0o077);
+        let fd = query
+            .open_at_resolve(
+                AT_FDCWD,
+                b"/created",
+                2 | 0x40 | O_CLOEXEC,
+                0o666,
+                0,
+                &writer,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.flags(fd).unwrap() & 3, 2);
+        assert!(owner.fds.get(&fd).unwrap().cloexec.get());
+        assert_eq!(
+            owner.stat_fd(fd).unwrap()[16..20],
+            0o100600u32.to_le_bytes()
+        );
+        assert!(writer
+            .get(fd)
+            .unwrap()
+            .write(b"hello", None, &mut Default::default())
+            .is_none());
+        owner.write(fd, b".....").unwrap();
+        writer
+            .get(fd)
+            .expect("new file has direct authority")
+            .write(b"hello", Some(0), &mut Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader
+                .get(fd)
+                .unwrap()
+                .read(5, Some(0), &mut Default::default())
+                .unwrap()
+                .unwrap(),
+            b"hello"
+        );
+        assert!(reader
+            .get(fd)
+            .unwrap()
+            .write(b"limit", Some(0), &mut Default::default())
+            .is_none());
+        let accepted = reader.get(fd).unwrap();
+        owner.close(fd).unwrap();
+        let replacement = query
+            .open_at_resolve(AT_FDCWD, b"/file", 0, 0, 0, &writer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement, fd);
+        assert_eq!(
+            reader
+                .get(fd)
+                .unwrap()
+                .read(3, None, &mut Default::default())
+                .unwrap()
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            accepted
+                .read(5, Some(0), &mut Default::default())
+                .unwrap()
+                .unwrap(),
+            b"hello"
+        );
+        owner.close(replacement).unwrap();
+        epoch.finish();
+        assert_eq!(
+            owner.stat_at(AT_FDCWD, b"/created").unwrap()[48..56],
+            5u64.to_le_bytes()
+        );
+    }
+    #[test]
+    fn worker_open_fallback_and_errors_do_not_leak_reservations_or_truncate() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"retained".to_vec()).unwrap();
+        owner.set_runtime_info(1, RuntimeInfo::default());
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&owner, true);
+        let query = owner.path_queries();
+        assert!(query
+            .open_at_resolve(AT_FDCWD, b"/file", 2 | 0x200, 0, 0, &files)
+            .is_none());
+        assert!(query
+            .open_at_resolve(AT_FDCWD, b"/proc/self/status", 0, 0, 0, &files)
+            .is_none());
+        assert!(query
+            .open_at_resolve(AT_FDCWD, b"/", O_DIRECTORY, 0, 0, &files)
+            .is_none());
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/missing", 0, 0, 0, &files),
+            Some(Err(Errno(2)))
+        );
+        assert_eq!(
+            owner.stat_at(AT_FDCWD, b"/file").unwrap()[48..56],
+            8u64.to_le_bytes()
+        );
+        let fd = query
+            .open_at_resolve(AT_FDCWD, b"/file", 0, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fd, 3);
+        owner.close(fd).unwrap();
+        epoch.finish();
+    }
+    #[test]
+    fn concurrent_exclusive_create_has_one_inode_and_disjoint_published_fds() {
+        let mut owner = Vfs::default();
+        let mut epoch = FileEpoch::default();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let query = owner.path_queries();
+                let files = epoch.capture(&owner, true);
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = query
+                        .open_at_resolve(AT_FDCWD, b"/race", 2 | 0xc0, 0o600, 0, &files)
+                        .unwrap();
+                    (query, files, result)
+                })
+            })
+            .collect();
+        let results: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.2.is_ok()).count(), 1);
+        assert!(results.iter().all(|r| r.2.is_ok() || r.2 == Err(Errno(17))));
+        for (_, _, result) in results {
+            if let Ok(fd) = result {
+                owner.close(fd).unwrap();
+            }
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let query = owner.path_queries();
+                let files = epoch.capture(&owner, true);
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    query
+                        .open_at_resolve(AT_FDCWD, b"/shared-race", 2 | 0x40, 0o600, 0, &files)
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect();
+        let fds: std::collections::BTreeSet<_> =
+            jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(fds.len(), 8);
+        for fd in fds {
+            owner.close(fd).unwrap();
+        }
+        epoch.finish();
+    }
+    #[test]
+    fn concurrent_creation_and_directory_queries_do_not_invert_inode_namespace_locks() {
+        let owner = Vfs::default();
+        let mut epoch = FileEpoch::default();
+        let jobs: Vec<_> = (0..8)
+            .map(|id| {
+                let query = owner.path_queries();
+                let files = epoch.capture(&owner, true);
+                let membership = owner.shared_files();
+                std::thread::spawn(move || {
+                    for i in 0..40 {
+                        let path = format!("/worker-{id}-{i}");
+                        let fd = query
+                            .open_at_resolve(AT_FDCWD, path.as_bytes(), 2 | 0x40, 0o600, 0, &files)
+                            .unwrap()
+                            .unwrap();
+                        assert!(files.get(fd).is_some());
+                        assert!(query.stat_at(AT_FDCWD, b"/", false).unwrap().is_ok());
+                        membership.close(fd, 1).unwrap().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for job in jobs {
+            job.join().unwrap();
+        }
+        epoch.finish();
+    }
+    #[test]
+    fn opens_on_distinct_workers_have_distinct_ofd_lock_owners() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"data".to_vec()).unwrap();
+        let original = owner.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&owner, true);
+        let a = owner
+            .path_queries()
+            .open_at_resolve(AT_FDCWD, b"/file", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let b = owner
+            .path_queries()
+            .open_at_resolve(AT_FDCWD, b"/file", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let ids: std::collections::BTreeSet<_> = [original, a, b]
+            .into_iter()
+            .map(|fd| owner.descriptor(fd).unwrap().open.borrow().id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        files.get(a).unwrap().flock(6).unwrap();
+        assert_eq!(files.get(b).unwrap().flock(6), Err(Errno(11)));
+        assert_eq!(files.get(original).unwrap().flock(6), Err(Errno(11)));
+        files.get(a).unwrap().flock(8).unwrap();
+        for fd in [original, a, b] {
+            owner.close(fd).unwrap();
+        }
+        epoch.finish();
+    }
+    #[test]
+    fn published_file_admission_does_not_survive_its_original_epoch() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"data".to_vec()).unwrap();
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&owner, true);
+        let fd = owner
+            .path_queries()
+            .open_at_resolve(AT_FDCWD, b"/file", 0, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let accepted = files.get(fd).unwrap().shared_file().unwrap();
+        owner.close(fd).unwrap();
+        epoch.finish();
+        let mut next = FileEpoch::default();
+        let next_files = next.capture(&owner, true);
+        assert!(next_files.accept(accepted).is_none());
+        next.finish();
+    }
     #[test]
     fn captured_resources_are_send_sync_and_private_control_moves_exclusively() {
         fn shared<T: Send + Sync>() {}
@@ -376,6 +646,51 @@ mod tests {
                 job.join().unwrap();
             }
         });
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    #[test]
+    fn concurrent_host_creators_open_one_winning_inode() {
+        let root =
+            std::env::temp_dir().join(format!("trames-worker-open-host-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let mut owner = Vfs::default();
+        owner.mkdir_at(AT_FDCWD, b"/host", 0o755).unwrap();
+        owner.mount_host(b"/host", &root, false).unwrap();
+        let mut epoch = FileEpoch::default();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let query = owner.path_queries();
+                let files = epoch.capture(&owner, true);
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    query
+                        .open_at_resolve(AT_FDCWD, b"/host/new", 2 | 0x40, 0o600, 0, &files)
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect();
+        let fds: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        let inodes: std::collections::BTreeSet<_> = fds
+            .iter()
+            .map(|&fd| owner.stat_fd(fd).unwrap()[8..16].to_vec())
+            .collect();
+        assert_eq!(inodes.len(), 1);
+        assert_eq!(
+            fds.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            8
+        );
+        for fd in fds {
+            owner.close(fd).unwrap();
+        }
+        epoch.finish();
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(all(feature = "hostfs", unix))]
     #[test]

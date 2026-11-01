@@ -509,6 +509,7 @@ impl Vfs {
                         host_file: None,
                         native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
+                        file_authority: Default::default(),
                         control: None,
                         read_node: None,
                         id: self.open_id(),

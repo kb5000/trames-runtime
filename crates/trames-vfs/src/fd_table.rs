@@ -49,6 +49,7 @@ pub(super) struct MembershipEntries {
     slots: BTreeMap<u32, Slot>,
     wayland: Option<PreparedWayland>,
     free: crate::fd_allocator::FreeFds,
+    reserved: std::collections::BTreeSet<u32>,
 }
 impl std::ops::Deref for MembershipEntries {
     type Target = BTreeMap<u32, Slot>;
@@ -94,7 +95,65 @@ impl Default for SharedFiles {
         )
     }
 }
+/// An unpublished numeric slot. Rollback releases only this reservation.
+pub(super) struct ReservedFd {
+    files: SharedFiles,
+    fd: u32,
+    pending: bool,
+}
+impl ReservedFd {
+    pub(super) fn publish(
+        mut self,
+        descriptor: Descriptor,
+        owner: Option<&DescriptorTable>,
+    ) -> u32 {
+        let mut entries = self.files.0.entries.lock().unwrap();
+        assert!(entries.reserved.remove(&self.fd));
+        if let Some(owner) = owner {
+            assert!(owner.install(self.fd, descriptor, &mut entries).is_none());
+        } else {
+            let OpenHandle::Shared(open) = descriptor.open else {
+                unreachable!("worker open admits only complete shared descriptions")
+            };
+            assert!(entries
+                .insert(
+                    self.fd,
+                    Slot {
+                        open: SlotOpen::Shared(open),
+                        cloexec: descriptor.cloexec
+                    }
+                )
+                .is_none());
+            self.files.changed(&mut entries);
+        }
+        self.pending = false;
+        self.fd
+    }
+}
+impl Drop for ReservedFd {
+    fn drop(&mut self) {
+        if self.pending {
+            let mut entries = self.files.0.entries.lock().unwrap();
+            assert!(entries.reserved.remove(&self.fd));
+            entries.free.release(self.fd);
+        }
+    }
+}
 impl SharedFiles {
+    pub(super) fn reserve(&self) -> Result<ReservedFd> {
+        let mut entries = self.0.entries.lock().unwrap();
+        let fd = entries
+            .available(0)
+            .filter(|&fd| fd < self.descriptor_limit())
+            .ok_or(Errno(24))?;
+        entries.free.reserve(fd);
+        entries.reserved.insert(fd);
+        Ok(ReservedFd {
+            files: self.clone(),
+            fd,
+            pending: true,
+        })
+    }
     pub fn descriptor_limit(&self) -> u32 {
         self.1.load(Ordering::Relaxed)
     }
@@ -276,6 +335,9 @@ impl SharedFiles {
                 Ok(open) => open.clone(),
                 Err(error) => return Some(Err(error)),
             };
+            if entries.reserved.contains(&new) {
+                return Some(Err(Errno(16))); // Linux dup/open reservation collision
+            }
             if let Some(target) = entries.get(&new) {
                 if let Err(error) = target.shared_open()? {
                     return Some(Err(error));
@@ -631,6 +693,9 @@ impl DescriptorTable {
         let mut entries = self.1 .0.entries.lock().unwrap();
         let mut descriptor = self.descriptor(old, entries.get(&old).ok_or(Errno(9))?);
         descriptor.ready()?;
+        if entries.reserved.contains(&new) {
+            return Err(Errno(16));
+        }
         if let Some(target) = entries.get(&new) {
             self.descriptor(new, target).ready()?;
         }
@@ -713,6 +778,7 @@ impl Clone for DescriptorTable {
                         slots: entries,
                         wayland: None,
                         free,
+                        reserved: Default::default(),
                     }),
                     revision: AtomicU64::new(0),
                 }),
@@ -725,6 +791,23 @@ impl Clone for DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unpublished_reservations_are_invisible_and_dup_collision_matches_linux() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"x".to_vec()).unwrap();
+        let fd = owner.open_at(AT_FDCWD, b"/file", 0, 0).unwrap();
+        let files = owner.shared_files();
+        let reservation = files.reserve().unwrap();
+        let reserved = reservation.fd;
+        assert!(matches!(files.lookup(reserved), Some(Err(Errno(9)))));
+        assert_eq!(files.duplicate_to(fd, reserved, 0, 1), Some(Err(Errno(16))));
+        assert_eq!(files.close(reserved, 1), Some(Err(Errno(9))));
+        drop(reservation);
+        assert_eq!(files.duplicate(fd, 0, false), Some(Ok(reserved)));
+        owner.close(fd).unwrap();
+        owner.close(reserved).unwrap();
+    }
+
     #[test]
     fn nofile_is_per_process_even_with_shared_files_and_threads_can_share_it() {
         let mut parent = Vfs::default();

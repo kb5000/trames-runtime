@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::state::Linux;
 use crate::{GuestOutput, MAX_WRITE};
-use trames_memory::{Access, Memory};
+use trames_memory::{Access, CpuMemory, Memory};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
 impl Linux {
     pub(crate) fn decode_open_how(
-        memory: &Memory,
+        memory: &impl CpuMemory,
         address: u64,
         size: u64,
     ) -> Result<(u32, u32, u64)> {

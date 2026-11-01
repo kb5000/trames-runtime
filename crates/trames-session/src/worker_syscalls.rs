@@ -42,13 +42,16 @@ pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
         63..=66 => {
             let fd = cpu.x(0) as u32;
             fd < trames_vfs::MAX_FDS
-                && (snapshot.streams[fd as usize / 64] | snapshot.files[fd as usize / 64])
+                && ((snapshot.streams[fd as usize / 64] | snapshot.files[fd as usize / 64])
                     & (1 << (fd % 64))
                     != 0
+                    || snapshot.direct.published_file(fd))
         }
         67..=70 | 82 | 83 => {
             let fd = cpu.x(0) as u32;
-            fd < trames_vfs::MAX_FDS && snapshot.files[fd as usize / 64] & (1 << (fd % 64)) != 0
+            fd < trames_vfs::MAX_FDS
+                && (snapshot.files[fd as usize / 64] & (1 << (fd % 64)) != 0
+                    || snapshot.direct.published_file(fd))
         }
         _ => false,
     }
@@ -347,7 +350,7 @@ impl Snapshot {
             return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
         }
         let result = match cpu.x(8) as u32 {
-            number @ (48 | 78..=80 | 291 | 439) => {
+            number @ (48 | 56 | 78..=80 | 291 | 437 | 439) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }

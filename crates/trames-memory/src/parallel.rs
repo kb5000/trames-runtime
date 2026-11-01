@@ -216,10 +216,13 @@ impl ConcurrentPage {
             self.code_epoch.fetch_add(1, Ordering::Release);
         }
     }
-    fn refresh(&self, bytes: &[u8; PAGE_SIZE as usize]) {
+    fn refresh(&self, bytes: &[u8; PAGE_SIZE as usize]) -> Result<(), MemoryError> {
         if self.constant.is_some() {
-            return;
+            return Ok(());
         }
+        // A joined content refresh may reach a deferred page that no worker
+        // touched. Materialize via its original source/COW contract first.
+        self.load()?;
         let mut guard = self
             .mutable()
             .expect("mutable page")
@@ -236,6 +239,7 @@ impl ConcurrentPage {
                 self.code_epoch.fetch_add(1, Ordering::Release);
             }
         }
+        Ok(())
     }
 }
 pub(super) struct Frame {
@@ -467,7 +471,7 @@ fn prepare_frame(
         }
         if let Some(key) = key {
             if let Some(bytes) = registry.shared.get(&key).and_then(Weak::upgrade) {
-                bytes.refresh(&data);
+                bytes.refresh(&data).ok()?;
                 bytes
             } else {
                 let bytes = Arc::new(ConcurrentPage::new(
@@ -481,7 +485,7 @@ fn prepare_frame(
                 bytes
             }
         } else if let Some(frame) = previous.filter(|f| f.bytes.constant.is_none()) {
-            frame.bytes.refresh(&data);
+            frame.bytes.refresh(&data).ok()?;
             frame.bytes.clone()
         } else {
             Arc::new(ConcurrentPage::new(
@@ -1382,7 +1386,7 @@ impl Memory {
                     registry.metrics.source_page_reads += 1;
                     registry.metrics.copied_publish_bytes += PAGE_SIZE;
                     page.read_bytes(0, &mut data).ok()?;
-                    frame.bytes.refresh(&data);
+                    frame.bytes.refresh(&data).ok()?;
                 }
                 frame.refresh_content_metadata(page);
             }
@@ -2090,6 +2094,42 @@ impl Memory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refreshing_unreached_deferred_pages_preserves_shared_and_private_sources() {
+        use super::*;
+        struct Source(Arc<SharedPage>);
+        impl PageSource for Source {
+            fn load(&self) -> Result<Arc<SharedPage>, MemoryError> {
+                Ok(self.0.clone())
+            }
+        }
+        for private in [false, true] {
+            let source = Arc::new(SharedPage::new([7; PAGE_SIZE as usize]));
+            let page = ConcurrentPage::deferred(
+                1,
+                Arc::new(Source(source.clone())),
+                private,
+                Arc::default(),
+            );
+            assert!(page.mutable().is_none());
+            page.refresh(&[9; PAGE_SIZE as usize]).unwrap();
+            assert_eq!(Arc::ptr_eq(page.mutable().unwrap(), &source), !private);
+            assert_eq!(page.mutable().unwrap().lock(0, 1).read(0, 1), [9]);
+            assert_eq!(source.lock(0, 1).read(0, 1), [if private { 7 } else { 9 }]);
+        }
+        struct Failed;
+        impl PageSource for Failed {
+            fn load(&self) -> Result<Arc<SharedPage>, MemoryError> {
+                Err(MemoryError::BackingIo(5))
+            }
+        }
+        let page = ConcurrentPage::deferred(2, Arc::new(Failed), false, Arc::default());
+        assert_eq!(
+            page.refresh(&[0; PAGE_SIZE as usize]),
+            Err(MemoryError::BackingIo(5))
+        );
+        assert!(page.mutable().is_none());
+    }
     use super::*;
     use std::sync::Barrier;
 

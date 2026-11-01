@@ -12,6 +12,8 @@ pub struct DirectFile {
     locks: Arc<locks::Records>,
     prepared: PreparedFile,
     file: Option<SharedFd>,
+    clear_setid: bool,
+    unlimited: bool,
 }
 /// Joined admission records policy and weak resource identities once. Promoting
 /// this capability never borrows an inode or repeats a pathname/stat lookup.
@@ -41,6 +43,8 @@ impl PreparedFile {
             locks: self.0.locks.upgrade()?,
             prepared: self.clone(),
             file,
+            clear_setid: self.0.clear_setid,
+            unlimited: self.0.unlimited,
         })
     }
     /// io_uring's accepted/fixed file may outlive its original numeric slot.
@@ -61,8 +65,48 @@ pub struct DirectFiles(
     Arc<[Option<PreparedFile>]>,
     Arc<BTreeMap<usize, PreparedFile>>,
     Option<SharedFiles>,
+    Option<PublishedFiles>,
 );
+#[derive(Clone)]
+struct PublishedFiles {
+    epoch: Arc<Mutex<PublishedEpoch>>,
+    clear_setid: bool,
+    unlimited: bool,
+}
+// Weak epoch identity prevents a later checkpoint from reusing stale admission.
+pub(super) struct PublishedFile {
+    epoch: std::sync::Weak<Mutex<PublishedEpoch>>,
+    prepared: PreparedFile,
+}
+#[derive(Default)]
+struct PublishedEpoch {
+    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>)>,
+}
 impl DirectFiles {
+    pub fn published(&self, fd: u32) -> bool {
+        self.2
+            .as_ref()
+            .and_then(|f| f.lookup(fd))
+            .is_some_and(|r| r.is_ok_and(|f| f.open.file_authority.get().is_some()))
+    }
+    pub(super) fn publish_open(&self, vfs: &Vfs, open: &OpenDescription) {
+        let publication = self.3.as_ref().expect("worker file publication authority");
+        if let Some((prepared, node, data)) =
+            FileEpoch::prepare_open(vfs, open, publication.unlimited)
+        {
+            // Resource preparation is outside this registration-only lock.
+            let mut epoch = publication.epoch.lock().unwrap();
+            epoch.nodes.insert(
+                Arc::as_ptr(&node) as usize,
+                (Arc::downgrade(&node), Arc::downgrade(&data)),
+            );
+            drop(epoch);
+            let _ = open.file_authority.set(PublishedFile {
+                epoch: Arc::downgrade(&publication.epoch),
+                prepared,
+            });
+        }
+    }
     pub fn get(&self, fd: u32) -> Option<DirectFile> {
         if let Some(result) = self.2.as_ref().and_then(|files| files.lookup(fd)) {
             return self.accept(result.ok()?);
@@ -72,9 +116,20 @@ impl DirectFiles {
     /// Resolve prepared authority for an already accepted shared lookup.
     /// Do not look up its numeric FD again while constructing a request.
     pub fn accept(&self, file: SharedFd) -> Option<DirectFile> {
-        let prepared = self.1.get(&file.identity())?;
-        debug_assert!(prepared.0.origin == file.ofd_identity());
-        prepared.accept(Some(file))
+        if let Some(prepared) = self.1.get(&file.identity()) {
+            debug_assert!(prepared.0.origin == file.ofd_identity());
+            return prepared.accept(Some(file));
+        }
+        let publication = self.3.as_ref()?;
+        let published = file.open.file_authority.get()?;
+        if published.epoch.as_ptr() != Arc::as_ptr(&publication.epoch) {
+            return None;
+        }
+        let prepared = published.prepared.clone();
+        let mut accepted = prepared.accept(Some(file))?;
+        accepted.clear_setid = publication.clear_setid;
+        accepted.unlimited = publication.unlimited;
+        Some(accepted)
     }
     /// Cold preparation of fixed or already-accepted io_uring descriptions.
     pub fn retain(&self, file: &RetainedFd) -> Option<DirectFile> {
@@ -89,16 +144,13 @@ impl DirectFiles {
 }
 #[derive(Default)]
 pub struct FileEpoch {
-    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>)>,
+    published: Arc<Mutex<PublishedEpoch>>,
     prepared: BTreeMap<(usize, bool, bool), PreparedFile>,
     captures: BTreeMap<(usize, u64, bool, bool, u64), DirectFiles>,
 }
 impl FileEpoch {
     pub fn capture(&mut self, vfs: &Vfs, unlimited: bool) -> DirectFiles {
         let mask = vfs.file_descriptors();
-        if mask.iter().all(|word| *word == 0) {
-            return DirectFiles::default();
-        }
         let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
         let membership = vfs.shared_files();
         let (identity, revision) = membership.capture_identity();
@@ -134,7 +186,16 @@ impl FileEpoch {
                 entries[fd as usize] = Some(prepared);
             }
         }
-        let capture = DirectFiles(entries.into(), Arc::new(shared), Some(membership));
+        let capture = DirectFiles(
+            entries.into(),
+            Arc::new(shared),
+            Some(membership),
+            Some(PublishedFiles {
+                epoch: self.published.clone(),
+                clear_setid,
+                unlimited,
+            }),
+        );
         self.captures.insert(key, capture.clone());
         capture
     }
@@ -173,10 +234,25 @@ impl FileEpoch {
         if let Some(prepared) = self.prepared.get(&prepared_key) {
             return Some(prepared.clone());
         }
+        let (prepared, node, data) = Self::prepare_open(vfs, o, unlimited)?;
+        self.published.lock().unwrap().nodes.insert(
+            Arc::as_ptr(&node) as usize,
+            (Arc::downgrade(&node), Arc::downgrade(&data)),
+        );
+        self.prepared.insert(prepared_key, prepared.clone());
+        Some(prepared)
+    }
+    fn prepare_open(
+        vfs: &Vfs,
+        o: &OpenDescription,
+        unlimited: bool,
+    ) -> Option<(PreparedFile, NodeRef, Arc<PlainFile>)> {
+        let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
         if o.read_node.is_some() {
             return None;
         }
         let node = Vfs::ordinary_file(o, false)?;
+        let flock = o.flock_capability();
         let n = node.borrow();
         let Content::File(storage::FileData::Plain(data)) = &n.content else {
             return None;
@@ -185,11 +261,7 @@ impl FileEpoch {
             return None;
         }
         let data = data.clone();
-        let key = Arc::as_ptr(&node) as usize;
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.nodes.entry(key) {
-            data.activate(n.mode, n.times);
-            entry.insert((Arc::downgrade(&node), Arc::downgrade(&data)));
-        }
+        data.activate(n.mode, n.times);
         let notifications =
             inotify::capture_node(&n, o.notification.as_ref().and_then(|c| c.link.as_ref()));
         let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
@@ -204,7 +276,7 @@ impl FileEpoch {
             position: Arc::downgrade(&o.file_position),
             locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
             origin: OfdIdentity::new(&o.shared),
-            flock: o.flock_capability(),
+            flock,
             stat,
             flags: o.flags.get(),
             status: o.flags.clone(),
@@ -218,13 +290,13 @@ impl FileEpoch {
                 .as_ref()
                 .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
         }));
-        self.prepared.insert(prepared_key, prepared.clone());
-        Some(prepared)
+        Some((prepared, node.clone(), data))
     }
     /// All workers/requests must have returned first. This touches only the
     /// captured inodes, never scans the filesystem or adds a compute fast-path lock.
     pub fn finish(self) {
-        for (_, (node, data)) in self.nodes {
+        let nodes = std::mem::take(&mut self.published.lock().unwrap().nodes);
+        for (_, (node, data)) in nodes {
             if let (Some(node), Some(data)) = (node.upgrade(), data.upgrade()) {
                 let Some(meta) = data.finish_metadata() else {
                     continue;
@@ -369,7 +441,7 @@ impl DirectFile {
         if bytes.is_empty() {
             return Some(Ok(0));
         }
-        if !self.prepared.0.unlimited || self.prepared.0.flags & 0x1000 != 0 {
+        if !self.unlimited || self.prepared.0.flags & 0x1000 != 0 {
             return None;
         }
         // Append growth/quotas/manifest retain the original owner path. No
@@ -391,7 +463,7 @@ impl DirectFile {
             result
         };
         if result.is_ok_and(|n| n != 0) {
-            self.data.modified(self.prepared.0.clear_setid);
+            self.data.modified(self.clear_setid);
             self.prepared.0.notifications.send(inotify::MODIFY);
         }
         Some(result)

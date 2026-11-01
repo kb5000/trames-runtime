@@ -767,6 +767,79 @@ mod tests {
         }
     }
     #[test]
+    fn filtered_open_publication_and_close_preserve_single_entry_decisions() {
+        for (path, decision, direct) in [
+            (b"/worker-open\0".as_slice(), ALLOW, true),
+            (b"/proc/self/status\0".as_slice(), ALLOW, false),
+            (b"/worker-open\0".as_slice(), 0x5007b, false),
+        ] {
+            let mut p = super::super::tests::process();
+            p.linux
+                .vfs
+                .set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+            p.memory.write(0x1234, path).unwrap();
+            let code = [
+                0x92800c60u32,
+                0xd2824681,
+                0xd2800842,
+                0xd2803003,
+                0xd2800708,
+                0xd4000001,
+                0xd2800728,
+                0xd4000001,
+                0x17fffff8,
+            ];
+            for (index, word) in code.into_iter().enumerate() {
+                p.memory
+                    .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu = Cpu::new(0x4000, 0);
+            p.affinity = 3;
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+            ));
+            let mut peer = p.fork();
+            peer.parent = 1;
+            let mut kernel = super::super::tests::kernel();
+            kernel.cpu_count = 2;
+            kernel.workers = crate::workers::Pool::new(2);
+            kernel.per_cpu = vec![Duration::ZERO; 2];
+            kernel.processes.insert(1, p);
+            kernel.processes.insert(2, peer);
+            assert!(kernel
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                .unwrap());
+            assert!(kernel.syscalls > 0);
+            assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+            if direct {
+                assert!(kernel.worker_file_syscalls > 100);
+                assert_eq!(kernel.service_requests, 0);
+                assert!(kernel.processes[&1]
+                    .linux
+                    .vfs
+                    .stat_at(trames_vfs::AT_FDCWD, b"/worker-open")
+                    .is_ok());
+            } else {
+                assert_eq!(kernel.worker_file_syscalls, 0);
+            }
+            if decision != ALLOW {
+                assert!(kernel.processes[&1]
+                    .linux
+                    .vfs
+                    .stat_at(trames_vfs::AT_FDCWD, b"/worker-open")
+                    .is_err());
+            }
+        }
+    }
+    #[test]
     fn allowed_filtered_dup_close_loops_do_not_checkpoint_peer_cpus() {
         let mut p = super::super::tests::process();
         let [fd, _] = p.linux.vfs.pipe(0).unwrap();

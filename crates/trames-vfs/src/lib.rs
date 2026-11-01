@@ -195,6 +195,7 @@ struct SharedOpenDescription {
     host_file: Option<Arc<hostfs::OpenFile>>,
     native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
+    file_authority: std::sync::OnceLock<file_io::PublishedFile>,
     control: Option<events::SharedControl>,
     id: u64,
     owner: (u32, u32),
@@ -585,7 +586,7 @@ pub struct Vfs {
     record_locks: Arc<locks::Registry>,
     file_size_limit: u64,
     file_size_signal: Cell<bool>,
-    next_open: Rc<Cell<u64>>,
+    next_open: Arc<AtomicU64>,
     proc_accessed: Cell<bool>,
     proc_refresh: Cell<ProcRefresh>,
     ptys: Rc<RefCell<BTreeMap<u32, Weak<Pty>>>>,
@@ -703,7 +704,7 @@ impl Vfs {
             record_locks: Arc::default(),
             file_size_limit: u64::MAX,
             file_size_signal: Cell::new(false),
-            next_open: Rc::new(Cell::new(1)),
+            next_open: Arc::new(AtomicU64::new(1)),
             proc_accessed: Cell::new(false),
             proc_refresh: Cell::new(ProcRefresh::Independent),
             bridge: None,
@@ -744,6 +745,7 @@ impl Default for Vfs {
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            file_authority: Default::default(),
                             control: None,
                             read_node: None,
                             id: v.open_id(),
@@ -793,8 +795,7 @@ impl Vfs {
             .any(|d| d.open.borrow().bridge.is_some())
     }
     fn open_id(&self) -> u64 {
-        let id = self.next_open.get();
-        self.next_open.set(id.wrapping_add(1));
+        let id = self.next_open.fetch_add(1, Ordering::Relaxed);
         (1u64 << 62) | id
     }
     /// CLONE_FILES joins the same membership object; later edits need no propagation.
@@ -1074,6 +1075,7 @@ impl Vfs {
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            file_authority: Default::default(),
                             control: None,
                             read_node: None,
                             id: self.open_id(),
@@ -1106,13 +1108,16 @@ impl Vfs {
         }
         Ok(())
     }
-    fn insert(
+    fn insert(&mut self, path: impl Into<ResolvedPath>, content: Content, mode: u32) -> Result<()> {
+        self.insert_entry(path.into(), content, mode, false)
+    }
+    fn insert_entry(
         &mut self,
-        path: impl Into<ResolvedPath>,
+        path: ResolvedPath,
         content: Content,
         mut mode: u32,
+        exclusive: bool,
     ) -> Result<()> {
-        let path = path.into();
         let filesystem = path.filesystem(self);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
@@ -1145,6 +1150,9 @@ impl Vfs {
             mode |= 0o2000;
         }
         let mut fs = filesystem.borrow_mut();
+        if exclusive && fs.paths.contains_key(&path.key) {
+            return Err(Errno(17));
+        }
         fs.admit_inode()?;
         if fs.paths.len() >= fs.limits.nodes {
             return Err(Errno(28));
@@ -1277,9 +1285,9 @@ impl Vfs {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
             return Ok(path);
         }
-        node.borrow()
-            .path_in(&self.fs.borrow().paths, b"/")
-            .ok_or(Errno(2))
+        let fs = self.fs.borrow();
+        let result = node.borrow().path_in(&fs.paths, b"/").ok_or(Errno(2));
+        result
     }
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
         Ok(self.descriptor(fd)?.open.borrow().kind.clone())
@@ -1907,6 +1915,17 @@ impl Vfs {
         mode: u32,
         policy: u64,
     ) -> Result<u32> {
+        self.open_at_resolve_published(dirfd, path, flags, mode, policy, None)
+    }
+    fn open_at_resolve_published(
+        &mut self,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        policy: u64,
+        publication: Option<&DirectFiles>,
+    ) -> Result<u32> {
         if policy & !63 != 0 || policy & 24 == 24 {
             return Err(Errno(22));
         }
@@ -1952,7 +1971,11 @@ impl Vfs {
                 return Ok(fd);
             }
         }
-        let fd = self.available(0)?;
+        let membership = self
+            .query
+            .as_ref()
+            .map_or_else(|| self.shared_files(), |q| q.files.clone());
+        let mut reservation = membership.reserve()?;
         let (p, _) = self.resolve_entry_policy(
             dirfd,
             path,
@@ -1963,9 +1986,11 @@ impl Vfs {
         // Only NO_XDEV alone can follow a final magic link. Validate the entire
         // traversal first; syscall execution serializes namespace mutations.
         if policy == 1 {
+            drop(reservation);
             if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
                 return Ok(fd);
             }
+            reservation = membership.reserve()?;
         }
         if flags & O_PATH == 0 {
             self.check_proc_inspection(&p, false)?;
@@ -1983,8 +2008,19 @@ impl Vfs {
         {
             return Err(Errno(30));
         }
-        let existed = match self.node(&p) {
-            Ok(_) => true,
+        let mut existed = match self.node(&p) {
+            Ok(node) => {
+                if let Some(query) = &self.query {
+                    let n = node.borrow();
+                    if n.volatile
+                        || n.seals.is_some()
+                        || !matches!(n.content, Content::File(storage::FileData::Plain(_)))
+                    {
+                        return query.defer();
+                    }
+                }
+                true
+            }
             Err(Errno(2)) => false,
             Err(e) => return Err(e),
         };
@@ -2000,11 +2036,15 @@ impl Vfs {
             self.check_parent_write(&p)?;
             #[cfg(all(feature = "hostfs", unix))]
             let native_created = if let Some(host) = &p.filesystem(self).host {
-                let (node, lease) =
-                    host.create_open(&p.filesystem(self), &p.key, flags, mode & !self.umask())?;
-                self.notification_link(&p, &node, true);
-                self.notification_entry(&p, inotify::CREATE, 0, false);
-                created_host_file = Some(lease);
+                match host.create_open(&p.filesystem(self), &p.key, flags, mode & !self.umask()) {
+                    Ok((node, lease)) => {
+                        self.notification_link(&p, &node, true);
+                        self.notification_entry(&p, inotify::CREATE, 0, false);
+                        created_host_file = Some(lease);
+                    }
+                    Err(Errno(17)) if flags & 0x80 == 0 => existed = true,
+                    Err(e) => return Err(e),
+                }
                 true
             } else {
                 false
@@ -2012,11 +2052,15 @@ impl Vfs {
             #[cfg(not(all(feature = "hostfs", unix)))]
             let native_created = false;
             if !native_created {
-                self.insert(
+                match self.insert_entry(
                     p.clone(),
                     Content::File(self.empty_data_at(&p)?),
                     0o100000 | (mode & 0o7777 & !self.umask()),
-                )?;
+                    true,
+                ) {
+                    Err(Errno(17)) if flags & 0x80 == 0 => existed = true,
+                    result => result?,
+                }
             }
         }
         let node = self.node(&p)?;
@@ -2085,18 +2129,16 @@ impl Vfs {
                 .transpose()?
                 .flatten(),
         };
+        if flags & 0x200 != 0
+            && !Self::cgroup_mount(&p)
+            && oom.is_none()
+            && network_control.is_none()
         {
             let mut n = node.borrow_mut();
-            if flags & 0x200 != 0
-                && !Self::cgroup_mount(&p)
-                && oom.is_none()
-                && network_control.is_none()
-            {
-                if let Content::File(b) = &mut n.content {
-                    b.truncate(0)?;
-                    n.times[1] = storage::Timestamp::now();
-                    n.times[2] = n.times[1];
-                }
+            if let Content::File(b) = &mut n.content {
+                b.truncate(0)?;
+                n.times[1] = storage::Timestamp::now();
+                n.times[2] = n.times[1];
             }
         }
         if flags & 0x200 != 0 {
@@ -2178,59 +2220,60 @@ impl Vfs {
         } else {
             None
         };
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        _disk_file: disk_file,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        control: None,
-                        read_node,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: if flags & O_PATH == 0
-                            && (pty.is_some()
-                                || matches!(
-                                    node.borrow().content,
-                                    Content::Terminal | Content::Device(pseudo::Device::Pts(_, _))
-                                ))
-                        {
-                            FdKind::Terminal
-                        } else {
-                            FdKind::Node(p.key.clone())
-                        },
-                        flags: (flags & !O_CLOEXEC).into(),
-                        file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
-                            value: 0,
-                            pending: 0,
-                        })),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: Some(node),
-                        pipe,
-                        bridge,
-                        kernel_log,
-                        notification,
-                    }),
-                    position: 0,
-                    mount: p.mount.map(OpenMount::Owner),
-                    socket: None,
-                    anonymous: None,
-                    local: None,
-                    pty,
-                    namespace: None,
-                    network_control,
-                    mount_file,
-                    oom,
+        let descriptor = Descriptor {
+            open: OpenHandle::new(OpenDescription {
+                shared: Arc::new(SharedOpenDescription {
+                    _disk_file: disk_file,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_file,
+                    native_image: None,
+                    mount_resource: std::sync::OnceLock::new(),
+                    file_authority: Default::default(),
+                    control: None,
+                    read_node,
+                    id: self.open_id(),
+                    owner: (self.credentials.fsuid, self.credentials.fsgid),
+                    kind: if flags & O_PATH == 0
+                        && (pty.is_some()
+                            || matches!(
+                                node.borrow().content,
+                                Content::Terminal | Content::Device(pseudo::Device::Pts(_, _))
+                            ))
+                    {
+                        FdKind::Terminal
+                    } else {
+                        FdKind::Node(p.key.clone())
+                    },
+                    flags: (flags & !O_CLOEXEC).into(),
+                    file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
+                        value: 0,
+                        pending: 0,
+                    })),
+                    flock: std::sync::OnceLock::new(),
+                    ofd_records: Default::default(),
+                    node: Some(node),
+                    pipe,
+                    bridge,
+                    kernel_log,
+                    notification,
                 }),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
-        Ok(fd)
+                position: 0,
+                mount: p.mount.map(OpenMount::Owner),
+                socket: None,
+                anonymous: None,
+                local: None,
+                pty,
+                namespace: None,
+                network_control,
+                mount_file,
+                oom,
+            }),
+            cloexec: (flags & O_CLOEXEC != 0).into(),
+        };
+        if let Some(files) = publication {
+            files.publish_open(self, &descriptor.open.borrow());
+        }
+        Ok(reservation.publish(descriptor, self.query.is_none().then_some(&self.fds)))
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
         if let Some(result) = self.fds.membership().close(fd, self.lock_owner) {
@@ -2401,6 +2444,7 @@ impl Vfs {
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            file_authority: Default::default(),
                             control: None,
                             read_node: None,
                             id: self.open_id(),

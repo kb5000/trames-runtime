@@ -485,7 +485,7 @@ impl Vfs {
         directory: bool,
     ) {
         if let Some((parent, name)) = self.notification_parent(path) {
-            parent.borrow_mut().notifications.send(
+            parent.borrow().notifications.send(
                 mask | if directory { ISDIR } else { 0 },
                 cookie,
                 &name,

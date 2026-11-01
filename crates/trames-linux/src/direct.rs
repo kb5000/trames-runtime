@@ -170,7 +170,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_path_query(&self, number: u32) -> bool {
-        matches!(number, 48 | 78..=80 | 291 | 439) && self.paths.is_some()
+        matches!(number, 48 | 56 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
     }
     pub fn invoke_path(
         &self,
@@ -178,7 +178,25 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        let result = crate::path_queries::call(self.paths.as_ref()?, number, a, memory)?;
+        let paths = self.paths.as_ref()?;
+        let result = if matches!(number, 56 | 437) {
+            let parameters = (|| {
+                let (flags, mode, policy) = if number == 437 {
+                    Linux::decode_open_how(memory, a[2], a[3])?
+                } else {
+                    (a[2] as u32, a[3] as u32, 0)
+                };
+                Ok((Linux::path(memory, a[1])?, flags, mode, policy))
+            })();
+            match parameters {
+                Ok((path, flags, mode, policy)) => paths
+                    .open_at_resolve(a[0] as i32, &path, flags, mode, policy, &self.files)?
+                    .map(u64::from),
+                Err(e) => Err(e),
+            }
+        } else {
+            crate::path_queries::call(paths, number, a, memory)?
+        };
         self.completed.set(self.completed.get() + 1);
         self.file_completed.set(self.file_completed.get() + 1);
         Some(result)
@@ -190,6 +208,9 @@ impl DirectSyscalls {
     pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
         self.local_identity = Some(identity);
         self
+    }
+    pub fn published_file(&self, fd: u32) -> bool {
+        self.files.published(fd)
     }
     pub fn with_files(mut self, files: trames_vfs::DirectFiles) -> Self {
         self.files = files;

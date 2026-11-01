@@ -453,7 +453,7 @@ serial path; worker counts therefore need not equal the workload's total calls.
 FD membership. It does not copy the directory tree or cache stat results. Host
 lookups still observe host replacement/unlink and virtual queries read live file
 metadata. The source root/cwd/mount topology is captured at the existing epoch
-boundary: chdir/chroot, mount changes, credentials and namespace mutations still
+boundary: chdir/chroot, mount changes, credentials and remaining namespace mutations still
 join before changing this authority. This step does not make these mutations
 concurrent with queries or remove their remaining owner dependency.
 
@@ -462,7 +462,7 @@ the existing resolver. Every Rc/RefCell/Cell in that view is private to the view
 source filesystem, inode, mount resources, host handles and FD membership cross
 only as their existing Send+Sync Arc capabilities. The view has a fresh empty
 control FD table, so its destruction cannot drain the real process membership.
-Its sealed query API returns owned bytes/results and exposes no VFS reference,
+Its sealed API returns owned bytes/results or numeric FDs and exposes no VFS reference,
 Rc or mutable control handle. `unsafe impl Send` moves this complete private
 control island between execution workers; the capability is neither Sync nor
 Clone. Tests assert Send+Sync on the captured resource types and move the query
@@ -506,3 +506,70 @@ replacement, deferred pseudo paths and one-time seccomp admission. Mac hardware
 and iPad interpreter checks share this source. The product's measured comparison
 and remaining migration work are maintained in the
 [coordinator audit](https://github.com/kb5000/trames-ipad/blob/main/docs/architecture/coordinator-removal.md).
+
+## Worker regular-file opens and publication (2026-11-02)
+
+`openat` and `openat2` now reuse the same resolver and open-description constructor
+on the existing execution worker for ordinary plain regular files, including
+`O_CREAT`, `O_EXCL`, `O_CLOEXEC` and `O_PATH` on a regular inode. Eligibility is
+decided by actual traversal and inode/backing kind, before creation, truncation,
+notifications or descriptor publication. Dynamic proc/sys/dev endpoints,
+directory cursors, lower-overlay files and other owner controls retain their
+joined path. Truncation is deferred before effects because changing an existing
+mapped backing still needs its original VM synchronization boundary.
+
+A Files transaction reserves a free numeric slot before opening the resource.
+The reservation is absent from visible membership, owns no fake guest descriptor
+and releases its number on errors or deferral. Publication installs the complete
+Arc-backed OFD and CLOEXEC bit in the real membership under its existing lock.
+Filesystem lookup, host I/O, notification delivery and preparation do not hold
+that lock. An explicit dup-to collision with an in-progress open returns Linux's
+`EBUSY`; close sees an unpublished slot as `EBADF`. Other allocations skip it.
+Creation tests cover one winner for `O_EXCL`, ordinary creators reopening the
+winning inode, distinct live FD numbers and reservation rollback. Private create
+checks insertion atomically under the existing filesystem namespace lock; host
+creation uses the native exclusive create and accepts an existing winner for
+non-exclusive `O_CREAT`. No deterministic winning thread is imposed.
+
+New OFDs publish immutable, weak prepared-file authority once on the actual OFD,
+before making the numeric FD visible. Existing worker captures first use their
+unchanged prepared map; a new OFD supplies its own prepared authority without a
+shared publication-cache lookup or a fresh path/stat walk on every read/write.
+The weak publication token is bound to its original execution epoch; a later
+checkpoint must recapture changed backing and policy through normal admission.
+Accepted I/O retains the original OFD across close/reuse. The authority does not
+retain the OFD, inode or data; last-close and open-unlinked lifetime stay real.
+Caller-specific FSETID and file-size-limit policy remain in the accepting capture,
+so another thread does not inherit the opener's write policy. New-file growth,
+append and other existing file-I/O deferrals can use the original per-caller
+owner service even though the FD was absent from the startup mask. This still
+has an owner hop, but does not stop peer CPUs to recapture the FD table.
+
+Only completed file-registration metadata uses the cohort's existing epoch
+lifetime, via a short registration lock. Actual resource preparation happens
+outside that lock. Joined completion merges the same live inode metadata as
+before. Open-description IDs use the session's shared relaxed atomic counter;
+worker-local copies must not create duplicate flock/OFD owners. Umask and the
+record-lock registry are the original shared capabilities. The private resolver
+view never exposes or publishes an Rc control, and its dummy FD table stays
+empty, so dropping the view cannot close real descriptors. The prior `Send`
+proof now covers this sealed open API as well as owned metadata results.
+
+Concurrent preparation no longer recursively borrows the inode while obtaining
+its flock capability. Ordinary open does not take an unused inode write lock;
+notification delivery uses its existing immutable Marks API. Reverse path lookup
+acquires the namespace read guard before the inode guard, matching insertion and
+checkpoint lock order. Tests exercise concurrent create, directory stat, close,
+FD reuse, distinct OFD lock owners, live umask and once-only seccomp decisions.
+No coordinator, resource thread, polling bus or ordinary-memory barrier is added.
+
+This is the second migration stage, not full FD/resource or coordinator removal.
+Pipe/socket/accept/event/timer creation, directory mutation, signal/task state,
+structural VM changes and native-device registration remain separate stages.
+
+The production systemd check also exposed a joined refresh of an unreached deferred
+page: its mutable storage had never been materialized. Refresh now goes through
+the same fallible source/private-COW load contract before updating the bytes.
+A deterministic regression covers shared physical identity, private isolation and
+backing I/O errors. Unchanged, untouched pages remain deferred; no new ordinary
+CPU memory check or barrier is introduced.
