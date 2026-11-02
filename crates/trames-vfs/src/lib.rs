@@ -3293,19 +3293,13 @@ impl Vfs {
             let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
             return Self::encode_host_directory(&o, count, children, inode, parent);
         }
-        let fs = filesystem.borrow();
         let inode = node.borrow().inode;
         let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
-        let mut children = BTreeMap::new();
+        let mut children = directory::metadata(&filesystem, &p.key);
         let mut prefix = p.clone();
         if prefix != b"/" {
             prefix.push(b'/');
         }
-        for (name, node) in directory::children(&fs.paths, &p.key) {
-            let n = node.borrow();
-            children.insert(name.to_vec(), (n.inode, ((n.mode & 0o170000) >> 12) as u8));
-        }
-        drop(fs);
         for name in self.mounted_pseudo_children(&p)? {
             let mut child = prefix.clone();
             child.extend_from_slice(&name);

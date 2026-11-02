@@ -2,6 +2,22 @@
 //! Enumerate immediate children without walking every descendant in a flat map.
 use std::collections::{btree_map::Range, BTreeMap};
 
+/// Return owned child metadata before the caller resolves any parent/mount
+/// paths. A resolver can acquire this same namespace lock again; keeping its
+/// calls outside this scope avoids recursive reads behind a queued writer.
+pub(super) fn metadata(filesystem: &super::FsHandle, key: &[u8]) -> BTreeMap<Vec<u8>, (u64, u8)> {
+    let fs = filesystem.borrow();
+    children(&fs.paths, key)
+        .map(|(name, node)| {
+            let node = node.borrow();
+            (
+                name.to_vec(),
+                (node.inode, ((node.mode & 0o170000) >> 12) as u8),
+            )
+        })
+        .collect()
+}
+
 /// Host/private enumeration shares the same actual OFD cursor. The lock covers
 /// only encoding and its cursor commit, never namespace lookup or resource drop.
 pub(super) fn encode(

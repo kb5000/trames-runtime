@@ -218,3 +218,61 @@ fn worker_host_directory_uses_live_children_and_the_same_cookies() {
     drop(owner);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn directory_walk_and_concurrent_creation_finish_without_nested_namespace_reads() {
+    let mut owner = Vfs::default();
+    owner.mkdir_at(AT_FDCWD, b"/read", 0o755).unwrap();
+    owner.mkdir_at(AT_FDCWD, b"/write", 0o755).unwrap();
+    let fd = owner.open_at(AT_FDCWD, b"/read", O_DIRECTORY, 0).unwrap();
+    let mut epoch = FileEpoch::default();
+    let barrier = Arc::new(std::sync::Barrier::new(6));
+    let (sent, received) = std::sync::mpsc::channel();
+    let jobs: Vec<_> = (0..6)
+        .map(|i| {
+            let q = owner.path_queries();
+            let files = epoch.capture(&owner, true);
+            let membership = owner.shared_files();
+            let barrier = barrier.clone();
+            let sent = sent.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for n in 0..if i < 4 { 1000 } else { 256 } {
+                    if i < 4 {
+                        q.directory_seek(fd, 0, 0).unwrap().unwrap();
+                        let bytes = q.getdents(fd, 4096, || Ok(())).unwrap().unwrap();
+                        assert!(
+                            bytes.is_empty()
+                                || names(&bytes) == vec![b".".to_vec(), b"..".to_vec()]
+                        );
+                    } else {
+                        let path = format!("/write/{i}-{n}");
+                        let file = q
+                            .open_at_resolve(AT_FDCWD, path.as_bytes(), 0x42, 0o600, 0, &files)
+                            .unwrap()
+                            .unwrap();
+                        membership.close(file, 0).unwrap().unwrap();
+                    }
+                }
+                sent.send(()).unwrap();
+            })
+        })
+        .collect();
+    drop(sent);
+    for _ in 0..6 {
+        if received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            // A failed regression must report failure, not deadlock its own
+            // cleanup on the namespace held by the blocked test workers.
+            std::mem::forget(owner);
+            std::mem::forget(epoch);
+            panic!("directory readers/namespace creators failed to make progress");
+        }
+    }
+    for job in jobs {
+        job.join().unwrap();
+    }
+    epoch.finish();
+}

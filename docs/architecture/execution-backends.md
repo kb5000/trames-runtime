@@ -1260,3 +1260,22 @@ join unrelated CPUs for these lifecycle/control operations; worker messages woul
 add a hop to the same objects. Direct shared ownership is used instead. Full
 Unix control ownership, owner-only PTY/ring/task/namespace graphs, task signal
 queues, directory mutation and structural VM/device transitions remain pending.
+
+### Concurrent directory namespace snapshots (2026-11-03)
+
+A cold directory benchmark exposed a recursive namespace read in getdents64:
+while holding the filesystem read guard, parent/mount resolution could acquire
+that same read lock. A queued namespace writer could then block the recursive
+reader behind itself, while waiting for the first read guard to leave. Live
+thread stacks showed directory readers in mount root/parent resolution and
+creators waiting in insert_entry on the same filesystem.
+
+Directory child metadata now comes from a closed helper returning owned values.
+The namespace guard does not escape, and the caller resolves parent/mount paths
+outside that scope. Encoding/cursor commit remain separate. This removes the
+recursive lock dependency without adding a lock, check, coordinator hop or guest
+memory barrier. A bounded concurrent creation/enumeration regression fails on
+the committed unfixed code and completes on the corrected code. Cold concurrent
+creation remains part of functional validation; timing comparisons can prepare
+contents sequentially to compare identical hot-loop work without concealing the
+recorded baseline deadlock.
