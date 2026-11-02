@@ -1047,6 +1047,16 @@ keep the existing fallback until admitted. Epoll watches stay weak and preserve
 edge/oneshot state; accepted native io_uring I/O retains a real transport lease.
 Capturing or polling a socket does not itself extend its last-close lifetime.
 
+Owner/service syscall admission retains one complete original socket OFD too.
+Service eligibility reads that OFD's live flags; bind/connect/accept, address
+copyout and TCP publication then use the same accepted object. A worker may
+close and reuse its old numeric FD without retargeting an in-progress operation.
+Accept never repeats the original numeric lookup after output preflight. The
+old OFD owns publication even if its number now names another socket or file.
+A deterministic regression closes/reuses a listener FD on a worker, connects to
+the retained original listener, and accepts from that listener while the new
+listener remains untouched.
+
 DescriptorFactory captures the creating Network and guest credentials. The
 production worker handles syscall 198 (IP and netlink socket creation) through
 the original permission/flag/error ordering and actual Files reservations.

@@ -104,6 +104,9 @@ impl Vfs {
         result
     }
     fn direct_tcp_open(open: &OpenDescription) -> Option<DirectTcpFd> {
+        Self::direct_tcp_shared(&open.shared)
+    }
+    pub(super) fn direct_tcp_shared(open: &SharedOpenDescription) -> Option<DirectTcpFd> {
         let socket = open.socket.as_ref()?;
         Some(DirectTcpFd {
             tcp: socket.direct_tcp()?,

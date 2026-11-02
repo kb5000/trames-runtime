@@ -482,36 +482,23 @@ impl Linux {
             if !matches!(a[0] as u32, 2 | 10) {
                 return None;
             }
-        } else {
-            if !matches!(number, 200..=205 | 208..=210 | 242) {
-                return None;
-            }
-            let socket = self.vfs.socket_fd(a[0] as u32).ok()?;
-            if !matches!(socket.address_size(), 16 | 28) {
-                return None;
-            }
-            if matches!(number, 202 | 203 | 242)
-                && self.vfs.flags(a[0] as u32).ok()? & trames_vfs::O_NONBLOCK == 0
-            {
-                return None;
-            }
+            return Some(Self::network_vfs(&mut self.vfs, number as u64, a, memory));
         }
-        Some(Self::network_vfs(&mut self.vfs, number as u64, a, memory))
+        if !matches!(number, 200..=205 | 208..=210 | 242) {
+            return None;
+        }
+        let socket = self.vfs.socket_operation(a[0] as u32).ok()?;
+        if !matches!(socket.address_size(), 16 | 28) {
+            return None;
+        }
+        if matches!(number, 202 | 203 | 242) && socket.flags() & trames_vfs::O_NONBLOCK == 0 {
+            return None;
+        }
+        let result = Self::network_socket(&mut self.vfs, &socket, number as u64, a, memory);
+        socket.refresh_tcp();
+        Some(result)
     }
     pub(crate) fn network_vfs(
-        vfs: &mut trames_vfs::Vfs,
-        number: u64,
-        a: [u64; 6],
-        memory: &mut impl CpuMemory,
-    ) -> Result<u64> {
-        if matches!(number,200..=206|208..=211|242) {
-            return vfs.with_socket_control(a[0] as u32, |vfs| {
-                Self::network_vfs_controlled(vfs, number, a, memory)
-            });
-        }
-        Self::network_vfs_controlled(vfs, number, a, memory)
-    }
-    fn network_vfs_controlled(
         vfs: &mut trames_vfs::Vfs,
         number: u64,
         a: [u64; 6],
@@ -530,7 +517,20 @@ impl Linux {
         if let Some(socket) = vfs.local_socket(a[0] as u32)? {
             return Self::local_network_vfs(vfs, &socket, number, a, memory);
         }
-        let socket = vfs.socket_fd(a[0] as u32)?;
+        let socket = vfs.socket_operation(a[0] as u32)?;
+        let result = Self::network_socket(vfs, &socket, number, a, memory);
+        if matches!(number,200..=206|208..=211|242) {
+            socket.refresh_tcp();
+        }
+        result
+    }
+    fn network_socket(
+        vfs: &mut trames_vfs::Vfs,
+        socket: &trames_net::Socket,
+        number: u64,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64> {
         match number {
             200 | 203 => {
                 let peer = address(memory, a[1], a[2])?;
@@ -553,8 +553,8 @@ impl Linux {
             }
             202 | 242 => {
                 let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?;
-                let (fd, _) = vfs.accept_output(
-                    a[0] as u32,
+                let (fd, _) = vfs.accept_socket_output(
+                    socket,
                     if number == 242 { a[3] as u32 } else { 0 },
                     |peer| match output {
                         Some(output) => output.write(memory, Some(peer)),
@@ -583,7 +583,7 @@ impl Linux {
                 };
                 let mut bytes = vec![0; a[2] as usize];
                 memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(vfs.socket_send_bytes(&socket, &bytes, a[3] as u32, peer.as_deref())? as u64)
+                Ok(vfs.socket_send_bytes(socket, &bytes, a[3] as u32, peer.as_deref())? as u64)
             }
             207 => {
                 let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
@@ -765,7 +765,7 @@ impl Linux {
                             .map_err(net)? as u64)
                     } else {
                         Ok(
-                            vfs.socket_send_bytes(&socket, &bytes, a[2] as u32, peer.as_deref())?
+                            vfs.socket_send_bytes(socket, &bytes, a[2] as u32, peer.as_deref())?
                                 as u64,
                         )
                     }

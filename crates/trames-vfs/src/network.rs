@@ -1,6 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use std::net::SocketAddr;
+/// One syscall's accepted original network OFD, independent of numeric reuse.
+pub struct SocketOperation(Arc<SharedOpenDescription>);
+impl std::ops::Deref for SocketOperation {
+    type Target = NetSocket;
+    fn deref(&self) -> &Self::Target {
+        self.0.socket.as_deref().expect("network OFD")
+    }
+}
+impl SocketOperation {
+    pub fn flags(&self) -> u32 {
+        self.0.flags.get()
+    }
+    pub fn refresh_tcp(&self) {
+        let tcp = Vfs::direct_tcp_shared(&self.0);
+        *self.0.tcp_publication.lock().unwrap() = tcp;
+    }
+}
 #[derive(Clone, Copy)]
 enum Sysctl {
     PingRange,
@@ -250,6 +267,12 @@ impl Vfs {
             cloexec: (flags & O_CLOEXEC != 0).into(),
         }
     }
+    pub fn socket_operation(&self, fd: u32) -> Result<SocketOperation> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        open.socket.as_ref().ok_or(Errno(88))?;
+        Ok(SocketOperation(open.shared.clone()))
+    }
     pub fn socket_fd(&self, fd: u32) -> Result<Arc<NetSocket>> {
         self.descriptor(fd)?
             .open
@@ -272,7 +295,19 @@ impl Vfs {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
-        let socket = self.socket_fd(fd)?;
+        let socket = self.socket_operation(fd)?;
+        self.accept_socket_output(&socket, flags, output)
+    }
+    /// Caller already retained its original socket; never look up its number again.
+    pub fn accept_socket_output(
+        &mut self,
+        socket: &NetSocket,
+        flags: u32,
+        output: impl FnOnce(SocketAddr) -> Result<()>,
+    ) -> Result<(u32, SocketAddr)> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(Errno(22));
+        }
         let reserved = self.fds.membership().reserve()?;
         let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
         output(address)?;
@@ -315,6 +350,46 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_control_keeps_the_original_listener_after_worker_close_and_fd_reuse() {
+        fn shared<T: Send + Sync>() {}
+        shared::<SocketOperation>();
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1 | O_NONBLOCK, 0).unwrap();
+        let original = v.socket_operation(fd).unwrap();
+        original.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        original.listen(4).unwrap();
+        let address = original.local_addr().unwrap();
+        let files = v.shared_files();
+        std::thread::spawn(move || files.close(fd, 1).unwrap().unwrap())
+            .join()
+            .unwrap();
+        let reused = v.socket(2, 1 | O_NONBLOCK, 0).unwrap();
+        assert_eq!(reused, fd);
+        let replacement = v.socket_fd(reused).unwrap();
+        replacement.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        replacement.listen(4).unwrap();
+        assert_ne!(replacement.local_addr().unwrap(), address);
+        let _peer = std::net::TcpStream::connect(address).unwrap();
+        let (accepted, _) = v
+            .accept_socket_output(&original, O_NONBLOCK, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            v.socket_fd(accepted).unwrap().local_addr().unwrap(),
+            address
+        );
+        assert!(matches!(
+            replacement.accept(),
+            Err(trames_net::NetError(11))
+        ));
+        original.refresh_tcp();
+        v.close(accepted).unwrap();
+        v.close(reused).unwrap();
+        drop(replacement);
+        std::thread::spawn(move || drop(original)).join().unwrap();
+        assert_eq!(v.live_sockets(), 0);
+    }
     #[test]
     fn forwarding_controls_pin_namespace_recheck_authority_and_validate_values() {
         let mut v = Vfs::default();

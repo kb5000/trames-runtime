@@ -121,6 +121,7 @@ pub fn query_fd_flags(flags: u32, command: u64) -> Result<u64> {
         _ => Err(Errno(22)),
     }
 }
+pub use network::SocketOperation;
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub use trames_net::{NetworkMode, Socket as NetSocket};
 pub fn kernel_log_capacity() -> usize {
