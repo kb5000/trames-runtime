@@ -374,7 +374,7 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
-            number @ (19 | 26 | 59 | 85) => {
+            number @ (19 | 26 | 59 | 85 | 198) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }
@@ -769,6 +769,7 @@ mod tests {
         assert!(!service_candidate(&cpu, &snapshot));
         snapshot.direct = trames_linux::DirectSyscalls::default()
             .with_membership(vfs.shared_files())
+            .with_resources(vfs.descriptor_factory())
             .with_lock_context(vfs.record_lock_context(1));
         cpu.set_x(1, 1030);
         cpu.set_x(2, 160);
@@ -784,6 +785,27 @@ mod tests {
         assert_eq!(snapshot.invoke(&cpu, &mut memory), Some(0));
         assert_eq!(vfs.flags(160), Err(Errno(9)));
         assert!(vfs.flags(fd).is_ok() && vfs.flags(200).is_ok());
+        cpu.set_x(8, 198);
+        cpu.set_x(0, 16);
+        cpu.set_x(1, 3);
+        cpu.set_x(2, 0);
+        assert!(snapshot.direct.supports_creation(198));
+        let socket = snapshot
+            .invoke(&cpu, &mut memory)
+            .expect("worker socket creation") as u32;
+        assert_eq!(vfs.socket_fd(socket).unwrap().address_size(), 12);
+        cpu.set_x(8, 57);
+        cpu.set_x(0, socket as u64);
+        assert_eq!(snapshot.invoke(&cpu, &mut memory), Some(0));
+        assert_eq!(vfs.fd_kind(socket), Err(Errno(9)));
+        cpu.set_x(8, 198);
+        cpu.set_x(0, 1);
+        cpu.set_x(1, 1);
+        assert_eq!(
+            snapshot.invoke(&cpu, &mut memory),
+            None,
+            "AF_UNIX defers before effects"
+        );
         cpu.set_x(8, 25);
         cpu.set_x(0, u32::MAX as u64);
         cpu.set_x(1, 3);

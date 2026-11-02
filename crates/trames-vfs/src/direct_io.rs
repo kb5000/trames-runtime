@@ -252,7 +252,12 @@ impl WatchResource {
         polls: Option<&BTreeMap<usize, Arc<dyn DirectPoll>>>,
     ) -> Option<Self> {
         match open {
-            OpenWeak::Shared(open) => Some(Self::Shared(open.clone())),
+            OpenWeak::Shared(open) => {
+                // Ownership can be shared before the endpoint is directly
+                // pollable (UDP, virtual transports, pre-connect TCP).
+                SharedFd::new(open.upgrade()?).direct_poll()?;
+                Some(Self::Shared(open.clone()))
+            }
             OpenWeak::Owner(_) => {
                 let open = open.upgrade()?;
                 let open = open.borrow();
@@ -268,7 +273,21 @@ impl WatchResource {
     }
     pub(super) fn resolve(&self) -> Option<DirectFd> {
         match self {
-            Self::Shared(open) => SharedFd::new(open.upgrade()?).direct_byte(),
+            Self::Shared(open) => {
+                let open = open.upgrade()?;
+                if open.kind == FdKind::Socket {
+                    let tcp = open
+                        .tcp_publication
+                        .lock()
+                        .unwrap()
+                        .as_ref()?
+                        .tcp
+                        .poll_only();
+                    Some(DirectFd::tcp_poll(&open, tcp))
+                } else {
+                    SharedFd::new(open).direct_poll()
+                }
+            }
             Self::Owner(fd) => fd
                 .origin
                 .as_ref()

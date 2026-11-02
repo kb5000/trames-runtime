@@ -29,6 +29,7 @@ impl ImageFds for Images {
         // Construct the complete OFD before publishing one slot. The table
         // mutex covers membership only; no native operation runs under it.
         let open = Arc::new(SharedOpenDescription {
+            socket: None,
             _disk_file: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_file: None,

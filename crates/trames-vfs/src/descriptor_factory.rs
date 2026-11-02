@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Real Files publication for fully shared anonymous resources. No owner RPC.
+//! Real Files publication for shared anonymous resources and network sockets.
 use super::*;
 
 #[derive(Clone)]
@@ -7,6 +7,8 @@ pub struct DescriptorFactory {
     files: SharedFiles,
     ids: Arc<AtomicU64>,
     owner: (u32, u32),
+    network: trames_net::Network,
+    credentials: Credentials,
 }
 pub(super) fn next_id(ids: &AtomicU64) -> u64 {
     (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)
@@ -17,12 +19,43 @@ impl Vfs {
             files: self.shared_files(),
             ids: self.next_open.clone(),
             owner: (self.credentials.fsuid, self.credentials.fsgid),
+            network: self.network.clone(),
+            credentials: self.credentials.clone(),
         }
     }
 }
 impl DescriptorFactory {
     fn open_id(&self) -> u64 {
         next_id(&self.ids)
+    }
+    /// AF_UNIX still owns task/SCM_RIGHTS state and uses the joined path.
+    /// IP and netlink creation retain the original namespace and credentials.
+    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
+        if matches!((family, kind & 0xf, protocol), (2, 2, 1) | (10, 2, 58)) {
+            let [low, high] = self.network.ping_range();
+            if !std::iter::once(self.credentials.egid)
+                .chain(self.credentials.groups.iter().copied())
+                .any(|gid| (low..=high).contains(&gid))
+            {
+                return Err(Errno(13));
+            }
+        }
+        if matches!(family, 2 | 10)
+            && kind & 0xf == 3
+            && !self.credentials.has_cap(capabilities::NET_RAW)
+        {
+            return Err(Errno(1));
+        }
+        if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
+            return Err(Errno(22));
+        }
+        let reserved = self.files.reserve()?;
+        let socket = self
+            .network
+            .socket(family, kind & 0xf, protocol)
+            .map_err(|e| Errno(e.0))?;
+        let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, kind);
+        Ok(reserved.publish(descriptor, None))
     }
     fn anonymous(&self, flags: u32, resource: events::Anonymous) -> Result<u32> {
         let reservation = self.files.reserve()?;
@@ -94,6 +127,7 @@ impl DescriptorFactory {
             |(end, kind, access)| Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        socket: None,
                         _disk_file: None,
                         #[cfg(all(feature = "hostfs", unix))]
                         host_file: None,
@@ -118,7 +152,6 @@ impl DescriptorFactory {
                         notification: None,
                     }),
                     position: 0,
-                    socket: None,
                     anonymous: None,
                     local: None,
                     pty: None,
@@ -139,6 +172,55 @@ impl DescriptorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_socket_creation_publishes_complete_ofds_and_keeps_creating_authority() {
+        let mut owner = Vfs::default();
+        owner.configure_network(NetworkMode::Loopback).unwrap();
+        owner.credentials = Credentials::user(1000, 1000);
+        owner.network.set_ping_range([0, 0]);
+        let original = owner.network.clone();
+        let factory = owner.descriptor_factory();
+        let files = owner.shared_files();
+        let network = owner.direct_network();
+        // Authority changes checkpoint workers; a retained capture still owns
+        // the exact creating namespace/credentials rather than looking up Vfs.
+        owner.credentials = Credentials::user(0, 0);
+        owner.unshare_net().unwrap();
+        let fds = std::thread::spawn(move || {
+            assert_eq!(factory.socket(2, 2, 1), Err(Errno(13)));
+            assert_eq!(factory.socket(2, 3, 1), Err(Errno(1)));
+            [
+                factory.socket(2, 1 | O_NONBLOCK | O_CLOEXEC, 0).unwrap(),
+                factory.socket(16, 3 | O_CLOEXEC, 0).unwrap(),
+            ]
+        })
+        .join()
+        .unwrap();
+        assert_eq!(original.live_sockets(), 2);
+        let socket = owner.socket_fd(fds[0]).unwrap();
+        assert_eq!(socket.info().unwrap().namespace_id, original.namespace_id());
+        assert_ne!(
+            socket.info().unwrap().namespace_id,
+            owner.network.namespace_id()
+        );
+        let weak = Arc::downgrade(&socket);
+        drop(socket);
+        for fd in fds {
+            assert!(network.is_socket(fd));
+            assert!(files.lookup(fd).unwrap().is_ok());
+            assert!(owner.fds.lookup(fd).unwrap().cloexec.get());
+        }
+        std::thread::spawn(move || {
+            for fd in fds {
+                files.close(fd, 1).unwrap().unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(original.live_sockets(), 0);
+        assert!(!network.is_socket(fds[0]));
+    }
     #[test]
     fn factories_are_send_sync_and_publish_real_resources_into_existing_views() {
         fn shared<T: Send + Sync>() {}

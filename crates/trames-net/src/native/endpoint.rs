@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Actual host transport ownership, without namespace/path Rc projections.
+//! Actual host transport ownership, without namespace/path Arc projections.
 use super::*;
 use crate::socket_quota::Reservation;
 use std::sync::Mutex;

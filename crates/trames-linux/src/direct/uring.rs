@@ -750,6 +750,7 @@ impl UringSnapshot {
                 .clone()
                 .direct_byte()
                 .map(Object::Byte)
+                .or_else(|| file.direct_tcp().map(Object::Tcp))
                 .or_else(|| self.files.accept(file).map(Object::File));
             return Ok(object.map(|object| Resource {
                 object,
@@ -1296,6 +1297,9 @@ impl UringEpoch {
             }
             if let Ok(file) = vfs.retain_uring_fd(fd) {
                 if file.shared_file().is_some() {
+                    if file.socket().is_some() {
+                        vfs.refresh_tcp(fd);
+                    }
                     continue;
                 }
                 if let Some(resource) = Resource::capture(&file)

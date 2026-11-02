@@ -105,7 +105,6 @@ impl OpenDescription {
         Self {
             shared,
             position: 0,
-            socket: None,
             anonymous,
             local: None,
             pty: None,
@@ -137,8 +136,7 @@ impl OpenDescription {
         Some(Arc::downgrade(&self.shared))
     }
     fn shareable(&self) -> bool {
-        if self.socket.is_some()
-            || matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
+        if matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
             || self.anonymous.is_some() && self.control.is_none()
             || self.local.is_some()
             || self.pty.is_some()
@@ -151,7 +149,8 @@ impl OpenDescription {
         {
             return false;
         }
-        self.control.is_some()
+        self.socket.is_some()
+            || self.control.is_some()
             || self.pipe.is_some()
             || self.node.as_ref().is_some_and(|node| {
                 let node = node.borrow();

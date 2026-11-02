@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_socket_create_close_loops_do_not_checkpoint_peer_cpus() {
+    fn idle_socket_create_close_loops_need_no_coordinator_or_peer_checkpoint() {
         let mut p = super::super::tests::process();
         p.linux
             .vfs
@@ -607,12 +607,11 @@ mod tests {
         assert!(k
             .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
             .unwrap());
+        assert_eq!(k.service_requests, 0);
         assert!(
-            k.service_requests > 100,
-            "services={} rounds={} pcs={:?}",
-            k.service_requests,
-            k.parallel_rounds,
-            k.processes.values().map(|p| p.cpu.pc).collect::<Vec<_>>()
+            k.worker_fd_syscalls > 100,
+            "worker_fd_syscalls={}",
+            k.worker_fd_syscalls
         );
         assert!(k.parallel_rounds <= 4, "rounds={}", k.parallel_rounds);
         for p in k.processes.values() {

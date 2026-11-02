@@ -5,8 +5,8 @@ pub(super) struct Flow {
     pub node: u64,
     tuple: Tuple,
     identifier: u16,
-    pub native: Rc<native::Socket>,
-    owner: Weak<Socket>,
+    pub native: Arc<native::Socket>,
+    owner: Weak<SocketMeta>,
     pub pending: Option<Vec<u8>>,
     last: Instant,
 }
@@ -108,7 +108,7 @@ impl Gateway {
                 tuple: h.tuple,
                 identifier,
                 native: socket,
-                owner: Rc::downgrade(&owner),
+                owner: Arc::downgrade(&owner),
                 pending: None,
                 last: Instant::now(),
             });

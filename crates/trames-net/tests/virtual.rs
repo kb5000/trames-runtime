@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::{
     net::{IpAddr, SocketAddr},
-    rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use trames_net::{wait, Fabric, NetError, Network, NetworkMode, Socket, MSG_PEEK, MSG_TRUNC};
 fn net(f: &Fabric, id: u8) -> Network {
     Network::virtual_network(f, id, NetworkMode::Outbound).unwrap()
 }
-fn socket(n: &Network, v6: bool, tcp: bool) -> Rc<Socket> {
+fn socket(n: &Network, v6: bool, tcp: bool) -> Arc<Socket> {
     n.socket(if v6 { 10 } else { 2 }, if tcp { 1 } else { 2 }, 0)
         .unwrap()
 }
 fn parse(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }
-fn until<T>(s: &Rc<Socket>, mut f: impl FnMut() -> Result<T, NetError>) -> T {
+fn until<T>(s: &Arc<Socket>, mut f: impl FnMut() -> Result<T, NetError>) -> T {
     let end = Instant::now() + Duration::from_secs(5);
     loop {
         match f() {
@@ -27,7 +27,7 @@ fn until<T>(s: &Rc<Socket>, mut f: impl FnMut() -> Result<T, NetError>) -> T {
         wait(&[(s.clone(), 1 | 4)], Duration::from_millis(2)).unwrap();
     }
 }
-fn connect(s: &Rc<Socket>, a: SocketAddr) {
+fn connect(s: &Arc<Socket>, a: SocketAddr) {
     assert_eq!(s.connect(a), Err(NetError(115)));
     until(s, || {
         if s.connect_complete()? {

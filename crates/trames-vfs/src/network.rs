@@ -202,36 +202,18 @@ impl Vfs {
         if family == 1 {
             return self.local_create(kind, protocol);
         }
-        if matches!((family, kind & 0xf, protocol), (2, 2, 1) | (10, 2, 58)) {
-            let [low, high] = self.network.ping_range();
-            if !std::iter::once(self.credentials.egid)
-                .chain(self.credentials.groups.iter().copied())
-                .any(|gid| (low..=high).contains(&gid))
-            {
-                return Err(Errno(13));
-            }
-        }
-        if matches!(family, 2 | 10)
-            && kind & 0xf == 3
-            && !self.credentials.has_cap(capabilities::NET_RAW)
-        {
-            return Err(Errno(1));
-        }
-        if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
-            return Err(Errno(22));
-        }
-        let reserved = self.fds.membership().reserve()?;
-        let socket = self
-            .network
-            .socket(family, kind & 0xf, protocol)
-            .map_err(|e| Errno(e.0))?;
-        let descriptor = self.socket_descriptor(socket, kind);
-        Ok(reserved.publish(descriptor, Some(&self.fds)))
+        self.descriptor_factory().socket(family, kind, protocol)
     }
-    fn socket_descriptor(&self, socket: Rc<NetSocket>, flags: u32) -> Descriptor {
+    pub(super) fn socket_descriptor(
+        id: u64,
+        owner: (u32, u32),
+        socket: Arc<NetSocket>,
+        flags: u32,
+    ) -> Descriptor {
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    socket: Some(socket.clone()),
                     _disk_file: None,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_file: None,
@@ -239,11 +221,11 @@ impl Vfs {
                     mount_resource: std::sync::OnceLock::new(),
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
-                    socket_control: socket.direct_control().map(network_io::SocketControl::new),
+                    socket_control: Some(network_io::SocketControl::new(&socket)),
                     control: None,
                     read_node: None,
-                    id: self.open_id(),
-                    owner: (self.credentials.fsuid, self.credentials.fsgid),
+                    id,
+                    owner,
                     kind: FdKind::Socket,
                     flags: (2 | (flags & O_NONBLOCK)).into(),
                     file_position: Arc::default(),
@@ -256,7 +238,6 @@ impl Vfs {
                     notification: None,
                 }),
                 position: 0,
-                socket: Some(socket),
                 anonymous: None,
                 local: None,
                 pty: None,
@@ -269,7 +250,7 @@ impl Vfs {
             cloexec: (flags & O_CLOEXEC != 0).into(),
         }
     }
-    pub fn socket_fd(&self, fd: u32) -> Result<Rc<NetSocket>> {
+    pub fn socket_fd(&self, fd: u32) -> Result<Arc<NetSocket>> {
         self.descriptor(fd)?
             .open
             .borrow()
@@ -295,7 +276,12 @@ impl Vfs {
         let reserved = self.fds.membership().reserve()?;
         let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
         output(address)?;
-        let descriptor = self.socket_descriptor(socket, flags);
+        let descriptor = Self::socket_descriptor(
+            self.open_id(),
+            (self.credentials.fsuid, self.credentials.fsgid),
+            socket,
+            flags,
+        );
         let new = reserved.publish(descriptor, Some(&self.fds));
         self.refresh_tcp(new);
         Ok((new, address))

@@ -2,8 +2,8 @@
 use super::*;
 impl Socket {
     pub fn info(&self) -> crate::SocketInfo {
-        let state = self.state.borrow();
         let fabric = self.network.0.fabric.0.borrow();
+        let state = self.state.borrow();
         let mut code = if state.peer.is_some() { 1 } else { 7 };
         let (mut tx, mut rx) = (0, 0);
         if let Some(n) = fabric.nodes.get(&self.network.0.key) {
@@ -232,7 +232,7 @@ impl Socket {
         n.registry
             .iter()
             .filter_map(Weak::upgrade)
-            .filter(|s| !std::ptr::eq(s.as_ref(), self) && s.kind == self.kind)
+            .filter(|s| !std::ptr::eq(s.as_ref(), self.meta.as_ref()) && s.kind == self.kind)
             .all(|s| {
                 let state = s.state.borrow();
                 let Some(b) = state.bound else {
@@ -261,6 +261,17 @@ impl Socket {
         Err(NetError(98))
     }
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
+        let _binding = self.network.0.binding.lock();
+        self.bind_locked(a)
+    }
+    fn ensure_bound(&self) -> Result<()> {
+        let _binding = self.network.0.binding.lock();
+        if self.state.borrow().bound.is_some() {
+            return Ok(());
+        }
+        self.bind_locked(self.wildcard())
+    }
+    fn bind_locked(&self, a: SocketAddr) -> Result<()> {
         self.fabric().tick();
         let mut a = self.normalize(a)?;
         if self.network.0.finished.get() {
@@ -384,9 +395,9 @@ impl Socket {
         state.backlog = backlog;
         Ok(())
     }
-    pub fn accept(&self) -> Result<(Rc<Socket>, SocketAddr)> {
+    pub fn accept(&self) -> Result<(Arc<Socket>, SocketAddr)> {
         self.fabric().tick();
-        self.network.reserve()?;
+        let reservation = self.network.reserve()?;
         let mut i = self.network.0.fabric.0.borrow_mut();
         i.reserve(1)?;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
@@ -445,7 +456,7 @@ impl Socket {
         drop(state);
         drop(i);
         Ok((
-            self.network.wrap(self.family, 1, accepted),
+            self.network.wrap(self.family, 1, accepted, reservation),
             self.presented(peer),
         ))
     }
@@ -465,7 +476,7 @@ impl Socket {
         let bound = state.bound;
         drop(state);
         if bound.is_none() {
-            self.bind(self.wildcard())?;
+            self.ensure_bound()?;
         }
         if self.kind != 1 {
             let mut s = self.state.borrow_mut();
@@ -618,8 +629,9 @@ impl Socket {
                 return Err(NetError(90));
             }
             if self.state.borrow().bound.is_none() {
-                self.bind(self.wildcard())?;
+                self.ensure_bound()?;
             }
+            let mut i = self.network.0.fabric.0.borrow_mut();
             let state = self.state.borrow();
             if state.write_closed {
                 return Err(NetError(32));
@@ -636,7 +648,6 @@ impl Socket {
             } else {
                 None
             };
-            let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let h = state
                 .handles
@@ -679,6 +690,7 @@ impl Socket {
             return Err(NetError(106));
         }
         self.before_io()?;
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if state.write_closed || matches!(state.connection, Connection::Failed(_)) {
             return Err(NetError(32));
@@ -689,7 +701,6 @@ impl Socket {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
         if !s.may_send() {
@@ -721,6 +732,7 @@ impl Socket {
         if self.kind == 1 {
             self.before_io()?;
         }
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
@@ -745,7 +757,6 @@ impl Socket {
             }
             return Err(NetError(107));
         }
-        let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         if self.kind == 1 {
             let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
@@ -839,11 +850,11 @@ impl Socket {
     }
     pub fn poll(&self, events: u16) -> Result<u16> {
         self.fabric().tick();
+        let i = self.network.0.fabric.0.borrow();
         let state = self.state.borrow();
         if matches!(state.connection, Connection::Failed(_)) {
             return Ok(events & 4 | 16 | if state.error.is_some() { 8 } else { 0 });
         }
-        let i = self.network.0.fabric.0.borrow();
         let n = i.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
         let mut ready = if state.error.is_some() { 8 } else { 0 };
         for h in &state.handles {
@@ -896,6 +907,7 @@ impl Socket {
         Ok((ready & events) | (ready & 24))
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
             (1, 2) => state.reuse = value != 0,
@@ -949,7 +961,6 @@ impl Socket {
             _ => return Err(NetError(92)),
         }
         if self.kind == 1 {
-            let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             for h in &state.handles {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
@@ -963,7 +974,6 @@ impl Socket {
             }
         }
         if matches!(self.kind, 2 | 3) {
-            let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             for h in &state.handles {
                 if self.kind == 2 {
@@ -1088,7 +1098,7 @@ impl Socket {
             return Err(NetError(90));
         }
         if self.state.borrow().bound.is_none() {
-            self.bind(self.wildcard())?;
+            self.ensure_bound()?;
         }
         if bytes[0] == if self.family == 2 { 8 } else { 128 } && bytes[1] == 0 {
             let mut state = self.state.borrow_mut();
@@ -1098,6 +1108,7 @@ impl Socket {
             }
             state.raw_identifiers.insert(identifier);
         }
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if state.write_closed {
             return Err(NetError(32));
@@ -1154,7 +1165,6 @@ impl Socket {
                 .fill_checksum(&source, &destination);
             header
         };
-        let mut fabric = self.network.0.fabric.0.borrow_mut();
         let n = fabric
             .nodes
             .get_mut(&self.network.0.key)
@@ -1175,8 +1185,9 @@ impl Socket {
     }
     fn recv_raw(&self, count: usize, flags: u32) -> Result<Received> {
         if self.state.borrow().bound.is_none() {
-            self.bind(self.wildcard())?;
+            self.ensure_bound()?;
         }
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         if let Some(errno) = state.error.take() {
             return Err(NetError(errno));
@@ -1192,7 +1203,6 @@ impl Socket {
             });
         }
         if state.icmp_pending.is_none() {
-            let mut fabric = self.network.0.fabric.0.borrow_mut();
             let n = fabric
                 .nodes
                 .get_mut(&self.network.0.key)
@@ -1270,8 +1280,9 @@ impl Socket {
             return Err(NetError(22));
         }
         if self.state.borrow().bound.is_none() {
-            self.bind(self.wildcard())?;
+            self.ensure_bound()?;
         }
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if state.write_closed {
             return Err(NetError(32));
@@ -1296,7 +1307,6 @@ impl Socket {
             };
             smoltcp::wire::Icmpv6Packet::new_unchecked(&mut data).fill_checksum(&source, &dest);
         }
-        let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         n.sockets
             .get_mut::<icmp::Socket>(state.handles[0])
@@ -1312,6 +1322,7 @@ impl Socket {
         }
     }
     fn recv_icmp(&self, count: usize, flags: u32) -> Result<Received> {
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         if let Some(errno) = state.error.take() {
             return Err(NetError(errno));
@@ -1327,7 +1338,6 @@ impl Socket {
             });
         }
         if state.icmp_pending.is_none() {
-            let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let h = *state.handles.first().ok_or(NetError(11))?;
             for _ in 0..16 {

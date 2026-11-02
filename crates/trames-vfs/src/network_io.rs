@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Live OFD TCP publication; namespace policy is prepared at joined boundaries.
+//! Shared socket OFDs and live TCP publication; policy captures remain joined.
 use super::*;
 #[derive(Clone)]
 pub struct DirectTcpFd {
@@ -14,19 +14,16 @@ impl DirectTcpFd {
         self.status.get() & O_NONBLOCK != 0
     }
 }
-/// Per-socket control publication. Stored capabilities remain weak; a running
-/// operation alone holds the real endpoint. No Files lock is held over this gate.
+/// Weak full-socket control admission. The socket owns the sole control gate;
+/// no separate VFS publication lock or Files lock covers a native operation.
 #[derive(Clone)]
-pub(super) struct SocketControl(Arc<std::sync::RwLock<Option<trames_net::DirectControl>>>);
+pub(super) struct SocketControl(std::sync::Weak<NetSocket>);
 impl SocketControl {
-    pub(super) fn new(control: trames_net::DirectControl) -> Self {
-        Self(Arc::new(std::sync::RwLock::new(Some(control))))
+    pub(super) fn new(socket: &Arc<NetSocket>) -> Self {
+        Self(Arc::downgrade(socket))
     }
     fn with_native<T>(&self, operation: impl FnOnce(&trames_net::DirectControl) -> T) -> Option<T> {
-        let current = self.0.read().unwrap();
-        let control = current.as_ref()?;
-        let _lease = control.retain().ok()?;
-        Some(operation(control))
+        self.0.upgrade()?.with_direct_control(operation)
     }
 }
 #[derive(Clone, Default)]
@@ -50,7 +47,7 @@ impl DirectNetwork {
             let result = operation(control);
             if refresh {
                 // Same original OFD across close/reuse. Publication runs under
-                // the control read gate and never holds Files membership.
+                // the socket control read gate and never holds Files membership.
                 *open.tcp_publication.lock().unwrap() =
                     control.direct_tcp().map(|tcp| DirectTcpFd {
                         tcp,
@@ -122,9 +119,6 @@ impl Vfs {
         if let Some(descriptor) = self.fds.get(&fd) {
             let open = descriptor.open.borrow();
             *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
-            if let Some(control) = &open.socket_control {
-                *control.0.write().unwrap() = open.socket.as_ref().and_then(|s| s.direct_control());
-            }
         }
     }
     /// The original OFD, rather than a possibly reused number, owns publication.
@@ -132,17 +126,11 @@ impl Vfs {
     /// This also preserves aliases when the addressed FD is closed.
     pub fn with_socket_control<T>(&mut self, fd: u32, operation: impl FnOnce(&mut Self) -> T) -> T {
         let descriptor = self.fds.get(&fd);
-        let control = descriptor
-            .as_ref()
-            .and_then(|d| d.open.borrow().socket_control.clone());
-        let Some(control) = control else {
-            return operation(self);
-        };
-        let mut current = control.0.write().unwrap();
         let result = operation(self);
-        let open = descriptor.as_ref().unwrap().open.borrow();
-        *current = open.socket.as_ref().and_then(|s| s.direct_control());
-        *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+        if let Some(descriptor) = descriptor {
+            let open = descriptor.open.borrow();
+            *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+        }
         result
     }
     pub fn direct_network(&self) -> DirectNetwork {
@@ -151,9 +139,6 @@ impl Vfs {
             let open = descriptor.open.borrow();
             let tcp = Self::direct_tcp_open(&open);
             *open.shared.tcp_publication.lock().unwrap() = tcp.clone();
-            if let Some(control) = &open.socket_control {
-                *control.0.write().unwrap() = open.socket.as_ref().and_then(|s| s.direct_control());
-            }
             let Some(tcp) = tcp else { continue };
             entries.resize_with(fd as usize + 1, || None);
             entries[fd as usize] = Some(tcp);

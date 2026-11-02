@@ -23,8 +23,9 @@ fn socket_admission_lease_rolls_back_errors_and_releases_without_namespace_rc() 
         backend,
         namespace,
         timeouts: _,
+        operation: _,
         _reservation,
-    } = Rc::try_unwrap(socket).ok().unwrap();
+    } = Arc::try_unwrap(socket).ok().unwrap();
     drop((backend, namespace));
     assert_eq!(root.live_sockets(), 1);
     std::thread::spawn(move || drop(_reservation))

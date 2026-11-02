@@ -10,15 +10,17 @@ mod netdev;
 mod netlink;
 mod nftables;
 mod rtnetlink;
+mod shared_state;
 mod socket_quota;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
+use crate::shared_state::Cell;
 pub use native::{
     decode_address, encode_address, DirectControl, DirectTcp, NetError, NetworkMode, Received,
     TcpLease, TcpPoll, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
     MSG_TRUNC,
 };
-use std::{cell::Cell, net::SocketAddr, rc::Rc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
 type Result<T> = std::result::Result<T, NetError>;
 #[derive(Clone)]
@@ -40,7 +42,7 @@ pub struct PacketInfo {
     pub interface: u32,
 }
 #[derive(Clone)]
-pub struct Network(Backend, Rc<netlink::Namespace>);
+pub struct Network(Backend, Arc<netlink::Namespace>);
 #[derive(Clone)]
 enum Backend {
     Native(native::Network),
@@ -97,7 +99,7 @@ impl Network {
             shared.as_ref().unwrap().clone()
         };
         let loopback = std::sync::Arc::new(netdev::Loopback::new(false));
-        let namespace = Rc::new(self.1.isolated(loopback.clone())?);
+        let namespace = Arc::new(self.1.isolated(loopback.clone())?);
         let view = netdev::View {
             graph: namespace.graph.clone(),
             namespace: namespace.id(),
@@ -137,7 +139,7 @@ impl Network {
     }
     pub fn new(mode: NetworkMode) -> Self {
         let native = native::Network::new(mode);
-        let namespace = Rc::new(netlink::Namespace::default());
+        let namespace = Arc::new(netlink::Namespace::default());
         namespace
             .graph
             .write()
@@ -153,7 +155,7 @@ impl Network {
     }
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
-        let namespace = Rc::new(netlink::Namespace::default());
+        let namespace = Arc::new(netlink::Namespace::default());
         namespace.nft_packet_hooks.set(false);
         namespace
             .graph
@@ -225,7 +227,7 @@ impl Network {
             n.finish();
         }
     }
-    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
+    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Arc<Socket>> {
         let reservation = self.1.socket_count.reserve()?;
         if family == 16 {
             return Ok(Socket::wrap(
@@ -253,21 +255,25 @@ impl Network {
     }
 }
 pub struct Socket {
+    // Serializes endpoint/control transitions, while ordinary data operations
+    // can run concurrently. Cached native byte capabilities bypass this gate.
+    operation: parking_lot::RwLock<()>,
     backend: SocketBackend,
-    namespace: Rc<netlink::Namespace>,
+    namespace: Arc<netlink::Namespace>,
     timeouts: [Cell<Option<Duration>>; 2],
-    // Drop after the backend and namespace; the lease itself contains no Rc.
+    // Drop after the backend and namespace; the lease itself contains no Arc.
     _reservation: socket_quota::Reservation,
 }
 enum SocketBackend {
-    Hybrid(Rc<hybrid::Socket>),
-    Netlink(Rc<netlink::Socket>),
-    Native(Rc<native::Socket>),
-    Virtual(Rc<virtualnet::Socket>),
+    Hybrid(Arc<hybrid::Socket>),
+    Netlink(Arc<netlink::Socket>),
+    Native(Arc<native::Socket>),
+    Virtual(Arc<virtualnet::Socket>),
 }
 macro_rules! delegate {
-    ($name:ident($($arg:ident:$ty:ty),*) -> $ret:ty) => {
+    ($gate:ident, $name:ident($($arg:ident:$ty:ty),*) -> $ret:ty) => {
         pub fn $name(&self,$($arg:$ty),*) -> $ret {
+            let _operation = self.operation.$gate();
             match &self.backend {SocketBackend::Hybrid(s)=>s.$name($($arg),*), SocketBackend::Native(s)=>s.$name($($arg),*),SocketBackend::Virtual(s)=>s.$name($($arg),*), SocketBackend::Netlink(s)=>s.$name($($arg),*) }
         }
     }
@@ -275,10 +281,11 @@ macro_rules! delegate {
 impl Socket {
     fn wrap(
         backend: SocketBackend,
-        namespace: Rc<netlink::Namespace>,
+        namespace: Arc<netlink::Namespace>,
         reservation: socket_quota::Reservation,
-    ) -> Rc<Self> {
-        Rc::new(Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            operation: parking_lot::RwLock::new(()),
             backend,
             namespace,
             timeouts: [Cell::new(None), Cell::new(None)],
@@ -288,6 +295,7 @@ impl Socket {
     /// Frozen connected-native transport capability, rebuilt each cohort.
     /// Descriptor/namespace/policy mutation still requires all workers joined.
     pub fn quiescent_tcp(&self) -> bool {
+        let _operation = self.operation.read_recursive();
         match &self.backend {
             SocketBackend::Native(s) => s.quiescent_tcp(),
             SocketBackend::Hybrid(s) => s.quiescent_tcp(),
@@ -295,6 +303,7 @@ impl Socket {
         }
     }
     pub fn idle_tcp(&self) -> bool {
+        let _operation = self.operation.read_recursive();
         match &self.backend {
             SocketBackend::Native(socket) => socket.idle_tcp(),
             SocketBackend::Hybrid(socket) => socket.idle_tcp(),
@@ -302,6 +311,7 @@ impl Socket {
         }
     }
     pub fn direct_control(&self) -> Option<DirectControl> {
+        let _operation = self.operation.read_recursive();
         let mut control = match &self.backend {
             SocketBackend::Native(s) => s.direct_control(),
             SocketBackend::Hybrid(s) => s.direct_control(),
@@ -310,7 +320,16 @@ impl Socket {
         control.timeouts = [false, true].map(|receive| self.io_timeout(receive));
         Some(control)
     }
+    /// Native control stays on the same endpoint while the operation runs.
+    /// The full socket, not a publication mirror, owns control transitions.
+    pub fn with_direct_control<T>(&self, operation: impl FnOnce(&DirectControl) -> T) -> Option<T> {
+        let _operation = self.operation.read_recursive();
+        let control = self.direct_control()?;
+        let _lease = control.retain().ok()?;
+        Some(operation(&control))
+    }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
+        let _operation = self.operation.read_recursive();
         match &self.backend {
             SocketBackend::Native(s) => s.direct_tcp(),
             SocketBackend::Hybrid(s) => s.direct_tcp(),
@@ -320,12 +339,14 @@ impl Socket {
     /// Guest socket timeouts are enforced by the virtual task scheduler; host
     /// sockets remain nonblocking. The shared socket owns them across dup/fork.
     pub fn set_io_timeout(&self, receive: bool, timeout: Option<Duration>) {
+        let _operation = self.operation.write();
         self.timeouts[usize::from(receive)].set(timeout);
     }
     pub fn io_timeout(&self, receive: bool) -> Option<Duration> {
         self.timeouts[usize::from(receive)].get()
     }
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
+        let _operation = self.operation.read_recursive();
         match &self.backend {
             SocketBackend::Netlink(s) => Some(s.poll_epoch()),
             SocketBackend::Native(s) => s.poll_epoch(),
@@ -334,6 +355,7 @@ impl Socket {
         }
     }
     pub fn info(&self) -> Option<SocketInfo> {
+        let _operation = self.operation.read_recursive();
         let mut info = match &self.backend {
             SocketBackend::Hybrid(s) => Some(s.info()),
             SocketBackend::Virtual(s) => Some(s.info()),
@@ -345,12 +367,15 @@ impl Socket {
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         if let SocketBackend::Hybrid(s) = &self.backend {
+            let _operation = self.operation.write();
             return s.set_option_bytes(level, name, value);
         }
         if let SocketBackend::Native(s) = &self.backend {
+            let _operation = self.operation.write();
             return s.set_option_bytes(level, name, value);
         }
         if let SocketBackend::Virtual(s) = &self.backend {
+            let _operation = self.operation.write();
             return s.set_option_bytes(level, name, value);
         }
         if value.len() < 4 {
@@ -369,6 +394,7 @@ impl Socket {
         destination: Option<SocketAddr>,
         mut info: PacketInfo,
     ) -> Result<usize> {
+        let _operation = self.operation.read_recursive();
         self.namespace.refresh_native();
         let graph = self.namespace.graph.read().unwrap();
         let owned_ip = match info.address {
@@ -407,6 +433,7 @@ impl Socket {
         }
     }
     pub fn ancillary_hop(&self) -> Option<(u32, u32, u8)> {
+        let _operation = self.operation.read_recursive();
         if let SocketBackend::Hybrid(s) = &self.backend {
             return s.ancillary_hop();
         }
@@ -420,7 +447,10 @@ impl Socket {
     }
     pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            s.bind_bytes(bytes)
+            {
+                let _operation = self.operation.write();
+                s.bind_bytes(bytes)
+            }
         } else {
             self.bind(decode_address(bytes)?)
         }
@@ -439,21 +469,30 @@ impl Socket {
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            s.connect_bytes(bytes)
+            {
+                let _operation = self.operation.write();
+                s.connect_bytes(bytes)
+            }
         } else {
             self.connect(decode_address(bytes)?)
         }
     }
     pub fn local_bytes(&self) -> Result<Vec<u8>> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            s.local_bytes()
+            {
+                let _operation = self.operation.read_recursive();
+                s.local_bytes()
+            }
         } else {
             self.local_addr().map(encode_address)
         }
     }
     pub fn peer_bytes(&self) -> Result<Vec<u8>> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            s.peer_bytes()
+            {
+                let _operation = self.operation.read_recursive();
+                s.peer_bytes()
+            }
         } else {
             self.peer_addr().map(encode_address)
         }
@@ -493,26 +532,42 @@ impl Socket {
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            s.send_with_namespace(bytes, flags, destination, net_admin, resolve)
+            {
+                let _operation = self.operation.write();
+                s.send_with_namespace(bytes, flags, destination, net_admin, resolve)
+            }
         } else {
             self.send(bytes, flags, destination.map(decode_address).transpose()?)
         }
     }
-    delegate!(address_size() -> usize);
-    delegate!(bind(address: SocketAddr) -> Result<()>);
-    delegate!(listen(backlog: u32) -> Result<()>);
-    delegate!(connect(address: SocketAddr) -> Result<()>);
-    delegate!(connect_complete() -> Result<bool>);
-    delegate!(resume_connect() -> Result<bool>);
-    delegate!(local_addr() -> Result<SocketAddr>);
-    delegate!(peer_addr() -> Result<SocketAddr>);
-    delegate!(shutdown(how: u32) -> Result<()>);
-    delegate!(send(bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize>);
-    delegate!(recv(count: usize, flags: u32) -> Result<Received>);
-    delegate!(poll(events: u16) -> Result<u16>);
-    delegate!(set_option(level: u32, name: u32, value: i32) -> Result<()>);
-    delegate!(get_option(level: u32, name: u32) -> Result<i32>);
-    pub fn accept(&self) -> Result<(Rc<Self>, SocketAddr)> {
+    delegate!(read_recursive, address_size() -> usize);
+    delegate!(write, bind(address: SocketAddr) -> Result<()>);
+    delegate!(write, listen(backlog: u32) -> Result<()>);
+    delegate!(write, connect(address: SocketAddr) -> Result<()>);
+    delegate!(read_recursive, connect_complete() -> Result<bool>);
+    delegate!(write, resume_connect() -> Result<bool>);
+    delegate!(read_recursive, local_addr() -> Result<SocketAddr>);
+    delegate!(read_recursive, peer_addr() -> Result<SocketAddr>);
+    delegate!(write, shutdown(how: u32) -> Result<()>);
+    delegate!(
+        read_recursive,
+        send(bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize>
+    );
+    delegate!(
+        read_recursive,
+        recv(count: usize, flags: u32) -> Result<Received>
+    );
+    delegate!(read_recursive, poll(events: u16) -> Result<u16>);
+    delegate!(
+        write,
+        set_option(level: u32, name: u32, value: i32) -> Result<()>
+    );
+    delegate!(
+        read_recursive,
+        get_option(level: u32, name: u32) -> Result<i32>
+    );
+    pub fn accept(&self) -> Result<(Arc<Self>, SocketAddr)> {
+        let _operation = self.operation.read_recursive();
         let reservation = self.namespace.socket_count.reserve()?;
         let (backend, peer) = match &self.backend {
             SocketBackend::Hybrid(s) => s.accept()?,
@@ -533,12 +588,12 @@ impl Socket {
         Ok((accepted, peer))
     }
 }
-pub fn wait(sockets: &[(Rc<Socket>, u16)], timeout: Duration) -> Result<()> {
+pub fn wait(sockets: &[(Arc<Socket>, u16)], timeout: Duration) -> Result<()> {
     wait_with_fds(sockets, &[], timeout)
 }
 /// Wait on native resources and network transports in the same idle executor.
 pub fn wait_with_fds(
-    sockets: &[(Rc<Socket>, u16)],
+    sockets: &[(Arc<Socket>, u16)],
     fds: &[std::os::fd::BorrowedFd<'_>],
     timeout: Duration,
 ) -> Result<()> {
@@ -589,3 +644,6 @@ mod routing_tests;
 
 #[cfg(test)]
 mod root_routing_tests;
+
+#[cfg(test)]
+mod shared_network_tests;

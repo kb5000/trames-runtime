@@ -213,32 +213,32 @@ impl SharedFiles {
         let Some(slot) = entries.get(&fd) else {
             return Some(Err(Errno(9)));
         };
+        let open = match &slot.open {
+            SlotOpen::Shared(open) => open.clone(),
+            SlotOpen::Owner(_, _, metadata) => metadata.as_ref()?.upgrade()?,
+        };
+        if open.kind == FdKind::Socket {
+            let tcp = open
+                .tcp_publication
+                .lock()
+                .unwrap()
+                .as_ref()?
+                .tcp
+                .poll_only();
+            return Some(Ok(PollOpen::Tcp(open, tcp)));
+        }
         match &slot.open {
-            SlotOpen::Shared(_) => Some(
-                slot.shared_open()?
-                    .map(|open| PollOpen::Shared(SharedFd::new(open.clone()))),
-            ),
-            SlotOpen::Owner(_, _, metadata) => {
-                let open = metadata.as_ref()?.upgrade()?;
-                if open.kind == FdKind::Socket {
-                    let tcp = open
-                        .tcp_publication
-                        .lock()
-                        .unwrap()
-                        .as_ref()?
-                        .tcp
-                        .poll_only();
-                    return Some(Ok(PollOpen::Tcp(open, tcp)));
-                }
-                if matches!(&open.control,Some(events::SharedControl::Epoll(live)) if live.owner_count()==0)
-                {
-                    Some(Ok(PollOpen::Epoll(open)))
-                } else {
-                    None
-                }
+            SlotOpen::Shared(_) => Some(Ok(PollOpen::Shared(SharedFd::new(open)))),
+            SlotOpen::Owner(_, _, _)
+                if matches!(&open.control,
+                Some(events::SharedControl::Epoll(live)) if live.owner_count()==0) =>
+            {
+                Some(Ok(PollOpen::Epoll(open)))
             }
+            _ => None,
         }
     }
+
     pub(super) fn socket_control(&self, fd: u32) -> Option<Arc<SharedOpenDescription>> {
         let open = self.control_open(fd)?;
         open.socket_control.as_ref()?;
@@ -335,11 +335,28 @@ impl SharedFd {
             cloexec: false.into(),
         })
     }
+    /// Accepted native I/O owns a real transport lease; poll snapshots stay weak.
+    pub fn direct_tcp(&self) -> Option<DirectTcpFd> {
+        let mut tcp = self.open.tcp_publication.lock().unwrap().clone()?;
+        tcp.lease = Some(tcp.tcp.retain().ok()?);
+        Some(tcp)
+    }
     pub fn direct_byte(self) -> Option<DirectFd> {
         let fd = DirectFd::shared_byte(&self.open)?;
         Some(fd.with_ofd(self))
     }
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
+        if self.open.kind == FdKind::Socket {
+            let tcp = self
+                .open
+                .tcp_publication
+                .lock()
+                .unwrap()
+                .as_ref()?
+                .tcp
+                .poll_only();
+            return Some(DirectFd::tcp_poll(&self.open, tcp));
+        }
         // Named FIFO descriptions keep their pathname kind, but their poll
         // state and subscriptions still belong to the real pipe resource.
         let fd = DirectFd::shared_byte(&self.open).or_else(|| {

@@ -98,7 +98,7 @@ impl RetainedFd {
         let open = self.0.open.borrow();
         (Vfs::poll_open(&open, events, 0), Vfs::poll_epoch(&open))
     }
-    pub fn socket(&self) -> Option<Rc<NetSocket>> {
+    pub fn socket(&self) -> Option<Arc<NetSocket>> {
         self.0.open.borrow().socket.clone()
     }
 }
@@ -357,7 +357,7 @@ impl Uring {
             .flat_map(|file| file.native_wait_fds())
             .collect()
     }
-    pub fn sockets(&self) -> Vec<(Rc<NetSocket>, u16)> {
+    pub fn sockets(&self) -> Vec<(Arc<NetSocket>, u16)> {
         let state = self.state.borrow();
         let blocked = self.backpressured(&state);
         state

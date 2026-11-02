@@ -817,6 +817,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
     Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
@@ -841,7 +842,6 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
                 notification: None,
             }),
             position: 0,
-            socket: None,
             anonymous: Some(anonymous),
             local: None,
             pty: None,

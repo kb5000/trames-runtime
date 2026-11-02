@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn invalid_accept_destination_does_not_drop_queued_connection() {
         fn ready<T>(
-            socket: &std::rc::Rc<trames_net::Socket>,
+            socket: &std::sync::Arc<trames_net::Socket>,
             mut operation: impl FnMut() -> Result<T>,
         ) -> T {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

@@ -209,7 +209,7 @@ fn attr(out: &mut Vec<u8>, k: u16, v: &[u8]) {
     netlink::attr(out, k, v)
 }
 fn wire(
-    s: &Rc<Socket>,
+    s: &Arc<Socket>,
     kind: u16,
     flags: u16,
     payload: &[u8],

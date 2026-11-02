@@ -1005,3 +1005,62 @@ These changes remove ownership and per-packet writer dependencies, not productio
 socket dispatch. Namespace/fabric lifetime, full shared socket OFDs, factory and
 bind/connect/listen/accept dispatch still need migration, alongside Unix/task/VM
 work. No whole-app performance gain is inferred from the resource tests.
+
+
+## Shared complete sockets and worker creation (2026-11-02)
+
+The complete Network, Socket and virtual Fabric graphs now satisfy Send + Sync
+by composition. Native, hybrid, netlink and packet-stack handles use Arc; scalar
+metadata uses relaxed atomics and compound state synchronizes on its actual
+object. No unsafe Send/Sync override wraps an owner Rc graph. Mac and iPad use
+the same implementation; ordinary native TCP bytes retain the existing direct
+weak-endpoint path, without the fabric, topology or socket control gate.
+
+Socket control transitions use one socket-owned writer, while normal socket I/O
+can share its reader. Legitimate nested immutable metadata reads use recursive
+read admission so a queued writer cannot deadlock the same thread's second read.
+The old independent VFS control-publication lock is removed. VFS now keeps only
+a weak full-socket control reference, admitted under the socket's own gate.
+
+The virtual packet stack still owns one mutable fabric transaction. Lock order
+is fabric then socket metadata. Binding reserves/checks/publishes namespace ports
+under one binding transaction; automatic binding and lazy native/guest/DNS branch
+initialization recheck their actual state under their initialization lock. The
+existing socket and namespace limits use atomic RAII reservations before effects,
+with rollback on errors and release by the real final owner. Namespace topology
+admission and insertion share the same topology writer. Initial root-stack
+creation uses a cold per-namespace initialization gate and OnceLock publication.
+
+Packet observers retain only metadata, not Socket or Namespace close authority.
+The real controls own teardown. Thus an observer upgraded by a tick cannot become
+the final close callback while the fabric is locked and recursively acquire that
+lock. Observer metadata carries no such destructor. Netlink listener registries
+likewise upgrade under the registry lock but release it before enqueue/callbacks
+or final owner destruction. Reply and port registries retain their object locks;
+read epochs and namespace counts use relaxed atomic RMWs.
+
+Actual Arc<Socket> ownership moves into SharedOpenDescription. Files duplication,
+close and replacement can therefore retain/drop the complete network OFD on the
+executing worker, outside Files membership. Epoll and io_uring distinguish shared
+ownership from direct byte/poll eligibility: pre-connect, UDP and virtual targets
+keep the existing fallback until admitted. Epoll watches stay weak and preserve
+edge/oneshot state; accepted native io_uring I/O retains a real transport lease.
+Capturing or polling a socket does not itself extend its last-close lifetime.
+
+DescriptorFactory captures the creating Network and guest credentials. The
+production worker handles syscall 198 (IP and netlink socket creation) through
+the original permission/flag/error ordering and actual Files reservations.
+AF_UNIX defers before effects. seccomp decisions are evaluated exactly once;
+unsupported, traced and mutable-authority operations retain their existing joined
+fallback. This adds no coordinator/resource thread, message bus, spin loop, new
+quota, guest-race errno or ordinary guest-memory barrier.
+
+Regression coverage includes complete auto-trait checks, concurrent exact socket
+admission, competing binds, parallel UDP transfers on one fabric, observer-only
+last release under the fabric guard, creating authority surviving setns, real
+worker close, original epoll/io_uring lifetimes, two-CPU socket creation/close
+loops with zero service requests, and allow/deny seccomp loops with one decision
+per syscall. Apple and ARM64 Linux affected tests and strict checks pass. The
+remaining network dispatch includes bind/connect/listen/accept and blocking or
+policy-aware byte operations; AF_UNIX/SCM_RIGHTS, task and VM dependencies remain.
+No whole-application performance claim follows from this migration alone.

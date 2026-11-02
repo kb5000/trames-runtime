@@ -8,24 +8,24 @@ use std::sync::{
 type Result<T> = std::result::Result<T, NetError>;
 
 #[derive(Default)]
-pub(crate) struct Quota(AtomicUsize);
-impl Quota {
+pub(crate) struct Quota<const LIMIT: usize = MAX_SOCKETS>(AtomicUsize);
+impl<const LIMIT: usize> Quota<LIMIT> {
     pub(crate) fn live(&self) -> usize {
         self.0.load(Ordering::Relaxed)
     }
-    pub(crate) fn reserve(self: &Arc<Self>) -> Result<Reservation> {
+    pub(crate) fn reserve(self: &Arc<Self>) -> Result<Reservation<LIMIT>> {
         // Accounting does not publish socket data. Reserve before host creation
         // or accept, and return the slot on every failure and final close.
         self.0
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < MAX_SOCKETS).then_some(n + 1)
+                (n < LIMIT).then_some(n + 1)
             })
             .map_err(|_| NetError(24))?;
         Ok(Reservation(self.clone()))
     }
 }
-pub(crate) struct Reservation(Arc<Quota>);
-impl Drop for Reservation {
+pub(crate) struct Reservation<const LIMIT: usize = MAX_SOCKETS>(Arc<Quota<LIMIT>>);
+impl<const LIMIT: usize> Drop for Reservation<LIMIT> {
     fn drop(&mut self) {
         self.0 .0.fetch_sub(1, Ordering::Relaxed);
     }
@@ -36,7 +36,7 @@ mod tests {
     use super::*;
     #[test]
     fn concurrent_reservations_obey_the_bound_and_release_on_the_worker() {
-        let quota = Arc::new(Quota::default());
+        let quota = Arc::new(Quota::<MAX_SOCKETS>::default());
         let ready = std::sync::Barrier::new(9);
         let release = std::sync::Barrier::new(9);
         std::thread::scope(|s| {

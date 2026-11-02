@@ -972,20 +972,33 @@ mod tests {
         }
     }
     #[test]
-    fn anonymous_creation_and_close_complete_on_workers_with_one_seccomp_decision() {
-        for number in [19u32, 26, 59, 85] {
+    fn shared_resource_creation_and_close_complete_on_workers_with_one_seccomp_decision() {
+        for number in [19u32, 26, 59, 85, 198] {
             for decision in [None, Some(ALLOW), Some(0x5007b)] {
                 let mut p = super::super::tests::process();
                 p.memory.write(0x1800, &[0; 8]).unwrap();
                 let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
-                let initial = if number == 59 {
+                if number == 198 {
+                    p.linux
+                        .vfs
+                        .configure_network(trames_vfs::NetworkMode::Loopback)
+                        .unwrap();
+                }
+                let initial = if number == 198 {
+                    2
+                } else if number == 59 {
                     0x1800
                 } else if number == 85 {
                     1
                 } else {
                     0
                 };
-                let mut code = vec![mov(0, initial), mov(1, 0), mov(8, number), 0xd4000001];
+                let mut code = vec![
+                    mov(0, initial),
+                    mov(1, u32::from(number == 198)),
+                    mov(8, number),
+                    0xd4000001,
+                ];
                 if number == 59 {
                     code.extend([
                         mov(9, 0x1800),

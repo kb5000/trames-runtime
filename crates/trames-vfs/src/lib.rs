@@ -180,7 +180,6 @@ pub enum FdKind {
 struct OpenDescription {
     shared: Arc<SharedOpenDescription>,
     position: u64,
-    socket: Option<Rc<NetSocket>>,
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
     pty: Option<Rc<PtyEnd>>,
@@ -191,8 +190,9 @@ struct OpenDescription {
     mount: Option<OpenMount>,
 }
 // The actual file, pipe and lock/notification lifetimes share one allocation.
-// Endpoint/namespace control projections above still retain owner ownership.
+// Local IPC, task and mount control projections above still retain owner ownership.
 struct SharedOpenDescription {
+    socket: Option<Arc<NetSocket>>,
     _disk_file: Option<Arc<std::fs::File>>,
     #[cfg(all(feature = "hostfs", unix))]
     host_file: Option<Arc<hostfs::OpenFile>>,
@@ -745,6 +745,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            socket: None,
                             _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
@@ -769,7 +770,6 @@ impl Default for Vfs {
                             notification: None,
                         }),
                         position: 0,
-                        socket: None,
                         anonymous: None,
                         local: None,
                         pty: None,
@@ -1076,6 +1076,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            socket: None,
                             _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
@@ -1100,7 +1101,6 @@ impl Vfs {
                             notification: None,
                         }),
                         position: 0,
-                        socket: None,
                         anonymous: None,
                         local: None,
                         pty: None,
@@ -2231,6 +2231,7 @@ impl Vfs {
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    socket: None,
                     _disk_file: disk_file,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_file,
@@ -2269,7 +2270,6 @@ impl Vfs {
                 }),
                 position: 0,
                 mount: p.mount.map(OpenMount::Owner),
-                socket: None,
                 anonymous: None,
                 local: None,
                 pty,

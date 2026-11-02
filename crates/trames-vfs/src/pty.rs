@@ -186,6 +186,7 @@ impl Vfs {
             Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        socket: None,
                         _disk_file: None,
                         #[cfg(all(feature = "hostfs", unix))]
                         host_file: None,
@@ -210,7 +211,6 @@ impl Vfs {
                         notification: None,
                     }),
                     position: 0,
-                    socket: None,
                     anonymous: None,
                     local: None,
                     namespace: None,

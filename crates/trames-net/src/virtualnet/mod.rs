@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! A bounded IP fabric. Only the trusted gateway opens native sockets.
 use crate::dns;
+use crate::shared_state::FabricState;
+use crate::shared_state::{Cell, State as SharedState};
+use crate::socket_quota::{Quota, Reservation};
+use std::ops::Deref;
 mod gateway;
 pub(crate) mod packet;
 mod sockets;
 use super::native::{
-    self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT,
-    MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
+    self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL,
+    MSG_PEEK, MSG_TRUNC,
 };
 use packet::{Port, Tuple};
 use smoltcp::{
@@ -15,10 +19,9 @@ use smoltcp::{
     wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint},
 };
 use std::{
-    cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    rc::{Rc, Weak},
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, NetError>;
@@ -55,7 +58,7 @@ pub struct LinkStats {
     pub tx_dropped: u64,
 }
 #[derive(Clone)]
-pub struct Fabric(Rc<RefCell<Inner>>);
+pub struct Fabric(Arc<FabricState<Inner>>);
 struct Inner {
     started: Instant,
     next_node: u64,
@@ -67,32 +70,45 @@ struct Inner {
 }
 struct Node {
     id: u8,
-    owner: Weak<Namespace>,
+    owner: Weak<NamespaceData>,
     iface: Interface,
     sockets: SocketSet<'static>,
     port: Port,
     filter_rx: Port,
-    registry: Vec<Weak<Socket>>,
+    registry: Vec<Weak<SocketMeta>>,
     detached: Vec<(SocketHandle, Instant)>,
-    resets: Vec<(Weak<Socket>, Connection)>,
+    resets: Vec<(Weak<SocketMeta>, Connection)>,
     links: [LinkStats; 2],
     configuration_pending: bool,
     configuration_revision: u64,
     configuration_lo: bool,
 }
 struct Namespace {
+    data: Arc<NamespaceData>,
+}
+impl Deref for Namespace {
+    type Target = NamespaceData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+// Packet observers may outlive the final control owner briefly. Their metadata
+// carries no close callback, so dropping an observer under the fabric cannot
+// recursively acquire the fabric lock.
+struct NamespaceData {
     fabric: Fabric,
     key: u64,
     info: NetworkInfo,
     mode: NetworkMode,
-    live: Cell<usize>,
+    live: Arc<Quota>,
+    binding: parking_lot::Mutex<()>,
     finished: Cell<bool>,
     isolated: Cell<bool>,
     loopback_up: std::sync::Arc<crate::netdev::Loopback>,
     routing: Option<crate::netdev::View>,
 }
 #[derive(Clone)]
-pub(super) struct Network(Rc<Namespace>);
+pub(super) struct Network(Arc<Namespace>);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Connection {
     Idle,
@@ -131,9 +147,19 @@ struct State {
 }
 pub(super) struct Socket {
     network: Network,
+    meta: Arc<SocketMeta>,
+    _reservation: Reservation,
+}
+impl Deref for Socket {
+    type Target = SocketMeta;
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+pub(super) struct SocketMeta {
     family: u32,
     kind: u32,
-    state: RefCell<State>,
+    state: SharedState<State>,
 }
 fn v4(id: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, id)
@@ -214,7 +240,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
 }
 impl Fabric {
     pub fn new() -> Result<Self> {
-        Ok(Self(Rc::new(RefCell::new(Inner {
+        Ok(Self(Arc::new(FabricState::new(Inner {
             started: Instant::now(),
             next_node: 1,
             nodes: BTreeMap::new(),
@@ -255,7 +281,7 @@ impl Fabric {
         s
     }
     pub(super) fn same(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
     pub(super) fn environment(&self, id: u8, mode: NetworkMode) -> Result<Network> {
         let mut i = self.0.borrow_mut();
@@ -281,18 +307,21 @@ impl Fabric {
             prefix6: 64,
         };
         let mut node = make_node(id, i.now())?;
-        let ns = Rc::new(Namespace {
-            fabric: self.clone(),
-            key,
-            info,
-            mode,
-            live: Cell::new(0),
-            finished: Cell::new(false),
-            isolated: Cell::new(false),
-            loopback_up: std::sync::Arc::new(crate::netdev::Loopback::new(true)),
-            routing: None,
+        let ns = Arc::new(Namespace {
+            data: Arc::new(NamespaceData {
+                fabric: self.clone(),
+                key,
+                info,
+                mode,
+                live: Arc::new(Quota::default()),
+                binding: parking_lot::Mutex::new(()),
+                finished: Cell::new(false),
+                isolated: Cell::new(false),
+                loopback_up: std::sync::Arc::new(crate::netdev::Loopback::new(true)),
+                routing: None,
+            }),
         });
-        node.owner = Rc::downgrade(&ns);
+        node.owner = Arc::downgrade(&ns.data);
         i.nodes.insert(key, node);
         Ok(Network(ns))
     }
@@ -309,27 +338,30 @@ impl Fabric {
         let key = i.next_node;
         i.next_node = i.next_node.checked_add(1).ok_or(NetError(28))?;
         let mut node = make_node(2, i.now())?;
-        let ns = Rc::new(Namespace {
-            fabric: self.clone(),
-            key,
-            info: NetworkInfo {
-                id: 2,
-                ipv4: Ipv4Addr::UNSPECIFIED,
-                ipv6: Ipv6Addr::UNSPECIFIED,
-                gateway4: Ipv4Addr::UNSPECIFIED,
-                gateway6: Ipv6Addr::UNSPECIFIED,
-                mtu: 1500,
-                prefix4: 0,
-                prefix6: 0,
-            },
-            mode,
-            live: Cell::new(0),
-            finished: Cell::new(false),
-            isolated: Cell::new(true),
-            loopback_up,
-            routing: Some(routing),
+        let ns = Arc::new(Namespace {
+            data: Arc::new(NamespaceData {
+                fabric: self.clone(),
+                key,
+                info: NetworkInfo {
+                    id: 2,
+                    ipv4: Ipv4Addr::UNSPECIFIED,
+                    ipv6: Ipv6Addr::UNSPECIFIED,
+                    gateway4: Ipv4Addr::UNSPECIFIED,
+                    gateway6: Ipv6Addr::UNSPECIFIED,
+                    mtu: 1500,
+                    prefix4: 0,
+                    prefix6: 0,
+                },
+                mode,
+                live: Arc::new(Quota::default()),
+                binding: parking_lot::Mutex::new(()),
+                finished: Cell::new(false),
+                isolated: Cell::new(true),
+                loopback_up,
+                routing: Some(routing),
+            }),
         });
-        node.owner = Rc::downgrade(&ns);
+        node.owner = Arc::downgrade(&ns.data);
         node.iface.set_any_ip(true);
         node.configure_dynamic(&mut 0);
         i.nodes.insert(key, node);
@@ -351,7 +383,7 @@ impl Fabric {
             .unwrap_or(Duration::from_millis(20))
             .min(Duration::from_millis(20))
     }
-    pub(super) fn native_waiters(&self) -> Vec<(Rc<native::Socket>, u16)> {
+    pub(super) fn native_waiters(&self) -> Vec<(Arc<native::Socket>, u16)> {
         self.0.borrow().gateway.waiters()
     }
 }
@@ -615,7 +647,7 @@ impl Inner {
                                             && node.resets.len() < 96
                                         {
                                             node.resets
-                                                .push((Rc::downgrade(&socket), state.connection));
+                                                .push((Arc::downgrade(&socket), state.connection));
                                         }
                                     }
                                 }
@@ -847,7 +879,7 @@ impl Node {
         }
     }
 }
-impl Namespace {
+impl NamespaceData {
     fn finish(&self) {
         if self.finished.replace(true) {
             return;
@@ -888,27 +920,22 @@ impl Network {
             .get(&self.0.key)
             .map_or([LinkStats::default(); 2], |n| n.links)
     }
-    pub fn live_sockets(&self) -> usize {
-        self.0.live.get()
-    }
     pub fn info(&self) -> NetworkInfo {
         self.0.info
     }
     pub fn finish(&self) {
         self.0.finish();
     }
-    fn reserve(&self) -> Result<()> {
+    fn reserve(&self) -> Result<Reservation> {
         if self.0.finished.get() {
             Err(NetError(100))
         } else if self.0.mode == NetworkMode::Off {
             Err(NetError(13))
-        } else if self.live_sockets() >= MAX_SOCKETS {
-            Err(NetError(24))
         } else {
-            Ok(())
+            self.0.live.reserve()
         }
     }
-    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
+    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Arc<Socket>> {
         if !matches!(family, 2 | 10) {
             return Err(NetError(97));
         }
@@ -928,7 +955,7 @@ impl Network {
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
-        self.reserve()?;
+        let reservation = self.reserve()?;
         Ok(self.wrap(
             family,
             kind,
@@ -960,28 +987,30 @@ impl Network {
                 device: None,
                 raw_identifiers: std::collections::BTreeSet::new(),
             },
+            reservation,
         ))
     }
-    fn wrap(&self, family: u32, kind: u32, state: State) -> Rc<Socket> {
-        self.0.live.set(self.live_sockets() + 1);
-        let s = Rc::new(Socket {
+    fn wrap(&self, family: u32, kind: u32, state: State, reservation: Reservation) -> Arc<Socket> {
+        let s = Arc::new(Socket {
             network: self.clone(),
-            family,
-            kind,
-            state: RefCell::new(state),
+            meta: Arc::new(SocketMeta {
+                family,
+                kind,
+                state: SharedState::new(state),
+            }),
+            _reservation: reservation,
         });
         if let Some(n) = self.0.fabric.0.borrow_mut().nodes.get_mut(&self.0.key) {
-            n.registry.push(Rc::downgrade(&s));
+            n.registry.push(Arc::downgrade(&s.meta));
         }
         s
     }
 }
 impl Drop for Socket {
     fn drop(&mut self) {
-        self.network.0.live.set(self.network.live_sockets() - 1);
         let mut i = self.network.0.fabric.0.borrow_mut();
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
-            for h in self.state.get_mut().handles.drain(..) {
+            for h in self.state.borrow_mut().handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
                     if s.is_listening() || s.state() == tcp::State::Closed {
@@ -996,5 +1025,28 @@ impl Drop for Socket {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_lifetime_tests {
+    use super::*;
+    #[test]
+    fn packet_observers_never_own_socket_or_namespace_close_callbacks() {
+        let fabric = Fabric::new().unwrap();
+        let network = fabric.environment(2, NetworkMode::Outbound).unwrap();
+        let original_handles = fabric.stats().stack_sockets;
+        let socket = network.socket(2, 2, 0).unwrap();
+        let socket_observer = socket.meta.clone();
+        let namespace_observer = network.0.data.clone();
+        socket.bind("10.0.0.2:34000".parse().unwrap()).unwrap();
+        drop(socket);
+        assert_eq!(fabric.stats().stack_sockets, original_handles);
+        drop(network);
+        assert_eq!(fabric.stats().environments, 0);
+        // These are the last references. Neither destructor may reenter fabric.
+        let _fabric = fabric.0.borrow_mut();
+        drop(socket_observer);
+        drop(namespace_observer);
     }
 }

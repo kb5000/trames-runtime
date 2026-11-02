@@ -2,10 +2,8 @@
 //! Root guest sockets retain the BSD fast path. Only guest-owned routes and
 //! bridge listeners use the shared packet stack; no host route is modified.
 use super::*;
-use std::{
-    cell::{Cell, RefCell},
-    net::IpAddr,
-};
+use crate::shared_state::{Cell, State as SharedState};
+use std::net::IpAddr;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Path {
     Idle,
@@ -13,47 +11,83 @@ enum Path {
     Guest,
     Both,
 }
+impl Path {
+    fn decode(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Native,
+            2 => Self::Guest,
+            _ => Self::Both,
+        }
+    }
+}
+impl crate::shared_state::Value for Path {
+    type Storage = <u8 as crate::shared_state::Value>::Storage;
+    fn storage(v: Self) -> Self::Storage {
+        <u8 as crate::shared_state::Value>::storage(v as u8)
+    }
+    fn load(s: &Self::Storage) -> Self {
+        Self::decode(<u8 as crate::shared_state::Value>::load(s))
+    }
+    fn store(s: &Self::Storage, v: Self) {
+        <u8 as crate::shared_state::Value>::store(s, v as u8);
+    }
+    fn swap(s: &Self::Storage, v: Self) -> Self {
+        Self::decode(<u8 as crate::shared_state::Value>::swap(s, v as u8))
+    }
+    fn update(s: &Self::Storage, mut f: impl FnMut(Self) -> Self) -> Self {
+        Self::decode(<u8 as crate::shared_state::Value>::update(s, |v| {
+            f(Self::decode(v)) as u8
+        }))
+    }
+}
 pub(super) struct Socket {
     network: native::Network,
-    namespace: Rc<netlink::Namespace>,
+    namespace: Arc<netlink::Namespace>,
     family: u32,
     kind: u32,
     protocol: u32,
-    native: RefCell<Option<Rc<native::Socket>>>,
-    guest: RefCell<Option<Rc<virtualnet::Socket>>>,
+    native: SharedState<Option<Arc<native::Socket>>>,
+    guest: SharedState<Option<Arc<virtualnet::Socket>>>,
     path: Cell<Path>,
     bound: Cell<Option<SocketAddr>>,
     peer: Cell<Option<SocketAddr>>,
     listening: Cell<bool>,
+    automatic_binding: parking_lot::Mutex<()>,
     options: native::SavedOptions,
 }
 impl Socket {
     pub fn new(
         network: native::Network,
-        namespace: Rc<netlink::Namespace>,
+        namespace: Arc<netlink::Namespace>,
         family: u32,
         kind: u32,
         protocol: u32,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<Arc<Self>> {
         let native = network.socket(family, kind, protocol)?;
         native.attach_policy(namespace.clone());
-        Ok(Rc::new(Self {
+        Ok(Arc::new(Self {
             network,
             namespace,
             family,
             kind,
             protocol,
-            native: RefCell::new(Some(native)),
-            guest: RefCell::new(None),
+            native: SharedState::new(Some(native)),
+            guest: SharedState::new(None),
             path: Cell::new(Path::Idle),
             bound: Cell::new(None),
             peer: Cell::new(None),
             listening: Cell::new(false),
+            automatic_binding: parking_lot::Mutex::new(()),
             options: Default::default(),
         }))
     }
-    fn native(&self) -> Result<Rc<native::Socket>> {
+    fn native(&self) -> Result<Arc<native::Socket>> {
         if let Some(s) = self.native.borrow().as_ref() {
+            return Ok(s.clone());
+        }
+        let mut branch = self.native.borrow_mut();
+        if let Some(s) = branch.as_ref() {
             return Ok(s.clone());
         }
         let s = self.network.socket(self.family, self.kind, self.protocol)?;
@@ -61,14 +95,18 @@ impl Socket {
         for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;
         }
-        *self.native.borrow_mut() = Some(s.clone());
+        *branch = Some(s.clone());
         Ok(s)
     }
-    fn guest(&self) -> Result<Rc<virtualnet::Socket>> {
+    fn guest(&self) -> Result<Arc<virtualnet::Socket>> {
         if let Some(s) = self.guest.borrow().as_ref() {
             return Ok(s.clone());
         }
         let stack = self.namespace.root_stack()?;
+        let mut branch = self.guest.borrow_mut();
+        if let Some(s) = branch.as_ref() {
+            return Ok(s.clone());
+        }
         let s = stack.socket(self.family, self.kind, self.protocol)?;
         for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;
@@ -76,7 +114,7 @@ impl Socket {
         if let Some(bound) = self.bound.get() {
             s.bind(bound)?;
         }
-        *self.guest.borrow_mut() = Some(s.clone());
+        *branch = Some(s.clone());
         Ok(s)
     }
     fn remember_native_binding(&self, native: &native::Socket) {
@@ -385,15 +423,18 @@ impl Socket {
                 return s.send_control(bytes, flags, address.or(self.peer.get()), info);
             }
             if self.bound.get().is_none() {
-                let wildcard = SocketAddr::new(
-                    if self.family == 2 {
-                        std::net::Ipv4Addr::UNSPECIFIED.into()
-                    } else {
-                        std::net::Ipv6Addr::UNSPECIFIED.into()
-                    },
-                    0,
-                );
-                self.bind(wildcard)?;
+                let _binding = self.automatic_binding.lock();
+                if self.bound.get().is_none() {
+                    let wildcard = SocketAddr::new(
+                        if self.family == 2 {
+                            std::net::Ipv4Addr::UNSPECIFIED.into()
+                        } else {
+                            std::net::Ipv6Addr::UNSPECIFIED.into()
+                        },
+                        0,
+                    );
+                    self.bind(wildcard)?;
+                }
             }
             self.path.set(Path::Both);
             return s.send_control(bytes, flags, address.or(self.peer.get()), info);
@@ -484,7 +525,7 @@ impl Socket {
                 .and_then(|s| s.ancillary_hop())
         }
     }
-    pub fn waiters(&self, events: u16) -> (Option<(Rc<native::Socket>, u16)>, Option<Fabric>) {
+    pub fn waiters(&self, events: u16) -> (Option<(Arc<native::Socket>, u16)>, Option<Fabric>) {
         let native = (self.path.get() != Path::Guest)
             .then(|| self.native.borrow().as_ref().map(|s| (s.clone(), events)))
             .flatten();

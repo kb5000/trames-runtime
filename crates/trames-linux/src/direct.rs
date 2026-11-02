@@ -183,7 +183,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_creation(&self, number: u32) -> bool {
-        matches!(number, 19 | 26 | 59 | 85) && self.resources.is_some()
+        matches!(number, 19 | 26 | 59 | 85 | 198) && self.resources.is_some()
     }
     pub fn invoke_creation(
         &self,

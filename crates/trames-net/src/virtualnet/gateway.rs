@@ -10,10 +10,10 @@ const FLOWS: usize = 64;
 struct TcpFlow {
     node: u64,
     tuple: Tuple,
-    native: Rc<native::Socket>,
+    native: Arc<native::Socket>,
     handle: Option<SocketHandle>,
     syn: Option<Vec<u8>>,
-    owner: Weak<Socket>,
+    owner: Weak<SocketMeta>,
     native_eof: bool,
     write_shutdown: bool,
     last: Instant,
@@ -22,8 +22,8 @@ struct TcpFlow {
 struct UdpFlow {
     node: u64,
     tuple: Tuple,
-    native: Rc<native::Socket>,
-    owner: Weak<Socket>,
+    native: Arc<native::Socket>,
+    owner: Weak<SocketMeta>,
     pending: Option<Vec<u8>>,
     last: Instant,
 }
@@ -153,7 +153,7 @@ impl Gateway {
         key: u64,
         tuple: Tuple,
         kind: u32,
-    ) -> Weak<Socket> {
+    ) -> Weak<SocketMeta> {
         let protocol = if kind == 1 { 6 } else { 17 };
         let tuple = self
             .routed
@@ -173,7 +173,7 @@ impl Gateway {
                     }) && (kind == 2 || state.peer == Some(tuple.destination))
                 })
             })
-            .map(|s| Rc::downgrade(&s))
+            .map(|s| Arc::downgrade(&s))
             .unwrap_or_default()
     }
     pub fn ingress(
@@ -580,7 +580,7 @@ impl Gateway {
         }
         self.dns_service(nodes);
     }
-    pub fn waiters(&self) -> Vec<(Rc<native::Socket>, u16)> {
+    pub fn waiters(&self) -> Vec<(Arc<native::Socket>, u16)> {
         let mut waiters = Vec::new();
         waiters.extend(
             self.icmp
@@ -847,7 +847,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn until<T>(socket: &Rc<crate::Socket>, mut operation: impl FnMut() -> Result<T>) -> T {
+    fn until<T>(socket: &Arc<crate::Socket>, mut operation: impl FnMut() -> Result<T>) -> T {
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             match operation() {

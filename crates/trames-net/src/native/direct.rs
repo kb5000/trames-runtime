@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Established BSD TCP bytes without sharing namespace Rc/RefCell authority.
+//! Established BSD TCP bytes over a weak native endpoint capability.
 use super::*;
 use std::{
     io::Read,
@@ -218,7 +218,7 @@ impl DirectTcp {
 mod tests {
     use super::*;
     use std::{io::Write, net::TcpListener};
-    fn pair() -> (Network, Rc<Socket>, TcpStream) {
+    fn pair() -> (Network, Arc<Socket>, TcpStream) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();

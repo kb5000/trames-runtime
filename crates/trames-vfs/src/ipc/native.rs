@@ -142,6 +142,7 @@ impl OpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Self {
         Self {
             shared: Arc::new(SharedOpenDescription {
+                socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
@@ -170,7 +171,6 @@ impl OpenDescription {
                 notification: None,
             }),
             position: 0,
-            socket: None,
             anonymous: None,
             local: None,
             pty: None,
@@ -637,6 +637,7 @@ impl Vfs {
         drop(fs);
         Ok(OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
@@ -661,7 +662,6 @@ impl Vfs {
                 notification: None,
             }),
             position: 0,
-            socket: None,
             anonymous: None,
             local: None,
             pty: None,

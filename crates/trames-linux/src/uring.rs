@@ -1258,7 +1258,7 @@ impl Linux {
             .flat_map(|ring| ring.native_wait_fds())
             .collect()
     }
-    pub fn uring_sockets(&self) -> Vec<(Rc<trames_net::Socket>, u16)> {
+    pub fn uring_sockets(&self) -> Vec<(std::sync::Arc<trames_net::Socket>, u16)> {
         self.uring_rings()
             .iter()
             .flat_map(|r| r.sockets())

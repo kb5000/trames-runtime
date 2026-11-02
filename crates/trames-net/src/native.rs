@@ -2,6 +2,7 @@
 //! Bounded native sockets. All host operations are nonblocking; guest ABI
 //! addresses, flags and errno numbers are translated explicitly.
 use crate::direct_dns;
+use crate::shared_state::{Cell, State as SharedState};
 mod control;
 mod direct;
 mod state;
@@ -27,11 +28,9 @@ use nix::{
 };
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket as RawNativeSocket, TcpKeepalive, Type};
 use std::{
-    cell::{Cell, RefCell},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpStream, UdpSocket},
     os::fd::{AsFd, BorrowedFd},
-    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -64,7 +63,7 @@ pub enum NetworkMode {
 /// The scheduler waits on a bounded, deduplicated set of opaque socket handles.
 /// No guest descriptor number is used as a host descriptor.
 pub fn wait_with_fds(
-    sockets: &[(Rc<Socket>, u16)],
+    sockets: &[(Arc<Socket>, u16)],
     extra: &[std::os::fd::BorrowedFd<'_>],
     timeout: Duration,
 ) -> Result<()> {
@@ -74,12 +73,12 @@ pub fn wait_with_fds(
     } else {
         timeout
     };
-    let mut unique: Vec<(Rc<Socket>, u16)> = Vec::new();
+    let mut unique: Vec<(Arc<Socket>, u16)> = Vec::new();
     for (socket, events) in sockets {
         if socket.dns_peer.get() {
             continue;
         }
-        if let Some((_, interest)) = unique.iter_mut().find(|(s, _)| Rc::ptr_eq(s, socket)) {
+        if let Some((_, interest)) = unique.iter_mut().find(|(s, _)| Arc::ptr_eq(s, socket)) {
             *interest |= events;
         } else {
             if unique.len() == 1024 {
@@ -138,20 +137,20 @@ struct PreparedSocket {
     kind: u32,
 }
 impl PreparedSocket {
-    fn finish(self) -> Rc<Socket> {
-        Rc::new(Socket {
+    fn finish(self) -> Arc<Socket> {
+        Arc::new(Socket {
             native: self.native,
             network: self.network,
             family: self.family,
             kind: self.kind,
-            dns: RefCell::default(),
+            dns: SharedState::default(),
             dns_target: Cell::new(direct_dns::ADDRESS),
             dns_peer: Cell::new(false),
             dns_receive_errors: Cell::new(false),
-            echo: RefCell::default(),
-            policy: RefCell::default(),
+            echo: SharedState::default(),
+            policy: SharedState::default(),
             receive_packet_info: Cell::new(false),
-            policy_forward: RefCell::default(),
+            policy_forward: SharedState::default(),
         })
     }
 }
@@ -196,7 +195,7 @@ impl Network {
     pub fn live_sockets(&self) -> usize {
         self.0.sockets.live()
     }
-    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
+    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Arc<Socket>> {
         Ok(self.prepare_socket(family, kind, protocol)?.finish())
     }
     fn prepare_socket(&self, family: u32, kind: u32, protocol: u32) -> Result<PreparedSocket> {
@@ -254,7 +253,7 @@ impl Network {
         family: u32,
         kind: u32,
         connection: Connection,
-    ) -> Rc<Socket> {
+    ) -> Arc<Socket> {
         PreparedSocket {
             native: Endpoint::new(native, kind, reservation, connection),
             network: self.clone(),
@@ -349,14 +348,14 @@ pub struct Socket {
     network: Network,
     family: u32,
     kind: u32,
-    dns: RefCell<std::collections::BTreeMap<SocketAddr, Arc<direct_dns::Endpoint>>>,
+    dns: SharedState<std::collections::BTreeMap<SocketAddr, Arc<direct_dns::Endpoint>>>,
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
     dns_receive_errors: Cell<bool>,
-    echo: RefCell<icmp::Echo>,
+    echo: SharedState<icmp::Echo>,
     receive_packet_info: Cell<bool>,
-    policy: RefCell<Option<Rc<crate::netlink::Namespace>>>,
-    policy_forward: RefCell<
+    policy: SharedState<Option<Arc<crate::netlink::Namespace>>>,
+    policy_forward: SharedState<
         std::collections::BTreeMap<
             (SocketAddr, SocketAddr),
             (crate::netdev::NativeForward, Instant),
@@ -380,7 +379,7 @@ impl Socket {
         }
         Some(epoch)
     }
-    pub(crate) fn attach_policy(&self, namespace: Rc<crate::netlink::Namespace>) {
+    pub(crate) fn attach_policy(&self, namespace: Arc<crate::netlink::Namespace>) {
         *self.policy.borrow_mut() = Some(namespace);
     }
     fn policy_check(&self, input: bool, peer: SocketAddr, bytes: &[u8], flags: u8) -> Result<()> {
@@ -504,7 +503,8 @@ impl Socket {
         if self.family != 2 || !matches!(self.kind, 1 | 2) {
             return Err(NetError(97));
         }
-        if !self.dns.borrow().contains_key(&address) {
+        let mut endpoints = self.dns.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = endpoints.entry(address) {
             if self.local_addr()?.port() == 0 {
                 self.native
                     .control()
@@ -521,12 +521,12 @@ impl Socket {
                     )
                     .map_err(from_io)?;
             }
-            self.dns.borrow_mut().insert(
-                address,
-                direct_dns::Endpoint::new(self.network.0.dns.clone(), self.kind == 1),
-            );
+            entry.insert(direct_dns::Endpoint::new(
+                self.network.0.dns.clone(),
+                self.kind == 1,
+            ));
         }
-        Ok(self.dns.borrow()[&address].clone())
+        Ok(endpoints[&address].clone())
     }
     pub fn info(&self) -> super::SocketInfo {
         super::SocketInfo {
@@ -613,7 +613,7 @@ impl Socket {
         self.native.state.set_connection(Connection::Listening);
         Ok(())
     }
-    pub fn accept(&self) -> Result<(Rc<Socket>, SocketAddr)> {
+    pub fn accept(&self) -> Result<(Arc<Socket>, SocketAddr)> {
         if self.native.state.connection() != Connection::Listening {
             return Err(NetError(22));
         }

@@ -2,74 +2,77 @@
 //! Guest route/netfilter sockets, bounded subscriptions and namespace-owned control.
 //! The logical host eth0 is a read-only view; dynamic links never configure the host.
 use super::*;
-use std::rc::Weak;
+use crate::shared_state::{Cell, State as SharedState};
+use std::sync::Weak;
 use std::{
-    cell::{Cell, RefCell},
     collections::{BTreeSet, VecDeque},
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
     id: u64,
-    pub(crate) native: std::cell::OnceCell<native::Network>,
+    pub(crate) native: std::sync::OnceLock<native::Network>,
     pub(crate) socket_count: std::sync::Arc<crate::socket_quota::Quota>,
     pub(crate) nft_packet_hooks: Cell<bool>,
     // Netlink sockets also pin the complete stack, not just link metadata.
-    pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
+    pub(crate) stack: std::sync::OnceLock<virtualnet::Network>,
     pub(crate) graph: std::sync::Arc<std::sync::RwLock<crate::netdev::Topology>>,
-    pub(crate) fabric: Rc<RefCell<Option<Fabric>>>,
-    listeners: Rc<RefCell<Vec<Weak<Socket>>>>,
+    pub(crate) fabric: Arc<SharedState<Option<Fabric>>>,
+    listeners: Arc<SharedState<Vec<Weak<Socket>>>>,
     loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
     pub(super) ping_range: Cell<[u32; 2]>,
     pub(super) unprivileged_port: Cell<u16>,
-    quota: Rc<Cell<usize>>,
+    quota: Arc<crate::socket_quota::Quota<128>>,
+    _reservation: crate::socket_quota::Reservation<128>,
+    stack_init: parking_lot::Mutex<()>,
     live: Cell<usize>,
     next: Cell<u32>,
-    ports: RefCell<BTreeSet<(u32, u32)>>,
+    ports: SharedState<BTreeSet<(u32, u32)>>,
 }
 impl Default for Namespace {
     fn default() -> Self {
         let id = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
         let graph = std::sync::Arc::new(std::sync::RwLock::new(crate::netdev::Topology::default()));
         graph.write().unwrap().add_space(id, None, None);
+        let quota = Arc::new(crate::socket_quota::Quota::default());
+        let reservation = quota.reserve().expect("initial namespace reservation");
         Self {
             id,
-            native: std::cell::OnceCell::new(),
+            native: std::sync::OnceLock::new(),
             socket_count: std::sync::Arc::default(),
             nft_packet_hooks: Cell::new(true),
-            stack: std::cell::OnceCell::new(),
+            stack: std::sync::OnceLock::new(),
             graph,
-            fabric: Rc::default(),
-            listeners: Rc::default(),
+            fabric: Arc::default(),
+            listeners: Arc::default(),
             loopback: None,
             ping_range: Cell::new([0, i32::MAX as u32]),
             unprivileged_port: Cell::new(1024),
-            quota: Rc::new(Cell::new(1)),
+            quota,
+            _reservation: reservation,
+            stack_init: parking_lot::Mutex::new(()),
             live: Cell::new(0),
             next: Cell::new(0),
-            ports: RefCell::default(),
+            ports: SharedState::default(),
         }
     }
 }
 impl Namespace {
     pub fn isolated(&self, loopback: std::sync::Arc<crate::netdev::Loopback>) -> Result<Self> {
-        if !self.graph.read().unwrap().can_add_space() {
-            return Err(NetError(28));
-        }
-        if self.quota.get() >= 128 {
-            return Err(NetError(28));
-        }
-        self.quota.set(self.quota.get() + 1);
+        let reservation = self.quota.reserve().map_err(|_| NetError(28))?;
         let mut namespace = Self::default();
         namespace.quota = self.quota.clone();
-        namespace.graph = self.graph.clone();
+        namespace._reservation = reservation;
         namespace.fabric = self.fabric.clone();
         namespace.listeners = self.listeners.clone();
-        namespace
-            .graph
-            .write()
-            .unwrap()
-            .add_space(namespace.id(), Some(loopback.clone()), None);
+        {
+            let mut graph = self.graph.write().unwrap();
+            if !graph.can_add_space() {
+                return Err(NetError(28));
+            }
+            graph.add_space(namespace.id(), Some(loopback.clone()), None);
+        }
+        namespace.graph = self.graph.clone();
         namespace.loopback = Some(loopback);
         namespace.ping_range.set([1, 0]);
         Ok(namespace)
@@ -86,6 +89,10 @@ impl Namespace {
         }
     }
     pub fn root_stack(&self) -> Result<virtualnet::Network> {
+        if let Some(stack) = self.stack.get() {
+            return Ok(stack.clone());
+        }
+        let _initialization = self.stack_init.lock();
         if let Some(stack) = self.stack.get() {
             return Ok(stack.clone());
         }
@@ -109,7 +116,7 @@ impl Namespace {
         self.stack
             .set(stack.clone())
             .ok()
-            .expect("root stack initialized by coordinator");
+            .expect("root stack initialized under namespace gate");
         Ok(stack)
     }
     pub fn id(&self) -> u64 {
@@ -147,18 +154,17 @@ impl Drop for Namespace {
                 .collect()
         };
         notify(&self.listeners, changes);
-        self.quota.set(self.quota.get() - 1);
     }
 }
 pub(super) struct Socket {
-    namespace: Rc<Namespace>,
+    namespace: Arc<Namespace>,
     kind: u32,
     protocol: u32,
     port: Cell<u32>,
     connected: Cell<bool>,
     groups: Cell<u32>,
     overrun: Cell<bool>,
-    replies: RefCell<VecDeque<Datagram>>,
+    replies: SharedState<VecDeque<Datagram>>,
     read_epoch: Cell<u64>,
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
@@ -184,9 +190,7 @@ fn enqueue(listener: &Socket, data: &[u8], source: [u8; 12]) {
             data: data.to_vec(),
             source,
         });
-        listener
-            .read_epoch
-            .set(listener.read_epoch.get().wrapping_add(1));
+        listener.read_epoch.update(|n| n.wrapping_add(1));
     }
 }
 pub(super) fn address(port: u32) -> Vec<u8> {
@@ -224,11 +228,16 @@ pub(crate) fn message(kind: u16, flags: u16, sequence: u32, port: u32, data: &[u
     out.resize((out.len() + 3) & !3, 0);
     out
 }
-fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
-    let mut listeners = listeners.borrow_mut();
-    listeners.retain(|s| s.strong_count() != 0);
+// Drop upgraded owners outside the registry: final close may notify again.
+fn live_listeners(registry: &SharedState<Vec<Weak<Socket>>>) -> Vec<Arc<Socket>> {
+    let mut registry = registry.borrow_mut();
+    registry.retain(|s| s.strong_count() != 0);
+    registry.iter().filter_map(Weak::upgrade).collect()
+}
+fn notify(listeners: &Arc<SharedState<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
+    let listeners = live_listeners(listeners);
     for (ns, kind, group, data) in changes {
-        for listener in listeners.iter().filter_map(Weak::upgrade) {
+        for listener in &listeners {
             if listener.protocol != 0
                 || listener.namespace.id() != ns
                 || listener.groups.get() & group == 0
@@ -236,25 +245,25 @@ fn notify(listeners: &Rc<RefCell<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u3
                 continue;
             }
             let p = message(kind, 0, 0, 0, &data);
-            enqueue(&listener, &p, source(0, group));
+            enqueue(listener, &p, source(0, group));
         }
     }
 }
 impl Socket {
     pub fn new(
-        namespace: Rc<Namespace>,
+        namespace: Arc<Namespace>,
         _info: Option<NetworkInfo>,
         kind: u32,
         protocol: u32,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<Arc<Self>> {
         if !matches!(protocol, 0 | 12) {
             return Err(NetError(93));
         }
         if !matches!(kind, 2 | 3) {
             return Err(NetError(94));
         }
-        namespace.live.set(namespace.live.get() + 1);
-        let s = Rc::new(Self {
+        namespace.live.update(|n| n + 1);
+        let s = Arc::new(Self {
             namespace: namespace.clone(),
             kind,
             protocol,
@@ -262,7 +271,7 @@ impl Socket {
             connected: Cell::new(false),
             groups: Cell::new(0),
             overrun: Cell::new(false),
-            replies: RefCell::new(VecDeque::new()),
+            replies: SharedState::new(VecDeque::new()),
             read_epoch: Cell::new(0),
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
@@ -272,7 +281,7 @@ impl Socket {
             .listeners
             .borrow_mut()
             .retain(|s| s.strong_count() != 0);
-        namespace.listeners.borrow_mut().push(Rc::downgrade(&s));
+        namespace.listeners.borrow_mut().push(Arc::downgrade(&s));
         Ok(s)
     }
     fn supported_groups(&self) -> u32 {
@@ -286,22 +295,19 @@ impl Socket {
         if self.port.get() != 0 {
             return Ok(());
         }
+        let mut ports = self.namespace.ports.borrow_mut();
+        // Allocation and publication share the actual port registry transaction.
+        if self.port.get() != 0 {
+            return Ok(());
+        }
         let mut next = self.namespace.next.get().max(1);
-        while self
-            .namespace
-            .ports
-            .borrow()
-            .contains(&(self.protocol, next))
-        {
+        while ports.contains(&(self.protocol, next)) {
             next = next.checked_add(1).ok_or(NetError(98))?;
         }
         self.namespace
             .next
             .set(next.checked_add(1).ok_or(NetError(98))?);
-        self.namespace
-            .ports
-            .borrow_mut()
-            .insert((self.protocol, next));
+        ports.insert((self.protocol, next));
         self.port.set(next);
         Ok(())
     }
@@ -432,7 +438,7 @@ impl Socket {
                 available,
             )?;
             if !generated.is_empty() {
-                self.read_epoch.set(self.read_epoch.get().wrapping_add(1));
+                self.read_epoch.update(|n| n.wrapping_add(1));
             }
             queue.extend(generated.into_iter().map(|data| Datagram {
                 data,
@@ -454,14 +460,13 @@ impl Socket {
         }
         self.autobind()?;
         if group != 0 {
-            let mut listeners = self.namespace.listeners.borrow_mut();
-            listeners.retain(|s| s.strong_count() != 0);
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
+            let listeners = live_listeners(&self.namespace.listeners);
+            for listener in &listeners {
                 if listener.namespace.id() == self.namespace.id()
                     && listener.port.get() != self.port.get()
                     && listener.groups.get() & group != 0
                 {
-                    enqueue(&listener, bytes, source(self.port.get(), group));
+                    enqueue(listener, bytes, source(self.port.get(), group));
                 }
             }
         }
@@ -507,7 +512,7 @@ impl Socket {
             return Err(NetError(105));
         }
         if !replies.is_empty() {
-            self.read_epoch.set(self.read_epoch.get().wrapping_add(1));
+            self.read_epoch.update(|n| n.wrapping_add(1));
         }
         queued.extend(replies.into_iter().map(|data| Datagram {
             data,
@@ -618,7 +623,7 @@ impl Socket {
 }
 impl Drop for Socket {
     fn drop(&mut self) {
-        self.namespace.live.set(self.namespace.live.get() - 1);
+        self.namespace.live.update(|n| n - 1);
         self.namespace
             .ports
             .borrow_mut()
@@ -631,7 +636,7 @@ mod tests {
     use super::*;
     #[test]
     fn loopback_up_requires_authority_and_never_accepts_real_interface_changes() {
-        let s = Socket::new(Rc::new(Namespace::default()), None, 3, 0).unwrap();
+        let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
         let mut data = vec![0; 16];
         data[4..8].copy_from_slice(&1u32.to_le_bytes());
         data[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -664,7 +669,7 @@ mod tests {
     }
     #[test]
     fn malformed_multi_request_has_no_reply_and_dump_preserves_sequence_and_peek() {
-        let s = Socket::new(Rc::new(Namespace::default()), None, 3, 0).unwrap();
+        let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
         let request = message(18, 0x301, 45, 0, &[0; 16]);
         let mut malformed = request.clone();
         malformed.push(1);
@@ -684,7 +689,7 @@ mod tests {
     }
     #[test]
     fn reply_and_request_limits_fail_without_appending_partial_results() {
-        let s = Socket::new(Rc::new(Namespace::default()), None, 3, 0).unwrap();
+        let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
         let request = message(18, 0x301, 1, 0, &[0; 16]);
         assert_eq!(
             s.send_bytes(&request.repeat(129), 0, None),

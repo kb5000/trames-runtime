@@ -10,6 +10,9 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64, Errno>> {
     Some(match number {
+        198 if a[0] as u32 != 1 => factory
+            .socket(a[0] as u32, a[1] as u32, a[2] as u32)
+            .map(u64::from),
         19 => factory.eventfd(a[0] as u32, a[1] as u32).map(u64::from),
         26 => factory.inotify_init(a[0] as u32).map(u64::from),
         85 => factory.timerfd(a[0] as u32, a[1] as u32).map(u64::from),
@@ -34,6 +37,12 @@ mod tests {
     #[test]
     fn owner_and_worker_creation_share_abi_flags_copyout_and_error_order() {
         for (number, args) in [
+            (198, [2, 1, 0, 0, 0, 0]),
+            (198, [2, 2, 17, 0, 0, 0]),
+            (198, [16, 3, 0, 0, 0, 0]),
+            (198, [2, 1, 17, 0, 0, 0]),
+            (198, [2, 0xffff, 0, 0, 0, 0]),
+            (198, [0xffff, 1, 0, 0, 0, 0]),
             (19, [7, 0, 0, 0, 0, 0]),
             (19, [0, 2, 0, 0, 0, 0]),
             (26, [0, 0, 0, 0, 0, 0]),
