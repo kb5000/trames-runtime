@@ -12,7 +12,7 @@ mod descriptor_create;
 mod direct;
 pub use direct::{
     epoll_parameters, epoll_scatter, DirectSyscalls, IoAttempt, PendingIo, RetainedByte,
-    UringEpoch, UringSnapshot,
+    RetainedSocket, UringEpoch, UringSnapshot,
 };
 mod file_calls;
 mod heap;

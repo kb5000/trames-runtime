@@ -11,9 +11,20 @@ impl std::ops::Deref for SocketOperation {
     }
 }
 impl SocketOperation {
+    pub fn shares_resources(&self, fds: &DirectFds) -> bool {
+        fds.1.as_ref().is_some_and(|files| {
+            files
+                .byte_descriptions()
+                .iter()
+                .any(|file| Arc::ptr_eq(&self.0, &file.open))
+        })
+    }
     pub(super) fn from_shared(file: SharedFd) -> Result<Self> {
         file.open.socket.as_ref().ok_or(Errno(88))?;
         Ok(Self(file.open))
+    }
+    pub fn socket_handle(&self) -> Arc<NetSocket> {
+        self.0.socket.as_ref().expect("network OFD").clone()
     }
     pub fn flags(&self) -> u32 {
         self.0.flags.get()

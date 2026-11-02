@@ -530,6 +530,20 @@ mod tests {
         assert!(p.tcp_liveness.is_some());
         assert_eq!(p.linux.vfs.close_quiescent_tcp(fd), None);
         peer.write_all(b"x").unwrap();
+        // A successful host write need not already be readable on Darwin's
+        // receiving thread. Wait for the actual read event without consuming it.
+        {
+            let socket = p.linux.vfs.socket_fd(fd).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while socket.poll(1).unwrap() & 1 == 0 {
+                assert!(Instant::now() < until);
+                trames_net::wait(
+                    &[(socket.clone(), 1)],
+                    until.saturating_duration_since(Instant::now()),
+                )
+                .unwrap();
+            }
+        }
         k.call(1, &mut p, 63, args, &mut io);
         assert_eq!(p.cpu.x(0), 1);
         assert!(p.tcp_liveness.is_none());

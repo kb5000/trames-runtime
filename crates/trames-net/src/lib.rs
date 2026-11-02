@@ -354,6 +354,32 @@ impl Socket {
             SocketBackend::Virtual(s) => Some(s.poll_epoch()),
         }
     }
+    /// Existing native edge observers and packet-stack timer for one retained
+    /// operation. Drain old edges before the deciding retry; no service thread.
+    pub fn wait_sources(&self) -> std::io::Result<(Vec<std::os::fd::OwnedFd>, Option<Duration>)> {
+        let _operation = self.operation.read_recursive();
+        let (mut native, fabric) = match &self.backend {
+            SocketBackend::Native(s) => (vec![s.clone()], None),
+            SocketBackend::Hybrid(s) => {
+                let (native, fabric) = s.waiters(5);
+                (native.into_iter().map(|(s, _)| s).collect(), fabric)
+            }
+            SocketBackend::Virtual(s) => (Vec::new(), Some(s.fabric())),
+            SocketBackend::Netlink(_) => (Vec::new(), None),
+        };
+        let delay = fabric.as_ref().map(|f| f.next_wait());
+        if let Some(fabric) = fabric {
+            native.extend(fabric.native_waiters().into_iter().map(|(s, _)| s));
+        }
+        let fds = native
+            .into_iter()
+            .map(|s| {
+                let _ = s.poll_epoch();
+                s.wait_event_fd()
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok((fds, delay))
+    }
     pub fn info(&self) -> Option<SocketInfo> {
         let _operation = self.operation.read_recursive();
         let mut info = match &self.backend {

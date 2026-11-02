@@ -59,9 +59,24 @@ pub(super) struct IoCall {
     pub args: [u64; 6],
     pub flock: Option<trames_vfs::FlockRequest>,
     pub retained_byte: Option<trames_linux::RetainedByte>,
+    pub retained_socket: Option<trames_linux::RetainedSocket>,
     pub tcp_liveness: Option<trames_net::TcpLease>,
     pub retained_poll: Option<trames_linux::RetainedPoll>,
     pub deadline: Option<Instant>,
+}
+impl IoCall {
+    pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
+        Self {
+            number: call.number,
+            args: call.args,
+            deadline: call.deadline,
+            retained_socket: Some(call),
+            flock: None,
+            retained_byte: None,
+            tcp_liveness: None,
+            retained_poll: None,
+        }
+    }
 }
 impl From<&trames_linux::PendingIo> for IoCall {
     fn from(io: &trames_linux::PendingIo) -> Self {
@@ -70,6 +85,7 @@ impl From<&trames_linux::PendingIo> for IoCall {
             args: io.args,
             flock: io.flock.clone(),
             retained_byte: io.retained_byte.clone(),
+            retained_socket: io.retained_socket.clone(),
             tcp_liveness: io.tcp_liveness(),
             retained_poll: io.retained_poll.clone(),
             deadline: io.deadline,

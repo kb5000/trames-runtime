@@ -1123,3 +1123,30 @@ Files operations continue. Two interpreter CPUs exercise all ten short control
 numbers with native/virtual networking and allow/deny/unfiltered policies: sixty
 cases, zero service requests for allowed calls and one seccomp decision per
 filtered syscall. Original VFS/ABI/epoll/io_uring regressions remain applicable.
+
+## Retained blocking socket controls (2026-11-02)
+
+Blocking TCP connect/accept/accept4 now execute on the calling worker. A blocked
+operation keeps its original socket OFD, creating Files/credentials, entry ABI,
+absolute timeout and handshake phase. Numeric close/reuse, a later cohort or an
+owner fallback cannot retarget it. Connect resumes the already-started handshake;
+it never repeats connect or reads a changed peer-address buffer. Accept keeps the
+original output preflight, reservations and pre-visible TCP publication.
+
+Workers subscribe to the endpoint's existing edge queue and the packet stack's
+existing transport/timer sources, drain stale edges before the deciding retry,
+then park the virtual task and release its execution slot. Existing workers
+dispatch those events; no dedicated reactor, service thread or polling bus is
+added. Fabric deadlines retain the current stack's timer semantics. A missing
+host event registry hands the accepted operation to the existing joined executor
+without replaying effects. Related full-socket waits remain eligible across
+cohorts, including when all related tasks are parked and no GUI service exists.
+
+The accepted syscall keeps its original seccomp decision across parking and
+fallback. A subsequent SVC evaluates the current filter normally. Stop retains
+the operation; caught signals, exit and exec release it, using the existing
+restart and timed-socket interruption rules. Ordinary guest memory and native
+byte I/O are unchanged. Coverage includes a single execution worker, all-blocked
+cohorts, native event idleness, virtual handshake recovery/timeout, original Files
+after close/reuse, filtering and signal cleanup. AF_UNIX/SCM_RIGHTS, task/signal
+authority and structural VM/device ownership remain separate migration work.

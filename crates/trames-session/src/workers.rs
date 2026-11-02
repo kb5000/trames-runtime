@@ -479,7 +479,9 @@ impl<C: Cpu> Pool<C> {
                                     let call = job.retry.take().unwrap();
                                     let tcp_handoff=call.tcp_liveness.is_some();
                                     let _tcp_liveness=call.tcp_liveness;
-                                    if let Some(request) = call.flock {
+                                    if let Some(socket) = call.retained_socket {
+                                        snapshot.direct.start_retained_socket(socket,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(request) = call.flock {
                                         snapshot.direct.start_flock(request, call.args, work.memory.as_deref_mut().expect("worker view"),
                                             work.pid, &epoch.as_ref().unwrap().io_target)
                                     } else if let Some(file) = call.retained_byte {
@@ -506,6 +508,12 @@ impl<C: Cpu> Pool<C> {
                                         parked_io = Some(pending);
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
+                                    trames_linux::IoAttempt::SocketCheckpoint(socket) => {
+                                        for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                        work.cpu.set_x(8,socket.number as u64);
+                                        job.retry=Some(crate::run_queue::IoCall::from_socket(socket));
+                                        break SliceOutcome::Syscall {instructions:0};
+                                    }
                                     trames_linux::IoAttempt::Checkpoint => {
                                         // An owner-blocked call can leave -EAGAIN
                                         // in x0. The joined path needs the original
@@ -518,7 +526,7 @@ impl<C: Cpu> Pool<C> {
                                         work.cpu.set_x(8, call.number as u64);
                                         // A SIGPIPE/checkpoint must still reach the
                                         // original accepted OFD in the joined kernel.
-                                        job.retry = saved_call.filter(|call| call.retained_byte.is_some() || call.retained_poll.is_some() || call.tcp_liveness.is_some());
+                                        job.retry = saved_call.filter(|call| call.retained_socket.is_some() || call.retained_byte.is_some() || call.retained_poll.is_some() || call.tcp_liveness.is_some());
                                         break SliceOutcome::Syscall { instructions: 0 };
                                     }
                                 }
@@ -602,6 +610,19 @@ impl<C: Cpu> Pool<C> {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                             syscalls+=1;continue;
+                                        }
+                                        if let Some(epoch)=&epoch {
+                                            if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
+                                                if let Some(began)=began {syscall_time+=began.elapsed();}
+                                                match attempt {
+                                                    trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                    trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
+                                                    trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                        work.cpu.set_x(8,socket.number as u64);
+                                        job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
+                                                    trames_linux::IoAttempt::Checkpoint=>{job.seccomp_entry=Some(entry);break result;}
+                                                }
+                                            }
                                         }
                                         if let Some(value)=snapshot.direct.invoke_socket_control(number,args,work.memory.as_deref_mut().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
@@ -687,6 +708,17 @@ impl<C: Cpu> Pool<C> {
                                     if let Some(epoch) = &epoch {
                                         let number = work.cpu.x(8) as u32;
                                         let args = std::array::from_fn(|i| work.cpu.x(i));
+                                        if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
+                                            if let Some(began)=began {syscall_time+=began.elapsed();}
+                                            match attempt {
+                                                trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
+                                                trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                        work.cpu.set_x(8,socket.number as u64);
+                                        job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
+                                                trames_linux::IoAttempt::Checkpoint=>break result,
+                                            }
+                                        }
                                         if snapshot.direct.supports_call(number, args) {
                                             let attempt = snapshot.direct.start(number, args,
                                                 work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None)
@@ -702,6 +734,9 @@ impl<C: Cpu> Pool<C> {
                                                     parked_io = Some(pending);
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
+                                                trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                        work.cpu.set_x(8,socket.number as u64);
+                                        job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
                                                 trames_linux::IoAttempt::Checkpoint => break result,
                                             }
                                         }
@@ -1245,6 +1280,7 @@ mod tests {
             args,
             deadline: None,
             flock: None,
+            retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,

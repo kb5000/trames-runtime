@@ -372,6 +372,9 @@ pub struct Received {
     pub truncated: bool,
 }
 impl Socket {
+    pub(crate) fn wait_event_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.native.poll_event_fd()
+    }
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
         let mut epoch = self.native.poll_epoch()?;
         for dns in self.dns.borrow().values() {

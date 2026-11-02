@@ -10,7 +10,9 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+mod socket_wait;
 mod uring;
+pub use socket_wait::RetainedSocket;
 pub use uring::{UringEpoch, UringSnapshot};
 
 fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
@@ -27,6 +29,7 @@ pub struct PendingIo {
     pub signal: Arc<IoSignal>,
     pub flock: Option<trames_vfs::FlockRequest>,
     pub retained_byte: Option<RetainedByte>,
+    pub retained_socket: Option<RetainedSocket>,
     // Cohort-local accepted TCP authority. Joined policy/signal transitions
     // keep their original owner restart path, rather than exporting this lease.
     native_tcp: Option<trames_vfs::DirectTcpFd>,
@@ -35,6 +38,7 @@ pub struct PendingIo {
     epoll_revision: Option<u64>,
     _subscriptions: Vec<IoSubscription>,
     host_subscription: Option<trames_vfs::HostSubscription>,
+    socket_subscriptions: Vec<trames_vfs::HostSubscription>,
     uring: Option<Box<uring::Wait>>,
     poll_uring: Option<Box<uring::PollWait>>,
     target: Weak<dyn IoWake>,
@@ -64,7 +68,8 @@ impl PendingIo {
             .map_or_else(Vec::new, |file| file.fd.native_wait_fds())
     }
     pub fn external_wait(&self) -> bool {
-        self.host_subscription.is_some()
+        self.retained_socket.is_some()
+            || self.host_subscription.is_some()
             || self._subscriptions.iter().any(|s| s.external())
             || self.uring.as_ref().is_some_and(|w| w.external())
             || self.poll_uring.as_ref().is_some_and(|w| w.external())
@@ -83,6 +88,7 @@ pub enum IoAttempt {
     Complete(Result<u64, Errno>),
     Blocked(PendingIo),
     Checkpoint,
+    SocketCheckpoint(RetainedSocket),
 }
 /// Shared epoll ABI for both joined and worker-local implementations.
 pub fn epoll_parameters(
@@ -694,12 +700,14 @@ impl DirectSyscalls {
                 deadline,
                 signal,
                 native_tcp: Some(fd),
+                retained_socket: None,
                 retained_byte: None,
                 flock: None,
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: Vec::new(),
+                socket_subscriptions: Vec::new(),
                 host_subscription: Some(subscription),
                 uring: None,
                 poll_uring: None,
@@ -1029,9 +1037,11 @@ impl DirectSyscalls {
                 retained_poll: poll,
                 resource_deadline: None,
                 flock: None,
+                retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
                 _subscriptions: subscriptions,
+                socket_subscriptions: Vec::new(),
                 host_subscription,
                 uring: None,
                 poll_uring: None,
@@ -1073,11 +1083,13 @@ impl DirectSyscalls {
                 signal,
                 epoll_revision: None,
                 retained_poll: Some(poll),
+                retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
                 flock: None,
                 resource_deadline: None,
                 _subscriptions: subscriptions,
+                socket_subscriptions: Vec::new(),
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
@@ -1142,12 +1154,14 @@ impl DirectSyscalls {
                 deadline: None,
                 signal,
                 flock: None,
+                retained_socket: None,
                 retained_byte: Some(file),
                 native_tcp: None,
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
+                socket_subscriptions: Vec::new(),
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
@@ -1180,12 +1194,14 @@ impl DirectSyscalls {
                 deadline: None,
                 signal,
                 flock: Some(request),
+                retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
+                socket_subscriptions: Vec::new(),
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
@@ -1223,6 +1239,9 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         checkpoint_pipe: bool,
     ) -> IoAttempt {
+        if pending.retained_socket.is_some() {
+            return self.resume_socket(pending, memory);
+        }
         if pending.uring.is_some() {
             return self.urings.resume(pending, memory);
         }

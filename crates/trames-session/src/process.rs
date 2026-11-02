@@ -97,6 +97,7 @@ pub(crate) struct Process<C: Cpu> {
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
     retained_byte: Option<trames_linux::RetainedByte>,
+    retained_socket: Option<trames_linux::RetainedSocket>,
     tcp_liveness: Option<trames_net::TcpLease>,
     retained_poll: Option<trames_linux::RetainedPoll>,
     retained_select: Option<trames_linux::RetainedSelect>,
@@ -119,9 +120,18 @@ pub(crate) struct Process<C: Cpu> {
 }
 impl<C: Cpu> Process<C> {
     fn shares_wait_resources(&self, fds: &trames_vfs::DirectFds) -> bool {
-        self.retained_poll
+        self.retained_socket
             .as_ref()
-            .is_some_and(|poll| poll.shares_resources(fds))
+            .or_else(|| {
+                self.byte_wait
+                    .as_ref()
+                    .and_then(|w| w.retained_socket.as_ref())
+            })
+            .is_some_and(|socket| socket.shares_resources(fds))
+            || self
+                .retained_poll
+                .as_ref()
+                .is_some_and(|poll| poll.shares_resources(fds))
             || self
                 .retained_byte
                 .as_ref()
@@ -132,9 +142,17 @@ impl<C: Cpu> Process<C> {
                 .and_then(|wait| wait.retained_byte.as_ref())
                 .is_some_and(|byte| byte.shares_resources(fds))
     }
-    /// Only unfiltered, untraced already-blocked calls can be adopted without
-    /// another authority evaluation. New calls use Snapshot::admit on-worker.
-    fn worker_ring_event_wait(&self, id: u32) -> bool {
+    /// Original accepted calls can rearm their actual event source. New calls
+    /// still use Snapshot::admit and evaluate policy only at their SVC entry.
+    fn worker_event_wait(&self, id: u32) -> bool {
+        if self.retained_socket.is_some()
+            || self
+                .byte_wait
+                .as_ref()
+                .is_some_and(|w| w.retained_socket.is_some())
+        {
+            return true;
+        }
         let owner = self.memory.instruction_identity().0;
         if let Some((_, ring, deadline)) = &self.uring_wait {
             return trames_linux::UringEpoch::has_event_wait(ring, owner, id, *deadline);
@@ -169,6 +187,14 @@ impl<C: Cpu> Process<C> {
             return !self.linux.trace
                 && self.seccomp.mode() == 0
                 && poll.supports_worker(&self.linux.vfs);
+        }
+        if self.retained_socket.is_some()
+            || self
+                .byte_wait
+                .as_ref()
+                .is_some_and(|w| w.retained_socket.is_some())
+        {
+            return !self.linux.trace;
         }
         if self.retained_byte.is_some() || self.byte_wait.is_some() {
             return !self.linux.trace && self.seccomp.mode() == 0;
@@ -315,6 +341,7 @@ impl<C: Cpu> Process<C> {
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
+            retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,
@@ -1091,6 +1118,7 @@ impl<C: Cpu> Kernel<C> {
         p.flock_wait = None;
         p.record_wait = None;
         p.byte_wait = None;
+        p.retained_socket = None;
         p.retained_byte = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
@@ -1530,6 +1558,7 @@ impl<C: Cpu> Kernel<C> {
                 p.flock_wait = None;
                 p.record_wait = None;
                 p.byte_wait = None;
+                p.retained_socket = None;
                 p.retained_byte = None;
                 p.tcp_liveness = None;
                 p.retained_poll = None;
@@ -1765,6 +1794,7 @@ impl<C: Cpu> Kernel<C> {
             p.flock_wait = None;
             p.record_wait = None;
             p.byte_wait = None;
+            p.retained_socket = None;
             p.retained_byte = None;
             p.tcp_liveness = None;
             p.retained_poll = None;
@@ -2857,7 +2887,30 @@ impl<C: Cpu> Kernel<C> {
         put_args(&mut p.cpu, a);
         let ids = |c: &trames_vfs::Credentials| [c.euid, c.egid, c.fsuid, c.fsgid];
         let before_ids = ids(&p.linux.vfs.credentials);
-        let byte = if matches!(number, 63..=66) {
+        let socket = p
+            .byte_wait
+            .as_ref()
+            .and_then(|wait| wait.retained_socket.clone())
+            .or_else(|| p.retained_socket.take());
+        let byte = if let Some(socket) = socket {
+            p.byte_wait = None;
+            Some(trames_linux::DirectSyscalls::default().retry_owned_socket(
+                socket,
+                &mut p.memory,
+                pid,
+                &Arc::downgrade(&self.byte_target),
+            ))
+        } else if !p.linux.trace && matches!(number, 202 | 203 | 242) {
+            trames_linux::DirectSyscalls::default()
+                .with_resources(p.linux.vfs.descriptor_factory())
+                .start_owned_socket_control(
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                )
+        } else if matches!(number, 63..=66) {
             let direct = trames_linux::DirectSyscalls::default()
                 .with_membership(p.linux.vfs.shared_files())
                 .with_local_identity([
@@ -2883,8 +2936,14 @@ impl<C: Cpu> Kernel<C> {
         let result = match byte {
             Some(trames_linux::IoAttempt::Complete(result)) => result.map(Some),
             Some(trames_linux::IoAttempt::Blocked(wait)) => {
+                if wait.retained_socket.is_some() {
+                    p.socket_deadline = wait.deadline;
+                }
                 p.byte_wait = Some(wait);
                 Ok(None)
+            }
+            Some(trames_linux::IoAttempt::SocketCheckpoint(_)) => {
+                unreachable!("owner socket retry")
             }
             Some(trames_linux::IoAttempt::Checkpoint) => {
                 unreachable!("joined shared byte call")
@@ -3811,11 +3870,11 @@ impl<C: Cpu> Kernel<C> {
             {
                 return true;
             }
-            // A parked ring with a real host event or imported deadline and a
+            // A retained socket/ring with an actual event source or deadline and a
             // related peer can retain event-driven execution with every CPU
             // asleep. Unrelated terminals/timers do not change the solo gate.
             return self.processes.iter().any(|(&id, p)| {
-                if p.frozen(id) || !p.worker_io_candidate(id) || !p.worker_ring_event_wait(id) {
+                if p.frozen(id) || !p.worker_io_candidate(id) || !p.worker_event_wait(id) {
                     return false;
                 }
                 let fds = p.linux.vfs.direct_descriptors();
@@ -4144,6 +4203,10 @@ impl<C: Cpu> Kernel<C> {
                     .as_ref()
                     .and_then(trames_linux::PendingIo::tcp_liveness)
                     .or_else(|| p.tcp_liveness.take());
+                let retained_socket = previous
+                    .as_ref()
+                    .and_then(|wait| wait.retained_socket.clone())
+                    .or_else(|| p.retained_socket.take());
                 let retained_byte = previous
                     .and_then(|wait| wait.retained_byte)
                     .or_else(|| p.retained_byte.take());
@@ -4156,11 +4219,12 @@ impl<C: Cpu> Kernel<C> {
                         p.flock_wait.as_ref().map(|(request, _)| request.clone())
                     },
                     retained_byte,
+                    retained_socket,
                     tcp_liveness,
                     retained_poll: p.retained_poll.take(),
                     number,
                     args,
-                    deadline: if matches!(number, 63..=66) {
+                    deadline: if matches!(number, 63..=66 | 202 | 203 | 242) {
                         p.socket_deadline
                     } else {
                         p.poll_deadline
@@ -4346,6 +4410,10 @@ impl<C: Cpu> Kernel<C> {
             }
             p.retain_worker_flock(done.io.as_ref());
             p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
+            p.retained_socket = done
+                .io
+                .as_ref()
+                .and_then(|call| call.retained_socket.clone());
             p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
             p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
             p.state = if let Some(compile) = done.gpu_pending {
@@ -4359,7 +4427,7 @@ impl<C: Cpu> Kernel<C> {
                     instructions: self.instructions,
                 }
             } else if let Some(call) = done.io {
-                if matches!(call.number, 63..=66) {
+                if matches!(call.number, 63..=66 | 202 | 203 | 242) {
                     p.socket_deadline = call.deadline;
                 } else {
                     p.poll_deadline = call.deadline;
@@ -4788,6 +4856,7 @@ impl<C: Cpu> Kernel<C> {
                         || p.linux.vfs.has_bridge_descriptors()
                         || p.linux.vfs.has_native_services()
                         || p.linux.vfs.has_native_event_sources()
+                        || p.retained_socket.is_some()
                         || p.byte_wait.as_ref().is_some_and(|wait|wait.external_wait())
                         || !p.linux.uring_native_wait_fds().is_empty()
                         || p.flock_wait.as_ref().is_some_and(|(r,_)| r.native_wait_fd().is_some())
@@ -4875,6 +4944,14 @@ impl<C: Cpu> Kernel<C> {
             let State::Blocked(number, a) = p.state else {
                 continue;
             };
+            if let Some(call) = p.retained_socket.as_ref().or_else(|| {
+                p.byte_wait
+                    .as_ref()
+                    .and_then(|wait| wait.retained_socket.as_ref())
+            }) {
+                sockets.push((call.socket_handle(), call.events()));
+                continue;
+            }
             let mut add = |fd, events| {
                 if let Ok(socket) = p.linux.vfs.socket_fd(fd) {
                     sockets.push((socket, events));
@@ -5000,6 +5077,7 @@ pub(super) fn run<C: Cpu>(
         flock_wait: None,
         record_wait: None,
         byte_wait: None,
+        retained_socket: None,
         retained_byte: None,
         tcp_liveness: None,
         retained_poll: None,
@@ -5508,6 +5586,7 @@ mod tests {
             args: [a as u64, 2, 0, 0, 0, 0],
             deadline: None,
             flock: Some(request),
+            retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,
@@ -6058,6 +6137,7 @@ mod tests {
             args: [a as u64, 1, 0, 0, 0, 0],
             deadline: None,
             flock: Some(shared.clone()),
+            retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,
@@ -6313,6 +6393,7 @@ mod tests {
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
+            retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,
@@ -8429,3 +8510,7 @@ mod cpu_fault_tests {
         );
     }
 }
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_socket_wait.rs"]
+mod socket_wait_tests;
