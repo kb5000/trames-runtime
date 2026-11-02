@@ -399,6 +399,54 @@ mod tests {
 
     use super::*;
     #[test]
+    fn filtered_socket_controls_remain_joined_and_never_run_in_snapshot_invoke() {
+        for allowed in [false, true] {
+            let mut p = super::super::tests::process();
+            p.linux
+                .vfs
+                .configure_network(trames_vfs::NetworkMode::Loopback)
+                .unwrap();
+            let fd = p.linux.vfs.socket(2, 1, 0).unwrap();
+            p.memory.write_array(0x1000, 4u32.to_le_bytes()).unwrap();
+            p.cpu.set_x(8, 209);
+            put_args(&mut p.cpu, [fd as u64, 6, 1, 0x1100, 0x1000, 0]);
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
+            ));
+            let snapshot = crate::worker_syscalls::Snapshot {
+                seccomp: p.seccomp.clone(),
+                identities: [0; 7],
+                started: Instant::now(),
+                processor: 0,
+                profile: false,
+                streams: Default::default(),
+                files: Default::default(),
+                fd_flags: p.linux.vfs.fd_flags_snapshot(),
+                umask: p.linux.vfs.umask_capability(),
+                actions: p.signals.actions.shared(),
+                program_break: p.linux.program_break(),
+                uts: None,
+                direct: trames_linux::DirectSyscalls::default()
+                    .with_network(p.linux.vfs.direct_network()),
+                futex: Default::default(),
+            };
+            assert!(!snapshot.admit(&p.cpu));
+            assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), None);
+            assert_eq!(p.seccomp.evaluations(), 0);
+            let mut k = super::super::tests::kernel();
+            k.call(
+                1,
+                &mut p,
+                209,
+                [fd as u64, 6, 1, 0x1100, 0x1000, 0],
+                &mut trames_linux::CapturedOutput::default(),
+            );
+            assert_eq!(p.seccomp.evaluations(), 1);
+            assert_eq!(p.cpu.x(0), if allowed { 0 } else { error(Errno(13)) });
+        }
+    }
+
+    #[test]
     fn cached_mapping_decision_is_bound_to_entry_and_filter_identity() {
         let mut policy = Seccomp::default();
         policy.push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));

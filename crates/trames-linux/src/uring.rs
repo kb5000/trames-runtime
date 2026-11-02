@@ -616,34 +616,36 @@ impl Linux {
                 return Err(Errno(22));
             }
             return self.vfs.with_uring_fd(file, |v, fd| {
-                if let Some(socket) = v.local_socket(fd)? {
-                    if s.opcode() == 16 {
-                        v.local_connect(&socket, request.path.as_deref().unwrap())?;
+                v.with_socket_control(fd, |v| {
+                    if let Some(socket) = v.local_socket(fd)? {
+                        if s.opcode() == 16 {
+                            v.local_connect(&socket, request.path.as_deref().unwrap())?;
+                        } else {
+                            v.local_bind(&socket, request.path.as_deref().unwrap())?;
+                        }
                     } else {
-                        v.local_bind(&socket, request.path.as_deref().unwrap())?;
+                        let socket = v.socket_fd(fd)?;
+                        let result = if s.opcode() == 56 {
+                            socket.bind_authorized(
+                                request.path.as_deref().unwrap(),
+                                v.credentials
+                                    .has_cap(trames_vfs::capabilities::NET_BIND_SERVICE),
+                            )
+                        } else if request.started {
+                            socket.resume_connect().and_then(|ready| {
+                                if ready {
+                                    Ok(())
+                                } else {
+                                    Err(trames_net::NetError(11))
+                                }
+                            })
+                        } else {
+                            socket.connect_bytes(request.path.as_deref().unwrap())
+                        };
+                        result.map_err(|e| Errno(if e.0 == 115 { 11 } else { e.0 }))?;
                     }
-                } else {
-                    let socket = v.socket_fd(fd)?;
-                    let result = if s.opcode() == 56 {
-                        socket.bind_authorized(
-                            request.path.as_deref().unwrap(),
-                            v.credentials
-                                .has_cap(trames_vfs::capabilities::NET_BIND_SERVICE),
-                        )
-                    } else if request.started {
-                        socket.resume_connect().and_then(|ready| {
-                            if ready {
-                                Ok(())
-                            } else {
-                                Err(trames_net::NetError(11))
-                            }
-                        })
-                    } else {
-                        socket.connect_bytes(request.path.as_deref().unwrap())
-                    };
-                    result.map_err(|e| Errno(if e.0 == 115 { 11 } else { e.0 }))?;
-                }
-                Ok((0, true))
+                    Ok((0, true))
+                })
             });
         }
         if s.opcode() == 13 {

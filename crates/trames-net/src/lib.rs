@@ -13,8 +13,9 @@ mod rtnetlink;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
 pub use native::{
-    decode_address, encode_address, DirectTcp, NetError, NetworkMode, Received, TcpLease,
-    MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC,
+    decode_address, encode_address, DirectControl, DirectTcp, NetError, NetworkMode, Received,
+    TcpLease, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
+    MSG_TRUNC,
 };
 use std::{cell::Cell, net::SocketAddr, rc::Rc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
@@ -277,6 +278,13 @@ impl Socket {
             SocketBackend::Native(socket) => socket.idle_tcp(),
             SocketBackend::Hybrid(socket) => socket.idle_tcp(),
             _ => false,
+        }
+    }
+    pub fn direct_control(&self) -> Option<DirectControl> {
+        match &self.0 {
+            SocketBackend::Native(s) => s.direct_control(),
+            SocketBackend::Hybrid(s) => s.direct_control(),
+            _ => None,
         }
     }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {

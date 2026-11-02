@@ -136,6 +136,87 @@ impl AddressOutput {
             .map_err(|_| Errno(14))
     }
 }
+fn query_address(
+    memory: &mut impl CpuMemory,
+    a: [u64; 6],
+    size: usize,
+    read: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<u64> {
+    let output = AddressOutput::prepare(memory, a[1], a[2], size)?.ok_or(Errno(14))?;
+    let address = read()?;
+    output.write_bytes(memory, &address)?;
+    Ok(0)
+}
+fn read_option<const N: usize>(
+    memory: &mut impl CpuMemory,
+    a: [u64; 6],
+    read: impl FnOnce() -> Result<[u8; N]>,
+) -> Result<u64> {
+    Linux::check(memory, a[4], 4, Access::Write)?;
+    let capacity = u32_at(memory, a[4])?;
+    if capacity > i32::MAX as u32 {
+        return Err(Errno(22));
+    }
+    let count = (capacity as usize).min(N);
+    Linux::check(memory, a[3], count, Access::Write)?;
+    let value = read()?;
+    memory.write(a[3], &value[..count]).map_err(|_| Errno(14))?;
+    memory
+        .write(a[4], &(count as u32).to_le_bytes())
+        .map_err(|_| Errno(14))?;
+    Ok(0)
+}
+fn write_option(
+    memory: &impl CpuMemory,
+    a: [u64; 6],
+    write: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    if a[4] < 4 || a[4] > 65536 {
+        return Err(Errno(22));
+    }
+    Linux::check(memory, a[3], a[4] as usize, Access::Read)?;
+    // Ordinary scalar options do not need a temporary heap allocation.
+    let mut small = [0; 64];
+    let mut large;
+    let bytes = if a[4] <= 64 {
+        &mut small[..a[4] as usize]
+    } else {
+        large = vec![0; a[4] as usize];
+        &mut large
+    };
+    memory.read(a[3], bytes).map_err(|_| Errno(14))?;
+    write(bytes)?;
+    Ok(0)
+}
+/// Restricted before any guest or host effects. Unsupported controls retain
+/// the original owner path, including SO_ERROR/connection completion.
+pub(crate) fn direct_control(
+    control: &trames_net::DirectControl,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Result<u64> {
+    match number {
+        204 | 205 => query_address(memory, a, control.address_size(), || {
+            control
+                .address(number == 205)
+                .map(encode_address)
+                .map_err(net)
+        }),
+        208 => write_option(memory, a, |value| {
+            control
+                .set_option_bytes(a[1] as u32, a[2] as u32, value)
+                .map_err(net)
+        }),
+        209 => read_option(memory, a, || {
+            control
+                .get_option(a[1] as u32, a[2] as u32)
+                .map(i32::to_le_bytes)
+                .map_err(net)
+        }),
+        _ => unreachable!("restricted control admission"),
+    }
+}
 struct Vectors {
     parts: Vec<(u64, usize)>,
     size: usize,
@@ -396,7 +477,10 @@ impl Linux {
             if !self.vfs.socket_fd(a[0] as u32).ok()?.idle_tcp() {
                 return None;
             }
-            return Some(self.vfs.close(a[0] as u32).map(|()| 0));
+            return Some(
+                self.vfs
+                    .with_socket_control(a[0] as u32, |v| v.close(a[0] as u32).map(|()| 0)),
+            );
         }
         if number == 198 {
             if !matches!(a[0] as u32, 2 | 10) {
@@ -416,13 +500,22 @@ impl Linux {
                 return None;
             }
         }
-        let result = Self::network_vfs(&mut self.vfs, number as u64, a, memory);
-        if number != 198 {
-            self.vfs.refresh_tcp(a[0] as u32);
-        }
-        Some(result)
+        Some(Self::network_vfs(&mut self.vfs, number as u64, a, memory))
     }
     pub(crate) fn network_vfs(
+        vfs: &mut trames_vfs::Vfs,
+        number: u64,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64> {
+        if matches!(number,200..=206|208..=211|242) {
+            return vfs.with_socket_control(a[0] as u32, |vfs| {
+                Self::network_vfs_controlled(vfs, number, a, memory)
+            });
+        }
+        Self::network_vfs_controlled(vfs, number, a, memory)
+    }
+    fn network_vfs_controlled(
         vfs: &mut trames_vfs::Vfs,
         number: u64,
         a: [u64; 6],
@@ -474,18 +567,14 @@ impl Linux {
                 )?;
                 Ok(fd as u64)
             }
-            204 | 205 => {
-                let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?
-                    .ok_or(Errno(14))?;
-                let address = if number == 204 {
+            204 | 205 => query_address(memory, a, socket.address_size(), || {
+                if number == 204 {
                     socket.local_bytes()
                 } else {
                     socket.peer_bytes()
                 }
-                .map_err(net)?;
-                output.write_bytes(memory, &address)?;
-                Ok(0)
-            }
+                .map_err(net)
+            }),
             206 => {
                 if a[2] > trames_net::MAX_TRANSFER as u64 {
                     return Err(Errno(90));
@@ -516,11 +605,8 @@ impl Linux {
                 } as u64)
             }
             208 => {
-                if (a[4] as u32) < 4 || (a[4] as u32) > i32::MAX as u32 {
-                    return Err(Errno(22));
-                }
                 if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
-                    if a[4] < 16 {
+                    if (a[4] as u32) < 4 || (a[4] as u32) > i32::MAX as u32 || a[4] < 16 {
                         return Err(Errno(22));
                     }
                     Self::check(memory, a[3], 16, Access::Read)?;
@@ -542,49 +628,30 @@ impl Linux {
                     socket.set_io_timeout(matches!(a[2], 20 | 66), timeout);
                     return Ok(0);
                 }
-                if a[4] > 65536 {
-                    return Err(Errno(22));
-                }
-                Self::check(memory, a[3], a[4] as usize, Access::Read)?;
-                let mut value = vec![0; a[4] as usize];
-                memory.read(a[3], &mut value).map_err(|_| Errno(14))?;
-                socket
-                    .set_option_bytes(a[1] as u32, a[2] as u32, &value)
-                    .map_err(net)?;
-                Ok(0)
+                write_option(memory, a, |value| {
+                    socket
+                        .set_option_bytes(a[1] as u32, a[2] as u32, value)
+                        .map_err(net)
+                })
             }
             209 => {
-                Linux::check(memory, a[4], 4, Access::Write)?;
-                let capacity = u32_at(memory, a[4])?;
-                if capacity > i32::MAX as u32 {
-                    return Err(Errno(22));
-                }
                 if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
-                    let count = capacity.min(16) as usize;
-                    Self::check(memory, a[3], count, Access::Write)?;
-                    let timeout = socket
-                        .io_timeout(matches!(a[2], 20 | 66))
-                        .unwrap_or_default();
-                    let mut value = [0; 16];
-                    value[..8].copy_from_slice(&timeout.as_secs().to_le_bytes());
-                    value[8..].copy_from_slice(&(timeout.subsec_micros() as u64).to_le_bytes());
-                    memory.write(a[3], &value[..count]).map_err(|_| Errno(14))?;
-                    memory
-                        .write(a[4], &(count as u32).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                    return Ok(0);
+                    return read_option(memory, a, || {
+                        let timeout = socket
+                            .io_timeout(matches!(a[2], 20 | 66))
+                            .unwrap_or_default();
+                        let mut value = [0; 16];
+                        value[..8].copy_from_slice(&timeout.as_secs().to_le_bytes());
+                        value[8..].copy_from_slice(&(timeout.subsec_micros() as u64).to_le_bytes());
+                        Ok(value)
+                    });
                 }
-                let count = capacity.min(4) as usize;
-                Linux::check(memory, a[3], count, Access::Write)?;
-                let value = socket
-                    .get_option(a[1] as u32, a[2] as u32)
-                    .map_err(net)?
-                    .to_le_bytes();
-                memory.write(a[3], &value[..count]).map_err(|_| Errno(14))?;
-                memory
-                    .write(a[4], &(count as u32).to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-                Ok(0)
+                read_option(memory, a, || {
+                    socket
+                        .get_option(a[1] as u32, a[2] as u32)
+                        .map(i32::to_le_bytes)
+                        .map_err(net)
+                })
             }
             210 => {
                 socket.shutdown(a[1] as u32).map_err(net)?;
@@ -719,6 +786,102 @@ mod tests {
     use std::{io::Write, net::TcpStream};
     use trames_memory::{Permissions, PAGE_SIZE};
     use trames_vfs::NetworkMode;
+    #[test]
+    fn direct_and_owner_controls_share_copyout_and_option_error_order() {
+        let cases: [(u32, [u64; 6]); 10] = [
+            (208, [3, 6, 1, 0x1100, 4, 0]),
+            (208, [3, 6, 1, 0x9000, 4, 0]),
+            (208, [3, 6, 1, 0x1100, 3, 0]),
+            (208, [3, 6, 1, 0x1100, 65537, 0]),
+            (209, [3, 6, 1, 0x1110, 0x1000, 0]),
+            (209, [3, 6, 1, 0x9000, 0x1000, 0]),
+            (209, [3, 1, 3, 0x1110, 0x9000, 0]),
+            (204, [3, 0x1300, 0x1200, 0, 0, 0]),
+            (204, [3, 0, 0x1200, 0, 0, 0]),
+            (205, [3, 0x1300, 0x1200, 0, 0, 0]),
+        ];
+        for (number, args) in cases {
+            let mut results = Vec::new();
+            for worker in [false, true] {
+                let mut linux = Linux::new(0x10000);
+                linux.vfs.configure_network(NetworkMode::Loopback).unwrap();
+                assert_eq!(linux.vfs.socket(2, 1, 0).unwrap(), 3);
+                let mut memory = Memory::default();
+                memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+                memory.write_array(0x1000, 4u32.to_le_bytes()).unwrap();
+                memory.write_array(0x1100, 1i32.to_le_bytes()).unwrap();
+                memory.write_array(0x1200, 16u32.to_le_bytes()).unwrap();
+                let value = if worker {
+                    let direct =
+                        crate::DirectSyscalls::default().with_network(linux.vfs.direct_network());
+                    let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+                    let value = direct
+                        .invoke_socket_control(number, args, &mut view)
+                        .unwrap();
+                    drop(view);
+                    memory.commit_parallel().unwrap();
+                    assert_eq!(direct.socket_completed(), 1);
+                    value
+                } else {
+                    Linux::network_vfs(&mut linux.vfs, number as u64, args, &mut memory)
+                };
+                results.push((
+                    value,
+                    memory.read_array::<4096>(0x1000).unwrap(),
+                    linux.vfs.socket_fd(3).unwrap().get_option(6, 1),
+                ));
+            }
+            assert_eq!(results[0], results[1], "control {number} {args:?}");
+        }
+    }
+    #[test]
+    fn explicit_dns_send_retires_native_control_publication() {
+        let mut linux = Linux::new(0x10000);
+        linux.vfs.configure_network(NetworkMode::Full).unwrap();
+        let fd = linux.vfs.socket(2, 1, 0).unwrap();
+        let direct = crate::DirectSyscalls::default().with_network(linux.vfs.direct_network());
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory
+            .write(0x1000, &encode_address("127.0.0.53:53".parse().unwrap()))
+            .unwrap();
+        assert!(direct
+            .invoke_socket_control(204, [fd as u64, 0, 0, 0, 0, 0], &mut memory)
+            .is_some());
+        assert_eq!(
+            Linux::network_vfs(
+                &mut linux.vfs,
+                206,
+                [fd as u64, 0, 0, 0, 0x1000, 16],
+                &mut memory
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            direct.invoke_socket_control(204, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+    }
+    #[test]
+    fn stateful_socket_options_defer_before_memory_or_native_effects() {
+        let mut v = trames_vfs::Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let direct = crate::DirectSyscalls::default().with_network(v.direct_network());
+        let mut memory = Memory::default();
+        for (number, level, option) in [(209, 1, 4), (208, 1, 9), (208, 1, 20), (209, 1, 30)] {
+            assert_eq!(
+                direct.invoke_socket_control(
+                    number,
+                    [fd as u64, level, option, u64::MAX, u64::MAX, 0],
+                    &mut memory
+                ),
+                None
+            );
+        }
+        assert_eq!(direct.socket_completed(), 0);
+    }
+
     #[test]
     fn idle_tcp_close_services_preserve_aliases_and_defer_active_resources() {
         let mut linux = Linux::new(0x10000);

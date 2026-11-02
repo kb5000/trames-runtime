@@ -686,3 +686,45 @@ atomic status/cloexec words, not native controls or namespace state. New sockets
 aliases and reused numbers therefore work in existing worker snapshots. The
 ordinary shared-file branch keeps its borrowed flag access and gains no extra
 reference-count increment. No additional memory ordering or global lock is used.
+
+### Direct native TCP controls (2026-11-02)
+
+Unfiltered getsockname/getpeername, TCP_NODELAY set/get and immutable TCP
+SO_TYPE/SO_DOMAIN/SO_PROTOCOL queries now execute on the guest's current worker.
+They operate on the original host endpoint, using the same Linux address/option
+ABI helpers and native option methods as the owner. Unsupported/stateful options,
+SO_ERROR/connection completion and seccomp-filtered controls keep their original
+owner path. The new dispatch arm applies only to those four socket syscall
+numbers; unrelated clock, file and futex calls gain no extra control admission.
+
+The shared OFD optionally publishes a SocketControl for native TCP. Its weak
+native projection contains no Rc, namespace graph, DNS service or route authority.
+Snapshot publication does not retain the endpoint. An executing operation takes
+this socket's read gate and an actual transport lease before accessing memory or
+host controls. The existing worker TCP byte path does not acquire this gate.
+Files membership is released before waiting for the gate or copying guest bytes;
+no Files-to-object/object-to-Files lock cycle is introduced.
+
+Owner control transitions take that same socket's write gate, including the
+normal network ABI and io_uring bind/connect on retained descriptors. The original
+OFD is retained for this synchronous operation and refreshed afterward, regardless
+of whether its numeric slot was closed/reused. This preserves other aliases and
+cannot publish an old object's control into a replacement FD. TCP control replay
+uses the actual shared hybrid option list: TCP_NODELAY host update and saved-option
+replacement synchronize that socket's two-field invariant. Guest/native routing
+transitions then replay the same saved options. No global network lock is added.
+
+Native projection is absent for guest-stack branches, UDP and DNS transport. A
+control transition retires it as needed; explicit owner sendto/sendmsg also takes
+the gate because a DNS destination can lazily create that transport even without
+connect. Ordinary direct byte I/O remains unchanged. Errors after admission are
+final results; fallback occurs before memory or native effects. Copyout preflight
+and SO_ERROR consumption ordering are shared with the existing owner ABI.
+
+Regression coverage includes original-endpoint agreement, weak snapshot/final-close
+lifetime, aliases and FD reuse, object-gate ordering while Files and other sockets
+continue, actual guest-option replay, virtual/DNS exclusions, owner/worker output
+and fault ordering, filtered allow/deny entries evaluating once on the owner,
+and two CPUs doing controls without any service requests or cohort checkpoints.
+The implementation uses safe Rust and shared resource objects; no new thread,
+message bus, busy loop or guest-memory ordering rule is introduced.

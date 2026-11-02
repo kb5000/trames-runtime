@@ -14,9 +14,31 @@ impl DirectTcpFd {
         self.status.get() & O_NONBLOCK != 0
     }
 }
+/// Per-socket control publication. Stored capabilities remain weak; a running
+/// operation alone holds the real endpoint. No Files lock is held over this gate.
+#[derive(Clone)]
+pub(super) struct SocketControl(Arc<std::sync::RwLock<Option<trames_net::DirectControl>>>);
+impl SocketControl {
+    pub(super) fn new(control: trames_net::DirectControl) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(Some(control))))
+    }
+    fn with_native<T>(&self, operation: impl FnOnce(&trames_net::DirectControl) -> T) -> Option<T> {
+        let current = self.0.read().unwrap();
+        let control = current.as_ref()?;
+        let _lease = control.retain().ok()?;
+        Some(operation(control))
+    }
+}
 #[derive(Clone, Default)]
 pub struct DirectNetwork(Arc<[Option<DirectTcpFd>]>, Option<SharedFiles>);
 impl DirectNetwork {
+    pub fn with_control<T>(
+        &self,
+        fd: u32,
+        operation: impl FnOnce(&trames_net::DirectControl) -> T,
+    ) -> Option<T> {
+        self.1.as_ref()?.socket_control(fd)?.with_native(operation)
+    }
     pub fn is_socket(&self, fd: u32) -> bool {
         self.1.as_ref().is_some_and(|files| files.is_socket(fd))
     }
@@ -76,7 +98,28 @@ impl Vfs {
         if let Some(descriptor) = self.fds.get(&fd) {
             let open = descriptor.open.borrow();
             *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+            if let Some(control) = &open.socket_control {
+                *control.0.write().unwrap() = open.socket.as_ref().and_then(|s| s.direct_control());
+            }
         }
+    }
+    /// The original OFD, rather than a possibly reused number, owns publication.
+    /// Retain its owner projection only for this synchronous control operation.
+    /// This also preserves aliases when the addressed FD is closed.
+    pub fn with_socket_control<T>(&mut self, fd: u32, operation: impl FnOnce(&mut Self) -> T) -> T {
+        let descriptor = self.fds.get(&fd);
+        let control = descriptor
+            .as_ref()
+            .and_then(|d| d.open.borrow().socket_control.clone());
+        let Some(control) = control else {
+            return operation(self);
+        };
+        let mut current = control.0.write().unwrap();
+        let result = operation(self);
+        let open = descriptor.as_ref().unwrap().open.borrow();
+        *current = open.socket.as_ref().and_then(|s| s.direct_control());
+        *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+        result
     }
     pub fn direct_network(&self) -> DirectNetwork {
         let mut entries = Vec::new();
@@ -84,6 +127,9 @@ impl Vfs {
             let open = descriptor.open.borrow();
             let tcp = Self::direct_tcp_open(&open);
             *open.shared.tcp_publication.lock().unwrap() = tcp.clone();
+            if let Some(control) = &open.socket_control {
+                *control.0.write().unwrap() = open.socket.as_ref().and_then(|s| s.direct_control());
+            }
             let Some(tcp) = tcp else { continue };
             entries.resize_with(fd as usize + 1, || None);
             entries[fd as usize] = Some(tcp);
@@ -100,6 +146,85 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         time::Duration,
     };
+    #[test]
+    fn control_publication_preserves_aliases_after_close_and_fd_reuse() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let network = v.direct_network();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        assert_eq!(
+            network.with_control(fd, |c| c.set_option_bytes(6, 1, &1i32.to_le_bytes())),
+            Some(Ok(()))
+        );
+        assert_eq!(v.with_socket_control(fd, |v| v.close(fd)), Ok(()));
+        let event = v.eventfd(0, 0).unwrap();
+        assert_eq!(event, fd);
+        assert!(network
+            .with_control(event, |c| c.get_option(6, 1))
+            .is_none());
+        assert_eq!(
+            network.with_control(alias, |c| c.get_option(6, 1)),
+            Some(Ok(1))
+        );
+        let weak = network.with_control(alias, Clone::clone).unwrap();
+        assert_eq!(v.with_socket_control(alias, |v| v.close(alias)), Ok(()));
+        assert_eq!(v.live_sockets(), 0);
+        assert_eq!(weak.get_option(6, 1), Err(trames_net::NetError(9)));
+    }
+    #[test]
+    fn object_transition_waits_for_controls_without_holding_files_or_other_sockets() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let other = v.socket(2, 1, 0).unwrap();
+        let network = v.direct_network();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let active = network.clone();
+        let worker = std::thread::spawn(move || {
+            active.with_control(fd, |c| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                c.get_option(6, 1)
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let factory = v.descriptor_factory();
+        let concurrent = network.clone();
+        let helper = std::thread::spawn(move || {
+            let event = factory.eventfd(0, 0).unwrap();
+            assert_eq!(
+                concurrent.with_control(other, |c| c.set_option_bytes(6, 1, &1i32.to_le_bytes())),
+                Some(Ok(()))
+            );
+            release.send(()).unwrap();
+            event
+        });
+        // Owner mutation takes this socket's writer side only. The helper can
+        // allocate through Files and control another socket while it waits.
+        assert_eq!(
+            v.with_socket_control(fd, |v| v.socket_fd(fd).unwrap().set_option(6, 1, 1)),
+            Ok(())
+        );
+        assert_eq!(worker.join().unwrap(), Some(Ok(0)));
+        let event = helper.join().unwrap();
+        v.close(event).unwrap();
+        assert_eq!(
+            network.with_control(fd, |c| c.get_option(6, 1)),
+            Some(Ok(1))
+        );
+        let mut virtual_vfs = Vfs::default();
+        virtual_vfs
+            .configure_local_fabric(NetworkMode::Full)
+            .unwrap();
+        let fd = virtual_vfs.socket(2, 1, 0).unwrap();
+        assert!(virtual_vfs
+            .direct_network()
+            .with_control(fd, |c| c.get_option(6, 1))
+            .is_none());
+    }
+
     #[test]
     fn equal_fork_versions_bind_each_capture_to_its_actual_files_membership() {
         let mut parent = Vfs::default();

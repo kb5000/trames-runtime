@@ -2,7 +2,10 @@
 //! Bounded native sockets. All host operations are nonblocking; guest ABI
 //! addresses, flags and errno numbers are translated explicitly.
 use crate::direct_dns;
+mod control;
 mod direct;
+pub use control::DirectControl;
+pub(crate) use control::SavedOptions;
 mod endpoint;
 pub use direct::DirectTcp;
 use direct::Links;
@@ -1146,7 +1149,7 @@ impl Socket {
                     self.native.control().set_recv_buffer_size(value as usize)
                 }
             }
-            (6, 1) if self.kind == 1 => self.native.control().set_tcp_nodelay(value != 0),
+            (6, 1) if self.kind == 1 => return self.native.set_nodelay(value),
             (6, 4..=6) if self.kind == 1 => {
                 if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
                     return Err(NetError(22));
@@ -1221,9 +1224,7 @@ impl Socket {
             )),
             (1, 7) => Ok(self.native.control().send_buffer_size().map_err(from_io)? as i32),
             (1, 8) => Ok(self.native.control().recv_buffer_size().map_err(from_io)? as i32),
-            (6, 1) if self.kind == 1 => Ok(i32::from(
-                self.native.control().tcp_nodelay().map_err(from_io)?,
-            )),
+            (6, 1) if self.kind == 1 => self.native.nodelay(),
             (6, 4) if self.kind == 1 => Ok(self
                 .native
                 .control()

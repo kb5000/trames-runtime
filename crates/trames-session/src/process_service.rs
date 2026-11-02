@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn short_socket_controls_do_not_checkpoint_peer_cpus() {
+    fn direct_socket_controls_do_not_checkpoint_or_service_peer_cpus() {
         let mut p = super::super::tests::process();
         p.linux
             .vfs
@@ -566,7 +566,8 @@ mod tests {
         assert!(k
             .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
             .unwrap());
-        assert!(k.service_requests > 100, "services={}", k.service_requests);
+        assert_eq!(k.service_requests, 0);
+        assert!(k.worker_socket_syscalls > 100);
         assert!(k.parallel_rounds <= 4, "rounds={}", k.parallel_rounds);
         for p in k.processes.values() {
             assert_eq!(p.memory.read_array::<2>(0x1900).unwrap(), [2, 0]);

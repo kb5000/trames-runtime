@@ -101,6 +101,7 @@ impl DescriptorFactory {
                         mount_resource: std::sync::OnceLock::new(),
                         file_authority: Default::default(),
                         tcp_publication: Default::default(),
+                        socket_control: None,
                         control: None,
                         read_node: None,
                         id: self.open_id(),

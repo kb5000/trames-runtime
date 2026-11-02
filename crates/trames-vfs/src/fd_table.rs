@@ -193,6 +193,14 @@ impl Drop for ReservedPair {
     }
 }
 impl SharedFiles {
+    pub(super) fn socket_control(&self, fd: u32) -> Option<network_io::SocketControl> {
+        let entries = self.0.entries.lock().unwrap();
+        let open = match &entries.get(&fd)?.open {
+            SlotOpen::Shared(open) => open.clone(),
+            SlotOpen::Owner(_, _, open) => open.as_ref()?.upgrade()?,
+        };
+        open.socket_control.clone()
+    }
     pub(super) fn is_socket(&self, fd: u32) -> bool {
         matches!(
             self.0.entries.lock().unwrap().get(&fd).map(|s| &s.open),

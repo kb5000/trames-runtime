@@ -25,7 +25,7 @@ pub(super) struct Socket {
     bound: Cell<Option<SocketAddr>>,
     peer: Cell<Option<SocketAddr>>,
     listening: Cell<bool>,
-    options: RefCell<Vec<(u32, u32, Vec<u8>)>>,
+    options: native::SavedOptions,
 }
 impl Socket {
     pub fn new(
@@ -49,7 +49,7 @@ impl Socket {
             bound: Cell::new(None),
             peer: Cell::new(None),
             listening: Cell::new(false),
-            options: RefCell::default(),
+            options: Default::default(),
         }))
     }
     fn native(&self) -> Result<Rc<native::Socket>> {
@@ -58,7 +58,7 @@ impl Socket {
         }
         let s = self.network.socket(self.family, self.kind, self.protocol)?;
         s.attach_policy(self.namespace.clone());
-        for (level, name, value) in self.options.borrow().iter() {
+        for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;
         }
         *self.native.borrow_mut() = Some(s.clone());
@@ -70,7 +70,7 @@ impl Socket {
         }
         let stack = self.namespace.root_stack()?;
         let s = stack.socket(self.family, self.kind, self.protocol)?;
-        for (level, name, value) in self.options.borrow().iter() {
+        for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;
         }
         if let Some(bound) = self.bound.get() {
@@ -175,6 +175,14 @@ impl Socket {
             && self.peer.get().is_none()
             && self.guest.borrow().is_none()
             && self.native.borrow().as_ref().is_some_and(|s| s.idle_tcp())
+    }
+    pub fn direct_control(&self) -> Option<DirectControl> {
+        if !matches!(self.path.get(), Path::Idle | Path::Native) {
+            return None;
+        }
+        let mut control = self.native.borrow().as_ref()?.direct_control()?;
+        control.options = Some(self.options.clone());
+        Some(control)
     }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
         if self.path.get() != Path::Native {
@@ -441,7 +449,7 @@ impl Socket {
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         {
-            let options = self.options.borrow();
+            let options = self.options.lock().unwrap();
             if options.len() >= 128 && !options.iter().any(|(l, n, _)| *l == level && *n == name) {
                 return Err(NetError(105));
             }
@@ -452,7 +460,7 @@ impl Socket {
         if self.path.get() != Path::Guest {
             self.native()?.set_option_bytes(level, name, value)?;
         }
-        let mut options = self.options.borrow_mut();
+        let mut options = self.options.lock().unwrap();
         options.retain(|(l, n, _)| *l != level || *n != name);
         options.push((level, name, value.to_vec()));
         Ok(())
@@ -490,6 +498,26 @@ impl Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_tcp_option_updates_are_replayed_to_the_real_guest_branch() {
+        let root = Network::new(NetworkMode::Full);
+        let socket = root.socket(2, 1, 0).unwrap();
+        let SocketBackend::Hybrid(hybrid) = &socket.0 else {
+            unreachable!()
+        };
+        let control = socket.direct_control().unwrap();
+        std::thread::spawn(move || control.set_option_bytes(6, 1, &1i32.to_le_bytes()).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(socket.get_option(6, 1), Ok(1));
+        // Exercise the actual lazy branch creation/replay used by routing.
+        let guest = hybrid.guest().unwrap();
+        assert_eq!(guest.get_option(6, 1), Ok(1));
+        hybrid.path.set(Path::Guest);
+        assert!(socket.direct_control().is_none());
+        assert_eq!(socket.get_option(6, 1), Ok(1));
+    }
+
     #[test]
     fn missing_native_descriptor_cannot_bypass_guest_low_port_authorization() {
         let root = Network::new(NetworkMode::Full);
