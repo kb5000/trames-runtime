@@ -43,23 +43,22 @@ impl DirectNetwork {
         operation: impl FnOnce(&trames_net::DirectControl) -> T,
     ) -> Option<T> {
         let open = self.1.as_ref()?.socket_control(fd)?;
+        let mut publication = refresh.then(|| open.tcp_publication.lock().unwrap());
         open.socket_control.as_ref()?.with_native(|control| {
             let result = operation(control);
-            if refresh {
-                // Same original OFD across close/reuse. Publication runs under
-                // the socket control read gate and never holds Files membership.
-                *open.tcp_publication.lock().unwrap() =
-                    control.direct_tcp().map(|tcp| DirectTcpFd {
-                        tcp,
-                        lease: None,
-                        flags: open.flags.get(),
-                        status: open.flags.clone(),
-                        timeouts: [false, true].map(|receive| control.io_timeout(receive)),
-                    });
+            if let Some(publication) = publication.as_mut() {
+                **publication = control.direct_tcp().map(|tcp| DirectTcpFd {
+                    tcp,
+                    lease: None,
+                    flags: open.flags.get(),
+                    status: open.flags.clone(),
+                    timeouts: [false, true].map(|receive| control.io_timeout(receive)),
+                });
             }
             result
         })
     }
+
     pub fn is_socket(&self, fd: u32) -> bool {
         self.1.as_ref().is_some_and(|files| files.is_socket(fd))
     }
@@ -121,7 +120,8 @@ impl Vfs {
     pub fn refresh_tcp(&self, fd: u32) {
         if let Some(descriptor) = self.fds.get(&fd) {
             let open = descriptor.open.borrow();
-            *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+            let mut publication = open.shared.tcp_publication.lock().unwrap();
+            *publication = Self::direct_tcp_open(&open);
         }
     }
     /// The original OFD, rather than a possibly reused number, owns publication.
@@ -132,7 +132,8 @@ impl Vfs {
         let result = operation(self);
         if let Some(descriptor) = descriptor {
             let open = descriptor.open.borrow();
-            *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
+            let mut publication = open.shared.tcp_publication.lock().unwrap();
+            *publication = Self::direct_tcp_open(&open);
         }
         result
     }
@@ -140,8 +141,12 @@ impl Vfs {
         let mut entries = Vec::new();
         for (&fd, descriptor) in self.fds.entries().iter() {
             let open = descriptor.open.borrow();
-            let tcp = Self::direct_tcp_open(&open);
-            *open.shared.tcp_publication.lock().unwrap() = tcp.clone();
+            let tcp = {
+                let mut publication = open.shared.tcp_publication.lock().unwrap();
+                let tcp = Self::direct_tcp_open(&open);
+                *publication = tcp.clone();
+                tcp
+            };
             let Some(tcp) = tcp else { continue };
             entries.resize_with(fd as usize + 1, || None);
             entries[fd as usize] = Some(tcp);
@@ -158,6 +163,59 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         time::Duration,
     };
+    #[test]
+    fn control_and_timeout_publication_share_the_existing_admission_transaction() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let original = v.socket_operation(fd).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(matches!(
+            original.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let _peer = listener.accept().unwrap().0;
+        assert_eq!(original.connect_complete(), Ok(true));
+        v.refresh_tcp(fd);
+        let open = v.descriptor(fd).unwrap().open.borrow().shared.clone();
+        let publication = open.tcp_publication.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (changed_tx, changed_rx) = std::sync::mpsc::channel();
+        let control = original.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            control.with_tcp_publication(|| {
+                control.set_io_timeout(true, Some(Duration::from_millis(7)));
+                changed_tx.send(()).unwrap();
+            });
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(
+            changed_rx.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(
+            original.io_timeout(true),
+            None,
+            "mutation must wait too, not just its cache write"
+        );
+        // Holding this object's publication never holds the Files table.
+        let other = v.eventfd(0, 0).unwrap();
+        drop(publication);
+        changed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            open.tcp_publication
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .timeouts[1],
+            Some(Duration::from_millis(7))
+        );
+        v.close(other).unwrap();
+        v.close(fd).unwrap();
+    }
     #[test]
     fn promoted_tcp_interest_preserves_oneshot_aliases_and_worker_control() {
         use std::io::Write;

@@ -217,23 +217,56 @@ impl DirectSyscalls {
         self.record_fd_control();
         Some(result.map(|()| 0))
     }
+    pub fn supports_socket_control(&self, number: u32) -> bool {
+        crate::network::control_number(number) && self.resources.is_some()
+    }
     pub fn invoke_socket_control(
         &self,
         number: u32,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if !matches!(number, 204 | 205 | 208..=210) {
+        if self.resources.is_none() {
+            // Retain compatibility for explicitly native-only captures. Product
+            // workers carry DescriptorFactory and use the full socket ABI below.
+            if !matches!(number, 204 | 205 | 208..=210) {
+                return None;
+            }
+            let refresh = number == 209 && (a[1] as u32, a[2] as u32) == (1, 4);
+            let result = self
+                .network
+                .with_control_refresh(a[0] as u32, refresh, |control| {
+                    control
+                        .supports_operation(number, a[1] as u32, a[2] as u32)
+                        .then(|| crate::network::direct_control(control, number, a, memory))
+                })??;
+            self.completed.set(self.completed.get() + 1);
+            self.socket_completed.set(self.socket_completed.get() + 1);
+            return Some(result);
+        }
+        if !self.supports_socket_control(number) {
             return None;
         }
-        let refresh = number == 209 && (a[1] as u32, a[2] as u32) == (1, 4);
-        let result = self
-            .network
-            .with_control_refresh(a[0] as u32, refresh, |control| {
-                control
-                    .supports_operation(number, a[1] as u32, a[2] as u32)
-                    .then(|| crate::network::direct_control(control, number, a, memory))
-            })??;
+        let factory = self.resources.as_ref()?;
+        let socket = match factory.socket_operation(a[0] as u32)? {
+            Ok(socket) => socket,
+            Err(error) => return Some(Err(error)),
+        };
+        // Blocking connect/accept will use the retained event-wait entry.
+        if socket.flags() & trames_vfs::O_NONBLOCK == 0
+            && (matches!(number, 202 | 242)
+                || number == 203 && socket.info().is_some_and(|info| info.kind == 1))
+        {
+            return None;
+        }
+        let result = if crate::network::control_publishes(number, a) {
+            socket.with_tcp_publication(|| {
+                crate::network::control(factory, &socket, number, a, memory)
+                    .expect("socket control ABI")
+            })
+        } else {
+            crate::network::control(factory, &socket, number, a, memory)?
+        };
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
         Some(result)
@@ -3280,3 +3313,6 @@ mod tests {
         assert_eq!(vfs.read(fd, 8), Err(Errno(11)));
     }
 }
+
+#[cfg(test)]
+mod socket_control_tests;

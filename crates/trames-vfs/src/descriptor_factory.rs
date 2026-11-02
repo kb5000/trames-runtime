@@ -57,6 +57,40 @@ impl DescriptorFactory {
         let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, kind);
         Ok(reserved.publish(descriptor, None))
     }
+    /// None leaves an excluded owner object untouched; missing/invalid shared
+    /// entries preserve the ordinary EBADF/ENOTSOCK result.
+    pub fn socket_operation(&self, fd: u32) -> Option<Result<SocketOperation>> {
+        Some(
+            self.files
+                .lookup(fd)?
+                .and_then(SocketOperation::from_shared),
+        )
+    }
+    pub fn can_bind_service(&self) -> bool {
+        self.credentials.has_cap(capabilities::NET_BIND_SERVICE)
+    }
+    pub fn accept_socket_output(
+        &self,
+        socket: &NetSocket,
+        flags: u32,
+        output: impl FnOnce(std::net::SocketAddr) -> Result<()>,
+    ) -> Result<(u32, std::net::SocketAddr)> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(Errno(22));
+        }
+        let reserved = self.files.reserve()?;
+        let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
+        output(address)?;
+        let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, flags);
+        {
+            // Prepare the accepted original OFD before its number is visible.
+            // A concurrent close/reuse must not redirect this publication.
+            let open = descriptor.open.borrow();
+            *open.tcp_publication.lock().unwrap() = Vfs::direct_tcp_shared(&open.shared);
+        }
+        let fd = reserved.publish(descriptor, None);
+        Ok((fd, address))
+    }
     fn anonymous(&self, flags: u32, resource: events::Anonymous) -> Result<u32> {
         let reservation = self.files.reserve()?;
         let descriptor = events::anonymous_descriptor(self.open_id(), flags, resource);

@@ -312,6 +312,7 @@ impl Snapshot {
         // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
         if self.direct.supports_creation(cpu.x(8) as u32)
+            || self.direct.supports_socket_control(cpu.x(8) as u32)
             || self.direct.supports_path_query(cpu.x(8) as u32)
             || self.direct.supports_epoll_control(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)

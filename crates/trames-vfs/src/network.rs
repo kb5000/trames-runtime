@@ -2,6 +2,7 @@
 use super::*;
 use std::net::SocketAddr;
 /// One syscall's accepted original network OFD, independent of numeric reuse.
+#[derive(Clone)]
 pub struct SocketOperation(Arc<SharedOpenDescription>);
 impl std::ops::Deref for SocketOperation {
     type Target = NetSocket;
@@ -10,12 +11,24 @@ impl std::ops::Deref for SocketOperation {
     }
 }
 impl SocketOperation {
+    pub(super) fn from_shared(file: SharedFd) -> Result<Self> {
+        file.open.socket.as_ref().ok_or(Errno(88))?;
+        Ok(Self(file.open))
+    }
     pub fn flags(&self) -> u32 {
         self.0.flags.get()
     }
+    /// The existing admission/publication mutex covers the control transition
+    /// and its resulting TCP view. Callers must not enter Files membership in
+    /// this callback; accept prepares its new OFD separately before publication.
+    pub fn with_tcp_publication<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let mut publication = self.0.tcp_publication.lock().unwrap();
+        let result = operation();
+        *publication = Vfs::direct_tcp_shared(&self.0);
+        result
+    }
     pub fn refresh_tcp(&self) {
-        let tcp = Vfs::direct_tcp_shared(&self.0);
-        *self.0.tcp_publication.lock().unwrap() = tcp;
+        self.with_tcp_publication(|| ());
     }
 }
 #[derive(Clone, Copy)]
@@ -305,21 +318,8 @@ impl Vfs {
         flags: u32,
         output: impl FnOnce(SocketAddr) -> Result<()>,
     ) -> Result<(u32, SocketAddr)> {
-        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        let reserved = self.fds.membership().reserve()?;
-        let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
-        output(address)?;
-        let descriptor = Self::socket_descriptor(
-            self.open_id(),
-            (self.credentials.fsuid, self.credentials.fsgid),
-            socket,
-            flags,
-        );
-        let new = reserved.publish(descriptor, Some(&self.fds));
-        self.refresh_tcp(new);
-        Ok((new, address))
+        self.descriptor_factory()
+            .accept_socket_output(socket, flags, output)
     }
     /// None defers before effects. The control writer excludes native control
     /// operations; the Files transaction excludes a newly accepted byte lease.

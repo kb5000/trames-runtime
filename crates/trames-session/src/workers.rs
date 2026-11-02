@@ -586,6 +586,7 @@ impl<C: Cpu> Pool<C> {
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
                                         && (snapshot.direct.supports_creation(work.cpu.x(8) as u32)
+                                            || snapshot.direct.supports_socket_control(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_epoll_control(work.cpu.x(8) as u32)
                                             || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
@@ -598,6 +599,11 @@ impl<C: Cpu> Pool<C> {
                                     let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if entry.allowed() {
                                         if let Some(value)=snapshot.direct.invoke_epoll_control(number,args,work.memory.as_deref().expect("worker view")) {
+                                            if let Some(began)=began {syscall_time+=began.elapsed();}
+                                            work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                            syscalls+=1;continue;
+                                        }
+                                        if let Some(value)=snapshot.direct.invoke_socket_control(number,args,work.memory.as_deref_mut().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                             syscalls+=1;continue;

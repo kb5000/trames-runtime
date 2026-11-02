@@ -1074,3 +1074,52 @@ per syscall. Apple and ARM64 Linux affected tests and strict checks pass. The
 remaining network dispatch includes bind/connect/listen/accept and blocking or
 policy-aware byte operations; AF_UNIX/SCM_RIGHTS, task and VM dependencies remain.
 No whole-application performance claim follows from this migration alone.
+
+
+## Worker full socket controls (2026-11-02)
+
+Production worker captures now use the actual shared socket OFD and the creating
+credential/Files factory for short control calls. bind/listen, nonblocking TCP
+connect/accept/accept4, getsockname/getpeername, setsockopt/getsockopt and shutdown
+run on the executing worker. Blocking UDP and netlink connect also complete
+there because they cannot wait for a TCP handshake. Blocking TCP connect/accept
+still defer before effects to their original scheduler path; their retained
+cross-cohort wait lifetime is the next migration, not claimed complete here.
+AF_UNIX owner resources and traced operations retain their existing fallback.
+
+Owner and worker paths invoke one original control ABI implementation. It keeps
+copyin/copyout validation and error order, namespace/low-port authority, socket
+flags, existing limits and timeout semantics. Filtered captures evaluate their
+exact entry once; successful calls complete on the worker and rejected/deferred
+entries keep the same decision through the joined fallback. Native-only explicit
+captures retain compatibility with the previous limited controls; production
+captures carry DescriptorFactory and use the full socket ABI.
+
+The common ABI preflights peer output before any accept effect. The factory then
+reserves in the actual Files domain, consumes the connection, writes peer output,
+constructs the complete original OFD, and prepares its native TCP view before
+publishing its number. No follow-up lookup by the new
+number can race another worker's close/reuse. Failed output or construction
+returns the existing reservations and real socket. No Files lock covers host
+accept, guest output or another resource callback.
+
+Control mutations and their resulting byte-capability/timeouts view form one
+transaction under the existing per-OFD TCP admission/publication mutex. The
+mutation callback never enters Files membership. Lock order is Files admission,
+then publication, then the socket's backend operation gate. Queries/shutdown do
+not republish an unchanged view; SO_ERROR completion and relevant mutations do.
+accept uses separate unpublished output ownership and never holds its listener's
+publication lock while reserving Files. Legacy native completion, owner refresh
+and capture follow the same publication-before-operation order. Normal native
+TCP bytes keep their original path; no extra service thread, bus, loop, guest
+quota, metadata fence or global network lock is introduced.
+
+Coverage exercises native and virtual full connections, output rejection before
+accept consumes a connection, pre-visible TCP capability publication, captured
+low-port permissions, immediate UDP/netlink connect, and blocking TCP deferral
+without effects. A concurrent test holds the admission transaction and proves a
+control cannot mutate the socket before publication ownership, while unrelated
+Files operations continue. Two interpreter CPUs exercise all ten short control
+numbers with native/virtual networking and allow/deny/unfiltered policies: sixty
+cases, zero service requests for allowed calls and one seccomp decision per
+filtered syscall. Original VFS/ABI/epoll/io_uring regressions remain applicable.

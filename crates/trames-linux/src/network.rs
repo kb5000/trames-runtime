@@ -11,6 +11,116 @@ use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
 pub(crate) mod local;
 mod unix;
+pub(super) fn control_number(number: u32) -> bool {
+    matches!(number, 200..=205 | 208..=210 | 242)
+}
+pub(super) fn control_publishes(number: u32, a: [u64; 6]) -> bool {
+    matches!(number, 200 | 201 | 203 | 208) || number == 209 && (a[1] as u32, a[2] as u32) == (1, 4)
+}
+/// Identical socket control ABI for owner and executing-worker dispatch.
+pub(super) fn control(
+    factory: &trames_vfs::DescriptorFactory,
+    socket: &trames_net::Socket,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Option<Result<u64>> {
+    if !control_number(number) {
+        return None;
+    }
+    Some((|| match number {
+        200 | 203 => {
+            let peer = address(memory, a[1], a[2])?;
+            if number == 200 {
+                socket
+                    .bind_authorized(&peer, factory.can_bind_service())
+                    .map_err(net)?;
+            } else {
+                socket.connect_bytes(&peer).map_err(net)?;
+            }
+            Ok(0)
+        }
+        201 => {
+            socket.listen(a[1] as u32).map_err(net)?;
+            Ok(0)
+        }
+        202 | 242 => {
+            let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?;
+            let (fd, _) = factory.accept_socket_output(
+                socket,
+                if number == 242 { a[3] as u32 } else { 0 },
+                |peer| match output {
+                    Some(output) => output.write(memory, Some(peer)),
+                    None => Ok(()),
+                },
+            )?;
+            Ok(fd as u64)
+        }
+        204 | 205 => query_address(memory, a, socket.address_size(), || {
+            if number == 204 {
+                socket.local_bytes()
+            } else {
+                socket.peer_bytes()
+            }
+            .map_err(net)
+        }),
+        208 => {
+            if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
+                if (a[4] as u32) < 4 || (a[4] as u32) > i32::MAX as u32 || a[4] < 16 {
+                    return Err(Errno(22));
+                }
+                Linux::check(memory, a[3], 16, Access::Read)?;
+                let seconds = u64_at(memory, a[3])? as i64;
+                let micros = u64_at(memory, a[3] + 8)? as i64;
+                if !(0..1_000_000).contains(&micros) {
+                    return Err(Errno(33));
+                }
+                let timeout = if seconds < 0 {
+                    Some(std::time::Duration::ZERO)
+                } else if seconds == 0 && micros == 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::new(
+                        seconds as u64,
+                        micros as u32 * 1000,
+                    ))
+                };
+                socket.set_io_timeout(matches!(a[2], 20 | 66), timeout);
+                return Ok(0);
+            }
+            write_option(memory, a, |value| {
+                socket
+                    .set_option_bytes(a[1] as u32, a[2] as u32, value)
+                    .map_err(net)
+            })
+        }
+        209 => {
+            if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
+                return read_option(memory, a, || {
+                    let timeout = socket
+                        .io_timeout(matches!(a[2], 20 | 66))
+                        .unwrap_or_default();
+                    let mut value = [0; 16];
+                    value[..8].copy_from_slice(&timeout.as_secs().to_le_bytes());
+                    value[8..].copy_from_slice(&(timeout.subsec_micros() as u64).to_le_bytes());
+                    Ok(value)
+                });
+            }
+            read_option(memory, a, || {
+                socket
+                    .get_option(a[1] as u32, a[2] as u32)
+                    .map(i32::to_le_bytes)
+                    .map_err(net)
+            })
+        }
+        210 => {
+            socket.shutdown(a[1] as u32).map_err(net)?;
+            Ok(0)
+        }
+        _ => unreachable!("socket control number"),
+    })())
+}
+
 fn net(error: NetError) -> Errno {
     Errno(error.0)
 }
@@ -494,9 +604,13 @@ impl Linux {
         if matches!(number, 202 | 203 | 242) && socket.flags() & trames_vfs::O_NONBLOCK == 0 {
             return None;
         }
-        let result = Self::network_socket(&mut self.vfs, &socket, number as u64, a, memory);
-        socket.refresh_tcp();
-        Some(result)
+        Some(if control_publishes(number, a) {
+            socket.with_tcp_publication(|| {
+                Self::network_socket(&mut self.vfs, &socket, number as u64, a, memory)
+            })
+        } else {
+            Self::network_socket(&mut self.vfs, &socket, number as u64, a, memory)
+        })
     }
     pub(crate) fn network_vfs(
         vfs: &mut trames_vfs::Vfs,
@@ -518,11 +632,15 @@ impl Linux {
             return Self::local_network_vfs(vfs, &socket, number, a, memory);
         }
         let socket = vfs.socket_operation(a[0] as u32)?;
-        let result = Self::network_socket(vfs, &socket, number, a, memory);
-        if matches!(number,200..=206|208..=211|242) {
-            socket.refresh_tcp();
+        // Non-netlink sends can finish an in-progress TCP connection. Their
+        // implementation never resolves namespace descriptors through Files.
+        if control_publishes(number as u32, a)
+            || matches!(number, 206 | 211) && socket.address_size() != 12
+        {
+            socket.with_tcp_publication(|| Self::network_socket(vfs, &socket, number, a, memory))
+        } else {
+            Self::network_socket(vfs, &socket, number, a, memory)
         }
-        result
     }
     fn network_socket(
         vfs: &mut trames_vfs::Vfs,
@@ -531,46 +649,11 @@ impl Linux {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64> {
+        if control_number(number as u32) {
+            return control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
+                .expect("socket control ABI");
+        }
         match number {
-            200 | 203 => {
-                let peer = address(memory, a[1], a[2])?;
-                if number == 200 {
-                    socket
-                        .bind_authorized(
-                            &peer,
-                            vfs.credentials
-                                .has_cap(trames_vfs::capabilities::NET_BIND_SERVICE),
-                        )
-                        .map_err(net)?;
-                } else {
-                    socket.connect_bytes(&peer).map_err(net)?;
-                }
-                Ok(0)
-            }
-            201 => {
-                socket.listen(a[1] as u32).map_err(net)?;
-                Ok(0)
-            }
-            202 | 242 => {
-                let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?;
-                let (fd, _) = vfs.accept_socket_output(
-                    socket,
-                    if number == 242 { a[3] as u32 } else { 0 },
-                    |peer| match output {
-                        Some(output) => output.write(memory, Some(peer)),
-                        None => Ok(()),
-                    },
-                )?;
-                Ok(fd as u64)
-            }
-            204 | 205 => query_address(memory, a, socket.address_size(), || {
-                if number == 204 {
-                    socket.local_bytes()
-                } else {
-                    socket.peer_bytes()
-                }
-                .map_err(net)
-            }),
             206 => {
                 if a[2] > trames_net::MAX_TRANSFER as u64 {
                     return Err(Errno(90));
@@ -599,59 +682,6 @@ impl Linux {
                 } else {
                     received.data.len()
                 } as u64)
-            }
-            208 => {
-                if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
-                    if (a[4] as u32) < 4 || (a[4] as u32) > i32::MAX as u32 || a[4] < 16 {
-                        return Err(Errno(22));
-                    }
-                    Self::check(memory, a[3], 16, Access::Read)?;
-                    let seconds = u64_at(memory, a[3])? as i64;
-                    let micros = u64_at(memory, a[3] + 8)? as i64;
-                    if !(0..1_000_000).contains(&micros) {
-                        return Err(Errno(33));
-                    }
-                    let timeout = if seconds < 0 {
-                        Some(std::time::Duration::ZERO)
-                    } else if seconds == 0 && micros == 0 {
-                        None
-                    } else {
-                        Some(std::time::Duration::new(
-                            seconds as u64,
-                            micros as u32 * 1000,
-                        ))
-                    };
-                    socket.set_io_timeout(matches!(a[2], 20 | 66), timeout);
-                    return Ok(0);
-                }
-                write_option(memory, a, |value| {
-                    socket
-                        .set_option_bytes(a[1] as u32, a[2] as u32, value)
-                        .map_err(net)
-                })
-            }
-            209 => {
-                if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
-                    return read_option(memory, a, || {
-                        let timeout = socket
-                            .io_timeout(matches!(a[2], 20 | 66))
-                            .unwrap_or_default();
-                        let mut value = [0; 16];
-                        value[..8].copy_from_slice(&timeout.as_secs().to_le_bytes());
-                        value[8..].copy_from_slice(&(timeout.subsec_micros() as u64).to_le_bytes());
-                        Ok(value)
-                    });
-                }
-                read_option(memory, a, || {
-                    socket
-                        .get_option(a[1] as u32, a[2] as u32)
-                        .map(i32::to_le_bytes)
-                        .map_err(net)
-                })
-            }
-            210 => {
-                socket.shutdown(a[1] as u32).map_err(net)?;
-                Ok(0)
             }
             211 | 212 => {
                 let receive = number == 212;
