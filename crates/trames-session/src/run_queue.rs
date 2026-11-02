@@ -65,6 +65,21 @@ pub(super) struct IoCall {
     pub deadline: Option<Instant>,
 }
 impl IoCall {
+    pub fn from_byte(file: trames_linux::RetainedByte) -> Self {
+        let (number, args) = file
+            .local_message_entry()
+            .expect("accepted message checkpoint");
+        Self {
+            number,
+            args,
+            deadline: None,
+            retained_byte: Some(file),
+            retained_socket: None,
+            flock: None,
+            tcp_liveness: None,
+            retained_poll: None,
+        }
+    }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
         Self {
             number: call.number,

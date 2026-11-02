@@ -19,7 +19,7 @@ pub(super) struct Slot {
     pub(super) cloexec: CloseOnExec,
 }
 impl Slot {
-    fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
+    pub(super) fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
         let SlotOpen::Shared(open) = &self.open else {
             return None;
         };

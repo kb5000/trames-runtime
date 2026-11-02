@@ -6,8 +6,10 @@ pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
 mod datagram;
 mod native;
+mod shared_rights;
 pub(crate) use native::Services as NativeServices;
 pub use native::WaylandAuth;
+pub use shared_rights::SharedRights;
 
 #[derive(Clone, Default)]
 pub struct LocalRights(pub(super) Vec<OpenHandle>);
@@ -87,11 +89,11 @@ pub(super) struct LocalNamespace {
     abstract_names: BTreeMap<Vec<u8>, Weak<LocalSocket>>,
     sockets: Vec<Weak<LocalSocket>>,
 }
-pub struct LocalReceived {
+pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
-    pub rights: LocalRights,
+    pub rights: R,
     pub credentials: Option<[u32; 3]>,
     pub source: Vec<u8>,
     /// Linux cmsg type and (seconds, fractional units) at queue admission.
@@ -152,9 +154,7 @@ impl LocalSocket {
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
             channel.resource.set_passcred(side, end.passcred.get());
-            channel
-                .resource
-                .set_timestamp(side, end.timestamp.get() != 0);
+            channel.resource.set_timestamp(side, end.timestamp.get());
         }
         // Connect changes direct-resource eligibility without changing the FD
         // table; another forked table may already have cached this description.
@@ -221,7 +221,7 @@ impl LocalSocket {
             self.channel
                 .borrow()
                 .resource
-                .set_timestamp(self.side.get(), value != 0);
+                .set_timestamp(self.side.get(), if value == 0 { 0 } else { option });
             return Ok(());
         }
         if matches!(option, 7 | 8 | 32 | 33) {
@@ -316,6 +316,17 @@ impl LocalSocket {
                 Some(credentials),
             );
         }
+        // Shared OFDs contain no owning LocalSocket control graph. Their real
+        // resources can travel with the packet and need no owner-only ledger.
+        if let Some(shared) = rights.shared() {
+            return binding.resource.send_shared(
+                self.side.get(),
+                bytes,
+                flags,
+                shared,
+                Some(credentials),
+            );
+        }
         binding.resource.send_check(self.side.get(), flags)?;
         let peer = binding.ends[1 - self.side.get()]
             .upgrade()
@@ -387,7 +398,14 @@ impl LocalSocket {
             .resource
             .recv(self.side.get(), count, flags, true)
             .expect("owner may receive rights")?;
-        let ancillary = if let Some(id) = received.rights {
+        let ancillary = if let Some(shared_rights::QueuedRights::Shared(rights)) = &received.rights
+        {
+            Ancillary {
+                rights: rights.local(),
+                credentials: None,
+                source: vec![1, 0],
+            }
+        } else if let Some(shared_rights::QueuedRights::Owner(id)) = received.rights {
             if flags & 2 != 0 {
                 binding
                     .rights

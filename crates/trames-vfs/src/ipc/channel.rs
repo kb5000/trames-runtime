@@ -2,12 +2,13 @@
 //! Shared AF_UNIX bytes/state. Rights are opaque tokens, resolved only by the
 //! owning VFS thread; no Rc, guest pointer or descriptor table crosses here.
 use super::super::*;
+use super::shared_rights::{QueuedRights, SharedRights};
 use crate::readiness::Readiness;
 use std::sync::Mutex;
 
 struct Packet {
     data: Vec<u8>,
-    rights: Option<u64>,
+    rights: Option<QueuedRights>,
     credentials: Option<[u32; 3]>,
     timestamp: Option<[u64; 2]>,
 }
@@ -19,7 +20,7 @@ struct Data {
     write_closed: [bool; 2],
     epochs: [[u64; 2]; 2],
     passcred: [bool; 2],
-    timestamp: [bool; 2],
+    timestamp: [u32; 2],
     send_limit: [usize; 2],
     receive_limit: [usize; 2],
 }
@@ -27,9 +28,10 @@ pub(crate) struct Received {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
-    pub rights: Option<u64>,
+    pub(super) rights: Option<QueuedRights>,
     pub credentials: Option<[u32; 3]>,
     pub timestamp: Option<[u64; 2]>,
+    pub(super) options: [u32; 2],
 }
 pub(crate) struct Resource {
     kind: u32,
@@ -37,6 +39,9 @@ pub(crate) struct Resource {
     pub readiness: Arc<Readiness>,
 }
 impl Resource {
+    pub fn kind(&self) -> u32 {
+        self.kind
+    }
     pub fn new(kind: u32, connected: bool) -> Arc<Self> {
         Arc::new(Self {
             kind,
@@ -48,7 +53,7 @@ impl Resource {
                 write_closed: [false; 2],
                 epochs: [[0; 2]; 2],
                 passcred: [false; 2],
-                timestamp: [false; 2],
+                timestamp: [0; 2],
                 send_limit: [
                     PIPE_CAPACITY,
                     if kind == 2 && !connected {
@@ -85,8 +90,8 @@ impl Resource {
     pub fn set_passcred(&self, side: usize, enabled: bool) {
         self.data.lock().unwrap().passcred[side] = enabled;
     }
-    pub fn set_timestamp(&self, side: usize, enabled: bool) {
-        self.data.lock().unwrap().timestamp[side] = enabled;
+    pub fn set_timestamp(&self, side: usize, mode: u32) {
+        self.data.lock().unwrap().timestamp[side] = mode;
     }
     pub fn buffer_size(&self, side: usize, receive: bool) -> usize {
         let data = self.data.lock().unwrap();
@@ -114,7 +119,7 @@ impl Resource {
     pub fn right_ids(&self, side: usize) -> Vec<u64> {
         self.data.lock().unwrap().queues[side]
             .iter()
-            .filter_map(|p| p.rights)
+            .filter_map(|p| p.rights.as_ref().and_then(QueuedRights::owner))
             .collect()
     }
     pub fn shutdown(&self, side: usize, how: u32) -> Result<()> {
@@ -137,17 +142,19 @@ impl Resource {
         Ok(())
     }
     pub fn close(&self, side: usize) -> Vec<u64> {
-        self.change(|data| {
+        let packets = self.change(|data| {
             data.alive[side] = false;
             data.used[side] = 0;
             for counter in &mut data.epochs[1 - side] {
                 *counter = counter.wrapping_add(1);
             }
             std::mem::take(&mut data.queues[side])
-                .into_iter()
-                .filter_map(|p| p.rights)
-                .collect()
-        })
+        });
+        // Rights can run final-close callbacks; never drop them under Data.
+        packets
+            .into_iter()
+            .filter_map(|p| p.rights.as_ref().and_then(QueuedRights::owner))
+            .collect()
     }
     pub fn send_check(&self, side: usize, flags: u32) -> Result<()> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -161,6 +168,33 @@ impl Resource {
         bytes: &[u8],
         flags: u32,
         rights: Option<u64>,
+        identity: Option<[u32; 3]>,
+    ) -> Result<usize> {
+        self.send_ancillary(
+            side,
+            bytes,
+            flags,
+            rights.map(QueuedRights::Owner),
+            identity,
+        )
+    }
+    pub(super) fn send_shared(
+        &self,
+        side: usize,
+        bytes: &[u8],
+        flags: u32,
+        rights: SharedRights,
+        identity: Option<[u32; 3]>,
+    ) -> Result<usize> {
+        let rights = (!rights.is_empty()).then_some(QueuedRights::Shared(rights));
+        self.send_ancillary(side, bytes, flags, rights, identity)
+    }
+    fn send_ancillary(
+        &self,
+        side: usize,
+        bytes: &[u8],
+        flags: u32,
+        rights: Option<QueuedRights>,
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -177,7 +211,7 @@ impl Resource {
             } else {
                 None
             };
-            let timestamp = data.timestamp[peer].then(|| {
+            let timestamp = (data.timestamp[peer] != 0).then(|| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
@@ -213,7 +247,7 @@ impl Resource {
             } else if count != 0 || self.kind != 1 {
                 queue.push_back(Packet {
                     data: bytes[..count].to_vec(),
-                    rights,
+                    rights: rights.clone(),
                     credentials,
                     timestamp,
                 });
@@ -232,6 +266,23 @@ impl Resource {
         flags: u32,
         allow_rights: bool,
     ) -> Option<Result<Received>> {
+        self.recv_mode(side, count, flags, if allow_rights { 2 } else { 0 })
+    }
+    pub(super) fn recv_portable(
+        &self,
+        side: usize,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<Received>> {
+        self.recv_mode(side, count, flags, 1)
+    }
+    fn recv_mode(
+        &self,
+        side: usize,
+        count: usize,
+        flags: u32,
+        mode: u8,
+    ) -> Option<Result<Received>> {
         if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Some(Err(Errno(95)));
         }
@@ -239,6 +290,7 @@ impl Resource {
             return Some(Err(Errno(95)));
         }
         self.change(|data| {
+            let options = [u32::from(data.passcred[side]), data.timestamp[side]];
             let peer = 1 - side;
             let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
             let queue = &mut data.queues[side];
@@ -250,6 +302,7 @@ impl Resource {
                     rights: None,
                     credentials: None,
                     timestamp: None,
+                    options,
                 }));
             }
             if queue.is_empty() {
@@ -257,10 +310,11 @@ impl Resource {
             }
             if self.kind != 1 {
                 let packet = queue.front().expect("packet");
-                if !allow_rights
-                    && (packet.rights.is_some()
-                        || packet.credentials.is_some()
-                        || packet.timestamp.is_some())
+                if mode == 1 && packet.rights.as_ref().is_some_and(|r| r.owner().is_some())
+                    || mode == 0
+                        && (packet.rights.is_some()
+                            || packet.credentials.is_some()
+                            || packet.timestamp.is_some())
                 {
                     return None;
                 }
@@ -269,9 +323,10 @@ impl Resource {
                     data: packet.data[..count.min(length)].to_vec(),
                     length,
                     truncated: count < length,
-                    rights: packet.rights,
+                    rights: packet.rights.clone(),
                     credentials: packet.credentials,
                     timestamp: packet.timestamp,
+                    options,
                 };
                 if flags & 2 == 0 {
                     queue.pop_front();
@@ -288,7 +343,7 @@ impl Resource {
                 if packet.credentials != credentials || packet.timestamp != timestamp {
                     break;
                 }
-                if !allow_rights && (packet.credentials.is_some() || packet.timestamp.is_some()) {
+                if mode == 0 && (packet.credentials.is_some() || packet.timestamp.is_some()) {
                     return None;
                 }
                 let n = (count - bytes.len()).min(packet.data.len());
@@ -297,10 +352,12 @@ impl Resource {
                     // A plain prefix ending before the rights-bearing packet
                     // can complete locally. Crossing its boundary defers the
                     // entire call before any queue or guest-memory effects.
-                    if !allow_rights {
+                    if mode == 0
+                        || mode == 1 && packet.rights.as_ref().is_some_and(|r| r.owner().is_some())
+                    {
                         return None;
                     }
-                    rights = packet.rights;
+                    rights = packet.rights.clone();
                     break;
                 }
                 if bytes.len() == count {
@@ -340,6 +397,7 @@ impl Resource {
                 rights,
                 credentials,
                 timestamp,
+                options,
             }))
         })
     }

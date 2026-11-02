@@ -521,7 +521,11 @@ impl DirectFd {
                 write: end.write,
                 initial_write_epoch: end.initial_write_epoch,
             }
-        } else if let Some((data, side)) = open.local.as_ref().and_then(|s| s.direct()) {
+        } else if let Some((data, side)) = open
+            .local
+            .as_ref()
+            .and_then(|s| s.direct().or_else(|| s.direct_message()))
+        {
             ByteResource::Unix { data, side }
         } else if let Some(end) = &open.pty {
             ByteResource::Pty {
@@ -631,6 +635,34 @@ impl DirectFd {
     }
     pub fn is_unix(&self) -> bool {
         matches!(self.resource, ByteResource::Unix { .. })
+    }
+    pub fn local_kind(&self) -> u32 {
+        match &self.resource {
+            ByteResource::Unix { data, .. } => data.kind(),
+            _ => 0,
+        }
+    }
+    pub fn recv_local_message(
+        &self,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<LocalReceived<SharedRights>>> {
+        let ByteResource::Unix { data, side } = &self.resource else {
+            return None;
+        };
+        data.recv_local(*side, count, flags)
+    }
+    pub fn send_local_message(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: &SharedRights,
+        credentials: [u32; 3],
+    ) -> Option<Result<usize>> {
+        let ByteResource::Unix { data, side } = &self.resource else {
+            return None;
+        };
+        data.send_local(*side, bytes, flags, rights, credentials)
     }
     pub fn is_pty(&self) -> bool {
         matches!(self.resource, ByteResource::Pty { .. })

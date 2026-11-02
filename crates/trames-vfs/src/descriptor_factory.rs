@@ -4,11 +4,13 @@ use super::*;
 
 #[derive(Clone)]
 pub struct DescriptorFactory {
-    files: SharedFiles,
+    pub(super) files: SharedFiles,
     ids: Arc<AtomicU64>,
     owner: (u32, u32),
     network: trames_net::Network,
     credentials: Credentials,
+    local_identity: [u32; 3],
+    pid_namespace: PidNamespace,
 }
 pub(super) fn next_id(ids: &AtomicU64) -> u64 {
     (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)
@@ -21,10 +23,28 @@ impl Vfs {
             owner: (self.credentials.fsuid, self.credentials.fsgid),
             network: self.network.clone(),
             credentials: self.credentials.clone(),
+            local_identity: self.local_sender_credentials(),
+            pid_namespace: self.pid_namespace().clone(),
         }
     }
 }
 impl DescriptorFactory {
+    pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
+        self.local_identity = identity;
+        self
+    }
+    pub fn local_sender_credentials(&self) -> [u32; 3] {
+        self.local_identity
+    }
+    pub fn local_credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+    pub fn local_pid(&self, global: u32) -> u32 {
+        self.pid_namespace.local(global)
+    }
+    pub fn local_global_pid(&self, local: u32) -> Result<u32> {
+        self.pid_namespace.global(local).ok_or(Errno(3))
+    }
     fn open_id(&self) -> u64 {
         next_id(&self.ids)
     }

@@ -14,6 +14,12 @@ pub const URING_OPS: &[u8] = &[
 #[derive(Clone)]
 pub struct RetainedFd(pub(super) Descriptor);
 impl RetainedFd {
+    pub fn ofd_identity(&self) -> OfdIdentity {
+        OfdIdentity::new(&self.0.open.borrow().shared)
+    }
+    pub fn local_socket(&self) -> Option<Rc<LocalSocket>> {
+        self.0.open.borrow().local.clone()
+    }
     /// Actual close-notification lease, independent of owner inode/path anchors.
     /// Capture only for accepted operations, never every capability snapshot.
     pub fn close_notification(&self) -> Option<Arc<FileClose>> {

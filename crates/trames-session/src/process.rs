@@ -97,6 +97,7 @@ pub(crate) struct Process<C: Cpu> {
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
     retained_byte: Option<trames_linux::RetainedByte>,
+    retained_message_owner: Option<trames_vfs::RetainedFd>,
     retained_socket: Option<trames_linux::RetainedSocket>,
     tcp_liveness: Option<trames_net::TcpLease>,
     retained_poll: Option<trames_linux::RetainedPoll>,
@@ -183,6 +184,9 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
+        if !matches!(self.state, State::Blocked(..)) {
+            return false;
+        }
         if let Some(poll) = &self.retained_poll {
             return !self.linux.trace
                 && self.seccomp.mode() == 0
@@ -197,6 +201,18 @@ impl<C: Cpu> Process<C> {
             return !self.linux.trace;
         }
         if self.retained_byte.is_some() || self.byte_wait.is_some() {
+            if self
+                .retained_byte
+                .as_ref()
+                .or_else(|| {
+                    self.byte_wait
+                        .as_ref()
+                        .and_then(|w| w.retained_byte.as_ref())
+                })
+                .is_some_and(|file| file.local_message_entry().is_some())
+            {
+                return !self.linux.trace;
+            }
             return !self.linux.trace && self.seccomp.mode() == 0;
         }
         if matches!(self.state, State::Blocked(116, a) if a[0] as u32 == 2) {
@@ -290,6 +306,36 @@ impl<C: Cpu> Process<C> {
         }
     }
 
+    fn retain_local_message_owner(&mut self, call: Option<&crate::run_queue::IoCall>) {
+        let Some((call, identity)) = call.and_then(|call| {
+            call.retained_byte
+                .as_ref()?
+                .local_owner_identity()
+                .map(|identity| (call, identity))
+        }) else {
+            self.retained_message_owner = None;
+            return;
+        };
+        if self
+            .retained_message_owner
+            .as_ref()
+            .is_some_and(|owner| owner.ofd_identity() == identity)
+        {
+            return;
+        }
+        // Unix membership mutation remains joined. Every completion is visited
+        // before returned owner calls execute, so this is the original OFD.
+        assert!(self
+            .linux
+            .vfs
+            .matches_open_description(call.args[0] as u32, &identity));
+        self.retained_message_owner = Some(
+            self.linux
+                .vfs
+                .retain_uring_fd(call.args[0] as u32)
+                .expect("accepted local message owner"),
+        );
+    }
     fn worker_gpu_candidate(&self) -> bool {
         matches!(self.state, State::Gpu { retired: true, .. })
     }
@@ -343,6 +389,7 @@ impl<C: Cpu> Process<C> {
             byte_wait: None,
             retained_socket: None,
             retained_byte: None,
+            retained_message_owner: None,
             tcp_liveness: None,
             retained_poll: None,
             retained_select: None,
@@ -1120,6 +1167,7 @@ impl<C: Cpu> Kernel<C> {
         p.byte_wait = None;
         p.retained_socket = None;
         p.retained_byte = None;
+        p.retained_message_owner = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
         p.retained_select = None;
@@ -1560,6 +1608,7 @@ impl<C: Cpu> Kernel<C> {
                 p.byte_wait = None;
                 p.retained_socket = None;
                 p.retained_byte = None;
+                p.retained_message_owner = None;
                 p.tcp_liveness = None;
                 p.retained_poll = None;
                 p.retained_select = None;
@@ -1796,6 +1845,7 @@ impl<C: Cpu> Kernel<C> {
             p.byte_wait = None;
             p.retained_socket = None;
             p.retained_byte = None;
+            p.retained_message_owner = None;
             p.tcp_liveness = None;
             p.retained_poll = None;
             p.retained_select = None;
@@ -2892,7 +2942,30 @@ impl<C: Cpu> Kernel<C> {
             .as_ref()
             .and_then(|wait| wait.retained_socket.clone())
             .or_else(|| p.retained_socket.take());
-        let byte = if let Some(socket) = socket {
+        let local = p
+            .byte_wait
+            .as_ref()
+            .and_then(|wait| wait.retained_byte.as_ref())
+            .or(p.retained_byte.as_ref())
+            .filter(|file| file.local_message_entry().is_some())
+            .cloned();
+        let was_local = local.is_some();
+        let byte = if let Some(file) = local {
+            p.byte_wait = None;
+            p.retained_byte = None;
+            Some(
+                trames_linux::DirectSyscalls::default().start_owned_local_message(
+                    file,
+                    &mut p.linux.vfs,
+                    p.retained_message_owner
+                        .as_ref()
+                        .expect("retained Unix owner"),
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ),
+            )
+        } else if let Some(socket) = socket {
             p.byte_wait = None;
             Some(trames_linux::DirectSyscalls::default().retry_owned_socket(
                 socket,
@@ -2942,6 +3015,9 @@ impl<C: Cpu> Kernel<C> {
                 p.byte_wait = Some(wait);
                 Ok(None)
             }
+            Some(trames_linux::IoAttempt::ByteCheckpoint(_)) => {
+                unreachable!("owner local message retry")
+            }
             Some(trames_linux::IoAttempt::SocketCheckpoint(_)) => {
                 unreachable!("owner socket retry")
             }
@@ -2953,6 +3029,9 @@ impl<C: Cpu> Kernel<C> {
                 None => self.syscall(pid, p, number, a, io),
             },
         };
+        if was_local && !matches!(result, Ok(None)) {
+            p.retained_message_owner = None;
+        }
         if ids(&p.linux.vfs.credentials) != before_ids {
             p.pdeath_signal = 0;
         }
@@ -4409,6 +4488,7 @@ impl<C: Cpu> Kernel<C> {
                 p.seccomp_entry = Some(entry);
             }
             p.retain_worker_flock(done.io.as_ref());
+            p.retain_local_message_owner(done.io.as_ref());
             p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
             p.retained_socket = done
                 .io
@@ -5079,6 +5159,7 @@ pub(super) fn run<C: Cpu>(
         byte_wait: None,
         retained_socket: None,
         retained_byte: None,
+        retained_message_owner: None,
         tcp_liveness: None,
         retained_poll: None,
         retained_select: None,
@@ -6395,6 +6476,7 @@ mod tests {
             byte_wait: None,
             retained_socket: None,
             retained_byte: None,
+            retained_message_owner: None,
             tcp_liveness: None,
             retained_poll: None,
             retained_select: None,

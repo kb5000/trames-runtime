@@ -148,165 +148,409 @@ impl Linux {
                 socket.shutdown(a[1] as u32)?;
                 Ok(0)
             }
-            211 | 212 => {
-                let receive = number == 212;
-                let Message {
-                    control,
-                    control_size,
-                    output,
-                    vectors,
-                    destination,
-                } = Message::prepare(memory, a[1], receive, socket.kind() == 1)?;
-                if receive {
-                    let received = socket.recv(vectors.size, a[2] as u32 | nonblocking)?;
-                    vectors.write(memory, &received.data)?;
-                    let mut ancillary = Vec::new();
-                    let mut control_truncated = false;
-                    if let Some(mut credentials) = received.credentials {
-                        credentials[0] = vfs.pid_namespace().local(credentials[0]);
-                        let value: Vec<_> =
-                            credentials.into_iter().flat_map(u32::to_le_bytes).collect();
-                        push_control(&mut ancillary, 1, 2, &value);
-                        if control_size < 28 {
-                            control_truncated = true;
-                        }
-                        ancillary.truncate(control_size as usize);
-                        if ancillary.len() >= 16 {
-                            let length = ancillary.len().min(28) as u64;
-                            ancillary[..8].copy_from_slice(&length.to_le_bytes());
-                        } else {
-                            ancillary.clear();
-                        }
-                    }
-                    if let Some((kind, stamp)) = received.timestamp {
-                        let remaining = control_size as usize - ancillary.len();
-                        let value: Vec<_> = stamp.into_iter().flat_map(u64::to_le_bytes).collect();
-                        let mut bytes = Vec::new();
-                        push_control(&mut bytes, 1, kind, &value);
-                        if remaining < bytes.len() {
-                            control_truncated = true;
-                        }
-                        bytes.truncate(remaining);
-                        if bytes.len() >= 16 {
-                            let length = bytes.len() as u64;
-                            bytes[..8].copy_from_slice(&length.to_le_bytes());
-                            ancillary.extend_from_slice(&bytes);
-                        }
-                    }
-                    let remaining = control_size as usize - ancillary.len();
-                    let capacity = remaining.saturating_sub(16) / 4;
-                    let (fds, truncated) =
-                        vfs.receive_rights(received.rights, capacity, a[2] & 0x40000000 != 0);
-                    if !fds.is_empty() {
-                        let size = 16 + fds.len() * 4;
-                        let space = ((size + 7) & !7).min(remaining);
-                        let mut bytes = vec![0; space];
-                        bytes[..8].copy_from_slice(&(size as u64).to_le_bytes());
-                        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-                        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
-                        for (i, fd) in fds.iter().enumerate() {
-                            bytes[16 + i * 4..20 + i * 4].copy_from_slice(&fd.to_le_bytes());
-                        }
-                        ancillary.extend_from_slice(&bytes);
-                    }
-                    memory.write(control, &ancillary).map_err(|_| Errno(14))?;
-                    let control_count = ancillary.len();
-                    if let Some(output) = output {
-                        output.write_bytes(
-                            memory,
-                            if socket.kind() == 1 {
-                                &[]
-                            } else {
-                                &received.source
-                            },
-                        )?;
-                    } else {
-                        memory
-                            .write(a[1] + 8, &0u32.to_le_bytes())
-                            .map_err(|_| Errno(14))?;
-                    }
-                    memory
-                        .write(a[1] + 40, &(control_count as u64).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                    memory
-                        .write(
-                            a[1] + 48,
-                            &((if received.truncated { MSG_TRUNC } else { 0 })
-                                | if truncated || control_truncated { 8 } else { 0 })
-                            .to_le_bytes(),
-                        )
-                        .map_err(|_| Errno(14))?;
-                    Ok(if a[2] & MSG_TRUNC as u64 != 0 {
-                        received.length
-                    } else {
-                        received.data.len()
-                    } as u64)
-                } else {
-                    let mut fds = Vec::new();
-                    let mut identity = vfs.local_sender_credentials();
-                    let mut offset = 0;
-                    while control_size - offset >= 16 {
-                        let length = u64_at(memory, control + offset)?;
-                        if length < 16 || length > control_size - offset {
-                            return Err(Errno(22));
-                        }
-                        let level = u32_at(memory, control + offset + 8)?;
-                        let kind = u32_at(memory, control + offset + 12)?;
-                        if level != 1 || !matches!(kind, 1 | 2) {
-                            return Err(Errno(95));
-                        }
-                        if kind == 2 {
-                            if length != 28 {
-                                return Err(Errno(22));
-                            }
-                            let pid = u32_at(memory, control + offset + 16)?;
-                            let uid = u32_at(memory, control + offset + 20)?;
-                            let gid = u32_at(memory, control + offset + 24)?;
-                            let c = &vfs.credentials;
-                            let global = vfs.global_pid(pid)?;
-                            if (global != identity[0]
-                                && !c.has_cap(trames_vfs::capabilities::SYS_ADMIN))
-                                || (![c.uid, c.euid, c.suid].contains(&uid)
-                                    && !c.has_cap(trames_vfs::capabilities::SETUID))
-                                || (![c.gid, c.egid, c.sgid].contains(&gid)
-                                    && !c.has_cap(trames_vfs::capabilities::SETGID))
-                            {
-                                return Err(Errno(1));
-                            }
-                            identity = [global, uid, gid];
-                        } else {
-                            for i in 0..(length - 16) / 4 {
-                                fds.push(u32_at(memory, control + offset + 16 + i * 4)?);
-                            }
-                        }
-                        if fds.len() > 253 {
-                            return Err(Errno(22));
-                        }
-                        let next = (length + 7) & !7;
-                        if next > control_size - offset {
-                            break;
-                        }
-                        offset += next;
-                    }
-                    if control_size != 0 && control_size < 16 {
-                        return Err(Errno(22));
-                    }
-                    let rights = vfs.send_rights(&fds)?;
-                    Ok(vfs.local_send_credentials(
-                        socket,
-                        &vectors.read(memory)?,
-                        a[2] as u32,
-                        destination.as_deref(),
-                        rights,
-                        identity,
-                    )? as u64)
-                }
-            }
+            211 | 212 => message(
+                number as u32,
+                a,
+                memory,
+                &mut OwnerMessage {
+                    vfs,
+                    socket,
+                    nonblocking,
+                },
+            )
+            .expect("owner Unix message"),
             _ => Err(Errno(95)),
         }
     }
 }
 
+pub(crate) trait MessageIo {
+    type Rights: Clone;
+    fn kind(&self) -> u32;
+    fn nonblocking(&self) -> u32;
+    fn recv(
+        &mut self,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<trames_vfs::LocalReceived<Self::Rights>>>;
+    fn send(
+        &mut self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        rights: Self::Rights,
+        identity: [u32; 3],
+    ) -> Option<Result<usize>>;
+    fn sender_credentials(&self) -> [u32; 3];
+    fn credentials(&self) -> &trames_vfs::Credentials;
+    fn local_pid(&self, global: u32) -> u32;
+    fn global_pid(&self, local: u32) -> Result<u32>;
+    fn send_rights(&self, fds: &[u32]) -> Option<Result<Self::Rights>>;
+    fn receive_rights(
+        &mut self,
+        rights: Self::Rights,
+        capacity: usize,
+        cloexec: bool,
+    ) -> (Vec<u32>, bool);
+}
+struct OwnerMessage<'a> {
+    vfs: &'a mut trames_vfs::Vfs,
+    socket: &'a std::rc::Rc<trames_vfs::LocalSocket>,
+    nonblocking: u32,
+}
+impl MessageIo for OwnerMessage<'_> {
+    type Rights = trames_vfs::LocalRights;
+    fn kind(&self) -> u32 {
+        self.socket.kind()
+    }
+    fn nonblocking(&self) -> u32 {
+        self.nonblocking
+    }
+    fn recv(&mut self, count: usize, flags: u32) -> Option<Result<trames_vfs::LocalReceived>> {
+        Some(self.socket.recv(count, flags))
+    }
+    fn send(
+        &mut self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        rights: trames_vfs::LocalRights,
+        identity: [u32; 3],
+    ) -> Option<Result<usize>> {
+        Some(self.vfs.local_send_credentials(
+            self.socket,
+            bytes,
+            flags,
+            destination,
+            rights,
+            identity,
+        ))
+    }
+    fn sender_credentials(&self) -> [u32; 3] {
+        self.vfs.local_sender_credentials()
+    }
+    fn credentials(&self) -> &trames_vfs::Credentials {
+        &self.vfs.credentials
+    }
+    fn local_pid(&self, global: u32) -> u32 {
+        self.vfs.pid_namespace().local(global)
+    }
+    fn global_pid(&self, local: u32) -> Result<u32> {
+        self.vfs.global_pid(local)
+    }
+    fn send_rights(&self, fds: &[u32]) -> Option<Result<trames_vfs::LocalRights>> {
+        Some(self.vfs.send_rights(fds))
+    }
+    fn receive_rights(
+        &mut self,
+        rights: trames_vfs::LocalRights,
+        capacity: usize,
+        cloexec: bool,
+    ) -> (Vec<u32>, bool) {
+        self.vfs.receive_rights(rights, capacity, cloexec)
+    }
+}
+/// One original ancillary ABI for owner and worker transports. Deferral occurs
+/// before any transport effect; actual shared rights require no owner ledger.
+pub(crate) fn message(
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+    io: &mut impl MessageIo,
+) -> Option<Result<u64>> {
+    match prepare_message(number, a, memory, io)? {
+        Ok(prepared) => prepared.progress(memory, io),
+        Err(error) => Some(Err(error)),
+    }
+}
+#[derive(Clone)]
+pub(crate) struct PreparedMessage<R> {
+    frame: Message,
+    args: [u64; 6],
+    receive: bool,
+    send: Option<(Vec<u8>, R, [u32; 3])>,
+}
+/// Import buffers, credentials and descriptor references once, before waiting.
+/// The typed worker Rights graph owns only actual shared OFDs.
+pub(crate) fn prepare_message<I: MessageIo>(
+    number: u32,
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+    io: &I,
+) -> Option<Result<PreparedMessage<I::Rights>>> {
+    let deferred = std::cell::Cell::new(false);
+    let result = (|| {
+        let receive = number == 212;
+        let frame = Message::prepare(memory, a[1], receive, io.kind() == 1)?;
+        if receive {
+            return Ok(PreparedMessage {
+                frame,
+                args: a,
+                receive,
+                send: None,
+            });
+        }
+        let control = frame.control;
+        let control_size = frame.control_size;
+        let vectors = &frame.vectors;
+        let mut fds = Vec::new();
+        let mut identity = io.sender_credentials();
+        let mut offset = 0;
+        while control_size - offset >= 16 {
+            let length = u64_at(memory, control + offset)?;
+            if length < 16 || length > control_size - offset {
+                return Err(Errno(22));
+            }
+            let level = u32_at(memory, control + offset + 8)?;
+            let kind = u32_at(memory, control + offset + 12)?;
+            if level != 1 || !matches!(kind, 1 | 2) {
+                return Err(Errno(95));
+            }
+            if kind == 2 {
+                if length != 28 {
+                    return Err(Errno(22));
+                }
+                let pid = u32_at(memory, control + offset + 16)?;
+                let uid = u32_at(memory, control + offset + 20)?;
+                let gid = u32_at(memory, control + offset + 24)?;
+                let c = io.credentials();
+                let global = io.global_pid(pid)?;
+                if (global != identity[0] && !c.has_cap(trames_vfs::capabilities::SYS_ADMIN))
+                    || (![c.uid, c.euid, c.suid].contains(&uid)
+                        && !c.has_cap(trames_vfs::capabilities::SETUID))
+                    || (![c.gid, c.egid, c.sgid].contains(&gid)
+                        && !c.has_cap(trames_vfs::capabilities::SETGID))
+                {
+                    return Err(Errno(1));
+                }
+                identity = [global, uid, gid];
+            } else {
+                for i in 0..(length - 16) / 4 {
+                    fds.push(u32_at(memory, control + offset + 16 + i * 4)?);
+                }
+            }
+            if fds.len() > 253 {
+                return Err(Errno(22));
+            }
+            let next = (length + 7) & !7;
+            if next > control_size - offset {
+                break;
+            }
+            offset += next;
+        }
+        if control_size != 0 && control_size < 16 {
+            return Err(Errno(22));
+        }
+        let rights = io.send_rights(&fds).unwrap_or_else(|| {
+            deferred.set(true);
+            Err(Errno(11))
+        })?;
+
+        let bytes = vectors.read(memory)?;
+        Ok(PreparedMessage {
+            frame,
+            args: a,
+            receive,
+            send: Some((bytes, rights, identity)),
+        })
+    })();
+    if deferred.get() {
+        None
+    } else {
+        Some(result)
+    }
+}
+impl<R: Clone> PreparedMessage<R> {
+    fn owner(
+        &self,
+        rights: impl Fn(&R) -> trames_vfs::LocalRights,
+    ) -> PreparedMessage<trames_vfs::LocalRights> {
+        PreparedMessage {
+            frame: self.frame.clone(),
+            args: self.args,
+            receive: self.receive,
+            send: self
+                .send
+                .as_ref()
+                .map(|(bytes, value, identity)| (bytes.clone(), rights(value), *identity)),
+        }
+    }
+    /// A later VM transaction can invalidate an imported destination. Recheck
+    /// those original ranges before consuming a queued message, without
+    /// importing another header/iovec or changing their accepted addresses.
+    pub(crate) fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
+        if !self.receive {
+            return Ok(());
+        }
+        Linux::check(memory, self.args[1], 56, Access::Write)?;
+        Linux::check(
+            memory,
+            self.frame.control,
+            self.frame.control_size as usize,
+            Access::Write,
+        )?;
+        for &(pointer, size) in &self.frame.vectors.parts {
+            Linux::check(memory, pointer, size, Access::Write)?;
+        }
+        if let Some(output) = &self.frame.output {
+            Linux::check(memory, output.length_pointer, 4, Access::Write)?;
+            Linux::check(
+                memory,
+                output.pointer,
+                output.capacity.min(110),
+                Access::Write,
+            )?;
+        }
+        Ok(())
+    }
+    pub(crate) fn progress(
+        &self,
+        memory: &mut impl CpuMemory,
+        io: &mut impl MessageIo<Rights = R>,
+    ) -> Option<Result<u64>> {
+        let a = self.args;
+        let control = self.frame.control;
+        let control_size = self.frame.control_size;
+        let vectors = &self.frame.vectors;
+        let output = self.frame.output;
+        let deferred = std::cell::Cell::new(false);
+        let nonblocking = io.nonblocking();
+        let result = (|| {
+            if self.receive {
+                let received = io
+                    .recv(vectors.size, a[2] as u32 | nonblocking)
+                    .unwrap_or_else(|| {
+                        deferred.set(true);
+                        Err(Errno(11))
+                    })?;
+                vectors.write(memory, &received.data)?;
+                let mut ancillary = Vec::new();
+                let mut control_truncated = false;
+                if let Some(mut credentials) = received.credentials {
+                    credentials[0] = io.local_pid(credentials[0]);
+                    let value: Vec<_> =
+                        credentials.into_iter().flat_map(u32::to_le_bytes).collect();
+                    push_control(&mut ancillary, 1, 2, &value);
+                    if control_size < 28 {
+                        control_truncated = true;
+                    }
+                    ancillary.truncate(control_size as usize);
+                    if ancillary.len() >= 16 {
+                        let length = ancillary.len().min(28) as u64;
+                        ancillary[..8].copy_from_slice(&length.to_le_bytes());
+                    } else {
+                        ancillary.clear();
+                    }
+                }
+                if let Some((kind, stamp)) = received.timestamp {
+                    let remaining = control_size as usize - ancillary.len();
+                    let value: Vec<_> = stamp.into_iter().flat_map(u64::to_le_bytes).collect();
+                    let mut bytes = Vec::new();
+                    push_control(&mut bytes, 1, kind, &value);
+                    if remaining < bytes.len() {
+                        control_truncated = true;
+                    }
+                    bytes.truncate(remaining);
+                    if bytes.len() >= 16 {
+                        let length = bytes.len() as u64;
+                        bytes[..8].copy_from_slice(&length.to_le_bytes());
+                        ancillary.extend_from_slice(&bytes);
+                    }
+                }
+                let remaining = control_size as usize - ancillary.len();
+                let capacity = remaining.saturating_sub(16) / 4;
+                let (fds, truncated) =
+                    io.receive_rights(received.rights, capacity, a[2] & 0x40000000 != 0);
+                if !fds.is_empty() {
+                    let size = 16 + fds.len() * 4;
+                    let space = ((size + 7) & !7).min(remaining);
+                    let mut bytes = vec![0; space];
+                    bytes[..8].copy_from_slice(&(size as u64).to_le_bytes());
+                    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+                    bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+                    for (i, fd) in fds.iter().enumerate() {
+                        bytes[16 + i * 4..20 + i * 4].copy_from_slice(&fd.to_le_bytes());
+                    }
+                    ancillary.extend_from_slice(&bytes);
+                }
+                memory.write(control, &ancillary).map_err(|_| Errno(14))?;
+                let control_count = ancillary.len();
+                if let Some(output) = output {
+                    output.write_bytes(
+                        memory,
+                        if io.kind() == 1 {
+                            &[]
+                        } else {
+                            &received.source
+                        },
+                    )?;
+                } else {
+                    memory
+                        .write(a[1] + 8, &0u32.to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                memory
+                    .write(a[1] + 40, &(control_count as u64).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                memory
+                    .write(
+                        a[1] + 48,
+                        &((if received.truncated { MSG_TRUNC } else { 0 })
+                            | if truncated || control_truncated { 8 } else { 0 })
+                        .to_le_bytes(),
+                    )
+                    .map_err(|_| Errno(14))?;
+                Ok(if a[2] & MSG_TRUNC as u64 != 0 {
+                    received.length
+                } else {
+                    received.data.len()
+                } as u64)
+            } else {
+                let (bytes, rights, identity) = self.send.as_ref().expect("prepared send");
+                io.send(
+                    bytes,
+                    a[2] as u32,
+                    self.frame.destination.as_deref(),
+                    rights.clone(),
+                    *identity,
+                )
+                .unwrap_or_else(|| {
+                    deferred.set(true);
+                    Err(Errno(11))
+                })
+                .map(|n| n as u64)
+            }
+        })();
+        if deferred.get() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+}
+
+pub(crate) fn progress_owned(
+    prepared: &PreparedMessage<trames_vfs::SharedRights>,
+    vfs: &mut trames_vfs::Vfs,
+    socket: &std::rc::Rc<trames_vfs::LocalSocket>,
+    nonblocking: u32,
+    memory: &mut impl CpuMemory,
+) -> Result<u64> {
+    prepared.recheck(memory)?;
+    prepared
+        .owner(trames_vfs::SharedRights::local)
+        .progress(
+            memory,
+            &mut OwnerMessage {
+                vfs,
+                socket,
+                nonblocking,
+            },
+        )
+        .expect("owner accepted Unix message")
+}
+
+#[derive(Clone)]
 struct Message {
     control: u64,
     control_size: u64,
@@ -475,45 +719,52 @@ mod tests {
 
     #[test]
     fn explicit_credentials_enforce_authority_and_receive_faults_leave_packets_queued() {
-        let mut vfs = trames_vfs::Vfs::default();
-        vfs.set_lock_owner(1);
-        vfs.credentials = trames_vfs::Credentials::user(1000, 1001);
-        let [sender, receiver] = vfs.socketpair(1, 2, 0).unwrap();
-        let endpoint = vfs.local_socket(receiver).unwrap().unwrap();
-        endpoint.set_reuse(16, 1).unwrap();
-        let mut memory = Memory::default();
-        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
-        let mut header = [0u8; 56];
-        for (offset, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 32)] {
-            header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        for worker in [false, true] {
+            let call =
+                |vfs: &mut trames_vfs::Vfs, number: u64, args: [u64; 6], memory: &mut Memory| {
+                    if worker {
+                        crate::DirectSyscalls::new(vfs.direct_descriptors())
+                            .with_resources(vfs.descriptor_factory())
+                            .invoke(number as u32, args, memory)
+                            .expect("paired datagram message worker")
+                    } else {
+                        Linux::network_vfs(vfs, number, args, memory)
+                    }
+                };
+            let mut vfs = trames_vfs::Vfs::default();
+            vfs.set_lock_owner(1);
+            vfs.credentials = trames_vfs::Credentials::user(1000, 1001);
+            let [sender, receiver] = vfs.socketpair(1, 2, 0).unwrap();
+            let endpoint = vfs.local_socket(receiver).unwrap().unwrap();
+            endpoint.set_reuse(16, 1).unwrap();
+            let mut memory = Memory::default();
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            let mut header = [0u8; 56];
+            for (offset, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 32)] {
+                header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            memory.write(0x1000, &header).unwrap();
+            memory.write(0x1100, &0x1200u64.to_le_bytes()).unwrap();
+            memory.write(0x1108, &1u64.to_le_bytes()).unwrap();
+            memory.write(0x1200, b"x").unwrap();
+            let mut control = Vec::new();
+            let identity: Vec<_> = [1u32, 1002, 1001]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            push_control(&mut control, 1, 2, &identity);
+            memory.write(0x1300, &control).unwrap();
+            let send = [sender as u64, 0x1000, 0, 0, 0, 0];
+            assert_eq!(call(&mut vfs, 211, send, &mut memory), Err(Errno(1)));
+            assert_eq!(endpoint.recv(1, 0).err(), Some(Errno(11)));
+            memory.write(0x1314, &1000u32.to_le_bytes()).unwrap();
+            assert_eq!(call(&mut vfs, 211, send, &mut memory), Ok(1));
+            memory.write(0x1020, &0x9000u64.to_le_bytes()).unwrap();
+            let recv = [receiver as u64, 0x1000, 0, 0, 0, 0];
+            assert_eq!(call(&mut vfs, 212, recv, &mut memory), Err(Errno(14)));
+            let received = endpoint.recv(1, 0).unwrap();
+            assert_eq!(received.data, b"x");
+            assert_eq!(received.credentials, Some([1, 1000, 1001]));
         }
-        memory.write(0x1000, &header).unwrap();
-        memory.write(0x1100, &0x1200u64.to_le_bytes()).unwrap();
-        memory.write(0x1108, &1u64.to_le_bytes()).unwrap();
-        memory.write(0x1200, b"x").unwrap();
-        let mut control = Vec::new();
-        let identity: Vec<_> = [1u32, 1002, 1001]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        push_control(&mut control, 1, 2, &identity);
-        memory.write(0x1300, &control).unwrap();
-        let send = [sender as u64, 0x1000, 0, 0, 0, 0];
-        assert_eq!(
-            Linux::network_vfs(&mut vfs, 211, send, &mut memory),
-            Err(Errno(1))
-        );
-        assert_eq!(endpoint.recv(1, 0).err(), Some(Errno(11)));
-        memory.write(0x1314, &1000u32.to_le_bytes()).unwrap();
-        assert_eq!(Linux::network_vfs(&mut vfs, 211, send, &mut memory), Ok(1));
-        memory.write(0x1020, &0x9000u64.to_le_bytes()).unwrap();
-        let recv = [receiver as u64, 0x1000, 0, 0, 0, 0];
-        assert_eq!(
-            Linux::network_vfs(&mut vfs, 212, recv, &mut memory),
-            Err(Errno(14))
-        );
-        let received = endpoint.recv(1, 0).unwrap();
-        assert_eq!(received.data, b"x");
-        assert_eq!(received.credentials, Some([1, 1000, 1001]));
     }
 }

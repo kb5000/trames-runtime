@@ -291,3 +291,145 @@ fn all_blocked_related_accepts_are_adopted_without_an_interactive_service() {
     assert_eq!(k.service_requests, 0);
     assert!(k.worker_socket_syscalls >= 2);
 }
+
+#[test]
+fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechecking_entry() {
+    let mut p = super::tests::process();
+    let mut k = super::tests::kernel();
+    let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+    let event = p.linux.vfs.eventfd(19, 0).unwrap();
+    let weak = Rc::downgrade(&p.linux.vfs.local_socket(rx).unwrap().unwrap());
+    let mut header = [0; 56];
+    for (at, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 24)] {
+        header[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    p.memory.write(0x1000, &header).unwrap();
+    p.memory
+        .write_array(0x1100, 0x1200u64.to_le_bytes())
+        .unwrap();
+    p.memory.write_array(0x1108, 4u64.to_le_bytes()).unwrap();
+    p.memory.write(0x1200, b"abcd").unwrap();
+    p.memory.write(0x1800, &[0xff; 16]).unwrap();
+    filter(&mut k, &mut p, 0x7fff0000);
+    let mut peer = p.fork();
+    peer.tgid = 2;
+    peer.parent = 1;
+    p.linux.vfs.close(tx).unwrap();
+    p.linux.vfs.close(event).unwrap();
+    peer.linux.vfs.close(rx).unwrap();
+    peer.memory
+        .write_array(0x1300, 20u64.to_le_bytes())
+        .unwrap();
+    peer.memory.write_array(0x1308, 1u32.to_le_bytes()).unwrap();
+    peer.memory.write_array(0x130c, 1u32.to_le_bytes()).unwrap();
+    peer.memory
+        .write_array(0x1310, event.to_le_bytes())
+        .unwrap();
+    program(
+        &mut p,
+        vec![
+            mov(0, rx),
+            mov(1, 0x1000),
+            mov(2, 0),
+            mov(8, 212),
+            0xd4000001,
+            mov(1, 0x1800),
+            0xf9000020,
+            mov(0, rx),
+            mov(1, 0x1000),
+            mov(2, 0),
+            mov(8, 212),
+            0xd4000001,
+            mov(1, 0x1808),
+            0xf9000020,
+            0x14000000,
+        ],
+    );
+    program(&mut peer, vec![0x14000000]);
+    k.cpu_count = 2;
+    k.per_cpu = vec![Duration::ZERO; 2];
+    k.workers = crate::workers::Pool::new(1);
+    k.processes.insert(1, p);
+    k.processes.insert(2, peer);
+    assert!(k
+        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+        .unwrap());
+    let mut p = k.processes.remove(&1).unwrap();
+    assert!(matches!(p.state, State::Blocked(212, _)));
+    assert!(p.retained_message_owner.is_some());
+    Kernel::queue_one(1, &mut p, 19, 0);
+    assert_eq!(k.deliver(1, &mut p), Ok(true));
+    assert!(matches!(p.state, State::Stopped));
+    assert!(
+        !p.worker_io_candidate(1),
+        "a retained message does not make a stopped task runnable"
+    );
+    Kernel::queue_one(1, &mut p, 18, 0);
+    assert!(
+        !k.resume_event(&mut p),
+        "continued socket still waits for its message"
+    );
+    assert!(matches!(p.state, State::Blocked(212, _)));
+    p.linux.vfs.close(rx).unwrap();
+    let replacement = p.linux.vfs.eventfd(99, 0).unwrap();
+    if replacement != rx {
+        assert_eq!(p.linux.vfs.dup(replacement, rx, false).unwrap(), rx);
+        p.linux.vfs.close(replacement).unwrap();
+    }
+    assert!(
+        weak.upgrade().is_some(),
+        "accepted call retains its original local OFD"
+    );
+    filter(&mut k, &mut p, 0x5000d);
+    k.processes.insert(1, p);
+    let peer = k.processes.get_mut(&2).unwrap();
+    peer.memory
+        .protect(0x4000, PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    program(
+        peer,
+        vec![
+            mov(0, tx),
+            mov(1, 0x1000),
+            mov(2, 0),
+            mov(8, 211),
+            0xd4000001,
+            mov(1, 0x1800),
+            0xf9000020,
+            0x14000000,
+        ],
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let limit = k.instructions + 100_000;
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+            .unwrap());
+        if k.processes[&1].memory.read_u64(0x1808).unwrap() == error(Errno(13)) {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "retained filtered message did not progress"
+        );
+    }
+    let p = k.processes.get_mut(&1).unwrap();
+    assert_eq!(p.memory.read_u64(0x1800).unwrap(), 4);
+    let imported = u32::from_le_bytes(p.memory.read_array(0x1310).unwrap());
+    assert_eq!(p.linux.vfs.read(imported, 8).unwrap(), 19u64.to_le_bytes());
+    assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
+    assert!(
+        weak.upgrade().is_none(),
+        "completed call releases old transport"
+    );
+    assert_eq!(p.seccomp.evaluations(), 3);
+    assert_eq!(k.service_requests, 0);
+    assert!(
+        k.worker_io_waits > 0 && k.worker_socket_syscalls >= 2,
+        "waits={} socket={} direct={} services={}",
+        k.worker_io_waits,
+        k.worker_socket_syscalls,
+        k.worker_direct_syscalls,
+        k.service_requests
+    );
+}

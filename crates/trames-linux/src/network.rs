@@ -10,7 +10,7 @@ use trames_net::{encode_address, NetError, MSG_TRUNC};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
 pub(crate) mod local;
-mod unix;
+pub(crate) mod unix;
 pub(super) fn control_number(number: u32) -> bool {
     matches!(number, 200..=205 | 208..=210 | 242)
 }
@@ -201,6 +201,7 @@ fn address(memory: &impl CpuMemory, pointer: u64, length: u64) -> Result<Vec<u8>
     memory.read(pointer, &mut bytes).map_err(|_| Errno(14))?;
     Ok(bytes)
 }
+#[derive(Clone, Copy)]
 struct AddressOutput {
     pointer: u64,
     length_pointer: u64,
@@ -328,6 +329,7 @@ pub(crate) fn direct_control(
         _ => unreachable!("restricted control admission"),
     }
 }
+#[derive(Clone)]
 struct Vectors {
     parts: Vec<(u64, usize)>,
     size: usize,

@@ -10,6 +10,7 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+mod local_message;
 mod socket_wait;
 mod uring;
 pub use socket_wait::RetainedSocket;
@@ -48,8 +49,12 @@ pub struct PendingIo {
 #[derive(Clone)]
 pub struct RetainedByte {
     fd: trames_vfs::DirectFd,
+    message: Option<Arc<local_message::AcceptedMessage>>,
 }
 impl RetainedByte {
+    pub fn local_owner_identity(&self) -> Option<trames_vfs::OfdIdentity> {
+        self.message.as_ref().map(|_| self.fd.ofd_identity())
+    }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.shares_with(std::iter::once(&self.fd))
     }
@@ -89,6 +94,7 @@ pub enum IoAttempt {
     Blocked(PendingIo),
     Checkpoint,
     SocketCheckpoint(RetainedSocket),
+    ByteCheckpoint(RetainedByte),
 }
 /// Shared epoll ABI for both joined and worker-local implementations.
 pub fn epoll_parameters(
@@ -225,6 +231,9 @@ impl DirectSyscalls {
     }
     pub fn supports_socket_control(&self, number: u32) -> bool {
         crate::network::control_number(number) && self.resources.is_some()
+    }
+    pub fn supports_local_message(&self, number: u32) -> bool {
+        matches!(number, 211 | 212) && self.resources.is_some()
     }
     pub fn invoke_socket_control(
         &self,
@@ -527,6 +536,9 @@ impl DirectSyscalls {
             .is_some_and(|fd| Self::supports_fd(number, &fd))
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
+        if fd.is_unix() && fd.local_kind() != 1 {
+            return matches!(number, 210..=212);
+        }
         if number == 62 {
             fd.is_kmsg()
         } else if matches!(number, 22 | 441) {
@@ -726,6 +738,9 @@ impl DirectSyscalls {
         if !Self::supports_fd_call(number, args, fd) {
             return None;
         }
+        if matches!(number, 211 | 212) && self.resources.is_some() {
+            return self.local_message(fd, number, args, memory);
+        }
         let deferred = Cell::new(false);
         let flags = socket_flags(number, args);
         let read = |count| {
@@ -857,6 +872,9 @@ impl DirectSyscalls {
         // Accepted shared byte calls already own their complete authority.
         // Accounting must not re-resolve the numeric FD after close/reuse.
         self.completed.set(self.completed.get() + 1);
+        if file.fd.is_unix() {
+            self.socket_completed.set(self.socket_completed.get() + 1);
+        }
         if file.fd.timer().is_some() {
             self.timer_completed.set(self.timer_completed.get() + 1);
         }
@@ -882,6 +900,11 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if matches!(number, 211 | 212) && self.resources.is_some() {
+            if let Some(attempt) = self.start_local_message(number, args, memory, pid, target) {
+                return Some(attempt);
+            }
+        }
         if matches!(number, 63..=66) {
             if let Some(fd) = self.network.get(args[0] as u32) {
                 return Some(self.start_tcp(fd, number, args, memory, pid, target, saved_deadline));
@@ -1059,7 +1082,7 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         let fd = file.direct_byte()?;
-        Some(Ok(RetainedByte { fd }))
+        Some(Ok(RetainedByte { fd, message: None }))
     }
     pub fn start_retained_poll(
         &self,
@@ -1139,11 +1162,24 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         checkpoint_pipe: bool,
     ) -> IoAttempt {
-        match self.transfer_fd(&file.fd, number, args, memory) {
-            Some(Err(Errno(11))) if !file.fd.nonblocking() => {}
-            Some(Err(Errno(32))) if checkpoint_pipe => return IoAttempt::Checkpoint,
+        match self.transfer_retained(&file, number, args, memory) {
+            Some(Err(Errno(11)))
+                if !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
+            Some(Err(Errno(32))) if checkpoint_pipe && signals_pipe(number, args) => {
+                return if file.message.is_some() {
+                    IoAttempt::ByteCheckpoint(file)
+                } else {
+                    IoAttempt::Checkpoint
+                }
+            }
             Some(result) => return self.complete_byte(&file, result),
-            None => return IoAttempt::Checkpoint,
+            None => {
+                return if file.message.is_some() {
+                    IoAttempt::ByteCheckpoint(file)
+                } else {
+                    IoAttempt::Checkpoint
+                }
+            }
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = file.fd.subscribe(&signal);
@@ -1302,8 +1338,11 @@ impl DirectSyscalls {
         let result = if let Some(fd) = &pending.native_tcp {
             self.transfer_tcp(fd, pending.number, pending.args, memory)
         } else if let Some(file) = &pending.retained_byte {
-            self.transfer_fd(&file.fd, pending.number, pending.args, memory)
-                .expect("shared byte operation")
+            let Some(result) = self.transfer_retained(file, pending.number, pending.args, memory)
+            else {
+                return IoAttempt::Checkpoint;
+            };
+            result
         } else if let Some(poll) = &pending.retained_poll {
             poll.check(memory, pending.deadline)
         } else if matches!(pending.number, 22 | 441) {

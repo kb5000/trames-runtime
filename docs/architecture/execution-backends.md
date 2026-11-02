@@ -1150,3 +1150,37 @@ byte I/O are unchanged. Coverage includes a single execution worker, all-blocked
 cohorts, native event idleness, virtual handshake recovery/timeout, original Files
 after close/reuse, filtering and signal cleanup. AF_UNIX/SCM_RIGHTS, task/signal
 authority and structural VM/device ownership remain separate migration work.
+
+## Worker Unix ancillary messages (2026-11-02)
+
+Paired Unix stream, datagram and seqpacket sendmsg/recvmsg use one original
+ancillary ABI on the executing worker. Portable messages own the actual shared
+OFDs in their packet; they no longer refer to an owner-only rights ledger. Files,
+pipes, event/timer/inotify objects and network sockets keep their real identity,
+offsets, flags and close behavior. Descriptor admission and import use the actual
+Files membership and its existing limit. Owner-only objects defer before effects;
+mixed messages are never partially sent. Existing Unix control/creation, addressed
+datagrams, ownership-cycle policy and native service pumping remain joined.
+
+The message imports its header, iovecs, credentials and source descriptors once.
+An accepted wait retains those references and the creating Files/authority;
+close/reuse or changed guest headers cannot change the message on retry. Receive
+rechecks the original output ranges after a possible VM transaction before
+consuming a packet. Ready calls need no retained-message allocation, and messages
+without rights avoid Files locking. Metadata is captured under the existing
+channel lock rather than re-locking the channel for each option.
+
+Blocked messages release their execution slot and reuse the existing resource
+subscriptions. Their typed shared state contains no Rc/RefCell. Unix control
+objects remain owner projections: on a cohort handoff, the joined executor retains
+the original local OFD before any returned owner mutation executes. That owner
+lease stays outside worker state and is released on completion, signal or exit.
+Fallback uses the accepted message and original transport, not a fresh numeric
+lookup or another header import. Filtered entries keep one decision across this
+handoff; subsequent SVCs evaluate the current filter normally.
+
+Peek, truncation, CMSG_CLOEXEC, credentials, timestamps and no-rights byte behavior
+retain the common ABI. Payload/descriptor references are released outside channel
+and Files locks, including truncation and receiver close, so final-close callbacks
+cannot invert the resource/run-queue lock order. No new thread, bus, unsafe trait
+override, guest-memory barrier, resource quota or global network lock is added.
