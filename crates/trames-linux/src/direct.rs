@@ -273,6 +273,9 @@ impl DirectSyscalls {
         self.kernel_log = Some(log);
         self
     }
+    pub fn socket_descriptor(&self, fd: u32) -> bool {
+        self.network.is_socket(fd)
+    }
     pub fn with_network(mut self, network: trames_vfs::DirectNetwork) -> Self {
         self.network = network;
         self

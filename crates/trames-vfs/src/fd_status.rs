@@ -152,6 +152,36 @@ impl FdFlags {
 mod tests {
     use super::*;
     #[test]
+    fn existing_flag_capture_resolves_new_socket_aliases_and_reuse() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let flags = v.fd_flags_snapshot();
+        let network = v.direct_network();
+        let fd = v.socket(2, 1, 0).unwrap();
+        assert!(network.is_socket(fd));
+        let alias = v.dup(fd, 0, false).unwrap();
+        let shared = flags.clone();
+        std::thread::spawn(move || {
+            shared.fcntl(fd, 4, (2 | O_NONBLOCK) as u64).unwrap();
+            shared.fcntl(fd, 2, 1).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(v.flags(fd).unwrap(), 2 | O_NONBLOCK | O_CLOEXEC);
+        assert_eq!(v.flags(alias).unwrap(), 2 | O_NONBLOCK);
+        assert_eq!(flags.fcntl(fd, 1, 0), Ok(1));
+        assert_eq!(flags.fcntl(alias, 3, 0), Ok((2 | O_NONBLOCK) as u64));
+        v.close(fd).unwrap();
+        let replacement = v.socket(2, 1 | O_CLOEXEC, 0).unwrap();
+        assert_eq!(replacement, fd);
+        assert_eq!(flags.get(fd).unwrap(), 2 | O_CLOEXEC);
+        assert_eq!(flags.get(alias).unwrap(), 2 | O_NONBLOCK);
+        v.close(replacement).unwrap();
+        assert_eq!(flags.get(fd), Err(Errno(9)));
+        v.close(alias).unwrap();
+        assert_eq!(v.live_sockets(), 0);
+    }
+    #[test]
     fn aliases_and_fork_share_status_without_changing_membership_or_cloexec() {
         let mut parent = Vfs::default();
         let [fd, _writer] = parent.pipe(O_CLOEXEC).unwrap();

@@ -470,6 +470,62 @@ mod tests {
         assert_eq!(k.processes[&1].linux.vfs.fd_snapshot().len(), 4);
     }
     #[test]
+    fn idle_socket_create_close_loops_do_not_checkpoint_peer_cpus() {
+        let mut p = super::super::tests::process();
+        p.linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        p.memory.write_array(0x1800, [0xff; 8]).unwrap();
+        // socket(AF_INET,SOCK_STREAM,0); close(fd); store result; repeat.
+        let code = [
+            0xd2800040u32,
+            0xd2800021,
+            0xd2800002,
+            0xd28018c8,
+            0xd4000001,
+            0xd2800728,
+            0xd4000001,
+            0xd2830004,
+            0xf9000080,
+            0x17fffff7,
+        ];
+        for (i, word) in code.into_iter().enumerate() {
+            p.memory
+                .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RX)
+            .unwrap();
+        p.cpu = Cpu::new(0x4000, 0);
+        p.affinity = 3;
+        let mut peer = p.fork();
+        peer.parent = 1;
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        assert!(
+            k.service_requests > 100,
+            "services={} rounds={} pcs={:?}",
+            k.service_requests,
+            k.parallel_rounds,
+            k.processes.values().map(|p| p.cpu.pc).collect::<Vec<_>>()
+        );
+        assert!(k.parallel_rounds <= 4, "rounds={}", k.parallel_rounds);
+        for p in k.processes.values() {
+            assert_eq!(p.memory.read_array::<8>(0x1800).unwrap(), [0; 8]);
+            assert!(p.linux.vfs.fd_snapshot().len() <= 4);
+        }
+    }
+
+    #[test]
     fn short_socket_controls_do_not_checkpoint_peer_cpus() {
         let mut p = super::super::tests::process();
         p.linux

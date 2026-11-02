@@ -272,6 +272,13 @@ impl Socket {
     }
     /// Frozen connected-native transport capability, rebuilt each cohort.
     /// Descriptor/namespace/policy mutation still requires all workers joined.
+    pub fn idle_tcp(&self) -> bool {
+        match &self.0 {
+            SocketBackend::Native(socket) => socket.idle_tcp(),
+            SocketBackend::Hybrid(socket) => socket.idle_tcp(),
+            _ => false,
+        }
+    }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
         match &self.0 {
             SocketBackend::Native(s) => s.direct_tcp(),

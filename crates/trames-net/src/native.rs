@@ -698,6 +698,13 @@ impl Socket {
         }
         Ok(())
     }
+    /// Owner-only admission: no accepted direct TCP byte request can exist.
+    pub fn idle_tcp(&self) -> bool {
+        self.kind == 1
+            && self.connection.get() == Connection::Idle
+            && !self.dns_peer.get()
+            && self.dns.borrow().is_empty()
+    }
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.native
             .control()

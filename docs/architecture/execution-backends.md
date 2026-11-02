@@ -661,3 +661,28 @@ and denied-entry effects are unchanged. Pending TCP I/O's existing close/join
 contract is preserved; this stage does not claim arbitrary cross-epoch FD reuse
 for an unfinished numeric-FD TCP request. Connection/options updates publish only
 that OFD; namespace authority is refreshed at the original joined boundary.
+
+### Idle TCP close and live Files identity (2026-11-02)
+
+Unfiltered close of native TCP in its original Idle state can use the existing
+single-caller owner service. Hybrid sockets must have no peer, listener or guest
+stack branch. The owner still performs admission and the original VFS close;
+no new endpoint/control projection crosses threads. Connected, connecting,
+failed, listening, virtual and non-TCP sockets retain their joined close path.
+The worker's candidate check recognizes actual socket membership, so unrelated
+owner resources keep their original checkpoint behavior. Shared-file close
+continues on its existing worker path. Seccomp admission remains unchanged.
+
+NetworkEpoch now keys captures by the actual Files membership allocation rather
+than its descriptor-content version. Forks may retain an equal content version
+while owning independently mutable tables: attaching a live membership query to
+the old content key could bind a child's new FD to its parent's table. Captures
+retain the actual membership allocation, preventing address reuse within an
+epoch; CLONE_FILES tasks continue to reuse the one correct capture.
+
+FdFlags also resolves new socket flags through the socket-only weak OFD
+projection already published in membership. This exposes only the original
+atomic status/cloexec words, not native controls or namespace state. New sockets,
+aliases and reused numbers therefore work in existing worker snapshots. The
+ordinary shared-file branch keeps its borrowed flag access and gains no extra
+reference-count increment. No additional memory ordering or global lock is used.

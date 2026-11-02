@@ -169,6 +169,13 @@ impl Socket {
                 })
                 .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
     }
+    pub fn idle_tcp(&self) -> bool {
+        matches!(self.path.get(), Path::Idle | Path::Native)
+            && !self.listening.get()
+            && self.peer.get().is_none()
+            && self.guest.borrow().is_none()
+            && self.native.borrow().as_ref().is_some_and(|s| s.idle_tcp())
+    }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
         if self.path.get() != Path::Native {
             return None;

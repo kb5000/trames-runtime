@@ -193,6 +193,12 @@ impl Drop for ReservedPair {
     }
 }
 impl SharedFiles {
+    pub(super) fn is_socket(&self, fd: u32) -> bool {
+        matches!(
+            self.0.entries.lock().unwrap().get(&fd).map(|s| &s.open),
+            Some(SlotOpen::Owner(_, _, Some(_)))
+        )
+    }
     pub(super) fn tcp_lookup(&self, fd: u32) -> Option<DirectTcpFd> {
         let entries = self.0.entries.lock().unwrap();
         let open = match &entries.get(&fd)?.open {
@@ -323,9 +329,18 @@ impl SharedFiles {
         let Some(slot) = entries.get(&fd) else {
             return Some(Err(Errno(9)));
         };
-        let open = match slot.shared_open()? {
-            Ok(open) => open,
-            Err(error) => return Some(Err(error)),
+        let retained;
+        let open = match &slot.open {
+            SlotOpen::Shared(_) => match slot.shared_open()? {
+                Ok(open) => open,
+                Err(error) => return Some(Err(error)),
+            },
+            // Only socket slots already publish this weak shared OFD. Expose
+            // its existing atomic FD bits, never endpoint/namespace control.
+            SlotOpen::Owner(_, _, open) => {
+                retained = open.as_ref()?.upgrade()?;
+                &retained
+            }
         };
         Some(access(&open.flags, &slot.cloexec))
     }

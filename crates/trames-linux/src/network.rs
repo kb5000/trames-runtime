@@ -390,6 +390,14 @@ impl Linux {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64>> {
+        if number == 57 {
+            // No control is sent across threads. The original owner closes only
+            // idle native TCP; connected/listening/waiting sockets still join.
+            if !self.vfs.socket_fd(a[0] as u32).ok()?.idle_tcp() {
+                return None;
+            }
+            return Some(self.vfs.close(a[0] as u32).map(|()| 0));
+        }
         if number == 198 {
             if !matches!(a[0] as u32, 2 | 10) {
                 return None;
@@ -711,6 +719,75 @@ mod tests {
     use std::{io::Write, net::TcpStream};
     use trames_memory::{Permissions, PAGE_SIZE};
     use trames_vfs::NetworkMode;
+    #[test]
+    fn idle_tcp_close_services_preserve_aliases_and_defer_active_resources() {
+        let mut linux = Linux::new(0x10000);
+        linux.vfs.configure_network(NetworkMode::Loopback).unwrap();
+        let mut memory = Memory::default();
+        let capture = linux.vfs.direct_network();
+        let fd = linux.vfs.socket(2, 1, 0).unwrap();
+        let alias = linux.vfs.dup(fd, 0, false).unwrap();
+        assert_eq!(
+            linux.network_service(57, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+            Some(Ok(0))
+        );
+        assert_eq!(linux.vfs.live_sockets(), 1);
+        assert!(linux.vfs.socket_fd(alias).unwrap().idle_tcp());
+        let factory = linux.vfs.descriptor_factory();
+        let event = std::thread::spawn(move || factory.eventfd(0, 0).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(event, fd);
+        assert_eq!(
+            linux.network_service(57, [event as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+        assert_eq!(
+            linux.network_service(57, [alias as u64, 0, 0, 0, 0, 0], &mut memory),
+            Some(Ok(0))
+        );
+        assert_eq!(linux.vfs.live_sockets(), 0);
+        assert!(capture.get(fd).is_none());
+        let fd = linux.vfs.socket(2, 1, 0).unwrap();
+        let socket = linux.vfs.socket_fd(fd).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(socket.idle_tcp());
+        socket.listen(1).unwrap();
+        assert!(!socket.idle_tcp());
+        assert_eq!(
+            linux.network_service(57, [fd as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+        let _client = std::net::TcpStream::connect(socket.local_addr().unwrap()).unwrap();
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let connected = linux.vfs.socket(2, 1, 0).unwrap();
+        let tcp = linux.vfs.socket_fd(connected).unwrap();
+        assert!(matches!(
+            tcp.connect(peer.local_addr().unwrap()),
+            Ok(()) | Err(NetError(115))
+        ));
+        assert!(!tcp.idle_tcp());
+        assert_eq!(
+            linux.network_service(57, [connected as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+        let (_peer, _) = peer.accept().unwrap();
+        assert_eq!(tcp.connect_complete(), Ok(true));
+        assert_eq!(
+            linux.network_service(57, [connected as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+        let udp = linux.vfs.socket(2, 2, 0).unwrap();
+        assert_eq!(
+            linux.network_service(57, [udp as u64, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+        assert_eq!(
+            linux.network_service(57, [9999, 0, 0, 0, 0, 0], &mut memory),
+            None
+        );
+    }
+
     #[test]
     fn network_services_use_live_views_and_defer_blocking_before_effects() {
         let mut linux = Linux::new(0x10000);

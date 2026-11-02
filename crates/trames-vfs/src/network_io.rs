@@ -17,6 +17,9 @@ impl DirectTcpFd {
 #[derive(Clone, Default)]
 pub struct DirectNetwork(Arc<[Option<DirectTcpFd>]>, Option<SharedFiles>);
 impl DirectNetwork {
+    pub fn is_socket(&self, fd: u32) -> bool {
+        self.1.as_ref().is_some_and(|files| files.is_socket(fd))
+    }
     pub fn get(&self, fd: u32) -> Option<DirectTcpFd> {
         self.1.as_ref()?.tcp_lookup(fd)
     }
@@ -32,7 +35,9 @@ impl DirectNetwork {
 }
 /// Reuse TCP capabilities while preparing one stopped execution cohort.
 /// Discard before running guests: connect, timeout and policy changes need not
-/// change FD membership. Keeping the identity alive also prevents pointer reuse.
+/// change FD membership. Key by actual Files membership: forks can share a
+/// content version while owning independently mutable numeric tables. Captures
+/// retain that membership allocation, preventing address reuse during the epoch.
 #[derive(Default)]
 pub struct NetworkEpoch {
     captures: BTreeMap<usize, (Rc<fd_table::DescriptorVersion>, DirectNetwork)>,
@@ -41,7 +46,7 @@ impl NetworkEpoch {
     pub fn capture(&mut self, vfs: &Vfs) -> DirectNetwork {
         let identity = vfs.fds.identity();
         self.captures
-            .entry(Rc::as_ptr(&identity) as usize)
+            .entry(vfs.fds.membership().capture_identity().0)
             .or_insert_with(|| (identity, vfs.direct_network()))
             .1
             .clone()
@@ -95,6 +100,29 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         time::Duration,
     };
+    #[test]
+    fn equal_fork_versions_bind_each_capture_to_its_actual_files_membership() {
+        let mut parent = Vfs::default();
+        parent.configure_network(NetworkMode::Loopback).unwrap();
+        let mut child = parent.clone();
+        assert!(Rc::ptr_eq(&parent.fds.identity(), &child.fds.identity()));
+        let mut epoch = NetworkEpoch::default();
+        let a = epoch.capture(&parent);
+        let b = epoch.capture(&child);
+        let tcp = parent.socket(2, 1, 0).unwrap();
+        assert!(a.is_socket(tcp));
+        assert!(!b.is_socket(tcp));
+        let event = child.eventfd(0, 0).unwrap();
+        assert_eq!(event, tcp);
+        assert!(!b.is_socket(event));
+        assert!(a.is_socket(tcp));
+        let child_tcp = child.socket(2, 1, 0).unwrap();
+        assert!(b.is_socket(child_tcp));
+        assert!(!a.is_socket(child_tcp));
+        parent.close(tcp).unwrap();
+        assert!(!a.is_socket(tcp));
+        assert!(b.is_socket(child_tcp));
+    }
     #[test]
     fn existing_empty_capture_observes_new_connections_and_actual_close_reuse() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
