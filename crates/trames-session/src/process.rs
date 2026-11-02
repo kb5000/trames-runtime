@@ -2975,6 +2975,22 @@ impl<C: Cpu> Kernel<C> {
                     pid,
                     &Arc::downgrade(&self.byte_target),
                 )
+        } else if !p.linux.trace && matches!(number, 206 | 207 | 211 | 212) {
+            trames_linux::DirectSyscalls::default()
+                .with_resources(p.linux.vfs.descriptor_factory())
+                .with_local_identity([
+                    p.tgid,
+                    p.linux.vfs.credentials.uid,
+                    p.linux.vfs.credentials.gid,
+                ])
+                .start_owned_local_transfer(
+                    number,
+                    a,
+                    &mut p.linux.vfs,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                )
         } else if matches!(number, 63..=66) {
             let direct = trames_linux::DirectSyscalls::default()
                 .with_membership(p.linux.vfs.shared_files())
@@ -3024,7 +3040,7 @@ impl<C: Cpu> Kernel<C> {
                     ])
                     .start_owned_local_byte(
                         file,
-                        &p.linux.vfs,
+                        &mut p.linux.vfs,
                         number,
                         a,
                         &mut p.memory,
@@ -3039,6 +3055,13 @@ impl<C: Cpu> Kernel<C> {
             Some(trames_linux::IoAttempt::Blocked(wait)) => {
                 if wait.retained_socket.is_some() {
                     p.socket_deadline = wait.deadline;
+                }
+                if let Some(owner) = wait
+                    .retained_byte
+                    .as_ref()
+                    .and_then(|file| file.local_owner())
+                {
+                    p.retained_message_owner = Some(owner);
                 }
                 p.byte_wait = Some(wait);
                 Ok(None)

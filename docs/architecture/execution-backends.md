@@ -1510,3 +1510,41 @@ This keeps forked children from reporting a retained parent PID through socket
 creation or SO_PEERCRED on connect/listen. Separate one/two-slot saturated-backlog
 tests verify that connect parks until accept releases capacity, with one filter
 decision per entry and zero coordinator services.
+
+## Worker addressed Unix datagrams (2026-11-03)
+
+Unpaired AF_UNIX datagrams now use the same actual endpoint queues from the
+owner, native interfaces and workers. Source address, sender credentials and
+portable shared OFDs travel with their packet; a byte-only datagram no longer
+needs an owner ancillary-ledger entry. Unix-bearing owning graphs retain their
+original owner ledger, bounded cycle rejection and reclamation path. No Rc graph
+is made Send, and passive byte snapshots do not keep a peer endpoint open.
+
+Worker read/write, readv/writev, sendto/recvfrom and sendmsg/recvmsg retain the
+accepted full source OFD and import their input/output records once. Vector I/O
+keeps the existing one-packet semantics. Send binds one target per accepted call
+using the original pathname resolver or abstract network namespace. Its capability
+holds a weak peer plus the original queue/notification source: blocked sends
+cannot keep the receiver open or follow an unlinked/rebound address. A sender
+waiting for capacity subscribes to that destination queue as well as its source;
+related-wait admission includes the actual target resource. Receives recheck the
+original output ranges before consuming, without rereading changed vector/header
+metadata. An owner handoff keeps the original OFD and accepted ABI records.
+
+Filtered entry admits these addressed operations through the existing dedicated
+worker path; each syscall has one filter decision. Queue waits release their
+execution slot and use internal resource notifications, with subscribe/retry on
+the original worker or owner to close the unlock-before-park race. Notifications
+and final OFD destruction stay outside queue and name/peer guards. No global
+socket/VFS lock, service thread, bus, polling loop, ordinary-memory fence or extra
+native permission policy is introduced. Existing paired stream hot paths retain
+their original byte/control handling.
+
+Regression coverage includes packet/source/credential association under concurrent
+writers, portable rights without ledger entries, late passcred activation, native
+default-connected sends, target-space notification, final receiver close, pathname
+rebind, sender FD reuse, frozen send bytes and receive vectors, original owner-only
+rights fallback, and one/two-slot filtered and unfiltered capacity waits. Batch
+sendmmsg/recvmmsg, Unix-bearing ancillary ownership, native-service adapters,
+structural VM/task transitions and remaining owner controls are still separate
+migration boundaries; this is not a claim that coordination has disappeared.

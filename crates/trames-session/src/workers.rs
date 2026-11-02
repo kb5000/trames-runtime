@@ -603,7 +603,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     snapshot.seccomp.mode() != 0
                                         && (snapshot.direct.supports_creation(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_socket_control(work.cpu.x(8) as u32)
-                                            || snapshot.direct.supports_local_message(work.cpu.x(8) as u32)
+                                            || snapshot.direct.supports_local_message(work.cpu.x(8) as u32, work.cpu.x(0) as u32)
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_epoll_control(work.cpu.x(8) as u32)
                                             || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
@@ -640,7 +640,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                 }
                                             }
                                         }
-                                        if snapshot.direct.supports_local_message(number) {
+                                        if snapshot.direct.supports_local_message(number, args[0] as u32) {
                                             if let Some(epoch) = &epoch {
                                                 if let Some(attempt) = snapshot.direct.start(number, args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None) {
                                                     if let Some(began) = began { syscall_time += began.elapsed(); }

@@ -67,6 +67,9 @@ impl RetainedByte {
     }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.shares_with(std::iter::once(&self.fd))
+            || self
+                .datagram_target()
+                .is_some_and(|target| target.shares_resources(fds))
     }
 }
 impl PendingIo {
@@ -247,8 +250,14 @@ impl DirectSyscalls {
     pub fn supports_socket_control(&self, number: u32) -> bool {
         crate::network::control_number(number) && self.resources.is_some()
     }
-    pub fn supports_local_message(&self, number: u32) -> bool {
-        matches!(number, 211 | 212) && self.resources.is_some()
+    pub fn supports_local_message(&self, number: u32, fd: u32) -> bool {
+        self.resources.is_some()
+            && (matches!(number, 211 | 212)
+                || matches!(number, 63..=66 | 206 | 207)
+                    && self
+                        .descriptors
+                        .get(fd)
+                        .is_some_and(|fd| fd.is_addressed_datagram()))
     }
     pub fn invoke_socket_control(
         &self,
@@ -564,7 +573,7 @@ impl DirectSyscalls {
             .is_some_and(|fd| Self::supports_fd(number, &fd))
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
-        if fd.is_unix() && fd.local_kind() != 1 {
+        if fd.is_unix() && fd.local_kind() != 1 && !fd.is_addressed_datagram() {
             return matches!(number, 210..=212);
         }
         if number == 62 {
@@ -770,6 +779,11 @@ impl DirectSyscalls {
         if !Self::supports_fd_call(number, args, fd) {
             return None;
         }
+        // Addressed packet calls bind their target/input once at the retained
+        // entry, before any queue effect, rather than probing then re-resolving.
+        if fd.is_addressed_datagram() && matches!(number, 63..=66 | 206 | 207 | 211 | 212) {
+            return None;
+        }
         if matches!(number, 211 | 212) && self.resources.is_some() {
             return self.local_message(fd, number, args, memory);
         }
@@ -948,7 +962,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
-        if matches!(number, 211 | 212) && self.resources.is_some() {
+        if matches!(number, 206 | 207 | 211 | 212) && self.resources.is_some() {
             if let Some(attempt) = self.start_local_message(number, args, memory, pid, target) {
                 return Some(attempt);
             }
@@ -1184,6 +1198,9 @@ impl DirectSyscalls {
             .map(Ok)
             .or_else(|| self.retain_byte(number, args))?;
         Some(match retained {
+            Ok(file) if file.fd.is_addressed_datagram() && file.message.is_none() => {
+                IoAttempt::ByteCheckpoint(file)
+            }
             Ok(file) => self.start_byte(file, number, args, memory, pid, target, false),
             Err(error) => self.complete(number, args, Err(error)),
         })
@@ -1197,6 +1214,15 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if file.fd.is_addressed_datagram() && file.message.is_none() {
+            return match self.prepare_addressed_byte(&file, number, args, memory) {
+                Some(Ok(prepared)) => {
+                    self.start_byte(prepared, number, args, memory, pid, target, true)
+                }
+                Some(Err(error)) => self.complete_byte(&file, Err(error)),
+                None => IoAttempt::ByteCheckpoint(file),
+            };
+        }
         self.start_byte(file, number, args, memory, pid, target, true)
     }
     #[allow(clippy::too_many_arguments)]
@@ -1230,7 +1256,7 @@ impl DirectSyscalls {
             }
         }
         let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = file.fd.subscribe(&signal);
+        let subscriptions = file.subscribe(&signal);
         self.resume_inner(
             PendingIo {
                 number,

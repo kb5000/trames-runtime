@@ -7,6 +7,7 @@ pub(super) mod channel;
 mod control;
 mod datagram;
 pub use control::LocalConnection;
+pub use datagram::LocalDatagram;
 mod native;
 #[cfg(test)]
 mod shared_graph_tests;
@@ -218,8 +219,6 @@ impl std::ops::Deref for LocalSocket {
 #[derive(Clone)]
 struct Ancillary {
     rights: LocalRights,
-    credentials: Option<[u32; 3]>,
-    source: Vec<u8>,
 }
 pub struct LocalResource {
     namespace: Arc<SharedCell<LocalNamespace>>,
@@ -504,6 +503,9 @@ impl LocalResource {
         self.channel.borrow().resource.shutdown(self.side(), how)
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
+        if self.addressed_datagram() {
+            return self.send_connected_datagram(bytes, flags, Some(self.credentials.get()));
+        }
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
@@ -530,6 +532,9 @@ impl LocalSocket {
         rights: LocalRights,
         credentials: [u32; 3],
     ) -> Result<usize> {
+        if self.addressed_datagram() {
+            return self.send_connected_rights(bytes, flags, rights, credentials);
+        }
         // Preserve the original flags/connection/state checks before rights
         // graph traversal. Pure bytes need no owner rights-map operation.
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -602,16 +607,8 @@ impl LocalSocket {
             .next_right
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| Errno(75))?;
-        self.owner.insert(
-            &binding,
-            1 - self.side(),
-            id,
-            Ancillary {
-                rights,
-                credentials: None,
-                source: vec![1, 0],
-            },
-        );
+        self.owner
+            .insert(&binding, 1 - self.side(), id, Ancillary { rights });
         let result = binding.resource.send_credentials(
             self.side(),
             bytes,
@@ -644,8 +641,6 @@ impl LocalSocket {
         {
             Ancillary {
                 rights: rights.local(),
-                credentials: None,
-                source: vec![1, 0],
             }
         } else if let Some(shared_rights::QueuedRights::Owner(id)) = received.rights {
             if flags & 2 != 0 {
@@ -656,8 +651,6 @@ impl LocalSocket {
         } else {
             Ancillary {
                 rights: LocalRights::default(),
-                credentials: None,
-                source: vec![1, 0],
             }
         };
         Ok(LocalReceived {
@@ -666,14 +659,15 @@ impl LocalSocket {
             truncated: received.truncated,
             rights: ancillary.rights,
             credentials: if self.passcred.load(Ordering::Relaxed) {
-                received
-                    .credentials
-                    .or(ancillary.credentials)
-                    .or(Some([0, 65534, 65534]))
+                received.credentials.or(Some([0, 65534, 65534]))
             } else {
                 None
             },
-            source: ancillary.source,
+            source: if received.source.is_empty() {
+                vec![1, 0]
+            } else {
+                received.source
+            },
             timestamp: (self.timestamp.load(Ordering::Relaxed) != 0)
                 .then_some(received.timestamp)
                 .flatten()
@@ -821,10 +815,6 @@ impl Vfs {
     }
     pub fn local_bind(&mut self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
         self.local_bind_core(&socket.core, bytes)
-    }
-    fn local_destination(&self, socket: &LocalSocket, bytes: &[u8]) -> Result<Rc<LocalSocket>> {
-        let peer = self.local_destination_core(&socket.core, bytes)?;
-        Ok(LocalSocket::view(peer, self.local_rights.clone()))
     }
     pub fn local_connect(&self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
         self.local_connection_core(

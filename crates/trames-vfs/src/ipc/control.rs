@@ -142,7 +142,7 @@ impl Vfs {
         *socket.name.borrow_mut() = name;
         Ok(())
     }
-    pub(super) fn local_destination_core(
+    pub(crate) fn local_destination_core(
         &self,
         socket: &Arc<LocalResource>,
         bytes: &[u8],

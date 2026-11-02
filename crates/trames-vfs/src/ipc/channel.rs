@@ -11,6 +11,7 @@ struct Packet {
     rights: Option<QueuedRights>,
     credentials: Option<[u32; 3]>,
     timestamp: Option<[u64; 2]>,
+    source: Vec<u8>,
 }
 struct Data {
     queues: [VecDeque<Packet>; 2],
@@ -31,6 +32,7 @@ pub(crate) struct Received {
     pub(super) rights: Option<QueuedRights>,
     pub credentials: Option<[u32; 3]>,
     pub timestamp: Option<[u64; 2]>,
+    pub source: Vec<u8>,
     pub(super) options: [u32; 2],
 }
 pub(crate) struct Resource {
@@ -199,6 +201,7 @@ impl Resource {
             flags,
             rights.map(QueuedRights::Owner),
             identity,
+            Vec::new(),
         )
     }
     pub(super) fn send_shared(
@@ -210,7 +213,17 @@ impl Resource {
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
         let rights = (!rights.is_empty()).then_some(QueuedRights::Shared(rights));
-        self.send_ancillary(side, bytes, flags, rights, identity)
+        self.send_ancillary(side, bytes, flags, rights, identity, Vec::new())
+    }
+    pub(super) fn send_addressed(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: Option<QueuedRights>,
+        identity: [u32; 3],
+        source: Vec<u8>,
+    ) -> Result<usize> {
+        self.send_ancillary(1, bytes, flags, rights, Some(identity), source)
     }
     fn send_ancillary(
         &self,
@@ -219,6 +232,7 @@ impl Resource {
         flags: u32,
         rights: Option<QueuedRights>,
         identity: Option<[u32; 3]>,
+        source: Vec<u8>,
     ) -> Result<usize> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
@@ -229,7 +243,7 @@ impl Resource {
                 return Ok(0);
             }
             let peer = 1 - side;
-            let credentials = if data.passcred[peer] {
+            let credentials = if data.passcred[peer] || !source.is_empty() {
                 Some(identity.ok_or(Errno(95))?)
             } else {
                 None
@@ -273,6 +287,7 @@ impl Resource {
                     rights: rights.clone(),
                     credentials,
                     timestamp,
+                    source,
                 });
             }
             data.used[peer] += count;
@@ -291,7 +306,7 @@ impl Resource {
     ) -> Option<Result<Received>> {
         self.recv_mode(side, count, flags, if allow_rights { 2 } else { 0 })
     }
-    pub(super) fn recv_portable(
+    pub(crate) fn recv_portable(
         &self,
         side: usize,
         count: usize,
@@ -325,6 +340,7 @@ impl Resource {
                     rights: None,
                     credentials: None,
                     timestamp: None,
+                    source: Vec::new(),
                     options,
                 }));
             }
@@ -349,6 +365,7 @@ impl Resource {
                     rights: packet.rights.clone(),
                     credentials: packet.credentials,
                     timestamp: packet.timestamp,
+                    source: packet.source.clone(),
                     options,
                 };
                 if flags & 2 == 0 {
@@ -420,6 +437,7 @@ impl Resource {
                 rights,
                 credentials,
                 timestamp,
+                source: Vec::new(),
                 options,
             }))
         })

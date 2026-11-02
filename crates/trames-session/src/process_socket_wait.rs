@@ -1444,3 +1444,129 @@ fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
         }
     }
 }
+
+#[test]
+fn addressed_datagram_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_decision() {
+    for filtered in [false, true] {
+        for slots in [1, 2] {
+            for (send, receive) in [(64, 63), (66, 65), (206, 207), (211, 212)] {
+                let mut p = super::tests::process();
+                let mut k = super::tests::kernel();
+                let tx = p.linux.vfs.local_create(2, 0).unwrap();
+                let rx = p.linux.vfs.local_create(2, 0).unwrap();
+                let source = p.linux.vfs.local_socket(tx).unwrap().unwrap();
+                let receiver = p.linux.vfs.local_socket(rx).unwrap().unwrap();
+                let address = b"\x01\x00\0worker-datagrams";
+                p.linux.vfs.local_bind(&receiver, address).unwrap();
+                receiver.set_reuse(8, 256).unwrap();
+                p.linux.vfs.local_connect(&source, address).unwrap();
+                p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                p.memory.write(0x1000, address).unwrap();
+                p.memory.write(0x1030, b"data").unwrap();
+                for (at, value) in [
+                    (0x1100, 0x1030u64),
+                    (0x1108, 4),
+                    (0x1120, 0x1200),
+                    (0x1128, 512),
+                    (0x1140, 0x1400),
+                    (0x1148, 4),
+                    (0x1500, 0x1000),
+                    (0x1508, address.len() as u64),
+                    (0x1510, 0x1100),
+                    (0x1518, 1),
+                    (0x1550, 0x1120),
+                    (0x1558, 1),
+                    (0x1590, 0x1140),
+                    (0x1598, 1),
+                ] {
+                    p.memory.write_array(at, value.to_le_bytes()).unwrap();
+                }
+                if filtered {
+                    filter(&mut k, &mut p, 0x7fff0000);
+                }
+                let mut peer = p.fork();
+                peer.parent = 1;
+                peer.tgid = 2;
+                let park = [
+                    mov(0, 0x1060),
+                    mov(1, 128),
+                    mov(2, 0),
+                    mov(3, 0),
+                    mov(8, 98),
+                    0xd4000001,
+                    0x14000000,
+                ];
+                let send_args = match send {
+                    66 => [tx, 0x1100, 1, 0, 0, 0],
+                    211 => [tx, 0x1500, 0, 0, 0, 0],
+                    206 => [tx, 0x1030, 4, 0, 0x1000, address.len() as u32],
+                    _ => [tx, 0x1030, 4, 0, 0, 0],
+                };
+                let mut parent = Vec::new();
+                for (i, value) in send_args.into_iter().enumerate() {
+                    parent.push(mov(i as u32, value));
+                }
+                parent.extend([mov(8, send), 0xd4000001, mov(10, 0x1800), 0xf9000140]);
+                parent.extend(park);
+                let mut child = Vec::new();
+                for (index, count, buffer, iovec, header) in [
+                    (0, 512, 0x1200, 0x1120, 0x1540),
+                    (1, 4, 0x1400, 0x1140, 0x1580),
+                ] {
+                    let args = match receive {
+                        65 => [rx, iovec, 1, 0, 0, 0],
+                        212 => [rx, header, 0, 0, 0, 0],
+                        _ => [rx, buffer, count, 0, 0, 0],
+                    };
+                    for (i, value) in args.into_iter().enumerate() {
+                        child.push(mov(i as u32, value));
+                    }
+                    child.extend([
+                        mov(8, receive),
+                        0xd4000001,
+                        mov(10, 0x1800 + index * 8),
+                        0xf9000140,
+                    ]);
+                }
+                child.extend(park);
+                program(&mut p, parent);
+                program(&mut peer, child);
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(slots);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                let until = Instant::now() + Duration::from_secs(3);
+                while k.syscalls < 5 {
+                    let limit = k.instructions + 100_000;
+                    assert!(k
+                        .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
+                        .unwrap(), "send={send} filtered={filtered} slots={slots} syscalls={} services={} states={:?}", k.syscalls, k.service_requests, k.processes.iter().map(|(id,p)| (*id, match p.state { State::Blocked(n,_) => n, State::Futex{..} => 98, State::Ready=>0, _=>999 }, p.cpu.x(0), p.cpu.x(8), p.byte_wait.as_ref().map(|w| (w.signal.ready(),w.retained_byte.as_ref().and_then(|f|f.local_message_entry()).map(|e|e.0))), p.linux.vfs.readable_bytes(rx), p.retained_byte.as_ref().map(|f| f.local_message_entry()))).collect::<Vec<_>>());
+                    assert!(Instant::now()<until,"send={send} filtered={filtered} slots={slots}: datagram wait did not progress");
+                }
+                assert_eq!(
+                    k.processes[&1].memory.read_u64(0x1800).unwrap(),
+                    4,
+                    "send={send}"
+                );
+                assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 512);
+                assert_eq!(k.processes[&2].memory.read_u64(0x1808).unwrap(), 4);
+                assert_eq!(
+                    k.processes[&2].memory.read_array::<4>(0x1400).unwrap(),
+                    *b"data"
+                );
+                assert_eq!(
+                    k.service_requests, 0,
+                    "send={send} filtered={filtered} slots={slots}"
+                );
+                assert_eq!(k.syscalls, 5);
+                if filtered {
+                    assert_eq!(k.processes[&1].seccomp.evaluations(), 5);
+                }
+                if slots == 1 {
+                    assert!(k.worker_io_waits > 0);
+                }
+            }
+        }
+    }
+}

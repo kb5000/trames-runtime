@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Owner-side Unix socket control and per-message metadata.
 use super::*;
+mod packet;
+pub(crate) use packet::{prepare_transfer, DatagramState, PreparedTransfer};
 impl Linux {
     pub(super) fn local_network_vfs(
         vfs: &mut trames_vfs::Vfs,
@@ -29,46 +31,23 @@ impl Linux {
             202 | 242 => accept(&vfs.descriptor_factory(), socket, number as u32, a, memory),
             204 | 205 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("Unix address ABI"),
-            206 => {
-                let destination = if a[4] == 0 {
-                    None
-                } else {
-                    Some(address(memory, a[4], a[5])?)
-                };
-                Linux::write_transport(a, memory, &mut Vec::new(), |bytes| {
-                    vfs.local_send_to(
-                        socket,
-                        bytes,
-                        a[3] as u32,
-                        destination.as_deref(),
-                        trames_vfs::LocalRights::default(),
-                    )
-                    .map(|n| n as u64)
-                })
-            }
-            207 => {
-                if socket.kind() == 1 {
-                    return local::recv(a, memory, |count| {
-                        socket
-                            .recv(count, a[3] as u32 | nonblocking)
-                            .map(|r| r.data)
-                    });
-                }
-
-                let count = a[2].min(crate::MAX_WRITE as u64) as usize;
-                Self::check(memory, a[1], count, Access::Write)?;
-                let output = AddressOutput::prepare(memory, a[4], a[5], 110)?;
-                let received = socket.recv(count, a[3] as u32 | nonblocking)?;
-                memory.write(a[1], &received.data).map_err(|_| Errno(14))?;
-                if let Some(output) = output {
-                    output.write_bytes(memory, &received.source)?;
-                }
-                Ok(if a[3] & MSG_TRUNC as u64 != 0 {
-                    received.length
-                } else {
-                    received.data.len()
-                } as u64)
-            }
+            207 if socket.kind() == 1 => local::recv(a, memory, |count| {
+                socket
+                    .recv(count, a[3] as u32 | nonblocking)
+                    .map(|r| r.data)
+            }),
+            206 | 207 => packet_transfer(
+                number as u32,
+                a,
+                memory,
+                &mut OwnerMessage {
+                    vfs,
+                    socket,
+                    nonblocking,
+                    datagram: None,
+                },
+            )
+            .expect("owner Unix packet ABI"),
             208..=210 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("Unix control ABI"),
             211 | 212 => message(
@@ -79,6 +58,7 @@ impl Linux {
                     vfs,
                     socket,
                     nonblocking,
+                    datagram: None,
                 },
             )
             .expect("owner Unix message"),
@@ -232,6 +212,7 @@ struct OwnerMessage<'a> {
     vfs: &'a mut trames_vfs::Vfs,
     socket: &'a std::rc::Rc<trames_vfs::LocalSocket>,
     nonblocking: u32,
+    datagram: Option<&'a DatagramState>,
 }
 impl MessageIo for OwnerMessage<'_> {
     type Rights = trames_vfs::LocalRights;
@@ -252,6 +233,17 @@ impl MessageIo for OwnerMessage<'_> {
         rights: trames_vfs::LocalRights,
         identity: [u32; 3],
     ) -> Option<Result<usize>> {
+        if let Some(datagram) = self.datagram {
+            return Some(self.vfs.send_datagram_owned(
+                &datagram.source,
+                &datagram.target,
+                bytes,
+                flags,
+                destination,
+                rights,
+                identity,
+            ));
+        }
         Some(self.vfs.local_send_credentials(
             self.socket,
             bytes,
@@ -565,11 +557,12 @@ impl<R: Clone> PreparedMessage<R> {
 }
 
 pub(crate) fn progress_owned(
-    prepared: &PreparedMessage<trames_vfs::SharedRights>,
+    prepared: &PreparedTransfer<trames_vfs::SharedRights>,
     vfs: &mut trames_vfs::Vfs,
     socket: &std::rc::Rc<trames_vfs::LocalSocket>,
     nonblocking: u32,
     memory: &mut impl CpuMemory,
+    datagram: Option<&DatagramState>,
 ) -> Result<u64> {
     prepared.recheck(memory)?;
     prepared
@@ -580,9 +573,22 @@ pub(crate) fn progress_owned(
                 vfs,
                 socket,
                 nonblocking,
+                datagram,
             },
         )
-        .expect("owner accepted Unix message")
+        .expect("owner accepted Unix transfer")
+}
+
+fn packet_transfer(
+    number: u32,
+    args: [u64; 6],
+    memory: &mut impl CpuMemory,
+    io: &mut impl MessageIo,
+) -> Option<Result<u64>> {
+    match prepare_transfer(number, args, memory, io)? {
+        Ok(prepared) => prepared.progress(memory, io),
+        Err(error) => Some(Err(error)),
+    }
 }
 
 #[derive(Clone)]

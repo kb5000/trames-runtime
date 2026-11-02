@@ -2,7 +2,8 @@
 //! The shared original ancillary ABI on one accepted Unix transport.
 use super::*;
 pub(super) struct AcceptedMessage {
-    prepared: crate::network::unix::PreparedMessage<trames_vfs::SharedRights>,
+    prepared: crate::network::unix::PreparedTransfer<trames_vfs::SharedRights>,
+    datagram: Option<crate::network::unix::DatagramState>,
     factory: trames_vfs::DescriptorFactory,
     identity: [u32; 3],
     number: u32,
@@ -12,6 +13,8 @@ struct Message<'a> {
     factory: &'a trames_vfs::DescriptorFactory,
     fd: &'a trames_vfs::DirectFd,
     identity: [u32; 3],
+    datagram: Option<&'a crate::network::unix::DatagramState>,
+    paths: Option<&'a trames_vfs::PathQueries>,
 }
 impl crate::network::unix::MessageIo for Message<'_> {
     type Rights = trames_vfs::SharedRights;
@@ -40,6 +43,16 @@ impl crate::network::unix::MessageIo for Message<'_> {
         rights: Self::Rights,
         identity: [u32; 3],
     ) -> Option<Result<usize, Errno>> {
+        if let Some(datagram) = self.datagram {
+            return datagram.source.send_datagram(
+                &datagram.target,
+                bytes,
+                flags,
+                rights,
+                identity,
+                || self.paths?.local_datagram(&datagram.source, destination),
+            );
+        }
         if destination.is_some() {
             return Some(Err(Errno(106)));
         }
@@ -76,13 +89,34 @@ impl DirectSyscalls {
     pub fn start_owned_local_byte(
         &self,
         file: RetainedByte,
-        vfs: &trames_vfs::Vfs,
+        vfs: &mut trames_vfs::Vfs,
         number: u32,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if file.fd.is_addressed_datagram() {
+            let direct = Self::default()
+                .with_resources(vfs.descriptor_factory())
+                .with_local_identity(
+                    self.local_identity
+                        .unwrap_or_else(|| vfs.local_sender_credentials()),
+                );
+            let prepared = match direct
+                .prepare_local_fd(&file.fd, number, args, memory)
+                .expect("owner datagram ABI")
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return self.complete_byte(&file, Err(error)),
+            };
+            let owner = file
+                .fd
+                .shared_file()
+                .expect("accepted datagram OFD")
+                .retained();
+            return direct.start_owned_local_message(prepared, vfs, &owner, memory, pid, target);
+        }
         let socket = file
             .fd
             .shared_file()
@@ -103,10 +137,11 @@ impl DirectSyscalls {
             )
             .map(|count| count as u64)
         };
-        let result = match number {
+        let records = file.fd.readv_records();
+        let mut retry = || match number {
             63 => Linux::read_transport(args, memory, read),
             64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
-            65 => Linux::readv_transport_mode(args, memory, file.fd.readv_records(), read),
+            65 => Linux::readv_transport_mode(args, memory, records, read),
             66 => Linux::writev_transport_mode(
                 args,
                 memory,
@@ -116,7 +151,49 @@ impl DirectSyscalls {
             ),
             _ => unreachable!("raw Unix byte entry"),
         };
-        self.finish_owned_local(file, number, args, result, pid, target)
+        let result = retry();
+        self.finish_owned_local(file, number, args, result, pid, target, retry)
+    }
+    fn prepare_local_fd(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<RetainedByte, Errno>> {
+        let factory = self.resources.as_ref()?;
+        let identity = self
+            .local_identity
+            .unwrap_or_else(|| factory.local_sender_credentials());
+        let datagram = if fd.is_addressed_datagram() {
+            Some(crate::network::unix::DatagramState::new(
+                fd.local_operation()?,
+            ))
+        } else {
+            None
+        };
+        let io = Message {
+            factory,
+            fd,
+            identity,
+            datagram: datagram.as_ref(),
+            paths: self.paths.as_ref(),
+        };
+        Some(
+            crate::network::unix::prepare_transfer(number, args, memory, &io)?.map(|prepared| {
+                RetainedByte {
+                    fd: fd.clone(),
+                    message: Some(Arc::new(AcceptedMessage {
+                        prepared,
+                        datagram,
+                        factory: factory.clone(),
+                        identity,
+                        number,
+                        args,
+                    })),
+                }
+            }),
+        )
     }
     pub(super) fn start_local_message(
         &self,
@@ -126,48 +203,45 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
-        let factory = self.resources.as_ref()?;
         let fd = self.descriptors.get(args[0] as u32)?;
+        if !fd.is_unix() || matches!(number, 206 | 207) && !fd.is_addressed_datagram() {
+            return None;
+        }
+        Some(match self.prepare_local_fd(&fd, number, args, memory) {
+            Some(Ok(file)) => self.start_retained_byte(file, number, args, memory, pid, target),
+            Some(Err(error)) => self.complete(number, args, Err(error)),
+            None => IoAttempt::Checkpoint,
+        })
+    }
+    pub(super) fn prepare_addressed_byte(
+        &self,
+        file: &RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<RetainedByte, Errno>> {
+        self.prepare_local_fd(&file.fd, number, args, memory)
+    }
+    pub fn start_owned_local_transfer(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        vfs: &mut trames_vfs::Vfs,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<IoAttempt> {
+        let fd = vfs.direct_descriptors().get(args[0] as u32)?;
         if !fd.is_unix() {
             return None;
         }
-        let identity = self
-            .local_identity
-            .unwrap_or_else(|| factory.local_sender_credentials());
-        let mut io = Message {
-            factory,
-            fd: &fd,
-            identity,
-        };
-        let prepared = match crate::network::unix::prepare_message(number, args, memory, &io) {
-            Some(Ok(prepared)) => prepared,
-            Some(Err(error)) => return Some(self.complete(number, args, Err(error))),
-            None => return Some(IoAttempt::Checkpoint),
-        };
-        let result = prepared.progress(memory, &mut io);
-        if let Some(result) = result {
-            if !(result == Err(Errno(11))
-                && !fd.nonblocking()
-                && socket_flags(number, args) & 0x40 == 0
-                || result == Err(Errno(32)) && signals_pipe(number, args))
-            {
-                return Some(self.complete(number, args, result));
+        Some(match self.prepare_local_fd(&fd, number, args, memory)? {
+            Ok(file) => {
+                let owner = fd.shared_file().expect("accepted Unix OFD").retained();
+                self.start_owned_local_message(file, vfs, &owner, memory, pid, target)
             }
-        }
-        let file = RetainedByte {
-            fd,
-            message: Some(Arc::new(AcceptedMessage {
-                prepared,
-                factory: factory.clone(),
-                identity,
-                number,
-                args,
-            })),
-        };
-        if result.is_none() || result == Some(Err(Errno(32))) {
-            return Some(IoAttempt::ByteCheckpoint(file));
-        }
-        Some(self.start_retained_byte(file, number, args, memory, pid, target))
+            Err(error) => self.complete(number, args, Err(error)),
+        })
     }
     pub(super) fn transfer_retained(
         &self,
@@ -186,6 +260,8 @@ impl DirectSyscalls {
                     factory: &accepted.factory,
                     fd: &file.fd,
                     identity: accepted.identity,
+                    datagram: accepted.datagram.as_ref(),
+                    paths: self.paths.as_ref(),
                 },
             )
         } else {
@@ -202,19 +278,25 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let accepted = file.message.as_ref().expect("accepted local message");
+        let accepted = file.message.clone().expect("accepted local message");
         let number = accepted.number;
         let args = accepted.args;
         let socket = owner.local_socket(vfs).expect("original local OFD");
-        let result = crate::network::unix::progress_owned(
-            &accepted.prepared,
-            vfs,
-            &socket,
-            if file.fd.nonblocking() { 0x40 } else { 0 },
-            memory,
-        );
-        self.finish_owned_local(file, number, args, result, pid, target)
+        let nonblocking = if file.fd.nonblocking() { 0x40 } else { 0 };
+        let mut retry = || {
+            crate::network::unix::progress_owned(
+                &accepted.prepared,
+                vfs,
+                &socket,
+                nonblocking,
+                memory,
+                accepted.datagram.as_ref(),
+            )
+        };
+        let result = retry();
+        self.finish_owned_local(file, number, args, result, pid, target, retry)
     }
+    #[allow(clippy::too_many_arguments)]
     fn finish_owned_local(
         &self,
         file: RetainedByte,
@@ -223,6 +305,7 @@ impl DirectSyscalls {
         result: Result<u64, Errno>,
         pid: u32,
         target: &Weak<dyn IoWake>,
+        retry: impl FnOnce() -> Result<u64, Errno>,
     ) -> IoAttempt {
         if result != Err(Errno(11))
             || file.fd.nonblocking()
@@ -231,7 +314,13 @@ impl DirectSyscalls {
             return self.complete_byte(&file, result);
         }
         let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = file.fd.subscribe(&signal);
+        let subscriptions = file.subscribe(&signal);
+        // Subscribe then retry on the original owner: capacity/data becoming
+        // ready before subscription must not leave this call parked forever.
+        let result = retry();
+        if result != Err(Errno(11)) {
+            return self.complete_byte(&file, result);
+        }
         IoAttempt::Blocked(PendingIo {
             number,
             args,
@@ -267,6 +356,8 @@ impl DirectSyscalls {
             &mut Message {
                 factory,
                 fd,
+                datagram: None,
+                paths: self.paths.as_ref(),
                 identity: self
                     .local_identity
                     .unwrap_or_else(|| factory.local_sender_credentials()),
@@ -275,6 +366,16 @@ impl DirectSyscalls {
     }
 }
 impl RetainedByte {
+    pub(super) fn datagram_target(&self) -> Option<&trames_vfs::LocalDatagram> {
+        self.message.as_ref()?.datagram.as_ref()?.target.get()
+    }
+    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+        let mut subscriptions = self.fd.subscribe(signal);
+        if let Some(target) = self.datagram_target() {
+            subscriptions.push(target.subscribe(signal));
+        }
+        subscriptions
+    }
     pub fn local_message_entry(&self) -> Option<(u32, [u64; 6])> {
         self.message.as_ref().map(|m| (m.number, m.args))
     }
@@ -716,5 +817,177 @@ mod tests {
             v.fd_kind(owner_socket).unwrap()
         );
         assert_eq!(v.read(rx, 8).unwrap(), 99u64.to_le_bytes());
+    }
+    fn datagrams() -> (Vfs, u32, u32) {
+        let mut v = Vfs::default();
+        let tx = v.local_create(2, 0).unwrap();
+        let rx = v.local_create(2, 0).unwrap();
+        v.local_bind(&v.local_socket(tx).unwrap().unwrap(), b"\x01\x00/source\0")
+            .unwrap();
+        v.local_bind(&v.local_socket(rx).unwrap().unwrap(), b"\x01\x00/target\0")
+            .unwrap();
+        (v, tx, rx)
+    }
+    fn datagram_direct(v: &Vfs) -> DirectSyscalls {
+        direct(v).with_paths(v.path_queries())
+    }
+    fn packet_args(m: &mut Memory, tx: u32) -> [u64; 6] {
+        let address = b"\x01\x00/target\0";
+        m.write(0x1400, address).unwrap();
+        [tx as u64, 0x1200, 4, 0, 0x1400, address.len() as u64]
+    }
+    #[test]
+    fn datagram_blocked_send_subscribes_target_space_and_retains_original_target_bytes_and_ofd() {
+        for close_target in [false, true] {
+            let (mut v, tx, rx) = datagrams();
+            let receiver = v.local_socket(rx).unwrap().unwrap();
+            receiver.set_reuse(8, 256).unwrap();
+            v.local_send_to(
+                &v.local_socket(tx).unwrap().unwrap(),
+                &[0x55; 512],
+                0,
+                Some(b"\x01\x00/target\0"),
+                Default::default(),
+            )
+            .unwrap();
+            let d = datagram_direct(&v);
+            let mut m = memory();
+            let args = packet_args(&mut m, tx);
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let wait = blocked(
+                d.start(206, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap(),
+            );
+            assert!(!wait.signal.ready());
+            assert!(!wait.external_wait());
+            v.close(tx).unwrap();
+            assert_eq!(v.eventfd(99, 0).unwrap(), tx);
+            m.write(0x1200, b"evil").unwrap();
+            m.write(0x1400, &[0xff; 10]).unwrap();
+            v.unlink_at(-100, b"/target", false).unwrap();
+            if close_target {
+                v.close(rx).unwrap();
+            }
+            let replacement = v.socket(1, 2 | O_CLOEXEC, 0).unwrap();
+            v.local_bind(
+                &v.local_socket(replacement).unwrap().unwrap(),
+                b"\x01\x00/target\0",
+            )
+            .unwrap();
+            if close_target {
+                drop(receiver);
+                assert!(
+                    wait.signal.ready(),
+                    "final target close wakes refused sender"
+                );
+                assert!(matches!(
+                    d.resume(wait, &mut m),
+                    IoAttempt::Complete(Err(Errno(111)))
+                ));
+            } else {
+                assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+                assert!(
+                    wait.signal.ready(),
+                    "receive frees target capacity, not source capacity"
+                );
+                assert!(matches!(d.resume(wait, &mut m), IoAttempt::Complete(Ok(4))));
+                assert_eq!(receiver.recv(4, 0).unwrap().data, b"abcd");
+            }
+            assert_eq!(v.read(replacement, 4), Err(Errno(11)));
+            assert_eq!(v.read(tx, 8).unwrap(), 99u64.to_le_bytes());
+        }
+    }
+    #[test]
+    fn datagram_raw_vectors_and_message_rights_keep_packet_abi_and_original_outputs_on_wait() {
+        let (mut v, tx, rx) = datagrams();
+        v.local_connect(&v.local_socket(tx).unwrap().unwrap(), b"\x01\x00/target\0")
+            .unwrap();
+        let d = datagram_direct(&v);
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        for send_number in [64, 66, 206, 211] {
+            header(&mut m, 0);
+            m.write(0x1200, b"abcd").unwrap();
+            let args = match send_number {
+                66 => [tx as u64, 0x1100, 1, 0, 0, 0],
+                211 => [tx as u64, 0x1000, 0, 0, 0, 0],
+                _ => [tx as u64, 0x1200, 4, 0, 0, 0],
+            };
+            assert!(matches!(
+                d.start(send_number, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap(),
+                IoAttempt::Complete(Ok(4))
+            ));
+            assert_eq!(
+                v.local_socket(rx)
+                    .unwrap()
+                    .unwrap()
+                    .recv(1, 0x20)
+                    .unwrap()
+                    .length,
+                4
+            );
+            assert_eq!(
+                v.read(rx, 4),
+                Err(Errno(11)),
+                "vector send emits one packet"
+            );
+        }
+        for recv_number in [63, 65, 207, 212] {
+            header(&mut m, 24);
+            m.write_array(0x1460, 110u32.to_le_bytes()).unwrap();
+            let args = match recv_number {
+                65 => [rx as u64, 0x1100, 1, 0, 0, 0],
+                212 => [rx as u64, 0x1000, 0, 0, 0, 0],
+                207 => [rx as u64, 0x1200, 4, 0, 0x1400, 0x1460],
+                _ => [rx as u64, 0x1200, 4, 0, 0, 0],
+            };
+            let wait = blocked(
+                d.start(recv_number, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap(),
+            );
+            let file = wait.retained_byte.clone().unwrap();
+            drop(wait);
+            let owner = v.retain_uring_fd(rx).unwrap();
+            // Freeze outputs once; neither an edited iovec nor changed capacity
+            // may redirect copyout after wait/owner handoff.
+            m.write_array(0x1100, 0x9000u64.to_le_bytes()).unwrap();
+            m.write_array(0x1460, 0u32.to_le_bytes()).unwrap();
+            let owner_socket = v.local_create(1, 0).unwrap();
+            v.local_socket(tx)
+                .unwrap()
+                .unwrap()
+                .send_rights(b"real", 0, v.send_rights(&[owner_socket]).unwrap())
+                .unwrap();
+            let file = match d.start_retained_byte(
+                file,
+                recv_number,
+                args,
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            ) {
+                IoAttempt::ByteCheckpoint(file) => file,
+                _ => panic!("legacy owning graph must defer before dequeue"),
+            };
+            assert!(matches!(
+                d.start_owned_local_message(
+                    file,
+                    &mut v,
+                    &owner,
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target)
+                ),
+                IoAttempt::Complete(Ok(4))
+            ));
+            assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"real");
+            if recv_number == 207 {
+                assert_eq!(m.read_array::<10>(0x1400).unwrap(), *b"\x01\x00/source\0");
+                assert_eq!(word(&m, 0x1460), 10);
+            }
+            v.close(owner_socket).unwrap();
+            m.write_array(0x1100, 0x1200u64.to_le_bytes()).unwrap();
+        }
     }
 }

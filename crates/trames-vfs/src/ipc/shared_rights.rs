@@ -82,11 +82,15 @@ impl channel::Resource {
                     truncated: received.truncated,
                     rights,
                     credentials: if received.options[0] != 0 {
-                        received.credentials
+                        received.credentials.or(Some([0, 65534, 65534]))
                     } else {
                         None
                     },
-                    source: vec![1, 0],
+                    source: if received.source.is_empty() {
+                        vec![1, 0]
+                    } else {
+                        received.source
+                    },
                     timestamp: (kind != 0).then_some(received.timestamp).flatten().map(
                         |mut stamp| {
                             if matches!(kind, 29 | 63) {

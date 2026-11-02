@@ -122,6 +122,13 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn local_datagram(
+        &self,
+        socket: &LocalOperation,
+        destination: Option<&[u8]>,
+    ) -> Option<Result<LocalDatagram>> {
+        self.query(|view| view.local_datagram_core(socket.core(), destination))
+    }
     pub fn local_bind(&self, socket: &LocalOperation, address: &[u8]) -> Option<Result<()>> {
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();

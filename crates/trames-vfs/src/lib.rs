@@ -71,8 +71,8 @@ use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
 pub use ipc::{
-    LocalConnection, LocalOperation, LocalReceived, LocalResource, LocalRights, LocalSocket,
-    SharedRights, WaylandAuth,
+    LocalConnection, LocalDatagram, LocalOperation, LocalReceived, LocalResource, LocalRights,
+    LocalSocket, SharedRights, WaylandAuth,
 };
 pub use locks::{RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER};
 mod linux_namespace;

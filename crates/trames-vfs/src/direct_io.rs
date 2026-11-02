@@ -208,6 +208,7 @@ enum ByteResource {
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     UnixControl(std::sync::Weak<ipc::LocalResource>),
+    UnixDatagram(Arc<ipc::channel::Resource>),
     Kmsg(Arc<kernel_log::Kmsg>),
     PollOnly(Arc<dyn DirectPoll>),
     Event(Arc<EventCounter>),
@@ -371,6 +372,9 @@ impl DirectFd {
         let resource = if let Some(local) = &open.local {
             match local.direct().or_else(|| local.direct_message()) {
                 Some((data, side)) => ByteResource::Unix { data, side },
+                None if local.addressed_datagram() => {
+                    ByteResource::UnixDatagram(local.datagram_resource())
+                }
                 None => ByteResource::UnixControl(Arc::downgrade(local)),
             }
         } else if let Some(end) = &open.pty {
@@ -443,6 +447,7 @@ impl DirectFd {
             (ByteResource::Pipe { data: a, .. }, ByteResource::Pipe { data: b, .. }) => {
                 Arc::ptr_eq(a, b)
             }
+            (ByteResource::UnixDatagram(a), ByteResource::UnixDatagram(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Unix { data: a, .. }, ByteResource::Unix { data: b, .. }) => {
                 Arc::ptr_eq(a, b)
             }
@@ -488,7 +493,9 @@ impl DirectFd {
             ByteResource::Timer(timer) => vec![timer.subscribe(signal)],
             ByteResource::Inotify(queue) => vec![queue.queue.subscribe(signal)],
             ByteResource::Pipe { data, .. } => vec![data.readiness.subscribe(signal)],
-            ByteResource::Unix { data, .. } => vec![data.readiness.subscribe(signal)],
+            ByteResource::Unix { data, .. } | ByteResource::UnixDatagram(data) => {
+                vec![data.readiness.subscribe(signal)]
+            }
             ByteResource::Pty { data, .. } => vec![data.subscribe(signal)],
             ByteResource::Epoll(epoll) => {
                 let mut subscriptions = vec![epoll.live.changed.subscribe(signal)];
@@ -658,11 +665,27 @@ impl DirectFd {
         matches!(self.resource, ByteResource::Epoll(_))
     }
     pub fn is_unix(&self) -> bool {
-        matches!(self.resource, ByteResource::Unix { .. })
+        matches!(
+            self.resource,
+            ByteResource::Unix { .. } | ByteResource::UnixDatagram(_)
+        )
+    }
+    pub fn is_addressed_datagram(&self) -> bool {
+        matches!(self.resource, ByteResource::UnixDatagram(_))
+    }
+    pub fn local_operation(&self) -> Option<LocalOperation> {
+        LocalOperation::from_shared(self.shared_file()?).ok()
+    }
+    fn local_data(&self) -> Option<(&Arc<ipc::channel::Resource>, usize)> {
+        match &self.resource {
+            ByteResource::Unix { data, side } => Some((data, *side)),
+            ByteResource::UnixDatagram(data) => Some((data, 0)),
+            _ => None,
+        }
     }
     pub fn local_kind(&self) -> u32 {
         match &self.resource {
-            ByteResource::Unix { data, .. } => data.kind(),
+            ByteResource::Unix { data, .. } | ByteResource::UnixDatagram(data) => data.kind(),
             _ => 0,
         }
     }
@@ -671,10 +694,8 @@ impl DirectFd {
         count: usize,
         flags: u32,
     ) -> Option<Result<LocalReceived<SharedRights>>> {
-        let ByteResource::Unix { data, side } = &self.resource else {
-            return None;
-        };
-        data.recv_local(*side, count, flags)
+        let (data, side) = self.local_data()?;
+        data.recv_local(side, count, flags)
     }
     pub fn send_local_message(
         &self,
@@ -780,6 +801,7 @@ impl DirectFd {
         matches!(
             self.resource,
             ByteResource::Unix { .. }
+                | ByteResource::UnixDatagram(_)
                 | ByteResource::Pipe { .. }
                 | ByteResource::Pty { .. }
                 | ByteResource::Inotify(_)
@@ -788,6 +810,7 @@ impl DirectFd {
     pub fn readable_bytes(&self) -> usize {
         match &self.resource {
             ByteResource::Unix { data, side } => data.readable_bytes(*side),
+            ByteResource::UnixDatagram(data) => data.readable_bytes(0),
             ByteResource::Pipe { data, .. } => data.lock().unwrap().bytes.len(),
             ByteResource::Pty { data, master } => data.readable_bytes(*master),
             ByteResource::Inotify(queue) => queue.available(),
@@ -797,6 +820,7 @@ impl DirectFd {
     pub fn shutdown(&self, how: u32) -> Result<()> {
         match &self.resource {
             ByteResource::Unix { data, side } => data.shutdown(*side, how),
+            ByteResource::UnixDatagram(data) => data.shutdown(0, how),
             _ => Err(Errno(88)),
         }
     }
@@ -823,6 +847,7 @@ impl DirectFd {
             ByteResource::Timer(timer) => timer.poll(events),
             ByteResource::Inotify(queue) => queue.poll(events),
             ByteResource::Unix { data, side } => data.poll(*side, events),
+            ByteResource::UnixDatagram(data) => data.poll(0, events),
             ByteResource::Pty { data, master } => data.poll_state(*master, events),
             ByteResource::Pipe {
                 data,
@@ -937,7 +962,9 @@ impl DirectFd {
                 }
                 data.lock().unwrap().read(count)
             }
-            ByteResource::Unix { .. } => unreachable!("handled Unix receive"),
+            ByteResource::Unix { .. } | ByteResource::UnixDatagram(_) => {
+                unreachable!("handled Unix receive")
+            }
             ByteResource::Pty { .. } => return self.terminal_read(count, None),
         })
     }
@@ -951,10 +978,13 @@ impl DirectFd {
         if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
             return Some(Err(Errno(9)));
         }
-        let ByteResource::Unix { data, side } = &self.resource else {
-            return None;
+        let (data, side) = self.local_data()?;
+        let received = if self.is_addressed_datagram() {
+            data.recv_portable(side, count, flags)
+        } else {
+            data.recv(side, count, flags, false)
         };
-        data.recv(*side, count, flags, false).map(|r| {
+        received.map(|r| {
             r.map(|r| {
                 let length = if flags & 0x20 != 0 {
                     r.length
@@ -981,6 +1011,10 @@ impl DirectFd {
             ByteResource::Unix { data, side } => {
                 data.send_credentials(*side, bytes, flags, None, credentials)
             }
+            ByteResource::UnixDatagram(_) => self
+                .local_operation()
+                .ok_or(Errno(95))?
+                .send_connected_datagram(bytes, flags, credentials),
             _ => Err(Errno(88)),
         }
     }
@@ -999,7 +1033,7 @@ impl DirectFd {
             | ByteResource::Timer(_)
             | ByteResource::UnixControl(_)
             | ByteResource::Inotify(_) => Err(Errno(22)),
-            ByteResource::Unix { .. } => self.send(bytes, 0),
+            ByteResource::Unix { .. } | ByteResource::UnixDatagram(_) => self.send(bytes, 0),
             ByteResource::Pty { .. } => self.terminal_write(bytes, None).unwrap_or(Err(Errno(95))),
             ByteResource::Pipe { data, write, .. } => {
                 if !write {
