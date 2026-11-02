@@ -12,6 +12,8 @@ use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
 mod ip_message;
 mod local_message;
+#[cfg(test)]
+mod netlink;
 mod socket_wait;
 mod uring;
 pub use socket_wait::RetainedSocket;
@@ -572,7 +574,7 @@ impl DirectSyscalls {
             return matches!(number, 63..=66);
         }
         if let Some(fd) = self.descriptors.get(fd) {
-            return Self::supports_fd(number, &fd);
+            return Self::supports_fd(number, &fd) || matches!(number, 63..=66) && fd.is_netlink();
         }
         matches!(number, 63..=66) && self.raw_ip_socket(fd).is_some()
     }

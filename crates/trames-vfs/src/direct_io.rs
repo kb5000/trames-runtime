@@ -205,6 +205,7 @@ pub trait DirectPoll: Send + Sync {
 #[derive(Clone)]
 enum ByteResource {
     TcpPoll(trames_net::TcpPoll),
+    NetlinkPoll(std::sync::Weak<NetSocket>),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     SimpleDevice(simple_device::Kind),
@@ -330,7 +331,7 @@ pub struct DirectFd {
     flags: u32,
     status: StatusFlags,
     _file: Option<SharedFd>,
-    origin: Option<OfdIdentity>,
+    pub(super) origin: Option<OfdIdentity>,
 }
 impl DirectFd {
     pub(super) fn tcp_poll(open: &Arc<SharedOpenDescription>, tcp: trames_net::TcpPoll) -> Self {
@@ -368,6 +369,19 @@ impl DirectFd {
             _file: None,
             origin: None,
         }
+    }
+    pub(super) fn netlink_poll(open: &SharedOpenDescription) -> Option<Self> {
+        let socket = open.socket.as_ref().filter(|s| s.is_netlink())?;
+        Some(Self {
+            resource: ByteResource::NetlinkPoll(Arc::downgrade(socket)),
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            _file: None,
+            origin: None,
+        })
+    }
+    pub fn is_netlink(&self) -> bool {
+        matches!(self.resource, ByteResource::NetlinkPoll(_))
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
         let resource = if let Some(local) = &open.local {
@@ -440,6 +454,9 @@ impl DirectFd {
     fn shares_resource(&self, other: &Self) -> bool {
         match (&self.resource, &other.resource) {
             (ByteResource::TcpPoll(a), ByteResource::TcpPoll(b)) => a.shares_socket(b),
+            (ByteResource::NetlinkPoll(a), ByteResource::NetlinkPoll(b)) => {
+                std::sync::Weak::ptr_eq(a, b)
+            }
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Epoll(a), _) => a
                 .snapshot()
@@ -484,6 +501,11 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::NetlinkPoll(socket) => socket
+                .upgrade()
+                .and_then(|s| s.subscribe(signal))
+                .into_iter()
+                .collect(),
             ByteResource::TcpPoll(tcp) => vec![IoSubscription::native(
                 tcp.poll_event_fd().map(Into::into),
                 signal,
@@ -646,7 +668,8 @@ impl DirectFd {
     pub fn is_poll_only(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::TcpPoll(_)
+            ByteResource::NetlinkPoll(_)
+                | ByteResource::TcpPoll(_)
                 | ByteResource::UnixControl(_)
                 | ByteResource::PollOnly(_)
                 | ByteResource::Regular
@@ -844,6 +867,12 @@ impl DirectFd {
     pub(super) fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
             ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
+            ByteResource::NetlinkPoll(socket) => socket.upgrade().map_or((32, [0; 2]), |s| {
+                (
+                    s.poll(events).unwrap_or(32),
+                    s.poll_epoch().unwrap_or([0; 2]),
+                )
+            }),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular | ByteResource::SimpleDevice(_) => (events & 5, [0; 2]),
             ByteResource::UnixControl(local) => local.upgrade().map_or((16, [0; 2]), |local| {
@@ -1002,6 +1031,7 @@ impl DirectFd {
             ByteResource::Inotify(queue) => queue.read(count),
             ByteResource::Epoll(_)
             | ByteResource::TcpPoll(_)
+            | ByteResource::NetlinkPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::UnixControl(_)
@@ -1087,6 +1117,7 @@ impl DirectFd {
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
             | ByteResource::TcpPoll(_)
+            | ByteResource::NetlinkPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::Timer(_)

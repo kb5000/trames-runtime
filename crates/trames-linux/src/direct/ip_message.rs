@@ -66,19 +66,41 @@ impl Message {
         number: u32,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
-    ) -> Result<u64, Errno> {
-        self.progress_with(socket, number, a, memory, |bytes, flags, peer| {
-            socket
-                .send_bytes(bytes, flags, peer)
-                .map_err(|e| Errno(e.0))
-        })
+        factory: &trames_vfs::DescriptorFactory,
+        owner: bool,
+    ) -> Option<Result<u64, Errno>> {
+        let mut deferred = false;
+        let result = self.progress_context(
+            socket,
+            number,
+            a,
+            memory,
+            owner,
+            &mut deferred,
+            |bytes, flags, peer| factory.send_socket_bytes(socket, bytes, flags, peer),
+        );
+        (!deferred).then_some(result)
     }
+    #[cfg(test)]
     fn progress_with(
         &self,
         socket: &trames_vfs::SocketOperation,
         number: u32,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
+        send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
+    ) -> Result<u64, Errno> {
+        self.progress_context(socket, number, a, memory, false, &mut false, send)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn progress_context(
+        &self,
+        socket: &trames_vfs::SocketOperation,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        owner: bool,
+        deferred: &mut bool,
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
         let mut state = self.state.lock().unwrap();
@@ -112,6 +134,10 @@ impl Message {
                         socket.address_size(),
                     )?);
                 }
+                if !owner && !state.active.as_ref().unwrap().worker_admitted(socket) {
+                    *deferred = true;
+                    return Err(Errno(11));
+                }
                 if state.recheck {
                     state.active.as_ref().unwrap().recheck(memory)?;
                     state.recheck = false;
@@ -125,7 +151,7 @@ impl Message {
                 };
                 // Preserve the existing per-message publication boundary, not
                 // a batch-wide socket lock. No Files lookup enters this guard.
-                let sent = if matches!(number, 206 | 211 | 269) {
+                let sent = if matches!(number, 206 | 211 | 269) && !socket.is_netlink() {
                     socket.with_tcp_publication(transfer)
                 } else {
                     transfer()
@@ -141,6 +167,9 @@ impl Message {
                 }
                 Ok(sent)
             })();
+            if *deferred {
+                return Err(Errno(11));
+            }
             match result {
                 Ok(sent) if !batch => state.terminal = Some(Ok(sent)),
                 Ok(sent) => {
@@ -210,17 +239,18 @@ mod tests {
         let target: Arc<dyn IoWake> = Arc::new(Target);
         let mut m = memory();
         for number in [63, 64, 65, 66] {
-            assert!(!d.supports_call(number, [netlink as u64, u64::MAX, 1, 0, 0, 0]));
-            assert!(d
-                .start(
+            assert!(d.supports_call(number, [netlink as u64, u64::MAX, 1, 0, 0, 0]));
+            assert!(matches!(
+                d.start(
                     number,
                     [netlink as u64, u64::MAX, 1, 0, 0, 0],
                     &mut m,
                     1,
                     &Arc::downgrade(&target),
                     None
-                )
-                .is_none());
+                ),
+                Some(IoAttempt::Complete(Err(Errno(14))))
+            ));
         }
         for number in [63, 65] {
             for timeout in [false, true] {
@@ -438,15 +468,16 @@ mod tests {
                 matches!(d.start_socket_control(269,a,&mut m,1,&Arc::downgrade(&target)),Some(IoAttempt::Complete(value)) if value==result)
             );
         }
-        assert!(d
-            .start_socket_control(
+        assert!(matches!(
+            d.start_socket_control(
                 211,
                 [netlink as u64, u64::MAX, 0, 0, 0, 0],
                 &mut m,
                 1,
                 &Arc::downgrade(&target)
-            )
-            .is_none());
+            ),
+            Some(IoAttempt::Complete(Err(Errno(14))))
+        ));
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         for timeout in [false, true] {
             if timeout {

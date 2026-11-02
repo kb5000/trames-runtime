@@ -222,6 +222,12 @@ impl Prepared {
             transfer,
         })
     }
+    pub fn worker_admitted(&self, socket: &trames_net::Socket) -> bool {
+        match &self.transfer {
+            Transfer::Send { bytes, .. } => socket.worker_send_supported(bytes),
+            _ => true,
+        }
+    }
     pub fn progress(
         &self,
         socket: &trames_net::Socket,

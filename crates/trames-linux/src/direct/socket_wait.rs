@@ -22,7 +22,7 @@ pub struct RetainedSocket {
 }
 impl RetainedSocket {
     pub fn external_wait(&self) -> bool {
-        matches!(self.socket, Control::Network(_))
+        matches!(&self.socket, Control::Network(socket) if !socket.is_netlink())
     }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         match &self.socket {
@@ -78,11 +78,19 @@ impl RetainedSocket {
         &mut self,
         memory: &mut impl CpuMemory,
         paths: Option<&trames_vfs::PathQueries>,
+        owner: bool,
     ) -> Option<Result<u64, Errno>> {
         match &mut self.socket {
             Control::Network(socket) => {
                 if let Some(message) = &self.message {
-                    return Some(message.progress(socket, self.number, self.args, memory));
+                    return message.progress(
+                        socket,
+                        self.number,
+                        self.args,
+                        memory,
+                        &self.factory,
+                        owner,
+                    );
                 }
                 let result = if self.number == 203 && self.connecting {
                     socket.with_tcp_publication(|| {
@@ -165,7 +173,7 @@ impl RetainedSocket {
 impl DirectSyscalls {
     pub(super) fn raw_ip_socket(&self, fd: u32) -> Option<trames_vfs::SocketOperation> {
         let socket = self.resources.as_ref()?.socket_operation(fd)?.ok()?;
-        matches!(socket.address_size(), 16 | 28).then_some(socket)
+        matches!(socket.address_size(), 12 | 16 | 28).then_some(socket)
     }
     pub(super) fn start_raw_ip(
         &self,
@@ -222,7 +230,7 @@ impl DirectSyscalls {
                 return None
             }
             Ok(trames_vfs::SocketControlOperation::Network(ref socket))
-                if ip_message::number(number) && !matches!(socket.address_size(), 16 | 28) =>
+                if ip_message::number(number) && !matches!(socket.address_size(), 12 | 16 | 28) =>
             {
                 return None
             }
@@ -310,7 +318,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref(), false) else {
             return IoAttempt::SocketCheckpoint(call);
         };
         if call.pipe_signal() {
@@ -342,6 +350,10 @@ impl DirectSyscalls {
         let Control::Network(socket) = &call.socket else {
             unreachable!()
         };
+        if let Some(subscription) = socket.subscribe(&pending.signal) {
+            pending._subscriptions = vec![subscription];
+            return true;
+        }
         let Some(events) = pending.target.upgrade().and_then(|t| t.host_events()) else {
             return false;
         };
@@ -372,7 +384,7 @@ impl DirectSyscalls {
     }
     fn retry_socket(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         let call = pending.retained_socket.as_mut().unwrap();
-        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref(), false) else {
             return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
         };
         if call.pipe_signal() {
@@ -444,7 +456,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref(), true) else {
             return IoAttempt::SocketCheckpoint(call);
         };
         if !call.waits(&result) {

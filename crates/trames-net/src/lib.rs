@@ -558,10 +558,13 @@ impl Socket {
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
         if let SocketBackend::Netlink(s) = &self.backend {
-            {
+            let mut wakes = netlink::Notifications::default();
+            let result = {
                 let _operation = self.operation.write();
-                s.send_with_namespace(bytes, flags, destination, net_admin, resolve)
-            }
+                s.send_deferred(bytes, flags, destination, net_admin, resolve, &mut wakes)
+            };
+            wakes.flush();
+            result
         } else {
             self.send(bytes, flags, destination.map(decode_address).transpose()?)
         }
@@ -575,10 +578,39 @@ impl Socket {
     delegate!(read_recursive, local_addr() -> Result<SocketAddr>);
     delegate!(read_recursive, peer_addr() -> Result<SocketAddr>);
     delegate!(write, shutdown(how: u32) -> Result<()>);
-    delegate!(
-        read_recursive,
-        send(bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize>
-    );
+    pub fn is_netlink(&self) -> bool {
+        matches!(self.backend, SocketBackend::Netlink(_))
+    }
+    pub fn worker_send_supported(&self, bytes: &[u8]) -> bool {
+        match &self.backend {
+            SocketBackend::Netlink(socket) => socket.worker_send_supported(bytes),
+            _ => true,
+        }
+    }
+    pub fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        match &self.backend {
+            SocketBackend::Netlink(socket) => Some(socket.subscribe(signal)),
+            _ => None,
+        }
+    }
+    pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
+        if self.is_netlink() {
+            if address.is_some() {
+                return Err(NetError(97));
+            }
+            return self.send_bytes(bytes, flags, None);
+        }
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Native(socket) => socket.send(bytes, flags, address),
+            SocketBackend::Hybrid(socket) => socket.send(bytes, flags, address),
+            SocketBackend::Virtual(socket) => socket.send(bytes, flags, address),
+            SocketBackend::Netlink(_) => unreachable!(),
+        }
+    }
     delegate!(
         read_recursive,
         recv(count: usize, flags: u32) -> Result<Received>

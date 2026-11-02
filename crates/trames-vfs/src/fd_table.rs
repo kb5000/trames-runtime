@@ -217,7 +217,10 @@ impl SharedFiles {
             SlotOpen::Shared(open) => open.clone(),
             SlotOpen::Owner(_, _, metadata) => metadata.as_ref()?.upgrade()?,
         };
-        if open.kind == FdKind::Socket && open.local.is_none() {
+        if open.kind == FdKind::Socket
+            && open.local.is_none()
+            && !open.socket.as_ref().is_some_and(|s| s.is_netlink())
+        {
             let tcp = open
                 .tcp_publication
                 .lock()
@@ -350,6 +353,10 @@ impl SharedFd {
     }
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
         if self.open.kind == FdKind::Socket && self.open.local.is_none() {
+            if let Some(mut fd) = DirectFd::netlink_poll(&self.open) {
+                fd.origin = Some(OfdIdentity::new(&self.open));
+                return Some(fd);
+            }
             let tcp = self
                 .open
                 .tcp_publication

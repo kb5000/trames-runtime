@@ -1709,3 +1709,42 @@ calls, including the final waits, finish on workers with one decision per entry
 and no coordinator service. Netlink byte/control operations remain owner-bound
 before guest input import. Structural VM/task, Unix owning ancillary graphs and
 native-service/io_uring controls are separate remaining boundaries.
+
+## Retained Netlink data and resource wakeups (2026-11-03)
+
+NETLINK_ROUTE and non-publishing NETLINK_NETFILTER data calls use the same retained
+raw/message/batch ABI and actual shared socket OFD as IP calls. Route/conntrack
+queries and supported route/link/address changes execute on the calling worker;
+reply and multicast readiness belong to their real socket queue. Existing resource
+subscriptions wake reads, poll and epoll without a reactor, periodic service or a
+new coordination thread. Poll captures remain weak, so subscriptions and watches
+cannot pin final socket close. Ready IP/TCP/pipe paths gain no new resource lookup.
+
+Notifications are collected during the original queue/topology operation and
+flushed after queue, registry, topology and outer Socket gates release. A callback
+may safely receive and change options on the same socket. Namespace-FD targets
+are accepted through actual shared namespace OFDs before taking the topology
+writer; canonical validation still selects the original errors and their order.
+Their complete OFDs and namespace identities survive close/reuse and are released
+after the source Socket gate and notification flush. Source socket namespace and
+accepted caller credentials retain the same semantics on owner and worker paths.
+
+Already connected native TCP endpoints retain their selected transport across
+route/link updates; hybrid send routing only reselects non-stream transports.
+Only an nf_tables batch beginning with NFNL_MSG_BATCH_BEGIN retains its joined
+publication boundary. Such publication can invalidate previously captured native
+TCP policy-free byte capabilities. This stage preserves that invariant without
+adding a permission check, policy generation load or barrier to every native TCP
+byte operation. An accepted batch can finish earlier messages before this owner
+handoff; the same source, current item and completed count survive, without replay
+or a second seccomp decision. Read-only NF/conntrack messages and replies use their
+existing object transactions directly. This is a remaining policy-publication
+migration, not a claim that all Netlink operations are coordinator-free.
+
+Tests cover raw/vector/message/batch route queries, retained receive and poll
+identity after close/reuse, reentrant callbacks, real namespace FD/error/capability
+handling and target teardown outside locks. Filtered guest link changes on one/two
+workers wake a distinct process's poll and recvmsg; all six calls finish on workers
+with one filter decision per entry and zero coordinator services. Unix owning
+ancillary graphs, policy publication, native services, io_uring controls and
+structural VM/task transitions remain separate boundaries.

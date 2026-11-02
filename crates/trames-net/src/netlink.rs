@@ -166,6 +166,7 @@ pub(super) struct Socket {
     overrun: Cell<bool>,
     replies: SharedState<VecDeque<Datagram>>,
     read_epoch: Cell<u64>,
+    readiness: Arc<trames_shared::Readiness>,
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
     strict: Cell<bool>,
@@ -181,7 +182,8 @@ fn source(port: u32, groups: u32) -> [u8; 12] {
     bytes[8..12].copy_from_slice(&groups.to_le_bytes());
     bytes
 }
-fn enqueue(listener: &Socket, data: &[u8], source: [u8; 12]) {
+fn enqueue(listener: &Socket, data: &[u8], source: [u8; 12], wakes: &mut Notifications) {
+    wakes.0.push(listener.readiness.clone());
     let mut q = listener.replies.borrow_mut();
     if q.len() >= 128 || q.iter().map(|p| p.data.len()).sum::<usize>() + data.len() > MAX_BUFFER {
         listener.overrun.set(true);
@@ -234,7 +236,31 @@ fn live_listeners(registry: &SharedState<Vec<Weak<Socket>>>) -> Vec<Arc<Socket>>
     registry.retain(|s| s.strong_count() != 0);
     registry.iter().filter_map(Weak::upgrade).collect()
 }
+// Flush only after queue, topology, registry and outer Socket gates release.
+#[derive(Default)]
+pub(super) struct Notifications(Vec<Arc<trames_shared::Readiness>>, Vec<Network>);
+impl Notifications {
+    pub fn flush(mut self) {
+        // A final namespace release may itself generate link notifications.
+        // Its topology and source Socket gates must already be released.
+        drop(self.1);
+        self.0.sort_unstable_by_key(Arc::as_ptr);
+        self.0.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        for source in self.0 {
+            source.notify_locked();
+        }
+    }
+}
 fn notify(listeners: &Arc<SharedState<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
+    let mut wakes = Notifications::default();
+    notify_deferred(listeners, changes, &mut wakes);
+    wakes.flush();
+}
+fn notify_deferred(
+    listeners: &Arc<SharedState<Vec<Weak<Socket>>>>,
+    changes: Vec<(u64, u16, u32, Vec<u8>)>,
+    wakes: &mut Notifications,
+) {
     let listeners = live_listeners(listeners);
     for (ns, kind, group, data) in changes {
         for listener in &listeners {
@@ -245,7 +271,7 @@ fn notify(listeners: &Arc<SharedState<Vec<Weak<Socket>>>>, changes: Vec<(u64, u1
                 continue;
             }
             let p = message(kind, 0, 0, 0, &data);
-            enqueue(listener, &p, source(0, group));
+            enqueue(listener, &p, source(0, group), wakes);
         }
     }
 }
@@ -273,6 +299,7 @@ impl Socket {
             overrun: Cell::new(false),
             replies: SharedState::new(VecDeque::new()),
             read_epoch: Cell::new(0),
+            readiness: Arc::default(),
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
             strict: Cell::new(false),
@@ -352,6 +379,7 @@ impl Socket {
             Err(NetError(107))
         }
     }
+    #[cfg(test)]
     pub fn send_bytes(
         &self,
         bytes: &[u8],
@@ -360,6 +388,7 @@ impl Socket {
     ) -> Result<usize> {
         self.send_bytes_authorized(bytes, flags, destination, false)
     }
+    #[cfg(test)]
     pub fn send_bytes_authorized(
         &self,
         bytes: &[u8],
@@ -369,6 +398,7 @@ impl Socket {
     ) -> Result<usize> {
         self.send_with_namespace(bytes, flags, destination, net_admin, &|_| Err(NetError(9)))
     }
+    #[cfg(test)]
     pub fn send_with_namespace(
         &self,
         bytes: &[u8],
@@ -376,6 +406,20 @@ impl Socket {
         destination: Option<&[u8]>,
         net_admin: bool,
         resolve: &dyn Fn(u32) -> Result<Network>,
+    ) -> Result<usize> {
+        let mut wakes = Notifications::default();
+        let result = self.send_deferred(bytes, flags, destination, net_admin, resolve, &mut wakes);
+        wakes.flush();
+        result
+    }
+    pub(super) fn send_deferred(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+        resolve: &dyn Fn(u32) -> Result<Network>,
+        wakes: &mut Notifications,
     ) -> Result<usize> {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(NetError(95));
@@ -425,7 +469,7 @@ impl Socket {
         }
         if self.protocol == 12 {
             self.autobind()?;
-            // Admission and commit are one coordinator operation. Never commit
+            // Admission and commit share this reply-queue transaction. Never commit
             // a batch whose replies cannot fit, even when the reader stalls.
             let mut queue = self.replies.borrow_mut();
             let available = MAX_BUFFER - queue.iter().map(|p| p.data.len()).sum::<usize>();
@@ -440,6 +484,7 @@ impl Socket {
             if !generated.is_empty() {
                 self.read_epoch.update(|n| n.wrapping_add(1));
             }
+            wakes.0.push(self.readiness.clone());
             queue.extend(generated.into_iter().map(|data| Datagram {
                 data,
                 source: source(0, 0),
@@ -466,7 +511,7 @@ impl Socket {
                     && listener.port.get() != self.port.get()
                     && listener.groups.get() & group != 0
                 {
-                    enqueue(listener, bytes, source(self.port.get(), group));
+                    enqueue(listener, bytes, source(self.port.get(), group), wakes);
                 }
             }
         }
@@ -496,7 +541,8 @@ impl Socket {
                 net_admin,
                 resolve,
             )?;
-            notify(&self.namespace.listeners, r.changes);
+            wakes.1.extend(r.retained_namespaces);
+            notify_deferred(&self.namespace.listeners, r.changes, wakes);
             let generated = r.messages;
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
@@ -514,11 +560,23 @@ impl Socket {
         if !replies.is_empty() {
             self.read_epoch.update(|n| n.wrapping_add(1));
         }
+        wakes.0.push(self.readiness.clone());
         queued.extend(replies.into_iter().map(|data| Datagram {
             data,
             source: source(0, 0),
         }));
         Ok(bytes.len())
+    }
+    pub fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.readiness.subscribe(signal)
+    }
+    pub fn worker_send_supported(&self, bytes: &[u8]) -> bool {
+        // A valid nf_tables batch is the only ruleset publication path. Its
+        // joined boundary invalidates already captured policy-free TCP views.
+        !(self.protocol == 12 && bytes.len() >= 16 && bytes[4..6] == 16u16.to_le_bytes())
     }
     pub fn address_size(&self) -> usize {
         12
@@ -546,12 +604,6 @@ impl Socket {
     }
     pub fn shutdown(&self, _: u32) -> Result<()> {
         Err(NetError(95))
-    }
-    pub fn send(&self, bytes: &[u8], flags: u32, destination: Option<SocketAddr>) -> Result<usize> {
-        if destination.is_some() {
-            return Err(NetError(97));
-        }
-        self.send_bytes(bytes, flags, None)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
         if flags & !(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC) != 0 {
@@ -634,6 +686,56 @@ impl Drop for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn namespace_resolution_precedes_topology_writer_and_preserves_error_ack() {
+        let network = Network::new(NetworkMode::Loopback);
+        let mut data = vec![0; 16];
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        attr(&mut data, 28, &55u32.to_le_bytes());
+        let request = message(19, 1, 7, 0, &data);
+        let mut count = 0;
+        let calls = std::cell::Cell::new(0);
+        let reply = crate::rtnetlink::request(&network.1, &request, 0, true, &|fd| {
+            assert_eq!(fd, 55);
+            assert!(
+                network.1.graph.try_write().is_ok(),
+                "namespace FD lookup held topology writer"
+            );
+            calls.set(calls.get() + 1);
+            Err(NetError(9))
+        })
+        .unwrap();
+        for packet in reply.messages {
+            if packet[4..6] == 2u16.to_le_bytes() {
+                assert_eq!(i32::from_le_bytes(packet[16..20].try_into().unwrap()), -9);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn namespace_target_remains_pinned_in_deferred_notifications() {
+        let network = Network::new(NetworkMode::Loopback);
+        let target = network.isolated().unwrap();
+        let weak = Arc::downgrade(&target.1);
+        let target = std::cell::RefCell::new(Some(target));
+        let mut data = vec![0; 16];
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        attr(&mut data, 28, &55u32.to_le_bytes());
+        let reply =
+            crate::rtnetlink::request(&network.1, &message(19, 1, 8, 0, &data), 0, true, &|_| {
+                Ok(target.borrow_mut().take().unwrap())
+            })
+            .unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(reply.retained_namespaces.len(), 1);
+        let mut wakes = Notifications::default();
+        wakes.1.extend(reply.retained_namespaces);
+        assert!(weak.upgrade().is_some());
+        wakes.flush();
+        assert!(weak.upgrade().is_none());
+    }
     #[test]
     fn loopback_up_requires_authority_and_never_accepts_real_interface_changes() {
         let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();

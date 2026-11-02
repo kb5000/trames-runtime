@@ -206,25 +206,16 @@ impl Vfs {
         flags: u32,
         destination: Option<&[u8]>,
     ) -> Result<usize> {
+        if socket.is_netlink() {
+            return self
+                .descriptor_factory()
+                .send_socket_bytes(socket, bytes, flags, destination);
+        }
         socket
-            .send_bytes_with_namespace(
-                bytes,
-                flags,
-                destination,
-                self.credentials.has_cap(capabilities::NET_ADMIN),
-                &|fd| {
-                    let descriptor = self.descriptor(fd).map_err(|e| trames_net::NetError(e.0))?;
-                    let open = descriptor.open.borrow();
-                    match &open.namespace {
-                        Some(linux_namespace::NamespaceHandle::Net(ns)) => {
-                            Ok(ns.network.borrow().clone())
-                        }
-                        _ => Err(trames_net::NetError(22)),
-                    }
-                },
-            )
+            .send_bytes(bytes, flags, destination)
             .map_err(|e| Errno(e.0))
     }
+
     pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
         self.network.info()
     }

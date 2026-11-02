@@ -774,6 +774,7 @@ dependencies = [
  "parking_lot",
  "smoltcp",
  "socket2",
+ "trames-shared",
 ]
 
 [[package]]

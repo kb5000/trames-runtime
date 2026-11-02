@@ -137,6 +137,42 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
 pub(crate) struct Reply {
     pub messages: Vec<Vec<u8>>,
     pub changes: Vec<(u64, u16, u32, Vec<u8>)>,
+    pub retained_namespaces: Vec<Network>,
+}
+// Resolve only schema-defined namespace FD attributes, before the topology
+// writer. Keep their original results/strong lifetimes until after that writer
+// drops; canonical validation below still chooses the error and its order.
+fn namespace_fds(request: &[u8], admin: bool) -> Vec<u32> {
+    if !admin
+        || request.len() < 32
+        || !matches!(
+            u16::from_le_bytes(request[4..6].try_into().unwrap()),
+            16 | 17 | 19
+        )
+    {
+        return Vec::new();
+    }
+    let Ok(a) = attrs(&request[32..]) else {
+        return Vec::new();
+    };
+    let mut fds = Vec::new();
+    if let Some(fd) = get(&a, 28).and_then(|v| u32v(v).ok()) {
+        fds.push(fd);
+    }
+    if let Some(info) = get(&a, 18).and_then(|v| attrs(v).ok()) {
+        if get(&info, 1).and_then(|v| text(v).ok()) == Some(b"veth".as_slice()) {
+            if let Some(data) = get(&info, 2).and_then(|v| attrs(v).ok()) {
+                if let Some(peer) = get(&data, 1).filter(|v| v.len() >= 16) {
+                    if let Ok(a) = attrs(&peer[16..]) {
+                        if let Some(fd) = get(&a, 28).and_then(|v| u32v(v).ok()) {
+                            fds.push(fd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fds
 }
 pub(crate) fn request(
     namespace: &crate::netlink::Namespace,
@@ -171,6 +207,11 @@ pub(crate) fn request(
     } else {
         request
     };
+    let mut namespaces = std::collections::BTreeMap::new();
+    for fd in namespace_fds(request, admin) {
+        namespaces.entry(fd).or_insert_with(|| resolve(fd));
+    }
+    let resolve = |fd| namespaces.get(&fd).cloned().unwrap_or(Err(NetError(9)));
     let ns = namespace.id();
     let mut graph = namespace.graph.write().unwrap();
     let mut changes = vec![];
@@ -599,12 +640,15 @@ pub(crate) fn request(
         Ok(())
     };
     let result = execute();
+    drop(graph);
+    let retained_namespaces = namespaces.into_values().filter_map(Result::ok).collect();
     if let Err(e) = result {
         let mut data = (-(e.0 as i32)).to_le_bytes().to_vec();
         data.extend_from_slice(&request[..16]);
         return Ok(Reply {
             messages: vec![message(2, 0, seq, port, &data)],
             changes: vec![],
+            retained_namespaces,
         });
     }
     if dump {
@@ -617,6 +661,7 @@ pub(crate) fn request(
     Ok(Reply {
         messages: out,
         changes,
+        retained_namespaces,
     })
 }
 fn address_data(d: &Device, a: Address) -> Vec<u8> {
