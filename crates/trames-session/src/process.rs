@@ -2939,6 +2939,7 @@ impl<C: Cpu> Kernel<C> {
             .filter(|file| file.local_message_entry().is_some())
             .cloned();
         let was_local = local.is_some();
+        let batch_signal_source = local.clone();
         let byte = if let Some(file) = local {
             p.byte_wait = None;
             p.retained_byte = None;
@@ -3143,7 +3144,10 @@ impl<C: Cpu> Kernel<C> {
             269 => a[3] & 0x4000 == 0,
             _ => false,
         };
-        let batch_pipe_signal = p.linux.take_batch_pipe_signal();
+        let batch_pipe_signal = p.linux.take_batch_pipe_signal()
+            || batch_signal_source
+                .as_ref()
+                .is_some_and(|file| file.batch_pipe_signal());
         if signal_pipe && raw == Some(error(Errno(32))) || batch_pipe_signal {
             Self::queue_one(pid, p, 13, pid);
         }

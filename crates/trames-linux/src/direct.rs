@@ -70,6 +70,7 @@ impl RetainedByte {
             || self
                 .datagram_target()
                 .is_some_and(|target| target.shares_resources(fds))
+            || self.batch_shares_resources(fds)
     }
 }
 impl PendingIo {
@@ -252,12 +253,12 @@ impl DirectSyscalls {
     }
     pub fn supports_local_message(&self, number: u32, fd: u32) -> bool {
         self.resources.is_some()
-            && (matches!(number, 211 | 212)
+            && (matches!(number, 211 | 212 | 269)
                 || matches!(number, 63..=66 | 206 | 207)
                     && self
                         .descriptors
                         .get(fd)
-                        .is_some_and(|fd| fd.is_addressed_datagram()))
+                        .is_some_and(|fd| fd.is_unix() && fd.local_kind() != 1))
     }
     pub fn invoke_socket_control(
         &self,
@@ -562,7 +563,7 @@ impl DirectSyscalls {
     pub fn supports(&self, number: u32, fd: u32) -> bool {
         // Classify the ABI before resolving an FD. Creation, pathname, clock
         // and other non-I/O calls must not look up argument zero as a number.
-        if !matches!(number,22|28|29|62..=66|86|87|206|207|210..=212|441) {
+        if !matches!(number,22|28|29|62..=66|86|87|206|207|210..=212|269|441) {
             return false;
         }
         if self.network.get(fd).is_some() {
@@ -573,9 +574,6 @@ impl DirectSyscalls {
             .is_some_and(|fd| Self::supports_fd(number, &fd))
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
-        if fd.is_unix() && fd.local_kind() != 1 && !fd.is_addressed_datagram() {
-            return matches!(number, 210..=212);
-        }
         if number == 62 {
             fd.is_kmsg()
         } else if matches!(number, 22 | 441) {
@@ -584,7 +582,7 @@ impl DirectSyscalls {
             fd.timer().is_some()
         } else if number == 28 {
             fd.is_inotify()
-        } else if matches!(number, 206 | 207 | 210..=212) {
+        } else if matches!(number, 206 | 207 | 210..=212 | 269) {
             fd.is_unix()
         } else if number == 29 {
             fd.has_readable_bytes()
@@ -781,7 +779,10 @@ impl DirectSyscalls {
         }
         // Addressed packet calls bind their target/input once at the retained
         // entry, before any queue effect, rather than probing then re-resolving.
-        if fd.is_addressed_datagram() && matches!(number, 63..=66 | 206 | 207 | 211 | 212) {
+        if fd.is_unix() && fd.local_kind() != 1 && matches!(number, 63..=66 | 206 | 207)
+            || fd.is_addressed_datagram() && matches!(number, 211 | 212)
+            || number == 269
+        {
             return None;
         }
         if matches!(number, 211 | 212) && self.resources.is_some() {
@@ -962,7 +963,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
-        if matches!(number, 206 | 207 | 211 | 212) && self.resources.is_some() {
+        if matches!(number, 206 | 207 | 211 | 212 | 269) && self.resources.is_some() {
             if let Some(attempt) = self.start_local_message(number, args, memory, pid, target) {
                 return Some(attempt);
             }
@@ -1198,7 +1199,9 @@ impl DirectSyscalls {
             .map(Ok)
             .or_else(|| self.retain_byte(number, args))?;
         Some(match retained {
-            Ok(file) if file.fd.is_addressed_datagram() && file.message.is_none() => {
+            Ok(file)
+                if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message.is_none() =>
+            {
                 IoAttempt::ByteCheckpoint(file)
             }
             Ok(file) => self.start_byte(file, number, args, memory, pid, target, false),
@@ -1214,8 +1217,8 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        if file.fd.is_addressed_datagram() && file.message.is_none() {
-            return match self.prepare_addressed_byte(&file, number, args, memory) {
+        if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message.is_none() {
+            return match self.prepare_packet_byte(&file, number, args, memory) {
                 Some(Ok(prepared)) => {
                     self.start_byte(prepared, number, args, memory, pid, target, true)
                 }
@@ -1433,7 +1436,7 @@ impl DirectSyscalls {
         };
         match result {
             Err(Errno(11)) => {
-                if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212)
+                if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269)
                     && pending.retained_byte.as_ref().map_or_else(
                         || {
                             pending.native_tcp.as_ref().map_or_else(
@@ -1568,14 +1571,14 @@ fn poll_deadline(
 
 fn socket_flags(number: u32, args: [u64; 6]) -> u32 {
     match number {
-        206 | 207 => args[3] as u32,
+        206 | 207 | 269 => args[3] as u32,
         211 | 212 => args[2] as u32,
         _ => 0,
     }
 }
 fn signals_pipe(number: u32, args: [u64; 6]) -> bool {
     matches!(number, 64 | 66)
-        || matches!(number, 206 | 211) && socket_flags(number, args) & 0x4000 == 0
+        || matches!(number, 206 | 211 | 269) && socket_flags(number, args) & 0x4000 == 0
 }
 
 #[cfg(test)]

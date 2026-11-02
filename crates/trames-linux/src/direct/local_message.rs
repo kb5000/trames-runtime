@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The shared original ancillary ABI on one accepted Unix transport.
 use super::*;
+mod batch;
+use batch::Batch;
+// Keep the existing single-message records inline in their Arc allocation.
+// Boxing them would add an allocation to every normal message for a cold batch.
+#[allow(clippy::large_enum_variant)]
+enum Transfer {
+    Single {
+        prepared: crate::network::unix::PreparedTransfer<trames_vfs::SharedRights>,
+        datagram: Option<crate::network::unix::DatagramState>,
+    },
+    Batch(Box<Batch>),
+}
 pub(super) struct AcceptedMessage {
-    prepared: crate::network::unix::PreparedTransfer<trames_vfs::SharedRights>,
-    datagram: Option<crate::network::unix::DatagramState>,
+    transfer: Transfer,
     factory: trames_vfs::DescriptorFactory,
     identity: [u32; 3],
     number: u32,
@@ -96,7 +107,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        if file.fd.is_addressed_datagram() {
+        if file.fd.is_unix() && file.fd.local_kind() != 1 {
             let direct = Self::default()
                 .with_resources(vfs.descriptor_factory())
                 .with_local_identity(
@@ -165,6 +176,28 @@ impl DirectSyscalls {
         let identity = self
             .local_identity
             .unwrap_or_else(|| factory.local_sender_credentials());
+        self.prepare_local_context(fd, number, args, memory, (factory, identity))
+    }
+    fn prepare_local_context(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+        (factory, identity): (&trames_vfs::DescriptorFactory, [u32; 3]),
+    ) -> Option<Result<RetainedByte, Errno>> {
+        if number == 269 {
+            return Some(Batch::new(args).map(|batch| RetainedByte {
+                fd: fd.clone(),
+                message: Some(Arc::new(AcceptedMessage {
+                    transfer: Transfer::Batch(Box::new(batch)),
+                    factory: factory.clone(),
+                    identity,
+                    number,
+                    args,
+                })),
+            }));
+        }
         let datagram = if fd.is_addressed_datagram() {
             Some(crate::network::unix::DatagramState::new(
                 fd.local_operation()?,
@@ -184,8 +217,7 @@ impl DirectSyscalls {
                 RetainedByte {
                     fd: fd.clone(),
                     message: Some(Arc::new(AcceptedMessage {
-                        prepared,
-                        datagram,
+                        transfer: Transfer::Single { prepared, datagram },
                         factory: factory.clone(),
                         identity,
                         number,
@@ -204,7 +236,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
         let fd = self.descriptors.get(args[0] as u32)?;
-        if !fd.is_unix() || matches!(number, 206 | 207) && !fd.is_addressed_datagram() {
+        if !fd.is_unix() || matches!(number, 206 | 207) && fd.local_kind() == 1 {
             return None;
         }
         Some(match self.prepare_local_fd(&fd, number, args, memory) {
@@ -213,7 +245,7 @@ impl DirectSyscalls {
             None => IoAttempt::Checkpoint,
         })
     }
-    pub(super) fn prepare_addressed_byte(
+    pub(super) fn prepare_packet_byte(
         &self,
         file: &RetainedByte,
         number: u32,
@@ -251,16 +283,22 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
         if let Some(accepted) = &file.message {
-            if let Err(error) = accepted.prepared.recheck(memory) {
+            let Transfer::Single { prepared, datagram } = &accepted.transfer else {
+                let Transfer::Batch(batch) = &accepted.transfer else {
+                    unreachable!()
+                };
+                return batch.progress(self, accepted, &file.fd, memory, None);
+            };
+            if let Err(error) = prepared.recheck(memory) {
                 return Some(Err(error));
             }
-            accepted.prepared.progress(
+            prepared.progress(
                 memory,
                 &mut Message {
                     factory: &accepted.factory,
                     fd: &file.fd,
                     identity: accepted.identity,
-                    datagram: accepted.datagram.as_ref(),
+                    datagram: datagram.as_ref(),
                     paths: self.paths.as_ref(),
                 },
             )
@@ -283,15 +321,19 @@ impl DirectSyscalls {
         let args = accepted.args;
         let socket = owner.local_socket(vfs).expect("original local OFD");
         let nonblocking = if file.fd.nonblocking() { 0x40 } else { 0 };
-        let mut retry = || {
-            crate::network::unix::progress_owned(
-                &accepted.prepared,
+        let fd = file.fd.clone();
+        let mut retry = || match &accepted.transfer {
+            Transfer::Single { prepared, datagram } => crate::network::unix::progress_owned(
+                prepared,
                 vfs,
                 &socket,
                 nonblocking,
                 memory,
-                accepted.datagram.as_ref(),
-            )
+                datagram.as_ref(),
+            ),
+            Transfer::Batch(batch) => batch
+                .progress(self, &accepted, &fd, memory, Some((vfs, &socket)))
+                .expect("owner batch progress"),
         };
         let result = retry();
         self.finish_owned_local(file, number, args, result, pid, target, retry)
@@ -367,14 +409,26 @@ impl DirectSyscalls {
 }
 impl RetainedByte {
     pub(super) fn datagram_target(&self) -> Option<&trames_vfs::LocalDatagram> {
-        self.message.as_ref()?.datagram.as_ref()?.target.get()
+        match &self.message.as_ref()?.transfer {
+            Transfer::Single { datagram, .. } => datagram.as_ref()?.target.get(),
+            Transfer::Batch(_) => None,
+        }
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
         let mut subscriptions = self.fd.subscribe(signal);
+        if let Some(Transfer::Batch(batch)) = self.message.as_ref().map(|m| &m.transfer) {
+            subscriptions.extend(batch.subscribe(signal));
+        }
         if let Some(target) = self.datagram_target() {
             subscriptions.push(target.subscribe(signal));
         }
         subscriptions
+    }
+    pub(super) fn batch_shares_resources(&self, fds: &DirectFds) -> bool {
+        matches!(self.message.as_ref().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.shares_resources(fds))
+    }
+    pub fn batch_pipe_signal(&self) -> bool {
+        matches!(self.message.as_ref().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.pipe_signal())
     }
     pub fn local_message_entry(&self) -> Option<(u32, [u64; 6])> {
         self.message.as_ref().map(|m| (m.number, m.args))
@@ -989,5 +1043,297 @@ mod tests {
             v.close(owner_socket).unwrap();
             m.write_array(0x1100, 0x1200u64.to_le_bytes()).unwrap();
         }
+    }
+    fn batch_headers(m: &mut Memory, messages: usize) {
+        m.write(0x1800, &vec![0; messages * 64]).unwrap();
+        for index in 0..messages as u64 {
+            let header = 0x1800 + index * 64;
+            m.write_array(header + 16, 0x1100u64.to_le_bytes()).unwrap();
+            m.write_array(header + 24, 1u64.to_le_bytes()).unwrap();
+        }
+    }
+    fn start_batch(d: &DirectSyscalls, fd: u32, count: u64, m: &mut Memory) -> IoAttempt {
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        d.start(
+            269,
+            [fd as u64, 0x1800, count, 0x4000, 0, 0],
+            m,
+            1,
+            &Arc::downgrade(&target),
+            None,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn worker_batches_preserve_packet_lengths_late_faults_and_post_send_copyout_order() {
+        for kind in [1, 2, 5] {
+            let mut v = Vfs::default();
+            let [tx, rx] = v.socketpair(1, kind, 0).unwrap();
+            let d = direct(&v);
+            let mut m = memory();
+            batch_headers(&mut m, 3);
+            assert!(matches!(
+                start_batch(&d, tx, 3, &mut m),
+                IoAttempt::Complete(Ok(3))
+            ));
+            for index in 0..3 {
+                assert_eq!(word(&m, 0x1838 + index * 64), 4);
+            }
+            if kind == 1 {
+                assert_eq!(v.read(rx, 12).unwrap(), b"abcdabcdabcd");
+            } else {
+                for _ in 0..3 {
+                    assert_eq!(v.read(rx, 12).unwrap(), b"abcd");
+                }
+            }
+            m.write_array(0x1850, 0x9000u64.to_le_bytes()).unwrap();
+            assert!(matches!(
+                start_batch(&d, tx, 3, &mut m),
+                IoAttempt::Complete(Ok(1))
+            ));
+            assert_eq!(v.read(rx, 12).unwrap(), b"abcd");
+            batch_headers(&mut m, 1);
+            m.protect(0x1000, 0x1000, Permissions::R).unwrap();
+            assert!(matches!(
+                start_batch(&d, tx, 1, &mut m),
+                IoAttempt::Complete(Err(Errno(14)))
+            ));
+            assert_eq!(
+                v.read(rx, 12).unwrap(),
+                b"abcd",
+                "length copyout faults after delivery"
+            );
+        }
+    }
+    #[test]
+    fn batch_capacity_wait_keeps_first_input_target_and_ofd_then_imports_later_messages_once() {
+        let (mut v, tx, rx) = datagrams();
+        let receiver = v.local_socket(rx).unwrap().unwrap();
+        receiver.set_reuse(8, 256).unwrap();
+        v.local_send_to(
+            &v.local_socket(tx).unwrap().unwrap(),
+            &[0x55; 512],
+            0,
+            Some(b"\x01\x00/target\0"),
+            Default::default(),
+        )
+        .unwrap();
+        let event = v.eventfd(77, 0).unwrap();
+        let d = datagram_direct(&v);
+        let mut m = memory();
+        batch_headers(&mut m, 2);
+        m.write(0x1400, b"\x01\x00/target\0").unwrap();
+        for header in [0x1800, 0x1840] {
+            m.write_array(header, 0x1400u64.to_le_bytes()).unwrap();
+            m.write_array(header + 8, 10u32.to_le_bytes()).unwrap();
+        }
+        rights(&mut m, &[event]);
+        m.write_array(0x1860, 0x1300u64.to_le_bytes()).unwrap();
+        m.write_array(0x1868, 24u64.to_le_bytes()).unwrap();
+        let wait = blocked(start_batch(&d, tx, 2, &mut m));
+        v.close(tx).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), tx);
+        v.unlink_at(-100, b"/target", false).unwrap();
+        let other = v.local_create(2, 0).unwrap();
+        v.local_bind(
+            &v.local_socket(other).unwrap().unwrap(),
+            b"\x01\x00/target\0",
+        )
+        .unwrap();
+        m.write(0x1200, b"next").unwrap();
+        assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+        assert!(wait.signal.ready());
+        assert!(matches!(
+            datagram_direct(&v)
+                .with_resources(Vfs::default().descriptor_factory())
+                .resume(wait, &mut m),
+            IoAttempt::Complete(Ok(2))
+        ));
+        assert_eq!(
+            receiver.recv(4, 0).unwrap().data,
+            b"abcd",
+            "waiting item uses original target and input"
+        );
+        let received = v.local_socket(other).unwrap().unwrap().recv(4, 0).unwrap();
+        assert_eq!(
+            received.data, b"next",
+            "next unaccepted item resolves independently"
+        );
+        let (fds, truncated) = v.receive_rights(received.rights, 1, false);
+        assert!(!truncated);
+        assert_eq!(v.read(fds[0], 8).unwrap(), 77u64.to_le_bytes());
+        assert_eq!(v.read(tx, 8).unwrap(), 99u64.to_le_bytes());
+    }
+    #[test]
+    fn batch_legacy_rights_handoff_resumes_at_the_original_next_item_after_source_reuse() {
+        let (mut v, tx, rx) = datagrams();
+        v.local_connect(&v.local_socket(tx).unwrap().unwrap(), b"\x01\x00/target\0")
+            .unwrap();
+        let legacy = v.local_create(1, 0).unwrap();
+        let d = datagram_direct(&v);
+        let mut m = memory();
+        batch_headers(&mut m, 3);
+        rights(&mut m, &[legacy]);
+        m.write_array(0x1860, 0x1300u64.to_le_bytes()).unwrap();
+        m.write_array(0x1868, 24u64.to_le_bytes()).unwrap();
+        let args = [tx as u64, 0x1800, 3, 0x4000, 0, 0];
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let file = match d
+            .start(269, args, &mut m, 1, &Arc::downgrade(&target), None)
+            .unwrap()
+        {
+            IoAttempt::ByteCheckpoint(f) => f,
+            _ => panic!("second item needs original owner"),
+        };
+        let owner = file.local_owner().unwrap();
+        v.close(tx).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), tx);
+        assert_eq!(
+            v.local_socket(rx)
+                .unwrap()
+                .unwrap()
+                .recv(4, 0)
+                .unwrap()
+                .data,
+            b"abcd"
+        );
+        assert!(matches!(
+            d.start_owned_local_message(file, &mut v, &owner, &mut m, 1, &Arc::downgrade(&target)),
+            IoAttempt::Complete(Ok(3))
+        ));
+        let second = v.local_socket(rx).unwrap().unwrap().recv(4, 0).unwrap();
+        assert_eq!(second.data, b"abcd");
+        let (fds, truncated) = v.receive_rights(second.rights, 1, false);
+        assert!(!truncated);
+        assert_eq!(v.fd_kind(fds[0]).unwrap(), v.fd_kind(legacy).unwrap());
+        assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
+        assert_eq!(
+            v.read(rx, 4),
+            Err(Errno(11)),
+            "first packet was not replayed"
+        );
+        assert_eq!(v.read(tx, 8).unwrap(), 99u64.to_le_bytes());
+    }
+    #[test]
+    fn batch_partial_epipe_keeps_positive_count_and_defers_only_task_signal_delivery() {
+        for no_signal in [false, true] {
+            let (mut v, tx, rx) = datagrams();
+            let bad = v.local_create(2, 0).unwrap();
+            let socket = v.local_socket(bad).unwrap().unwrap();
+            v.local_bind(&socket, b"\x01\x00/broken\0").unwrap();
+            socket.shutdown(0).unwrap();
+            let d = datagram_direct(&v);
+            let mut m = memory();
+            batch_headers(&mut m, 2);
+            m.write(0x1400, b"\x01\x00/target\0").unwrap();
+            m.write(0x1420, b"\x01\x00/broken\0").unwrap();
+            for (header, address) in [(0x1800, 0x1400u64), (0x1840, 0x1420)] {
+                m.write_array(header, address.to_le_bytes()).unwrap();
+                m.write_array(header + 8, 10u32.to_le_bytes()).unwrap();
+            }
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let args = [
+                tx as u64,
+                0x1800,
+                2,
+                if no_signal { 0x4000 } else { 0 },
+                0,
+                0,
+            ];
+            let attempt = d
+                .start(269, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap();
+            if no_signal {
+                assert!(matches!(attempt, IoAttempt::Complete(Ok(1))));
+            } else {
+                let file = match attempt {
+                    IoAttempt::ByteCheckpoint(file) => file,
+                    _ => panic!("SIGPIPE needs task authority"),
+                };
+                assert!(file.batch_pipe_signal());
+                let owner = file.local_owner().unwrap();
+                assert!(matches!(
+                    d.start_owned_local_message(
+                        file,
+                        &mut v,
+                        &owner,
+                        &mut m,
+                        1,
+                        &Arc::downgrade(&target)
+                    ),
+                    IoAttempt::Complete(Ok(1))
+                ));
+            }
+            assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
+            assert_eq!(v.read(rx, 4), Err(Errno(11)));
+        }
+    }
+    #[test]
+    fn worker_batch_zero_count_cap_short_stream_and_partial_eagain_keep_linux_results() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 2, 0).unwrap();
+        v.local_socket(rx)
+            .unwrap()
+            .unwrap()
+            .set_reuse(8, 256)
+            .unwrap();
+        v.write(tx, &[0x55; 508]).unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        batch_headers(&mut m, 2);
+        assert!(matches!(
+            start_batch(&d, tx, 2, &mut m),
+            IoAttempt::Complete(Ok(1))
+        ));
+        assert_eq!(v.read(rx, 512).unwrap(), [0x55; 508]);
+        assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
+        assert_eq!(v.read(rx, 4), Err(Errno(11)));
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        v.local_socket(rx)
+            .unwrap()
+            .unwrap()
+            .set_reuse(8, 256)
+            .unwrap();
+        v.write(tx, &[0x55; 510]).unwrap();
+        let d = direct(&v);
+        batch_headers(&mut m, 2);
+        assert!(matches!(
+            start_batch(&d, tx, 2, &mut m),
+            IoAttempt::Complete(Ok(1))
+        ));
+        assert_eq!(word(&m, 0x1838), 2);
+        assert_eq!(
+            v.read(rx, 512).unwrap(),
+            [vec![0x55; 510], b"ab".to_vec()].concat()
+        );
+        assert!(matches!(
+            start_batch(&d, tx, 0, &mut m),
+            IoAttempt::Complete(Ok(0))
+        ));
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        assert!(matches!(
+            d.start(
+                269,
+                [tx as u64, 0, 0, 0x8000_0000, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+                None
+            )
+            .unwrap(),
+            IoAttempt::Complete(Err(Errno(22)))
+        ));
+        m.map(0x3000, 0x10000, Permissions::RW).unwrap();
+        batch_headers(&mut m, 1024);
+        v.local_socket(rx)
+            .unwrap()
+            .unwrap()
+            .set_reuse(8, 8192)
+            .unwrap();
+        assert!(matches!(
+            start_batch(&d, tx, 1025, &mut m),
+            IoAttempt::Complete(Ok(1024))
+        ));
+        assert_eq!(v.read(rx, 4096).unwrap(), b"abcd".repeat(1024));
     }
 }

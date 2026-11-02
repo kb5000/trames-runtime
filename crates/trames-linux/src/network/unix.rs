@@ -653,6 +653,27 @@ impl Message {
     }
 }
 
+pub(crate) fn batch_owner_message(
+    vfs: &mut trames_vfs::Vfs,
+    socket: &std::rc::Rc<trames_vfs::LocalSocket>,
+    args: [u64; 6],
+    memory: &mut impl CpuMemory,
+    datagram: Option<&DatagramState>,
+) -> Result<u64> {
+    message(
+        211,
+        args,
+        memory,
+        &mut OwnerMessage {
+            vfs,
+            socket,
+            nonblocking: 0,
+            datagram,
+        },
+    )
+    .expect("owner batch item")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

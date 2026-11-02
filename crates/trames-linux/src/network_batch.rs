@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! AArch64 sendmmsg uses the existing sendmsg memory/socket path per message.
 use super::Linux;
-use trames_memory::Memory;
+use trames_memory::{CpuMemory, Memory};
 use trames_vfs::{Errno, FdKind};
 
 type Result<T> = std::result::Result<T, Errno>;
-fn word(memory: &Memory, address: u64, offset: u64) -> Result<u64> {
+fn word(memory: &impl CpuMemory, address: u64, offset: u64) -> Result<u64> {
     memory
         .read_array::<8>(address.checked_add(offset).ok_or(Errno(14))?)
         .map(u64::from_le_bytes)
         .map_err(|_| Errno(14))
 }
-fn requested(memory: &Memory, header: u64) -> Result<u64> {
+pub(crate) fn requested(memory: &impl CpuMemory, header: u64) -> Result<u64> {
     let vectors = word(memory, header, 16)?;
     let count = word(memory, header, 24)?;
     if count > 1024 {

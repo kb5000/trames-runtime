@@ -1548,3 +1548,46 @@ rights fallback, and one/two-slot filtered and unfiltered capacity waits. Batch
 sendmmsg/recvmmsg, Unix-bearing ancillary ownership, native-service adapters,
 structural VM/task transitions and remaining owner controls are still separate
 migration boundaries; this is not a claim that coordination has disappeared.
+
+## Retained Unix batches and paired packet bytes (2026-11-03)
+
+AF_UNIX sendmmsg now runs on workers for stream, datagram and seqpacket endpoints.
+The accepted full source OFD owns a per-call progress record. This record holds only
+completed count, the current accepted message and its resolved target; later headers
+are imported lazily using the original sendmsg decoder. Each addressed item gets its
+own canonical weak destination/notification capability. A waiting item keeps its
+copied bytes, rights, input records and original target, while a subsequent unaccepted
+item can legitimately observe a newer pathname binding or guest header.
+
+Errors after prior successes return the completed message count; EAGAIN after
+progress does not park the entire batch. First-item capacity waits subscribe/retry
+on the actual resource and release their execution slot. A short stream send ends
+the batch. The original compat-flag check, 1,024-message cap and post-transport
+msg_len copyout order remain: a length-copyout EFAULT cannot undo delivery.
+Owner fallback retains the original source and completed progress, so earlier
+messages are not replayed. Already accepted portable messages use their same
+prepared records through fallback. A still-unaccepted owner-only rights item keeps
+the original owner decoder/ledger boundary; its owner-only rights graph has not
+been made portable by this change.
+
+Partial EPIPE without MSG_NOSIGNAL preserves both the positive completed count
+and task-level SIGPIPE delivery. The worker records the terminal result and hands
+only task effects to the original owner; no packet is resent to rediscover EPIPE.
+The accepted syscall's mutex does not serialize unrelated calls or protect the
+socket algorithm: actual queue/Files/resource synchronization remains object-local.
+Single-message records stay inline in their existing Arc allocation; only the cold
+batch state is separately allocated. No service thread, bus or polling is added.
+
+Paired datagram/seqpacket read/write, readv/writev and sendto/recvfrom also use the
+same retained packet ABI as addressed datagrams. Vector calls preserve one packet,
+and legacy ancillary receive defers before dequeue using the original full OFD.
+The existing immediate paired sendmsg/recvmsg and stream hot paths are preserved.
+Filtered operations retain one entry decision across waits and owner/task handoff.
+
+Tests exercise lazy later faults, first-item waits, positive partial EAGAIN, short
+streams, post-send copyout faults, caps/empty batches, distinct addressed targets,
+close/reuse/rebind, legacy rights after earlier success and partial SIGPIPE delivery.
+Real guest tests cover all packet byte/message pairs on one/two slots and paired
+or addressed transports, plus batch-capacity and filtered signal handoff. Native
+TCP/UDP batches and owner-only ancillary/task effects remain boundaries. recvmmsg
+is currently unimplemented, rather than a migrated coordinator path.
