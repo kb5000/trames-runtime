@@ -111,7 +111,6 @@ impl OpenDescription {
             position: 0,
             anonymous,
             local: None,
-            pty: None,
             namespace,
             oom: None,
             network_control: None,
@@ -143,7 +142,6 @@ impl OpenDescription {
         if matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
             || self.anonymous.is_some() && self.control.is_none()
             || self.local.is_some()
-            || self.pty.is_some()
             || self.namespace.is_some() && self.namespace_resource.is_none()
             || self.oom.is_some()
             || self.network_control.is_some()
@@ -153,7 +151,8 @@ impl OpenDescription {
         {
             return false;
         }
-        self.namespace_resource.is_some()
+        self.pty.is_some()
+            || self.namespace_resource.is_some()
             || self.socket.is_some()
             || self.control.is_some()
             || self.pipe.is_some()

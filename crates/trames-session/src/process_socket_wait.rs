@@ -510,6 +510,111 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
 }
 
 #[test]
+fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.linux.vfs.set_runtime_info(1, Default::default());
+        let master = p
+            .linux
+            .vfs
+            .open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2, 0)
+            .unwrap();
+        let pair = p.linux.vfs.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let slave = p.linux.vfs.open_pty_peer(master, 2).unwrap();
+        p.memory.write_array(0x1000, 1u32.to_le_bytes()).unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut code = Vec::new();
+        for i in 0..8 {
+            let base = 0x1800 + i * 56;
+            code.extend([
+                mov(0, slave),
+                mov(8, 23),
+                0xd4000001,
+                0xaa0003f3,
+                mov(1, base),
+                0xf9000020,
+            ]);
+            // Use the master for controls; the slave alias exercises real
+            // endpoint dup/close, without generating a task hangup boundary.
+            for (j, request) in [0x80045430u32, 0x40045431, 0x80045439, 0x5420, 0x80045438]
+                .into_iter()
+                .enumerate()
+            {
+                let address = match request {
+                    0x40045431 | 0x5420 => 0x1000,
+                    0x80045430 => 0x1010,
+                    0x80045439 => 0x1014,
+                    _ => 0x1018,
+                };
+                code.extend([
+                    mov(0, master),
+                    mov(1, request & 0xffff),
+                    0xf2a00001 | ((request >> 16) << 5),
+                    mov(2, address),
+                    mov(8, 29),
+                    0xd4000001,
+                    mov(1, base + (j as u32 + 1) * 8),
+                    0xf9000020,
+                ]);
+            }
+            code.extend([
+                0xaa1303e0,
+                mov(8, 57),
+                0xd4000001,
+                mov(1, base + 48),
+                0xf9000020,
+            ]);
+        }
+        code.push(0x14000000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..8 {
+                for (j, value) in [5, 0, 0, 0, 0, 0, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + i * 56 + j as u64 * 8).unwrap(),
+                        value,
+                        "slots={slots} iteration={i} call={j}"
+                    );
+                }
+            }
+            assert_eq!(
+                p.memory.read_array::<4>(0x1010).unwrap(),
+                pair.number.to_le_bytes()
+            );
+            assert_eq!(
+                p.memory.read_array::<4>(0x1014).unwrap(),
+                1u32.to_le_bytes()
+            );
+            assert_eq!(
+                p.memory.read_array::<4>(0x1018).unwrap(),
+                1u32.to_le_bytes()
+            );
+            assert_eq!(p.seccomp.evaluations(), 112);
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 112);
+    }
+}
+
+#[test]
 fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decision() {
     for slots in [1, 2] {
         let mut p = super::tests::process();

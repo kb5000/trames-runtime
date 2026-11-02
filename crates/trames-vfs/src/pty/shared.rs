@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Only the terminal and endpoint state cross the worker boundary. Namespace,
-//! devpts nodes, FD ownership and signal delivery stay with their owners.
+//! Shared terminal queues and endpoint leases. Full PTY OFDs retain the real
+//! devpts resources; task/job-control signal delivery still joins its owner.
 use super::*;
 use crate::readiness::Readiness;
 use std::sync::{

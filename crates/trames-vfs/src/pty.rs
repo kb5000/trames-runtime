@@ -7,30 +7,30 @@ pub use shared::{PtyIo, PtySlaveEndpoint, TerminalAccess};
 
 pub struct Pty {
     pub number: u32,
-    pub(super) mount: Option<Rc<Mount>>,
+    pub(super) mount: Option<Arc<mounts::MountData>>,
     slave: NodeRef,
     pub(super) io: Arc<PtyIo>,
-    pub locked: Cell<bool>,
-    pub hangup_notified: Cell<bool>,
-    pub host_resize_pending: Cell<bool>,
-    pub host_signals: Cell<u64>,
+    pub locked: std::sync::atomic::AtomicBool,
+    pub hangup_notified: std::sync::atomic::AtomicBool,
+    pub host_resize_pending: std::sync::atomic::AtomicBool,
+    pub host_signals: AtomicU64,
 }
 pub struct PtyEnd {
-    pub pair: Rc<Pty>,
+    pub pair: Arc<Pty>,
     pub master: bool,
     slave: Option<Arc<PtySlaveEndpoint>>,
 }
 impl PtyEnd {
-    pub(super) fn new(pair: Rc<Pty>, master: bool) -> Rc<Self> {
+    pub(super) fn new(pair: Arc<Pty>, master: bool) -> Arc<Self> {
         let slave = (!master).then(|| PtySlaveEndpoint::open(pair.io.clone()));
-        Rc::new(Self {
+        Arc::new(Self {
             pair,
             master,
             slave,
         })
     }
-    /// Capture only for an accepted operation. The master still requires its
-    /// devpts and task/job-control close effects and has no shared lease yet.
+    /// Capture only for an accepted operation. Prepared byte snapshots retain
+    /// neither endpoint; accepted shared OFDs retain the complete PtyEnd.
     pub fn slave_endpoint(&self) -> Option<Arc<PtySlaveEndpoint>> {
         self.slave.clone()
     }
@@ -70,7 +70,8 @@ impl Pty {
         let before = tty.window;
         tty.resize(rows, columns);
         if before != tty.window {
-            self.host_resize_pending.set(true);
+            self.host_resize_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
     pub(super) fn private(&self) -> bool {
@@ -86,20 +87,25 @@ impl Vfs {
         self.controlling_terminal = id;
         Ok(())
     }
-    pub fn pty(&self, fd: u32) -> Result<Option<Rc<PtyEnd>>> {
+    pub fn pty(&self, fd: u32) -> Result<Option<Arc<PtyEnd>>> {
         Ok(self.descriptor(fd)?.open.borrow().pty.clone())
     }
-    pub fn pty_by_id(&self, id: u32) -> Option<Rc<Pty>> {
-        self.ptys.borrow().get(&id).and_then(Weak::upgrade)
-    }
-    pub fn live_ptys(&self) -> Vec<Rc<Pty>> {
+    pub fn pty_by_id(&self, id: u32) -> Option<Arc<Pty>> {
         self.ptys
-            .borrow()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+    pub fn live_ptys(&self) -> Vec<Arc<Pty>> {
+        self.ptys
+            .lock()
+            .unwrap()
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
             .collect()
     }
-    pub(super) fn allocate_pty(&mut self, at: &ResolvedPath) -> Result<Rc<PtyEnd>> {
+    pub(super) fn allocate_pty(&mut self, at: &ResolvedPath) -> Result<Arc<PtyEnd>> {
         // A /dev/ptmx device node refers to the devpts mounted beside it;
         // devpts/ptmx and bind mounts retain the filesystem they came from.
         let mount = if at.mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
@@ -152,17 +158,17 @@ impl Vfs {
             node.borrow_mut().gid = 5;
             (id, node)
         };
-        let pair = Rc::new(Pty {
+        let pair = Arc::new(Pty {
             number,
-            mount,
+            mount: mount.map(|m| m.shared.clone()),
             slave,
             io: Arc::new(PtyIo::new(id, tty)),
-            locked: Cell::new(true),
-            hangup_notified: Cell::new(false),
-            host_resize_pending: Cell::new(false),
-            host_signals: Cell::new(0),
+            locked: std::sync::atomic::AtomicBool::new(true),
+            hangup_notified: std::sync::atomic::AtomicBool::new(false),
+            host_resize_pending: std::sync::atomic::AtomicBool::new(false),
+            host_signals: AtomicU64::new(0),
         });
-        self.ptys.borrow_mut().insert(id, Rc::downgrade(&pair));
+        self.ptys.lock().unwrap().insert(id, Arc::downgrade(&pair));
         Ok(PtyEnd::new(pair, true))
     }
     /// TIOCGPTPEER follows the master's devpts identity even after chroot or
@@ -172,7 +178,7 @@ impl Vfs {
         if flags & !(3 | 0x100 | O_NONBLOCK | O_CLOEXEC) != 0 || flags & 3 != 2 {
             return Err(Errno(22));
         }
-        if end.pair.locked.get() {
+        if end.pair.locked.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Errno(5));
         }
         let fd = self.available(0)?;
@@ -208,6 +214,7 @@ impl Vfs {
                         ofd_records: Default::default(),
                         node: Some(node),
                         pipe: None,
+                        pty: Some(PtyEnd::new(end.pair.clone(), false)),
                         bridge: None,
                         kernel_log: None,
                         notification: None,
@@ -219,8 +226,7 @@ impl Vfs {
                     network_control: None,
                     mount_file: None,
                     oom: None,
-                    mount: end.pair.mount.clone().map(OpenMount::Owner),
-                    pty: Some(PtyEnd::new(end.pair.clone(), false)),
+                    mount: end.pair.mount.clone().map(OpenMount::Shared),
                 }),
                 cloexec: (flags & O_CLOEXEC != 0).into(),
             },
@@ -349,11 +355,16 @@ mod tests {
         v.set_runtime_info(1, RuntimeInfo::default());
         mount(&mut v, b"/pts");
         let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
-        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        v.pty(master)
+            .unwrap()
+            .unwrap()
+            .pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let slave = v.open_pty_peer(master, 2).unwrap();
         let direct = v.direct_descriptors();
-        let read = direct.get(master).unwrap();
-        let write = direct.get(slave).unwrap();
+        let read = DirectFd::snapshot(&v.descriptor(master).unwrap().open.borrow()).unwrap();
+        let write = DirectFd::snapshot(&v.descriptor(slave).unwrap().open.borrow()).unwrap();
         let access = Some(TerminalAccess {
             session: 0,
             group: 0,
@@ -369,6 +380,40 @@ mod tests {
         assert_eq!(write.terminal_write(b"closed", access), Some(Err(Errno(5))));
         assert_eq!(write.terminal_read(1, access), Some(Ok(vec![])));
         assert_eq!(write.poll_ready(5), Some(25));
+        assert!(direct.get(master).is_none());
+        assert!(direct.get(slave).is_none());
+    }
+    #[test]
+    fn accepted_master_pins_devpts_across_close_reuse_and_worker_final_drop() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Pty>();
+        send_sync::<PtyEnd>();
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked.store(false, Ordering::Relaxed);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let accepted = v.direct_descriptors().get(master).unwrap();
+        let accepted_slave = v.direct_descriptors().get(slave).unwrap();
+        v.close(master).unwrap();
+        v.close(slave).unwrap();
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/replacement", 0x42, 0o600).unwrap(),
+            master
+        );
+        assert!(pair.master_alive.load(Ordering::Relaxed));
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        assert!(v.stat_at(AT_FDCWD, b"/pts/0").is_ok());
+        std::thread::spawn(move || drop(accepted)).join().unwrap();
+        assert!(!pair.master_alive.load(Ordering::Relaxed));
+        assert!(matches!(v.stat_at(AT_FDCWD, b"/pts/0"), Err(Errno(2))));
+        assert_eq!(accepted_slave.poll_ready(5), Some(25));
+        std::thread::spawn(move || drop(accepted_slave))
+            .join()
+            .unwrap();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn accepted_slave_survives_alias_close_and_fd_reuse_then_worker_notifies_hup() {
@@ -391,7 +436,8 @@ mod tests {
         mount(&mut v, b"/pts");
         let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
         let pair = v.pty(master).unwrap().unwrap().pair.clone();
-        pair.locked.set(false);
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(v.pty(master).unwrap().unwrap().slave_endpoint().is_none());
         let slave = v.open_pty_peer(master, 2).unwrap();
         let lease = v.pty(slave).unwrap().unwrap().slave_endpoint().unwrap();
@@ -435,7 +481,8 @@ mod tests {
         mount(&mut v, b"/pts");
         let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
         let pair = v.pty(master).unwrap().unwrap().pair.clone();
-        pair.locked.set(false);
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let first = v.open_pty_peer(master, 2).unwrap();
         let second = v.open_at(AT_FDCWD, b"/pts/0", 2, 0).unwrap();
         let one = v.pty(first).unwrap().unwrap().slave_endpoint().unwrap();
@@ -482,7 +529,8 @@ mod tests {
         mount(&mut v, b"/pts");
         let master = v.open_at(AT_FDCWD, b"/pts/ptmx", 2, 0).unwrap();
         let pair = v.pty(master).unwrap().unwrap().pair.clone();
-        pair.locked.set(false);
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let slave = v.open_pty_peer(master, 2).unwrap();
         let lease = v.pty(slave).unwrap().unwrap().slave_endpoint().unwrap();
         let bytes = v.direct_descriptors();
@@ -529,7 +577,12 @@ mod tests {
                 0o20000
             );
         }
-        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        v.pty(master)
+            .unwrap()
+            .unwrap()
+            .pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let slave = v.open_pty_peer(master, 2).unwrap();
         assert_eq!(v.stat_fd(slave).unwrap()[8..16], 3u64.to_le_bytes());
         v.open_at(AT_FDCWD, b"/ptmx-alias", 0x42, 0o600).unwrap();
@@ -585,7 +638,9 @@ mod tests {
             v.open_at(AT_FDCWD, slave_link.as_bytes(), 2, 0),
             Err(Errno(5))
         );
-        a.pair.locked.set(false);
+        a.pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let slave = v.open_at(AT_FDCWD, slave_link.as_bytes(), 2, 0).unwrap();
         assert!(!v.pty(slave).unwrap().unwrap().master);
         assert_eq!(a.pair.slaves.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -609,12 +664,16 @@ mod tests {
         assert_eq!((pa.pair.number, pb.pair.number), (0, 0));
         assert_ne!(pa.pair.id, pb.pair.id);
         assert_eq!(v.open_at(AT_FDCWD, b"/pts-a/0", 2, 0), Err(Errno(5)));
-        pa.pair.locked.set(false);
-        pb.pair.locked.set(false);
+        pa.pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        pb.pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let sa = v.open_pty_peer(a, 2 | O_CLOEXEC).unwrap();
         let sb = v.open_at(AT_FDCWD, b"/pts-b/0", 2, 0).unwrap();
-        assert!(Rc::ptr_eq(&v.pty(sa).unwrap().unwrap().pair, &pa.pair));
-        assert!(Rc::ptr_eq(&v.pty(sb).unwrap().unwrap().pair, &pb.pair));
+        assert!(Arc::ptr_eq(&v.pty(sa).unwrap().unwrap().pair, &pa.pair));
+        assert!(Arc::ptr_eq(&v.pty(sb).unwrap().unwrap().pair, &pb.pair));
         let x = v.stat_fd(sa).unwrap();
         let y = v.stat_fd(sb).unwrap();
         assert_ne!(&x[..8], &y[..8]);
@@ -648,7 +707,7 @@ mod tests {
         // still refer to the old, unlinked object, never the replacement PTY.
         assert_eq!(v.stat_fd(sa).unwrap()[8..16], 3u64.to_le_bytes());
         assert_eq!(v.stat_fd(sa).unwrap()[20..24], 0u32.to_le_bytes());
-        assert!(!Rc::ptr_eq(
+        assert!(!Arc::ptr_eq(
             &v.pty(sa).unwrap().unwrap().pair,
             &v.pty(again).unwrap().unwrap().pair
         ));
@@ -662,7 +721,12 @@ mod tests {
         v.mkdir_at(AT_FDCWD, b"/alias", 0o755).unwrap();
         v.mount(Some(b"/pts"), b"/alias", None, 4096, None).unwrap();
         let fd = v.open_at(AT_FDCWD, b"/alias/ptmx", 2, 0).unwrap();
-        v.pty(fd).unwrap().unwrap().pair.locked.set(false);
+        v.pty(fd)
+            .unwrap()
+            .unwrap()
+            .pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let mut child = v.clone();
         child.unshare_mounts().unwrap();
         assert_eq!(

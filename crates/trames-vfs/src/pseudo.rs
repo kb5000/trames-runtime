@@ -1078,6 +1078,7 @@ impl Vfs {
                 ofd_records: Default::default(),
                 node: Some(node),
                 pipe: None,
+                pty: None,
                 bridge: None,
                 kernel_log: None,
                 notification: None,
@@ -1085,7 +1086,6 @@ impl Vfs {
             position: 0,
             anonymous: None,
             local: None,
-            pty: None,
             namespace: None,
             network_control: None,
             mount_file: None,
@@ -1288,7 +1288,7 @@ impl Vfs {
                 }
                 Content::Device(Device::Pts(id, _)) if id != 0 => {
                     let pair = self.pty_by_id(id).ok_or(Errno(5))?;
-                    if pair.locked.get()
+                    if pair.locked.load(std::sync::atomic::Ordering::Relaxed)
                         || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         return Err(Errno(5));
@@ -1339,6 +1339,7 @@ impl Vfs {
                 ofd_records: Default::default(),
                 node: original.node.clone(),
                 pipe,
+                pty,
                 bridge: original.bridge.clone(),
                 kernel_log: None,
                 notification,
@@ -1346,7 +1347,6 @@ impl Vfs {
             position: 0,
             anonymous: None,
             local: None,
-            pty,
             namespace: original.namespace.clone(),
             network_control: original.network_control.clone(),
             oom: original.oom.clone(),

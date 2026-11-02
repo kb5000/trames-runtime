@@ -434,6 +434,62 @@ mod tests {
         epoch.finish();
     }
     #[test]
+    fn pty_rights_retain_real_endpoints_after_source_close_and_reuse() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let master = v.open_at(-100, b"/dev/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        rights(&mut m, &[master, slave]);
+        assert_eq!(
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        for fd in [master, slave] {
+            v.close(fd).unwrap();
+            assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+        }
+        assert!(pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(pair.slaves.load(std::sync::atomic::Ordering::Relaxed), 1);
+        header(&mut m, 24);
+        assert_eq!(
+            d.invoke(212, [rx as u64, 0x1000, 0x40000000, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        let got_master = word(&m, 0x1310);
+        let got_slave = word(&m, 0x1314);
+        assert_eq!(
+            d.invoke(29, [got_master as u64, 0x80045430, 0x1400, 0, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        assert_eq!(word(&m, 0x1400), pair.number);
+        let bytes = direct(&v).with_terminal(trames_vfs::TerminalAccess {
+            session: 0,
+            group: 0,
+            controlling: None,
+            ignore_ttou: false,
+        });
+        m.write(0x1400, b"live").unwrap();
+        assert_eq!(
+            bytes.invoke(64, [got_slave as u64, 0x1400, 4, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        assert_eq!(
+            bytes.invoke(63, [got_master as u64, 0x1500, 4, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        assert_eq!(m.read_array::<4>(0x1500).unwrap(), *b"live");
+        v.close(got_master).unwrap();
+        assert!(!pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
+        v.close(got_slave).unwrap();
+        assert_eq!(pair.slaves.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    #[test]
     fn signal_bpf_and_namespace_rights_use_original_shared_objects_after_source_reuse() {
         let mut v = Vfs::default();
         v.set_runtime_info(

@@ -193,10 +193,13 @@ impl<C: Cpu> Kernel<C> {
             // installs guest FDs, so it does not require returning their Views.
             root.linux.vfs.pump_native_services();
             if root.linux.vfs.live_ptys().iter().any(|pair| {
-                pair.host_resize_pending.get()
-                    || pair.host_signals.get() != 0
+                pair.host_resize_pending
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    || pair.host_signals.load(std::sync::atomic::Ordering::Relaxed) != 0
                     || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
-                        && !pair.hangup_notified.get()
+                        && !pair
+                            .hangup_notified
+                            .load(std::sync::atomic::Ordering::Relaxed)
             }) {
                 return Ok(true);
             }

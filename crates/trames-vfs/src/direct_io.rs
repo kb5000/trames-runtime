@@ -367,31 +367,40 @@ impl DirectFd {
         }
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        let resource = match &open.control {
-            // Sharing OFD ownership grants no creator-task signal queue or
-            // BPF byte authority. These retain their original ABI handling.
-            Some(events::SharedControl::Signal(_) | events::SharedControl::Bpf(_)) => return None,
-            Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
-            Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
-            Some(events::SharedControl::Inotify(instance)) => {
-                ByteResource::Inotify(instance.capability())
+        let resource = if let Some(end) = &open.pty {
+            ByteResource::Pty {
+                data: end.pair.io.clone(),
+                master: end.master,
             }
-            Some(events::SharedControl::Epoll(live)) => {
-                if live.owner_count() != 0 {
-                    return None;
+        } else {
+            match &open.control {
+                // Sharing OFD ownership grants no creator-task signal queue or
+                // BPF byte authority. These retain their original ABI handling.
+                Some(events::SharedControl::Signal(_) | events::SharedControl::Bpf(_)) => {
+                    return None
                 }
-                ByteResource::Epoll(DirectEpoll {
-                    watches: None,
-                    live: live.clone(),
-                })
-            }
-            None => {
-                let end = open.pipe.as_ref()?;
-                ByteResource::Pipe {
-                    data: end.data.clone(),
-                    read: end.read,
-                    write: end.write,
-                    initial_write_epoch: end.initial_write_epoch,
+                Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
+                Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
+                Some(events::SharedControl::Inotify(instance)) => {
+                    ByteResource::Inotify(instance.capability())
+                }
+                Some(events::SharedControl::Epoll(live)) => {
+                    if live.owner_count() != 0 {
+                        return None;
+                    }
+                    ByteResource::Epoll(DirectEpoll {
+                        watches: None,
+                        live: live.clone(),
+                    })
+                }
+                None => {
+                    let end = open.pipe.as_ref()?;
+                    ByteResource::Pipe {
+                        data: end.data.clone(),
+                        read: end.read,
+                        write: end.write,
+                        initial_write_epoch: end.initial_write_epoch,
+                    }
                 }
             }
         };
@@ -669,6 +678,10 @@ impl DirectFd {
     }
     pub fn is_pty(&self) -> bool {
         matches!(self.resource, ByteResource::Pty { .. })
+    }
+    /// Only an accepted full OFD grants control authority; byte snapshots do not.
+    pub fn pty_endpoint(&self) -> Option<&PtyEnd> {
+        self._file.as_ref()?.open.pty.as_deref()
     }
     pub fn is_inotify(&self) -> bool {
         matches!(self.resource, ByteResource::Inotify(_))

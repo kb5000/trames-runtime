@@ -563,7 +563,8 @@ impl DirectSyscalls {
         Self::supports_fd(number, fd)
             && (number != 29
                 || args[1] as u32 == 0x541b
-                || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413))
+                || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413)
+                || fd.pty_endpoint().is_some() && crate::pty_control_request(args[1] as u32))
     }
     fn invoke_control(
         &self,
@@ -619,7 +620,8 @@ impl DirectSyscalls {
                     .descriptors
                     .get(args[0] as u32)
                     .is_some_and(|fd| fd.is_pty())
-                    && matches!(args[1] as u32, 0x5401 | 0x5413))
+                    && (matches!(args[1] as u32, 0x5401 | 0x5413)
+                        || crate::pty_control_request(args[1] as u32)))
     }
     fn transfer(
         &self,
@@ -794,6 +796,14 @@ impl DirectSyscalls {
                 self.started.unwrap_or_else(Instant::now),
             ),
             29 => (|| {
+                if crate::pty_control_request(args[1] as u32) {
+                    return crate::pty_control(
+                        fd.pty_endpoint().expect("accepted PTY endpoint"),
+                        args[1] as u32,
+                        args[2],
+                        memory,
+                    );
+                }
                 if args[1] as u32 != 0x541b {
                     let bytes = fd.terminal_query(args[1] as u32).expect("terminal query");
                     Linux::check(memory, args[2], bytes.len(), Access::Write)?;
@@ -1941,7 +1951,12 @@ mod tests {
         let master = v
             .open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2 | O_NONBLOCK, 0)
             .unwrap();
-        v.pty(master).unwrap().unwrap().pair.locked.set(false);
+        v.pty(master)
+            .unwrap()
+            .unwrap()
+            .pair
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let slave = v.open_pty_peer(master, 2 | O_NONBLOCK).unwrap();
         let direct =
             DirectSyscalls::new(v.direct_descriptors()).with_terminal(trames_vfs::TerminalAccess {
@@ -2014,6 +2029,62 @@ mod tests {
             direct.invoke(63, [slave as u64, 0x1100, 1, 0, 0, 0], &mut m),
             Some(Err(Errno(11)))
         );
+    }
+    #[test]
+    fn pty_short_controls_keep_original_endpoint_fault_order_and_shared_state() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let master = v.open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let slave = v.open_pty_peer(master, 2).unwrap();
+        let alias = v.dup(master, 0, false).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let mut m = memory();
+        for request in [0x80045430, 0x40045431, 0x80045439, 0x5420, 0x80045438] {
+            assert_eq!(
+                direct.invoke(29, [slave as u64, request, 0, 0, 0, 0], &mut m),
+                Some(Err(Errno(25)))
+            );
+            assert_eq!(
+                direct.invoke(29, [alias as u64, request, 0x1fff, 0, 0, 0], &mut m),
+                Some(Err(Errno(14)))
+            );
+        }
+        assert!(!pair.locked.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!pair.packet.load(std::sync::atomic::Ordering::Relaxed));
+        for (set, get) in [(0x40045431, 0x80045439), (0x5420, 0x80045438)] {
+            m.write_array(0x1100, 7u32.to_le_bytes()).unwrap();
+            assert_eq!(
+                direct.invoke(29, [alias as u64, set, 0x1100, 0, 0, 0], &mut m),
+                Some(Ok(0))
+            );
+            assert_eq!(
+                direct.invoke(29, [master as u64, get, 0x1200, 0, 0, 0], &mut m),
+                Some(Ok(0))
+            );
+            assert_eq!(m.read_array::<4>(0x1200).unwrap(), 1u32.to_le_bytes());
+        }
+        v.close(alias).unwrap();
+        assert_eq!(
+            v.open_at(trames_vfs::AT_FDCWD, b"/replacement", 0x42, 0o600)
+                .unwrap(),
+            alias
+        );
+        assert_eq!(
+            direct.invoke(29, [alias as u64, 0x80045430, 0x1200, 0, 0, 0], &mut m),
+            None
+        );
+        assert_eq!(
+            direct.invoke(29, [master as u64, 0x80045430, 0x1200, 0, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        assert_eq!(
+            m.read_array::<4>(0x1200).unwrap(),
+            pair.number.to_le_bytes()
+        );
+        assert!(!direct.supports_call(29, [master as u64, 0x5441, 2, 0, 0, 0]));
     }
     #[test]
     fn timer_control_preflights_outputs_and_keeps_relative_and_absolute_state() {

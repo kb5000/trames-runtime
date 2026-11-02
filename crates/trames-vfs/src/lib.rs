@@ -183,7 +183,6 @@ struct OpenDescription {
     position: u64,
     anonymous: Option<events::Anonymous>,
     local: Option<Rc<LocalSocket>>,
-    pty: Option<Rc<PtyEnd>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<std::sync::Weak<OomTask>>,
     network_control: Option<network::Control>,
@@ -216,6 +215,7 @@ struct SharedOpenDescription {
     // Overlay read descriptions retain the real lower file selected at open.
     read_node: Option<NodeRef>,
     pipe: Option<Arc<PipeEnd>>,
+    pty: Option<Arc<PtyEnd>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
     kernel_log: Option<Arc<kernel_log::Kmsg>>,
     notification: Option<Arc<FileClose>>,
@@ -249,6 +249,7 @@ impl Drop for OpenDescription {
 impl Drop for SharedOpenDescription {
     fn drop(&mut self) {
         if self.pipe.is_some()
+            || self.pty.is_some()
             || self.kernel_log.is_some()
             || self.control.is_some()
             || self.native_image.is_some()
@@ -598,10 +599,10 @@ pub struct Vfs {
     next_open: Arc<AtomicU64>,
     proc_accessed: Cell<bool>,
     proc_refresh: Cell<ProcRefresh>,
-    ptys: Rc<RefCell<BTreeMap<u32, Weak<Pty>>>>,
+    ptys: Arc<std::sync::Mutex<BTreeMap<u32, std::sync::Weak<Pty>>>>,
     embedding_terminal: Rc<Cell<bool>>,
     pub controlling_terminal: Option<u32>,
-    controlling_pair: Option<Rc<Pty>>,
+    controlling_pair: Option<Arc<Pty>>,
     bridge: Option<trames_bridge::Broker>,
 }
 impl Clone for Vfs {
@@ -705,7 +706,7 @@ impl Vfs {
             cgroups: Rc::default(),
             dumpable: Rc::new(Cell::new(true)),
             pid: 1,
-            ptys: Rc::default(),
+            ptys: Arc::default(),
             embedding_terminal: Rc::default(),
             controlling_terminal: None,
             controlling_pair: None,
@@ -771,6 +772,7 @@ impl Default for Vfs {
                             ofd_records: Default::default(),
                             node: None,
                             pipe: None,
+                            pty: None,
                             bridge: None,
                             kernel_log: None,
                             notification: None,
@@ -778,7 +780,6 @@ impl Default for Vfs {
                         position: 0,
                         anonymous: None,
                         local: None,
-                        pty: None,
                         namespace: None,
                         network_control: None,
                         mount_file: None,
@@ -1104,6 +1105,7 @@ impl Vfs {
                             ofd_records: Default::default(),
                             node: None,
                             pipe: None,
+                            pty: None,
                             bridge: None,
                             kernel_log: None,
                             notification: None,
@@ -1111,7 +1113,6 @@ impl Vfs {
                         position: 0,
                         anonymous: None,
                         local: None,
-                        pty: None,
                         namespace: None,
                         network_control: None,
                         mount_file: None,
@@ -2199,7 +2200,7 @@ impl Vfs {
                 Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty(&p)?),
                 Content::Device(pseudo::Device::Pts(id, _)) if id != 0 => {
                     let pair = self.pty_by_id(id).ok_or(Errno(5))?;
-                    if pair.locked.get()
+                    if pair.locked.load(std::sync::atomic::Ordering::Relaxed)
                         || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         return Err(Errno(5));
@@ -2277,6 +2278,7 @@ impl Vfs {
                     ofd_records: Default::default(),
                     node: Some(node),
                     pipe,
+                    pty,
                     bridge,
                     kernel_log,
                     notification,
@@ -2285,7 +2287,6 @@ impl Vfs {
                 mount: p.mount.map(OpenMount::Owner),
                 anonymous: None,
                 local: None,
-                pty,
                 namespace: None,
                 network_control,
                 mount_file,

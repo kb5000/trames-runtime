@@ -1279,3 +1279,40 @@ the committed unfixed code and completes on the corrected code. Cold concurrent
 creation remains part of functional validation; timing comparisons can prepare
 contents sequentially to compare identical hot-loop work without concealing the
 recorded baseline deadlock.
+
+## Shared PTY ownership and worker controls (2026-11-03)
+
+A PTY's actual open description now owns an `Arc<PtyEnd>`. Its pair retains the
+original terminal queues, slave inode and shared devpts mount resources, with no
+owner-local `Rc` graph admitted across a worker boundary. The weak pair registry
+is shared under its own short object lock; registry enumeration releases that
+lock before filesystem, terminal or notification work. Original single-field
+lock, resize, signal and hangup states use relaxed atomics. Host signal publication
+uses fetch-or and consumption uses swap, preserving concurrent pending bits.
+
+Shared Files operations, dup/close, flags and portable Unix rights operate on the
+same original PTY OFD. An accepted byte/control operation retains the complete OFD
+through completion or a parked wait, so numeric close/reuse cannot redirect it.
+Prepared byte/poll snapshots retain only weak OFD identity and the queue resource;
+they do not keep guest endpoints alive. Independently opening a slave creates a
+new slave lease; aliases and rights retain the original open. Final master drop
+marks it dead, notifies waiters and unlinks only its original devpts slave inode.
+Final slave drop updates its real endpoint count and notifies after resource locks
+have been released. Shared OFD final close invalidates cached descriptor watches.
+
+TIOCGPTN, TIOCSPTLCK, TIOCGPTLCK, TIOCPKT and TIOCGPKT use one common owner/worker
+ABI implementation. A worker accepts the original full OFD before accessing guest
+memory; prepared queue capabilities alone grant no endpoint control authority.
+Slave requests retain ENOTTY before pointer faults, and failed setters leave state
+untouched. Existing terminal attributes/window queries and ordinary foreground
+byte I/O continue using the same terminal object and original process authority.
+No resource server, message bus, global terminal lock or additional memory barrier
+is introduced.
+
+PTY allocation, pathname/open permissions and TIOCGPTPEER still use namespace and
+device-cgroup authority on the joined path. Controlling-terminal/session changes,
+background job checks requiring signals, host resize/signal routing and master
+hangup task effects also retain their joined task boundary. A shared close does
+not bypass SIGHUP/SIGCONT delivery or imply that every terminal ioctl is direct.
+These are remaining ownership migrations, rather than byte-queue performance
+fallbacks. The implementation is common to macOS and the iPad interpreter.

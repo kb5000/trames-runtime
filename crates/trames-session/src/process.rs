@@ -3319,34 +3319,14 @@ impl<C: Cpu> Kernel<C> {
                     .as_ref()
                     .filter(|end| end.master)
                     .ok_or(Errno(25))?;
-                match request {
-                    0x80045430 => write_u32(&mut p.memory, a[2], end.pair.number)?,
-                    0x40045431 => end.pair.locked.set(read_u32(&p.memory, a[2])? != 0),
-                    0x80045439 => write_u32(&mut p.memory, a[2], u32::from(end.pair.locked.get()))?,
-                    0x5420 => {
-                        end.pair.packet.store(
-                            read_u32(&p.memory, a[2])? != 0,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        end.pair
-                            .packet_status
-                            .store(0, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    0x80045438 => write_u32(
-                        &mut p.memory,
-                        a[2],
-                        u32::from(end.pair.packet.load(std::sync::atomic::Ordering::Relaxed)),
-                    )?,
-                    0x5441 => {
-                        return p
-                            .linux
-                            .vfs
-                            .open_pty_peer(a[0] as u32, a[2] as u32)
-                            .map(|fd| Some(fd as u64));
-                    }
-                    _ => unreachable!(),
+                if request == 0x5441 {
+                    return p
+                        .linux
+                        .vfs
+                        .open_pty_peer(a[0] as u32, a[2] as u32)
+                        .map(|fd| Some(fd as u64));
                 }
-                return Ok(Some(0));
+                return trames_linux::pty_control(end, request, a[2], &mut p.memory).map(Some);
             }
         }
         let mut dynamic = endpoint.as_ref().map(|end| end.pair.terminal.borrow_mut());
@@ -3626,10 +3606,16 @@ impl<C: Cpu> Kernel<C> {
             .unwrap_or_default();
         for pair in pairs {
             pair.flush_echo();
-            if pair.host_resize_pending.replace(false) {
-                pair.host_signals.set(pair.host_signals.get() | (1 << 27));
+            if pair
+                .host_resize_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                pair.host_signals
+                    .fetch_or(1 << 27, std::sync::atomic::Ordering::Relaxed);
             }
-            let signals = pair.host_signals.replace(0);
+            let signals = pair
+                .host_signals
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
             if signals != 0 {
                 let tty = pair.terminal.borrow();
                 for (&pid, process) in &mut self.processes {
@@ -3646,7 +3632,9 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
-                || pair.hangup_notified.replace(true)
+                || pair
+                    .hangup_notified
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 continue;
             }
@@ -6632,7 +6620,8 @@ mod tests {
             tty.foreground = 3;
         }
         pair.resize_from_host(40, 120);
-        pair.host_signals.set(1 << 1);
+        pair.host_signals
+            .store(1 << 1, std::sync::atomic::Ordering::Relaxed);
         let mut foreground = process();
         foreground.session = 9;
         foreground.group = 3;
@@ -6651,8 +6640,13 @@ mod tests {
             assert!(!k.processes[&id].signals.pending.contains_key(&2));
             assert!(!k.processes[&id].signals.pending.contains_key(&28));
         }
-        assert_eq!(pair.host_signals.get(), 0);
-        assert!(!pair.host_resize_pending.get());
+        assert_eq!(
+            pair.host_signals.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(!pair
+            .host_resize_pending
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
     pub(super) fn kernel() -> Kernel {
         Kernel {
