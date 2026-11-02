@@ -1634,3 +1634,46 @@ owner-only paths. Real filtered guest lifecycles cover null/zero on one/two work
 slots, with all 122 calls completing on workers and one filter decision per entry.
 Dynamic device controls, Unix owning graphs, task effects and structural operations
 remain separate migration boundaries.
+
+## Retained IP messages and batches (2026-11-03)
+
+IPv4/IPv6 sendto, recvfrom, sendmsg, recvmsg and sendmmsg use the actual shared
+socket OFD on the calling worker. Native, hybrid and packet-stack IP transports
+keep their original Socket algorithms, policy, accounting and object locks. The
+common message decoder is also used by owner execution; netlink namespace/control
+messages retain their owner boundary before guest buffer import or transport
+side effects. Ordinary connected TCP byte I/O keeps its existing direct path.
+
+An accepted message retains copied send bytes/destination/packet info or the
+original receive scatter/address/ancillary destinations. Blocking EAGAIN uses the
+existing socket event sources and packet-stack deadline, releases its execution
+slot, then retries after subscribing. Only parked receive destinations are
+rechecked before dequeue; normal ready calls do not repeat preflight. Numeric FD
+reuse and later guest header edits cannot redirect an accepted operation. The
+original descriptor flags remain live, while MSG_DONTWAIT and the accepted socket
+timeout still govern the call. Cancellation releases the actual OFD and interests.
+
+A batch retains completed count and its current prepared message, importing later
+headers lazily. The original 1,024-message cap, compat rejection, empty-batch FD
+validation, requested-length checks, short stream termination, positive partial
+errors and post-send msg_len copyout order remain. Delivery followed by EFAULT is
+terminal and is never replayed. First-item EAGAIN can park; EAGAIN after progress
+returns the count. The progress mutex belongs only to one accepted call. Each
+message uses the pre-existing TCP publication boundary separately; the batch adds
+no socket-wide algorithm lock. No global lock, new service thread, polling bus,
+ordinary guest-memory barrier or new native access policy is introduced.
+
+SIGPIPE records a relaxed per-call atomic flag plus the saved terminal result.
+Workers hand only the original task effects to the owner; owner retry observes the
+same completed result without resending. MSG_NOSIGNAL keeps the entire completion
+on the worker. Partial batch EPIPE retains both positive progress and SIGPIPE.
+The existing accepted-entry handoff preserves one seccomp decision across waits
+and signal delivery. Actual guest tests cover IPv4/IPv6 pairs on one/two execution
+slots and native stream EPIPE for scalar, message and batch sends. ABI tests cover
+lazy batch input, first-item waits, short/partial errors, post-send copyout faults,
+close/reuse, captured receive outputs, remap faults before dequeue, truncation and
+packet-info output, nonblocking/timeout behavior and netlink exclusion.
+
+This does not remove raw UDP read/write ownership, netlink control, Unix owning
+ancillary graphs, io_uring owner controls, task/job control, or structural VM/task
+transitions. recvmmsg remains unimplemented, not a removed coordinator dependency.

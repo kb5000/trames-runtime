@@ -3,6 +3,278 @@ use super::*;
 use trames_cpu::Cpu as Interpreter;
 use trames_memory::{Permissions, PAGE_SIZE};
 
+#[test]
+fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
+    for family in [2, 10] {
+        for slots in [1, 2] {
+            let mut p = super::tests::process();
+            let mut k = super::tests::kernel();
+            p.linux
+                .vfs
+                .configure_network(trames_vfs::NetworkMode::Loopback)
+                .unwrap();
+            let left = p.linux.vfs.socket(family, 2, 0).unwrap();
+            let right = p.linux.vfs.socket(family, 2, 0).unwrap();
+            let address = |fd| {
+                let socket = p.linux.vfs.socket_fd(fd).unwrap();
+                socket
+                    .bind(
+                        if family == 2 {
+                            "127.0.0.1:0"
+                        } else {
+                            "[::1]:0"
+                        }
+                        .parse()
+                        .unwrap(),
+                    )
+                    .unwrap();
+                trames_net::encode_address(socket.local_addr().unwrap())
+            };
+            let left_address = address(left);
+            let right_address = address(right);
+            let size = left_address.len() as u32;
+            p.memory.write(0x1100, &right_address).unwrap();
+            p.memory.write(0x1400, b"defghi").unwrap();
+            for (at, value) in [
+                (0x1010, 0x1200u64),
+                (0x1018, 1),
+                (0x1200, 0x1308),
+                (0x1208, 3),
+                (0x1500, 0x1100),
+                (0x1508, size as u64),
+                (0x1510, 0x1580),
+                (0x1518, 1),
+                (0x1580, 0x1403),
+                (0x1588, 3),
+            ] {
+                p.memory.write_array(at, value.to_le_bytes()).unwrap();
+            }
+            filter(&mut k, &mut p, 0x7fff0000);
+            let mut peer = p.fork();
+            peer.parent = 1;
+            peer.tgid = 2;
+            peer.memory.write(0x1100, &left_address).unwrap();
+            peer.memory.write(0x1400, b"abcxyz").unwrap();
+            for (at, value) in [
+                (0x1000, 0x1100u64),
+                (0x1008, size as u64),
+                (0x1010, 0x1200),
+                (0x1018, 1),
+                (0x1040, 0x1100),
+                (0x1048, size as u64),
+                (0x1050, 0x1210),
+                (0x1058, 1),
+                (0x1200, 0x1400),
+                (0x1208, 3),
+                (0x1210, 0x1403),
+                (0x1218, 3),
+                (0x1500, 0),
+                (0x1580, 0x1308),
+            ] {
+                peer.memory.write_array(at, value.to_le_bytes()).unwrap();
+            }
+            let finish = [
+                mov(0, 0x1900),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ];
+            let make = |calls: &[(u32, [u32; 6])]| {
+                let mut code = Vec::new();
+                for (index, (number, args)) in calls.iter().enumerate() {
+                    for (r, value) in args.iter().enumerate() {
+                        code.push(mov(r as u32, *value));
+                    }
+                    code.extend([
+                        mov(8, *number),
+                        0xd4000001,
+                        mov(10, 0x1800 + index as u32 * 8),
+                        0xf9000140,
+                    ]);
+                }
+                code.extend(finish);
+                code
+            };
+            program(
+                &mut p,
+                make(&[
+                    (207, [left, 0x1300, 3, 0, 0, 0]),
+                    (212, [left, 0x1000, 0, 0, 0, 0]),
+                    (206, [left, 0x1400, 3, 0, 0x1100, size]),
+                    (211, [left, 0x1500, 0, 0, 0, 0]),
+                ]),
+            );
+            program(
+                &mut peer,
+                make(&[
+                    (269, [right, 0x1000, 2, 0, 0, 0]),
+                    (207, [right, 0x1300, 3, 0, 0, 0]),
+                    (212, [right, 0x1500, 0, 0, 0, 0]),
+                ]),
+            );
+            if slots == 2 {
+                peer.affinity = 2;
+            }
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            let until = Instant::now() + Duration::from_secs(5);
+            while k.syscalls < 9 {
+                let limit = k.instructions + 100_000;
+                assert!(
+                    k.parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+                        .unwrap(),
+                    "family={family} slots={slots} calls={} states={:?}",
+                    k.syscalls,
+                    k.processes
+                        .iter()
+                        .map(|(id, p)| (
+                            *id,
+                            matches!(p.state, State::Ready),
+                            matches!(p.state, State::Blocked(..)),
+                            p.cpu.pc,
+                            p.cpu.x(0),
+                            p.cpu.x(8),
+                            (0..4)
+                                .map(|i| p.memory.read_u64(0x1800 + i * 8))
+                                .collect::<Vec<_>>()
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    Instant::now() < until,
+                    "family={family} slots={slots} calls={}",
+                    k.syscalls
+                );
+            }
+            for (pid, results, first, second) in [
+                (1, vec![3, 3, 3, 3], b"abc", b"xyz"),
+                (2, vec![2, 3, 3], b"def", b"ghi"),
+            ] {
+                let p = &k.processes[&pid];
+                for (index, value) in results.into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + index as u64 * 8).unwrap(),
+                        value,
+                        "family={family} slots={slots} pid={pid} item={index}"
+                    );
+                }
+                assert_eq!(p.memory.read_array::<3>(0x1300).unwrap(), *first);
+                assert_eq!(p.memory.read_array::<3>(0x1308).unwrap(), *second);
+                assert_eq!(p.seccomp.evaluations(), 9);
+            }
+            assert_eq!(k.syscalls, 9);
+            assert_eq!(k.worker_syscalls, 9, "native messages joined owner");
+            assert_eq!(k.service_requests, 0);
+            if slots == 1 {
+                assert!(k.worker_io_waits > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_message_epipe_hands_only_saved_task_effects_to_owner() {
+    for number in [206, 211, 269] {
+        for no_signal in [false, true] {
+            let mut p = super::tests::process();
+            let mut k = super::tests::kernel();
+            let (listener, address) = listener(&mut p);
+            let fd = p.linux.vfs.socket(2, 1, 0).unwrap();
+            let socket = p.linux.vfs.socket_fd(fd).unwrap();
+            assert!(matches!(
+                socket.connect(address),
+                Ok(()) | Err(trames_net::NetError(115))
+            ));
+            let until = Instant::now() + Duration::from_secs(2);
+            while !socket.connect_complete().unwrap() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            loop {
+                match p.linux.vfs.accept(listener, 0) {
+                    Ok(_) => break,
+                    Err(trames_vfs::Errno(11)) => {
+                        assert!(Instant::now() < until);
+                        std::thread::yield_now();
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            socket.shutdown(1).unwrap();
+            drop(socket);
+            p.linux.vfs.close(listener).unwrap();
+            p.signals.mask |= 1 << 12;
+            p.memory.write(0x1400, b"test").unwrap();
+            for (at, value) in [
+                (0x1010, 0x1200u64),
+                (0x1018, 1),
+                (0x1200, 0x1400),
+                (0x1208, 4),
+            ] {
+                p.memory.write_array(at, value.to_le_bytes()).unwrap();
+            }
+            filter(&mut k, &mut p, 0x7fff0000);
+            let mut peer = p.fork();
+            peer.parent = 1;
+            peer.tgid = 2;
+            let flags = if no_signal { 0x4000 } else { 0 };
+            let args = match number {
+                206 => [fd, 0x1400, 4, flags, 0, 0],
+                211 => [fd, 0x1000, flags, 0, 0, 0],
+                _ => [fd, 0x1000, 1, flags, 0, 0],
+            };
+            let park = [
+                mov(0, 0x1900),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ];
+            let mut code = Vec::new();
+            for (i, value) in args.into_iter().enumerate() {
+                code.push(mov(i as u32, value));
+            }
+            code.extend([mov(8, number), 0xd4000001, mov(10, 0x1800), 0xf9000140]);
+            code.extend(park);
+            program(&mut p, code);
+            program(&mut peer, park.to_vec());
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(1);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            let until = Instant::now() + Duration::from_secs(3);
+            while k.syscalls < 3 {
+                let limit = k.instructions + 100_000;
+                assert!(k
+                    .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
+                    .unwrap());
+                assert!(Instant::now() < until);
+            }
+            assert_eq!(
+                k.processes[&1].memory.read_u64(0x1800).unwrap(),
+                0u64.wrapping_sub(32)
+            );
+            assert_eq!(k.processes[&1].seccomp.evaluations(), 3);
+            assert_eq!(
+                k.processes[&1].signals.pending.contains_key(&13),
+                !no_signal
+            );
+            if no_signal {
+                assert_eq!(k.worker_syscalls, 3);
+            }
+        }
+    }
+}
+
 fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
     for (i, word) in code.into_iter().enumerate() {
         p.memory

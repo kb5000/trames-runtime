@@ -9,6 +9,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_net::{encode_address, NetError, MSG_TRUNC};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
+pub(crate) mod data;
 pub(crate) mod local;
 pub(crate) mod unix;
 pub(super) fn control_number(number: u32) -> bool {
@@ -655,156 +656,11 @@ impl Linux {
             return control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("socket control ABI");
         }
-        match number {
-            206 => {
-                if a[2] > trames_net::MAX_TRANSFER as u64 {
-                    return Err(Errno(90));
-                }
-                Linux::check(memory, a[1], a[2] as usize, Access::Read)?;
-                let peer = if a[4] == 0 {
-                    None
-                } else {
-                    Some(address(memory, a[4], a[5])?)
-                };
-                let mut bytes = vec![0; a[2] as usize];
-                memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
-                Ok(vfs.socket_send_bytes(socket, &bytes, a[3] as u32, peer.as_deref())? as u64)
-            }
-            207 => {
-                let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
-                Linux::check(memory, a[1], count, Access::Write)?;
-                let output = AddressOutput::prepare(memory, a[4], a[5], socket.address_size())?;
-                let received = socket.recv(count, a[3] as u32).map_err(net)?;
-                memory.write(a[1], &received.data).map_err(|_| Errno(14))?;
-                if let Some(output) = output {
-                    output.write_bytes(memory, &socket.received_address(&received))?;
-                }
-                Ok(if a[3] as u32 & MSG_TRUNC != 0 {
-                    received.length
-                } else {
-                    received.data.len()
-                } as u64)
-            }
-            211 | 212 => {
-                let receive = number == 212;
-                Linux::check(
-                    memory,
-                    a[1],
-                    56,
-                    if receive { Access::Write } else { Access::Read },
-                )?;
-                // Also validate reads of the msghdr when the destination is writable-only.
-                Linux::check(memory, a[1], 56, Access::Read)?;
-                let name = u64_at(memory, a[1])?;
-                let name_size = u32_at(memory, a[1] + 8)?;
-                let control = u64_at(memory, a[1] + 32)?;
-                let control_size = u64_at(memory, a[1] + 40)?;
-                if control_size != 0 {
-                    if control_size > trames_net::MAX_TRANSFER as u64 {
-                        return Err(Errno(22));
-                    }
-                    Linux::check(
-                        memory,
-                        control,
-                        control_size as usize,
-                        if receive { Access::Write } else { Access::Read },
-                    )?;
-                }
-                let packet_info = if receive {
-                    None
-                } else {
-                    packet_control(memory, control, control_size)?
-                };
-                let vectors = Vectors::prepare(
-                    memory,
-                    u64_at(memory, a[1] + 16)?,
-                    u64_at(memory, a[1] + 24)?,
-                    if receive { Access::Write } else { Access::Read },
-                )?;
-                if receive {
-                    let output =
-                        AddressOutput::prepare(memory, name, a[1] + 8, socket.address_size())?;
-                    let received = socket.recv(vectors.size, a[2] as u32).map_err(net)?;
-                    vectors.write(memory, &received.data)?;
-                    if let Some(output) = output {
-                        output.write_bytes(memory, &socket.received_address(&received))?;
-                    } else {
-                        memory
-                            .write(a[1] + 8, &0u32.to_le_bytes())
-                            .map_err(|_| Errno(14))?;
-                    }
-                    let mut ancillary = Vec::new();
-                    if let Some((level, kind, hop)) = socket.ancillary_hop() {
-                        push_control(&mut ancillary, level, kind, &(hop as u32).to_le_bytes());
-                    }
-                    if let Some(info) = received.packet_info {
-                        let mut payload = vec![];
-                        match info.address {
-                            std::net::IpAddr::V4(ip) => {
-                                payload.extend_from_slice(&info.interface.to_le_bytes());
-                                payload.extend_from_slice(&ip.octets());
-                                payload.extend_from_slice(&ip.octets());
-                                push_control(&mut ancillary, 0, 8, &payload);
-                            }
-                            std::net::IpAddr::V6(ip) => {
-                                payload.extend_from_slice(&ip.octets());
-                                payload.extend_from_slice(&info.interface.to_le_bytes());
-                                push_control(&mut ancillary, 41, 50, &payload);
-                            }
-                        }
-                    }
-                    let control_count = ancillary.len().min(control_size as usize);
-                    if control_count != 0 {
-                        memory
-                            .write(control, &ancillary[..control_count])
-                            .map_err(|_| Errno(14))?;
-                    }
-                    memory
-                        .write(a[1] + 40, &(control_count as u64).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                    memory
-                        .write(
-                            a[1] + 48,
-                            &((if received.truncated { MSG_TRUNC } else { 0 })
-                                | if control_count < ancillary.len() {
-                                    8
-                                } else {
-                                    0
-                                })
-                            .to_le_bytes(),
-                        )
-                        .map_err(|_| Errno(14))?;
-                    Ok(if a[2] as u32 & MSG_TRUNC != 0 {
-                        received.length
-                    } else {
-                        received.data.len()
-                    } as u64)
-                } else {
-                    let peer = if name == 0 {
-                        None
-                    } else {
-                        Some(address(memory, name, name_size as u64)?)
-                    };
-                    let bytes = vectors.read(memory)?;
-                    if let Some(info) = packet_info {
-                        let peer = peer
-                            .as_deref()
-                            .map(trames_net::decode_address)
-                            .transpose()
-                            .map_err(net)?;
-                        Ok(socket
-                            .send_packet(&bytes, a[2] as u32, peer, info)
-                            .map_err(net)? as u64)
-                    } else {
-                        Ok(
-                            vfs.socket_send_bytes(socket, &bytes, a[2] as u32, peer.as_deref())?
-                                as u64,
-                        )
-                    }
-                }
-            }
-            _ => Err(Errno(38)),
-        }
+        data::Prepared::new(number as u32, a, memory, socket.address_size())?.progress(
+            socket,
+            memory,
+            |bytes, flags, peer| vfs.socket_send_bytes(socket, bytes, flags, peer),
+        )
     }
 }
 

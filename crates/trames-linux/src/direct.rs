@@ -10,6 +10,7 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+mod ip_message;
 mod local_message;
 mod socket_wait;
 mod uring;
@@ -249,7 +250,8 @@ impl DirectSyscalls {
         Some(result.map(|()| 0))
     }
     pub fn supports_socket_control(&self, number: u32) -> bool {
-        crate::network::control_number(number) && self.resources.is_some()
+        (crate::network::control_number(number) || ip_message::number(number))
+            && self.resources.is_some()
     }
     pub fn supports_local_message(&self, number: u32, fd: u32) -> bool {
         self.resources.is_some()
@@ -284,7 +286,7 @@ impl DirectSyscalls {
             self.socket_completed.set(self.socket_completed.get() + 1);
             return Some(result);
         }
-        if !self.supports_socket_control(number) {
+        if !crate::network::control_number(number) {
             return None;
         }
         let factory = self.resources.as_ref()?;

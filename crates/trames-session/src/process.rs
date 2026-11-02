@@ -2931,6 +2931,7 @@ impl<C: Cpu> Kernel<C> {
             .as_ref()
             .and_then(|wait| wait.retained_socket.clone())
             .or_else(|| p.retained_socket.take());
+        let socket_signal_source = socket.clone();
         let local = p
             .byte_wait
             .as_ref()
@@ -3145,6 +3146,9 @@ impl<C: Cpu> Kernel<C> {
             _ => false,
         };
         let batch_pipe_signal = p.linux.take_batch_pipe_signal()
+            || socket_signal_source
+                .as_ref()
+                .is_some_and(|call| call.pipe_signal())
             || batch_signal_source
                 .as_ref()
                 .is_some_and(|file| file.batch_pipe_signal());

@@ -18,6 +18,7 @@ pub struct RetainedSocket {
     pub args: [u64; 6],
     pub deadline: Option<Instant>,
     connecting: bool,
+    message: Option<Arc<ip_message::Message>>,
 }
 impl RetainedSocket {
     pub fn external_wait(&self) -> bool {
@@ -42,14 +43,26 @@ impl RetainedSocket {
             Control::Unix { .. } => None,
         }
     }
+    pub fn pipe_signal(&self) -> bool {
+        self.message
+            .as_ref()
+            .is_some_and(|message| message.pipe_signal())
+    }
     pub fn events(&self) -> u16 {
-        if self.number == 203 {
+        if matches!(self.number, 203 | 206 | 211 | 269) {
             4
         } else {
             1
         }
     }
     fn blocking(&self) -> bool {
+        if self.message.is_some() {
+            let Control::Network(socket) = &self.socket else {
+                unreachable!()
+            };
+            return socket.flags() & trames_vfs::O_NONBLOCK == 0
+                && socket_flags(self.number, self.args) & 0x40 == 0;
+        }
         match &self.socket {
             Control::Network(socket) => {
                 socket.flags() & trames_vfs::O_NONBLOCK == 0
@@ -68,6 +81,9 @@ impl RetainedSocket {
     ) -> Option<Result<u64, Errno>> {
         match &mut self.socket {
             Control::Network(socket) => {
+                if let Some(message) = &self.message {
+                    return Some(message.progress(socket, self.number, self.args, memory));
+                }
                 let result = if self.number == 203 && self.connecting {
                     socket.with_tcp_publication(|| {
                         socket
@@ -132,9 +148,10 @@ impl RetainedSocket {
         }
     }
     fn waits(&self, result: &Result<u64, Errno>) -> bool {
-        matches!(self.number, 202 | 203 | 242)
+        (matches!(self.number, 202 | 203 | 242) || self.message.is_some())
             && self.blocking()
-            && matches!(result, Err(Errno(11)) | Err(Errno(115)))
+            && (matches!(result, Err(Errno(11)))
+                || self.number == 203 && matches!(result, Err(Errno(115))))
             && !self.deadline.is_some_and(|d| Instant::now() >= d)
     }
     fn finish(&self, result: Result<u64, Errno>) -> Result<u64, Errno> {
@@ -152,11 +169,27 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Option<Result<RetainedSocket, Errno>> {
-        if !matches!(number, 200 | 202 | 203 | 242) || !self.supports_socket_control(number) {
+        if !(matches!(number, 200 | 202 | 203 | 242) || ip_message::number(number))
+            || !self.supports_socket_control(number)
+        {
             return None;
+        }
+        if number == 269 && args[3] as u32 & 0x8000_0000 != 0 {
+            return Some(Err(Errno(22)));
         }
         let factory = self.resources.as_ref()?;
         let accepted = factory.socket_control_operation(args[0] as u32)?;
+        let accepted = match accepted {
+            Ok(trames_vfs::SocketControlOperation::Unix(_)) if ip_message::number(number) => {
+                return None
+            }
+            Ok(trames_vfs::SocketControlOperation::Network(ref socket))
+                if ip_message::number(number) && !matches!(socket.address_size(), 16 | 28) =>
+            {
+                return None
+            }
+            other => other,
+        };
         Some((|| {
             let socket = match accepted? {
                 trames_vfs::SocketControlOperation::Network(socket) => Control::Network(socket),
@@ -172,9 +205,15 @@ impl DirectSyscalls {
             };
             let deadline = match &socket {
                 Control::Network(socket) => socket
-                    .io_timeout(number != 203)
+                    .io_timeout(matches!(number, 202 | 242 | 207 | 212))
                     .and_then(|d| Instant::now().checked_add(d)),
                 Control::Unix { .. } => None,
+            };
+            let message = match &socket {
+                Control::Network(socket) if ip_message::number(number) => Some(Arc::new(
+                    ip_message::Message::new(number, args, memory, socket.address_size())?,
+                )),
+                _ => None,
             };
             Ok(RetainedSocket {
                 socket,
@@ -183,6 +222,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 connecting: false,
+                message,
             })
         })())
     }
@@ -235,6 +275,9 @@ impl DirectSyscalls {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(call);
         };
+        if call.pipe_signal() {
+            return IoAttempt::SocketCheckpoint(call);
+        }
         if !call.waits(&result) {
             return self.complete_socket(call.finish(result));
         }
@@ -294,7 +337,9 @@ impl DirectSyscalls {
         let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
         };
-        if call.waits(&result) {
+        if call.pipe_signal() {
+            IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap())
+        } else if call.waits(&result) {
             IoAttempt::Blocked(pending)
         } else {
             self.complete_socket(call.finish(result))
