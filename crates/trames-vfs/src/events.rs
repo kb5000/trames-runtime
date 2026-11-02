@@ -8,9 +8,7 @@ pub(super) enum Anonymous {
     Uring(Rc<Uring>),
     Bpf(Arc<bpf::Program>),
     Inotify(Arc<inotify::InotifyInstance>),
-    Signal {
-        mask: u64,
-    },
+    Signal(Arc<SignalMask>),
     Event(Arc<direct_io::EventCounter>),
     Timer(Arc<TimerFd>),
     Epoll {
@@ -22,7 +20,22 @@ pub(super) enum Anonymous {
 
 /// Shared control portions of the original anonymous resources. Epoll keeps
 /// owner-only targets in Anonymous; its admitted live index contains no Rc.
+pub(super) struct SignalMask(AtomicU64);
+impl SignalMask {
+    pub(super) fn new(mask: u64) -> Self {
+        Self(AtomicU64::new(mask & !((1 << 8) | (1 << 18))))
+    }
+    pub(super) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub(super) fn set(&self, mask: u64) {
+        self.0
+            .store(mask & !((1 << 8) | (1 << 18)), Ordering::Relaxed);
+    }
+}
 pub(super) enum SharedControl {
+    Signal(Arc<SignalMask>),
+    Bpf(Arc<bpf::Program>),
     Event(Arc<direct_io::EventCounter>),
     Timer(Arc<TimerFd>),
     Inotify(Arc<inotify::InotifyInstance>),
@@ -31,6 +44,8 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Signal(mask) => Self::Signal(mask.clone()),
+            Anonymous::Bpf(program) => Self::Bpf(program.clone()),
             Anonymous::Event(counter) => Self::Event(counter.clone()),
             Anonymous::Timer(timer) => Self::Timer(timer.clone()),
             Anonymous::Inotify(instance) => Self::Inotify(instance.clone()),
@@ -40,6 +55,8 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Anonymous {
         match self {
+            Self::Signal(mask) => Anonymous::Signal(mask.clone()),
+            Self::Bpf(program) => Anonymous::Bpf(program.clone()),
             Self::Event(counter) => Anonymous::Event(counter.clone()),
             Self::Timer(timer) => Anonymous::Timer(timer.clone()),
             Self::Inotify(instance) => Anonymous::Inotify(instance.clone()),
@@ -103,7 +120,7 @@ impl Anonymous {
             Self::Uring(_) => b"anon_inode:[io_uring]",
             Self::Bpf(_) => b"anon_inode:bpf-prog",
             Self::Inotify(_) => b"anon_inode:inotify",
-            Self::Signal { .. } => b"anon_inode:[signalfd]",
+            Self::Signal(_) => b"anon_inode:[signalfd]",
             Self::Event(_) => b"anon_inode:[eventfd]",
             Self::Timer(_) => b"anon_inode:[timerfd]",
             Self::Epoll { .. } => b"anon_inode:[eventpoll]",
@@ -126,8 +143,8 @@ impl Anonymous {
                     0
                 }
             }
-            Self::Signal { mask } => {
-                if mask & pending != 0 {
+            Self::Signal(mask) => {
+                if mask.get() & pending != 0 {
                     events & 1
                 } else {
                     0
@@ -167,7 +184,7 @@ impl Anonymous {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
             Self::Bpf(_)
-            | Self::Signal { .. }
+            | Self::Signal(_)
             | Self::Epoll { .. }
             | Self::Inotify(_)
             | Self::Uring(_) => Err(Errno(22)),
@@ -229,24 +246,17 @@ impl Vfs {
     /// The descriptor holds only its mask. Signals belong to the reading task,
     /// never to the descriptor's creator or the host process.
     pub fn signalfd(&mut self, fd: i32, mask: u64, flags: u32) -> Result<u32> {
-        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
-            return Err(Errno(22));
-        }
-        let mask = mask & !((1 << 8) | (1 << 18));
-        if fd == -1 {
-            return self.anonymous(flags, Anonymous::Signal { mask });
-        }
-        let open_descriptor = self.descriptor(fd as u32)?;
-        let mut open = open_descriptor.open.borrow_mut();
-        let Some(Anonymous::Signal { mask: current }) = open.anonymous.as_mut() else {
-            return Err(Errno(22));
-        };
-        *current = mask;
-        Ok(fd as u32)
+        self.descriptor_factory()
+            .signalfd(fd, mask, flags)
+            .unwrap_or_else(|| {
+                // An existing owner-only FD cannot be a shared signalfd. Preserve
+                // owner type errors without admitting that resource to workers.
+                self.descriptor(fd as u32).and(Err(Errno(22)))
+            })
     }
     pub fn signalfd_mask(&self, fd: u32) -> Result<Option<u64>> {
-        Ok(match self.descriptor(fd)?.open.borrow().anonymous {
-            Some(Anonymous::Signal { mask }) => Some(mask),
+        Ok(match &self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Signal(mask)) => Some(mask.get()),
             _ => None,
         })
     }
@@ -824,6 +834,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 directory_mount: Default::default(),
+                namespace_resource: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

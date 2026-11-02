@@ -195,7 +195,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_creation(&self, number: u32) -> bool {
-        matches!(number, 19 | 26 | 59 | 85 | 198) && self.resources.is_some()
+        matches!(number, 19 | 26 | 59 | 74 | 85 | 198) && self.resources.is_some()
     }
     pub fn invoke_creation(
         &self,
@@ -1539,14 +1539,14 @@ mod tests {
         );
         assert_eq!(v.flags(writer), Err(Errno(9)));
         assert_eq!(direct.fd_control_completed(), 4);
-        let owner = v.signalfd(-1, 1, O_NONBLOCK).unwrap();
+        let owner = v.socket(1, 1 | O_NONBLOCK, 0).unwrap();
         assert!(direct
             .invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0])
             .is_none());
         assert!(direct
             .invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0])
             .is_none());
-        assert_eq!(v.signalfd_mask(owner), Ok(Some(1)));
+        assert_eq!(v.fd_kind(owner), Ok(trames_vfs::FdKind::Socket));
         assert_eq!(direct.fd_control_completed(), 4); // owner fallback had no effects
     }
     #[test]

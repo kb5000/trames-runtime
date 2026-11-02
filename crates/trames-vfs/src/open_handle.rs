@@ -102,13 +102,17 @@ impl OpenDescription {
             .control
             .as_ref()
             .map(events::SharedControl::owner_projection);
+        let namespace = shared
+            .namespace_resource
+            .as_ref()
+            .map(linux_namespace::SharedNamespace::owner_projection);
         Self {
             shared,
             position: 0,
             anonymous,
             local: None,
             pty: None,
-            namespace: None,
+            namespace,
             oom: None,
             network_control: None,
             mount_file: None,
@@ -140,7 +144,7 @@ impl OpenDescription {
             || self.anonymous.is_some() && self.control.is_none()
             || self.local.is_some()
             || self.pty.is_some()
-            || self.namespace.is_some()
+            || self.namespace.is_some() && self.namespace_resource.is_none()
             || self.oom.is_some()
             || self.network_control.is_some()
             || self.mount_file.is_some()
@@ -149,7 +153,8 @@ impl OpenDescription {
         {
             return false;
         }
-        self.socket.is_some()
+        self.namespace_resource.is_some()
+            || self.socket.is_some()
             || self.control.is_some()
             || self.pipe.is_some()
             || self.node.as_ref().is_some_and(|node| {

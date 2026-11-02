@@ -368,6 +368,9 @@ impl DirectFd {
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
         let resource = match &open.control {
+            // Sharing OFD ownership grants no creator-task signal queue or
+            // BPF byte authority. These retain their original ABI handling.
+            Some(events::SharedControl::Signal(_) | events::SharedControl::Bpf(_)) => return None,
             Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
             Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
             Some(events::SharedControl::Inotify(instance)) => {

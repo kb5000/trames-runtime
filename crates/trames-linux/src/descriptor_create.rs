@@ -10,6 +10,15 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64, Errno>> {
     Some(match number {
+        74 => {
+            let mask = match Linux::signalfd_parameters(a, memory) {
+                Ok(mask) => mask,
+                Err(error) => return Some(Err(error)),
+            };
+            factory
+                .signalfd(a[0] as i32, mask, a[3] as u32)?
+                .map(u64::from)
+        }
         198 if a[0] as u32 != 1 => factory
             .socket(a[0] as u32, a[1] as u32, a[2] as u32)
             .map(u64::from),
@@ -30,6 +39,23 @@ pub(super) fn call(
     })
 }
 
+impl Linux {
+    pub fn signalfd(&mut self, a: [u64; 6], memory: &impl CpuMemory) -> Result<u64, Errno> {
+        let mask = Self::signalfd_parameters(a, memory)?;
+        self.vfs
+            .signalfd(a[0] as i32, mask, a[3] as u32)
+            .map(u64::from)
+    }
+    pub fn signalfd_parameters(a: [u64; 6], memory: &impl CpuMemory) -> Result<u64, Errno> {
+        if a[2] != 8 {
+            return Err(Errno(22));
+        }
+        Ok(u64::from_le_bytes(
+            memory.read_array(a[1]).map_err(|_| Errno(14))?,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +69,22 @@ mod tests {
             (198, [2, 1, 17, 0, 0, 0]),
             (198, [2, 0xffff, 0, 0, 0, 0]),
             (198, [0xffff, 1, 0, 0, 0, 0]),
+            (74, [u64::MAX, 0x1000, 8, 0, 0, 0]),
+            (
+                74,
+                [
+                    u64::MAX,
+                    0x1000,
+                    8,
+                    trames_vfs::O_NONBLOCK as u64 | trames_vfs::O_CLOEXEC as u64,
+                    0,
+                    0,
+                ],
+            ),
+            (74, [u64::MAX, 0x9000, 8, 0, 0, 0]),
+            (74, [u64::MAX, 0x9000, 4, 0, 0, 0]),
+            (74, [u64::MAX, 0x1000, 8, 1, 0, 0]),
+            (74, [999, 0x1000, 8, 0, 0, 0]),
             (19, [7, 0, 0, 0, 0, 0]),
             (19, [0, 2, 0, 0, 0, 0]),
             (26, [0, 0, 0, 0, 0, 0]),

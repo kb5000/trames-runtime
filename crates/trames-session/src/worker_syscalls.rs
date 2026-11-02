@@ -375,7 +375,7 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
-            number @ (19 | 26 | 59 | 85 | 198) => {
+            number @ (19 | 26 | 59 | 74 | 85 | 198) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }

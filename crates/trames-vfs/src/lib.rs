@@ -200,6 +200,7 @@ struct SharedOpenDescription {
     native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
     directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
+    namespace_resource: Option<linux_namespace::SharedNamespace>,
     file_authority: std::sync::OnceLock<file_io::PublishedFile>,
     tcp_publication: std::sync::Mutex<Option<DirectTcpFd>>,
     socket_control: Option<network_io::SocketControl>,
@@ -576,8 +577,8 @@ pub struct Vfs {
     uts: UtsNamespace,
     root_network: Rc<linux_namespace::RootNetwork>,
     path_bindings: ipc::PathBindings,
-    ipc_namespace: Rc<linux_namespace::IpcNamespace>,
-    cgroup_namespace: Rc<linux_namespace::CgroupNamespace>,
+    ipc_namespace: Arc<linux_namespace::IpcNamespace>,
+    cgroup_namespace: Arc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
@@ -690,8 +691,8 @@ impl Vfs {
             uts: UtsNamespace::default(),
             root_network,
             path_bindings: ipc::PathBindings::default(),
-            ipc_namespace: Rc::default(),
-            cgroup_namespace: Rc::default(),
+            ipc_namespace: Arc::default(),
+            cgroup_namespace: Arc::default(),
             pid_ns: pid_ns.clone(),
             pid_children: pid_ns,
             mounts: None,
@@ -755,6 +756,7 @@ impl Default for Vfs {
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             directory_mount: Default::default(),
+                            namespace_resource: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -1087,6 +1089,7 @@ impl Vfs {
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
                             directory_mount: Default::default(),
+                            namespace_resource: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -2246,6 +2249,7 @@ impl Vfs {
                     native_image: None,
                     mount_resource: std::sync::OnceLock::new(),
                     directory_mount: Default::default(),
+                    namespace_resource: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
@@ -2950,7 +2954,7 @@ impl Vfs {
                 _ => Err(Errno(22)),
             };
         }
-        if matches!(o.anonymous, Some(events::Anonymous::Signal { .. })) {
+        if matches!(o.anonymous, Some(events::Anonymous::Signal(_))) {
             return Ok(o.position);
         }
         if o.kind == FdKind::Terminal {
@@ -3733,3 +3737,6 @@ mod permission_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_control_tests;

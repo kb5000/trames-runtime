@@ -25,14 +25,7 @@ use trames_kernel::signal::write_signalfd;
 
 impl<C: Cpu> Kernel<C> {
     pub(super) fn signalfd(&self, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        if a[2] != 8 {
-            return Err(Errno(22));
-        }
-        let mask = read_u64(&p.memory, a[1])?;
-        p.linux
-            .vfs
-            .signalfd(a[0] as i32, mask, a[3] as u32)
-            .map(|fd| Some(fd as u64))
+        p.linux.signalfd(a, &p.memory).map(Some)
     }
     pub(super) fn read_signalfd(
         &self,

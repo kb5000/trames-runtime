@@ -508,3 +508,128 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
         assert_eq!(k.syscalls, 160);
     }
 }
+
+#[test]
+fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decision() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.memory
+            .write_array(0x1000, (1u64 << 9).to_le_bytes())
+            .unwrap();
+        p.memory
+            .write_array(0x1010, (1u64 << 11).to_le_bytes())
+            .unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut code = Vec::new();
+        for i in 0..8 {
+            let base = 0x1800 + i * 40;
+            code.extend([
+                0x92800000,
+                mov(1, 0x1000),
+                mov(2, 8),
+                mov(3, trames_vfs::O_NONBLOCK),
+                mov(8, 74),
+                0xd4000001,
+                0xaa0003f3,
+                mov(1, base),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1303e0,
+                mov(8, 23),
+                0xd4000001,
+                0xaa0003f4,
+                mov(1, base + 8),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1303e0,
+                mov(8, 57),
+                0xd4000001,
+                mov(1, base + 16),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1403e0,
+                mov(1, 0x1010),
+                mov(2, 8),
+                mov(3, 0),
+                mov(8, 74),
+                0xd4000001,
+                mov(1, base + 24),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1403e0,
+                mov(8, 57),
+                0xd4000001,
+                mov(1, base + 32),
+                0xf9000020,
+            ]);
+        }
+        code.push(0x14000000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..8 {
+                for (j, value) in [3, 4, 0, 4, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + i * 40 + j as u64 * 8).unwrap(),
+                        value,
+                        "slots={slots} iteration={i} call={j}"
+                    );
+                }
+            }
+            assert_eq!(p.seccomp.evaluations(), 80);
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 80);
+    }
+}
+#[test]
+fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creator() {
+    let mut p = super::tests::process();
+    let k = super::tests::kernel();
+    let fd = p
+        .linux
+        .vfs
+        .signalfd(-1, (1 << 9) | (1 << 11), trames_vfs::O_NONBLOCK)
+        .unwrap();
+    let mut peer = p.fork();
+    let info = |sender| Info {
+        sender,
+        uid: 123,
+        status: 0,
+        code: -6,
+        timer: None,
+        fault: None,
+    };
+    p.signals.pending.enqueue(10, info(31)).unwrap();
+    peer.signals.pending.enqueue(12, info(41)).unwrap();
+    let args = [fd as u64, 0x1800, 128, 0, 0, 0];
+    assert_eq!(k.read_signalfd(&mut peer, 63, args), Ok(Some(128)));
+    assert_eq!(
+        u32::from_le_bytes(peer.memory.read_array(0x1800).unwrap()),
+        12
+    );
+    assert!(p.signals.pending.contains_key(&10));
+    assert!(peer.signals.pending.is_empty());
+    assert_eq!(k.read_signalfd(&mut p, 63, args), Ok(Some(128)));
+    assert_eq!(u32::from_le_bytes(p.memory.read_array(0x1800).unwrap()), 10);
+    assert_eq!(k.read_signalfd(&mut peer, 63, args), Err(Errno(11)));
+}

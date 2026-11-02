@@ -1008,6 +1008,7 @@ impl Linux {
                 memory,
             )
             .expect("creation ABI"),
+            74 => self.signalfd(a, memory),
             20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
             21 => {
                 let (events, data) = Self::epoll_control_parameters(a, memory)?;

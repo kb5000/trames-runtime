@@ -434,14 +434,64 @@ mod tests {
         epoch.finish();
     }
     #[test]
+    fn signal_bpf_and_namespace_rights_use_original_shared_objects_after_source_reuse() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(
+            1,
+            trames_vfs::RuntimeInfo {
+                processes: vec![trames_vfs::ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let signal = v.signalfd(-1, 1 << 9, trames_vfs::O_NONBLOCK).unwrap();
+        let namespace = v.open_at(-100, b"/proc/self/ns/uts", 0, 0).unwrap();
+        let program = v
+            .bpf_load_device(&[0xb7, 0, 0, 0, 1, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        rights(&mut m, &[signal, namespace, program]);
+        assert_eq!(
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        for fd in [signal, namespace, program] {
+            v.close(fd).unwrap();
+            assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+        }
+        v.unshare_uts().unwrap();
+        v.set_uts_name(false, b"new").unwrap();
+        header(&mut m, 32);
+        assert_eq!(
+            d.invoke(212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        let got = [word(&m, 0x1310), word(&m, 0x1314), word(&m, 0x1318)];
+        assert_eq!(v.signalfd_mask(got[0]), Ok(Some(1 << 9)));
+        v.signalfd(got[0] as i32, 1 << 11, 0).unwrap();
+        assert_eq!(v.signalfd_mask(got[0]), Ok(Some(1 << 11)));
+        v.setns(got[1], trames_vfs::CLONE_NEWUTS).unwrap();
+        assert_eq!(v.uts_name(false), b"trames");
+        let reopened = v.bpf_get_fd(1).unwrap();
+        v.close(reopened).unwrap();
+        assert_eq!(v.read(got[2], 8), Err(Errno(22)));
+        v.close(got[2]).unwrap();
+        assert_eq!(v.bpf_get_fd(1), Err(Errno(2)));
+    }
+    #[test]
     fn mixed_owner_rights_and_output_faults_defer_or_fail_before_queue_effects() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
         let event = v.eventfd(1, 0).unwrap();
-        let signal = v.signalfd(-1, 1, 0).unwrap();
+        let owner_socket = v.socket(1, 1, 0).unwrap();
         let d = direct(&v);
         let mut m = memory();
-        rights(&mut m, &[event, signal]);
+        rights(&mut m, &[event, owner_socket]);
         assert_eq!(d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m), None);
         assert_eq!(v.readable_bytes(rx).unwrap(), Some(0));
         assert_eq!(
@@ -514,7 +564,7 @@ mod tests {
     fn blocked_receive_and_owner_fallback_keep_original_transport_and_output_ranges() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        let signal = v.signalfd(-1, 1, 0).unwrap();
+        let owner_socket = v.socket(1, 1, 0).unwrap();
         let d = direct(&v);
         let mut m = memory();
         let target: Arc<dyn IoWake> = Arc::new(Target);
@@ -534,7 +584,7 @@ mod tests {
         v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .send_rights(b"real", 0, v.send_rights(&[signal]).unwrap())
+            .send_rights(b"real", 0, v.send_rights(&[owner_socket]).unwrap())
             .unwrap();
         let file = match d.start_retained_byte(file, 212, args, &mut m, 1, &Arc::downgrade(&target))
         {
@@ -548,7 +598,7 @@ mod tests {
         assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"real");
         assert_eq!(
             v.fd_kind(word(&m, 0x1310)).unwrap(),
-            v.fd_kind(signal).unwrap()
+            v.fd_kind(owner_socket).unwrap()
         );
         assert_eq!(v.read(rx, 8).unwrap(), 99u64.to_le_bytes());
     }

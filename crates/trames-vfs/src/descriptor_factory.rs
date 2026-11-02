@@ -29,6 +29,31 @@ impl Vfs {
     }
 }
 impl DescriptorFactory {
+    /// Signals belong to the reading task, while the mask belongs to this OFD.
+    /// None defers an owner-only type before any mask or membership effects.
+    pub fn signalfd(&self, fd: i32, mask: u64, flags: u32) -> Option<Result<u32>> {
+        if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+            return Some(Err(Errno(22)));
+        }
+        if fd == -1 {
+            return Some((|| {
+                let reserved = self.files.reserve()?;
+                let descriptor = events::anonymous_descriptor(
+                    self.open_id(),
+                    flags,
+                    events::Anonymous::Signal(Arc::new(events::SignalMask::new(mask))),
+                );
+                Ok(reserved.publish(descriptor, None))
+            })());
+        }
+        Some(self.files.lookup(fd as u32)?.and_then(|file| {
+            let Some(events::SharedControl::Signal(current)) = &file.open.control else {
+                return Err(Errno(22));
+            };
+            current.set(mask);
+            Ok(fd as u32)
+        }))
+    }
     pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
         self.local_identity = identity;
         self
@@ -188,6 +213,7 @@ impl DescriptorFactory {
                         native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
                         directory_mount: Default::default(),
+                        namespace_resource: None,
                         file_authority: Default::default(),
                         tcp_publication: Default::default(),
                         socket_control: None,

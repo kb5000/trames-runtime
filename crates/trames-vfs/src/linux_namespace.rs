@@ -10,6 +10,19 @@ pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 const MAX_NAMESPACES: usize = 128;
 static NEXT_INODE: AtomicU64 = AtomicU64::new(0xf000_0000);
 
+fn reserve_namespace(live: &std::sync::atomic::AtomicUsize) -> Result<u64> {
+    live.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        (n < MAX_NAMESPACES).then_some(n + 1)
+    })
+    .map_err(|_| Errno(28))?;
+    NEXT_INODE
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| {
+            live.fetch_sub(1, Ordering::Relaxed);
+            Errno(28)
+        })
+}
+
 /// A network identity owns both its IP stack and abstract Unix address space.
 /// Existing socket FDs retain their creating stack after unshare/setns.
 pub(super) struct RootNetwork {
@@ -35,28 +48,28 @@ impl Drop for RootNetwork {
 }
 pub(super) struct IpcNamespace {
     inode: u64,
-    pub mqueue: RefCell<Option<FsHandle>>,
-    live: Rc<Cell<usize>>,
+    pub mqueue: std::sync::OnceLock<FsHandle>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Default for IpcNamespace {
     fn default() -> Self {
         Self {
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
-            mqueue: RefCell::default(),
-            live: Rc::new(Cell::new(1)),
+            mqueue: Default::default(),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
 }
 impl Drop for IpcNamespace {
     fn drop(&mut self) {
-        self.live.set(self.live.get() - 1);
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 pub(super) struct CgroupNamespace {
     inode: u64,
     pub root: Option<NodeRef>,
     pub path: Vec<u8>,
-    live: Rc<Cell<usize>>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Default for CgroupNamespace {
     fn default() -> Self {
@@ -64,13 +77,13 @@ impl Default for CgroupNamespace {
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             root: None,
             path: b"/".to_vec(),
-            live: Rc::new(Cell::new(1)),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
 }
 impl Drop for CgroupNamespace {
     fn drop(&mut self) {
-        self.live.set(self.live.get() - 1);
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -152,9 +165,38 @@ pub(super) enum NamespaceHandle {
     Mount(MountNamespace),
     Pid(PidNamespace),
     Net(Rc<RootNetwork>),
-    Ipc(Rc<IpcNamespace>),
-    Cgroup(Rc<CgroupNamespace>),
+    Ipc(Arc<IpcNamespace>),
+    Cgroup(Arc<CgroupNamespace>),
 }
+// Complete shared namespace capabilities. Owner topology and the Unix network
+// control graph remain excluded until those actual resources are shared too.
+#[derive(Clone)]
+pub(super) enum SharedNamespace {
+    Uts(UtsNamespace),
+    Pid(PidNamespace),
+    Ipc(Arc<IpcNamespace>),
+    Cgroup(Arc<CgroupNamespace>),
+}
+impl SharedNamespace {
+    fn capture(namespace: &NamespaceHandle) -> Option<Self> {
+        Some(match namespace {
+            NamespaceHandle::Uts(n) => Self::Uts(n.clone()),
+            NamespaceHandle::Pid(n) => Self::Pid(n.clone()),
+            NamespaceHandle::Ipc(n) => Self::Ipc(n.clone()),
+            NamespaceHandle::Cgroup(n) => Self::Cgroup(n.clone()),
+            _ => return None,
+        })
+    }
+    pub(super) fn owner_projection(&self) -> NamespaceHandle {
+        match self {
+            Self::Uts(n) => NamespaceHandle::Uts(n.clone()),
+            Self::Pid(n) => NamespaceHandle::Pid(n.clone()),
+            Self::Ipc(n) => NamespaceHandle::Ipc(n.clone()),
+            Self::Cgroup(n) => NamespaceHandle::Cgroup(n.clone()),
+        }
+    }
+}
+
 impl NamespaceHandle {
     pub fn id(&self) -> u64 {
         match self {
@@ -192,8 +234,8 @@ impl NamespaceHandle {
 pub struct NamespaceSnapshot {
     uts: std::sync::Weak<Uts>,
     pub(super) net: Weak<RootNetwork>,
-    ipc: Weak<IpcNamespace>,
-    cgroup: Weak<CgroupNamespace>,
+    ipc: std::sync::Weak<IpcNamespace>,
+    cgroup: std::sync::Weak<CgroupNamespace>,
     pub(super) pid: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) pid_children: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) mount: Weak<RefCell<mounts::Table>>,
@@ -206,8 +248,8 @@ impl Vfs {
         NamespaceSnapshot {
             uts: Arc::downgrade(&self.uts.0),
             net: Rc::downgrade(&self.root_network),
-            ipc: Rc::downgrade(&self.ipc_namespace),
-            cgroup: Rc::downgrade(&self.cgroup_namespace),
+            ipc: Arc::downgrade(&self.ipc_namespace),
+            cgroup: Arc::downgrade(&self.cgroup_namespace),
             pid: Arc::downgrade(&self.pid_ns.0),
             pid_children: Arc::downgrade(&self.pid_children.0),
             mount: self
@@ -249,16 +291,10 @@ impl Vfs {
             return Err(Errno(1));
         }
         let live = self.ipc_namespace.live.clone();
-        if live.get() >= MAX_NAMESPACES {
-            return Err(Errno(28));
-        }
-        let inode = NEXT_INODE
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Errno(28))?;
-        live.set(live.get() + 1);
-        self.ipc_namespace = Rc::new(IpcNamespace {
+        let inode = reserve_namespace(&live)?;
+        self.ipc_namespace = Arc::new(IpcNamespace {
             inode,
-            mqueue: RefCell::default(),
+            mqueue: Default::default(),
             live,
         });
         Ok(())
@@ -268,7 +304,7 @@ impl Vfs {
             return Err(Errno(1));
         }
         let live = self.cgroup_namespace.live.clone();
-        if live.get() >= MAX_NAMESPACES {
+        if live.load(Ordering::Relaxed) >= MAX_NAMESPACES {
             return Err(Errno(28));
         }
         let path = self.cgroup_path(self.pid);
@@ -281,11 +317,8 @@ impl Vfs {
             .get(&path)
             .cloned()
             .ok_or(Errno(2))?;
-        let inode = NEXT_INODE
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Errno(28))?;
-        live.set(live.get() + 1);
-        self.cgroup_namespace = Rc::new(CgroupNamespace {
+        let inode = reserve_namespace(&live)?;
+        self.cgroup_namespace = Arc::new(CgroupNamespace {
             inode,
             root: Some(root),
             path,
@@ -436,7 +469,11 @@ impl Vfs {
             )),
         }))
     }
-    pub(super) fn namespace_description(&self, ns: NamespaceHandle) -> OpenHandle {
+    pub(super) fn namespace_description(
+        &self,
+        ns: NamespaceHandle,
+        mount: Option<OpenMount>,
+    ) -> OpenHandle {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 socket: None,
@@ -446,6 +483,7 @@ impl Vfs {
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 directory_mount: Default::default(),
+                namespace_resource: SharedNamespace::capture(&ns),
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,
@@ -472,7 +510,7 @@ impl Vfs {
             network_control: None,
             mount_file: None,
             oom: None,
-            mount: None,
+            mount,
         })
     }
     /// Linux chroot changes only fs.root. Existing cwd/dirfds remain capabilities.

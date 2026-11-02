@@ -954,7 +954,7 @@ impl Vfs {
                 };
                 FdInfo {
                     signal_mask: match o.anonymous {
-                        Some(events::Anonymous::Signal { mask }) => Some(mask),
+                        Some(events::Anonymous::Signal(ref mask)) => Some(mask.get()),
                         _ => None,
                     },
                     fd,
@@ -1010,9 +1010,9 @@ impl Vfs {
         }
         let link_path = self.resolve_final(dirfd, path, false)?;
         if let Some(ns) = link_path.mount.as_ref().and_then(|m| m.namespace.clone()) {
-            let description = self.namespace_description(ns);
-            description.borrow_mut().mount = link_path.mount.map(OpenMount::Owner);
-            return Ok(Some(description));
+            return Ok(Some(
+                self.namespace_description(ns, link_path.mount.map(OpenMount::Owner)),
+            ));
         }
         if !self.uses_pseudo(&link_path) {
             return Ok(None);
@@ -1033,7 +1033,7 @@ impl Vfs {
                 self.resolve_final(AT_FDCWD, format!("/proc/self/fd/{fd}").as_bytes(), false)?;
         }
         if let Some(ns) = self.namespace_for_path(&actual)? {
-            return Ok(Some(self.namespace_description(ns)));
+            return Ok(Some(self.namespace_description(ns, None)));
         }
         if let Some(open) = self.proc_fd_description_normalized(&actual)? {
             return Ok(Some(open));
@@ -1044,7 +1044,7 @@ impl Vfs {
         {
             let resolved = self.resolve_final(dirfd, path, true)?;
             if let Some(ns) = self.namespace_for_path(&resolved)? {
-                return Ok(Some(self.namespace_description(ns)));
+                return Ok(Some(self.namespace_description(ns, None)));
             }
         }
         let Some((node, label, mount)) = self.proc_exe_node_normalized(&actual)? else {
@@ -1063,6 +1063,7 @@ impl Vfs {
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 directory_mount: Default::default(),
+                namespace_resource: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,
@@ -1309,6 +1310,7 @@ impl Vfs {
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 directory_mount: Default::default(),
+                namespace_resource: original.namespace_resource.clone(),
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

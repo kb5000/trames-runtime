@@ -1099,11 +1099,11 @@ impl Vfs {
                         (flags & ATTRS) | if readonly { MS_RDONLY } else { 0 },
                     )
                 }
-                b"mqueue" if self.ipc_namespace.mqueue.borrow().is_some() => {
+                b"mqueue" if self.ipc_namespace.mqueue.get().is_some() => {
                     if data.is_some_and(|d| !d.is_empty()) {
                         return Err(Errno(95));
                     }
-                    let fs = self.ipc_namespace.mqueue.borrow().as_ref().unwrap().clone();
+                    let fs = self.ipc_namespace.mqueue.get().unwrap().clone();
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Mqueue, flags & ATTRS)
                 }
@@ -1154,9 +1154,13 @@ impl Vfs {
                         disk: None,
                         volume: None,
                     });
-                    if mqueue {
-                        *self.ipc_namespace.mqueue.borrow_mut() = Some(fs.clone());
-                    }
+                    let (fs, root) = if mqueue {
+                        let shared = self.ipc_namespace.mqueue.get_or_init(|| fs).clone();
+                        let root = shared.borrow().paths[b"/".as_slice()].clone();
+                        (shared, root)
+                    } else {
+                        (fs, root)
+                    };
                     (
                         fs,
                         root,

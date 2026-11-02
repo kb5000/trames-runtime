@@ -1221,3 +1221,42 @@ Full Unix creation/listener/connection controls still own Rc graphs that can
 retain PTYs, signalfds, namespace and ring rights. These, directory mutations,
 task/signal/namespace transitions and structural VM/device operations remain
 separate migration work. This stage is progress, not complete coordinator removal.
+
+## Shared descriptor controls and worker signalfd (2026-11-03)
+
+Signalfd masks and verified BPF programs are now complete shared OFD controls.
+The signal mask is one relaxed atomic u64; descriptor aliases, fdinfo and
+ancillary transfers observe the original mask, while CLOEXEC stays per FD.
+Signalfd creation and mask updates use the original shared Files factory on the
+executing worker. Owner and worker decode the same size/memory ABI, sanitize
+SIGKILL/SIGSTOP identically, and preserve the original flags/error ordering.
+Existing owner-only wrong-type FDs defer before resource effects.
+
+Sharing a signalfd never captures its creator's pending signals. Reads and
+signal-dependent poll/epoll still use the current reading task through the
+original joined kernel path. These controls grant no generic direct byte/poll
+capability. BPF verification, loading, attachment and execution policy are
+unchanged; shared descriptors retain the same immutable program, weak registry
+identity and quota until its last actual reference, including worker last-close.
+
+UTS, PID, IPC and cgroup namespace OFDs can also retain their actual shared
+namespace resource through Unix rights and worker descriptor lifecycle calls.
+IPC/cgroup namespace identities, weak snapshots and quota leases now use Arc;
+quota reservation/release is atomic and rolls back an identity allocation
+failure. IPC mqueue filesystem association is initialized once, so all users
+retain one original filesystem. Setns/unshare still use the original owner task
+and permission/type checks. Network/mount namespace control graphs and nsfs
+mount topology stay excluded from complete shared ownership.
+
+Proc namespace reopen constructs the complete resource before publication,
+retaining namespace capability in a fresh OFD. Namespace mount association is
+also supplied before ownership classification; changing a temporary shared
+projection cannot silently drop that association. Bound nsfs descriptions keep
+the original owner mount pin until topology itself is shared.
+
+No coordinator/resource thread, owner RPC, polling bus, global task lock or
+ordinary guest-memory barrier is added. The original coordinator would still
+join unrelated CPUs for these lifecycle/control operations; worker messages would
+add a hop to the same objects. Direct shared ownership is used instead. Full
+Unix control ownership, owner-only PTY/ring/task/namespace graphs, task signal
+queues, directory mutation and structural VM/device transitions remain pending.

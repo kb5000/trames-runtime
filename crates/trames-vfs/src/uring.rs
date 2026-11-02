@@ -534,7 +534,7 @@ impl Vfs {
             matches!(
                 a,
                 events::Anonymous::Uring(_)
-                    | events::Anonymous::Signal { .. }
+                    | events::Anonymous::Signal(_)
                     | events::Anonymous::Epoll { .. }
             )
         }) || matches!(

@@ -1071,7 +1071,7 @@ mod tests {
     fn owner_control_slots_are_excluded_before_structural_effects() {
         let mut v = Vfs::default();
         let [_, writer] = v.pipe(O_NONBLOCK).unwrap();
-        let owner = v.signalfd(-1, 1, 0).unwrap();
+        let owner = v.socket(1, 1, 0).unwrap();
         let files = v.shared_files();
         assert!(files.close(owner, 0).is_none());
         assert!(files.duplicate(owner, 160, false).is_none());
