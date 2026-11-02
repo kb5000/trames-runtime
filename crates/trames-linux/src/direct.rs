@@ -52,6 +52,9 @@ pub struct RetainedByte {
     message: Option<Arc<local_message::AcceptedMessage>>,
 }
 impl RetainedByte {
+    pub fn pty_endpoint(&self) -> Option<(Arc<trames_vfs::PtyEnd>, u32)> {
+        self.fd.retained_pty()
+    }
     pub fn local_owner_identity(&self) -> Option<trames_vfs::OfdIdentity> {
         self.message.as_ref().map(|_| self.fd.ofd_identity())
     }
@@ -1188,7 +1191,7 @@ impl DirectSyscalls {
             }
             Some(result) => return self.complete_byte(&file, result),
             None => {
-                return if file.message.is_some() {
+                return if file.message.is_some() || file.fd.is_pty() {
                     IoAttempt::ByteCheckpoint(file)
                 } else {
                     IoAttempt::Checkpoint
@@ -1354,6 +1357,9 @@ impl DirectSyscalls {
         } else if let Some(file) = &pending.retained_byte {
             let Some(result) = self.transfer_retained(file, pending.number, pending.args, memory)
             else {
+                if file.fd.is_pty() {
+                    return IoAttempt::ByteCheckpoint(pending.retained_byte.take().unwrap());
+                }
                 return IoAttempt::Checkpoint;
             };
             result

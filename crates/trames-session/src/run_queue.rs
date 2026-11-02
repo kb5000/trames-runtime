@@ -65,10 +65,8 @@ pub(super) struct IoCall {
     pub deadline: Option<Instant>,
 }
 impl IoCall {
-    pub fn from_byte(file: trames_linux::RetainedByte) -> Self {
-        let (number, args) = file
-            .local_message_entry()
-            .expect("accepted message checkpoint");
+    pub fn from_byte(file: trames_linux::RetainedByte, number: u32, args: [u64; 6]) -> Self {
+        let (number, args) = file.local_message_entry().unwrap_or((number, args));
         Self {
             number,
             args,

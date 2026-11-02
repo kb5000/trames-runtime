@@ -1316,3 +1316,16 @@ hangup task effects also retain their joined task boundary. A shared close does
 not bypass SIGHUP/SIGCONT delivery or imply that every terminal ioctl is direct.
 These are remaining ownership migrations, rather than byte-queue performance
 fallbacks. The implementation is common to macOS and the iPad interpreter.
+
+### Joined terminal retries retain the accepted endpoint
+
+Production multi-terminal FFI validation also exercises the single-thread joined
+entry. It supplies the same frozen TerminalAccess for ordinary shared PTY waits.
+A byte attempt that requires task-level terminal signals returns a retained PTY
+checkpoint; worker retry metadata supplies its original syscall arguments without
+adding per-read argument storage. Joined terminal handling takes flags and the
+endpoint from that accepted OFD, rather than looking up a numeric slot again.
+Completion releases the lease; blocked signal/job-control calls keep it. The same
+handoff applies when a previously parked PTY operation becomes a task-control
+case. A regression closes and reuses both the slave waiting for input and the
+master publishing control-C, proving original bytes/signals and final close.

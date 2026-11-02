@@ -2986,6 +2986,13 @@ impl<C: Cpu> Kernel<C> {
         } else if matches!(number, 63..=66) {
             let direct = trames_linux::DirectSyscalls::default()
                 .with_membership(p.linux.vfs.shared_files())
+                .with_terminal(trames_vfs::TerminalAccess {
+                    session: p.session,
+                    group: p.group,
+                    controlling: p.linux.vfs.controlling_terminal,
+                    ignore_ttou: p.signals.mask & (1 << 21) != 0
+                        || p.signals.actions.get(22).handler == 1,
+                })
                 .with_local_identity([
                     p.tgid,
                     p.linux.vfs.credentials.uid,
@@ -3015,8 +3022,12 @@ impl<C: Cpu> Kernel<C> {
                 p.byte_wait = Some(wait);
                 Ok(None)
             }
-            Some(trames_linux::IoAttempt::ByteCheckpoint(_)) => {
-                unreachable!("owner local message retry")
+            Some(trames_linux::IoAttempt::ByteCheckpoint(file)) => {
+                // Job-control/input signals require task authority. Retain the
+                // accepted endpoint across this handoff and any signal wait.
+                assert!(file.pty_endpoint().is_some(), "owner local message retry");
+                p.retained_byte = Some(file);
+                self.terminal_call(pid, p, number, a, io)
             }
             Some(trames_linux::IoAttempt::SocketCheckpoint(_)) => {
                 unreachable!("owner socket retry")
@@ -3079,6 +3090,7 @@ impl<C: Cpu> Kernel<C> {
         };
         if raw.is_some() {
             p.tcp_liveness = None;
+            p.retained_byte = None;
         }
         let signal_pipe = match number {
             64 | 66 | 71 | 76 => true,
@@ -3297,7 +3309,14 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
-        let flags = p.linux.vfs.flags(a[0] as u32)?;
+        let retained = p
+            .retained_byte
+            .as_ref()
+            .and_then(|file| file.pty_endpoint());
+        let flags = match &retained {
+            Some((_, flags)) => *flags,
+            None => p.linux.vfs.flags(a[0] as u32)?,
+        };
         if flags & trames_vfs::O_PATH != 0 {
             return Err(Errno(9));
         }
@@ -3306,7 +3325,10 @@ impl<C: Cpu> Kernel<C> {
         {
             return Err(Errno(9));
         }
-        let endpoint = p.linux.vfs.pty(a[0] as u32)?;
+        let endpoint = match retained {
+            Some((end, _)) => Some(end),
+            None => p.linux.vfs.pty(a[0] as u32)?,
+        };
         let master = endpoint.as_ref().is_some_and(|end| end.master);
         let id = endpoint.as_ref().map_or(0, |end| end.pair.id);
         if number == 29 {
@@ -3352,7 +3374,7 @@ impl<C: Cpu> Kernel<C> {
                         Linux::scatter(&mut p.memory, &parts, &bytes)?;
                         Ok(Some(bytes.len() as u64))
                     }
-                    Err(Errno(11)) if p.linux.vfs.flags(a[0] as u32)? & O_NONBLOCK == 0 => Ok(None),
+                    Err(Errno(11)) if flags & O_NONBLOCK == 0 => Ok(None),
                     Err(e) => Err(e),
                 };
             }
@@ -3380,7 +3402,7 @@ impl<C: Cpu> Kernel<C> {
                     Linux::scatter(&mut p.memory, &parts, &bytes)?;
                     Ok(Some(bytes.len() as u64))
                 }
-                Err(Errno(11)) if p.linux.vfs.flags(a[0] as u32)? & O_NONBLOCK == 0 => Ok(None),
+                Err(Errno(11)) if flags & O_NONBLOCK == 0 => Ok(None),
                 Err(e) => Err(e),
             }
         } else if number == 64 || number == 66 {
@@ -3452,7 +3474,7 @@ impl<C: Cpu> Kernel<C> {
                 return Ok(None);
             }
             let count = match tty.queue_output(&bytes) {
-                Err(Errno(11)) if p.linux.vfs.flags(a[0] as u32)? & O_NONBLOCK == 0 => {
+                Err(Errno(11)) if flags & O_NONBLOCK == 0 => {
                     return Ok(None);
                 }
                 result => result?,

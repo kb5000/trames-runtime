@@ -683,6 +683,9 @@ impl DirectFd {
     pub fn pty_endpoint(&self) -> Option<&PtyEnd> {
         self._file.as_ref()?.open.pty.as_deref()
     }
+    pub fn retained_pty(&self) -> Option<(Arc<PtyEnd>, u32)> {
+        Some((self._file.as_ref()?.open.pty.clone()?, self.status.get()))
+    }
     pub fn is_inotify(&self) -> bool {
         matches!(self.resource, ByteResource::Inotify(_))
     }

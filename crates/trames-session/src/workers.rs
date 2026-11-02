@@ -509,7 +509,8 @@ impl<C: Cpu> Pool<C> {
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
                                     trames_linux::IoAttempt::ByteCheckpoint(file) => {
-    let call = crate::run_queue::IoCall::from_byte(file);
+    let saved = saved_call.as_ref().expect("retained byte call");
+    let call = crate::run_queue::IoCall::from_byte(file, saved.number, saved.args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
     job.retry=Some(call);
@@ -626,7 +627,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                                     trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                     trames_linux::IoAttempt::ByteCheckpoint(file) => {
-    let call = crate::run_queue::IoCall::from_byte(file);
+    let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
     job.retry=Some(call);
@@ -647,7 +648,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                         trames_linux::IoAttempt::Complete(value) => { work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
                                                         trames_linux::IoAttempt::Blocked(pending) => { parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
                                                         trames_linux::IoAttempt::ByteCheckpoint(file) => {
-                                                            let call=crate::run_queue::IoCall::from_byte(file);
+                                                            let call=crate::run_queue::IoCall::from_byte(file, number, args);
                                                             for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                                             work.cpu.set_x(8,call.number as u64);job.retry=Some(call);break result;
                                                         }
@@ -748,7 +749,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                 trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                 trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                 trames_linux::IoAttempt::ByteCheckpoint(file) => {
-    let call = crate::run_queue::IoCall::from_byte(file);
+    let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
     job.retry=Some(call);
@@ -776,7 +777,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
                                                 trames_linux::IoAttempt::ByteCheckpoint(file) => {
-    let call = crate::run_queue::IoCall::from_byte(file);
+    let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
     job.retry=Some(call);

@@ -510,6 +510,72 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
 }
 
 #[test]
+fn joined_pty_wait_and_signal_handoff_keep_accepted_endpoints_after_fd_reuse() {
+    let mut p = super::tests::process();
+    let mut k = super::tests::kernel();
+    p.linux.vfs.set_runtime_info(1, Default::default());
+    let master = p
+        .linux
+        .vfs
+        .open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2, 0)
+        .unwrap();
+    let pair = p.linux.vfs.pty(master).unwrap().unwrap().pair.clone();
+    pair.locked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let slave = p.linux.vfs.open_pty_peer(master, 2).unwrap();
+    p.session = 1;
+    p.group = 1;
+    p.linux.vfs.set_controlling_terminal(Some(pair.id)).unwrap();
+    {
+        let mut tty = pair.terminal.borrow_mut();
+        tty.session = 1;
+        tty.foreground = 1;
+    }
+    let read = [slave as u64, 0x1100, 3, 0, 0, 0];
+    let mut output = trames_linux::CapturedOutput::default();
+    k.call(1, &mut p, 63, read, &mut output);
+    assert!(
+        p.byte_wait.is_some(),
+        "ordinary PTY input uses its resource wait"
+    );
+    p.linux.vfs.close(slave).unwrap();
+    assert_eq!(p.linux.vfs.eventfd(99, 0).unwrap(), slave);
+    assert_eq!(pair.master_write(b"ok\n").unwrap().0, 3);
+    assert!(p.byte_wait.as_ref().unwrap().signal.ready());
+    k.call(1, &mut p, 63, read, &mut output);
+    assert_eq!(p.cpu.x(0), 3);
+    assert_eq!(p.memory.read_array::<3>(0x1100).unwrap(), *b"ok\n");
+    assert!(p.byte_wait.is_none());
+
+    p.memory.write(0x1100, b"\x03").unwrap();
+    let write = [master as u64, 0x1100, 1, 0, 0, 0];
+    let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+        .with_membership(p.linux.vfs.shared_files());
+    let accepted = match direct
+        .start(
+            64,
+            write,
+            &mut p.memory,
+            1,
+            &Arc::downgrade(&k.byte_target),
+            None,
+        )
+        .unwrap()
+    {
+        trames_linux::IoAttempt::ByteCheckpoint(file) => file,
+        _ => panic!("terminal input signal must retain its original endpoint"),
+    };
+    p.linux.vfs.close(master).unwrap();
+    assert_eq!(p.linux.vfs.eventfd(100, 0).unwrap(), master);
+    p.retained_byte = Some(accepted);
+    k.call(1, &mut p, 64, write, &mut output);
+    assert_eq!(p.cpu.x(0), 1);
+    assert!(p.signals.pending.contains_key(&2));
+    assert!(p.retained_byte.is_none());
+    assert!(!pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
 fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
     for slots in [1, 2] {
         let mut p = super::tests::process();
