@@ -1812,3 +1812,136 @@ fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filt
         assert_eq!(p.linux.vfs.read(rx, 4), Err(Errno(11)));
     }
 }
+
+#[test]
+fn stateless_device_lifecycles_and_unix_rights_complete_on_workers_with_one_filter_entry() {
+    for (path, read_count) in [
+        (b"/dev/null\0".as_slice(), 0),
+        (b"/dev/zero\0".as_slice(), 8),
+    ] {
+        for slots in [1, 2] {
+            let mut p = super::tests::process();
+            let mut k = super::tests::kernel();
+            p.linux
+                .vfs
+                .set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+            let [tx, rx] = p.linux.vfs.socketpair(1, 2, 0).unwrap();
+            assert_eq!([tx, rx], [3, 4]);
+            p.memory.write(0x1200, path).unwrap();
+            p.memory.write(0x1300, b"device!!").unwrap();
+            for (at, value) in [
+                (0x1010, 0x1080u64),
+                (0x1018, 1),
+                (0x1020, 0x1100),
+                (0x1028, 24),
+                (0x1080, 0x1300),
+                (0x1088, 1),
+                (0x1100, 20),
+            ] {
+                p.memory.write_array(at, value.to_le_bytes()).unwrap();
+            }
+            p.memory.write_array(0x1108, 1u32.to_le_bytes()).unwrap();
+            p.memory.write_array(0x110c, 1u32.to_le_bytes()).unwrap();
+            filter(&mut k, &mut p, 0x7fff0000);
+            let mut peer = p.fork();
+            peer.parent = 1;
+            peer.tgid = 2;
+            let mut code = Vec::new();
+            let mut results = Vec::new();
+            for _ in 0..4u32 {
+                let mut call = |setup: &[u32], number: u32, expected: u64| {
+                    code.extend_from_slice(setup);
+                    code.extend([
+                        mov(8, number),
+                        0xd4000001,
+                        mov(10, 0x1800 + (results.len() as u32) * 8),
+                        0xf9000140,
+                    ]);
+                    results.push(expected);
+                };
+                call(&[0x92800c60, mov(1, 0x1200), mov(2, 2), mov(3, 0)], 56, 5);
+                call(&[mov(0, 5), mov(1, 0x1300), mov(2, 8)], 63, read_count);
+                call(&[mov(0, 5), mov(1, 0x1300), mov(2, 8)], 64, 8);
+                call(
+                    &[mov(0, 5), mov(1, 0x1300), mov(2, 8), mov(3, 9)],
+                    67,
+                    read_count,
+                );
+                call(&[mov(0, 5), mov(1, 0x1300), mov(2, 8), mov(3, 9)], 68, 8);
+                call(&[mov(0, 5), mov(1, 999), mov(2, 99)], 62, 0);
+                call(&[mov(0, 5), mov(1, 0x1400)], 80, 0);
+                call(&[mov(0, 5)], 23, 6);
+                call(&[mov(0, 5), mov(1, 4), mov(2, 0x800)], 25, 0);
+                // Rewrite cmsg length/capacity and original FD on every iteration;
+                // recvmsg installs an actual new alias in this task's Files.
+                call(
+                    &[
+                        mov(10, 0x1110),
+                        mov(11, 5),
+                        0xb900014b,
+                        mov(10, 0x1028),
+                        mov(11, 24),
+                        0xf900014b,
+                        mov(0, 3),
+                        mov(1, 0x1000),
+                        mov(2, 0),
+                    ],
+                    211,
+                    1,
+                );
+                call(&[mov(0, 5)], 57, 0);
+                call(&[mov(0, 4), mov(1, 0x1000), mov(2, 0)], 212, 1);
+                call(&[mov(0, 5), mov(1, 0x1300), mov(2, 8)], 63, read_count);
+                call(&[mov(0, 5)], 57, 0);
+                call(&[mov(0, 6)], 57, 0);
+            }
+            code.extend([
+                mov(0, 0x1060),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ]);
+            program(&mut p, code.clone());
+            program(&mut peer, code);
+            if slots == 2 {
+                peer.affinity = 2;
+            }
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            let total = (results.len() * 2 + 2) as u64;
+            let until = Instant::now() + Duration::from_secs(5);
+            while k.syscalls < total {
+                let limit = k.instructions + 100_000;
+                assert!(
+                    k.parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
+                        .unwrap(),
+                    "path={path:?} slots={slots} calls={}",
+                    k.syscalls
+                );
+                assert!(Instant::now() < until);
+            }
+            for p in k.processes.values() {
+                for (index, expected) in results.iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + index as u64 * 8).unwrap(),
+                        *expected,
+                        "path={path:?} slots={slots} call={index}"
+                    );
+                }
+                assert_eq!(p.seccomp.evaluations(), total);
+            }
+            assert_eq!(k.service_requests, 0);
+            assert_eq!(k.syscalls, total);
+            assert_eq!(
+                k.worker_syscalls, total,
+                "device lifecycle must not join the owner"
+            );
+        }
+    }
+}

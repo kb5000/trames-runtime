@@ -157,6 +157,9 @@ impl OpenDescription {
             || self.control.is_some()
             || self.pipe.is_some()
             || self.node.as_ref().is_some_and(|node| {
+                if node.simple_device.is_some() {
+                    return true;
+                }
                 let node = node.borrow();
                 !node.volatile && matches!(node.content, Content::File(_) | Content::Directory)
             })

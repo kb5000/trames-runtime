@@ -27,6 +27,7 @@ mod open_handle;
 pub use open_handle::OfdIdentity;
 use open_handle::{OpenHandle, OpenMount, OpenWeak};
 mod shared_cell;
+mod simple_device;
 use shared_cell::SharedCell;
 mod flock;
 use fd_table::{Descriptor, DescriptorTable};
@@ -299,6 +300,8 @@ enum Content {
 }
 type NodeRef = Arc<Inode>;
 struct Inode {
+    // Immutable device behavior belongs to inode identity, not its pathname.
+    simple_device: Option<simple_device::Kind>,
     #[cfg(all(feature = "hostfs", unix))]
     mount_target: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "hostfs", unix))]
@@ -316,6 +319,7 @@ impl Inode {
         }
         node.identity = trames_memory::new_backing_identity();
         Self {
+            simple_device: simple_device::Kind::content(&node.content),
             #[cfg(all(feature = "hostfs", unix))]
             mount_target: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(feature = "hostfs", unix))]
@@ -2049,6 +2053,7 @@ impl Vfs {
                             _ => false,
                         };
                     if !pty
+                        && node.simple_device.is_none()
                         && (n.volatile
                             || n.seals.is_some()
                             || !matches!(
@@ -2583,6 +2588,9 @@ impl Vfs {
         self.refresh_pseudo_fd(fd)?;
         let o_descriptor = self.descriptor(fd)?;
         let mut o = o_descriptor.open.borrow_mut();
+        if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
+            return o.simple_read(kind, count);
+        }
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }
@@ -2667,6 +2675,9 @@ impl Vfs {
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
         let o_descriptor = self.descriptor(fd)?;
         let mut o = o_descriptor.open.borrow_mut();
+        if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
+            return o.simple_write::<false>(kind, bytes);
+        }
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
         }
@@ -2857,6 +2868,9 @@ impl Vfs {
         if o.bridge.is_some() || o.kernel_log.is_some() {
             return Err(Errno(29));
         }
+        if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
+            return o.simple_read(kind, count);
+        }
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }
@@ -2894,6 +2908,12 @@ impl Vfs {
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        let descriptor = self.descriptor(fd)?;
+        let o = descriptor.open.borrow();
+        if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
+            return o.simple_write::<true>(kind, bytes);
+        }
+        drop(o);
         self.file_write(fd, bytes, Some(offset))
     }
     pub fn truncate_fd(&mut self, fd: u32, length: u64) -> Result<()> {
@@ -3071,6 +3091,8 @@ impl Vfs {
                 self.pseudo
                     .borrow()
                     .nodes
+                    .borrow()
+                    .entries
                     .iter()
                     .find(|(_, n)| n.identity == node.identity)
                     .map(|((_, p), _)| p.clone())

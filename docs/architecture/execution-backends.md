@@ -1591,3 +1591,46 @@ Real guest tests cover all packet byte/message pairs on one/two slots and paired
 or addressed transports, plus batch-capacity and filtered signal handoff. Native
 TCP/UDP batches and owner-only ancillary/task effects remain boundaries. recvmmsg
 is currently unimplemented, rather than a migrated coordinator path.
+
+## Shared stateless memory devices (2026-11-03)
+
+Null, zero, full, random and urandom endpoints are admitted by immutable inode
+behavior, not by their pathname. Original mknod nodes, renamed nodes and opened
+mount identities use the same typed endpoint. Complete OFDs enter shared Files
+and portable SCM_RIGHTS; source close/reuse or a namespace change cannot replace
+the accepted object. The original device algorithms still perform byte operations.
+Owner/native and worker interfaces share access, mount, timestamp and notification
+handling, including the original raw versus positioned error order. No storage or
+RLIMIT_FSIZE charge is added to these stateless operations.
+
+The inode's device type is fixed at creation. Existing content replacement changes
+ordinary file backing or refreshes the same pseudo-device type; replacing a path
+installs a different inode. Actual inode/OFD metadata remains synchronized by the
+existing object mechanisms. Hot reads/writes do not acquire the pseudo cache or
+re-resolve the name. Direct capabilities retain the full OFD only when accepted;
+passive caches neither own its close notification nor keep an endpoint open.
+
+Fixed synthetic /dev devices are looked up in the original shared pseudo-inode
+cache, including concurrent first opens. The cache protects only registration,
+identity allocation and pruning. A hit releases the cache guard before refreshing
+mutable content; fixed device behavior needs no content rewrite. PathQueries still
+has its sealed private Rc/control island; only the actual Arc-backed inode cache
+crosses the boundary. Runtime/task pseudo state does not become shared or Send.
+Proc, sysfs, magic device links, terminals, PTMX, render, bridge, block and kernel-log
+controls retain their explicit owner boundary. Ordinary /dev filesystem fallback
+uses the common walker, credentials, nodev, permissions and actual device policy.
+
+Scalar/vector and positioned I/O, seek and stat use their original ABI. Access
+checks run once in the common device operation; compile-time raw/positioned paths
+preserve mount-versus-access error order. Existing synchronous device-write results
+are retained. Notifications and final OFD release occur outside inode/cache/Files
+guards. A remount changes the original mount's policy; a later mount-namespace copy
+does not substitute a different mount into an already open descriptor.
+
+Tests cover five device types, concurrent cold opens sharing one inode with distinct
+OFDs, renamed mknod devices, readonly/nodev and namespace changes, actual access/
+modify/open/final-close notifications, FD reuse, fixed error results and original
+owner-only paths. Real filtered guest lifecycles cover null/zero on one/two worker
+slots, with all 122 calls completing on workers and one filter decision per entry.
+Dynamic device controls, Unix owning graphs, task effects and structural operations
+remain separate migration boundaries.

@@ -140,7 +140,7 @@ impl Vfs {
         } else {
             let path = format!("/dev/pts/{id}").into_bytes();
             let mut pseudo = self.pseudo.borrow_mut();
-            pseudo.nodes.remove(&(0, path.clone()));
+            pseudo.nodes.borrow_mut().entries.remove(&(0, path.clone()));
             let node = pseudo.cache(
                 0,
                 &path,

@@ -563,7 +563,7 @@ impl DirectSyscalls {
     pub fn supports(&self, number: u32, fd: u32) -> bool {
         // Classify the ABI before resolving an FD. Creation, pathname, clock
         // and other non-I/O calls must not look up argument zero as a number.
-        if !matches!(number,22|28|29|62..=66|86|87|206|207|210..=212|269|441) {
+        if !matches!(number,22|28|29|62..=70|86|87|206|207|210..=212|269|441) {
             return false;
         }
         if self.network.get(fd).is_some() {
@@ -575,7 +575,9 @@ impl DirectSyscalls {
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
         if number == 62 {
-            fd.is_kmsg()
+            fd.is_kmsg() || fd.is_simple_device()
+        } else if matches!(number, 67..=70) {
+            fd.is_simple_device()
         } else if matches!(number, 22 | 441) {
             fd.is_epoll()
         } else if matches!(number, 86 | 87) {
@@ -835,7 +837,7 @@ impl DirectSyscalls {
                 .map(|n| n as u64)
         };
         let result = match number {
-            62 => fd.kmsg_seek(args[1] as i64, args[2] as u32),
+            62 => fd.byte_seek(args[1] as i64, args[2] as u32),
             28 => fd.inotify_remove(args[1] as i32),
             86 | 87 => crate::timerfd_control(
                 fd.timer().expect("timerfd resource"),
@@ -867,6 +869,22 @@ impl DirectSyscalls {
                     )
                     .map_err(|_| Errno(14))?;
                 Ok(0)
+            })(),
+            67 => Linux::read_transport(args, memory, |count| fd.device_pread(count, args[3])),
+            68 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), |bytes| {
+                fd.device_pwrite(bytes, args[3]).map(|n| n as u64)
+            }),
+            69 | 70 => (|| {
+                let (parts, total) = Linux::positioned_vector_parts(memory, args, number == 70)?;
+                if number == 70 {
+                    let mut scratch = self.scratch.borrow_mut();
+                    Linux::gather_parts(memory, &parts, total, &mut scratch)?;
+                    fd.device_pwrite(&scratch, args[3]).map(|n| n as u64)
+                } else {
+                    let bytes = fd.device_pread(total, args[3])?;
+                    Linux::scatter(memory, &parts, &bytes)?;
+                    Ok(bytes.len() as u64)
+                }
             })(),
             63 => Linux::read_transport(args, memory, read),
             64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), |bytes| {
@@ -1137,7 +1155,7 @@ impl DirectSyscalls {
         ))
     }
     fn retain_byte(&self, number: u32, args: [u64; 6]) -> Option<Result<RetainedByte, Errno>> {
-        if !matches!(number, 63..=66) {
+        if !matches!(number, 63..=70) {
             return None;
         }
         let file = match self.membership.as_ref()?.lookup(args[0] as u32)? {
@@ -1145,6 +1163,9 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         let fd = file.direct_byte()?;
+        if matches!(number, 67..=70) && !fd.is_simple_device() {
+            return None;
+        }
         Some(Ok(RetainedByte { fd, message: None }))
     }
     pub fn start_retained_poll(
@@ -3543,6 +3564,87 @@ mod tests {
             Some(Err(Errno(22)))
         );
         assert_eq!(vfs.read(fd, 8), Err(Errno(11)));
+    }
+    #[test]
+    fn device_scalar_vector_and_positioned_abi_preserves_faults_access_and_original_ofd() {
+        for (path, full, zeros) in [
+            (b"/dev/null".as_slice(), false, false),
+            (b"/dev/zero", false, true),
+            (b"/dev/full", true, true),
+        ] {
+            for flags in [0, 1, 2, trames_vfs::O_PATH] {
+                let mut v = Vfs::default();
+                v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+                let fd = v.open_at(-100, path, flags, 0).unwrap();
+                let d = DirectSyscalls::new(v.direct_descriptors());
+                let mut m = memory();
+                for (at, value) in [
+                    (0x1000, 0x1100u64),
+                    (0x1008, 1),
+                    (0x1010, 0x1101),
+                    (0x1018, 3),
+                ] {
+                    m.write_array(at, value.to_le_bytes()).unwrap();
+                }
+                for number in 63..=70 {
+                    m.write(0x1100, b"data").unwrap();
+                    let vector = matches!(number, 65 | 66 | 69 | 70);
+                    let writing = matches!(number, 64 | 66 | 68 | 70);
+                    let args = [
+                        fd as u64,
+                        if vector { 0x1000 } else { 0x1100 },
+                        if vector { 2 } else { 4 },
+                        23,
+                        0,
+                        0,
+                    ];
+                    let expected = if flags & trames_vfs::O_PATH != 0
+                        || writing && flags == 0
+                        || !writing && flags == 1
+                    {
+                        Err(Errno(9))
+                    } else if writing && full {
+                        Err(Errno(28))
+                    } else {
+                        Ok(if writing || zeros { 4 } else { 0 })
+                    };
+                    assert_eq!(
+                        d.invoke(number, args, &mut m),
+                        Some(expected),
+                        "{path:?} flags={flags} number={number}"
+                    );
+                    if !writing && flags != 1 && flags & trames_vfs::O_PATH == 0 {
+                        assert_eq!(
+                            m.read_array::<4>(0x1100).unwrap(),
+                            if zeros { [0; 4] } else { *b"data" }
+                        );
+                    }
+                }
+                if flags == 2 {
+                    let bad = [fd as u64, 0x9000, 4, u64::MAX, 0, 0];
+                    assert_eq!(d.invoke(67, bad, &mut m), Some(Err(Errno(14))));
+                    m.write_array(0x1000, 0x9000u64.to_le_bytes()).unwrap();
+                    assert_eq!(
+                        d.invoke(69, [fd as u64, 0x1000, 2, 0, 0, 0], &mut m),
+                        Some(Err(Errno(14)))
+                    );
+                    assert_eq!(
+                        d.invoke(69, [fd as u64, 0x1000, 2, u64::MAX, 0, 0], &mut m),
+                        Some(Err(Errno(22)))
+                    );
+                    m.write_array(0x1000, 0x1100u64.to_le_bytes()).unwrap();
+                    let args = [fd as u64, 0x1000, 2, 0, 0, 0];
+                    let file = d.retain_byte(69, args).unwrap().unwrap();
+                    v.close(fd).unwrap();
+                    assert_eq!(v.eventfd(91, 0).unwrap(), fd);
+                    let target: Arc<dyn IoWake> = Arc::new(Target);
+                    assert!(
+                        matches!(d.start_retained_byte(file,69,args,&mut m,1,&Arc::downgrade(&target)),IoAttempt::Complete(Ok(n)) if n==if zeros{4}else{0})
+                    );
+                    assert_eq!(v.read(fd, 8).unwrap(), 91u64.to_le_bytes());
+                }
+            }
+        }
     }
 }
 

@@ -653,12 +653,18 @@ pub(super) struct PseudoFs {
     pub(super) video_device: bool,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
-    pub(super) nodes: BTreeMap<(u64, Vec<u8>), NodeRef>,
+    pub(super) nodes: Arc<SharedCell<PseudoNodes>>,
+}
+#[derive(Default)]
+pub(super) struct PseudoNodes {
+    pub(super) entries: BTreeMap<(u64, Vec<u8>), NodeRef>,
     next_inode: u64,
 }
 impl PseudoFs {
     pub(super) fn path_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
         self.nodes
+            .borrow()
+            .entries
             .iter()
             .find(|(_, n)| Arc::ptr_eq(n, node))
             .map(|((_, p), _)| p.clone())
@@ -670,14 +676,19 @@ impl PseudoFs {
         content: Content,
         mode: u32,
     ) -> Result<NodeRef> {
-        if let Some(node) = self.nodes.get(&(ns, path.to_vec())) {
-            node.borrow_mut().content = content;
-            return Ok(node.clone());
+        let mut nodes = self.nodes.borrow_mut();
+        if let Some(node) = nodes.entries.get(&(ns, path.to_vec())).cloned() {
+            drop(nodes);
+            debug_assert_eq!(node.simple_device, simple_device::Kind::content(&content));
+            if node.simple_device.is_none() {
+                node.borrow_mut().content = content;
+            }
+            return Ok(node);
         }
-        if self.nodes.len() >= 32768 {
+        if nodes.entries.len() >= 32768 {
             return Err(Errno(28));
         }
-        self.next_inode = self.next_inode.checked_add(1).ok_or(Errno(28))?;
+        nodes.next_inode = nodes.next_inode.checked_add(1).ok_or(Errno(28))?;
         let node = Arc::new(Inode::new(Node {
             identity: 0,
             record_locks: std::sync::OnceLock::new(),
@@ -703,14 +714,14 @@ impl PseudoFs {
             inode: if path == b"/proc" {
                 1
             } else {
-                (1u64 << 63) + self.next_inode
+                (1u64 << 63) + nodes.next_inode
             },
             links: 1,
             times: [storage::Timestamp::default(); 3],
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        self.nodes.insert((ns, path.to_vec()), node.clone());
+        nodes.entries.insert((ns, path.to_vec()), node.clone());
         Ok(node)
     }
 }
@@ -831,7 +842,7 @@ impl Vfs {
             p.namespaces = self.namespace_snapshot();
         }
         let mut pseudo = self.pseudo.borrow_mut();
-        pseudo.nodes.retain(|(ns, path), _| {
+        pseudo.nodes.borrow_mut().entries.retain(|(ns, path), _| {
             if !self.pid_ns.namespace_alive(*ns) {
                 return false;
             }
@@ -1442,7 +1453,9 @@ impl Vfs {
             return Ok(None);
         }
         if let Some(query) = &self.query {
-            return query.defer();
+            if path != b"/dev" && !path.starts_with(b"/dev/") {
+                return query.defer();
+            }
         }
         let content = self.pseudo_content(at)?;
         if let Some((content, mode)) = content {
@@ -1493,6 +1506,37 @@ impl Vfs {
     }
     fn pseudo_content<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<(Content, u32)>> {
         let path = at.key();
+        if let Some(content) = simple_device::builtin(path) {
+            return Ok(Some(content));
+        }
+        if path == b"/dev" || path.starts_with(b"/dev/") {
+            let owner = matches!(
+                path,
+                b"/dev/tty"
+                    | b"/dev/ptmx"
+                    | b"/dev/fd"
+                    | b"/dev/stdin"
+                    | b"/dev/stdout"
+                    | b"/dev/stderr"
+                    | b"/dev/kmsg"
+                    | b"/dev/vda"
+                    | b"/dev/vda1"
+                    | b"/dev/trames-bridge"
+            ) || [b"/dev/pts".as_slice(), b"/dev/dri", b"/dev/block"]
+                .iter()
+                .any(|base| {
+                    path == *base
+                        || path
+                            .strip_prefix(*base)
+                            .is_some_and(|p| p.starts_with(b"/"))
+                });
+            if !owner {
+                return Ok(None);
+            }
+            if let Some(query) = &self.query {
+                return query.defer();
+            }
+        }
         let pseudo = self.pseudo.borrow();
         let r = self.proc_runtime(at, &pseudo.runtime);
         let task_limit = if r.task_limit == 0 {
@@ -1586,11 +1630,7 @@ impl Vfs {
             b"/sys/class/block/vda1" => return Ok(link(b"../../devices/virtual/block/vda/vda1".to_vec())),
             b"/sys/dev/block/253:0" => return Ok(link(b"../../devices/virtual/block/vda".to_vec())),
             b"/sys/dev/block/253:1" => return Ok(link(b"../../devices/virtual/block/vda/vda1".to_vec())),
-            b"/dev/zero" | b"/dev/full" | b"/dev/random" | b"/dev/urandom" | b"/dev/ptmx" => {
-                let d = match path { b"/dev/zero" => Device::Zero, b"/dev/full" => Device::Full,
-                    b"/dev/random" => Device::Random, b"/dev/urandom" => Device::Urandom, _ => Device::Ptmx };
-                return Ok(Some((Content::Device(d), 0o20666)));
-            }
+            b"/dev/ptmx" => return Ok(Some((Content::Device(Device::Ptmx),0o20666))),
             b"/proc/uptime" => return Ok(regular(format!("{:.2} {:.2}\n", r.uptime.as_secs_f64(), r.idle.as_secs_f64()).into_bytes())),
             b"/proc/meminfo" => {
                 let total = r.memory_limit as u64 / 1024;

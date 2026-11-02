@@ -207,6 +207,7 @@ enum ByteResource {
     TcpPoll(trames_net::TcpPoll),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
+    SimpleDevice(simple_device::Kind),
     UnixControl(std::sync::Weak<ipc::LocalResource>),
     UnixDatagram(Arc<ipc::channel::Resource>),
     Kmsg(Arc<kernel_log::Kmsg>),
@@ -403,6 +404,13 @@ impl DirectFd {
                         live: live.clone(),
                     })
                 }
+                None if open
+                    .node
+                    .as_ref()
+                    .is_some_and(|n| n.simple_device.is_some()) =>
+                {
+                    ByteResource::SimpleDevice(open.node.as_ref()?.simple_device?)
+                }
                 None => {
                     let end = open.pipe.as_ref()?;
                     ByteResource::Pipe {
@@ -481,7 +489,7 @@ impl DirectFd {
                 signal,
             )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
-            ByteResource::Regular => Vec::new(),
+            ByteResource::Regular | ByteResource::SimpleDevice(_) => Vec::new(),
             ByteResource::UnixControl(local) => local
                 .upgrade()
                 .map(|local| local.subscribe(signal))
@@ -837,7 +845,7 @@ impl DirectFd {
         match &self.resource {
             ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
             ByteResource::Mounts(watch) => watch.peek(events),
-            ByteResource::Regular => (events & 5, [0; 2]),
+            ByteResource::Regular | ByteResource::SimpleDevice(_) => (events & 5, [0; 2]),
             ByteResource::UnixControl(local) => local.upgrade().map_or((16, [0; 2]), |local| {
                 (local.poll(events), local.poll_epoch())
             }),
@@ -913,17 +921,50 @@ impl DirectFd {
     pub fn is_eventfd(&self) -> bool {
         matches!(self.resource, ByteResource::Event(_))
     }
+    pub fn is_simple_device(&self) -> bool {
+        matches!(self.resource, ByteResource::SimpleDevice(_))
+    }
     pub fn is_kmsg(&self) -> bool {
         matches!(self.resource, ByteResource::Kmsg(_))
     }
     pub fn kmsg_seek(&self, offset: i64, whence: u32) -> Result<u64> {
+        self.byte_seek(offset, whence)
+    }
+    pub fn device_pread(&self, count: usize, offset: u64) -> Result<Vec<u8>> {
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        let ByteResource::SimpleDevice(kind) = self.resource else {
+            return Err(Errno(29));
+        };
+        self._file
+            .as_ref()
+            .ok_or(Errno(9))?
+            .open
+            .simple_read(kind, count)
+    }
+    pub fn device_pwrite(&self, bytes: &[u8], offset: u64) -> Result<usize> {
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        let ByteResource::SimpleDevice(kind) = self.resource else {
+            return Err(Errno(29));
+        };
+        self._file
+            .as_ref()
+            .ok_or(Errno(9))?
+            .open
+            .simple_write::<true>(kind, bytes)
+    }
+    pub fn byte_seek(&self, offset: i64, whence: u32) -> Result<u64> {
         if self.flags & O_PATH != 0 {
             return Err(Errno(9));
         }
-        let ByteResource::Kmsg(log) = &self.resource else {
-            return Err(Errno(29));
-        };
-        log.seek(offset, whence)
+        match &self.resource {
+            ByteResource::Kmsg(log) => log.seek(offset, whence),
+            ByteResource::SimpleDevice(_) => Ok(0),
+            _ => Err(Errno(29)),
+        }
     }
     pub fn readv_records(&self) -> bool {
         matches!(
@@ -942,11 +983,20 @@ impl DirectFd {
         if self.is_unix() {
             return self.recv(count, 0);
         }
+        if let ByteResource::SimpleDevice(kind) = self.resource {
+            return Some(
+                self._file
+                    .as_ref()
+                    .ok_or(Errno(9))
+                    .and_then(|f| f.open.simple_read(kind, count)),
+            );
+        }
         if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
             return Some(Err(Errno(9)));
         }
         Some(match &self.resource {
             ByteResource::Kmsg(log) => log.read(count),
+            ByteResource::SimpleDevice(_) => unreachable!("typed device read"),
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Timer(timer) => timer.read(count),
             ByteResource::Inotify(queue) => queue.read(count),
@@ -1019,11 +1069,20 @@ impl DirectFd {
         }
     }
     pub fn write(&self, bytes: &[u8]) -> Result<usize> {
+        if let ByteResource::SimpleDevice(kind) = self.resource {
+            return self
+                ._file
+                .as_ref()
+                .ok_or(Errno(9))?
+                .open
+                .simple_write::<false>(kind, bytes);
+        }
         if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
             return Err(Errno(9));
         }
         match &self.resource {
             ByteResource::Kmsg(log) => log.write(bytes),
+            ByteResource::SimpleDevice(_) => unreachable!("typed device write"),
             ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
@@ -1104,7 +1163,10 @@ impl DirectFds {
         if target_fd.is_epoll() {
             return None;
         }
-        if matches!(target_fd.resource, ByteResource::Regular) {
+        if matches!(
+            target_fd.resource,
+            ByteResource::Regular | ByteResource::SimpleDevice(_)
+        ) {
             return Some(Err(Errno(1)));
         }
         let key = (target, target_open.id);

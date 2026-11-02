@@ -22,7 +22,12 @@ impl Authority {
             return self.defer();
         };
         let file = file?;
-        if file.open.node.as_ref().is_some_and(|n| n.borrow().volatile) {
+        if file
+            .open
+            .node
+            .as_ref()
+            .is_some_and(|n| n.simple_device.is_none() && n.borrow().volatile)
+        {
             return self.defer();
         }
         Ok(Descriptor {
@@ -56,7 +61,8 @@ pub struct PathQueries {
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
 // afresh, including mounts, fs context, pseudo state, dummy FD table and namespaces.
-// Source resources cross only as their existing Send+Sync Arc capabilities.
+// Source resources cross only as their existing Send+Sync Arc capabilities,
+// including the actual pseudo inode cache (never runtime/task control state).
 // Query-local clones never escape a method. Send moves the entire private island
 // exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
 // Methods return owned bytes/results, numeric FDs and original shared socket
@@ -109,7 +115,12 @@ impl Vfs {
         view.next_open = self.next_open.clone();
         view.ptys = self.ptys.clone();
         view.path_bindings = self.path_bindings.clone();
-        view.pseudo.borrow_mut().enabled = self.pseudo.borrow().enabled;
+        {
+            let source = self.pseudo.borrow();
+            let mut pseudo = view.pseudo.borrow_mut();
+            pseudo.enabled = source.enabled;
+            pseudo.nodes = source.nodes.clone();
+        }
         view.query = Some(Authority {
             files: self.shared_files(),
             devices: self.device_access(),
@@ -162,13 +173,9 @@ impl PathQueries {
         let mut eligible = false;
         let result = self.query(|view| {
             let descriptor = view.descriptor(fd)?;
-            if !descriptor
-                .open
-                .borrow()
-                .node
-                .as_ref()
-                .is_some_and(|node| matches!(node.borrow().content, Content::Directory))
-            {
+            if !descriptor.open.borrow().node.as_ref().is_some_and(|node| {
+                node.simple_device.is_some() || matches!(node.borrow().content, Content::Directory)
+            }) {
                 return Ok(0); // Ineligible, with no resource effects.
             }
             eligible = true;
@@ -629,7 +636,7 @@ mod tests {
             b"/proc/self/status".as_slice(),
             b"/alias",
             b"/sys/kernel",
-            b"/dev/null",
+            b"/dev/kmsg",
         ] {
             assert!(query.stat_at(AT_FDCWD, path, false).is_none(), "{path:?}");
         }
