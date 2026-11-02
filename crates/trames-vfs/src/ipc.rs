@@ -528,6 +528,7 @@ impl Vfs {
                         host_file: None,
                         native_image: None,
                         mount_resource: std::sync::OnceLock::new(),
+                        directory_mount: Default::default(),
                         file_authority: Default::default(),
                         tcp_publication: Default::default(),
                         socket_control: None,

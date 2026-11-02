@@ -454,7 +454,17 @@ impl Vfs {
         let page = PAGE_SIZE;
         let ring_bytes = (URING_CQES as u64 + cq_entries as u64 * 16).div_ceil(page) * page;
         let sqe_bytes = (entries as u64 * 64).div_ceil(page) * page;
-        let fd = self.memfd_create(b"io_uring", 1)?;
+        let (fd, mut open) = self.memfd_description(b"io_uring", 1)?;
+        Arc::get_mut(&mut open.shared).unwrap().kind = FdKind::Anonymous;
+        // This OFD will own Rc ring controls. Publish that final ownership
+        // class from construction; never publish then demote a shared OFD.
+        self.fds.insert(
+            fd,
+            Descriptor {
+                open: OpenHandle::Owner(Rc::new(RefCell::new(open))),
+                cloexec: true.into(),
+            },
+        );
         let result = (|| {
             self.truncate_fd(fd, ring_bytes + sqe_bytes)?;
             let memory = self
@@ -479,9 +489,6 @@ impl Vfs {
             }
             let open_descriptor = self.descriptor(fd)?;
             let mut open = open_descriptor.open.borrow_mut();
-            Arc::get_mut(&mut open.shared)
-                .expect("owner-local io_uring setup")
-                .kind = FdKind::Anonymous;
             open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
             Ok((fd, ring))
         })();

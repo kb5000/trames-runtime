@@ -115,8 +115,8 @@ impl OpenDescription {
             mount,
         }
     }
-    /// Metadata-only admission keeps directory cursors and endpoint controls
-    /// on their existing owner. The weak lease cannot extend last-close life.
+    /// Metadata-only admission for remaining owner controls. The weak lease
+    /// cannot extend last-close life or publish a complete shared OFD.
     pub(super) fn query_metadata(&self) -> Option<std::sync::Weak<SharedOpenDescription>> {
         let node = self.node.as_ref()?.borrow();
         if node.volatile
@@ -154,7 +154,7 @@ impl OpenDescription {
             || self.pipe.is_some()
             || self.node.as_ref().is_some_and(|node| {
                 let node = node.borrow();
-                !node.volatile && node.seals.is_none() && matches!(node.content, Content::File(_))
+                !node.volatile && matches!(node.content, Content::File(_) | Content::Directory)
             })
     }
 }
@@ -167,6 +167,14 @@ impl OpenHandle {
             };
             if let Some(mount) = mount {
                 if let Some(mount) = mount {
+                    if open
+                        .node
+                        .as_ref()
+                        .is_some_and(|node| matches!(node.borrow().content, Content::Directory))
+                    {
+                        open.directory_mount
+                            .get_or_init(|| mounts::DirectoryPin::new(mount.clone()));
+                    }
                     let published = open.shared.mount_resource.get_or_init(|| mount.clone());
                     debug_assert!(Arc::ptr_eq(published, &mount));
                 }

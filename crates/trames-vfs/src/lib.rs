@@ -199,6 +199,7 @@ struct SharedOpenDescription {
     host_file: Option<Arc<hostfs::OpenFile>>,
     native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
+    directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
     file_authority: std::sync::OnceLock<file_io::PublishedFile>,
     tcp_publication: std::sync::Mutex<Option<DirectTcpFd>>,
     socket_control: Option<network_io::SocketControl>,
@@ -263,7 +264,8 @@ impl OpenDescription {
         }
         if self.data_node().is_some_and(|n| {
             let n = n.borrow();
-            !n.volatile && matches!(n.content, Content::File(_))
+            matches!(n.content, Content::Directory)
+                || !n.volatile && matches!(n.content, Content::File(_))
         }) {
             self.file_position.lock().unwrap().value
         } else {
@@ -752,6 +754,7 @@ impl Default for Vfs {
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            directory_mount: Default::default(),
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -1083,6 +1086,7 @@ impl Vfs {
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            directory_mount: Default::default(),
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -2023,7 +2027,10 @@ impl Vfs {
                     let n = node.borrow();
                     if n.volatile
                         || n.seals.is_some()
-                        || !matches!(n.content, Content::File(storage::FileData::Plain(_)))
+                        || !matches!(
+                            n.content,
+                            Content::File(storage::FileData::Plain(_)) | Content::Directory
+                        )
                     {
                         return query.defer();
                     }
@@ -2238,6 +2245,7 @@ impl Vfs {
                     host_file,
                     native_image: None,
                     mount_resource: std::sync::OnceLock::new(),
+                    directory_mount: Default::default(),
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
@@ -2288,6 +2296,9 @@ impl Vfs {
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
         if let Some(result) = self.fds.membership().close(fd, self.lock_owner) {
+            if !self.detached_mounts.borrow().is_empty() {
+                self.reap_detached_mounts();
+            }
             return result;
         }
         let descriptor = self.fds.close(fd)?;
@@ -2374,6 +2385,9 @@ impl Vfs {
             .membership()
             .duplicate_to(old, new, flags, self.lock_owner)
         {
+            if !self.detached_mounts.borrow().is_empty() {
+                self.reap_detached_mounts();
+            }
             return result;
         }
         if let Some(replaced) = self.fds.duplicate_to(old, new, flags)? {
@@ -2922,6 +2936,9 @@ impl Vfs {
     }
     pub fn seek(&mut self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
         let o_descriptor = self.descriptor(fd)?;
+        Self::seek_description(&o_descriptor, offset, whence)
+    }
+    fn seek_description(o_descriptor: &Descriptor, offset: i64, whence: u32) -> Result<u64> {
         let mut o = o_descriptor.open.borrow_mut();
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
@@ -2961,7 +2978,8 @@ impl Vfs {
             }
         };
         let mut file_position = o.file_position.lock().unwrap();
-        let regular = matches!(n.content, Content::File(_)) && !n.volatile;
+        let regular = matches!(n.content, Content::Directory)
+            || matches!(n.content, Content::File(_)) && !n.volatile;
         let base = match whence {
             0 => 0,
             1 => {
@@ -3251,7 +3269,13 @@ impl Vfs {
     }
     pub fn getdents(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         let d = self.descriptor(fd)?;
-        let mut o = d.open.borrow_mut();
+        self.getdents_description(&d, count)
+    }
+    fn getdents_description(&self, d: &Descriptor, count: usize) -> Result<Vec<u8>> {
+        let o = d.open.borrow();
+        if o.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         let node = o.node.as_ref().ok_or(Errno(20))?;
         if !matches!(node.borrow().content, Content::Directory) {
             return Err(Errno(20));
@@ -3263,7 +3287,7 @@ impl Vfs {
             let children = host.children(&p.key)?;
             let inode = node.borrow().inode;
             let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
-            return Self::encode_host_directory(&mut o, count, children, inode, parent);
+            return Self::encode_host_directory(&o, count, children, inode, parent);
         }
         let fs = filesystem.borrow();
         let inode = node.borrow().inode;
@@ -3292,25 +3316,7 @@ impl Vfs {
                 .into_iter()
                 .map(|(name, (inode, kind))| (name, inode, kind)),
         );
-        let mut out = Vec::new();
-        while let Some((name, ino, kind)) = entries.get(o.position as usize) {
-            let size = (19 + name.len() + 1 + 7) & !7;
-            if out.len() + size > count {
-                if out.is_empty() {
-                    return Err(Errno(22));
-                }
-                break;
-            }
-            let start = out.len();
-            out.resize(start + size, 0);
-            out[start..start + 8].copy_from_slice(&ino.to_le_bytes());
-            out[start + 8..start + 16].copy_from_slice(&(o.position + 1).to_le_bytes());
-            out[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
-            out[start + 18] = *kind;
-            out[start + 19..start + 19 + name.len()].copy_from_slice(name);
-            o.position += 1;
-        }
-        Ok(out)
+        directory::encode(&o.file_position, count, &entries)
     }
 }
 #[cfg(test)]

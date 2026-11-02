@@ -35,6 +35,7 @@ impl ImageFds for Images {
             host_file: None,
             native_image: Some(image),
             mount_resource: Default::default(),
+            directory_mount: Default::default(),
             file_authority: Default::default(),
             tcp_publication: Default::default(),
             socket_control: None,

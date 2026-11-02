@@ -379,7 +379,7 @@ impl Snapshot {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }
-            number @ (27 | 48 | 56 | 78..=80 | 291 | 437 | 439) => {
+            number @ (27 | 48 | 56 | 61 | 78..=80 | 291 | 437 | 439) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }

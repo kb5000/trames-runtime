@@ -81,11 +81,26 @@ pub(super) struct MountIdentity {
     pub writers: Arc<mapped::Writers>,
 }
 pub(super) struct MountData {
+    directory_users: std::sync::atomic::AtomicUsize,
     pub identity: Arc<MountIdentity>,
     parent: Arc<SharedCell<Option<SharedAttachment>>>,
     // Namespace descriptors remain owner controls; their topology must not be
     // projected as a complete shared mount capability.
     _owner_control: bool,
+}
+// One lease per actual shared directory OFD, independent of FD aliases.
+// This retains detached traversal topology only while directory users need it.
+pub(super) struct DirectoryPin(Arc<MountData>);
+impl DirectoryPin {
+    pub(super) fn new(mount: Arc<MountData>) -> Self {
+        mount.directory_users.fetch_add(1, Ordering::Relaxed);
+        Self(mount)
+    }
+}
+impl Drop for DirectoryPin {
+    fn drop(&mut self) {
+        self.0.directory_users.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 impl std::ops::Deref for MountData {
     type Target = MountIdentity;
@@ -219,6 +234,7 @@ impl Mount {
             writers: init.writers,
         });
         let shared = Arc::new(MountData {
+            directory_users: Default::default(),
             identity,
             parent: parent.clone(),
             _owner_control: owner_control,
@@ -239,6 +255,7 @@ impl Mount {
         let parent = Arc::new(SharedCell::new(None));
         Rc::new(Self {
             shared: Arc::new(MountData {
+                directory_users: Default::default(),
                 identity,
                 parent: parent.clone(),
                 _owner_control: false,
@@ -1972,7 +1989,7 @@ impl Vfs {
                             .is_some_and(|a| Rc::ptr_eq(&a.parent, m))
                     })
                     .count();
-                Rc::strong_count(m) > internal
+                Rc::strong_count(m) > internal || m.directory_users.load(Ordering::Relaxed) != 0
             })
         });
     }

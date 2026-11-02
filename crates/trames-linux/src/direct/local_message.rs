@@ -375,14 +375,73 @@ mod tests {
         assert_eq!(v.read(read, 1).unwrap(), b"", "truncated right is closed");
     }
     #[test]
+    fn directory_and_memfd_rights_keep_actual_cursor_seals_and_backing_after_reuse() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let directory = v.open_at(-100, b"/", 0, 0).unwrap();
+        assert_eq!(v.getdents(directory, 24).unwrap().len(), 24);
+        let shared = v.memfd_create(b"portable", 2).unwrap();
+        v.write(shared, b"hello").unwrap();
+        v.seek(shared, 1, 0).unwrap();
+        let mapping = v.shared_file(shared).unwrap().map(0, 5).unwrap();
+        v.seals(shared, Some(4 | 8)).unwrap();
+        let mut epoch = trames_vfs::FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        assert!(
+            files.get(shared).is_none(),
+            "sharing ownership must not bypass seals/VM admission"
+        );
+        let d = direct(&v);
+        let mut m = memory();
+        rights(&mut m, &[directory, shared]);
+        assert_eq!(
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        v.close(directory).unwrap();
+        v.close(shared).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), directory);
+        assert_eq!(v.eventfd(100, 0).unwrap(), shared);
+        header(&mut m, 24);
+        assert_eq!(
+            d.invoke(212, [rx as u64, 0x1000, 0x40000000, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        let received_dir = word(&m, 0x1310);
+        let received_file = word(&m, 0x1314);
+        assert!(
+            v.fd_snapshot()
+                .iter()
+                .find(|f| f.fd == received_dir)
+                .unwrap()
+                .flags
+                & O_CLOEXEC
+                != 0
+        );
+        let next = v.getdents(received_dir, 24).unwrap();
+        assert_eq!(&next[19..21], b"..");
+        assert_eq!(v.read(received_file, 4).unwrap(), b"ello");
+        assert_eq!(v.seals(received_file, None), Ok(12));
+        assert_eq!(v.write(received_file, b"x"), Err(Errno(1)));
+        assert_eq!(v.truncate_fd(received_file, 6), Err(Errno(1)));
+        v.close(received_file).unwrap();
+        // SAFETY: this retained managed mapping owns five initialized bytes;
+        // no other thread mutates them in this test.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(mapping.pointer(), 5) },
+            b"hello"
+        );
+        epoch.finish();
+    }
+    #[test]
     fn mixed_owner_rights_and_output_faults_defer_or_fail_before_queue_effects() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
         let event = v.eventfd(1, 0).unwrap();
-        let directory = v.open_at(-100, b"/", 0, 0).unwrap();
+        let signal = v.signalfd(-1, 1, 0).unwrap();
         let d = direct(&v);
         let mut m = memory();
-        rights(&mut m, &[event, directory]);
+        rights(&mut m, &[event, signal]);
         assert_eq!(d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m), None);
         assert_eq!(v.readable_bytes(rx).unwrap(), Some(0));
         assert_eq!(
@@ -455,7 +514,7 @@ mod tests {
     fn blocked_receive_and_owner_fallback_keep_original_transport_and_output_ranges() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        let directory = v.open_at(-100, b"/", 0, 0).unwrap();
+        let signal = v.signalfd(-1, 1, 0).unwrap();
         let d = direct(&v);
         let mut m = memory();
         let target: Arc<dyn IoWake> = Arc::new(Target);
@@ -475,7 +534,7 @@ mod tests {
         v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .send_rights(b"real", 0, v.send_rights(&[directory]).unwrap())
+            .send_rights(b"real", 0, v.send_rights(&[signal]).unwrap())
             .unwrap();
         let file = match d.start_retained_byte(file, 212, args, &mut m, 1, &Arc::downgrade(&target))
         {
@@ -489,7 +548,7 @@ mod tests {
         assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"real");
         assert_eq!(
             v.fd_kind(word(&m, 0x1310)).unwrap(),
-            v.fd_kind(directory).unwrap()
+            v.fd_kind(signal).unwrap()
         );
         assert_eq!(v.read(rx, 8).unwrap(), 99u64.to_le_bytes());
     }

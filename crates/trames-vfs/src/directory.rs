@@ -2,6 +2,35 @@
 //! Enumerate immediate children without walking every descendant in a flat map.
 use std::collections::{btree_map::Range, BTreeMap};
 
+/// Host/private enumeration shares the same actual OFD cursor. The lock covers
+/// only encoding and its cursor commit, never namespace lookup or resource drop.
+pub(super) fn encode(
+    position: &std::sync::Mutex<super::file_data::FilePosition>,
+    count: usize,
+    entries: &[(Vec<u8>, u64, u8)],
+) -> super::Result<Vec<u8>> {
+    let mut cursor = position.lock().unwrap();
+    let mut out = Vec::new();
+    while let Some((name, inode, kind)) = entries.get(cursor.value as usize) {
+        let size = (19 + name.len() + 1 + 7) & !7;
+        if out.len() + size > count {
+            if out.is_empty() {
+                return Err(super::Errno(22));
+            }
+            break;
+        }
+        let start = out.len();
+        out.resize(start + size, 0);
+        out[start..start + 8].copy_from_slice(&inode.to_le_bytes());
+        out[start + 8..start + 16].copy_from_slice(&(cursor.value + 1).to_le_bytes());
+        out[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
+        out[start + 18] = *kind;
+        out[start + 19..start + 19 + name.len()].copy_from_slice(name);
+        cursor.value += 1;
+    }
+    Ok(out)
+}
+
 pub(super) struct Children<'a, T> {
     paths: &'a BTreeMap<Vec<u8>, T>,
     range: Range<'a, Vec<u8>, T>,

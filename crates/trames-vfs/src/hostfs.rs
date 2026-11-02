@@ -951,7 +951,7 @@ impl Vfs {
         node.host.get().cloned()
     }
     pub(super) fn encode_host_directory(
-        o: &mut OpenDescription,
+        o: &OpenDescription,
         count: usize,
         children: BTreeMap<Vec<u8>, (u64, u8)>,
         inode: u64,
@@ -963,25 +963,7 @@ impl Vfs {
                 .into_iter()
                 .map(|(name, (inode, kind))| (name, inode, kind)),
         );
-        let mut out = Vec::new();
-        while let Some((name, inode, kind)) = entries.get(o.position as usize) {
-            let size = (19 + name.len() + 1 + 7) & !7;
-            if out.len() + size > count {
-                if out.is_empty() {
-                    return Err(Errno(22));
-                }
-                break;
-            }
-            let start = out.len();
-            out.resize(start + size, 0);
-            out[start..start + 8].copy_from_slice(&inode.to_le_bytes());
-            out[start + 8..start + 16].copy_from_slice(&(o.position + 1).to_le_bytes());
-            out[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
-            out[start + 18] = *kind;
-            out[start + 19..start + 19 + name.len()].copy_from_slice(name);
-            o.position += 1;
-        }
-        Ok(out)
+        directory::encode(&o.file_position, count, &entries)
     }
     /// Embedding-only mount: Linux mount(2) cannot manufacture host authority.
     /// The selected directory already exists; mounts are session-local.

@@ -291,7 +291,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_path_query(&self, number: u32) -> bool {
-        matches!(number, 27 | 48 | 56 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
+        matches!(number, 27 | 48 | 56 | 61 | 62 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
     }
     pub fn invoke_path(
         &self,
@@ -460,7 +460,11 @@ impl DirectSyscalls {
         if !matches!(number, 62..=70 | 80) {
             return None;
         }
-        let file = self.files.get(a[0] as u32)?;
+        let file = match self.files.get(a[0] as u32) {
+            Some(file) => file,
+            None if number == 62 => return self.invoke_path(number, a, memory),
+            None => return None,
+        };
         let deferred = Cell::new(false);
         let read = |count, offset| {
             file.read(count, offset, &mut self.disk_cache.borrow_mut())

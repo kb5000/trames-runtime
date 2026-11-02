@@ -1184,3 +1184,40 @@ retain the common ABI. Payload/descriptor references are released outside channe
 and Files locks, including truncation and receiver close, so final-close callbacks
 cannot invert the resource/run-queue lock order. No new thread, bus, unsafe trait
 override, guest-memory barrier, resource quota or global network lock is added.
+
+## Worker directories and portable memfd ownership (2026-11-02)
+
+Static directory OFDs now use the same complete shared ownership as ordinary
+files. Their actual `FilePosition` owns the enumeration cookie: owner/worker
+`getdents64`, `lseek`, dup/fork, fdinfo and Unix rights all observe that one cursor.
+Private and host enumeration use the original resolver and one common encoder;
+only encoding and cursor commit hold the OFD position lock. Namespace lookup,
+resource destruction and guest-memory writes remain outside that lock.
+
+The existing sealed `PathQueries` control island can open static directories,
+read their entries and seek them on the executing worker. It accepts the original
+FD before output preflight, so another worker's close/reuse cannot redirect that
+accepted operation. Dynamic pseudo directories and excluded mounts defer before
+cursor effects. Regular-file seek retains its existing byte capability and
+pending-operation policy. O_PATH enumeration returns EBADF on both paths.
+Directory traversal retains the actual mount identity and one counted directory
+lease per OFD. Lazy-unmounted subtrees retain their existing topology while these
+leases are live; aliases and rights retain the same lease, and last-close or the
+next owner mount cleanup can retire it. No directory contents/cursor authority is
+mirrored in a worker cache, and no resource-service thread is introduced.
+
+Memfd OFDs also use complete shared ownership. Portable Unix rights therefore
+retain the original content, offset, seals and backing after sender FD close or
+reuse. This grants no new direct byte or VM access: FileEpoch still rejects
+sealed/shared storage, and mapping, truncation and seals keep their original
+joined implementation. io_uring uses the same unpublished backing constructor,
+but publishes an owner OFD from the start because its ring controls are still Rc
+objects; a published shared OFD is never demoted or given hidden owner controls.
+
+Object sharing avoids normal directory lifecycle/enumeration cohort joins. A
+worker message/RPC alternative would add communication to the same operations,
+and the old coordinator would still stop unrelated CPUs; neither is used.
+Full Unix creation/listener/connection controls still own Rc graphs that can
+retain PTYs, signalfds, namespace and ring rights. These, directory mutations,
+task/signal/namespace transitions and structural VM/device operations remain
+separate migration work. This stage is progress, not complete coordinator removal.

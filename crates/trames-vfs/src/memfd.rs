@@ -68,6 +68,23 @@ impl Vfs {
         self.truncate_fd(fd, if mode == 0 { old.max(end) } else { old })
     }
     pub fn memfd_create(&mut self, name: &[u8], flags: u32) -> Result<u32> {
+        let (fd, open) = self.memfd_description(name, flags)?;
+        self.fds.insert(
+            fd,
+            Descriptor {
+                open: OpenHandle::new(open),
+                cloexec: (flags & 1 != 0).into(),
+            },
+        );
+        Ok(fd)
+    }
+    // Construct before publication: io_uring uses the same backing allocator,
+    // but its final OFD also owns an owner-local ring control graph.
+    pub(super) fn memfd_description(
+        &mut self,
+        name: &[u8],
+        flags: u32,
+    ) -> Result<(u32, OpenDescription)> {
         if name.len() > 249 {
             return Err(Errno(22));
         }
@@ -104,49 +121,44 @@ impl Vfs {
         drop(fs);
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        socket: None,
-                        _disk_file: None,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file: None,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        file_authority: Default::default(),
-                        tcp_publication: Default::default(),
-                        socket_control: None,
-                        control: None,
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: FdKind::Node(target),
-                        flags: (2).into(),
-                        file_position: Arc::default(),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: Some(node),
-                        pipe: None,
-                        bridge: None,
-                        kernel_log: None,
-                        notification: None,
-                    }),
-                    position: 0,
-                    anonymous: None,
-                    local: None,
-                    pty: None,
-                    namespace: None,
-                    network_control: None,
-                    mount_file: None,
-                    oom: None,
-                    mount: None,
-                }),
-                cloexec: (flags & 1 != 0).into(),
-            },
-        );
-        Ok(fd)
+        let open = OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                socket: None,
+                _disk_file: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
+                native_image: None,
+                mount_resource: std::sync::OnceLock::new(),
+                directory_mount: Default::default(),
+                file_authority: Default::default(),
+                tcp_publication: Default::default(),
+                socket_control: None,
+                control: None,
+                read_node: None,
+                id: self.open_id(),
+                owner: (self.credentials.fsuid, self.credentials.fsgid),
+                kind: FdKind::Node(target),
+                flags: (2).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                ofd_records: Default::default(),
+                node: Some(node),
+                pipe: None,
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
+            position: 0,
+            anonymous: None,
+            local: None,
+            pty: None,
+            namespace: None,
+            network_control: None,
+            mount_file: None,
+            oom: None,
+            mount: None,
+        };
+        Ok((fd, open))
     }
     /// A managed shared inode capability for native protocol FD translation.
     /// Guest descriptor numbers and guest-selected host paths never cross here.

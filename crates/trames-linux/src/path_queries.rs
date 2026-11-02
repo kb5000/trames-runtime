@@ -12,6 +12,17 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64>> {
     match number {
+        61 => {
+            let count = a[2].min(crate::MAX_WRITE as u64) as usize;
+            let bytes = q.getdents(a[0] as u32, count, || {
+                Linux::check(memory, a[1], count, Access::Write)
+            })?;
+            Some(bytes.and_then(|bytes| {
+                memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+                Ok(bytes.len() as u64)
+            }))
+        }
+        62 => q.directory_seek(a[0] as u32, a[1] as i64, a[2] as u32),
         27 => {
             let path = match Linux::path(memory, a[1]) {
                 Ok(path) => path,
@@ -201,6 +212,43 @@ mod tests {
                 a.read_array::<256>(0x1400).unwrap(),
                 b.read_array::<256>(0x1400).unwrap(),
                 "syscall {number}"
+            );
+        }
+    }
+    #[test]
+    fn directory_abi_matches_owner_errors_cookies_and_output_preflight() {
+        let mut linux = Linux::new(0x10000);
+        linux.vfs.mkdir_at(AT_FDCWD, b"/dir", 0o755).unwrap();
+        let fd = linux.vfs.open_at(AT_FDCWD, b"/dir", 0, 0).unwrap() as u64;
+        let path = linux
+            .vfs
+            .open_at(AT_FDCWD, b"/dir", trames_vfs::O_PATH, 0)
+            .unwrap() as u64;
+        let file = linux.vfs.memfd_create(b"file", 0).unwrap() as u64;
+        let q = linux.vfs.path_queries();
+        for args in [
+            [fd, 0x1400, 48, 0, 0, 0],
+            [fd, 0x1400, 23, 0, 0, 0],
+            [fd, 0x1400, 0, 0, 0, 0],
+            [fd, 0x9000, 48, 0, 0, 0],
+            [999, 0x9000, 48, 0, 0, 0],
+            [path, 0x1400, 48, 0, 0, 0],
+            [file, 0x1400, 48, 0, 0, 0],
+        ] {
+            let mut a = Memory::new(8192);
+            a.map(0x1000, 4096, Permissions::RW).unwrap();
+            a.write(0x1400, &[0x55; 256]).unwrap();
+            let mut b = a.clone();
+            linux.vfs.seek(fd as u32, 0, 0).unwrap();
+            let actual = call(&q, 61, args, &mut a).unwrap();
+            let cursor = linux.vfs.seek(fd as u32, 0, 1).unwrap();
+            linux.vfs.seek(fd as u32, 0, 0).unwrap();
+            let expected = linux.syscall(61, args, &mut b, &mut CapturedOutput::default());
+            assert_eq!(actual, expected, "getdents64 {args:?}");
+            assert_eq!(cursor, linux.vfs.seek(fd as u32, 0, 1).unwrap());
+            assert_eq!(
+                a.read_array::<256>(0x1400).unwrap(),
+                b.read_array::<256>(0x1400).unwrap()
             );
         }
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pathname authority over the original filesystem and inode objects.
 //! The resolver is the owner VFS's resolver, in a sealed private control view.
-//! Ordinary file opens publish only complete shared OFDs into the live Files table.
+//! Ordinary file/directory opens publish complete shared OFDs into live Files.
 use super::*;
 
 #[derive(Clone)]
@@ -117,6 +117,38 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn getdents(
+        &self,
+        fd: u32,
+        count: usize,
+        preflight: impl FnOnce() -> Result<()>,
+    ) -> Option<Result<Vec<u8>>> {
+        self.query(|view| {
+            // Accept once, before output validation. The deciding operation
+            // retains this original OFD even if another worker reuses its FD.
+            let descriptor = view.descriptor(fd)?;
+            preflight()?;
+            view.getdents_description(&descriptor, count)
+        })
+    }
+    pub fn directory_seek(&self, fd: u32, offset: i64, whence: u32) -> Option<Result<u64>> {
+        let mut eligible = false;
+        let result = self.query(|view| {
+            let descriptor = view.descriptor(fd)?;
+            if !descriptor
+                .open
+                .borrow()
+                .node
+                .as_ref()
+                .is_some_and(|node| matches!(node.borrow().content, Content::Directory))
+            {
+                return Ok(0); // Ineligible, with no resource effects.
+            }
+            eligible = true;
+            Vfs::seek_description(&descriptor, offset, whence)
+        })?;
+        (eligible || result.is_err()).then_some(result)
+    }
     pub fn open_at_resolve(
         &self,
         dirfd: i32,
@@ -308,9 +340,12 @@ mod tests {
         assert!(query
             .open_at_resolve(AT_FDCWD, b"/proc/self/status", 0, 0, 0, &files)
             .is_none());
-        assert!(query
+        let directory = query
             .open_at_resolve(AT_FDCWD, b"/", O_DIRECTORY, 0, 0, &files)
-            .is_none());
+            .unwrap()
+            .unwrap();
+        assert!(owner.shared_files().lookup(directory).unwrap().is_ok());
+        owner.close(directory).unwrap();
         assert_eq!(
             query.open_at_resolve(AT_FDCWD, b"/missing", 0, 0, 0, &files),
             Some(Err(Errno(2)))
@@ -764,3 +799,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod directory_tests;

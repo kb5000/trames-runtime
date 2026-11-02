@@ -433,3 +433,78 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
         k.service_requests
     );
 }
+
+#[test]
+fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_per_entry() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.linux.vfs.mkdir_at(-100, b"/dir", 0o755).unwrap();
+        p.memory.write(0x1000, b"/dir\0").unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut code = Vec::new();
+        // Each opened directory must be visible to the next call without
+        // recapture. Validate read, shared seek, reread, and final close.
+        for i in 0..16 {
+            code.extend([
+                mov(0, 0),
+                mov(1, 0x1000),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 56),
+                0xd4000001,
+                0xaa0003f3,
+            ]);
+            for (j, (number, arg1, arg2)) in
+                [(61, 0x1100, 48), (62, 0, 0), (61, 0x1100, 24), (57, 0, 0)]
+                    .into_iter()
+                    .enumerate()
+            {
+                code.extend([
+                    0xaa1303e0,
+                    mov(1, arg1),
+                    mov(2, arg2),
+                    mov(8, number),
+                    0xd4000001,
+                    mov(1, 0x1800 + (i * 4 + j as u32) * 8),
+                    0xf9000020,
+                ]);
+            }
+        }
+        code.push(0x14000000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..16 {
+                for (j, value) in [48, 0, 24, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + (i * 4 + j as u64) * 8).unwrap(),
+                        value,
+                        "slot count {slots}, iteration {i}, call {j}"
+                    );
+                }
+            }
+            assert_eq!(
+                p.seccomp.evaluations(),
+                160,
+                "shared filter counts both workers' 80 entries"
+            );
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 160);
+    }
+}
