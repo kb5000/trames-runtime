@@ -763,3 +763,43 @@ creation nor close itself is moved to a worker in this stage: it removes the
 remaining unnecessary cohort drains for quiescent connected close, while the
 owner still tears down its Rc control projection. There is no new guest quota,
 race errno, global lock or stronger guest-memory ordering.
+
+## Shared native TCP connection state and controls (2026-11-02)
+
+The original host transport now owns connection progress, pending errors and the
+blocking-connect failure marker. Owner and worker calls use that same state;
+there is no worker connection-state copy to reconcile. One relaxed atomic word
+contains the connection state, failure cause and consumable error bit. Concurrent
+SO_ERROR readers consume the pending error once. An object-local completion lock
+covers the readiness/error sampling and connection transition; ordinary TCP byte
+operations acquire neither it nor the keepalive-parameter lock.
+
+Unfiltered native TCP SO_ERROR can complete a connection on its executing worker.
+Completion uses the original helper, with the namespace policy callback retained
+on owner-only paths. Captures with live firewall rules do not admit worker
+completion; DNS, virtual and guest-routed branches retain their previous authority.
+Filtered network controls keep the existing owner entry. There is no new guest
+policy, race errno, resource-service thread or polling bus.
+
+Worker controls also cover SO_KEEPALIVE, SO_REUSEADDR, socket buffers,
+SO_ACCEPTCONN, TCP keepalive parameters, relevant IPv4/IPv6 options and shutdown,
+in addition to the earlier address/TCP_NODELAY/identity controls. Shared host
+option helpers preserve the serial implementation and hybrid branch option replay.
+The keepalive helper's host enable/restore sequence synchronizes only setters of
+that same socket's keepalive state. Guest timeout setters remain owner-side.
+
+A successful worker completion publishes weak native byte authority on the
+original OFD, using its live flags and original timeout capture. Existing workers
+and FD aliases can immediately use it. Files membership is released before
+control, host calls and guest copyout; no numeric-FD relookup publishes onto a
+replacement descriptor. The existing socket gate excludes owner transitions, and
+weak captures do not extend endpoint lifetime or delay FIN. Failed connections
+publish no byte capability. Address and option copyout still use the common Linux
+ABI preflight, including not consuming an error on an invalid destination.
+
+This stage migrates state/control ownership, not socket factory and full teardown
+ownership. Socket creation, bind/connect/listen/accept, owner projections, broader
+close, AF_UNIX/SCM_RIGHTS and epoll registration remain follow-up work. Short
+admitted calls keep their existing single-caller owner service; their existence
+must not be counted as a whole-cohort pause.
+

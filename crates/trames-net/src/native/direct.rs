@@ -76,19 +76,19 @@ pub(super) fn read_tcp(socket: &TcpStream, data: &mut [u8], flags: u32) -> Resul
 /// the host FD with its actual socket owner; stale snapshots cannot delay FIN.
 #[derive(Clone)]
 pub struct DirectTcp {
-    socket: Weak<Endpoint>,
-    links: Arc<Links>,
-    peer: SocketAddr,
+    pub(super) socket: Weak<Endpoint>,
+    pub(super) links: Arc<Links>,
+    pub(super) peer: SocketAddr,
 }
 impl Socket {
     /// Pure owner metadata: also used under Files during conditional close.
     /// Host address queries and transport I/O stay outside that table lock.
     pub(super) fn direct_tcp_admitted(&self) -> bool {
         if self.kind != 1
-            || self.connection.get() != Connection::Connected
+            || self.native.state.connection() != Connection::Connected
             || self.dns_peer.get()
             || !self.dns.borrow().is_empty()
-            || self.pending_error.get().is_some()
+            || self.native.state.pending_error().is_some()
         {
             return false;
         }
@@ -365,9 +365,9 @@ mod tests {
             assert!(n.socket(2, kind, 0).unwrap().direct_tcp().is_none());
         }
         let (_, socket, _) = pair();
-        socket.connection.set(Connection::Connecting);
+        socket.native.state.set_connection(Connection::Connecting);
         assert!(socket.direct_tcp().is_none());
-        socket.connection.set(Connection::Connected);
+        socket.native.state.set_connection(Connection::Connected);
         socket.dns_peer.set(true);
         assert!(socket.direct_tcp().is_none());
         let count = AtomicU64::new(u64::MAX - 1);

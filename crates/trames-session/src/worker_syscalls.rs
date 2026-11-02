@@ -355,10 +355,16 @@ impl Snapshot {
         {
             return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
         }
+        if self.seccomp.mode() == 0 {
+            if let Some(result) = self.direct.invoke_socket_control(
+                cpu.x(8) as u32,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            ) {
+                return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+            }
+        }
         let result = match cpu.x(8) as u32 {
-            number @ (204 | 205 | 208 | 209) if self.seccomp.mode() == 0 => self
-                .direct
-                .invoke_socket_control(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
             number @ (19 | 26 | 59 | 85) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?

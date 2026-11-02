@@ -4,6 +4,7 @@
 use crate::direct_dns;
 mod control;
 mod direct;
+mod state;
 pub use control::DirectControl;
 pub(crate) use control::SavedOptions;
 mod endpoint;
@@ -224,13 +225,10 @@ impl Network {
         connection: Connection,
     ) -> Rc<Socket> {
         Rc::new(Socket {
-            native: Endpoint::new(native, kind, reservation),
+            native: Endpoint::new(native, kind, reservation, connection),
             network: self.clone(),
             family,
             kind,
-            connection: Cell::new(connection),
-            pending_error: Cell::new(None),
-            blocking_failed: Cell::new(false),
             dns: RefCell::default(),
             dns_target: Cell::new(direct_dns::ADDRESS),
             dns_peer: Cell::new(false),
@@ -327,9 +325,6 @@ pub struct Socket {
     network: Network,
     family: u32,
     kind: u32,
-    connection: Cell<Connection>,
-    pending_error: Cell<Option<u32>>,
-    blocking_failed: Cell<bool>,
     dns: RefCell<std::collections::BTreeMap<SocketAddr, Rc<direct_dns::Endpoint>>>,
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
@@ -532,7 +527,7 @@ impl Socket {
                     7
                 }
             } else {
-                match self.connection.get() {
+                match self.native.state.connection() {
                     Connection::Listening => 10,
                     Connection::Connecting => 2,
                     Connection::Connected => 1,
@@ -587,11 +582,11 @@ impl Socket {
             .control()
             .listen(backlog.min(128) as i32)
             .map_err(from_io)?;
-        self.connection.set(Connection::Listening);
+        self.native.state.set_connection(Connection::Listening);
         Ok(())
     }
     pub fn accept(&self) -> Result<(Rc<Socket>, SocketAddr)> {
-        if self.connection.get() != Connection::Listening {
+        if self.native.state.connection() != Connection::Listening {
             return Err(NetError(22));
         }
         let reservation = self.network.reserve()?;
@@ -616,7 +611,7 @@ impl Socket {
         let native = self.address(address)?;
         self.network.destination(address)?;
         if self.kind == 1 {
-            match self.connection.get() {
+            match self.native.state.connection() {
                 Connection::Connecting => return Err(NetError(114)),
                 Connection::Connected => return Err(NetError(106)),
                 Connection::Listening => return Err(NetError(22)),
@@ -631,17 +626,17 @@ impl Socket {
             self.dns_endpoint(address)?;
             self.dns_target.set(address);
             self.dns_peer.set(true);
-            self.connection.set(Connection::Connected);
+            self.native.state.set_connection(Connection::Connected);
             return Ok(());
         }
         self.dns_peer.set(false);
         match self.native.control().connect(&native).map_err(from_io) {
             Ok(()) => {
-                self.connection.set(Connection::Connected);
+                self.native.state.set_connection(Connection::Connected);
                 Ok(())
             }
             Err(NetError(115 | 114)) if self.kind == 1 => {
-                self.connection.set(Connection::Connecting);
+                self.native.state.set_connection(Connection::Connecting);
                 Err(NetError(115))
             }
             Err(e) => Err(e),
@@ -649,53 +644,32 @@ impl Socket {
     }
     /// A blocked guest connect resumes without issuing connect a second time.
     pub fn connect_complete(&self) -> Result<bool> {
-        if self.connection.get() == Connection::Connecting {
-            let ready = self.native_poll(4)?;
-            if ready & (4 | 8 | 16) != 0 {
-                if let Some(error) = self.native.control().take_error().map_err(from_io)? {
-                    let error = from_io(error).0;
-                    self.connection.set(Connection::Failed(error));
-                    self.pending_error.set(Some(error));
-                } else {
-                    let check = self
-                        .peer_addr()
-                        .and_then(|peer| self.policy_check(true, peer, &[], 18));
-                    if let Err(e) = check {
-                        self.connection.set(Connection::Failed(e.0));
-                        self.pending_error.set(Some(e.0));
-                        let _ = self.native.control().shutdown(Shutdown::Both);
-                    } else {
-                        self.connection.set(Connection::Connected);
-                    }
-                }
-            }
-        }
-        match self.connection.get() {
-            Connection::Connecting => Ok(false),
-            Connection::Connected => Ok(true),
-            Connection::Failed(e) => Err(NetError(e)),
-            _ => Err(NetError(107)),
-        }
+        self.native
+            .complete_connect(|peer| self.policy_check(true, peer, &[], 18))
     }
+
     pub fn resume_connect(&self) -> Result<bool> {
         let result = self.connect_complete();
-        if matches!(self.connection.get(), Connection::Failed(_)) {
+        if matches!(self.native.state.connection(), Connection::Failed(_)) {
             // Blocking connect itself consumes the pending connection error.
-            self.pending_error.set(None);
-            self.blocking_failed.set(true);
+            self.native.state.take_error();
+            self.native
+                .state
+                .blocking_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         result
     }
     fn before_io(&self) -> Result<()> {
-        if self.connection.get() == Connection::Connecting {
+        if self.native.state.connection() == Connection::Connecting {
             match self.connect_complete() {
                 Ok(false) => return Err(NetError(11)),
                 Ok(true) => {}
                 Err(_) => {}
             }
         }
-        if matches!(self.connection.get(), Connection::Failed(_)) {
-            if let Some(error) = self.pending_error.take() {
+        if matches!(self.native.state.connection(), Connection::Failed(_)) {
+            if let Some(error) = self.native.state.take_error() {
                 return Err(NetError(error));
             }
         }
@@ -710,7 +684,7 @@ impl Socket {
     }
     pub fn idle_tcp(&self) -> bool {
         self.kind == 1
-            && self.connection.get() == Connection::Idle
+            && self.native.state.connection() == Connection::Idle
             && !self.dns_peer.get()
             && self.dns.borrow().is_empty()
     }
@@ -813,7 +787,7 @@ impl Socket {
         }
         if self.kind == 1 {
             self.before_io()?;
-            if matches!(self.connection.get(), Connection::Failed(_)) {
+            if matches!(self.native.state.connection(), Connection::Failed(_)) {
                 return Err(NetError(32));
             }
         }
@@ -894,7 +868,8 @@ impl Socket {
             }
             if self.kind == 2
                 && (self.dns_peer.get()
-                    || self.dns_receive_errors.get() && self.connection.get() == Connection::Idle)
+                    || self.dns_receive_errors.get()
+                        && self.native.state.connection() == Connection::Idle)
             {
                 // An in-process DNS service has no ICMP route: failures are DNS
                 // replies. Reading its genuinely empty error queue consumes no
@@ -939,8 +914,13 @@ impl Socket {
         }
         if self.kind == 1 {
             self.before_io()?;
-            if matches!(self.connection.get(), Connection::Failed(_)) {
-                if self.blocking_failed.get() {
+            if matches!(self.native.state.connection(), Connection::Failed(_)) {
+                if self
+                    .native
+                    .state
+                    .blocking_failed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return Err(NetError(107));
                 }
                 return Ok(Received {
@@ -1010,42 +990,17 @@ impl Socket {
         })
     }
     fn native_poll(&self, events: u16) -> Result<u16> {
-        let mut wanted = PollFlags::empty();
-        if events & 1 != 0 {
-            wanted |= PollFlags::POLLIN;
-        }
-        if events & 2 != 0 {
-            wanted |= PollFlags::POLLPRI;
-        }
-        if events & 4 != 0 {
-            wanted |= PollFlags::POLLOUT;
-        }
-        let mut fds = [PollFd::new(self.native.as_fd(), wanted)];
-        poll(&mut fds, PollTimeout::ZERO).map_err(from_errno)?;
-        let ready = fds[0].revents().unwrap_or(PollFlags::empty());
-        let mut result = 0;
-        for (native, guest) in [
-            (PollFlags::POLLIN, 1),
-            (PollFlags::POLLPRI, 2),
-            (PollFlags::POLLOUT, 4),
-            (PollFlags::POLLERR, 8),
-            (PollFlags::POLLHUP, 16),
-            (PollFlags::POLLNVAL, 32),
-        ] {
-            if ready.contains(native) {
-                result |= guest;
-            }
-        }
-        Ok(result)
+        self.native.poll(events)
     }
+
     pub fn poll(&self, events: u16) -> Result<u16> {
-        if self.connection.get() == Connection::Connecting {
+        if self.native.state.connection() == Connection::Connecting {
             let _ = self.connect_complete();
         }
-        if let Connection::Failed(_) = self.connection.get() {
+        if let Connection::Failed(_) = self.native.state.connection() {
             return Ok((events & 4)
                 | 16
-                | if self.pending_error.get().is_some() {
+                | if self.native.state.pending_error().is_some() {
                     8
                 } else {
                     0
@@ -1100,7 +1055,10 @@ impl Socket {
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         if (level, name) == (0, 11) && self.family == 2 && self.kind == 2 {
-            if value != 0 && self.connection.get() != Connection::Idle && !self.dns_peer.get() {
+            if value != 0
+                && self.native.state.connection() != Connection::Idle
+                && !self.dns_peer.get()
+            {
                 return Err(NetError(92));
             }
             self.dns_receive_errors.set(value != 0);
@@ -1135,54 +1093,10 @@ impl Socket {
             self.receive_packet_info.set(value != 0);
             return Ok(());
         }
-        let result = match (level, name) {
-            (1, 2) => self.native.control().set_reuse_address(value != 0),
-            (1, 6) => self.native.control().set_broadcast(value != 0),
-            (0, 2) if self.family == 2 && (1..=255).contains(&value) => {
-                self.native.control().set_ttl_v4(value as u32)
-            }
-            (41, 16) if self.family == 10 && (1..=255).contains(&value) => {
-                self.native.control().set_unicast_hops_v6(value as u32)
-            }
-            (1, 9) => self.native.control().set_keepalive(value != 0),
-            (1, 7 | 8) => {
-                if value <= 0 || value as usize > MAX_BUFFER {
-                    return Err(NetError(22));
-                }
-                if name == 7 {
-                    self.native.control().set_send_buffer_size(value as usize)
-                } else {
-                    self.native.control().set_recv_buffer_size(value as usize)
-                }
-            }
-            (6, 1) if self.kind == 1 => return self.native.set_nodelay(value),
-            (6, 4..=6) if self.kind == 1 => {
-                if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
-                    return Err(NetError(22));
-                }
-                let parameters = match name {
-                    4 => TcpKeepalive::new().with_time(Duration::from_secs(value as u64)),
-                    5 => TcpKeepalive::new().with_interval(Duration::from_secs(value as u64)),
-                    _ => TcpKeepalive::new().with_retries(value as u32),
-                };
-                let socket = self.native.control();
-                let enabled = socket.keepalive().map_err(from_io)?;
-                let changed = socket.set_tcp_keepalive(&parameters);
-                // socket2 enables SO_KEEPALIVE; Linux's individual TCP options
-                // preserve it, including when the parameter operation fails.
-                let restored = if enabled {
-                    Ok(())
-                } else {
-                    socket.set_keepalive(false)
-                };
-                changed.and(restored)
-            }
-            (41, 26) if self.family == 10 => self.native.control().set_only_v6(value != 0),
-            (1, 20 | 21) => return Err(NetError(95)), // guest timeout state is not implemented
-            _ => return Err(NetError(92)),
-        };
-        result.map_err(from_io)
+        self.native
+            .set_option(self.family, self.kind, level, name, value)
     }
+
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
             (0, 11) if self.family == 2 && self.kind == 2 => {
@@ -1207,12 +1121,14 @@ impl Socket {
             } else {
                 17
             }),
-            (1, 30) => Ok(i32::from(self.connection.get() == Connection::Listening)),
+            (1, 30) => Ok(i32::from(
+                self.native.state.connection() == Connection::Listening,
+            )),
             (1, 4) => {
-                if self.connection.get() == Connection::Connecting {
+                if self.native.state.connection() == Connection::Connecting {
                     let _ = self.connect_complete();
                 }
-                if let Some(error) = self.pending_error.take() {
+                if let Some(error) = self.native.state.take_error() {
                     return Ok(error as i32);
                 }
                 Ok(self
@@ -1222,36 +1138,7 @@ impl Socket {
                     .map_err(from_io)?
                     .map_or(0, |e| from_io(e).0 as i32))
             }
-            (1, 2) => Ok(i32::from(
-                self.native.control().reuse_address().map_err(from_io)?,
-            )),
-            (1, 9) => Ok(i32::from(
-                self.native.control().keepalive().map_err(from_io)?,
-            )),
-            (1, 7) => Ok(self.native.control().send_buffer_size().map_err(from_io)? as i32),
-            (1, 8) => Ok(self.native.control().recv_buffer_size().map_err(from_io)? as i32),
-            (6, 1) if self.kind == 1 => self.native.nodelay(),
-            (6, 4) if self.kind == 1 => Ok(self
-                .native
-                .control()
-                .tcp_keepalive_time()
-                .map_err(from_io)?
-                .as_secs() as i32),
-            (6, 5) if self.kind == 1 => Ok(self
-                .native
-                .control()
-                .tcp_keepalive_interval()
-                .map_err(from_io)?
-                .as_secs() as i32),
-            (6, 6) if self.kind == 1 => Ok(self
-                .native
-                .control()
-                .tcp_keepalive_retries()
-                .map_err(from_io)? as i32),
-            (41, 26) if self.family == 10 => {
-                Ok(i32::from(self.native.control().only_v6().map_err(from_io)?))
-            }
-            _ => Err(NetError(92)),
+            _ => self.native.get_option(self.family, self.kind, level, name),
         }
     }
 }

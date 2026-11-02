@@ -37,7 +37,31 @@ impl DirectNetwork {
         fd: u32,
         operation: impl FnOnce(&trames_net::DirectControl) -> T,
     ) -> Option<T> {
-        self.1.as_ref()?.socket_control(fd)?.with_native(operation)
+        self.with_control_refresh(fd, false, operation)
+    }
+    pub fn with_control_refresh<T>(
+        &self,
+        fd: u32,
+        refresh: bool,
+        operation: impl FnOnce(&trames_net::DirectControl) -> T,
+    ) -> Option<T> {
+        let open = self.1.as_ref()?.socket_control(fd)?;
+        open.socket_control.as_ref()?.with_native(|control| {
+            let result = operation(control);
+            if refresh {
+                // Same original OFD across close/reuse. Publication runs under
+                // the control read gate and never holds Files membership.
+                *open.tcp_publication.lock().unwrap() =
+                    control.direct_tcp().map(|tcp| DirectTcpFd {
+                        tcp,
+                        lease: None,
+                        flags: open.flags.get(),
+                        status: open.flags.clone(),
+                        timeouts: [false, true].map(|receive| control.io_timeout(receive)),
+                    });
+            }
+            result
+        })
     }
     pub fn is_socket(&self, fd: u32) -> bool {
         self.1.as_ref().is_some_and(|files| files.is_socket(fd))
@@ -146,6 +170,46 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         time::Duration,
     };
+    #[test]
+    fn worker_completion_publishes_original_tcp_to_live_aliases_with_timeouts() {
+        use std::io::Read;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let network = v.direct_network(); // capture before creation
+        let fd = v.socket(2, 1 | O_NONBLOCK, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        socket.set_io_timeout(true, Some(Duration::from_millis(123)));
+        let result = v.with_socket_control(fd, |v| {
+            v.socket_fd(fd)
+                .unwrap()
+                .connect(listener.local_addr().unwrap())
+        });
+        assert!(matches!(result, Ok(()) | Err(trames_net::NetError(115))));
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let worker = network.clone();
+        std::thread::spawn(move || {
+            assert_eq!(
+                worker.with_control_refresh(alias, true, |control| control.get_option(1, 4)),
+                Some(Ok(0))
+            );
+            let tcp = worker
+                .get(alias)
+                .expect("completion publishes without owner refresh");
+            assert_eq!(tcp.timeouts[1], Some(Duration::from_millis(123)));
+            assert!(tcp.nonblocking());
+            tcp.tcp.send(b"x", 0).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        assert!(network.get(fd).is_some());
+    }
     #[test]
     fn connected_close_is_atomic_with_accepted_leases_and_preserves_aliases() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

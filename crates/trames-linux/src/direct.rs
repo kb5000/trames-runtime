@@ -200,15 +200,17 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        let supported = matches!(number, 204 | 205)
-            || number == 208 && (a[1], a[2]) == (6, 1)
-            || number == 209 && matches!((a[1], a[2]), (6, 1) | (1, 3 | 38 | 39));
-        if !supported {
+        if !matches!(number, 204 | 205 | 208..=210) {
             return None;
         }
-        let result = self.network.with_control(a[0] as u32, |control| {
-            crate::network::direct_control(control, number, a, memory)
-        })?;
+        let refresh = number == 209 && (a[1] as u32, a[2] as u32) == (1, 4);
+        let result = self
+            .network
+            .with_control_refresh(a[0] as u32, refresh, |control| {
+                control
+                    .supports_operation(number, a[1] as u32, a[2] as u32)
+                    .then(|| crate::network::direct_control(control, number, a, memory))
+            })??;
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
         Some(result)

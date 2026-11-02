@@ -288,11 +288,13 @@ impl Socket {
         }
     }
     pub fn direct_control(&self) -> Option<DirectControl> {
-        match &self.0 {
+        let mut control = match &self.0 {
             SocketBackend::Native(s) => s.direct_control(),
             SocketBackend::Hybrid(s) => s.direct_control(),
             _ => None,
-        }
+        }?;
+        control.timeouts = [false, true].map(|receive| self.io_timeout(receive));
+        Some(control)
     }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
         match &self.0 {

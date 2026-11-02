@@ -36,12 +36,23 @@ pub(super) struct Endpoint {
     // This entire lifetime can end on the executing worker.
     events: Mutex<Option<edge::Events>>,
     pub(super) socket: NativeSocket,
+    pub(super) state: state::State,
+    pub(super) completion: Mutex<()>,
+    pub(super) keepalive: Mutex<()>,
     _reservation: Reservation,
 }
 impl Endpoint {
-    pub(super) fn new(native: RawNativeSocket, kind: u32, reservation: Reservation) -> Arc<Self> {
+    pub(super) fn new(
+        native: RawNativeSocket,
+        kind: u32,
+        reservation: Reservation,
+        connection: Connection,
+    ) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::default(),
+            state: state::State::new(connection),
+            completion: Mutex::default(),
+            keepalive: Mutex::default(),
             socket: if kind == 1 {
                 NativeSocket::Tcp(native.into())
             } else {

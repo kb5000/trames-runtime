@@ -188,8 +188,8 @@ fn write_option(
     write(bytes)?;
     Ok(0)
 }
-/// Restricted before any guest or host effects. Unsupported controls retain
-/// the original owner path, including SO_ERROR/connection completion.
+/// Restricted before any guest or host effects. Stateful native controls use
+/// the original shared transport; namespace-dependent operations retain owner authority.
 pub(crate) fn direct_control(
     control: &trames_net::DirectControl,
     number: u32,
@@ -214,6 +214,7 @@ pub(crate) fn direct_control(
                 .map(i32::to_le_bytes)
                 .map_err(net)
         }),
+        210 => control.shutdown(a[1] as u32).map(|()| 0).map_err(net),
         _ => unreachable!("restricted control admission"),
     }
 }
@@ -782,8 +783,47 @@ mod tests {
     use trames_memory::{Permissions, PAGE_SIZE};
     use trames_vfs::NetworkMode;
     #[test]
+    fn worker_so_error_fault_does_not_consume_the_original_pending_failure() {
+        use std::{
+            net::{Ipv4Addr, TcpListener},
+            time::{Duration, Instant},
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut v = trames_vfs::Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1 | trames_vfs::O_NONBLOCK, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert_eq!(socket.connect(address), Err(NetError(115)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(socket.connect_complete(), Ok(false)) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let direct = crate::DirectSyscalls::default().with_network(v.direct_network());
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write(0x1000, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            direct.invoke_socket_control(209, [fd as u64, 1, 4, u64::MAX, 0x1000, 0], &mut memory),
+            Some(Err(Errno(14)))
+        );
+        assert_eq!(
+            direct.invoke_socket_control(209, [fd as u64, 1, 4, 0x1008, 0x1000, 0], &mut memory),
+            Some(Ok(0))
+        );
+        assert_eq!(
+            memory.read_array::<4>(0x1008).unwrap(),
+            111i32.to_le_bytes()
+        );
+        assert_eq!(socket.get_option(1, 4), Ok(0));
+        assert_eq!(socket.connect_complete(), Err(NetError(111)));
+        assert!(v.direct_tcp_fd(fd).is_none());
+    }
+    #[test]
     fn direct_and_owner_controls_share_copyout_and_option_error_order() {
-        let cases: [(u32, [u64; 6]); 10] = [
+        let cases: [(u32, [u64; 6]); 17] = [
             (208, [3, 6, 1, 0x1100, 4, 0]),
             (208, [3, 6, 1, 0x9000, 4, 0]),
             (208, [3, 6, 1, 0x1100, 3, 0]),
@@ -794,6 +834,13 @@ mod tests {
             (204, [3, 0x1300, 0x1200, 0, 0, 0]),
             (204, [3, 0, 0x1200, 0, 0, 0]),
             (205, [3, 0x1300, 0x1200, 0, 0, 0]),
+            (208, [3, 1, 9, 0x1100, 4, 0]),
+            (209, [3, 1, 9, 0x1110, 0x1000, 0]),
+            (209, [3, 1, 4, 0x1110, 0x1000, 0]),
+            (209, [3, 1, 4, 0x9000, 0x1000, 0]),
+            (209, [3, 1, 30, 0x1110, 0x1000, 0]),
+            (210, [3, 3, 0, 0, 0, 0]),
+            (210, [3, 1, 0, 0, 0, 0]),
         ];
         for (number, args) in cases {
             let mut results = Vec::new();
@@ -858,13 +905,13 @@ mod tests {
         );
     }
     #[test]
-    fn stateful_socket_options_defer_before_memory_or_native_effects() {
+    fn unsupported_socket_options_defer_before_memory_or_native_effects() {
         let mut v = trames_vfs::Vfs::default();
         v.configure_network(NetworkMode::Loopback).unwrap();
         let fd = v.socket(2, 1, 0).unwrap();
         let direct = crate::DirectSyscalls::default().with_network(v.direct_network());
         let mut memory = Memory::default();
-        for (number, level, option) in [(209, 1, 4), (208, 1, 9), (208, 1, 20), (209, 1, 30)] {
+        for (number, level, option) in [(208, 1, 20), (209, 1, 20), (208, 0, 8), (209, 0, 8)] {
             assert_eq!(
                 direct.invoke_socket_control(
                     number,
