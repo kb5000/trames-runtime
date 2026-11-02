@@ -80,6 +80,16 @@ pub struct DirectTcp {
     pub(super) links: Arc<Links>,
     pub(super) peer: SocketAddr,
 }
+/// Readiness alone never grants byte or namespace authority. Keep this token
+/// to one weak pointer, so ordinary DirectFd snapshots do not grow to carry
+/// unused peer addresses or accounting resources.
+#[derive(Clone)]
+pub struct TcpPoll(Weak<Endpoint>);
+impl TcpPoll {
+    pub fn shares_socket(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
 impl Socket {
     /// Pure owner metadata: also used under Files during conditional close.
     /// Host address queries and transport I/O stay outside that table lock.
@@ -116,7 +126,29 @@ impl Socket {
         })
     }
 }
+impl TcpPoll {
+    /// Connected TCP readiness has no routing, DNS or packet-filter effects.
+    /// Reuse the owner's poll and persistent edge observer, including HUP/ERR.
+    pub fn poll(&self, events: u16) -> Result<(u16, [u64; 2])> {
+        let socket = self.0.upgrade().ok_or(NetError(9))?;
+        Ok((socket.poll(events)?, socket.poll_epoch().unwrap_or([0; 2])))
+    }
+    /// Duplicate the persistent event queue, not the socket. Its registration
+    /// does not retain Endpoint, delay FIN or consume socket quota after close.
+    /// Both read/write edges wake this queue; poll() drains it and tests only
+    /// the guest's requested directions, so unrelated writable levels cannot
+    /// cause a readable-only waiter to spin.
+    pub fn poll_event_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.0
+            .upgrade()
+            .ok_or_else(|| io::Error::from_raw_os_error(9))?
+            .poll_event_fd()
+    }
+}
 impl DirectTcp {
+    pub fn poll_only(&self) -> TcpPoll {
+        TcpPoll(self.socket.clone())
+    }
     /// Retain the actual transport for an accepted operation, independently of
     /// namespace/owner projections. Ordinary capability snapshots stay weak.
     pub fn retain(&self) -> Result<TcpLease> {
@@ -198,6 +230,31 @@ mod tests {
             Connection::Connected,
         );
         (network, socket, peer)
+    }
+    #[test]
+    fn event_queue_lease_preserves_edges_without_retaining_socket_or_quota() {
+        let (network, socket, mut peer) = pair();
+        let direct = socket.direct_tcp().unwrap();
+        let poller = direct.poll_only();
+        let queue = poller.poll_event_fd().unwrap();
+        assert_eq!(poller.poll(1).unwrap().0, 0); // drain initial writable edge
+        let before = direct.poll_epoch().unwrap();
+        peer.write_all(b"edge").unwrap();
+        let mut wait = [PollFd::new(queue.as_fd(), PollFlags::POLLIN)];
+        assert_eq!(poll(&mut wait, PollTimeout::from(2000u16)).unwrap(), 1);
+        let (ready, epoch) = poller.poll(1).unwrap();
+        assert_eq!(ready, 1);
+        assert_ne!(epoch[0], before[0]);
+        assert_eq!(direct.recv(4, 0).unwrap(), b"edge");
+        assert_eq!(poller.poll(1).unwrap().0, 0);
+        assert_eq!(poll(&mut wait, PollTimeout::ZERO).unwrap(), 0);
+        std::thread::spawn(move || drop(queue)).join().unwrap();
+        let _another_queue = poller.poll_event_fd().unwrap();
+        drop(socket);
+        assert_eq!(network.0.sockets.live(), 0);
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(poller.poll(1), Err(NetError(9)));
     }
     #[test]
     fn connected_tcp_bytes_peek_and_counters_share_the_original_socket() {

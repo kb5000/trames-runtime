@@ -14,6 +14,21 @@ pub(super) struct LiveEpoll {
     pub(super) changed: Arc<Readiness>,
 }
 impl LiveEpoll {
+    /// Move already-registered interests when their original TCP connection
+    /// becomes directly pollable. Preserve the same watch state and cursor;
+    /// this is neither a new ADD nor an implicit ONESHOT rearm.
+    pub(super) fn promote(&self, interests: Vec<DirectWatch>, owners: usize) {
+        let mut index = self.watches.write().unwrap();
+        let watches = Arc::make_mut(&mut index);
+        watches.extend(interests);
+        watches.sort_unstable_by_key(|w| w.0);
+        // A reader seeing zero owner interests must wait for this index write
+        // before inspecting the now-complete shared core.
+        self.set_owner_count(owners);
+        drop(index);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_atomic();
+    }
     pub(super) fn snapshot(&self) -> Arc<Vec<DirectWatch>> {
         self.watches.read().unwrap().clone()
     }

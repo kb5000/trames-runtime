@@ -857,3 +857,43 @@ Remaining work includes socket factory/full teardown, connection/accept and
 namespace-dependent controls, native TCP/signal/nested epoll interests, task and
 signal ownership, and scoped structural VM/device registration. The shared live
 index is not a claim that all epoll or coordinator paths have been removed.
+
+## Connected TCP poll/epoll ownership (2026-11-02)
+
+Connected native TCP now exports a poll-only capability containing one weak
+endpoint pointer. It has no byte, DNS, routing or namespace-control authority.
+DirectFds resolves new requests through actual Files membership and the existing
+TCP publication; frozen watches retain the original weak OFD identity. Byte
+admission and policy checks are unchanged. Once connected, a native TCP socket
+cannot switch to a guest route or a DNS endpoint. Later packet-filter changes
+therefore do not invalidate its transport-only readiness. Pending connections,
+DNS/virtual sockets, nested epoll and signal interests retain their owner paths.
+
+TCP interests installed before connect completes move into the actual live epoll
+index at execution-capture boundaries. The existing watch state and cursor move
+with them: consumed ONESHOT interests stay disarmed and ET history is preserved.
+Worker ADD/MOD/DEL, shared/owner waiters and subsequent captures then use the same
+index. This is not a shadow registration or a global FD-table rebuild per ctl.
+
+Poll and epoll subscribe through the existing executor's host poller to duplicates
+of the original persistent edge-observer queue. They do not duplicate the watched
+socket or retain Endpoint. Thus a blocked poll, a watch or a stale snapshot cannot
+delay FIN, endpoint destruction or quota return. Persistent read/write edges wake
+the queue; the original poll and epoch sampler drain it and test requested guest
+bits. An unrequested writable level does not repeatedly wake a readable-only
+waiter. Native-only IoSubscription stores no synthetic Readiness object and takes
+no global listener lock. Its optional resource reference uses the existing field
+space; the one-pointer TCP token also leaves the ordinary DirectFd footprint
+unchanged. Host registration failures retain the original checkpoint fallback.
+
+Tests cover queued edges, no spurious writable-level wake, true blocked ppoll and
+epoll completion, registration before connect, promotion of consumed ONESHOT,
+concurrent single delivery, original aliases, FD reuse and final close while a
+poll subscription still exists. Both Apple kqueue and Linux epoll host observers
+are exercised. The guest CPU/memory model, resource limits and ordinary TCP byte
+path are unchanged; there is no new service thread, bus or polling loop.
+
+Socket factory/full OFD teardown, bind/connect/listen/accept ownership, AF_UNIX
+control/SCM_RIGHTS, task/signal ownership and scoped structural VM/device changes
+still need migration. Connected TCP readiness is one completed part of that work,
+not completion of the coordinator-removal objective.

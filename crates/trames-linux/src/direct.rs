@@ -2643,6 +2643,92 @@ mod tests {
     }
 
     #[test]
+    fn native_tcp_epoll_and_ppoll_park_on_edges_without_delaying_last_close() {
+        use std::{
+            io::{Read, Write},
+            net::{Ipv4Addr, TcpListener},
+        };
+        for epoll in [false, true] {
+            let mut vfs = trames_vfs::Vfs::default();
+            vfs.configure_network(trames_net::NetworkMode::Loopback)
+                .unwrap();
+            let fd = vfs.socket(2, 1, 0).unwrap();
+            let ep = vfs.epoll_create(0).unwrap();
+            // Real clients commonly register before connect completes. Capture
+            // promotes this original interest, rather than requiring re-ADD.
+            vfs.epoll_ctl(ep, 1, fd, 1, 42).unwrap();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let socket = vfs.socket_fd(fd).unwrap();
+            assert!(matches!(
+                socket.connect(listener.local_addr().unwrap()),
+                Ok(()) | Err(trames_net::NetError(115))
+            ));
+            let (mut peer, _) = listener.accept().unwrap();
+            assert_eq!(socket.connect_complete(), Ok(true));
+            drop(socket);
+            vfs.direct_network();
+            let direct = DirectSyscalls::new(vfs.direct_descriptors());
+            let mut m = memory();
+            let (number, args) = if epoll {
+                (22, [ep as u64, 0x1100, 1, 2000, 0, 0])
+            } else {
+                m.write_array(0x1100, (fd as u64 | (1u64 << 32)).to_le_bytes())
+                    .unwrap();
+                m.write_array(0x1200, 2u64.to_le_bytes()).unwrap();
+                m.write_array(0x1208, 0u64.to_le_bytes()).unwrap();
+                (73, [0x1100, 1, 0x1200, 0, 0, 0])
+            };
+            let hub = trames_vfs::HostEvents::new().unwrap();
+            let target: Arc<dyn IoWake> = Arc::new(TcpTarget(hub.clone()));
+            let weak = Arc::downgrade(&target);
+            let wait = pending(
+                direct
+                    .start(number, args, &mut m, 1, &weak, None)
+                    .expect("worker TCP poll admission"),
+            );
+            hub.wait(Some(Instant::now() + Duration::from_millis(10)))
+                .unwrap();
+            assert!(
+                !wait.signal.ready(),
+                "read-only wait must ignore a writable level"
+            );
+            peer.write_all(b"x").unwrap();
+            hub.wait(Some(Instant::now() + Duration::from_secs(2)))
+                .unwrap();
+            assert!(wait.signal.ready());
+            assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+            if epoll {
+                assert_eq!(m.read_u64(0x1108).unwrap(), 42);
+            } else {
+                assert_eq!(m.read_array::<2>(0x1106).unwrap(), 1u16.to_le_bytes());
+            }
+            assert_eq!(vfs.read(fd, 1).unwrap(), b"x");
+            let wait = pending(direct.start(number, args, &mut m, 1, &weak, None).unwrap());
+            assert_eq!(
+                vfs.close_quiescent_tcp(fd),
+                Some(Ok(())),
+                "poll subscriptions must not retain TCP I/O leases"
+            );
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            assert_eq!(vfs.eventfd(1, 0).unwrap(), fd);
+            if epoll {
+                assert!(
+                    direct
+                        .descriptors
+                        .get(ep)
+                        .unwrap()
+                        .epoll_wait(1)
+                        .unwrap()
+                        .is_empty(),
+                    "reused FD must not retarget the interest"
+                );
+            }
+            drop(wait);
+        }
+    }
+
+    #[test]
     fn worker_epoll_control_matches_owner_event_layout_flags_and_fault_order() {
         for (op, address, events) in [
             (1, 0x1200, 1),

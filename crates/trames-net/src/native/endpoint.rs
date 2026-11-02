@@ -42,6 +42,16 @@ pub(super) struct Endpoint {
     _reservation: Reservation,
 }
 impl Endpoint {
+    pub(super) fn poll_event_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        let mut events = self.events.lock().unwrap();
+        if events.is_none() {
+            *events = Some(
+                edge::Events::new(self.as_fd().as_raw_fd())
+                    .ok_or_else(|| io::Error::other("native edge observer unavailable"))?,
+            );
+        }
+        events.as_ref().unwrap().duplicate()
+    }
     pub(super) fn new(
         native: RawNativeSocket,
         kind: u32,

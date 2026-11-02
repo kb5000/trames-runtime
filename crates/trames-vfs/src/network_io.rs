@@ -171,6 +171,67 @@ mod tests {
         time::Duration,
     };
     #[test]
+    fn promoted_tcp_interest_preserves_oneshot_aliases_and_worker_control() {
+        use std::io::Write;
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let ep = v.epoll_create(0).unwrap();
+        v.epoll_ctl(ep, 1, fd, 0xc0000004, 7).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        drop(socket);
+        // Consume ONESHOT through the original owner interest after connect,
+        // then prove the subsequent capture cannot silently rearm its state.
+        assert_eq!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(), vec![(4, 7)]);
+        v.direct_network();
+        let direct = v.direct_descriptors();
+        assert!(direct.get(ep).unwrap().epoll_wait(1).unwrap().is_empty());
+        assert_eq!(
+            direct.epoll_control(ep, 3, fd, 0xc0000001, 99),
+            Some(Ok(()))
+        );
+        peer.write_all(b"x").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while direct.get(fd).unwrap().poll_ready(1) == Some(0) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (direct, count) = (&direct, &count);
+                scope.spawn(move || {
+                    let events = direct.get(ep).unwrap().epoll_wait(1).unwrap();
+                    if !events.is_empty() {
+                        assert_eq!(events, vec![(1, 99)]);
+                    }
+                    count.fetch_add(events.len(), Ordering::Relaxed);
+                });
+            }
+        });
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(direct.epoll_control(ep, 3, fd, 1, 123), Some(Ok(())));
+        assert_eq!(v.close_quiescent_tcp(fd), Some(Ok(())));
+        assert_eq!(v.eventfd(1, 0).unwrap(), fd);
+        assert_eq!(
+            direct.get(ep).unwrap().epoll_wait(1).unwrap(),
+            vec![(1, 123)]
+        );
+        assert_eq!(v.read(alias, 1).unwrap(), b"x");
+        assert_eq!(v.close_quiescent_tcp(alias), Some(Ok(())));
+        assert!(direct.get(ep).unwrap().epoll_wait(1).unwrap().is_empty());
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
     fn worker_completion_publishes_original_tcp_to_live_aliases_with_timeouts() {
         use std::io::Read;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

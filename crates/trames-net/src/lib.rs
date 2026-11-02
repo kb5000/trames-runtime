@@ -14,7 +14,7 @@ pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRo
 mod virtualnet;
 pub use native::{
     decode_address, encode_address, DirectControl, DirectTcp, NetError, NetworkMode, Received,
-    TcpLease, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
+    TcpLease, TcpPoll, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
     MSG_TRUNC,
 };
 use std::{cell::Cell, net::SocketAddr, rc::Rc, time::Duration};

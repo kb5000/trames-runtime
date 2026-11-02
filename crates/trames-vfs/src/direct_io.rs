@@ -204,6 +204,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    TcpPoll(trames_net::TcpPoll),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     Kmsg(Arc<kernel_log::Kmsg>),
@@ -257,7 +258,9 @@ impl WatchResource {
                 let open = open.borrow();
                 let fd = match polls {
                     Some(polls) => DirectFd::snapshot_poll(&open, polls),
-                    None => DirectFd::snapshot(&open),
+                    None => {
+                        DirectFd::snapshot(&open).or_else(|| DirectFd::snapshot_tcp_poll(&open))
+                    }
                 }?;
                 Some(Self::Owner(fd))
             }
@@ -308,6 +311,21 @@ pub struct DirectFd {
     origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    pub(super) fn tcp_poll(open: &Arc<SharedOpenDescription>, tcp: trames_net::TcpPoll) -> Self {
+        Self {
+            resource: ByteResource::TcpPoll(tcp),
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            _file: None,
+            origin: Some(OfdIdentity::new(open)),
+        }
+    }
+    pub(super) fn snapshot_tcp_poll(open: &OpenDescription) -> Option<Self> {
+        Some(Self::tcp_poll(
+            &open.shared,
+            open.socket.as_ref()?.direct_tcp()?.poll_only(),
+        ))
+    }
     pub fn ofd_identity(&self) -> OfdIdentity {
         self._file.as_ref().map_or_else(
             || self.origin.as_ref().expect("prepared OFD identity").clone(),
@@ -372,6 +390,7 @@ impl DirectFd {
     // validated acyclic owner graph, so this traversal cannot cycle.
     fn shares_resource(&self, other: &Self) -> bool {
         match (&self.resource, &other.resource) {
+            (ByteResource::TcpPoll(a), ByteResource::TcpPoll(b)) => a.shares_socket(b),
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Epoll(a), _) => a
                 .snapshot()
@@ -399,6 +418,7 @@ impl DirectFd {
     /// Native interests of this accepted resource, not every open watch.
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
         match &self.resource {
+            ByteResource::TcpPoll(tcp) => tcp.poll_event_fd().map(Into::into).into_iter().collect(),
             ByteResource::Timer(timer) => timer.native_fd().into_iter().collect(),
             #[cfg(all(feature = "hostfs", unix))]
             ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
@@ -414,6 +434,10 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::TcpPoll(tcp) => vec![IoSubscription::native(
+                tcp.poll_event_fd().map(Into::into),
+                signal,
+            )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Regular => Vec::new(),
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
@@ -514,6 +538,9 @@ impl DirectFd {
         open: &OpenDescription,
         polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
     ) -> Option<Self> {
+        if let Some(fd) = Self::snapshot_tcp_poll(open) {
+            return Some(fd);
+        }
         if let Some(file) = &open.mount_file {
             return Some(Self {
                 resource: ByteResource::Mounts(file.watch.clone()),
@@ -558,7 +585,10 @@ impl DirectFd {
     pub fn is_poll_only(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::PollOnly(_) | ByteResource::Regular | ByteResource::Mounts(_)
+            ByteResource::TcpPoll(_)
+                | ByteResource::PollOnly(_)
+                | ByteResource::Regular
+                | ByteResource::Mounts(_)
         )
     }
     pub fn poll_identities(&self) -> Vec<usize> {
@@ -699,6 +729,7 @@ impl DirectFd {
     }
     pub(super) fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
+            ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular => (events & 5, [0; 2]),
             ByteResource::Kmsg(log) => log.poll(events),
@@ -810,6 +841,7 @@ impl DirectFd {
             ByteResource::Timer(timer) => timer.read(count),
             ByteResource::Inotify(queue) => queue.read(count),
             ByteResource::Epoll(_)
+            | ByteResource::TcpPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::Mounts(_) => Err(Errno(22)),
@@ -875,6 +907,7 @@ impl DirectFd {
             ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
+            | ByteResource::TcpPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::Timer(_)
@@ -904,6 +937,7 @@ impl DirectFds {
         if let Some(result) = self.1.as_ref().and_then(|files| files.poll_lookup(fd)) {
             return match result.ok()? {
                 fd_table::PollOpen::Shared(file) => file.direct_poll(),
+                fd_table::PollOpen::Tcp(open, tcp) => Some(DirectFd::tcp_poll(&open, tcp)),
                 fd_table::PollOpen::Epoll(open) => {
                     let mut fd = DirectFd::shared_byte(&open)?;
                     fd.origin = Some(OfdIdentity::new(&open));
@@ -1059,6 +1093,7 @@ impl Vfs {
         &self,
         polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
     ) -> DirectFds {
+        self.promote_tcp_epoll_watches();
         let descriptors = self.fds.entries();
         let mut entries = vec![
             None;
@@ -1074,6 +1109,7 @@ impl Vfs {
         DirectFds(entries.into(), Some(self.shared_files()))
     }
     pub fn direct_descriptors(&self) -> DirectFds {
+        self.promote_tcp_epoll_watches();
         self.descriptor_snapshots().1
     }
 }

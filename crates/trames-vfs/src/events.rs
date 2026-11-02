@@ -180,6 +180,51 @@ impl Anonymous {
         counter.write(bytes)
     }
 }
+
+impl Vfs {
+    /// Prepare original owner interests at an execution capture boundary.
+    /// TCP may have been registered before connect completed. Once connected,
+    /// its native transport cannot change routes or become a DNS endpoint;
+    /// later namespace filtering affects bytes, never this poll-only authority.
+    pub(super) fn promote_tcp_epoll_watches(&self) {
+        let descriptors = self.fds.entries();
+        for descriptor in descriptors.values() {
+            let open_handle::OpenView::Owner(owner) = &descriptor.open else {
+                continue;
+            };
+            if !matches!(owner.borrow().control, Some(SharedControl::Epoll(_))) {
+                continue;
+            }
+            let mut open = owner.borrow_mut();
+            let Some(Anonymous::Epoll {
+                watches, shared, ..
+            }) = open.anonymous.as_mut()
+            else {
+                continue;
+            };
+            let promoted: Vec<_> = watches
+                .iter()
+                .filter_map(|(&key, watch)| {
+                    let target = watch.open.upgrade()?;
+                    let poll = direct_io::DirectFd::snapshot_tcp_poll(&target.borrow())?;
+                    Some((
+                        key,
+                        watch.state.clone(),
+                        direct_io::WatchResource::Owner(poll),
+                    ))
+                })
+                .collect();
+            if promoted.is_empty() {
+                continue;
+            }
+            for (key, _, _) in &promoted {
+                watches.remove(key);
+            }
+            shared.promote(promoted, watches.len());
+            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 impl Vfs {
     /// The descriptor holds only its mask. Signals belong to the reading task,
     /// never to the descriptor's creator or the host process.

@@ -193,6 +193,7 @@ impl Drop for ReservedPair {
     }
 }
 pub(super) enum PollOpen {
+    Tcp(Arc<SharedOpenDescription>, trames_net::TcpPoll),
     Shared(SharedFd),
     Epoll(Arc<SharedOpenDescription>),
 }
@@ -219,6 +220,16 @@ impl SharedFiles {
             ),
             SlotOpen::Owner(_, _, metadata) => {
                 let open = metadata.as_ref()?.upgrade()?;
+                if open.kind == FdKind::Socket {
+                    let tcp = open
+                        .tcp_publication
+                        .lock()
+                        .unwrap()
+                        .as_ref()?
+                        .tcp
+                        .poll_only();
+                    return Some(Ok(PollOpen::Tcp(open, tcp)));
+                }
                 if matches!(&open.control,Some(events::SharedControl::Epoll(live)) if live.owner_count()==0)
                 {
                     Some(Ok(PollOpen::Epoll(open)))

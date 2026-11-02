@@ -103,7 +103,7 @@ impl DynamicHost {
     }
 }
 pub struct IoSubscription {
-    source: Arc<Readiness>,
+    source: Option<Arc<Readiness>>,
     id: u64,
     host: Option<crate::HostSubscription>,
     host_failed: bool,
@@ -121,7 +121,7 @@ impl Readiness {
         // would allow store buffering and a lost wake on ARM.
         self.armed.fetch_or(1, Ordering::AcqRel);
         IoSubscription {
-            source: self.clone(),
+            source: Some(self.clone()),
             id,
             host: None,
             host_failed: false,
@@ -156,6 +156,27 @@ impl Readiness {
     }
 }
 impl IoSubscription {
+    /// Register a native event queue directly, without inventing a guest
+    /// readiness resource or a shared listener lock. The queue owns no watched
+    /// socket; closing the guest socket is independent of this subscription.
+    /// Registration failures use the executor's existing host-wait fallback.
+    pub fn native(fd: std::io::Result<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
+        let mut subscription = Self {
+            source: None,
+            id: 0,
+            host: None,
+            host_failed: false,
+            external: true,
+            dynamic: None,
+        };
+        match fd {
+            Ok(fd) => subscription.with_host(fd, signal),
+            Err(_) => {
+                subscription.host_failed = true;
+                subscription
+            }
+        }
+    }
     /// Retain a native readiness registration on the existing executor's poller.
     /// The normal subscribe-then-retry protocol also covers readiness arriving
     /// before this registration; no service thread is introduced.
@@ -207,10 +228,11 @@ impl IoSubscription {
 }
 impl Drop for IoSubscription {
     fn drop(&mut self) {
-        let mut listeners = self.source.listeners.lock().unwrap();
+        let Some(source) = &self.source else { return };
+        let mut listeners = source.listeners.lock().unwrap();
         listeners.remove(&self.id);
         if listeners.is_empty() {
-            self.source.armed.fetch_and(!1, Ordering::Relaxed);
+            source.armed.fetch_and(!1, Ordering::Relaxed);
         }
     }
 }

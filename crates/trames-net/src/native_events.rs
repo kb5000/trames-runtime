@@ -6,6 +6,10 @@ pub(super) struct Events {
     epoch: [u64; 2],
 }
 impl Events {
+    pub fn duplicate(&self) -> std::io::Result<OwnedFd> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd().try_clone_to_owned()
+    }
     pub fn new(socket: RawFd) -> Option<Self> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
