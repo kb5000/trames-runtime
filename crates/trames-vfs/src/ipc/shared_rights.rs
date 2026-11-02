@@ -22,7 +22,8 @@ impl LocalRights {
         self.0
             .iter()
             .map(|open| match open {
-                OpenHandle::Shared(open) => Some(open.clone()),
+                OpenHandle::Shared(open) if open.local.is_none() => Some(open.clone()),
+                OpenHandle::Shared(_) => None,
                 OpenHandle::Owner(_) => None,
             })
             .collect::<Option<Vec<_>>>()
@@ -121,6 +122,11 @@ impl DescriptorFactory {
                 Ok(open) => open,
                 Err(e) => return Some(Err(e)),
             };
+            // Unix-bearing rights retain the original owner cycle/ledger path.
+            // Sharing the OFD does not make its owning reference graph portable.
+            if open.local.is_some() {
+                return None;
+            }
             rights.push(open.clone());
         }
         Some(Ok(SharedRights::new(rights)))

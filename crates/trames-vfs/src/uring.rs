@@ -17,8 +17,13 @@ impl RetainedFd {
     pub fn ofd_identity(&self) -> OfdIdentity {
         OfdIdentity::new(&self.0.open.borrow().shared)
     }
-    pub fn local_socket(&self) -> Option<Rc<LocalSocket>> {
-        self.0.open.borrow().local.clone()
+    pub fn local_socket(&self, vfs: &Vfs) -> Option<Rc<LocalSocket>> {
+        self.0
+            .open
+            .borrow()
+            .local
+            .clone()
+            .map(|core| vfs.local_view(core))
     }
     /// Actual close-notification lease, independent of owner inode/path anchors.
     /// Capture only for accepted operations, never every capability snapshot.

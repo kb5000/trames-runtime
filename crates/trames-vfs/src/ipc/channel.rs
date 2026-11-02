@@ -39,10 +39,20 @@ pub(crate) struct Resource {
     pub readiness: Arc<Readiness>,
 }
 impl Resource {
+    pub(super) fn alive(&self, side: usize) -> bool {
+        self.data.lock().unwrap().alive[side]
+    }
     pub fn kind(&self) -> u32 {
         self.kind
     }
     pub fn new(kind: u32, connected: bool) -> Arc<Self> {
+        Self::with_readiness(kind, connected, Arc::default())
+    }
+    pub(super) fn with_readiness(
+        kind: u32,
+        connected: bool,
+        readiness: Arc<Readiness>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             kind,
             data: Mutex::new(Data {
@@ -64,7 +74,7 @@ impl Resource {
                 ],
                 receive_limit: [PIPE_CAPACITY; 2],
             }),
-            readiness: Arc::default(),
+            readiness,
         })
     }
     // Notifications must leave the channel lock before entering the run queue.
@@ -101,20 +111,33 @@ impl Resource {
             data.send_limit[side]
         }
     }
-    pub fn set_buffer(&self, side: usize, receive: bool, requested: u32) {
-        // Linux reports doubled accounting space. The ceiling is an ABI
-        // integer limit; queues allocate payload only as it arrives.
+    pub(super) fn inherit_options(&self, side: usize, original: &Resource, from: usize) {
+        let values = {
+            let data = original.data.lock().unwrap();
+            (
+                data.send_limit[from],
+                data.receive_limit[from],
+                data.passcred[from],
+                data.timestamp[from],
+            )
+        };
+        let mut data = self.data.lock().unwrap();
+        data.send_limit[side] = values.0;
+        data.receive_limit[side] = values.1;
+        data.passcred[side] = values.2;
+        data.timestamp[side] = values.3;
+    }
+    pub(super) fn set_buffer_unnotified(&self, side: usize, receive: bool, requested: u32) {
         let bytes = (u64::from(requested) * 2)
             .clamp(if receive { 256 } else { 2048 }, i32::MAX as u64) as usize;
-        self.change(|data| {
-            if receive {
-                data.receive_limit[side] = bytes;
-            } else {
-                data.send_limit[side] = bytes;
-            }
-            data.epochs[side][1] = data.epochs[side][1].wrapping_add(1);
-            data.epochs[1 - side][1] = data.epochs[1 - side][1].wrapping_add(1);
-        });
+        let mut data = self.data.lock().unwrap();
+        if receive {
+            data.receive_limit[side] = bytes;
+        } else {
+            data.send_limit[side] = bytes;
+        }
+        data.epochs[side][1] = data.epochs[side][1].wrapping_add(1);
+        data.epochs[1 - side][1] = data.epochs[1 - side][1].wrapping_add(1);
     }
     pub fn right_ids(&self, side: usize) -> Vec<u64> {
         self.data.lock().unwrap().queues[side]
@@ -486,8 +509,8 @@ mod tests {
         let mut vfs = Vfs::default();
         let [a, b] = vfs.socketpair(1, 1, 0).unwrap();
         let snapshot = vfs.direct_descriptors();
-        let tx = snapshot.get(a).unwrap();
-        let rx = snapshot.get(b).unwrap();
+        let tx = DirectFd::snapshot(&vfs.descriptor(a).unwrap().open.borrow()).unwrap();
+        let rx = DirectFd::snapshot(&vfs.descriptor(b).unwrap().open.borrow()).unwrap();
         assert_eq!(tx.write(b"abc"), Ok(3));
         assert_eq!(vfs.readable_bytes(b), Ok(Some(3)));
         assert_eq!(vfs.read(b, 1).unwrap(), b"a");
@@ -501,6 +524,7 @@ mod tests {
         assert_eq!(rx.read(1), Ok(Vec::new()));
         assert_eq!(rx.send(b"x", 0x4000), Err(Errno(32)));
         assert_ne!(vfs.poll(b, 0x2001) & 16, 0);
+        assert!(snapshot.get(a).is_none());
     }
     #[test]
     fn rights_force_no_effect_deferral_and_keep_original_peek_and_partial_delivery() {
@@ -581,7 +605,8 @@ mod tests {
         vfs.local_listen(&server, 1).unwrap();
         let client = vfs.local_create(1, 0).unwrap();
         let old = vfs.direct_descriptors();
-        assert!(old.get(client).is_none());
+        assert!(old.get(client).unwrap().is_poll_only());
+        assert!(!old.get(client).unwrap().is_unix());
         let socket = vfs.local_socket(client).unwrap().unwrap();
         vfs.local_connect(&socket, b"\x01\x00\0worker-local-connect")
             .unwrap();

@@ -375,7 +375,7 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
-            number @ (19 | 26 | 59 | 74 | 85 | 198) => {
+            number @ (19 | 26 | 59 | 74 | 85 | 198 | 199) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }
@@ -802,11 +802,13 @@ mod tests {
         cpu.set_x(8, 198);
         cpu.set_x(0, 1);
         cpu.set_x(1, 1);
-        assert_eq!(
-            snapshot.invoke(&cpu, &mut memory),
-            None,
-            "AF_UNIX defers before effects"
-        );
+        let local = snapshot
+            .invoke(&cpu, &mut memory)
+            .expect("worker AF_UNIX creation") as u32;
+        assert_eq!(vfs.local_socket(local).unwrap().unwrap().kind(), 1);
+        cpu.set_x(8, 57);
+        cpu.set_x(0, local as u64);
+        assert_eq!(snapshot.invoke(&cpu, &mut memory), Some(0));
         cpu.set_x(8, 25);
         cpu.set_x(0, u32::MAX as u64);
         cpu.set_x(1, 3);

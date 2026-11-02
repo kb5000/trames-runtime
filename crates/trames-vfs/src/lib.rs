@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
+#![recursion_limit = "512"]
 mod bpf;
 pub mod capabilities;
 mod cgroup;
@@ -69,7 +70,10 @@ mod mounts;
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
-pub use ipc::{LocalReceived, LocalRights, LocalSocket, SharedRights, WaylandAuth};
+pub use ipc::{
+    LocalOperation, LocalReceived, LocalResource, LocalRights, LocalSocket, SharedRights,
+    WaylandAuth,
+};
 pub use locks::{RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER};
 mod linux_namespace;
 mod pid_namespace;
@@ -121,7 +125,7 @@ pub fn query_fd_flags(flags: u32, command: u64) -> Result<u64> {
         _ => Err(Errno(22)),
     }
 }
-pub use network::SocketOperation;
+pub use network::{SocketControlOperation, SocketOperation};
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub use trames_net::{NetworkMode, Socket as NetSocket};
 pub fn kernel_log_capacity() -> usize {
@@ -182,7 +186,6 @@ struct OpenDescription {
     shared: Arc<SharedOpenDescription>,
     position: u64,
     anonymous: Option<events::Anonymous>,
-    local: Option<Rc<LocalSocket>>,
     namespace: Option<linux_namespace::NamespaceHandle>,
     oom: Option<std::sync::Weak<OomTask>>,
     network_control: Option<network::Control>,
@@ -190,7 +193,7 @@ struct OpenDescription {
     mount: Option<OpenMount>,
 }
 // The actual file, pipe and lock/notification lifetimes share one allocation.
-// Local IPC, task and mount control projections above still retain owner ownership.
+// Legacy ancillary, task and mount control projections retain owner ownership.
 struct SharedOpenDescription {
     socket: Option<Arc<NetSocket>>,
     _disk_file: Option<Arc<std::fs::File>>,
@@ -216,6 +219,7 @@ struct SharedOpenDescription {
     read_node: Option<NodeRef>,
     pipe: Option<Arc<PipeEnd>>,
     pty: Option<Arc<PtyEnd>>,
+    local: Option<Arc<ipc::LocalResource>>,
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
     kernel_log: Option<Arc<kernel_log::Kmsg>>,
     notification: Option<Arc<FileClose>>,
@@ -231,16 +235,15 @@ impl Drop for OpenDescription {
         // Epoll snapshots in another forked FD table may retain this resource
         // without retaining the open description. Last-close must invalidate
         // those tables too, so their next snapshot removes the dead watch.
-        if self.local.is_some()
-            || self.control.is_none()
-                && matches!(
-                    self.anonymous,
-                    Some(
-                        events::Anonymous::Event(_)
-                            | events::Anonymous::Timer(_)
-                            | events::Anonymous::Inotify(_)
-                    )
+        if self.control.is_none()
+            && matches!(
+                self.anonymous,
+                Some(
+                    events::Anonymous::Event(_)
+                        | events::Anonymous::Timer(_)
+                        | events::Anonymous::Inotify(_)
                 )
+            )
         {
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
@@ -250,6 +253,7 @@ impl Drop for SharedOpenDescription {
     fn drop(&mut self) {
         if self.pipe.is_some()
             || self.pty.is_some()
+            || self.local.is_some()
             || self.kernel_log.is_some()
             || self.control.is_some()
             || self.native_image.is_some()
@@ -576,8 +580,9 @@ pub struct Vfs {
     fds: DescriptorTable,
     context: FsContext,
     uts: UtsNamespace,
-    root_network: Rc<linux_namespace::RootNetwork>,
+    root_network: Arc<linux_namespace::RootNetwork>,
     path_bindings: ipc::PathBindings,
+    local_rights: ipc::OwnerView,
     ipc_namespace: Arc<linux_namespace::IpcNamespace>,
     cgroup_namespace: Arc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
@@ -647,6 +652,7 @@ impl Vfs {
             uts: self.uts.clone(),
             root_network: self.root_network.clone(),
             path_bindings: self.path_bindings.clone(),
+            local_rights: self.local_rights.clone(),
             ipc_namespace: self.ipc_namespace.clone(),
             cgroup_namespace: self.cgroup_namespace.clone(),
             pid_ns: self.pid_ns.clone(),
@@ -680,7 +686,7 @@ impl Vfs {
 impl Vfs {
     fn empty(fs: FsHandle) -> Self {
         let pid_ns = PidNamespace::default();
-        let root_network = Rc::new(linux_namespace::RootNetwork::default());
+        let root_network = Arc::new(linux_namespace::RootNetwork::default());
         let network = root_network.network.borrow().clone();
         Self {
             query: None,
@@ -692,6 +698,7 @@ impl Vfs {
             uts: UtsNamespace::default(),
             root_network,
             path_bindings: ipc::PathBindings::default(),
+            local_rights: Default::default(),
             ipc_namespace: Arc::default(),
             cgroup_namespace: Arc::default(),
             pid_ns: pid_ns.clone(),
@@ -773,13 +780,13 @@ impl Default for Vfs {
                             node: None,
                             pipe: None,
                             pty: None,
+                            local: None,
                             bridge: None,
                             kernel_log: None,
                             notification: None,
                         }),
                         position: 0,
                         anonymous: None,
-                        local: None,
                         namespace: None,
                         network_control: None,
                         mount_file: None,
@@ -1106,13 +1113,13 @@ impl Vfs {
                             node: None,
                             pipe: None,
                             pty: None,
+                            local: None,
                             bridge: None,
                             kernel_log: None,
                             notification: None,
                         }),
                         position: 0,
                         anonymous: None,
-                        local: None,
                         namespace: None,
                         network_control: None,
                         mount_file: None,
@@ -2292,6 +2299,7 @@ impl Vfs {
                     node: Some(node),
                     pipe,
                     pty,
+                    local: None,
                     bridge,
                     kernel_log,
                     notification,
@@ -2299,7 +2307,6 @@ impl Vfs {
                 position: 0,
                 mount: p.mount.map(OpenMount::Owner),
                 anonymous: None,
-                local: None,
                 namespace: None,
                 network_control,
                 mount_file,
@@ -2317,11 +2324,13 @@ impl Vfs {
             if !self.detached_mounts.borrow().is_empty() {
                 self.reap_detached_mounts();
             }
+            self.reap_local_rights();
             return result;
         }
         let descriptor = self.fds.close(fd)?;
         self.release_record_locks(&descriptor);
         drop(descriptor);
+        self.reap_local_rights();
         self.reap_detached_mounts();
         Ok(())
     }
@@ -2364,6 +2373,7 @@ impl Vfs {
             self.release_record_locks(d);
         }
         drop(descriptors);
+        self.reap_local_rights();
         self.reap_detached_mounts();
     }
     /// Detach a task's view while another task retains the shared file table.
@@ -2598,7 +2608,10 @@ impl Vfs {
             return log.read(count);
         }
         if let Some(local) = &o.local {
-            return local.recv(count, 0).map(|r| r.data);
+            return self
+                .local_view(local.clone())
+                .recv(count, 0)
+                .map(|r| r.data);
         }
         if o.namespace.is_some() {
             return Err(Errno(22));
@@ -2661,7 +2674,13 @@ impl Vfs {
             return log.write(bytes);
         }
         if let Some(local) = &o.local {
-            return self.local_send_to(local, bytes, 0, None, LocalRights::default());
+            return self.local_send_to(
+                &self.local_view(local.clone()),
+                bytes,
+                0,
+                None,
+                LocalRights::default(),
+            );
         }
         if o.namespace.is_some() {
             return Err(Errno(22));

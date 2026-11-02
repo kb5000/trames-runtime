@@ -70,6 +70,54 @@ impl crate::network::unix::MessageIo for Message<'_> {
     }
 }
 impl DirectSyscalls {
+    /// Raw read/readv can encounter legacy ancillary data too. Keep the actual
+    /// accepted OFD through the owner handoff, never reopen its numeric slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_owned_local_byte(
+        &self,
+        file: RetainedByte,
+        vfs: &trames_vfs::Vfs,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let socket = file
+            .fd
+            .shared_file()
+            .expect("accepted Unix OFD")
+            .retained()
+            .local_socket(vfs)
+            .expect("original Unix socket");
+        let read = |count| socket.recv(count, 0).map(|received| received.data);
+        let write = |bytes: &[u8]| {
+            vfs.local_send_credentials(
+                &socket,
+                bytes,
+                0,
+                None,
+                trames_vfs::LocalRights::default(),
+                self.local_identity
+                    .unwrap_or_else(|| vfs.local_sender_credentials()),
+            )
+            .map(|count| count as u64)
+        };
+        let result = match number {
+            63 => Linux::read_transport(args, memory, read),
+            64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
+            65 => Linux::readv_transport_mode(args, memory, file.fd.readv_records(), read),
+            66 => Linux::writev_transport_mode(
+                args,
+                memory,
+                &mut self.scratch.borrow_mut(),
+                false,
+                write,
+            ),
+            _ => unreachable!("raw Unix byte entry"),
+        };
+        self.finish_owned_local(file, number, args, result, pid, target)
+    }
     pub(super) fn start_local_message(
         &self,
         number: u32,
@@ -157,7 +205,7 @@ impl DirectSyscalls {
         let accepted = file.message.as_ref().expect("accepted local message");
         let number = accepted.number;
         let args = accepted.args;
-        let socket = owner.local_socket().expect("original local OFD");
+        let socket = owner.local_socket(vfs).expect("original local OFD");
         let result = crate::network::unix::progress_owned(
             &accepted.prepared,
             vfs,
@@ -165,6 +213,17 @@ impl DirectSyscalls {
             if file.fd.nonblocking() { 0x40 } else { 0 },
             memory,
         );
+        self.finish_owned_local(file, number, args, result, pid, target)
+    }
+    fn finish_owned_local(
+        &self,
+        file: RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        result: Result<u64, Errno>,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
         if result != Err(Errno(11))
             || file.fd.nonblocking()
             || socket_flags(number, args) & 0x40 != 0

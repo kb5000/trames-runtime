@@ -184,3 +184,64 @@ fn immediate_blocking_udp_and_netlink_connect_complete_but_tcp_waits_defer_befor
         v.close(fd).unwrap();
     }
 }
+
+#[test]
+fn unix_owner_and_worker_controls_share_original_abi_and_error_order() {
+    let cases = [
+        (201, [3, 2, 0, 0, 0, 0]),
+        (204, [3, 0x1200, 0x1100, 0, 0, 0]),
+        (204, [3, 0, 0x1100, 0, 0, 0]),
+        (205, [3, 0x1200, 0x1100, 0, 0, 0]),
+        (208, [3, 1, 7, 0x1000, 4, 0]),
+        (208, [3, 1, 16, 0x1000, 4, 0]),
+        (208, [3, 1, 32, 0x9000, 4, 0]),
+        (208, [3, 1, 7, 0x9000, 3, 0]),
+        (208, [3, 0, 7, 0x9000, 4, 0]),
+        (209, [3, 1, 17, 0x1200, 0x1100, 0]),
+        (209, [3, 1, 7, 0x1200, 0x1100, 0]),
+        (209, [3, 1, 30, 0x1200, 0x1100, 0]),
+        (209, [3, 1, 999, 0x9000, 0x9000, 0]),
+        (209, [3, 1, 4, 0x9000, 0x1100, 0]),
+        (210, [3, 3, 0, 0, 0, 0]),
+        (210, [3, 1, 0, 0, 0, 0]),
+    ];
+    for state in 0..3 {
+        for user in [false, true] {
+            for (number, args) in cases {
+                let mut results = Vec::new();
+                for worker in [false, true] {
+                    let mut v = Vfs::default();
+                    if state == 2 {
+                        assert_eq!(v.socketpair(1, 1, 0).unwrap(), [3, 4]);
+                    } else {
+                        assert_eq!(v.local_create(1, 0), Ok(3));
+                        if state == 1 {
+                            let socket = v.local_socket(3).unwrap().unwrap();
+                            v.local_bind(&socket, b"\x01\x00\0unix-control").unwrap();
+                        }
+                    }
+                    if user {
+                        v.credentials = trames_vfs::Credentials::user(501, 502);
+                    }
+                    let mut m = memory();
+                    m.write_array(0x1000, 8192u32.to_le_bytes()).unwrap();
+                    m.write_array(0x1100, 12u32.to_le_bytes()).unwrap();
+                    let result = if worker {
+                        let direct =
+                            DirectSyscalls::default().with_resources(v.descriptor_factory());
+                        let result = direct.invoke_socket_control(number, args, &mut m).unwrap();
+                        assert_eq!(direct.socket_completed(), 1);
+                        result
+                    } else {
+                        Linux::network_vfs(&mut v, number as u64, args, &mut m)
+                    };
+                    results.push((result, m.read_array::<4096>(0x1000).unwrap()));
+                }
+                assert_eq!(
+                    results[0], results[1],
+                    "state={state} user={user} number={number} args={args:?}"
+                );
+            }
+        }
+    }
+}

@@ -4,6 +4,10 @@ use std::net::SocketAddr;
 /// One syscall's accepted original network OFD, independent of numeric reuse.
 #[derive(Clone)]
 pub struct SocketOperation(Arc<SharedOpenDescription>);
+pub enum SocketControlOperation {
+    Network(SocketOperation),
+    Unix(LocalOperation),
+}
 impl std::ops::Deref for SocketOperation {
     type Target = NetSocket;
     fn deref(&self) -> &Self::Target {
@@ -66,7 +70,7 @@ impl Sysctl {
 }
 #[derive(Clone)]
 pub(super) struct Control {
-    namespace: Rc<linux_namespace::RootNetwork>,
+    namespace: Arc<linux_namespace::RootNetwork>,
     kind: Sysctl,
 }
 impl Control {
@@ -277,13 +281,13 @@ impl Vfs {
                     node: None,
                     pipe: None,
                     pty: None,
+                    local: None,
                     bridge: None,
                     kernel_log: None,
                     notification: None,
                 }),
                 position: 0,
                 anonymous: None,
-                local: None,
                 namespace: None,
                 network_control: None,
                 mount_file: None,

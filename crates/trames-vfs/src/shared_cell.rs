@@ -14,3 +14,12 @@ impl<T> SharedCell<T> {
         self.0.write().unwrap()
     }
 }
+
+impl<T: Copy> SharedCell<T> {
+    pub fn get(&self) -> T {
+        *self.borrow()
+    }
+    pub fn set(&self, value: T) {
+        *self.borrow_mut() = value;
+    }
+}

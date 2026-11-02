@@ -192,6 +192,9 @@ impl<C: Cpu> Kernel<C> {
             // owned host resources; it neither accesses guest memory nor
             // installs guest FDs, so it does not require returning their Views.
             root.linux.vfs.pump_native_services();
+            if root.linux.vfs.local_rights_need_owner() {
+                return Ok(true);
+            }
             if root.linux.vfs.live_ptys().iter().any(|pair| {
                 pair.host_resize_pending
                     .load(std::sync::atomic::Ordering::Relaxed)

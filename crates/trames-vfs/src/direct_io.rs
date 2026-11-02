@@ -207,6 +207,7 @@ enum ByteResource {
     TcpPoll(trames_net::TcpPoll),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
+    UnixControl(std::sync::Weak<ipc::LocalResource>),
     Kmsg(Arc<kernel_log::Kmsg>),
     PollOnly(Arc<dyn DirectPoll>),
     Event(Arc<EventCounter>),
@@ -275,7 +276,7 @@ impl WatchResource {
         match self {
             Self::Shared(open) => {
                 let open = open.upgrade()?;
-                if open.kind == FdKind::Socket {
+                if open.kind == FdKind::Socket && open.local.is_none() {
                     let tcp = open
                         .tcp_publication
                         .lock()
@@ -367,7 +368,12 @@ impl DirectFd {
         }
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        let resource = if let Some(end) = &open.pty {
+        let resource = if let Some(local) = &open.local {
+            match local.direct().or_else(|| local.direct_message()) {
+                Some((data, side)) => ByteResource::Unix { data, side },
+                None => ByteResource::UnixControl(Arc::downgrade(local)),
+            }
+        } else if let Some(end) = &open.pty {
             ByteResource::Pty {
                 data: end.pair.io.clone(),
                 master: end.master,
@@ -471,6 +477,11 @@ impl DirectFd {
             )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Regular => Vec::new(),
+            ByteResource::UnixControl(local) => local
+                .upgrade()
+                .map(|local| local.subscribe(signal))
+                .into_iter()
+                .collect(),
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
@@ -621,6 +632,7 @@ impl DirectFd {
         matches!(
             self.resource,
             ByteResource::TcpPoll(_)
+                | ByteResource::UnixControl(_)
                 | ByteResource::PollOnly(_)
                 | ByteResource::Regular
                 | ByteResource::Mounts(_)
@@ -802,6 +814,9 @@ impl DirectFd {
             ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular => (events & 5, [0; 2]),
+            ByteResource::UnixControl(local) => local.upgrade().map_or((16, [0; 2]), |local| {
+                (local.poll(events), local.poll_epoch())
+            }),
             ByteResource::Kmsg(log) => log.poll(events),
             ByteResource::PollOnly(poll) => poll.poll(events),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
@@ -914,6 +929,7 @@ impl DirectFd {
             | ByteResource::TcpPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
+            | ByteResource::UnixControl(_)
             | ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Pipe { data, read, .. } => {
                 if !read {
@@ -981,6 +997,7 @@ impl DirectFd {
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::Timer(_)
+            | ByteResource::UnixControl(_)
             | ByteResource::Inotify(_) => Err(Errno(22)),
             ByteResource::Unix { .. } => self.send(bytes, 0),
             ByteResource::Pty { .. } => self.terminal_write(bytes, None).unwrap_or(Err(Errno(95))),

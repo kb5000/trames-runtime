@@ -1506,7 +1506,7 @@ mod tests {
                 ..RuntimeInfo::default()
             },
         );
-        let control = Rc::downgrade(&v.root_network);
+        let control = Arc::downgrade(&v.root_network);
         v.import_file(b"/namespace", vec![]).unwrap();
         v.import_file(b"/data", vec![0; PAGE_SIZE as usize])
             .unwrap();

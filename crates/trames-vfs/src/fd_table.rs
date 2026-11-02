@@ -217,7 +217,7 @@ impl SharedFiles {
             SlotOpen::Shared(open) => open.clone(),
             SlotOpen::Owner(_, _, metadata) => metadata.as_ref()?.upgrade()?,
         };
-        if open.kind == FdKind::Socket {
+        if open.kind == FdKind::Socket && open.local.is_none() {
             let tcp = open
                 .tcp_publication
                 .lock()
@@ -246,7 +246,7 @@ impl SharedFiles {
     }
     pub(super) fn is_socket(&self, fd: u32) -> bool {
         self.control_open(fd)
-            .is_some_and(|open| open.kind == FdKind::Socket)
+            .is_some_and(|open| open.kind == FdKind::Socket && open.local.is_none())
     }
     pub(super) fn tcp_lookup(&self, fd: u32) -> Option<DirectTcpFd> {
         let entries = self.0.entries.lock().unwrap();
@@ -343,10 +343,13 @@ impl SharedFd {
     }
     pub fn direct_byte(self) -> Option<DirectFd> {
         let fd = DirectFd::shared_byte(&self.open)?;
+        if fd.is_poll_only() {
+            return None;
+        }
         Some(fd.with_ofd(self))
     }
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
-        if self.open.kind == FdKind::Socket {
+        if self.open.kind == FdKind::Socket && self.open.local.is_none() {
             let tcp = self
                 .open
                 .tcp_publication
@@ -1071,7 +1074,7 @@ mod tests {
     fn owner_control_slots_are_excluded_before_structural_effects() {
         let mut v = Vfs::default();
         let [_, writer] = v.pipe(O_NONBLOCK).unwrap();
-        let owner = v.socket(1, 1, 0).unwrap();
+        let (owner, _ring) = v.uring_create(2, 4).unwrap();
         let files = v.shared_files();
         assert!(files.close(owner, 0).is_none());
         assert!(files.duplicate(owner, 160, false).is_none());

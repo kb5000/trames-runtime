@@ -56,18 +56,21 @@ impl Vfs {
         }
         let peer = if let Some(name) = destination {
             self.local_destination(socket, name)?
-        } else if socket.connected.get() {
-            socket.datagram_peer.borrow().upgrade().ok_or(Errno(111))?
+        } else if socket.connected() {
+            LocalSocket::view(
+                socket.datagram_peer.borrow().upgrade().ok_or(Errno(111))?,
+                self.local_rights.clone(),
+            )
         } else {
             return Err(Errno(89));
         };
         // A connected receiver accepts only its selected sender.
-        if peer.connected.get()
+        if peer.connected()
             && !peer
                 .datagram_peer
                 .borrow()
                 .upgrade()
-                .is_some_and(|expected| Rc::ptr_eq(&expected, socket))
+                .is_some_and(|expected| Arc::ptr_eq(&expected, &socket.core))
         {
             return Err(Errno(1));
         }
@@ -80,16 +83,22 @@ impl Vfs {
             .collect();
         let mut visited = std::collections::BTreeSet::new();
         while let Some(endpoint) = pending.pop() {
-            if Rc::ptr_eq(&endpoint, &peer) {
+            if Arc::ptr_eq(&endpoint, &peer.core) {
                 return Err(Errno(95));
             }
-            if !visited.insert(Rc::as_ptr(&endpoint) as usize) {
+            if !visited.insert(Arc::as_ptr(&endpoint) as usize) {
                 continue;
             }
             let channel = endpoint.channel.borrow();
-            let ledger = channel.rights.borrow();
-            for id in channel.resource.right_ids(endpoint.side.get()) {
-                for open in &ledger.get(&id).expect("queued metadata").rights.0 {
+            let ledger = self.local_rights.entries.borrow();
+            for id in channel.resource.right_ids(endpoint.side()) {
+                for open in &ledger
+                    .get(&(Arc::as_ptr(&channel) as usize, id))
+                    .expect("queued metadata")
+                    .data
+                    .rights
+                    .0
+                {
                     if let Some(local) = &open.borrow().local {
                         pending.push(local.clone());
                     }
@@ -97,9 +106,13 @@ impl Vfs {
             }
         }
         let channel = peer.channel.borrow();
-        let id = channel.next_right.get();
-        channel.next_right.set(id.checked_add(1).ok_or(Errno(75))?);
-        channel.rights.borrow_mut().insert(
+        let id = channel
+            .next_right
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Errno(75))?;
+        self.local_rights.insert(
+            &channel,
+            0,
             id,
             Ancillary {
                 rights,
@@ -112,7 +125,7 @@ impl Vfs {
                 .resource
                 .send_credentials(1, bytes, flags, Some(id), Some(credentials));
         if result.is_err() {
-            let unused = channel.rights.borrow_mut().remove(&id);
+            let unused = self.local_rights.remove(&channel, id);
             drop(unused);
         }
         result

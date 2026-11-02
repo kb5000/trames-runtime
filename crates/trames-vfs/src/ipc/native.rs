@@ -168,6 +168,7 @@ impl OpenDescription {
                 ofd_records: Default::default(),
                 pipe: Some(PipeEnd::new(pipe, !write, write, None)),
                 pty: None,
+                local: None,
                 node: None,
                 bridge: None,
                 kernel_log: None,
@@ -175,7 +176,6 @@ impl OpenDescription {
             }),
             position: 0,
             anonymous: None,
-            local: None,
             namespace: None,
             oom: None,
             network_control: None,
@@ -210,7 +210,7 @@ impl Services {
                         self.connection_revision = self.connection_revision.wrapping_add(1);
                         self.connections.push(Connection {
                             xwm: *xwm,
-                            local,
+                            local: LocalSocket::view(local, vfs.local_rights.clone()),
                             native: native.into(),
                             token,
                             owner: (uid, gid),
@@ -546,7 +546,9 @@ impl Vfs {
             services
                 .connections
                 .iter()
-                .find(|c| !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow()))
+                .find(|c| {
+                    !c.xwm && Arc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
+                })
                 .map(|c| c.token)
                 .ok_or(Errno(9))?
         } else {
@@ -590,7 +592,7 @@ impl Vfs {
                     .connections
                     .iter()
                     .find(|c| {
-                        !c.xwm && Rc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
+                        !c.xwm && Arc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
                     })
                     .map(|c| Grant::Connection(c.token))
             } else {
@@ -662,13 +664,13 @@ impl Vfs {
                 node: Some(node),
                 pipe: None,
                 pty: None,
+                local: None,
                 bridge: None,
                 kernel_log: None,
                 notification: None,
             }),
             position: 0,
             anonymous: None,
-            local: None,
             namespace: None,
             network_control: None,
             mount_file: None,

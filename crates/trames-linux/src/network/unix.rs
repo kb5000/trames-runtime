@@ -24,10 +24,8 @@ impl Linux {
                 }
                 Ok(0)
             }
-            201 => {
-                vfs.local_listen(socket, a[1] as u32)?;
-                Ok(0)
-            }
+            201 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
+                .expect("Unix listen ABI"),
             202 | 242 => {
                 let output =
                     AddressOutput::prepare(memory, a[1], a[2], socket.accept_address_size()?)?;
@@ -38,13 +36,8 @@ impl Linux {
                 }
                 Ok(fd as u64)
             }
-            204 | 205 => {
-                let name = socket.name(number == 205)?;
-                let output =
-                    AddressOutput::prepare(memory, a[1], a[2], name.len())?.ok_or(Errno(14))?;
-                output.write_bytes(memory, &name)?;
-                Ok(0)
-            }
+            204 | 205 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
+                .expect("Unix address ABI"),
             206 => {
                 let destination = if a[4] == 0 {
                     None
@@ -85,69 +78,8 @@ impl Linux {
                     received.data.len()
                 } as u64)
             }
-            208 => {
-                if a[1] != 1 {
-                    return Err(Errno(92));
-                }
-                if (a[4] as u32) < 4 || a[4] as u32 > i32::MAX as u32 {
-                    return Err(Errno(22));
-                }
-                if matches!(a[2], 32 | 33)
-                    && !vfs.credentials.has_cap(trames_vfs::capabilities::NET_ADMIN)
-                {
-                    return Err(Errno(1));
-                }
-                socket.set_reuse(a[2] as u32, u32_at(memory, a[3])?)?;
-                Ok(0)
-            }
-            209 => {
-                if a[1] != 1 {
-                    return Err(Errno(92));
-                }
-                if a[2] == 17 {
-                    let mut credentials = socket.peer_credentials();
-                    credentials[0] = vfs.pid_namespace().local(credentials[0]);
-                    let value: Vec<_> =
-                        credentials.into_iter().flat_map(u32::to_le_bytes).collect();
-                    let size = u32_at(memory, a[4])? as usize;
-                    if size > i32::MAX as usize {
-                        return Err(Errno(22));
-                    }
-                    Self::check(memory, a[4], 4, Access::Write)?;
-                    Self::check(memory, a[3], size.min(12), Access::Write)?;
-                    memory
-                        .write(a[3], &value[..size.min(12)])
-                        .map_err(|_| Errno(14))?;
-                    memory
-                        .write(a[4], &(size.min(12) as u32).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                    return Ok(0);
-                }
-                let value: u32 = match a[2] {
-                    2 | 15 | 16 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
-                    3 => socket.kind(),
-                    4 => 0,
-                    7 | 8 => socket.buffer_size(a[2] == 8) as u32,
-                    30 => u32::from(socket.listening()),
-                    38 => 0,
-                    39 => 1,
-                    _ => return Err(Errno(92)),
-                };
-                let size = u32_at(memory, a[4])? as usize;
-                Self::check(memory, a[4], 4, Access::Write)?;
-                Self::check(memory, a[3], size.min(4), Access::Write)?;
-                memory
-                    .write(a[3], &value.to_le_bytes()[..size.min(4)])
-                    .map_err(|_| Errno(14))?;
-                memory
-                    .write(a[4], &(size.min(4) as u32).to_le_bytes())
-                    .map_err(|_| Errno(14))?;
-                Ok(0)
-            }
-            210 => {
-                socket.shutdown(a[1] as u32)?;
-                Ok(0)
-            }
+            208..=210 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
+                .expect("Unix control ABI"),
             211 | 212 => message(
                 number as u32,
                 a,
@@ -162,6 +94,97 @@ impl Linux {
             _ => Err(Errno(95)),
         }
     }
+}
+
+/// Shared original Unix control decoder for owner and worker execution.
+pub(crate) fn control(
+    factory: &trames_vfs::DescriptorFactory,
+    socket: &trames_vfs::LocalResource,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Option<Result<u64>> {
+    if !matches!(number, 201 | 204 | 205 | 208..=210) {
+        return None;
+    }
+    Some((|| match number {
+        201 => {
+            factory.local_listen(socket, a[1] as u32)?;
+            Ok(0)
+        }
+        204 | 205 => {
+            let name = socket.name(number == 205)?;
+            let output =
+                AddressOutput::prepare(memory, a[1], a[2], name.len())?.ok_or(Errno(14))?;
+            output.write_bytes(memory, &name)?;
+            Ok(0)
+        }
+        208 => {
+            if a[1] != 1 {
+                return Err(Errno(92));
+            }
+            if (a[4] as u32) < 4 || a[4] as u32 > i32::MAX as u32 {
+                return Err(Errno(22));
+            }
+            if matches!(a[2], 32 | 33)
+                && !factory
+                    .local_credentials()
+                    .has_cap(trames_vfs::capabilities::NET_ADMIN)
+            {
+                return Err(Errno(1));
+            }
+            socket.set_reuse(a[2] as u32, u32_at(memory, a[3])?)?;
+            Ok(0)
+        }
+        209 => {
+            if a[1] != 1 {
+                return Err(Errno(92));
+            }
+            if a[2] == 17 {
+                let mut credentials = socket.peer_credentials();
+                credentials[0] = factory.local_pid(credentials[0]);
+                let value: Vec<_> = credentials.into_iter().flat_map(u32::to_le_bytes).collect();
+                let size = u32_at(memory, a[4])? as usize;
+                if size > i32::MAX as usize {
+                    return Err(Errno(22));
+                }
+                Linux::check(memory, a[4], 4, Access::Write)?;
+                Linux::check(memory, a[3], size.min(12), Access::Write)?;
+                memory
+                    .write(a[3], &value[..size.min(12)])
+                    .map_err(|_| Errno(14))?;
+                memory
+                    .write(a[4], &(size.min(12) as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
+            let value: u32 = match a[2] {
+                2 | 15 | 16 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
+                3 => socket.kind(),
+                4 => 0,
+                7 | 8 => socket.buffer_size(a[2] == 8) as u32,
+                30 => u32::from(socket.listening()),
+                38 => 0,
+                39 => 1,
+                _ => return Err(Errno(92)),
+            };
+            let size = u32_at(memory, a[4])? as usize;
+            Linux::check(memory, a[4], 4, Access::Write)?;
+            Linux::check(memory, a[3], size.min(4), Access::Write)?;
+            memory
+                .write(a[3], &value.to_le_bytes()[..size.min(4)])
+                .map_err(|_| Errno(14))?;
+            memory
+                .write(a[4], &(size.min(4) as u32).to_le_bytes())
+                .map_err(|_| Errno(14))?;
+            Ok(0)
+        }
+        210 => {
+            socket.shutdown(a[1] as u32)?;
+            Ok(0)
+        }
+        _ => unreachable!("Unix control number"),
+    })())
 }
 
 pub(crate) trait MessageIo {

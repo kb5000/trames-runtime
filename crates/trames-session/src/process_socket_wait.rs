@@ -298,7 +298,6 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
     let mut k = super::tests::kernel();
     let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
     let event = p.linux.vfs.eventfd(19, 0).unwrap();
-    let weak = Rc::downgrade(&p.linux.vfs.local_socket(rx).unwrap().unwrap());
     let mut header = [0; 56];
     for (at, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 24)] {
         header[at..at + 8].copy_from_slice(&value.to_le_bytes());
@@ -377,7 +376,7 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
         p.linux.vfs.close(replacement).unwrap();
     }
     assert!(
-        weak.upgrade().is_some(),
+        k.processes[&2].linux.vfs.poll(tx, 16) & 16 == 0,
         "accepted call retains its original local OFD"
     );
     filter(&mut k, &mut p, 0x5000d);
@@ -413,13 +412,14 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
             "retained filtered message did not progress"
         );
     }
+    let peer_hangup = k.processes[&2].linux.vfs.poll(tx, 16);
     let p = k.processes.get_mut(&1).unwrap();
     assert_eq!(p.memory.read_u64(0x1800).unwrap(), 4);
     let imported = u32::from_le_bytes(p.memory.read_array(0x1310).unwrap());
     assert_eq!(p.linux.vfs.read(imported, 8).unwrap(), 19u64.to_le_bytes());
     assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
     assert!(
-        weak.upgrade().is_none(),
+        peer_hangup & 16 != 0,
         "completed call releases old transport"
     );
     assert_eq!(p.seccomp.evaluations(), 3);
@@ -471,7 +471,16 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
                 ]);
             }
         }
-        code.push(0x14000000);
+        // Completed tasks must not exhaust the shared test instruction budget.
+        code.extend([
+            mov(0, 0x1040),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
         let mut peer = p.fork();
         peer.parent = 1;
         peer.tgid = 2;
@@ -500,12 +509,12 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
             }
             assert_eq!(
                 p.seccomp.evaluations(),
-                160,
-                "shared filter counts both workers' 80 entries"
+                162,
+                "shared filter counts both workers' 80 entries and final waits"
             );
         }
         assert_eq!(k.service_requests, 0);
-        assert_eq!(k.syscalls, 160);
+        assert_eq!(k.syscalls, 162);
     }
 }
 
@@ -752,7 +761,16 @@ fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
                 0xf9000020,
             ]);
         }
-        code.push(0x14000000);
+        // Completed tasks must not exhaust the shared test instruction budget.
+        code.extend([
+            mov(0, 0x1040),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
         let mut peer = p.fork();
         peer.parent = 1;
         peer.tgid = 2;
@@ -791,10 +809,10 @@ fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
                 p.memory.read_array::<4>(0x1018).unwrap(),
                 1u32.to_le_bytes()
             );
-            assert_eq!(p.seccomp.evaluations(), 112);
+            assert_eq!(p.seccomp.evaluations(), 114);
         }
         assert_eq!(k.service_requests, 0);
-        assert_eq!(k.syscalls, 112);
+        assert_eq!(k.syscalls, 114);
     }
 }
 
@@ -857,7 +875,17 @@ fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decisio
                 0xf9000020,
             ]);
         }
-        code.push(0x14000000);
+        // Park completed tasks rather than spending the shared instruction
+        // allowance while the other worker finishes its lifecycle calls.
+        code.extend([
+            mov(0, 0x1040),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
         let mut peer = p.fork();
         peer.parent = 1;
         peer.tgid = 2;
@@ -884,10 +912,10 @@ fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decisio
                     );
                 }
             }
-            assert_eq!(p.seccomp.evaluations(), 80);
+            assert_eq!(p.seccomp.evaluations(), 82);
         }
         assert_eq!(k.service_requests, 0);
-        assert_eq!(k.syscalls, 80);
+        assert_eq!(k.syscalls, 82);
     }
 }
 #[test]
@@ -921,4 +949,196 @@ fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creato
     assert_eq!(k.read_signalfd(&mut p, 63, args), Ok(Some(128)));
     assert_eq!(u32::from_le_bytes(p.memory.read_array(0x1800).unwrap()), 10);
     assert_eq!(k.read_signalfd(&mut peer, 63, args), Err(Errno(11)));
+}
+
+#[test]
+fn filtered_worker_unix_creation_controls_and_membership_need_no_services() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.memory.write_array(0x1028, 4u32.to_le_bytes()).unwrap();
+        p.memory.write(0x1030, b"x").unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut code = Vec::new();
+        for i in 0..8 {
+            let base = 0x1800 + i * 88;
+            let mut call = |setup: &[u32], number: u32, offset: u32| {
+                code.extend_from_slice(setup);
+                code.extend([
+                    mov(8, number),
+                    0xd4000001,
+                    mov(10, base + offset),
+                    0xf9000140,
+                ]);
+            };
+            call(&[mov(0, 1), mov(1, 1), mov(2, 0)], 198, 0);
+            call(&[mov(0, 3)], 23, 8);
+            call(
+                &[
+                    mov(0, 4),
+                    mov(1, 1),
+                    mov(2, 3),
+                    mov(3, 0x1020),
+                    mov(4, 0x1028),
+                ],
+                209,
+                16,
+            );
+            call(&[mov(0, 4)], 57, 24);
+            call(&[mov(0, 3)], 57, 32);
+            call(&[mov(0, 1), mov(1, 1), mov(2, 0), mov(3, 0x1000)], 199, 40);
+            call(&[mov(0, 3), mov(1, 0x1030), mov(2, 1)], 64, 48);
+            call(&[mov(0, 4), mov(1, 0x1038), mov(2, 1)], 63, 56);
+            call(&[mov(0, 3), mov(1, 1)], 210, 64);
+            call(&[mov(0, 3)], 57, 72);
+            call(&[mov(0, 4)], 57, 80);
+        }
+        code.extend([
+            mov(0, 0x1040),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..8 {
+                for (j, expected) in [3, 4, 0, 0, 0, 0, 1, 1, 0, 0, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + i * 88 + j as u64 * 8).unwrap(),
+                        expected,
+                        "slots={slots} iteration={i} call={j} services={}",
+                        k.service_requests
+                    );
+                }
+            }
+            assert_eq!(p.memory.read_array::<1>(0x1038).unwrap(), *b"x");
+            assert_eq!(p.seccomp.evaluations(), 178);
+            assert_eq!(p.linux.vfs.fd_snapshot().len(), 3);
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 178);
+    }
+}
+
+#[test]
+fn joined_unix_raw_reads_keep_legacy_ancillary_and_original_wait_after_reuse() {
+    for number in [63, 65] {
+        for parked in [false, true] {
+            let mut p = super::tests::process();
+            let mut k = super::tests::kernel();
+            let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+            let legacy = p.linux.vfs.local_create(1, 0).unwrap();
+            p.memory
+                .write_array(0x1080, 0x1100u64.to_le_bytes())
+                .unwrap();
+            p.memory.write_array(0x1088, 4u64.to_le_bytes()).unwrap();
+            let args = if number == 63 {
+                [rx as u64, 0x1100, 4, 0, 0, 0]
+            } else {
+                [rx as u64, 0x1080, 1, 0, 0, 0]
+            };
+            let mut output = trames_linux::CapturedOutput::default();
+            if parked {
+                k.call(1, &mut p, number, args, &mut output);
+                assert!(p.byte_wait.is_some());
+                p.linux.vfs.close(rx).unwrap();
+                assert_eq!(p.linux.vfs.eventfd(99, 0).unwrap(), rx);
+            }
+            p.linux
+                .vfs
+                .local_socket(tx)
+                .unwrap()
+                .unwrap()
+                .send_rights(b"real", 0, p.linux.vfs.send_rights(&[legacy]).unwrap())
+                .unwrap();
+            p.linux.vfs.close(legacy).unwrap();
+            k.call(1, &mut p, number, args, &mut output);
+            assert_eq!(p.cpu.x(0), 4, "number={number} parked={parked}");
+            assert_eq!(p.memory.read_array::<4>(0x1100).unwrap(), *b"real");
+            assert!(p.byte_wait.is_none());
+            if parked {
+                assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
+                assert_ne!(p.linux.vfs.poll(tx, 16) & 16, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reuse() {
+    let mut p = super::tests::process();
+    let mut k = super::tests::kernel();
+    let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+    let legacy = p.linux.vfs.local_create(1, 0).unwrap();
+    let mut header = [0; 56];
+    header[16..24].copy_from_slice(&0x1080u64.to_le_bytes());
+    header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    p.memory.write(0x1000, &header).unwrap();
+    p.memory
+        .write_array(0x1080, 0x1100u64.to_le_bytes())
+        .unwrap();
+    p.memory.write_array(0x1088, 4u64.to_le_bytes()).unwrap();
+    let args = [rx as u64, 0x1000, 0, 0, 0, 0];
+    let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+        .with_resources(p.linux.vfs.descriptor_factory());
+    let file = match direct
+        .start(
+            212,
+            args,
+            &mut p.memory,
+            1,
+            &Arc::downgrade(&k.byte_target),
+            None,
+        )
+        .unwrap()
+    {
+        trames_linux::IoAttempt::Blocked(wait) => wait.retained_byte.unwrap(),
+        _ => panic!("expected original message wait"),
+    };
+    let identity = file.local_owner_identity().unwrap();
+    let files = p.linux.vfs.shared_files();
+    std::thread::spawn(move || files.close(rx, 1).unwrap().unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(p.linux.vfs.eventfd(99, 0).unwrap(), rx);
+    let call = crate::run_queue::IoCall::from_byte(file, 212, args);
+    p.retain_local_message_owner(Some(&call));
+    assert!(p.retained_message_owner.as_ref().unwrap().ofd_identity() == identity);
+    p.retained_byte = call.retained_byte.clone();
+    p.linux
+        .vfs
+        .local_socket(tx)
+        .unwrap()
+        .unwrap()
+        .send_rights(b"real", 0, p.linux.vfs.send_rights(&[legacy]).unwrap())
+        .unwrap();
+    k.call(
+        1,
+        &mut p,
+        212,
+        args,
+        &mut trames_linux::CapturedOutput::default(),
+    );
+    assert_eq!(p.cpu.x(0), 4);
+    assert_eq!(p.memory.read_array::<4>(0x1100).unwrap(), *b"real");
+    assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
+    assert!(p.retained_message_owner.is_none());
 }

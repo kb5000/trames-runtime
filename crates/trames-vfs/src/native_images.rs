@@ -52,6 +52,7 @@ impl ImageFds for Images {
             read_node: None,
             pipe: None,
             pty: None,
+            local: None,
             bridge: None,
             kernel_log: None,
             notification: None,

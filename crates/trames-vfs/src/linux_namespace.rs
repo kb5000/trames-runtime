@@ -27,23 +27,23 @@ fn reserve_namespace(live: &std::sync::atomic::AtomicUsize) -> Result<u64> {
 /// Existing socket FDs retain their creating stack after unshare/setns.
 pub(super) struct RootNetwork {
     inode: u64,
-    pub network: RefCell<trames_net::Network>,
-    pub local: Rc<RefCell<ipc::LocalNamespace>>,
-    live: Rc<Cell<usize>>,
+    pub network: SharedCell<trames_net::Network>,
+    pub local: Arc<SharedCell<ipc::LocalNamespace>>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Default for RootNetwork {
     fn default() -> Self {
         Self {
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
-            network: RefCell::default(),
-            local: Rc::default(),
-            live: Rc::new(Cell::new(1)),
+            network: SharedCell::default(),
+            local: Arc::default(),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
 }
 impl Drop for RootNetwork {
     fn drop(&mut self) {
-        self.live.set(self.live.get() - 1);
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 pub(super) struct IpcNamespace {
@@ -164,16 +164,16 @@ pub(super) enum NamespaceHandle {
     Uts(UtsNamespace),
     Mount(MountNamespace),
     Pid(PidNamespace),
-    Net(Rc<RootNetwork>),
+    Net(Arc<RootNetwork>),
     Ipc(Arc<IpcNamespace>),
     Cgroup(Arc<CgroupNamespace>),
 }
-// Complete shared namespace capabilities. Owner topology and the Unix network
-// control graph remain excluded until those actual resources are shared too.
+// Complete shared namespace capabilities. Mount topology remains owner-owned.
 #[derive(Clone)]
 pub(super) enum SharedNamespace {
     Uts(UtsNamespace),
     Pid(PidNamespace),
+    Net(Arc<RootNetwork>),
     Ipc(Arc<IpcNamespace>),
     Cgroup(Arc<CgroupNamespace>),
 }
@@ -182,6 +182,7 @@ impl SharedNamespace {
         Some(match namespace {
             NamespaceHandle::Uts(n) => Self::Uts(n.clone()),
             NamespaceHandle::Pid(n) => Self::Pid(n.clone()),
+            NamespaceHandle::Net(n) => Self::Net(n.clone()),
             NamespaceHandle::Ipc(n) => Self::Ipc(n.clone()),
             NamespaceHandle::Cgroup(n) => Self::Cgroup(n.clone()),
             _ => return None,
@@ -191,6 +192,7 @@ impl SharedNamespace {
         match self {
             Self::Uts(n) => NamespaceHandle::Uts(n.clone()),
             Self::Pid(n) => NamespaceHandle::Pid(n.clone()),
+            Self::Net(n) => NamespaceHandle::Net(n.clone()),
             Self::Ipc(n) => NamespaceHandle::Ipc(n.clone()),
             Self::Cgroup(n) => NamespaceHandle::Cgroup(n.clone()),
         }
@@ -233,7 +235,7 @@ impl NamespaceHandle {
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
     uts: std::sync::Weak<Uts>,
-    pub(super) net: Weak<RootNetwork>,
+    pub(super) net: std::sync::Weak<RootNetwork>,
     ipc: std::sync::Weak<IpcNamespace>,
     cgroup: std::sync::Weak<CgroupNamespace>,
     pub(super) pid: std::sync::Weak<pid_namespace::PidSpace>,
@@ -247,7 +249,7 @@ impl Vfs {
         let paths = self.context.paths.borrow();
         NamespaceSnapshot {
             uts: Arc::downgrade(&self.uts.0),
-            net: Rc::downgrade(&self.root_network),
+            net: Arc::downgrade(&self.root_network),
             ipc: Arc::downgrade(&self.ipc_namespace),
             cgroup: Arc::downgrade(&self.cgroup_namespace),
             pid: Arc::downgrade(&self.pid_ns.0),
@@ -269,18 +271,18 @@ impl Vfs {
             return Err(Errno(1));
         }
         let live = self.root_network.live.clone();
-        if live.get() >= MAX_NAMESPACES {
-            return Err(Errno(28));
-        }
-        let network = self.network.isolated().map_err(|e| Errno(e.0))?;
-        let inode = NEXT_INODE
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Errno(28))?;
-        live.set(live.get() + 1);
-        self.root_network = Rc::new(RootNetwork {
+        let inode = reserve_namespace(&live)?;
+        let network = match self.network.isolated() {
+            Ok(network) => network,
+            Err(error) => {
+                live.fetch_sub(1, Ordering::Relaxed);
+                return Err(Errno(error.0));
+            }
+        };
+        self.root_network = Arc::new(RootNetwork {
             inode,
-            network: RefCell::new(network.clone()),
-            local: Rc::default(),
+            network: SharedCell::new(network.clone()),
+            local: Arc::default(),
             live,
         });
         self.network = network;
@@ -499,13 +501,13 @@ impl Vfs {
                 node: None,
                 pipe: None,
                 pty: None,
+                local: None,
                 bridge: None,
                 kernel_log: None,
                 notification: None,
             }),
             position: 0,
             anonymous: None,
-            local: None,
             namespace: Some(ns),
             network_control: None,
             mount_file: None,

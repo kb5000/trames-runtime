@@ -63,7 +63,7 @@ fn signal_mask_lifecycle_is_shared_but_readiness_stays_with_the_reading_task() {
             .signal_mask,
         Some(b)
     );
-    let owner = v.socket(1, 1, 0).unwrap();
+    let (owner, _ring) = v.uring_create(2, 4).unwrap();
     let factory = v.descriptor_factory();
     assert_eq!(factory.signalfd(owner as i32, a, 0), None);
     assert_eq!(v.signalfd(owner as i32, a, 0), Err(Errno(22)));
@@ -114,6 +114,7 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
         (b"pid", CLONE_NEWPID),
         (b"ipc", linux_namespace::CLONE_NEWIPC),
         (b"cgroup", linux_namespace::CLONE_NEWCGROUP),
+        (b"net", linux_namespace::CLONE_NEWNET),
     ];
     let mut fds = Vec::new();
     for (kind, _) in kinds {
@@ -143,11 +144,12 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
     v.unshare_uts().unwrap();
     v.unshare_ipc().unwrap();
     v.unshare_cgroup().unwrap();
-    let imported = std::thread::spawn(move || factory.receive_local_rights(rights, 4, true))
+    v.unshare_net().unwrap();
+    let imported = std::thread::spawn(move || factory.receive_local_rights(rights, 5, true))
         .join()
         .unwrap();
     assert!(!imported.1);
-    assert_eq!(imported.0.len(), 4);
+    assert_eq!(imported.0.len(), 5);
     for ((fd, (_, kind)), inode) in imported.0.iter().zip(kinds).zip(ids) {
         assert_eq!(v.namespace_type(*fd), Ok(Some(kind)));
         assert_eq!(v.stat_fd(*fd).unwrap()[8..16], inode);
@@ -161,6 +163,8 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
     v.setns(imported.0[2], linux_namespace::CLONE_NEWIPC)
         .unwrap();
     v.setns(imported.0[3], linux_namespace::CLONE_NEWCGROUP)
+        .unwrap();
+    v.setns(imported.0[4], linux_namespace::CLONE_NEWNET)
         .unwrap();
     v.import_file(b"/pinned", vec![]).unwrap();
     v.mount(Some(b"/proc/self/ns/uts"), b"/pinned", None, 4096, None)
@@ -185,11 +189,6 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
     assert_eq!(
         v.setns(imported.0[0], linux_namespace::CLONE_NEWIPC),
         Err(Errno(22))
-    );
-    let net = v.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
-    assert!(
-        files.lookup(net).is_none(),
-        "network control graph remains excluded"
     );
 }
 #[test]

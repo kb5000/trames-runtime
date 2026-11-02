@@ -52,11 +52,18 @@ pub struct RetainedByte {
     message: Option<Arc<local_message::AcceptedMessage>>,
 }
 impl RetainedByte {
+    pub fn is_unix(&self) -> bool {
+        self.fd.is_unix()
+    }
     pub fn pty_endpoint(&self) -> Option<(Arc<trames_vfs::PtyEnd>, u32)> {
         self.fd.retained_pty()
     }
     pub fn local_owner_identity(&self) -> Option<trames_vfs::OfdIdentity> {
         self.message.as_ref().map(|_| self.fd.ofd_identity())
+    }
+    pub fn local_owner(&self) -> Option<trames_vfs::RetainedFd> {
+        self.message.as_ref()?;
+        Some(self.fd.shared_file()?.retained())
     }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.shares_with(std::iter::once(&self.fd))
@@ -198,7 +205,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_creation(&self, number: u32) -> bool {
-        matches!(number, 19 | 26 | 59 | 74 | 85 | 198) && self.resources.is_some()
+        matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199) && self.resources.is_some()
     }
     pub fn invoke_creation(
         &self,
@@ -266,9 +273,15 @@ impl DirectSyscalls {
             return None;
         }
         let factory = self.resources.as_ref()?;
-        let socket = match factory.socket_operation(a[0] as u32)? {
-            Ok(socket) => socket,
+        let socket = match factory.socket_control_operation(a[0] as u32)? {
+            Ok(trames_vfs::SocketControlOperation::Network(socket)) => socket,
             Err(error) => return Some(Err(error)),
+            Ok(trames_vfs::SocketControlOperation::Unix(socket)) => {
+                let result = crate::network::unix::control(factory, &socket, number, a, memory)?;
+                self.completed.set(self.completed.get() + 1);
+                self.socket_completed.set(self.socket_completed.get() + 1);
+                return Some(result);
+            }
         };
         // Blocking connect/accept will use the retained event-wait entry.
         if socket.flags() & trames_vfs::O_NONBLOCK == 0
@@ -1201,7 +1214,7 @@ impl DirectSyscalls {
             }
             Some(result) => return self.complete_byte(&file, result),
             None => {
-                return if file.message.is_some() || file.fd.is_pty() {
+                return if file.message.is_some() || file.fd.is_pty() || file.fd.is_unix() {
                     IoAttempt::ByteCheckpoint(file)
                 } else {
                     IoAttempt::Checkpoint
@@ -1367,7 +1380,7 @@ impl DirectSyscalls {
         } else if let Some(file) = &pending.retained_byte {
             let Some(result) = self.transfer_retained(file, pending.number, pending.args, memory)
             else {
-                if file.fd.is_pty() {
+                if file.fd.is_pty() || file.fd.is_unix() {
                     return IoAttempt::ByteCheckpoint(pending.retained_byte.take().unwrap());
                 }
                 return IoAttempt::Checkpoint;
@@ -1565,14 +1578,14 @@ mod tests {
         );
         assert_eq!(v.flags(writer), Err(Errno(9)));
         assert_eq!(direct.fd_control_completed(), 4);
-        let owner = v.socket(1, 1 | O_NONBLOCK, 0).unwrap();
+        let (owner, _ring) = v.uring_create(2, 4).unwrap();
         assert!(direct
             .invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0])
             .is_none());
         assert!(direct
             .invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0])
             .is_none());
-        assert_eq!(v.fd_kind(owner), Ok(trames_vfs::FdKind::Socket));
+        assert_eq!(v.fd_kind(owner), Ok(trames_vfs::FdKind::Anonymous));
         assert_eq!(direct.fd_control_completed(), 4); // owner fallback had no effects
     }
     #[test]

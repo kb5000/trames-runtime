@@ -1372,3 +1372,83 @@ joined. Non-O_NOCTTY slave pathname opens may acquire a controlling terminal, an
 therefore defer before effects. O_PATH/dynamic pseudo controls, task/job-control
 ioctls, SIGHUP/SIGCONT and host signal/resize routing retain their original task
 boundary. This migration grants no arbitrary device native-memory authority.
+
+## Shared Unix control ownership and worker creation (2026-11-03)
+
+The complete Unix socket resource is an `Arc<LocalResource>` owned by its actual
+shared OFD. Its network identity, abstract namespace, pathname routing, address
+and credential tuples, listener/pending queue, connection and option state are
+shared original objects. The graph contains no owner `Rc` or `RefCell`; ordinary
+Rust Send/Sync derivation checks this boundary. Network identities and their quota
+leases are consequently shared too, including complete network-namespace OFDs.
+Unshare/setns, proc network mutation and mount topology still use the joined path.
+Retained factories and sockets keep their original namespace and credentials.
+
+A connected socket has one immutable connection publication. Its binding is
+initialized once after peer names, credentials and queue options are ready, with
+the unpublished accepted endpoint installed before the client. Ordinary byte and
+message I/O reads this canonical binding directly, without acquiring connection
+control locks or consulting a duplicated cache. The original preconnect readiness
+source is retained by the connected channel; existing subscriptions remain valid
+without notification forwarding or a polling/service thread. Resource locks and
+structural transition guards are released before notification callbacks.
+
+AF_UNIX socket/socketpair creation uses the common actual Files reservation and
+OFD constructors on execution workers. Pair output is checked/written before the
+reserved numbers become visible; errors and unwinding release reservations and
+endpoint quota. Dup, flags and close operate on these full shared descriptions.
+An accepted operation owns its original full OFD across close/numeric reuse;
+prepared maps and epoll watches remain weak and do not prolong endpoint lifetime.
+Fresh pair publication uses the existing Files revision. Connecting an existing
+published socket still invalidates its previous direct-resource eligibility.
+
+Listen, address/peer queries, original Unix options and shutdown use one ABI
+decoder on owner and worker execution paths. Calls accept the complete original
+OFD before acting. Effective credentials initialize creation/listening identity;
+peer credentials are translated through the calling process's PID namespace.
+The original option, permission and copyout error order is retained. There is no
+additional native permission policy, global socket/VFS lock, message bus or guest
+memory barrier. Bind, connect, accept and addressed datagram routing still retain
+their joined entry while their namespace/task/wait admission is migrated.
+
+Legacy ancillary payloads containing Unix sockets or other owner-only graphs
+remain owner-thread objects. A small owner projection refers to the same socket
+core and a shared-with-owner-clones Rc journal; no address/connection state is
+copied into that view. Shared packets carry only opaque legacy IDs. Portable
+SharedRights deliberately exclude Unix-bearing OFDs until owning-cycle handling
+is shared; existing owner graph checks and error behavior remain authoritative.
+Non-Unix complete shared rights continue to travel directly with their packets.
+
+A worker's final close closes and notifies the real endpoint immediately. Legacy
+queued owner rights are released at the next joined cleanup, never dropped on a
+worker. The existing cohort-control check requests that boundary only when a
+journal has closed destinations to reap. Reaping removes entries under the owner
+borrow, drops them outside it and drains newly closed entries iteratively, keeping
+long descriptor chains bounded in stack use. Owner-view/VFS teardown also reaps
+after endpoint release. This is an explicit remaining ancillary boundary rather
+than a claim that arbitrary owning Unix graphs can already cross workers.
+
+Regressions cover eight concurrent creators across all three Unix kinds, original
+network/credentials after unshare, copyout and panic rollback, original accepted
+OFD lifetime and weak watch cleanup, preconnect notifications and queue options,
+legacy final-close cleanup and existing deep/cyclic ancillary cases. A filtered
+two-task test runs 176 creation/control/byte/membership calls plus two final futex
+waits on one/two execution slots, with zero coordinator services and exactly one
+filter evaluation per entry. The same implementation is built for Mac and iPad.
+
+### Joined raw reads and worker reply handoff
+
+The production systemd boot exposed an older assumption that every shared raw
+byte call can finish without legacy ancillary handling. A read/readv of queued
+owner metadata now returns a retained Unix byte handoff, then uses the same
+original socket and ABI on the joined path. Parked reads retain that actual OFD
+through close/reuse and metadata arrival. The owner path can discard legacy
+rights without consuming bytes twice or looking up a replacement descriptor.
+
+Prepared message replies likewise transfer the worker's accepted full OFD into
+the owner projection. They no longer assume Unix membership stayed unchanged
+until reply collection. Socket-control transport admission performs one fget
+before choosing Unix or IP, so concurrent numeric reuse cannot redirect a second
+lookup. Tests exercise immediate and parked raw read/readv with legacy rights,
+replacement eventfds, final peer hangup, and a message handoff whose descriptor
+is closed/reused before the owner receives the worker reply.

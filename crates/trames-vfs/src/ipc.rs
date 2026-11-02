@@ -6,6 +6,8 @@ pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
 mod datagram;
 mod native;
+#[cfg(test)]
+mod shared_graph_tests;
 mod shared_rights;
 pub(crate) use native::Services as NativeServices;
 pub use native::WaylandAuth;
@@ -51,43 +53,227 @@ impl LocalRights {
 }
 struct Channel {
     resource: Arc<channel::Resource>,
-    ends: [Weak<LocalSocket>; 2],
-    rights: RefCell<BTreeMap<u64, Ancillary>>,
-    next_right: Cell<u64>,
+    ends: [std::sync::Weak<LocalResource>; 2],
+    next_right: AtomicU64,
 }
+struct Binding {
+    channel: Arc<Channel>,
+    side: usize,
+}
+/// One authoritative connection publication. Connected I/O never locks the
+/// mutable control graph; the unconnected initial resource is released once.
+struct LocalChannel {
+    initial: std::sync::Mutex<Option<Arc<Channel>>>,
+    paired: std::sync::OnceLock<Binding>,
+}
+enum ChannelRead<'a> {
+    Connected(&'a Arc<Channel>),
+    Initial(Arc<Channel>),
+}
+impl std::ops::Deref for ChannelRead<'_> {
+    type Target = Arc<Channel>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Connected(channel) => channel,
+            Self::Initial(channel) => channel,
+        }
+    }
+}
+impl LocalChannel {
+    fn new(kind: u32) -> Self {
+        Self {
+            initial: std::sync::Mutex::new(Some(Arc::new(Channel {
+                resource: channel::Resource::new(kind, false),
+                ends: Default::default(),
+                next_right: AtomicU64::new(0),
+            }))),
+            paired: Default::default(),
+        }
+    }
+    fn borrow(&self) -> ChannelRead<'_> {
+        if let Some(binding) = self.paired.get() {
+            return ChannelRead::Connected(&binding.channel);
+        }
+        let initial = self.initial.lock().unwrap();
+        // Connection publication can complete between the first test and lock.
+        match initial.as_ref() {
+            Some(channel) => ChannelRead::Initial(channel.clone()),
+            None => {
+                ChannelRead::Connected(&self.paired.get().expect("connection publication").channel)
+            }
+        }
+    }
+    fn install(&self, channel: Arc<Channel>, side: usize) {
+        assert!(
+            self.paired.set(Binding { channel, side }).is_ok(),
+            "Unix connection installed once"
+        );
+        let unused = self.initial.lock().unwrap().take();
+        drop(unused);
+    }
+    fn side(&self) -> usize {
+        self.paired.get().map_or(0, |binding| binding.side)
+    }
+}
+struct OwnerEntry {
+    channel: std::sync::Weak<Channel>,
+    side: usize,
+    data: Ancillary,
+}
+#[derive(Default)]
+pub(super) struct OwnerLedger {
+    entries: RefCell<BTreeMap<(usize, u64), OwnerEntry>>,
+}
+impl OwnerLedger {
+    fn reap(&self) {
+        loop {
+            let removed: Vec<_> = {
+                let mut entries = self.entries.borrow_mut();
+                let closed: Vec<_> = entries
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        entry
+                            .channel
+                            .upgrade()
+                            .is_none_or(|channel| !channel.resource.alive(entry.side))
+                            .then_some(*key)
+                    })
+                    .collect();
+                closed
+                    .into_iter()
+                    .filter_map(|key| entries.remove(&key))
+                    .collect()
+            };
+            if removed.is_empty() {
+                break;
+            }
+            // A released owner FD may close another channel. Drop outside the
+            // ledger borrow, then drain only newly closed resources.
+            drop(removed);
+        }
+    }
+    fn needs_reap(&self) -> bool {
+        self.entries.borrow().values().any(|entry| {
+            entry
+                .channel
+                .upgrade()
+                .is_none_or(|channel| !channel.resource.alive(entry.side))
+        })
+    }
+    fn insert(&self, channel: &Arc<Channel>, side: usize, id: u64, data: Ancillary) {
+        self.entries.borrow_mut().insert(
+            (Arc::as_ptr(channel) as usize, id),
+            OwnerEntry {
+                channel: Arc::downgrade(channel),
+                side,
+                data,
+            },
+        );
+    }
+    fn get(&self, channel: &Arc<Channel>, id: u64) -> Ancillary {
+        self.entries
+            .borrow()
+            .get(&(Arc::as_ptr(channel) as usize, id))
+            .expect("queued rights")
+            .data
+            .clone()
+    }
+    fn remove(&self, channel: &Arc<Channel>, id: u64) -> Option<Ancillary> {
+        self.entries
+            .borrow_mut()
+            .remove(&(Arc::as_ptr(channel) as usize, id))
+            .map(|entry| entry.data)
+    }
+}
+/// Owner-only ancillary access to the same actual shared socket resource.
+/// No mutable connection or address state is stored in this projection.
+pub struct LocalSocket {
+    core: Arc<LocalResource>,
+    // Fields drop in declaration order: release the core before reaping its
+    // legacy owner rights on this owner-only view's thread.
+    owner: OwnerView,
+}
+#[derive(Clone, Default)]
+pub(super) struct OwnerView(Rc<OwnerLedger>);
+impl std::ops::Deref for OwnerView {
+    type Target = OwnerLedger;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for OwnerView {
+    fn drop(&mut self) {
+        self.0.reap();
+    }
+}
+impl std::ops::Deref for LocalSocket {
+    type Target = LocalResource;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
 #[derive(Clone)]
 struct Ancillary {
     rights: LocalRights,
     credentials: Option<[u32; 3]>,
     source: Vec<u8>,
 }
-pub struct LocalSocket {
-    namespace: Rc<RefCell<LocalNamespace>>,
-    network: Rc<linux_namespace::RootNetwork>,
-    pathname_binding: OnceCell<binding::OwnedBinding>,
-    channel: RefCell<Rc<Channel>>,
-    side: Cell<usize>,
-    connected: Cell<bool>,
-    name: RefCell<Vec<u8>>,
-    peer_name: RefCell<Vec<u8>>,
-    credentials: Cell<[u32; 3]>,
-    peer_credentials: Cell<[u32; 3]>,
-    listener: RefCell<Option<Listener>>,
-    listen_epoch: Cell<u64>,
+pub struct LocalResource {
+    namespace: Arc<SharedCell<LocalNamespace>>,
+    network: Arc<linux_namespace::RootNetwork>,
+    pathname_binding: std::sync::OnceLock<binding::OwnedBinding>,
+    channel: LocalChannel,
+    transition: std::sync::Mutex<()>,
+    datagram_connected: std::sync::atomic::AtomicBool,
+    name: SharedCell<Vec<u8>>,
+    peer_name: SharedCell<Vec<u8>>,
+    credentials: SharedCell<[u32; 3]>,
+    peer_credentials: SharedCell<[u32; 3]>,
+    listener: SharedCell<Option<Listener>>,
+    listen_epoch: AtomicU64,
     kind: u32,
-    reuse: Cell<[u32; 2]>,
-    passcred: Cell<bool>,
-    timestamp: Cell<u32>,
-    datagram_peer: RefCell<Weak<LocalSocket>>,
+    reuse: [std::sync::atomic::AtomicU32; 2],
+    passcred: std::sync::atomic::AtomicBool,
+    timestamp: std::sync::atomic::AtomicU32,
+    datagram_peer: SharedCell<std::sync::Weak<LocalResource>>,
+}
+/// One accepted complete Unix OFD, independent of later close/numeric reuse.
+#[derive(Clone)]
+pub struct LocalOperation(Arc<SharedOpenDescription>);
+impl LocalOperation {
+    pub(super) fn from_shared(file: SharedFd) -> Result<Self> {
+        file.open.local.as_ref().ok_or(Errno(88))?;
+        Ok(Self(file.open))
+    }
+}
+impl std::ops::Deref for LocalOperation {
+    type Target = LocalResource;
+    fn deref(&self) -> &Self::Target {
+        self.0.local.as_deref().expect("Unix OFD")
+    }
+}
+impl DescriptorFactory {
+    pub fn local_operation(&self, fd: u32) -> Option<Result<LocalOperation>> {
+        Some(self.files.lookup(fd)?.and_then(LocalOperation::from_shared))
+    }
+    pub fn local_listen(&self, socket: &LocalResource, backlog: u32) -> Result<()> {
+        let identity = self.local_sender_credentials();
+        let credentials = self.local_credentials();
+        socket.listen_as(
+            backlog,
+            Some([identity[0], credentials.euid, credentials.egid]),
+        )
+    }
 }
 struct Listener {
     backlog: usize,
-    pending: VecDeque<Rc<LocalSocket>>,
+    pending: VecDeque<Arc<LocalResource>>,
 }
 #[derive(Default)]
 pub(super) struct LocalNamespace {
-    abstract_names: BTreeMap<Vec<u8>, Weak<LocalSocket>>,
-    sockets: Vec<Weak<LocalSocket>>,
+    abstract_names: BTreeMap<Vec<u8>, std::sync::Weak<LocalResource>>,
+    sockets: Vec<std::sync::Weak<LocalResource>>,
 }
 pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
@@ -99,7 +285,19 @@ pub struct LocalReceived<R = LocalRights> {
     /// Linux cmsg type and (seconds, fractional units) at queue admission.
     pub timestamp: Option<(u32, [u64; 2])>,
 }
-impl LocalSocket {
+impl LocalResource {
+    fn connected(&self) -> bool {
+        self.channel.paired.get().is_some() || self.datagram_connected.load(Ordering::Acquire)
+    }
+    fn side(&self) -> usize {
+        self.channel.side()
+    }
+    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.channel.borrow().resource.readiness.subscribe(signal)
+    }
+    fn notify(&self) {
+        self.channel.borrow().resource.readiness.notify_locked();
+    }
     pub fn readable_bytes(&self) -> Result<usize> {
         if self.listening() {
             return Err(Errno(22));
@@ -108,60 +306,73 @@ impl LocalSocket {
         // Linux AF_UNIX reports one datagram, but all queued bytes for stream
         // and seqpacket. Do not recv/peek here: rights and zero-length packets
         // must remain queued, including after shutdown(SHUT_RD).
-        Ok(binding.resource.readable_bytes(self.side.get()))
+        Ok(binding.resource.readable_bytes(self.side()))
+    }
+    pub(super) fn allocate(
+        kind: u32,
+        credentials: [u32; 3],
+        network: Arc<linux_namespace::RootNetwork>,
+    ) -> Result<Arc<Self>> {
+        let mut ns = network.local.borrow_mut();
+        ns.sockets.retain(|socket| socket.strong_count() != 0);
+        ns.abstract_names
+            .retain(|_, socket| socket.strong_count() != 0);
+        if ns.sockets.len() >= 1024 {
+            return Err(Errno(23));
+        }
+        let core = Self::new(kind, credentials, network.clone());
+        ns.sockets.push(Arc::downgrade(&core));
+        Ok(core)
     }
     fn new(
         kind: u32,
         credentials: [u32; 3],
-        network: Rc<linux_namespace::RootNetwork>,
-    ) -> Rc<Self> {
-        Rc::new(Self {
+        network: Arc<linux_namespace::RootNetwork>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             namespace: network.local.clone(),
             network,
-            pathname_binding: OnceCell::new(),
-            channel: RefCell::new(Rc::new(Channel {
-                resource: channel::Resource::new(kind, false),
-                ends: [Weak::new(), Weak::new()],
-                rights: RefCell::default(),
-                next_right: Cell::new(0),
-            })),
-            side: Cell::new(0),
-            connected: Cell::new(false),
-            name: RefCell::new(vec![1, 0]),
-            peer_name: RefCell::new(vec![1, 0]),
-            credentials: Cell::new(credentials),
-            peer_credentials: Cell::new([0, u32::MAX, u32::MAX]),
-            listener: RefCell::new(None),
-            listen_epoch: Cell::new(0),
+            pathname_binding: std::sync::OnceLock::new(),
+            channel: LocalChannel::new(kind),
+            transition: std::sync::Mutex::new(()),
+            datagram_connected: std::sync::atomic::AtomicBool::new(false),
+            name: SharedCell::new(vec![1, 0]),
+            peer_name: SharedCell::new(vec![1, 0]),
+            credentials: SharedCell::new(credentials),
+            peer_credentials: SharedCell::new([0, u32::MAX, u32::MAX]),
+            listener: SharedCell::new(None),
+            listen_epoch: AtomicU64::new(0),
             kind,
-            reuse: Cell::new([0; 2]),
-            passcred: Cell::new(false),
-            timestamp: Cell::new(0),
-            datagram_peer: RefCell::new(Weak::new()),
+            reuse: Default::default(),
+            passcred: std::sync::atomic::AtomicBool::new(false),
+            timestamp: std::sync::atomic::AtomicU32::new(0),
+            datagram_peer: SharedCell::new(std::sync::Weak::new()),
         })
     }
-    fn pair(a: &Rc<Self>, b: &Rc<Self>) {
-        let channel = Rc::new(Channel {
-            resource: channel::Resource::new(a.kind, true),
-            ends: [Rc::downgrade(a), Rc::downgrade(b)],
-            rights: RefCell::default(),
-            next_right: Cell::new(0),
+    pub(super) fn pair(a: &Arc<Self>, b: &Arc<Self>) {
+        let channel = Arc::new(Channel {
+            resource: channel::Resource::with_readiness(
+                a.kind,
+                true,
+                a.channel.borrow().resource.readiness.clone(),
+            ),
+            ends: [Arc::downgrade(a), Arc::downgrade(b)],
+            next_right: AtomicU64::new(0),
         });
         for (side, (end, peer)) in [(a, b), (b, a)].into_iter().enumerate() {
-            *end.channel.borrow_mut() = channel.clone();
-            end.side.set(side);
-            end.connected.set(true);
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
-            channel.resource.set_passcred(side, end.passcred.get());
-            channel.resource.set_timestamp(side, end.timestamp.get());
+            channel
+                .resource
+                .inherit_options(side, &end.channel.borrow().resource, end.side());
         }
-        // Connect changes direct-resource eligibility without changing the FD
-        // table; another forked table may already have cached this description.
-        FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        // The accepted endpoint is unpublished. Publish the client last, after
+        // both names, credentials and option sets are complete.
+        b.channel.install(channel.clone(), 1);
+        a.channel.install(channel, 0);
     }
     pub fn name(&self, peer: bool) -> Result<Vec<u8>> {
-        if peer && !self.connected.get() {
+        if peer && !self.connected() {
             return Err(Errno(107));
         }
         Ok(if peer {
@@ -190,10 +401,14 @@ impl LocalSocket {
         self.listener.borrow().is_some()
     }
     pub fn listen(&self, backlog: u32) -> Result<()> {
+        self.listen_as(backlog, None)
+    }
+    fn listen_as(&self, backlog: u32, identity: Option<[u32; 3]>) -> Result<()> {
+        let transition = self.transition.lock().unwrap();
         if self.kind == 2 {
             return Err(Errno(95));
         }
-        if self.connected.get() || self.name.borrow().len() == 2 {
+        if self.connected() || self.name.borrow().len() == 2 {
             return Err(Errno(22));
         }
         let mut listener = self.listener.borrow_mut();
@@ -201,43 +416,52 @@ impl LocalSocket {
         if let Some(l) = listener.as_mut() {
             l.backlog = backlog;
         } else {
+            if let Some(identity) = identity {
+                self.credentials.set(identity);
+            }
             *listener = Some(Listener {
                 backlog,
                 pending: VecDeque::new(),
             });
         }
+        drop(listener);
+        drop(transition);
+        self.notify();
         Ok(())
     }
     pub(super) fn poll_epoch(&self) -> [u64; 2] {
         if self.listening() {
-            return [self.listen_epoch.get(), 0];
+            return [self.listen_epoch.load(Ordering::Relaxed), 0];
         }
-        self.channel.borrow().resource.poll(self.side.get(), 0).1
+        self.channel.borrow().resource.poll(self.side(), 0).1
     }
 
     pub fn set_reuse(&self, option: u32, value: u32) -> Result<()> {
+        let transition = self.transition.lock().unwrap();
         if matches!(option, 29 | 35 | 63 | 64) {
-            self.timestamp.set(if value == 0 { 0 } else { option });
+            self.timestamp
+                .store(if value == 0 { 0 } else { option }, Ordering::Relaxed);
             self.channel
                 .borrow()
                 .resource
-                .set_timestamp(self.side.get(), if value == 0 { 0 } else { option });
+                .set_timestamp(self.side(), if value == 0 { 0 } else { option });
             return Ok(());
         }
         if matches!(option, 7 | 8 | 32 | 33) {
-            self.channel.borrow().resource.set_buffer(
-                self.side.get(),
-                matches!(option, 8 | 33),
-                value,
-            );
+            let binding = self.channel.borrow();
+            binding
+                .resource
+                .set_buffer_unnotified(self.side(), matches!(option, 8 | 33), value);
+            drop(transition);
+            binding.resource.readiness.notify_locked();
             return Ok(());
         }
         if option == 16 {
-            self.passcred.set(value != 0);
+            self.passcred.store(value != 0, Ordering::Relaxed);
             self.channel
                 .borrow()
                 .resource
-                .set_passcred(self.side.get(), value != 0);
+                .set_passcred(self.side(), value != 0);
             return Ok(());
         }
         let i = match option {
@@ -245,49 +469,55 @@ impl LocalSocket {
             15 => 1,
             _ => return Err(Errno(92)),
         };
-        let mut reuse = self.reuse.get();
-        reuse[i] = u32::from(value != 0);
-        self.reuse.set(reuse);
+        self.reuse[i].store(u32::from(value != 0), Ordering::Relaxed);
         Ok(())
     }
     pub fn reuse(&self, option: u32) -> u32 {
         if matches!(option, 29 | 35 | 63 | 64) {
-            return u32::from(self.timestamp.get() == option);
+            return u32::from(self.timestamp.load(Ordering::Relaxed) == option);
         }
         if option == 16 {
-            return u32::from(self.passcred.get());
+            return u32::from(self.passcred.load(Ordering::Relaxed));
         }
-        self.reuse.get()[usize::from(option == 15)]
+        self.reuse[usize::from(option == 15)].load(Ordering::Relaxed)
     }
     pub fn buffer_size(&self, receive: bool) -> usize {
         self.channel
             .borrow()
             .resource
-            .buffer_size(self.side.get(), receive)
+            .buffer_size(self.side(), receive)
     }
     pub fn kind(&self) -> u32 {
         self.kind
     }
     pub(super) fn direct(&self) -> Option<(Arc<channel::Resource>, usize)> {
-        (self.kind == 1 && self.connected.get() && !self.listening())
-            .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
+        let binding = self.channel.paired.get()?;
+        (self.kind == 1).then(|| (binding.channel.resource.clone(), binding.side))
     }
     pub(super) fn direct_message(&self) -> Option<(Arc<channel::Resource>, usize)> {
-        (matches!(self.kind, 2 | 5)
-            && self.connected.get()
-            && !self.listening()
-            && self.channel.borrow().ends[0].strong_count() != 0)
-            .then(|| (self.channel.borrow().resource.clone(), self.side.get()))
+        let binding = self.channel.paired.get()?;
+        matches!(self.kind, 2 | 5).then(|| (binding.channel.resource.clone(), binding.side))
     }
     pub fn shutdown(&self, how: u32) -> Result<()> {
-        self.channel
-            .borrow()
-            .resource
-            .shutdown(self.side.get(), how)
+        self.channel.borrow().resource.shutdown(self.side(), how)
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
-        self.send_rights(bytes, flags, LocalRights::default())
+        if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
+            return Err(Errno(95));
+        }
+        if !self.connected() {
+            return Err(Errno(if self.kind == 2 { 89 } else { 107 }));
+        }
+        self.channel.borrow().resource.send_credentials(
+            self.side(),
+            bytes,
+            flags,
+            None,
+            Some(self.credentials.get()),
+        )
     }
+}
+impl LocalSocket {
     pub fn send_rights(&self, bytes: &[u8], flags: u32, rights: LocalRights) -> Result<usize> {
         self.send_rights_credentials(bytes, flags, rights, self.credentials.get())
     }
@@ -303,32 +533,32 @@ impl LocalSocket {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
-        if !self.connected.get() {
+        if !self.connected() {
             return Err(Errno(if self.kind == 2 { 89 } else { 107 }));
         }
         let binding = self.channel.borrow();
         if rights.is_empty() {
             return binding.resource.send_credentials(
-                self.side.get(),
+                self.side(),
                 bytes,
                 flags,
                 None,
                 Some(credentials),
             );
         }
-        // Shared OFDs contain no owning LocalSocket control graph. Their real
-        // resources can travel with the packet and need no owner-only ledger.
+        // Portable sets exclude Unix owning graphs. Their actual resources
+        // travel with the packet without an owner-only ledger.
         if let Some(shared) = rights.shared() {
             return binding.resource.send_shared(
-                self.side.get(),
+                self.side(),
                 bytes,
                 flags,
                 shared,
                 Some(credentials),
             );
         }
-        binding.resource.send_check(self.side.get(), flags)?;
-        let peer = binding.ends[1 - self.side.get()]
+        binding.resource.send_check(self.side(), flags)?;
+        let peer = binding.ends[1 - self.side()]
             .upgrade()
             .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
         // Keep the existing no-owning-cycle rule. The shared queues only carry
@@ -340,17 +570,23 @@ impl LocalSocket {
             .collect();
         let mut visited = std::collections::BTreeSet::new();
         while let Some(socket) = pending.pop() {
-            if Rc::ptr_eq(&socket, &peer) {
+            if Arc::ptr_eq(&socket, &peer) {
                 return Err(Errno(95));
             }
-            if !visited.insert(Rc::as_ptr(&socket) as usize) {
+            if !visited.insert(Arc::as_ptr(&socket) as usize) {
                 continue;
             }
             let channel = socket.channel.borrow();
-            let ids = channel.resource.right_ids(socket.side.get());
-            let ledger = channel.rights.borrow();
+            let ids = channel.resource.right_ids(socket.side());
+            let ledger = self.owner.entries.borrow();
             for id in ids {
-                for open in &ledger.get(&id).expect("queued rights").rights.0 {
+                for open in &ledger
+                    .get(&(Arc::as_ptr(&channel) as usize, id))
+                    .expect("queued rights")
+                    .data
+                    .rights
+                    .0
+                {
                     if let Some(socket) = &open.borrow().local {
                         pending.push(socket.clone());
                     }
@@ -360,9 +596,13 @@ impl LocalSocket {
         if self.kind == 1 && bytes.is_empty() {
             return Ok(0);
         }
-        let id = binding.next_right.get();
-        binding.next_right.set(id.checked_add(1).ok_or(Errno(75))?);
-        binding.rights.borrow_mut().insert(
+        let id = binding
+            .next_right
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Errno(75))?;
+        self.owner.insert(
+            &binding,
+            1 - self.side(),
             id,
             Ancillary {
                 rights,
@@ -371,14 +611,14 @@ impl LocalSocket {
             },
         );
         let result = binding.resource.send_credentials(
-            self.side.get(),
+            self.side(),
             bytes,
             flags,
             Some(id),
             Some(credentials),
         );
         if result.is_err() {
-            let unused = binding.rights.borrow_mut().remove(&id);
+            let unused = self.owner.remove(&binding, id);
             drop(unused); // Never destroy rights while borrowing their ledger.
         }
         result
@@ -390,13 +630,13 @@ impl LocalSocket {
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
             return Err(Errno(95));
         }
-        if !self.connected.get() && self.kind != 2 {
+        if !self.connected() && self.kind != 2 {
             return Err(Errno(if self.kind == 2 { 11 } else { 22 }));
         }
         let binding = self.channel.borrow();
         let received = binding
             .resource
-            .recv(self.side.get(), count, flags, true)
+            .recv(self.side(), count, flags, true)
             .expect("owner may receive rights")?;
         let ancillary = if let Some(shared_rights::QueuedRights::Shared(rights)) = &received.rights
         {
@@ -407,18 +647,9 @@ impl LocalSocket {
             }
         } else if let Some(shared_rights::QueuedRights::Owner(id)) = received.rights {
             if flags & 2 != 0 {
-                binding
-                    .rights
-                    .borrow()
-                    .get(&id)
-                    .expect("peek rights")
-                    .clone()
+                self.owner.get(&binding, id)
             } else {
-                binding
-                    .rights
-                    .borrow_mut()
-                    .remove(&id)
-                    .expect("received rights")
+                self.owner.remove(&binding, id).expect("received rights")
             }
         } else {
             Ancillary {
@@ -432,7 +663,7 @@ impl LocalSocket {
             length: received.length,
             truncated: received.truncated,
             rights: ancillary.rights,
-            credentials: if self.passcred.get() {
+            credentials: if self.passcred.load(Ordering::Relaxed) {
                 received
                     .credentials
                     .or(ancillary.credentials)
@@ -441,17 +672,19 @@ impl LocalSocket {
                 None
             },
             source: ancillary.source,
-            timestamp: (self.timestamp.get() != 0)
+            timestamp: (self.timestamp.load(Ordering::Relaxed) != 0)
                 .then_some(received.timestamp)
                 .flatten()
                 .map(|mut stamp| {
-                    if matches!(self.timestamp.get(), 29 | 63) {
+                    if matches!(self.timestamp.load(Ordering::Relaxed), 29 | 63) {
                         stamp[1] /= 1000;
                     }
-                    (self.timestamp.get(), stamp)
+                    (self.timestamp.load(Ordering::Relaxed), stamp)
                 }),
         })
     }
+}
+impl LocalResource {
     pub fn poll(&self, events: u16) -> u16 {
         if let Some(listener) = self.listener.borrow().as_ref() {
             return if listener.pending.is_empty() {
@@ -460,51 +693,43 @@ impl LocalSocket {
                 events & 1
             };
         }
-        if !self.connected.get() && self.kind != 2 {
+        if !self.connected() && self.kind != 2 {
             return (events & 4) | if self.kind == 2 { 0 } else { 16 };
         }
-        self.channel
-            .borrow()
-            .resource
-            .poll(self.side.get(), events)
-            .0
+        self.channel.borrow().resource.poll(self.side(), events).0
     }
 }
-impl Drop for LocalSocket {
+impl Drop for LocalResource {
     fn drop(&mut self) {
-        // Invalidate the path before resource notifications or nested rights
-        // destruction can observe it. Inodes never own the socket lifetime.
         drop(self.pathname_binding.take());
-        let binding = self.channel.borrow();
-        let ids = binding.resource.close(self.side.get());
-        let rights: Vec<_> = {
-            let mut ledger = binding.rights.borrow_mut();
-            ids.into_iter()
-                .filter_map(|id| ledger.remove(&id))
-                .collect()
-        };
-        // Nested endpoint destruction must happen with neither byte lock nor
-        // rights-map borrow held; LocalRights retains its bounded-stack drain.
-        drop(rights);
+        self.channel.borrow().resource.close(self.side());
+    }
+}
+impl LocalSocket {
+    pub(super) fn view(core: Arc<LocalResource>, owner: OwnerView) -> Rc<Self> {
+        Rc::new(Self { core, owner })
     }
 }
 
 impl Vfs {
+    pub fn local_view(&self, core: Arc<LocalResource>) -> Rc<LocalSocket> {
+        LocalSocket::view(core, self.local_rights.clone())
+    }
+    pub fn reap_local_rights(&self) {
+        self.local_rights.reap();
+    }
+    pub fn local_rights_need_owner(&self) -> bool {
+        self.local_rights.needs_reap()
+    }
     fn new_local(&self, kind: u32) -> Result<Rc<LocalSocket>> {
         self.new_local_in(kind, &self.root_network)
     }
     fn new_local_in(
         &self,
         kind: u32,
-        network: &Rc<linux_namespace::RootNetwork>,
+        network: &Arc<linux_namespace::RootNetwork>,
     ) -> Result<Rc<LocalSocket>> {
-        let mut ns = network.local.borrow_mut();
-        ns.sockets.retain(|s| s.strong_count() != 0);
-        ns.abstract_names.retain(|_, s| s.strong_count() != 0);
-        if ns.sockets.len() >= 1024 {
-            return Err(Errno(23));
-        }
-        let socket = LocalSocket::new(
+        let core = LocalResource::allocate(
             kind,
             [
                 self.lock_owner,
@@ -512,70 +737,71 @@ impl Vfs {
                 self.credentials.egid,
             ],
             network.clone(),
-        );
-        ns.sockets.push(Rc::downgrade(&socket));
-        Ok(socket)
+        )?;
+        Ok(LocalSocket::view(core, self.local_rights.clone()))
+    }
+
+    pub(super) fn local_description(
+        id: u64,
+        owner: (u32, u32),
+        local: Arc<LocalResource>,
+        flags: u32,
+    ) -> Descriptor {
+        Descriptor {
+            open: OpenHandle::new(OpenDescription {
+                shared: Arc::new(SharedOpenDescription {
+                    socket: None,
+                    _disk_file: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_file: None,
+                    native_image: None,
+                    mount_resource: std::sync::OnceLock::new(),
+                    directory_mount: Default::default(),
+                    namespace_resource: None,
+                    file_authority: Default::default(),
+                    tcp_publication: Default::default(),
+                    socket_control: None,
+                    control: None,
+                    read_node: None,
+                    id,
+                    owner,
+                    kind: FdKind::Socket,
+                    flags: (2 | (flags & O_NONBLOCK)).into(),
+                    file_position: Arc::default(),
+                    flock: std::sync::OnceLock::new(),
+                    ofd_records: Default::default(),
+                    node: None,
+                    pipe: None,
+                    pty: None,
+                    local: Some(local),
+                    bridge: None,
+                    kernel_log: None,
+                    notification: None,
+                }),
+                position: 0,
+                anonymous: None,
+                namespace: None,
+                network_control: None,
+                mount_file: None,
+                oom: None,
+                mount: None,
+            }),
+            cloexec: (flags & O_CLOEXEC != 0).into(),
+        }
     }
     fn local_descriptor(&mut self, fd: u32, local: Rc<LocalSocket>, flags: u32) {
         self.fds.insert(
             fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        socket: None,
-                        _disk_file: None,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file: None,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        directory_mount: Default::default(),
-                        namespace_resource: None,
-                        file_authority: Default::default(),
-                        tcp_publication: Default::default(),
-                        socket_control: None,
-                        control: None,
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: FdKind::Socket,
-                        flags: (2 | (flags & O_NONBLOCK)).into(),
-                        file_position: Arc::default(),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: None,
-                        pipe: None,
-                        pty: None,
-                        bridge: None,
-                        kernel_log: None,
-                        notification: None,
-                    }),
-                    position: 0,
-                    anonymous: None,
-                    local: Some(local),
-                    namespace: None,
-                    network_control: None,
-                    mount_file: None,
-                    oom: None,
-                    mount: None,
-                }),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
+            Self::local_description(
+                self.open_id(),
+                (self.credentials.fsuid, self.credentials.fsgid),
+                local.core.clone(),
+                flags,
+            ),
         );
     }
     pub fn local_create(&mut self, kind: u32, protocol: u32) -> Result<u32> {
-        if kind & !(0xf | O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        if !matches!(kind & 0xf, 1 | 2 | 5) {
-            return Err(Errno(94));
-        }
-        if protocol != 0 {
-            return Err(Errno(93));
-        }
-        let fd = self.available(0)?;
-        let local = self.new_local(kind & 0xf)?;
-        self.local_descriptor(fd, local, kind);
-        Ok(fd)
+        self.descriptor_factory().local_create(kind, protocol)
     }
     fn local_address(bytes: &[u8]) -> Result<(Vec<u8>, bool)> {
         if !(3..=110).contains(&bytes.len()) || bytes[..2] != [1, 0] {
@@ -593,19 +819,17 @@ impl Vfs {
         Ok((name, false))
     }
     pub fn local_listen(&self, socket: &LocalSocket, backlog: u32) -> Result<()> {
-        let first = !socket.listening();
-        socket.listen(backlog)?;
-        if first {
-            // lock_owner is the coordinator's global TGID, unlike the calling TID.
-            socket.credentials.set([
+        socket.listen_as(
+            backlog,
+            Some([
                 self.lock_owner,
                 self.credentials.euid,
                 self.credentials.egid,
-            ]);
-        }
-        Ok(())
+            ]),
+        )
     }
     pub fn local_bind(&mut self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
+        let _transition = socket.transition.lock().unwrap();
         let (name, abstract_) = Self::local_address(bytes)?;
         if socket.name.borrow().len() != 2 {
             return Err(Errno(22));
@@ -615,13 +839,13 @@ impl Vfs {
             if ns
                 .abstract_names
                 .get(&name)
-                .and_then(Weak::upgrade)
+                .and_then(std::sync::Weak::upgrade)
                 .is_some()
             {
                 return Err(Errno(98));
             }
             ns.abstract_names
-                .insert(name.clone(), Rc::downgrade(socket));
+                .insert(name.clone(), Arc::downgrade(&socket.core));
         } else {
             let p = self.resolve_final(-100, &name[2..name.len() - 1], false)?;
             match self.node(&p) {
@@ -630,7 +854,7 @@ impl Vfs {
                 Err(e) => return Err(e),
             }
             self.check_parent_write(&p)?;
-            let binding = self.path_bindings.bind(socket);
+            let binding = self.path_bindings.bind(&socket.core);
             self.insert(
                 p,
                 Content::Socket(binding.path()),
@@ -650,7 +874,7 @@ impl Vfs {
                 .borrow()
                 .abstract_names
                 .get(&name)
-                .and_then(Weak::upgrade)
+                .and_then(std::sync::Weak::upgrade)
                 .ok_or(Errno(111))?
         } else {
             let p = self.resolve_final(-100, &name[2..name.len() - 1], true)?;
@@ -667,10 +891,11 @@ impl Vfs {
         if peer.kind != socket.kind {
             return Err(Errno(91));
         }
-        Ok(peer)
+        Ok(LocalSocket::view(peer, self.local_rights.clone()))
     }
     pub fn local_connect(&self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
-        if socket.connected.get() {
+        let _transition = socket.transition.lock().unwrap();
+        if socket.connected() {
             return Err(Errno(106));
         }
         if socket.listening() {
@@ -678,9 +903,9 @@ impl Vfs {
         }
         let peer = self.local_destination(socket, bytes)?;
         if socket.kind == 2 {
-            *socket.datagram_peer.borrow_mut() = Rc::downgrade(&peer);
+            *socket.datagram_peer.borrow_mut() = Arc::downgrade(&peer.core);
             *socket.peer_name.borrow_mut() = peer.name.borrow().clone();
-            socket.connected.set(true);
+            socket.datagram_connected.store(true, Ordering::Release);
             return Ok(());
         }
         if peer.kind != socket.kind {
@@ -699,14 +924,20 @@ impl Vfs {
             self.credentials.egid,
         ]);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
-        LocalSocket::pair(socket, &accepted);
         accepted.set_reuse(16, peer.reuse(16))?;
-        if peer.timestamp.get() != 0 {
-            accepted.set_reuse(peer.timestamp.get(), 1)?;
+        if peer.timestamp.load(Ordering::Relaxed) != 0 {
+            accepted.set_reuse(peer.timestamp.load(Ordering::Relaxed), 1)?;
         }
-        l.pending.push_back(accepted);
-        peer.listen_epoch
-            .set(peer.listen_epoch.get().wrapping_add(1));
+        LocalResource::pair(&socket.core, &accepted.core);
+        // Connect changes an already published OFD's direct eligibility.
+        // Fresh socketpairs need only their ordinary Files publication.
+        FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
+        l.pending.push_back(accepted.core.clone());
+        peer.listen_epoch.fetch_add(1, Ordering::Relaxed);
+        drop(listener);
+        drop(_transition);
+        peer.notify();
+        socket.notify();
         Ok(())
     }
     pub fn local_accept(&mut self, socket: &LocalSocket, flags: u32) -> Result<(u32, Vec<u8>)> {
@@ -723,7 +954,13 @@ impl Vfs {
             .pop_front()
             .ok_or(Errno(11))?;
         let name = accepted.peer_name.borrow().clone();
-        self.local_descriptor(fd, accepted, flags);
+        socket.listen_epoch.fetch_add(1, Ordering::Relaxed);
+        socket.notify();
+        self.local_descriptor(
+            fd,
+            LocalSocket::view(accepted, self.local_rights.clone()),
+            flags,
+        );
         Ok((fd, name))
     }
 
@@ -755,34 +992,22 @@ impl Vfs {
                 },
             );
         }
+        drop(rights);
+        self.reap_local_rights();
         (free, truncated)
     }
     pub fn local_socket(&self, fd: u32) -> Result<Option<Rc<LocalSocket>>> {
-        Ok(self.descriptor(fd)?.open.borrow().local.clone())
+        Ok(self
+            .descriptor(fd)?
+            .open
+            .borrow()
+            .local
+            .clone()
+            .map(|core| LocalSocket::view(core, self.local_rights.clone())))
     }
     pub fn socketpair(&mut self, family: u32, kind: u32, protocol: u32) -> Result<[u32; 2]> {
-        if family != 1 {
-            return Err(Errno(97));
-        }
-        if kind & !(0xf | O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        if !matches!(kind & 0xf, 1 | 2 | 5) {
-            return Err(Errno(94));
-        }
-        if protocol != 0 {
-            return Err(Errno(93));
-        }
-        let free = self.fds.available_fds(2);
-        if free.len() != 2 {
-            return Err(Errno(24));
-        }
-        let a = self.new_local(kind & 0xf)?;
-        let b = self.new_local(kind & 0xf)?;
-        LocalSocket::pair(&a, &b);
-        self.local_descriptor(free[0], a, kind);
-        self.local_descriptor(free[1], b, kind);
-        Ok([free[0], free[1]])
+        self.descriptor_factory()
+            .local_pair_with_output(family, kind, protocol, |_| Ok(()))
     }
 }
 
@@ -830,7 +1055,7 @@ mod waitall_tests {
             .spawn(|| {
                 let mut v = Vfs::default();
                 let [a, b] = v.socketpair(1, 1, 0).unwrap();
-                let weak_a = Rc::downgrade(&v.local_socket(a).unwrap().unwrap());
+                let weak_a = Arc::downgrade(&v.local_socket(a).unwrap().unwrap().core);
                 v.local_socket(a)
                     .unwrap()
                     .unwrap()
@@ -844,7 +1069,9 @@ mod waitall_tests {
                 let mut weak = Vec::new();
                 for _ in 0..600 {
                     let [next, receiver] = v.socketpair(1, 1, 0).unwrap();
-                    weak.push(Rc::downgrade(&v.local_socket(receiver).unwrap().unwrap()));
+                    weak.push(Arc::downgrade(
+                        &v.local_socket(receiver).unwrap().unwrap().core,
+                    ));
                     v.local_socket(sender)
                         .unwrap()
                         .unwrap()
@@ -875,7 +1102,7 @@ mod waitall_tests {
         let tx = v.local_socket(a).unwrap().unwrap();
         let rx = v.local_socket(b).unwrap().unwrap();
         let c_socket = v.local_socket(c).unwrap().unwrap();
-        let weak = Rc::downgrade(&c_socket);
+        let weak = Arc::downgrade(&c_socket.core);
         assert_eq!(
             tx.send_rights(b"cycle", 0, v.send_rights(&[b]).unwrap()),
             Err(Errno(95))

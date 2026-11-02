@@ -19,9 +19,19 @@ pub(super) fn call(
                 .signalfd(a[0] as i32, mask, a[3] as u32)?
                 .map(u64::from)
         }
-        198 if a[0] as u32 != 1 => factory
+        198 => factory
             .socket(a[0] as u32, a[1] as u32, a[2] as u32)
             .map(u64::from),
+        199 => (|| {
+            Linux::check(memory, a[3], 8, Access::Write)?;
+            factory.local_pair_with_output(a[0] as u32, a[1] as u32, a[2] as u32, |fds| {
+                let mut bytes = [0; 8];
+                bytes[..4].copy_from_slice(&fds[0].to_le_bytes());
+                bytes[4..].copy_from_slice(&fds[1].to_le_bytes());
+                memory.write(a[3], &bytes).map_err(|_| Errno(14))
+            })?;
+            Ok(0)
+        })(),
         19 => factory.eventfd(a[0] as u32, a[1] as u32).map(u64::from),
         26 => factory.inotify_init(a[0] as u32).map(u64::from),
         85 => factory.timerfd(a[0] as u32, a[1] as u32).map(u64::from),
@@ -63,6 +73,19 @@ mod tests {
     #[test]
     fn owner_and_worker_creation_share_abi_flags_copyout_and_error_order() {
         for (number, args) in [
+            (198, [1, 1, 0, 0, 0, 0]),
+            (198, [1, 2, 0, 0, 0, 0]),
+            (198, [1, 5, 0, 0, 0, 0]),
+            (198, [1, 4, 0, 0, 0, 0]),
+            (198, [1, 1, 6, 0, 0, 0]),
+            (199, [1, 1, 0, 0x1000, 0, 0]),
+            (199, [1, 2, 0, 0x1000, 0, 0]),
+            (199, [1, 5, 0, 0x1000, 0, 0]),
+            (199, [1, 1, 0, 0x1ffc, 0, 0]),
+            (199, [2, 1, 0, 0x1000, 0, 0]),
+            (199, [2, 1, 0, 0x9000, 0, 0]),
+            (199, [1, 4, 6, 0x1000, 0, 0]),
+            (199, [1, 1, 6, 0x1000, 0, 0]),
             (198, [2, 1, 0, 0, 0, 0]),
             (198, [2, 2, 17, 0, 0, 0]),
             (198, [16, 3, 0, 0, 0, 0]),

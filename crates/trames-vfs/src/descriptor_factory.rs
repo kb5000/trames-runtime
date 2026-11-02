@@ -8,6 +8,7 @@ pub struct DescriptorFactory {
     ids: Arc<AtomicU64>,
     owner: (u32, u32),
     network: trames_net::Network,
+    local_network: Arc<linux_namespace::RootNetwork>,
     credentials: Credentials,
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
@@ -23,6 +24,7 @@ impl Vfs {
             ids: self.next_open.clone(),
             owner: (self.credentials.fsuid, self.credentials.fsgid),
             network: self.network.clone(),
+            local_network: self.root_network.clone(),
             credentials: self.credentials.clone(),
             local_identity: self.local_sender_credentials(),
             pid_namespace: self.pid_namespace().clone(),
@@ -31,6 +33,57 @@ impl Vfs {
     }
 }
 impl DescriptorFactory {
+    fn local_parameters(kind: u32, protocol: u32) -> Result<()> {
+        if kind & !(0xf | O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(Errno(22));
+        }
+        if !matches!(kind & 0xf, 1 | 2 | 5) {
+            return Err(Errno(94));
+        }
+        if protocol != 0 {
+            return Err(Errno(93));
+        }
+        Ok(())
+    }
+    fn new_local(&self, kind: u32) -> Result<Arc<ipc::LocalResource>> {
+        ipc::LocalResource::allocate(
+            kind,
+            [
+                self.local_identity[0],
+                self.credentials.euid,
+                self.credentials.egid,
+            ],
+            self.local_network.clone(),
+        )
+    }
+    pub fn local_create(&self, kind: u32, protocol: u32) -> Result<u32> {
+        Self::local_parameters(kind, protocol)?;
+        let reserved = self.files.reserve()?;
+        let core = self.new_local(kind & 0xf)?;
+        let descriptor = Vfs::local_description(self.open_id(), self.owner, core, kind);
+        Ok(reserved.publish(descriptor, None))
+    }
+    pub fn local_pair_with_output(
+        &self,
+        family: u32,
+        kind: u32,
+        protocol: u32,
+        output: impl FnOnce([u32; 2]) -> Result<()>,
+    ) -> Result<[u32; 2]> {
+        if family != 1 {
+            return Err(Errno(97));
+        }
+        Self::local_parameters(kind, protocol)?;
+        let reserved = self.files.reserve_pair()?;
+        let a = self.new_local(kind & 0xf)?;
+        let b = self.new_local(kind & 0xf)?;
+        ipc::LocalResource::pair(&a, &b);
+        let descriptors =
+            [a, b].map(|socket| Vfs::local_description(self.open_id(), self.owner, socket, kind));
+        let fds = reserved.numbers();
+        output(fds)?;
+        Ok(reserved.publish(descriptors))
+    }
     /// TIOCGPTPEER accepts the original full master OFD; no pathname relookup.
     pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
         if !end.master {
@@ -100,9 +153,11 @@ impl DescriptorFactory {
     fn open_id(&self) -> u64 {
         next_id(&self.ids)
     }
-    /// AF_UNIX still owns task/SCM_RIGHTS state and uses the joined path.
-    /// IP and netlink creation retain the original namespace and credentials.
+    /// IP and Unix creation retain their actual namespace and credentials.
     pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
+        if family == 1 {
+            return self.local_create(kind, protocol);
+        }
         if matches!((family, kind & 0xf, protocol), (2, 2, 1) | (10, 2, 58)) {
             let [low, high] = self.network.ping_range();
             if !std::iter::once(self.credentials.egid)
@@ -132,11 +187,22 @@ impl DescriptorFactory {
     /// None leaves an excluded owner object untouched; missing/invalid shared
     /// entries preserve the ordinary EBADF/ENOTSOCK result.
     pub fn socket_operation(&self, fd: u32) -> Option<Result<SocketOperation>> {
-        Some(
-            self.files
-                .lookup(fd)?
-                .and_then(SocketOperation::from_shared),
-        )
+        match self.socket_control_operation(fd)? {
+            Ok(SocketControlOperation::Network(socket)) => Some(Ok(socket)),
+            Ok(SocketControlOperation::Unix(_)) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+    /// Accept once before deciding the transport; close/reuse cannot change it
+    /// between Unix admission and network admission.
+    pub fn socket_control_operation(&self, fd: u32) -> Option<Result<SocketControlOperation>> {
+        Some(self.files.lookup(fd)?.and_then(|file| {
+            if file.open.local.is_some() {
+                LocalOperation::from_shared(file).map(SocketControlOperation::Unix)
+            } else {
+                SocketOperation::from_shared(file).map(SocketControlOperation::Network)
+            }
+        }))
     }
     pub fn can_bind_service(&self) -> bool {
         self.credentials.has_cap(capabilities::NET_BIND_SERVICE)
@@ -256,13 +322,13 @@ impl DescriptorFactory {
                         node: None,
                         pipe: Some(end),
                         pty: None,
+                        local: None,
                         bridge: None,
                         kernel_log: None,
                         notification: None,
                     }),
                     position: 0,
                     anonymous: None,
-                    local: None,
                     namespace: None,
                     network_control: None,
                     mount_file: None,

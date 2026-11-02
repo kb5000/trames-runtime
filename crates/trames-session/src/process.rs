@@ -307,11 +307,9 @@ impl<C: Cpu> Process<C> {
     }
 
     fn retain_local_message_owner(&mut self, call: Option<&crate::run_queue::IoCall>) {
-        let Some((call, identity)) = call.and_then(|call| {
-            call.retained_byte
-                .as_ref()?
-                .local_owner_identity()
-                .map(|identity| (call, identity))
+        let Some((file, identity)) = call.and_then(|call| {
+            let file = call.retained_byte.as_ref()?;
+            Some((file, file.local_owner_identity()?))
         }) else {
             self.retained_message_owner = None;
             return;
@@ -323,18 +321,9 @@ impl<C: Cpu> Process<C> {
         {
             return;
         }
-        // Unix membership mutation remains joined. Every completion is visited
-        // before returned owner calls execute, so this is the original OFD.
-        assert!(self
-            .linux
-            .vfs
-            .matches_open_description(call.args[0] as u32, &identity));
-        self.retained_message_owner = Some(
-            self.linux
-                .vfs
-                .retain_uring_fd(call.args[0] as u32)
-                .expect("accepted local message owner"),
-        );
+        // Shared membership can change before the coordinator sees this reply.
+        // The worker already accepted the full original OFD; retain that lease.
+        self.retained_message_owner = Some(file.local_owner().expect("accepted local message OFD"));
     }
     fn worker_gpu_candidate(&self) -> bool {
         matches!(self.state, State::Gpu { retired: true, .. })
@@ -3013,6 +3002,26 @@ impl<C: Cpu> Kernel<C> {
         } else {
             None
         };
+        let byte = match byte {
+            Some(trames_linux::IoAttempt::ByteCheckpoint(file)) if file.is_unix() => Some(
+                trames_linux::DirectSyscalls::default()
+                    .with_local_identity([
+                        p.tgid,
+                        p.linux.vfs.credentials.uid,
+                        p.linux.vfs.credentials.gid,
+                    ])
+                    .start_owned_local_byte(
+                        file,
+                        &p.linux.vfs,
+                        number,
+                        a,
+                        &mut p.memory,
+                        pid,
+                        &Arc::downgrade(&self.byte_target),
+                    ),
+            ),
+            other => other,
+        };
         let result = match byte {
             Some(trames_linux::IoAttempt::Complete(result)) => result.map(Some),
             Some(trames_linux::IoAttempt::Blocked(wait)) => {
@@ -4038,6 +4047,7 @@ impl<C: Cpu> Kernel<C> {
             let Some(mut p) = self.processes.remove(&id) else {
                 continue;
             };
+            p.linux.vfs.reap_local_rights();
             if !matches!(p.state, State::Zombie(_)) && !p.frozen(id) {
                 if !p.worker_gpu_candidate() {
                     self.resume_gpu(id, &mut p);

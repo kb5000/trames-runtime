@@ -20,13 +20,13 @@ impl PathBinding {
     }
 }
 
-/// Owner-side resolution until socket controls themselves are shared. All VFS
-/// task clones share this domain, including after unshare/setns(CLONE_NEWNET):
+/// Actual shared pathname routing. All VFS task clones share this domain,
+/// including after unshare/setns(CLONE_NEWNET):
 /// pathname sockets belong to the filesystem, unlike abstract socket names.
 #[derive(Clone, Default)]
-pub(crate) struct PathBindings(Rc<RefCell<BTreeMap<usize, Weak<LocalSocket>>>>);
+pub(crate) struct PathBindings(Arc<SharedCell<BTreeMap<usize, std::sync::Weak<LocalResource>>>>);
 impl PathBindings {
-    pub(super) fn bind(&self, socket: &Rc<LocalSocket>) -> OwnedBinding {
+    pub(super) fn bind(&self, socket: &Arc<LocalResource>) -> OwnedBinding {
         let identity = Arc::new(Identity(AtomicBool::new(true)));
         let binding = OwnedBinding {
             identity,
@@ -34,14 +34,17 @@ impl PathBindings {
         };
         self.0
             .borrow_mut()
-            .insert(binding.path().key(), Rc::downgrade(socket));
+            .insert(binding.path().key(), Arc::downgrade(socket));
         binding
     }
-    pub(super) fn resolve(&self, path: &PathBinding) -> Option<Rc<LocalSocket>> {
+    pub(super) fn resolve(&self, path: &PathBinding) -> Option<Arc<LocalResource>> {
         if !path.is_live() {
             return None;
         }
-        self.0.borrow().get(&path.key()).and_then(Weak::upgrade)
+        self.0
+            .borrow()
+            .get(&path.key())
+            .and_then(std::sync::Weak::upgrade)
     }
 }
 
@@ -58,7 +61,7 @@ impl Drop for OwnedBinding {
     fn drop(&mut self) {
         // A concurrent liveness reader may temporarily retain the identity.
         // Its Arc must not keep a closed binding alive. This flag is not a
-        // byte-publication barrier; controls remain in the owner domain.
+        // byte-publication barrier; routing is protected by its object lock.
         self.identity.0.store(false, Ordering::Relaxed);
         self.routes.0.borrow_mut().remove(&self.path().key());
     }
@@ -106,9 +109,9 @@ mod tests {
             assert!(!retained_identity.0.load(Ordering::Relaxed));
         });
         ready_rx.recv().unwrap();
-        assert!(Rc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &v.path_bindings.resolve(&binding).unwrap(),
-            &socket
+            &socket.core
         ));
         drop(socket);
         assert!(weak.upgrade().is_none());
@@ -188,8 +191,8 @@ mod tests {
             .pending
             .pop_front()
             .unwrap();
-        assert!(Rc::ptr_eq(&accepted.network, &v.root_network));
-        assert!(!Rc::ptr_eq(&client.network, &v.root_network));
+        assert!(Arc::ptr_eq(&accepted.network, &v.root_network));
+        assert!(!Arc::ptr_eq(&client.network, &v.root_network));
         let unrelated = Vfs::default();
         assert!(unrelated
             .path_bindings
@@ -217,9 +220,9 @@ mod tests {
         assert_eq!(new.listener.borrow().as_ref().unwrap().pending.len(), 1);
         drop(old);
         assert!(v.path_bindings.resolve(&old_binding).is_none());
-        assert!(Rc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &v.path_bindings.resolve(&new_binding).unwrap(),
-            &new
+            &new.core
         ));
         let c3 = v.new_local(1).unwrap();
         assert_eq!(v.local_connect(&c3, &address(b"/alias")), Err(Errno(111)));
