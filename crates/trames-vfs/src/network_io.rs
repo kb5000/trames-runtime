@@ -147,6 +147,38 @@ mod tests {
         time::Duration,
     };
     #[test]
+    fn connected_close_is_atomic_with_accepted_leases_and_preserves_aliases() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        drop(socket);
+        let network = v.direct_network();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let accepted = network.get(fd).unwrap();
+        assert_eq!(v.close_quiescent_tcp(fd), None);
+        assert!(v.socket_fd(fd).is_ok());
+        drop(accepted);
+        assert_eq!(v.close_quiescent_tcp(fd), Some(Ok(())));
+        assert!(network.get(fd).is_none());
+        assert_eq!(
+            network.with_control(alias, |c| c.get_option(6, 1)),
+            Some(Ok(0))
+        );
+        assert_eq!(v.close_quiescent_tcp(alias), Some(Ok(())));
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(v.socket(2, 1, 0).unwrap(), fd);
+    }
+
+    #[test]
     fn control_publication_preserves_aliases_after_close_and_fd_reuse() {
         let mut v = Vfs::default();
         v.configure_network(NetworkMode::Loopback).unwrap();

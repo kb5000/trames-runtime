@@ -169,6 +169,14 @@ impl Socket {
                 })
                 .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
     }
+    pub fn quiescent_tcp(&self) -> bool {
+        (self.idle_tcp() || self.path.get() == Path::Native)
+            && self
+                .native
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| s.quiescent_tcp())
+    }
     pub fn idle_tcp(&self) -> bool {
         matches!(self.path.get(), Path::Idle | Path::Native)
             && !self.listening.get()

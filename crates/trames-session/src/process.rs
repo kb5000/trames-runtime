@@ -97,6 +97,7 @@ pub(crate) struct Process<C: Cpu> {
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
     retained_byte: Option<trames_linux::RetainedByte>,
+    tcp_liveness: Option<trames_net::TcpLease>,
     retained_poll: Option<trames_linux::RetainedPoll>,
     retained_select: Option<trames_linux::RetainedSelect>,
     pending_open: Option<u32>,
@@ -315,6 +316,7 @@ impl<C: Cpu> Process<C> {
             record_wait: None,
             byte_wait: None,
             retained_byte: None,
+            tcp_liveness: None,
             retained_poll: None,
             retained_select: None,
             pending_open: None,
@@ -1090,6 +1092,7 @@ impl<C: Cpu> Kernel<C> {
         p.record_wait = None;
         p.byte_wait = None;
         p.retained_byte = None;
+        p.tcp_liveness = None;
         p.retained_poll = None;
         p.retained_select = None;
         self.parent_thread_exited(pid, p, None);
@@ -1528,6 +1531,7 @@ impl<C: Cpu> Kernel<C> {
                 p.record_wait = None;
                 p.byte_wait = None;
                 p.retained_byte = None;
+                p.tcp_liveness = None;
                 p.retained_poll = None;
                 p.retained_select = None;
                 let timed_socket = p.socket_deadline.take().is_some();
@@ -1762,6 +1766,7 @@ impl<C: Cpu> Kernel<C> {
             p.record_wait = None;
             p.byte_wait = None;
             p.retained_byte = None;
+            p.tcp_liveness = None;
             p.retained_poll = None;
             p.retained_select = None;
             p.linux.vfs.unshare_descriptors();
@@ -2759,6 +2764,7 @@ impl<C: Cpu> Kernel<C> {
         let began = self.profile_syscalls.then(Instant::now);
         self.syscalls += 1;
         if !matches!(p.state, State::Blocked(..)) && self.filter_syscall(pid, p, number, a) {
+            p.tcp_liveness = None;
             return;
         }
         p.linux.vfs.set_process_context(pid);
@@ -2933,6 +2939,9 @@ impl<C: Cpu> Kernel<C> {
                 Some(raw)
             }
         };
+        if raw.is_some() {
+            p.tcp_liveness = None;
+        }
         let signal_pipe = match number {
             64 | 66 | 71 | 76 => true,
             206 => a[3] & 0x4000 == 0,
@@ -4130,9 +4139,12 @@ impl<C: Cpu> Kernel<C> {
             if let State::Blocked(number, args) = p.state {
                 // Re-arm against the new epoch target. The owner's notification
                 // target cannot schedule a parked worker in this cohort.
-                let retained_byte = p
-                    .byte_wait
-                    .take()
+                let previous = p.byte_wait.take();
+                let tcp_liveness = previous
+                    .as_ref()
+                    .and_then(trames_linux::PendingIo::tcp_liveness)
+                    .or_else(|| p.tcp_liveness.take());
+                let retained_byte = previous
                     .and_then(|wait| wait.retained_byte)
                     .or_else(|| p.retained_byte.take());
                 job.retry = Some(crate::run_queue::IoCall {
@@ -4144,6 +4156,7 @@ impl<C: Cpu> Kernel<C> {
                         p.flock_wait.as_ref().map(|(request, _)| request.clone())
                     },
                     retained_byte,
+                    tcp_liveness,
                     retained_poll: p.retained_poll.take(),
                     number,
                     args,
@@ -4333,6 +4346,7 @@ impl<C: Cpu> Kernel<C> {
             }
             p.retain_worker_flock(done.io.as_ref());
             p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
+            p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
             p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
             p.state = if let Some(compile) = done.gpu_pending {
                 State::Gpu {
@@ -4987,6 +5001,7 @@ pub(super) fn run<C: Cpu>(
         record_wait: None,
         byte_wait: None,
         retained_byte: None,
+        tcp_liveness: None,
         retained_poll: None,
         retained_select: None,
         pending_open: None,
@@ -5494,6 +5509,7 @@ mod tests {
             deadline: None,
             flock: Some(request),
             retained_byte: None,
+            tcp_liveness: None,
             retained_poll: None,
         };
         drop(file);
@@ -6043,6 +6059,7 @@ mod tests {
             deadline: None,
             flock: Some(shared.clone()),
             retained_byte: None,
+            tcp_liveness: None,
             retained_poll: None,
         };
         p.retain_worker_flock(Some(&call));
@@ -6297,6 +6314,7 @@ mod tests {
             record_wait: None,
             byte_wait: None,
             retained_byte: None,
+            tcp_liveness: None,
             retained_poll: None,
             retained_select: None,
             pending_open: None,

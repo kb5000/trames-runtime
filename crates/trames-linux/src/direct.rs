@@ -27,6 +27,9 @@ pub struct PendingIo {
     pub signal: Arc<IoSignal>,
     pub flock: Option<trames_vfs::FlockRequest>,
     pub retained_byte: Option<RetainedByte>,
+    // Cohort-local accepted TCP authority. Joined policy/signal transitions
+    // keep their original owner restart path, rather than exporting this lease.
+    native_tcp: Option<trames_vfs::DirectTcpFd>,
     resource_deadline: Option<Instant>,
     pub retained_poll: Option<crate::poll::RetainedPoll>,
     _subscriptions: Vec<IoSubscription>,
@@ -47,6 +50,13 @@ impl RetainedByte {
     }
 }
 impl PendingIo {
+    /// Passive lifetime only across a cohort handoff. The next cohort still
+    /// resolves its current FD/policy before accepting new native byte authority.
+    pub fn tcp_liveness(&self) -> Option<trames_net::TcpLease> {
+        self.native_tcp
+            .as_ref()
+            .map(|fd| fd.tcp.retain().expect("accepted TCP transport"))
+    }
     pub fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
         self.retained_byte
             .as_ref()
@@ -540,38 +550,104 @@ impl DirectSyscalls {
         if number == 116 {
             return Some(crate::syslog(self.kernel_log.as_ref()?, args, memory));
         }
-        if let Some(fd) = self.network.get(args[0] as u32) {
-            let read = |count| {
-                if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 1 {
-                    return Err(Errno(9));
-                }
-                fd.tcp.recv(count, 0).map_err(|e| Errno(e.0))
-            };
-            let write = |bytes: &[u8]| {
-                if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 0 {
-                    return Err(Errno(9));
-                }
-                fd.tcp
-                    .send(bytes, 0)
-                    .map(|n| n as u64)
-                    .map_err(|e| Errno(e.0))
-            };
-            return Some(match number {
-                63 => Linux::read_transport(args, memory, read),
-                64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
-                65 => Linux::readv_transport_mode(args, memory, false, read),
-                66 => Linux::writev_transport_mode(
-                    args,
-                    memory,
-                    &mut self.scratch.borrow_mut(),
-                    false,
-                    write,
-                ),
-                _ => unreachable!("native TCP byte call"),
-            });
-        }
         let fd = self.descriptors.get(args[0] as u32)?;
         self.transfer_fd(&fd, number, args, memory)
+    }
+    fn transfer_tcp(
+        &self,
+        fd: &trames_vfs::DirectTcpFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        let read = |count| {
+            if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 1 {
+                return Err(Errno(9));
+            }
+            fd.tcp.recv(count, 0).map_err(|e| Errno(e.0))
+        };
+        let write = |bytes: &[u8]| {
+            if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 0 {
+                return Err(Errno(9));
+            }
+            fd.tcp
+                .send(bytes, 0)
+                .map(|n| n as u64)
+                .map_err(|e| Errno(e.0))
+        };
+        match number {
+            63 => Linux::read_transport(args, memory, read),
+            64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
+            65 => Linux::readv_transport_mode(args, memory, false, read),
+            66 => Linux::writev_transport_mode(
+                args,
+                memory,
+                &mut self.scratch.borrow_mut(),
+                false,
+                write,
+            ),
+            _ => unreachable!("native TCP byte call"),
+        }
+    }
+    fn complete_tcp(&self, result: Result<u64, Errno>) -> IoAttempt {
+        self.completed.set(self.completed.get() + 1);
+        self.socket_completed.set(self.socket_completed.get() + 1);
+        IoAttempt::Complete(result)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_tcp(
+        &self,
+        fd: trames_vfs::DirectTcpFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+        saved_deadline: Option<Instant>,
+    ) -> IoAttempt {
+        match self.transfer_tcp(&fd, number, args, memory) {
+            Err(Errno(11)) if !fd.nonblocking() => {}
+            Err(Errno(32)) if signals_pipe(number, args) => return IoAttempt::Checkpoint,
+            result => return self.complete_tcp(result),
+        }
+        let deadline = saved_deadline.or_else(|| {
+            fd.timeouts[usize::from(matches!(number, 63 | 65))]
+                .and_then(|d| Instant::now().checked_add(d))
+        });
+        let signal = IoSignal::new(pid, target.clone());
+        let subscription = (|| {
+            target
+                .upgrade()?
+                .host_events()?
+                .subscribe(
+                    tcp_wait_fd(&fd.tcp).ok()?,
+                    matches!(number, 64 | 66),
+                    &signal,
+                )
+                .ok()
+        })();
+        let Some(subscription) = subscription else {
+            return IoAttempt::Checkpoint;
+        };
+        self.resume(
+            PendingIo {
+                number,
+                args,
+                deadline,
+                signal,
+                native_tcp: Some(fd),
+                retained_byte: None,
+                flock: None,
+                resource_deadline: None,
+                retained_poll: None,
+                _subscriptions: Vec::new(),
+                host_subscription: Some(subscription),
+                uring: None,
+                poll_uring: None,
+                target: target.clone(),
+            },
+            memory,
+        )
     }
     fn transfer_fd(
         &self,
@@ -720,7 +796,9 @@ impl DirectSyscalls {
         IoAttempt::Complete(result)
     }
     fn complete_pending(&self, pending: &PendingIo, result: Result<u64, Errno>) -> IoAttempt {
-        if let Some(file) = &pending.retained_byte {
+        if pending.native_tcp.is_some() {
+            self.complete_tcp(result)
+        } else if let Some(file) = &pending.retained_byte {
             self.complete_byte(file, result)
         } else {
             self.complete(pending.number, pending.args, result)
@@ -737,6 +815,11 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if matches!(number, 63..=66) {
+            if let Some(fd) = self.network.get(args[0] as u32) {
+                return Some(self.start_tcp(fd, number, args, memory, pid, target, saved_deadline));
+            }
+        }
         if let Some(file) = self.retain_byte(number, args) {
             return Some(match file {
                 Ok(file) => self.start_retained_byte(file, number, args, memory, pid, target),
@@ -880,6 +963,7 @@ impl DirectSyscalls {
                 resource_deadline: None,
                 flock: None,
                 retained_byte: None,
+                native_tcp: None,
                 _subscriptions: subscriptions,
                 host_subscription,
                 uring: None,
@@ -922,6 +1006,7 @@ impl DirectSyscalls {
                 signal,
                 retained_poll: Some(poll),
                 retained_byte: None,
+                native_tcp: None,
                 flock: None,
                 resource_deadline: None,
                 _subscriptions: subscriptions,
@@ -990,6 +1075,7 @@ impl DirectSyscalls {
                 signal,
                 flock: None,
                 retained_byte: Some(file),
+                native_tcp: None,
                 resource_deadline: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
@@ -1026,6 +1112,7 @@ impl DirectSyscalls {
                 signal,
                 flock: Some(request),
                 retained_byte: None,
+                native_tcp: None,
                 resource_deadline: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
@@ -1112,7 +1199,9 @@ impl DirectSyscalls {
         {
             return IoAttempt::Checkpoint;
         }
-        let result = if let Some(file) = &pending.retained_byte {
+        let result = if let Some(fd) = &pending.native_tcp {
+            self.transfer_tcp(fd, pending.number, pending.args, memory)
+        } else if let Some(file) = &pending.retained_byte {
             self.transfer_fd(&file.fd, pending.number, pending.args, memory)
                 .expect("shared byte operation")
         } else if let Some(poll) = &pending.retained_poll {
@@ -1130,7 +1219,12 @@ impl DirectSyscalls {
             Err(Errno(11)) => {
                 if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212)
                     && pending.retained_byte.as_ref().map_or_else(
-                        || self.nonblocking(pending.number, pending.args),
+                        || {
+                            pending.native_tcp.as_ref().map_or_else(
+                                || self.nonblocking(pending.number, pending.args),
+                                |fd| fd.nonblocking(),
+                            )
+                        },
                         |file| file.fd.nonblocking(),
                     ))
                     || pending.external_wait()
@@ -1138,7 +1232,9 @@ impl DirectSyscalls {
                 {
                     return self.complete_pending(&pending, Err(Errno(11)));
                 }
-                let resource_deadline = if let Some(file) = &pending.retained_byte {
+                let resource_deadline = if pending.native_tcp.is_some() {
+                    None
+                } else if let Some(file) = &pending.retained_byte {
                     file.fd.next_deadline()
                 } else if pending.number == 116 {
                     None
@@ -1191,6 +1287,18 @@ impl DirectSyscalls {
                     Some(result)
                 }
             };
+        }
+        if matches!(number, 63..=66) {
+            if let Some(fd) = self.network.get(args[0] as u32) {
+                return match self.transfer_tcp(&fd, number, args, memory) {
+                    Err(Errno(11)) if !fd.nonblocking() => None,
+                    Err(Errno(32)) if signals_pipe(number, args) => None,
+                    result => {
+                        self.complete_tcp(result);
+                        Some(result)
+                    }
+                };
+            }
         }
         if matches!(number, 22 | 32 | 441) || !self.supports_call(number, args) {
             return None;
@@ -2372,6 +2480,113 @@ mod tests {
         drop(request); // last original reference unlocks /lock.
         assert_eq!(v.flock(b, 6), Ok(()));
         files.finish();
+    }
+
+    struct TcpTarget(Arc<trames_vfs::HostEvents>);
+    impl IoWake for TcpTarget {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
+            Some(self.0.clone())
+        }
+    }
+    #[test]
+    fn pending_tcp_uses_original_transport_until_completion_and_releases_close() {
+        use std::{
+            io::{Read, Write},
+            net::{Ipv4Addr, TcpListener},
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut v = Vfs::default();
+        v.configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        drop(socket);
+        let direct = DirectSyscalls::default().with_network(v.direct_network());
+        let mut m = memory();
+        let hub = trames_vfs::HostEvents::new().unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(TcpTarget(hub.clone()));
+        let wait = pending(
+            direct
+                .start(
+                    63,
+                    [fd as u64, 0x1100, 1, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap(),
+        );
+        assert!(wait.native_tcp.is_some());
+        assert_eq!(v.close_quiescent_tcp(fd), None);
+        assert!(v.socket_fd(fd).is_ok());
+        // Force the old joined teardown in this component test. A same-epoch
+        // retry still uses its original accepted transport, never the reused FD.
+        v.close(fd).unwrap();
+        let replacement = v.eventfd(7, 0).unwrap();
+        assert_eq!(replacement, fd);
+        peer.write_all(b"o").unwrap();
+        hub.wait(Some(Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<1>(0x1100).unwrap(), *b"o");
+        assert_eq!(v.read(replacement, 8).unwrap(), 7u64.to_le_bytes());
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(direct.socket_completed(), 1);
+    }
+    #[test]
+    fn tcp_timeout_and_cancellation_drop_all_accepted_transport_leases() {
+        use std::{
+            io::Read,
+            net::{Ipv4Addr, TcpListener},
+        };
+        for expired in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut v = Vfs::default();
+            v.configure_network(trames_vfs::NetworkMode::Loopback)
+                .unwrap();
+            let fd = v.socket(2, 1, 0).unwrap();
+            let socket = v.socket_fd(fd).unwrap();
+            assert!(matches!(
+                socket.connect(listener.local_addr().unwrap()),
+                Ok(()) | Err(trames_net::NetError(115))
+            ));
+            let (mut peer, _) = listener.accept().unwrap();
+            assert_eq!(socket.connect_complete(), Ok(true));
+            drop(socket);
+            let direct = DirectSyscalls::default().with_network(v.direct_network());
+            let mut m = memory();
+            let target: Arc<dyn IoWake> =
+                Arc::new(TcpTarget(trames_vfs::HostEvents::new().unwrap()));
+            let result = direct
+                .start(
+                    63,
+                    [fd as u64, 0x1100, 1, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    expired.then(Instant::now),
+                )
+                .unwrap();
+            if expired {
+                assert_eq!(complete(result), Err(Errno(11)));
+            } else {
+                let wait = pending(result);
+                assert_eq!(v.close_quiescent_tcp(fd), None);
+                drop(wait);
+            }
+            assert_eq!(v.close_quiescent_tcp(fd), Some(Ok(())));
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
     }
 
     struct Target;

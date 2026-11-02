@@ -702,6 +702,12 @@ impl Socket {
         Ok(())
     }
     /// Owner-only admission: no accepted direct TCP byte request can exist.
+    /// Called with the actual Files membership locked. Every normal worker
+    /// byte admission retains Endpoint under that same lock. Snapshot controls
+    /// remain weak, and their read gate is excluded by the caller's writer.
+    pub fn quiescent_tcp(&self) -> bool {
+        (self.idle_tcp() || self.direct_tcp_admitted()) && Arc::strong_count(&self.native) == 1
+    }
     pub fn idle_tcp(&self) -> bool {
         self.kind == 1
             && self.connection.get() == Connection::Idle

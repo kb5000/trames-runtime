@@ -399,7 +399,11 @@ mod tests {
             actions: p.signals.actions.shared(),
             program_break: p.linux.program_break(),
             uts: None,
-            direct: Default::default(),
+            direct: if number == 57 {
+                trames_linux::DirectSyscalls::default().with_network(p.linux.vfs.direct_network())
+            } else {
+                Default::default()
+            },
             futex: Default::default(),
         };
         let memory = p.memory.parallel_view(&mut Default::default()).unwrap();
@@ -469,6 +473,89 @@ mod tests {
         finish(&mut k, request, control, result);
         assert_eq!(k.processes[&1].linux.vfs.fd_snapshot().len(), 4);
     }
+    #[test]
+    fn tcp_handoff_retains_lifetime_without_reusing_native_authority() {
+        use std::io::Write;
+        struct Target(Arc<trames_vfs::HostEvents>);
+        impl trames_vfs::IoWake for Target {
+            fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {}
+            fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
+                Some(self.0.clone())
+            }
+        }
+        let mut p = super::super::tests::process();
+        p.linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = p.linux.vfs.socket(2, 1, 0).unwrap();
+        let socket = p.linux.vfs.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        drop(socket);
+        let direct =
+            trames_linux::DirectSyscalls::default().with_network(p.linux.vfs.direct_network());
+        let target: Arc<dyn trames_vfs::IoWake> =
+            Arc::new(Target(trames_vfs::HostEvents::new().unwrap()));
+        let args = [fd as u64, 0x1800, 1, 0, 0, 0];
+        let trames_linux::IoAttempt::Blocked(wait) = direct
+            .start(63, args, &mut p.memory, 1, &Arc::downgrade(&target), None)
+            .unwrap()
+        else {
+            panic!("TCP wait")
+        };
+        let call = crate::run_queue::IoCall::from(&wait);
+        assert!(call.tcp_liveness.is_some());
+        drop(wait);
+        assert_eq!(p.linux.vfs.close_quiescent_tcp(fd), None);
+        p.tcp_liveness = call.tcp_liveness;
+        p.state = State::Blocked(63, args);
+        let mut k = super::super::tests::kernel();
+        let mut io = trames_linux::CapturedOutput::default();
+        k.call(1, &mut p, 63, args, &mut io);
+        assert!(p.tcp_liveness.is_some());
+        assert_eq!(p.linux.vfs.close_quiescent_tcp(fd), None);
+        peer.write_all(b"x").unwrap();
+        k.call(1, &mut p, 63, args, &mut io);
+        assert_eq!(p.cpu.x(0), 1);
+        assert!(p.tcp_liveness.is_none());
+        assert_eq!(p.memory.read_array::<1>(0x1800).unwrap(), *b"x");
+        assert_eq!(p.linux.vfs.close_quiescent_tcp(fd), Some(Ok(())));
+    }
+    #[test]
+    fn connected_tcp_close_services_finish_or_defer_before_fd_mutation() {
+        for busy in [false, true] {
+            let mut p = super::super::tests::process();
+            p.linux
+                .vfs
+                .configure_network(trames_vfs::NetworkMode::Loopback)
+                .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let fd = p.linux.vfs.socket(2, 1, 0).unwrap();
+            let socket = p.linux.vfs.socket_fd(fd).unwrap();
+            assert!(matches!(
+                socket.connect(listener.local_addr().unwrap()),
+                Ok(()) | Err(trames_net::NetError(115))
+            ));
+            let (_peer, _) = listener.accept().unwrap();
+            assert_eq!(socket.connect_complete(), Ok(true));
+            drop(socket);
+            let accepted = busy.then(|| p.linux.vfs.direct_network().get(fd).unwrap());
+            let (mut k, mut request, control) = pending(p, 57, [fd as u64, 0, 0, 0, 0, 0]);
+            let result =
+                k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
+            assert_eq!(result, if busy { None } else { Some(0) });
+            finish(&mut k, request, control, result);
+            assert_eq!(k.processes[&1].linux.vfs.socket_fd(fd).is_ok(), busy);
+            drop(accepted);
+        }
+    }
+
     #[test]
     fn idle_socket_create_close_loops_do_not_checkpoint_peer_cpus() {
         let mut p = super::super::tests::process();

@@ -300,6 +300,27 @@ impl Vfs {
         self.refresh_tcp(new);
         Ok((new, address))
     }
+    /// None defers before effects. The control writer excludes native control
+    /// operations; the Files transaction excludes a newly accepted byte lease.
+    pub fn close_quiescent_tcp(&mut self, fd: u32) -> Option<Result<()>> {
+        self.with_socket_control(fd, |v| {
+            let descriptor = match v.fds.close_if(fd, |d| {
+                d.open
+                    .borrow()
+                    .socket
+                    .as_ref()
+                    .is_some_and(|s| s.quiescent_tcp())
+            }) {
+                Ok(Some(d)) => d,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            v.release_record_locks(&descriptor);
+            drop(descriptor);
+            v.reap_detached_mounts();
+            Some(Ok(()))
+        })
+    }
     pub fn live_sockets(&self) -> usize {
         self.network.live_sockets()
     }

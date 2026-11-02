@@ -477,6 +477,8 @@ impl<C: Cpu> Pool<C> {
                                     snapshot.direct.resume(pending, work.memory.as_deref_mut().expect("worker view"))
                                 } else {
                                     let call = job.retry.take().unwrap();
+                                    let tcp_handoff=call.tcp_liveness.is_some();
+                                    let _tcp_liveness=call.tcp_liveness;
                                     if let Some(request) = call.flock {
                                         snapshot.direct.start_flock(request, call.args, work.memory.as_deref_mut().expect("worker view"),
                                             work.pid, &epoch.as_ref().unwrap().io_target)
@@ -490,7 +492,7 @@ impl<C: Cpu> Pool<C> {
                                             &epoch.as_ref().unwrap().io_target, call.deadline)
                                     } else {
                                         snapshot.direct.start(call.number, call.args, work.memory.as_deref_mut().expect("worker view"),
-                                            work.pid, &epoch.as_ref().unwrap().io_target, call.deadline).expect("admitted I/O retry")
+                                            work.pid, &epoch.as_ref().unwrap().io_target, call.deadline).unwrap_or_else(||if tcp_handoff {trames_linux::IoAttempt::Checkpoint} else {panic!("admitted I/O retry")})
                                     }
                                 };
                                 if let Some(began) = began { syscall_time += began.elapsed(); }
@@ -516,7 +518,7 @@ impl<C: Cpu> Pool<C> {
                                         work.cpu.set_x(8, call.number as u64);
                                         // A SIGPIPE/checkpoint must still reach the
                                         // original accepted OFD in the joined kernel.
-                                        job.retry = saved_call.filter(|call| call.retained_byte.is_some() || call.retained_poll.is_some());
+                                        job.retry = saved_call.filter(|call| call.retained_byte.is_some() || call.retained_poll.is_some() || call.tcp_liveness.is_some());
                                         break SliceOutcome::Syscall { instructions: 0 };
                                     }
                                 }
@@ -1232,6 +1234,7 @@ mod tests {
             deadline: None,
             flock: None,
             retained_byte: None,
+            tcp_liveness: None,
             retained_poll: None,
         });
         epoch.add(job);

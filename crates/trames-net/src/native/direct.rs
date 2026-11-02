@@ -81,16 +81,18 @@ pub struct DirectTcp {
     peer: SocketAddr,
 }
 impl Socket {
-    pub(crate) fn direct_tcp(&self) -> Option<DirectTcp> {
+    /// Pure owner metadata: also used under Files during conditional close.
+    /// Host address queries and transport I/O stay outside that table lock.
+    pub(super) fn direct_tcp_admitted(&self) -> bool {
         if self.kind != 1
             || self.connection.get() != Connection::Connected
             || self.dns_peer.get()
             || !self.dns.borrow().is_empty()
             || self.pending_error.get().is_some()
         {
-            return None;
+            return false;
         }
-        // Every firewall/route/connection/FD authority change still joins.
+        // Namespace/firewall authority changes retain their joined boundary.
         // A live ruleset can depend on packet content and conntrack; never
         // replace that decision with a cached "allow".
         if self
@@ -99,6 +101,12 @@ impl Socket {
             .as_ref()
             .is_some_and(|ns| ns.graph.borrow().firewall(ns.id()).borrow().has_rules())
         {
+            return false;
+        }
+        true
+    }
+    pub(crate) fn direct_tcp(&self) -> Option<DirectTcp> {
+        if !self.direct_tcp_admitted() {
             return None;
         }
         Some(DirectTcp {

@@ -59,6 +59,7 @@ pub(super) struct IoCall {
     pub args: [u64; 6],
     pub flock: Option<trames_vfs::FlockRequest>,
     pub retained_byte: Option<trames_linux::RetainedByte>,
+    pub tcp_liveness: Option<trames_net::TcpLease>,
     pub retained_poll: Option<trames_linux::RetainedPoll>,
     pub deadline: Option<Instant>,
 }
@@ -69,6 +70,7 @@ impl From<&trames_linux::PendingIo> for IoCall {
             args: io.args,
             flock: io.flock.clone(),
             retained_byte: io.retained_byte.clone(),
+            tcp_liveness: io.tcp_liveness(),
             retained_poll: io.retained_poll.clone(),
             deadline: io.deadline,
         }

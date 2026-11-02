@@ -472,15 +472,10 @@ impl Linux {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64>> {
         if number == 57 {
-            // No control is sent across threads. The original owner closes only
-            // idle native TCP; connected/listening/waiting sockets still join.
-            if !self.vfs.socket_fd(a[0] as u32).ok()?.idle_tcp() {
-                return None;
-            }
-            return Some(
-                self.vfs
-                    .with_socket_control(a[0] as u32, |v| v.close(a[0] as u32).map(|()| 0)),
-            );
+            return self
+                .vfs
+                .close_quiescent_tcp(a[0] as u32)
+                .map(|r| r.map(|()| 0));
         }
         if number == 198 {
             if !matches!(a[0] as u32, 2 | 10) {
@@ -936,9 +931,15 @@ mod tests {
         );
         let (_peer, _) = peer.accept().unwrap();
         assert_eq!(tcp.connect_complete(), Ok(true));
+        let accepted = linux.vfs.direct_network().get(connected).unwrap();
         assert_eq!(
             linux.network_service(57, [connected as u64, 0, 0, 0, 0, 0], &mut memory),
             None
+        );
+        drop(accepted);
+        assert_eq!(
+            linux.network_service(57, [connected as u64, 0, 0, 0, 0, 0], &mut memory),
+            Some(Ok(0))
         );
         let udp = linux.vfs.socket(2, 2, 0).unwrap();
         assert_eq!(
@@ -947,7 +948,7 @@ mod tests {
         );
         assert_eq!(
             linux.network_service(57, [9999, 0, 0, 0, 0, 0], &mut memory),
-            None
+            Some(Err(Errno(9)))
         );
     }
 

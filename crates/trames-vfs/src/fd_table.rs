@@ -758,13 +758,25 @@ impl DescriptorTable {
         Some(descriptor)
     }
     pub(super) fn close(&mut self, fd: u32) -> Result<Descriptor> {
+        Ok(self.close_if(fd, |_| true)?.expect("unconditional close"))
+    }
+    /// Admission and removal share the lookup transaction. The predicate may
+    /// inspect owner metadata only; resource teardown/callbacks occur afterward.
+    pub(super) fn close_if(
+        &mut self,
+        fd: u32,
+        allow: impl FnOnce(&Descriptor) -> bool,
+    ) -> Result<Option<Descriptor>> {
         let mut entries = self.1 .0.entries.lock().unwrap();
         let descriptor = self.descriptor(fd, entries.get(&fd).ok_or(Errno(9))?);
         descriptor.ready()?;
+        if !allow(&descriptor) {
+            return Ok(None);
+        }
         entries.remove(&fd);
         self.0.borrow_mut().entries.remove(&fd);
         self.1.changed(&mut entries);
-        Ok(descriptor)
+        Ok(Some(descriptor))
     }
     pub(super) fn duplicate(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
         let mut entries = self.1 .0.entries.lock().unwrap();

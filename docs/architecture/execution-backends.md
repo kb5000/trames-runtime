@@ -728,3 +728,38 @@ and fault ordering, filtered allow/deny entries evaluating once on the owner,
 and two CPUs doing controls without any service requests or cohort checkpoints.
 The implementation uses safe Rust and shared resource objects; no new thread,
 message bus, busy loop or guest-memory ordering rule is introduced.
+
+### Quiescent connected TCP close (2026-11-02)
+
+The existing single-caller close service now accepts connected native TCP when
+no worker transport lease is outstanding. Pure connection/DNS/firewall metadata
+admission is factored from the existing native byte capability; the close check
+performs no host address query or transport I/O under Files. Admission and FD
+removal occur in the same Files transaction. Worker TCP lookup takes its actual
+endpoint lease under that membership lock, so a new operation cannot enter
+between the quiescence check and removal. Native control operations remain
+excluded by the existing per-socket writer gate. Resource teardown, record-lock
+release and mount cleanup occur after the membership transaction.
+
+TCP byte entry now resolves one actual transport for its complete attempt,
+readiness registration, nonblocking/deadline decisions and same-cohort retries.
+Completion accounting also uses that accepted transport, without re-resolving a
+possibly reused numeric FD. Stored snapshots stay weak; ready attempts allocate
+no new wait object. Blocking requests use the existing host event subscription
+and give up their execution slot. No polling loop or new resource thread is used.
+
+A passive TcpLease also survives PendingIo -> IoCall -> Process -> queued-job
+handoffs. A task awaiting re-admission still prevents a quiescent fast close.
+That token exposes no byte/namespace policy authority: the new cohort resolves
+its current FD and policy normally, and unsupported re-admission checkpoints
+before effects. Completion, cancellation, signals and exit release it. Joined
+policy/signal behavior is preserved; this stage does not export a stale native
+TCP data capability across such transitions.
+
+Busy connections, virtual/DNS transports, listeners, connecting/failed sockets,
+rule-bearing native transports and filtered controls retain their old boundaries.
+Idle close continues through the same conditional owner path. Neither socket
+creation nor close itself is moved to a worker in this stage: it removes the
+remaining unnecessary cohort drains for quiescent connected close, while the
+owner still tears down its Rc control projection. There is no new guest quota,
+race errno, global lock or stronger guest-memory ordering.
