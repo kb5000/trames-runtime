@@ -805,7 +805,8 @@ impl Socket {
                                 .as_ref()
                                 .and_then(|v| {
                                     v.graph
-                                        .borrow()
+                                        .read()
+                                        .unwrap()
                                         .devices(v.namespace)
                                         .into_iter()
                                         .find(|d| d.addresses.iter().any(|a| a.ip == address))

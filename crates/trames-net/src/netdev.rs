@@ -1,14 +1,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Guest-owned IP link topology. Metadata is touched only by the kernel thread.
+//! Shared guest-owned topology, with namespace-local rules and connection state.
 //! Veth/bridge connectivity is explicit; a shared fabric is never all-to-all.
 use crate::{LinkStats, NetError, NetworkInfo};
 use std::{
-    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        Arc, Mutex, RwLock,
+    },
 };
+/// The same loopback flag is shared by topology and its packet-stack view.
+/// This metadata does not publish packet/guest bytes.
+pub(crate) struct Loopback(AtomicBool);
+impl Loopback {
+    pub fn new(up: bool) -> Self {
+        Self(AtomicBool::new(up))
+    }
+    pub fn get(&self) -> bool {
+        self.0.load(Relaxed)
+    }
+    pub fn set(&self, up: bool) {
+        self.0.store(up, Relaxed);
+    }
+}
 type Result<T> = std::result::Result<T, NetError>;
+/// An unchanged host interface is a read query. Recheck changed metadata under
+/// the writer before publication, without locking topology during host queries.
+pub(crate) fn refresh_native(
+    graph: &RwLock<Topology>,
+    id: u64,
+    enabled: bool,
+    info: Option<NetworkInfo>,
+) {
+    if graph.read().unwrap().direct_current(id, enabled, info) {
+        return;
+    }
+    graph.write().unwrap().refresh_direct(id, enabled, info);
+}
 #[path = "netdev_router.rs"]
 mod router;
 pub(crate) use router::NativeForward;
@@ -37,6 +66,60 @@ pub struct Device {
     pub addresses: Vec<Address>,
     pub stats: LinkStats,
 }
+// Stored links share only their actual counters. The public Device remains an
+// owned reporting snapshot, with no second mutable counter authority.
+#[derive(Default)]
+struct Counters([AtomicU64; 6]);
+impl Counters {
+    fn snapshot(&self) -> LinkStats {
+        let values = self.0.each_ref().map(|n| n.load(Relaxed));
+        LinkStats {
+            rx_bytes: values[0],
+            rx_packets: values[1],
+            rx_dropped: values[2],
+            tx_bytes: values[3],
+            tx_packets: values[4],
+            tx_dropped: values[5],
+        }
+    }
+    fn account(&self, len: usize, tx: bool, dropped: bool) {
+        let at = if tx { 3 } else { 0 };
+        self.0[at].fetch_add(len as u64, Relaxed);
+        self.0[at + 1].fetch_add(1, Relaxed);
+        self.0[at + 2].fetch_add(u64::from(dropped), Relaxed);
+    }
+}
+#[derive(Clone)]
+struct Link {
+    index: u32,
+    name: Vec<u8>,
+    namespace: u64,
+    kind: DeviceKind,
+    up: bool,
+    mtu: u32,
+    tx_queue_len: u32,
+    mac: [u8; 6],
+    master: Option<u32>,
+    addresses: Vec<Address>,
+    stats: Arc<Counters>,
+}
+impl Link {
+    fn snapshot(&self) -> Device {
+        Device {
+            index: self.index,
+            name: self.name.clone(),
+            namespace: self.namespace,
+            kind: self.kind,
+            up: self.up,
+            mtu: self.mtu,
+            tx_queue_len: self.tx_queue_len,
+            mac: self.mac,
+            master: self.master,
+            addresses: self.addresses.clone(),
+            stats: self.stats.snapshot(),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Address {
     pub ip: IpAddr,
@@ -52,12 +135,12 @@ pub struct Route {
 }
 #[derive(Clone)]
 struct Space {
-    lo: Option<Rc<Cell<bool>>>,
+    lo: Option<Arc<Loopback>>,
     routes: Vec<Route>,
     direct: bool,
     forwarding: [bool; 2],
-    firewall: Rc<RefCell<crate::nftables::Ruleset>>,
-    connections: Rc<RefCell<crate::conntrack::State>>,
+    firewall: Arc<RwLock<crate::nftables::Ruleset>>,
+    connections: Arc<Mutex<crate::conntrack::State>>,
     bridge_filter: [bool; 2],
 }
 #[derive(Clone, Default)]
@@ -65,11 +148,11 @@ pub(crate) struct Topology {
     next: u32,
     revision: u64,
     spaces: BTreeMap<u64, Space>,
-    devices: BTreeMap<(u64, u32), Device>,
+    devices: BTreeMap<(u64, u32), Link>,
 }
 #[derive(Clone)]
 pub(crate) struct View {
-    pub graph: Rc<RefCell<Topology>>,
+    pub graph: Arc<RwLock<Topology>>,
     pub namespace: u64,
 }
 impl Address {
@@ -108,6 +191,38 @@ impl Address {
     }
 }
 impl Topology {
+    fn direct_current(&self, id: u64, enabled: bool, info: Option<NetworkInfo>) -> bool {
+        let Some(space) = self.spaces.get(&id) else {
+            return true;
+        };
+        if space.direct != enabled {
+            return false;
+        }
+        if !enabled {
+            return !self.devices.contains_key(&(id, 2));
+        }
+        let Some(link) = self.devices.get(&(id, 2)) else {
+            return false;
+        };
+        let addresses = info
+            .into_iter()
+            .flat_map(|info| {
+                [
+                    Address {
+                        ip: info.ipv4.into(),
+                        prefix: info.prefix4,
+                    },
+                    Address {
+                        ip: info.ipv6.into(),
+                        prefix: info.prefix6,
+                    },
+                ]
+            })
+            .filter(|a| !a.ip.is_unspecified());
+        link.kind == DeviceKind::Direct
+            && link.mtu == info.map_or(1500, |i| i.mtu)
+            && link.addresses.iter().copied().eq(addresses)
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -131,7 +246,7 @@ impl Topology {
     pub fn can_add_space(&self) -> bool {
         self.devices.len() < MAX_LINKS
     }
-    pub fn add_space(&mut self, id: u64, lo: Option<Rc<Cell<bool>>>, info: Option<NetworkInfo>) {
+    pub fn add_space(&mut self, id: u64, lo: Option<Arc<Loopback>>, info: Option<NetworkInfo>) {
         self.changed();
         self.next = self.next.max(3);
         self.spaces.insert(
@@ -141,14 +256,14 @@ impl Topology {
                 routes: vec![],
                 direct: false,
                 forwarding: [false; 2],
-                firewall: Rc::default(),
-                connections: Rc::default(),
+                firewall: Arc::default(),
+                connections: Arc::default(),
                 bridge_filter: [true; 2],
             },
         );
         self.devices.insert(
             (id, 1),
-            Device {
+            Link {
                 index: 1,
                 name: b"lo".to_vec(),
                 namespace: id,
@@ -168,7 +283,7 @@ impl Topology {
                         prefix: 128,
                     },
                 ],
-                stats: LinkStats::default(),
+                stats: Arc::default(),
             },
         );
         if let Some(info) = info {
@@ -203,7 +318,7 @@ impl Topology {
             .collect();
             self.devices.insert(
                 (id, 2),
-                Device {
+                Link {
                     index: 2,
                     name: b"eth0".to_vec(),
                     namespace: id,
@@ -214,7 +329,7 @@ impl Topology {
                     mac: [0; 6],
                     master: None,
                     addresses,
-                    stats: LinkStats::default(),
+                    stats: Arc::default(),
                 },
             );
         }
@@ -254,7 +369,7 @@ impl Topology {
         }
         self.devices.insert(
             (id, 2),
-            Device {
+            Link {
                 index: 2,
                 name: b"eth0".to_vec(),
                 namespace: id,
@@ -265,7 +380,7 @@ impl Topology {
                 mac: [0; 6],
                 master: None,
                 addresses: addresses.clone(),
-                stats: LinkStats::default(),
+                stats: Arc::default(),
             },
         );
         let space = self.spaces.get_mut(&id).unwrap();
@@ -317,7 +432,7 @@ impl Topology {
             .filter(|ip| !ip.is_loopback())
             .collect();
         for space in self.spaces.values() {
-            space.connections.borrow_mut().remove_addresses(&ips);
+            space.connections.lock().unwrap().remove_addresses(&ips);
         }
         let links: Vec<_> = self
             .devices
@@ -334,7 +449,7 @@ impl Topology {
         self.devices
             .range((id, 0)..=(id, u32::MAX))
             .map(|(_, d)| {
-                let mut d = d.clone();
+                let mut d = d.snapshot();
                 if d.kind == DeviceKind::Loopback {
                     d.up = self.spaces[&id].lo.as_ref().is_none_or(|lo| lo.get());
                 }
@@ -394,7 +509,7 @@ impl Topology {
         self.changed();
         self.devices.insert(
             (id, index),
-            Device {
+            Link {
                 index,
                 name: name.to_vec(),
                 namespace: id,
@@ -412,7 +527,7 @@ impl Topology {
                 ],
                 master: None,
                 addresses: vec![],
-                stats: LinkStats::default(),
+                stats: Arc::default(),
             },
         );
         Ok(index)
@@ -741,10 +856,10 @@ impl Topology {
             1
         }
     }
-    pub fn connections(&self, id: u64) -> Rc<RefCell<crate::conntrack::State>> {
+    pub fn connections(&self, id: u64) -> Arc<Mutex<crate::conntrack::State>> {
         self.spaces[&id].connections.clone()
     }
-    pub fn firewall(&self, id: u64) -> Rc<RefCell<crate::nftables::Ruleset>> {
+    pub fn firewall(&self, id: u64) -> Arc<RwLock<crate::nftables::Ruleset>> {
         self.spaces[&id].firewall.clone()
     }
     pub fn peer_device(&self, index: u32) -> Option<Device> {
@@ -762,31 +877,27 @@ impl Topology {
             _ => true,
         }
     }
-    pub fn account(&mut self, id: u64, index: u32, len: usize, tx: bool, dropped: bool) {
-        if let Some(d) = self.devices.get_mut(&(id, index)) {
-            let s = &mut d.stats;
-            if tx {
-                s.tx_packets += 1;
-                s.tx_bytes += len as u64;
-                s.tx_dropped += u64::from(dropped);
-            } else {
-                s.rx_packets += 1;
-                s.rx_bytes += len as u64;
-                s.rx_dropped += u64::from(dropped);
-            }
+    pub fn account(&self, id: u64, index: u32, len: usize, tx: bool, dropped: bool) {
+        if let Some(d) = self.devices.get(&(id, index)) {
+            d.stats.account(len, tx, dropped);
         }
     }
 }
 impl View {
     pub fn own(&self, ip: IpAddr) -> bool {
-        self.graph.borrow().own(self.namespace, ip)
+        self.graph.read().unwrap().own(self.namespace, ip)
     }
     pub fn source(&self, ip: IpAddr) -> Result<IpAddr> {
-        self.graph.borrow().source(self.namespace, ip).map(|v| v.0)
+        self.graph
+            .read()
+            .unwrap()
+            .source(self.namespace, ip)
+            .map(|v| v.0)
     }
     pub fn addresses(&self, up_only: bool) -> Vec<Address> {
         self.graph
-            .borrow()
+            .read()
+            .unwrap()
             .devices(self.namespace)
             .into_iter()
             .filter(|d| !up_only || d.up)
@@ -794,3 +905,7 @@ impl View {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "netdev_shared_tests.rs"]
+mod shared_tests;

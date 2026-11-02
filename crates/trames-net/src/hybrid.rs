@@ -99,8 +99,13 @@ impl Socket {
         if !matches!(self.kind, 1 | 2) {
             return false;
         }
-        let graph = self.namespace.graph.borrow();
-        if !graph.firewall(self.namespace.id()).borrow().active(3) {
+        let graph = self.namespace.graph.read().unwrap();
+        if !graph
+            .firewall(self.namespace.id())
+            .read()
+            .unwrap()
+            .active(3)
+        {
             return false;
         }
         let peer = match peer.ip() {
@@ -139,35 +144,21 @@ impl Socket {
             IpAddr::V6(v) => v.to_ipv4_mapped().map_or(address, IpAddr::V4),
             _ => address,
         };
-        if !address.is_loopback()
-            && self
-                .namespace
-                .graph
-                .borrow()
-                .devices(self.namespace.id())
-                .iter()
-                .any(|d| {
-                    matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. })
-                        && d.addresses.iter().any(|a| a.ip == address)
-                })
-        {
+        if address.is_loopback() {
+            return false;
+        }
+        let graph = self.namespace.graph.read().unwrap();
+        if graph.devices(self.namespace.id()).iter().any(|d| {
+            matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. })
+                && d.addresses.iter().any(|a| a.ip == address)
+        }) {
             return true;
         }
-        !address.is_loopback()
-            && self
-                .namespace
-                .graph
-                .borrow()
-                .source(self.namespace.id(), address)
-                .ok()
-                .and_then(|(_, index, _)| {
-                    self.namespace
-                        .graph
-                        .borrow()
-                        .device(self.namespace.id(), index)
-                        .ok()
-                })
-                .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
+        graph
+            .source(self.namespace.id(), address)
+            .ok()
+            .and_then(|(_, index, _)| graph.device(self.namespace.id(), index).ok())
+            .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
     }
     pub fn quiescent_tcp(&self) -> bool {
         (self.idle_tcp() || self.path.get() == Path::Native)

@@ -127,8 +127,19 @@ pub(super) fn request(
     slots: usize,
     capacity: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    let shared = ns.graph.borrow().connections(ns.id());
-    let mut staged = shared.borrow().clone();
+    let shared = ns.graph.read().unwrap().connections(ns.id());
+    request_state(&shared, requests, port, admin, slots, capacity)
+}
+fn request_state(
+    shared: &std::sync::Mutex<crate::conntrack::State>,
+    requests: &[&[u8]],
+    port: u32,
+    admin: bool,
+    slots: usize,
+    capacity: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut current = shared.lock().unwrap();
+    let mut staged = current.clone();
     let mut messages = vec![];
     let mut changed = false;
     for &r in requests {
@@ -235,7 +246,7 @@ pub(super) fn request(
         return Err(NetError(105));
     }
     if changed {
-        *shared.borrow_mut() = staged;
+        *current = staged;
     }
     Ok(out)
 }
@@ -243,10 +254,67 @@ pub(super) fn request(
 mod tests {
     use super::*;
     #[test]
+    fn delete_transactions_do_not_restore_deleted_flows_or_erase_parallel_packets() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let state = Arc::new(Mutex::new(crate::conntrack::State::default()));
+        let deletes: Vec<_> = (0..64)
+            .map(|index| {
+                let packet = crate::conntrack::message(
+                    format!("172.17.0.2:{}", 40000 + index).parse().unwrap(),
+                    "198.18.0.1:80".parse().unwrap(),
+                    6,
+                    2,
+                    &[],
+                );
+                let mut state = state.lock().unwrap();
+                let flow = state.begin(&packet, 42).unwrap();
+                state.finish(flow, true);
+                let mut payload = data(2);
+                number(&mut payload, 12, flow.id as u32);
+                message(0x102, 5, index, 0, &payload)
+            })
+            .collect();
+        let start = Barrier::new(10);
+        std::thread::scope(|scope| {
+            for batch in deletes.chunks(8) {
+                let (state, start) = (&state, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for delete in batch {
+                        let out = request_state(state, &[delete], 99, true, 128, 65536).unwrap();
+                        assert_eq!(i32::from_le_bytes(out[0][16..20].try_into().unwrap()), 0);
+                    }
+                });
+            }
+            let (state, start) = (&state, &start);
+            scope.spawn(move || {
+                start.wait();
+                for index in 0..128 {
+                    let packet = crate::conntrack::message(
+                        format!("172.17.0.3:{}", 41000 + index).parse().unwrap(),
+                        "198.18.0.1:80".parse().unwrap(),
+                        6,
+                        2,
+                        &[],
+                    );
+                    let mut state = state.lock().unwrap();
+                    let flow = state.begin(&packet, 42).unwrap();
+                    state.finish(flow, true);
+                }
+            });
+            start.wait();
+        });
+        let current = state.lock().unwrap();
+        let flows = current.records();
+        assert_eq!(flows.len(), 128);
+        assert!(flows.iter().all(|(t, _)| t.original.tuple.source.ip()
+            == "172.17.0.3".parse::<std::net::IpAddr>().unwrap()));
+    }
+    #[test]
     fn original_docker_dump_replay_delete_is_scoped_atomic_and_authorized() {
         let ns = Namespace::default();
         let other = Namespace::default();
-        let shared = ns.graph.borrow().connections(ns.id());
+        let shared = ns.graph.read().unwrap().connections(ns.id());
         let p = crate::conntrack::message(
             "172.17.0.2:40000".parse().unwrap(),
             "198.18.0.1:80".parse().unwrap(),
@@ -254,8 +322,8 @@ mod tests {
             2,
             b"",
         );
-        let t = shared.borrow_mut().begin(&p, 42).unwrap();
-        shared.borrow_mut().finish(t, true);
+        let t = shared.lock().unwrap().begin(&p, 42).unwrap();
+        shared.lock().unwrap().finish(t, true);
         let dump = message(0x101, 0x301, 10, 0, &data(2));
         let replies = request(&ns, &[&dump], 99, true, 128, 65536).unwrap();
         assert_eq!(replies.len(), 1);
@@ -281,11 +349,11 @@ mod tests {
             -1
         );
         assert_eq!(request(&ns, &[&delete], 99, true, 0, 0), Err(NetError(105)));
-        assert_eq!(shared.borrow().records().len(), 1);
+        assert_eq!(shared.lock().unwrap().records().len(), 1);
         assert_eq!(
             error(request(&ns, &[&delete], 99, true, 128, 65536).unwrap()),
             0
         );
-        assert!(shared.borrow().records().is_empty());
+        assert!(shared.lock().unwrap().records().is_empty());
     }
 }

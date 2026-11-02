@@ -404,9 +404,11 @@ impl Socket {
         };
         if !namespace
             .graph
-            .borrow()
+            .read()
+            .unwrap()
             .firewall(namespace.id())
-            .borrow()
+            .read()
+            .unwrap()
             .has_rules()
         {
             return Ok(());
@@ -445,7 +447,8 @@ impl Socket {
             } else {
                 namespace
                     .graph
-                    .borrow()
+                    .read()
+                    .unwrap()
                     .source(namespace.id(), peer.ip())
                     .map(|v| v.0)
                     .unwrap_or(local.ip())
@@ -468,11 +471,12 @@ impl Socket {
             .get(&(local, peer))
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(300))
             .map(|(f, _)| *f);
-        let result =
-            namespace
-                .graph
-                .borrow()
-                .native_policy(namespace.id(), input, &mut packet, binding);
+        let result = namespace.graph.read().unwrap().native_policy(
+            namespace.id(),
+            input,
+            &mut packet,
+            binding,
+        );
         if let Some(forward) = result {
             if input {
                 let mut cache = self.policy_forward.borrow_mut();

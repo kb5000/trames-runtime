@@ -88,7 +88,7 @@ struct Namespace {
     live: Cell<usize>,
     finished: Cell<bool>,
     isolated: Cell<bool>,
-    loopback_up: Rc<Cell<bool>>,
+    loopback_up: std::sync::Arc<crate::netdev::Loopback>,
     routing: Option<crate::netdev::View>,
 }
 #[derive(Clone)]
@@ -289,7 +289,7 @@ impl Fabric {
             live: Cell::new(0),
             finished: Cell::new(false),
             isolated: Cell::new(false),
-            loopback_up: Rc::new(Cell::new(true)),
+            loopback_up: std::sync::Arc::new(crate::netdev::Loopback::new(true)),
             routing: None,
         });
         node.owner = Rc::downgrade(&ns);
@@ -300,7 +300,7 @@ impl Fabric {
         &self,
         mode: NetworkMode,
         routing: crate::netdev::View,
-        loopback_up: Rc<Cell<bool>>,
+        loopback_up: std::sync::Arc<crate::netdev::Loopback>,
     ) -> Result<Network> {
         let mut i = self.0.borrow_mut();
         if i.nodes.len() >= 128 {
@@ -508,10 +508,11 @@ impl Inner {
                     }
                     let original = crate::conntrack::key(&p);
                     let incoming = routed_reply.as_ref().map(|r| r.1);
-                    delivery = view
-                        .graph
-                        .borrow()
-                        .route_packet(view.namespace, incoming, &mut p);
+                    delivery =
+                        view.graph
+                            .read()
+                            .unwrap()
+                            .route_packet(view.namespace, incoming, &mut p);
                     let Some(route) = delivery else {
                         self.stats.dropped += 1;
                         continue;
@@ -557,7 +558,7 @@ impl Inner {
                         n.owner.upgrade().and_then(|ns| {
                             ns.routing.as_ref().and_then(|r| {
                                 (r.namespace == route.namespace
-                                    && Rc::ptr_eq(&r.graph, &view.graph))
+                                    && std::sync::Arc::ptr_eq(&r.graph, &view.graph))
                                 .then_some(key)
                             })
                         })
@@ -631,7 +632,7 @@ impl Inner {
                     let size = p.len() as u64;
                     let dropped = !permitted || !enabled || !node.port.receive_packet(p);
                     if let (Some(view), Some(path)) = (&dynamic, delivery) {
-                        let mut graph = view.graph.borrow_mut();
+                        let graph = view.graph.read().unwrap();
                         graph.account(view.namespace, path.output, size as usize, true, dropped);
                         graph.account(path.namespace, path.input, size as usize, false, dropped);
                     }
@@ -707,7 +708,7 @@ impl Node {
             return;
         };
         let Some(view) = &owner.routing else { return };
-        let revision = view.graph.borrow().revision();
+        let revision = view.graph.read().unwrap().revision();
         if !self.configuration_pending
             && self.configuration_revision == revision
             && self.configuration_lo == owner.loopback_up.get()

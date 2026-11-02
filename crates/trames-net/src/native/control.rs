@@ -18,11 +18,15 @@ impl Socket {
             DirectControl {
                 socket: Arc::downgrade(&self.native),
                 family: self.family,
-                unfiltered: !self
-                    .policy
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|ns| ns.graph.borrow().firewall(ns.id()).borrow().has_rules()),
+                unfiltered: !self.policy.borrow().as_ref().is_some_and(|ns| {
+                    ns.graph
+                        .read()
+                        .unwrap()
+                        .firewall(ns.id())
+                        .read()
+                        .unwrap()
+                        .has_rules()
+                }),
                 links: self.network.0.links.clone(),
                 timeouts: [None; 2],
                 options: None,

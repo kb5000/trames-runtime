@@ -6,7 +6,33 @@ use crate::{
     netlink::{attr, message, Namespace},
     NetError,
 };
-use std::{cell::Cell, cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
+// Counters are independent accounting metadata, not packet publication.
+#[derive(Default)]
+struct Counter(AtomicU64);
+impl Counter {
+    fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+    fn get(&self) -> u64 {
+        self.0.load(Relaxed)
+    }
+    fn set(&self, value: u64) {
+        self.0.store(value, Relaxed);
+    }
+    fn add(&self, value: u64) {
+        self.0.fetch_add(value, Relaxed);
+    }
+}
+impl Clone for Counter {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
 type Result<T> = std::result::Result<T, NetError>;
 #[path = "nft_conntrack.rs"]
 mod ctnetlink;
@@ -101,8 +127,8 @@ struct Chain {
     chain_type: String,
     userdata: Vec<u8>,
     rules: Vec<Rule>,
-    packets: Cell<u64>,
-    bytes: Cell<u64>,
+    packets: Counter,
+    bytes: Counter,
 }
 #[derive(Clone)]
 struct Rule {
@@ -182,8 +208,8 @@ enum Expr {
         port_max: Option<usize>,
     },
     Counter {
-        packets: Cell<u64>,
-        bytes: Cell<u64>,
+        packets: Counter,
+        bytes: Counter,
     },
 }
 fn reg(n: u32, len: usize) -> Result<usize> {
@@ -545,8 +571,8 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
             "counter" => {
                 let a = fields(data, &[1, 2, 3])?;
                 Expr::Counter {
-                    bytes: Cell::new(get(&a, 1).map(u64v).transpose()?.unwrap_or(0)),
-                    packets: Cell::new(get(&a, 2).map(u64v).transpose()?.unwrap_or(0)),
+                    bytes: Counter::new(get(&a, 1).map(u64v).transpose()?.unwrap_or(0)),
+                    packets: Counter::new(get(&a, 2).map(u64v).transpose()?.unwrap_or(0)),
                 }
             }
             _ => return Err(NetError(95)),
@@ -775,7 +801,7 @@ impl Ruleset {
     }
     fn execute(
         &mut self,
-        ns: &Namespace,
+        packet_hooks: bool,
         r: &[u8],
         port: u32,
         batch: bool,
@@ -987,7 +1013,7 @@ impl Ruleset {
                 let typ = get(&a, 7).map(text).transpose()?;
                 // Native BSD socket I/O does not pass through the packet stack.
                 // Root hooks other than FORWARD cannot yet be promised safely.
-                if h.is_some_and(|(hook, _)| !ns.nft_packet_hooks.get() || hook > 4)
+                if h.is_some_and(|(hook, _)| !packet_hooks || hook > 4)
                     || typ
                         .as_deref()
                         .is_some_and(|v| !matches!(v, "filter" | "nat"))
@@ -1062,8 +1088,8 @@ impl Ruleset {
                             chain_type: typ.unwrap_or_else(|| "filter".to_owned()),
                             userdata: userdata.unwrap_or_default(),
                             rules: vec![],
-                            packets: Cell::new(packets),
-                            bytes: Cell::new(bytes),
+                            packets: Counter::new(packets),
+                            bytes: Counter::new(bytes),
                         },
                     );
                 }
@@ -1197,9 +1223,33 @@ pub(crate) fn request(
     if requests.iter().all(|r| kind(r) >> 8 == 1) {
         return ctnetlink::request(ns, requests, port, admin, slots, capacity);
     }
-    let shared = ns.graph.borrow().firewall(ns.id());
-    let mut staged = shared.borrow().clone();
+    let shared = ns.graph.read().unwrap().firewall(ns.id());
+    request_rules(
+        &shared,
+        ns.nft_packet_hooks.get(),
+        requests,
+        port,
+        admin,
+        slots,
+        capacity,
+    )
+}
+// The actual object transaction, also usable without a namespace owner graph.
+fn request_rules(
+    shared: &std::sync::RwLock<Ruleset>,
+    packet_hooks: bool,
+    requests: &[&[u8]],
+    port: u32,
+    admin: bool,
+    slots: usize,
+    capacity: usize,
+) -> Result<Vec<Vec<u8>>> {
     let batch = kind(requests[0]) == 16;
+    let mut publication = batch.then(|| shared.write().unwrap());
+    let mut staged = match &publication {
+        Some(current) => (**current).clone(),
+        None => shared.read().unwrap().clone(),
+    };
     let mut out = vec![];
     let mut error = None;
     let mut mutated = false;
@@ -1232,7 +1282,7 @@ pub(crate) fn request(
             if batch && !matches!(kind(r) & 255, 0 | 2 | 3 | 5 | 6 | 8) {
                 return Err(NetError(95));
             }
-            let generated = staged.execute(ns, r, port, batch)?;
+            let generated = staged.execute(packet_hooks, r, port, batch)?;
             mutated |= batch;
             Ok(generated)
         })();
@@ -1283,7 +1333,7 @@ pub(crate) fn request(
             .flat_map(|t| t.chains.values())
             .filter_map(|c| c.hook)
             .fold(0, |mask, (h, _)| mask | (1 << h));
-        *shared.borrow_mut() = staged;
+        **publication.as_mut().unwrap() = staged;
     }
     Ok(out)
 }
@@ -1482,8 +1532,8 @@ impl Ruleset {
                 return false;
             }
             if v < 0 {
-                c.packets.set(c.packets.get().wrapping_add(1));
-                c.bytes.set(c.bytes.get().wrapping_add(packet.len() as u64));
+                c.packets.add(1);
+                c.bytes.add(packet.len() as u64);
                 if c.policy == 0 {
                     return false;
                 }
@@ -1753,8 +1803,8 @@ impl Rule {
                     return Some((1, None));
                 }
                 Expr::Counter { packets, bytes } => {
-                    packets.set(packets.get().wrapping_add(1));
-                    bytes.set(bytes.get().wrapping_add(ctx.packet.len() as u64));
+                    packets.add(1);
+                    bytes.add(ctx.packet.len() as u64);
                 }
                 Expr::Verdict(-1, _) => {}
                 Expr::Verdict(code, chain) => return Some((*code, chain.as_deref())),
@@ -1828,9 +1878,8 @@ impl Ruleset {
                 return false;
             }
             if v < 0 {
-                c.packets.set(c.packets.get().wrapping_add(1));
-                c.bytes
-                    .set(c.bytes.get().wrapping_add(ctx.packet.len() as u64));
+                c.packets.add(1);
+                c.bytes.add(ctx.packet.len() as u64);
                 if c.policy == 0 {
                     return false;
                 }

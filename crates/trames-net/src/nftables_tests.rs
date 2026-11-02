@@ -61,6 +61,115 @@ fn batch(ns: &Namespace, r: &[Vec<u8>]) -> Vec<Vec<u8>> {
     rs.push(&end);
     request(ns, &rs, 1, true, 128, MAX_BYTES).unwrap()
 }
+fn shared_batch(shared: &std::sync::RwLock<Ruleset>, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let start = message(16, 1, 1, 0, &[0, 0, 0, 10]);
+    let end = message(17, 1, 100, 0, &[0, 0, 0, 10]);
+    let mut requests = vec![start.as_slice()];
+    requests.extend(r.iter().map(Vec::as_slice));
+    requests.push(&end);
+    request_rules(shared, true, &requests, 1, true, 128, MAX_BYTES)
+}
+#[test]
+fn concurrent_rule_batches_preserve_every_commit_and_generation() {
+    let rules = std::sync::Arc::new(std::sync::RwLock::new(Ruleset::default()));
+    let start = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            let (rules, start) = (&rules, &start);
+            scope.spawn(move || {
+                let name = format!("worker-{index}");
+                start.wait();
+                assert_eq!(errno(&shared_batch(rules, &[table(&name)]).unwrap()), 0);
+            });
+        }
+        start.wait();
+    });
+    let current = rules.read().unwrap();
+    assert_eq!(current.generation, 8);
+    assert_eq!(current.tables.len(), 8);
+    for index in 0..8 {
+        assert!(current.tables.contains_key(&(2, format!("worker-{index}"))));
+    }
+    drop(current);
+    assert_eq!(
+        errno(
+            &shared_batch(
+                &rules,
+                &[table("rollback"), chain("rollback", "bad", Some(5), 0, 1)]
+            )
+            .unwrap()
+        ),
+        -95
+    );
+    assert_eq!(rules.read().unwrap().generation, 8);
+    assert!(!rules
+        .read()
+        .unwrap()
+        .tables
+        .contains_key(&(2, "rollback".into())));
+}
+#[test]
+fn counters_keep_parallel_packets_across_live_rule_publication() {
+    let rules = std::sync::Arc::new(std::sync::RwLock::new(Ruleset::default()));
+    assert_eq!(
+        errno(
+            &shared_batch(
+                &rules,
+                &[
+                    table("filter"),
+                    chain("filter", "out", Some(3), 0, 1),
+                    rule("filter", "out", &expression("counter", &[]))
+                ]
+            )
+            .unwrap()
+        ),
+        0
+    );
+    let start = std::sync::Barrier::new(6);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let (rules, start) = (&rules, &start);
+            scope.spawn(move || {
+                let packet = packet();
+                let ctx = Context {
+                    packet: &packet,
+                    hook: 3,
+                    input: 0,
+                    output: 1,
+                    input_name: &[],
+                    output_name: b"lo",
+                    track: None,
+                    source_type: 1,
+                    destination_type: 1,
+                    masquerade: None,
+                };
+                start.wait();
+                for _ in 0..2000 {
+                    assert!(rules.read().unwrap().allows(&ctx));
+                }
+            });
+        }
+        let (rules, start) = (&rules, &start);
+        scope.spawn(move || {
+            start.wait();
+            for index in 0..4 {
+                assert_eq!(
+                    errno(&shared_batch(rules, &[table(&format!("aux-{index}"))]).unwrap()),
+                    0
+                );
+            }
+        });
+        start.wait();
+    });
+    let current = rules.read().unwrap();
+    let chain = &current.tables[&(2, "filter".into())].chains["out"];
+    let Expr::Counter { packets, bytes } = &chain.rules[0].expressions[0] else {
+        panic!("counter")
+    };
+    assert_eq!(packets.get(), 8000);
+    assert_eq!(bytes.get(), 8000 * packet().len() as u64);
+    assert_eq!(current.generation, 5);
+}
 fn errno(r: &[Vec<u8>]) -> i32 {
     if r.is_empty() {
         0
@@ -83,9 +192,11 @@ fn packet() -> Vec<u8> {
 }
 fn allows(ns: &Namespace, hook: u32) -> bool {
     ns.graph
-        .borrow()
+        .read()
+        .unwrap()
         .firewall(ns.id())
-        .borrow()
+        .read()
+        .unwrap()
         .allows(&Context {
             packet: &packet(),
             hook,
@@ -103,7 +214,7 @@ fn allows(ns: &Namespace, hook: u32) -> bool {
 fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
     let n = Namespace::default();
     let other = Namespace::default();
-    let before = n.graph.borrow().firewall(n.id());
+    let before = n.graph.read().unwrap().firewall(n.id());
     assert_eq!(
         errno(&batch(
             &n,
@@ -113,7 +224,7 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
     );
     assert!(!allows(&n, 3));
     assert!(allows(&other, 3));
-    assert_eq!(before.borrow().generation, 1);
+    assert_eq!(before.read().unwrap().generation, 1);
     assert_eq!(
         errno(&batch(
             &n,
@@ -124,8 +235,8 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
         )),
         -95
     );
-    assert_eq!(before.borrow().generation, 1);
-    assert_eq!(before.borrow().tables.len(), 1);
+    assert_eq!(before.read().unwrap().generation, 1);
+    assert_eq!(before.read().unwrap().tables.len(), 1);
     let mut gen = vec![];
     number(&mut gen, 1, 0);
     let mut begin = vec![0, 0, 0, 10];
@@ -149,8 +260,8 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
         request(&n, &[&begin, &create, &end], 1, true, 0, 0),
         Err(NetError(105))
     );
-    assert_eq!(before.borrow().generation, 1);
-    assert_eq!(before.borrow().tables.len(), 1);
+    assert_eq!(before.read().unwrap().generation, 1);
+    assert_eq!(before.read().unwrap().tables.len(), 1);
 }
 #[test]
 fn jumps_priorities_live_counters_and_payload_match() {
@@ -180,8 +291,8 @@ fn jumps_priorities_live_counters_and_payload_match() {
     assert_eq!(errno(&batch(&n, &setup)), 0);
     assert!(!allows(&n, 3));
     assert!(allows(&n, 1));
-    let state = n.graph.borrow().firewall(n.id());
-    let state = state.borrow();
+    let state = n.graph.read().unwrap().firewall(n.id());
+    let state = state.read().unwrap();
     let t = &state.tables[&(2, "filter".into())];
     let r = &t.chains["user"].rules[0];
     assert!(
@@ -217,7 +328,15 @@ fn cycles_invalid_registers_and_native_hooks_are_rejected_atomically() {
         rule("f", "b", &verdict(-4, Some("a"))),
     ];
     assert_eq!(errno(&batch(&n, &setup)), -40);
-    assert!(n.graph.borrow().firewall(n.id()).borrow().tables.is_empty());
+    assert!(n
+        .graph
+        .read()
+        .unwrap()
+        .firewall(n.id())
+        .read()
+        .unwrap()
+        .tables
+        .is_empty());
     let mut cmp = vec![];
     number(&mut cmp, 1, 23);
     number(&mut cmp, 2, 0);
@@ -293,7 +412,8 @@ fn routed_filter_blocks_active_tcp_without_touching_native_path() {
     assign(&b, bi, "172.25.0.2", 24);
     for (n, dev, gw) in [(&a, ai, "172.24.0.1"), (&b, bi, "172.25.0.1")] {
         n.1.graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .route(
                 n.namespace_id(),
                 crate::netdev::Route {

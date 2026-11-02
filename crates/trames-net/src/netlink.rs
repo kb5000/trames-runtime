@@ -16,10 +16,10 @@ pub(super) struct Namespace {
     pub(crate) nft_packet_hooks: Cell<bool>,
     // Netlink sockets also pin the complete stack, not just link metadata.
     pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
-    pub(crate) graph: Rc<RefCell<crate::netdev::Topology>>,
+    pub(crate) graph: std::sync::Arc<std::sync::RwLock<crate::netdev::Topology>>,
     pub(crate) fabric: Rc<RefCell<Option<Fabric>>>,
     listeners: Rc<RefCell<Vec<Weak<Socket>>>>,
-    loopback: Option<Rc<Cell<bool>>>,
+    loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
     pub(super) ping_range: Cell<[u32; 2]>,
     pub(super) unprivileged_port: Cell<u16>,
     quota: Rc<Cell<usize>>,
@@ -30,8 +30,8 @@ pub(super) struct Namespace {
 impl Default for Namespace {
     fn default() -> Self {
         let id = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
-        let graph = Rc::new(RefCell::new(crate::netdev::Topology::default()));
-        graph.borrow_mut().add_space(id, None, None);
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(crate::netdev::Topology::default()));
+        graph.write().unwrap().add_space(id, None, None);
         Self {
             id,
             native: std::cell::OnceCell::new(),
@@ -52,8 +52,8 @@ impl Default for Namespace {
     }
 }
 impl Namespace {
-    pub fn isolated(&self, loopback: Rc<Cell<bool>>) -> Result<Self> {
-        if !self.graph.borrow().can_add_space() {
+    pub fn isolated(&self, loopback: std::sync::Arc<crate::netdev::Loopback>) -> Result<Self> {
+        if !self.graph.read().unwrap().can_add_space() {
             return Err(NetError(28));
         }
         if self.quota.get() >= 128 {
@@ -67,7 +67,8 @@ impl Namespace {
         namespace.listeners = self.listeners.clone();
         namespace
             .graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .add_space(namespace.id(), Some(loopback.clone()), None);
         namespace.loopback = Some(loopback);
         namespace.ping_range.set([1, 0]);
@@ -75,10 +76,12 @@ impl Namespace {
     }
     pub fn refresh_native(&self) {
         if let Some(n) = self.native.get() {
-            self.graph.borrow_mut().refresh_direct(
+            let info = n.info();
+            crate::netdev::refresh_native(
+                &self.graph,
                 self.id(),
                 matches!(n.mode(), NetworkMode::Full | NetworkMode::Outbound),
-                n.info(),
+                info,
             );
         }
     }
@@ -98,7 +101,11 @@ impl Namespace {
             graph: self.graph.clone(),
             namespace: self.id(),
         };
-        let stack = fabric.dynamic_environment(n.mode(), view, Rc::new(Cell::new(true)))?;
+        let stack = fabric.dynamic_environment(
+            n.mode(),
+            view,
+            std::sync::Arc::new(crate::netdev::Loopback::new(true)),
+        )?;
         self.stack
             .set(stack.clone())
             .ok()
@@ -131,7 +138,7 @@ impl Drop for Namespace {
             stack.finish();
         }
         let changes = {
-            let mut graph = self.graph.borrow_mut();
+            let mut graph = self.graph.write().unwrap();
             let removed = graph.removed_with_space(self.id());
             graph.remove_space(self.id());
             removed

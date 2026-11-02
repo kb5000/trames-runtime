@@ -31,7 +31,7 @@ impl Topology {
     ) -> bool {
         let (hook, raw) = stage;
         let (input, output) = devices;
-        self.spaces[&namespace].firewall.borrow().process(
+        self.spaces[&namespace].firewall.read().unwrap().process(
             packet,
             &Hook {
                 graph: self,
@@ -54,7 +54,7 @@ impl Topology {
     ) -> Option<(u32, Option<IpAddr>, Track)> {
         let k = conntrack::key(packet)?;
         let connection = self.spaces[&namespace].connections.clone();
-        let mut state = connection.borrow_mut();
+        let mut state = connection.lock().unwrap();
         let initial_out = self
             .source(namespace, k.tuple.destination.ip())
             .map(|(_, i, _)| i)
@@ -174,7 +174,7 @@ impl Topology {
                 // and input. Starting a second flow from the translated tuple
                 // would steal the reply index and break Docker's DNS redirect.
                 let connections = self.spaces[&ns].connections.clone();
-                let mut state = connections.borrow_mut();
+                let mut state = connections.lock().unwrap();
                 let accepted = self.hook(ns, (0, true), (1, 0), packet, &mut track, &mut state)
                     && self.hook(ns, (0, false), (1, 0), packet, &mut track, &mut state)
                     && self.hook(ns, (1, false), (1, 0), packet, &mut track, &mut state);
@@ -219,7 +219,7 @@ impl Topology {
     }
     fn bridge_packet(&self, ns: u64, bridge: u32, packet: &mut [u8]) -> Option<()> {
         let connection = self.spaces[&ns].connections.clone();
-        let mut state = connection.borrow_mut();
+        let mut state = connection.lock().unwrap();
         let key = conntrack::key(packet)?;
         let mut raw = Track::untracked(key, 0);
         if !self.hook(ns, (0, true), (bridge, 0), packet, &mut raw, &mut state) {
@@ -304,14 +304,14 @@ impl Topology {
         // connection state change until the real SYN/datagram enters the stack.
         let mut copy = self.clone();
         let space = copy.spaces.get_mut(&ns).unwrap();
-        let firewall = space.firewall.borrow().clone();
-        space.firewall = Rc::new(RefCell::new(firewall));
+        let firewall = space.firewall.read().unwrap().clone();
+        space.firewall = Arc::new(RwLock::new(firewall));
         let connections = if bound {
-            space.connections.borrow().clone()
+            space.connections.lock().unwrap().clone()
         } else {
             crate::conntrack::State::default()
         };
-        space.connections = Rc::new(RefCell::new(connections));
+        space.connections = Arc::new(Mutex::new(connections));
         let Some((_, _, t)) = copy.route_namespace(ns, None, packet, false) else {
             return false;
         };

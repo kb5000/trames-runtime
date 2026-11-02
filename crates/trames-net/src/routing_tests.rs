@@ -7,7 +7,8 @@ fn addr(ip: &str, port: u16) -> SocketAddr {
 }
 pub(super) fn assign(n: &Network, index: u32, ip: &str, prefix: u8) {
     n.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .address(
             n.namespace_id(),
             index,
@@ -25,12 +26,14 @@ pub(super) fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32
     let (a, b) = root
         .1
         .graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .create_veth(root.namespace_id(), name, n.namespace_id(), b"eth0")
         .unwrap();
     root.1
         .graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .change_link(
             root.namespace_id(),
             a,
@@ -49,7 +52,8 @@ pub(super) fn bridge(root: &Network, name: &[u8]) -> u32 {
     let i = root
         .1
         .graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .create_bridge(root.namespace_id(), name)
         .unwrap();
     root.set_device_up(i, true).unwrap();
@@ -111,27 +115,18 @@ fn bridge_controls_real_tcp_udp_and_live_link_isolation() {
     b.set_device_up(bi, true).unwrap();
     tx.send(b"up", 0, Some(addr("192.0.2.20", 14002))).unwrap();
     assert_eq!(udp.recv(30, 0).unwrap().data, b"up");
-    let host_peer = root
-        .1
-        .graph
-        .borrow()
-        .peer_device(
-            match b
-                .1
-                .graph
-                .borrow()
-                .device(b.namespace_id(), bi)
-                .unwrap()
-                .kind
-            {
-                DeviceKind::Veth { peer } => peer,
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
+    let host_peer = {
+        let graph = root.1.graph.read().unwrap();
+        let peer = match graph.device(b.namespace_id(), bi).unwrap().kind {
+            DeviceKind::Veth { peer } => peer,
+            _ => unreachable!(),
+        };
+        graph.peer_device(peer).unwrap()
+    };
     root.1
         .graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .change_link(
             root.namespace_id(),
             host_peer.index,
@@ -178,7 +173,8 @@ fn ipv6_duplicate_ports_and_address_removal_are_namespace_scoped() {
         "fd42::a".parse::<IpAddr>().unwrap()
     );
     b.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .address(
             b.namespace_id(),
             bi,
@@ -286,7 +282,7 @@ fn netlink_pair_move_and_rejection_are_atomic_and_notify_subscribers() {
     assert_eq!(wire(&s, 16, 0x600, &data, true, Some(&n)), -17);
     assert!(root.devices().iter().all(|d| d.name != b"edge0"));
     let ns = n.namespace_id();
-    let mut g = n.1.graph.borrow_mut();
+    let mut g = n.1.graph.write().unwrap();
     g.remove_link(ns, peer.index).unwrap();
     assert!(g.device(ns, edge.index).is_err());
 }
@@ -343,7 +339,8 @@ fn docker_link_strings_and_queue_metadata_are_validated_and_atomic() {
     assert_eq!(
         root.1
             .graph
-            .borrow()
+            .read()
+            .unwrap()
             .device(root.namespace_id(), br.index)
             .unwrap()
             .tx_queue_len,
@@ -363,12 +360,13 @@ fn docker_link_strings_and_queue_metadata_are_validated_and_atomic() {
     let link = root
         .1
         .graph
-        .borrow()
+        .read()
+        .unwrap()
         .device(root.namespace_id(), br.index)
         .unwrap();
     assert_eq!(link.tx_queue_len, 23);
     assert_eq!(link.name, b"docker-renamed");
-    let reply = rtnetlink::link_data(&root.1.graph.borrow(), &link);
+    let reply = rtnetlink::link_data(&root.1.graph.read().unwrap(), &link);
     assert!(reply.windows(8).any(|v| v == [8, 0, 13, 0, 23, 0, 0, 0]));
     assert_eq!(wire(&s, 19, 0, &update(2, 23, None), true, None), -95);
 
@@ -485,7 +483,8 @@ fn route_get_uses_namespace_routes_and_selected_source_without_mutating_them() {
         );
     }
     n.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .route(
             n.namespace_id(),
             netdev::Route {
@@ -564,7 +563,8 @@ fn routes_require_configuration_and_namespace_teardown_removes_veth_peer() {
     assign(&n, i, "172.23.0.2", 24);
     assert_eq!(
         n.1.graph
-            .borrow()
+            .read()
+            .unwrap()
             .source(n.namespace_id(), "203.0.113.1".parse().unwrap()),
         Err(NetError(101))
     );
@@ -579,12 +579,14 @@ fn routes_require_configuration_and_namespace_teardown_removes_veth_peer() {
         protocol: 3,
     };
     n.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .route(n.namespace_id(), route, true, false, false)
         .unwrap();
     assert_eq!(
         n.1.graph
-            .borrow()
+            .read()
+            .unwrap()
             .source(n.namespace_id(), "203.0.113.1".parse().unwrap())
             .unwrap()
             .2,
@@ -628,7 +630,8 @@ fn explicit_static_routes_work_and_teardown_notifies_without_enabling_host_egres
         protocol: 3,
     };
     a.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .route(a.namespace_id(), route, true, false, false)
         .unwrap();
     client
@@ -636,7 +639,8 @@ fn explicit_static_routes_work_and_teardown_notifies_without_enabling_host_egres
         .unwrap();
     assert_eq!(server.recv(30, 0).unwrap().data, b"static");
     a.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .route(a.namespace_id(), route, false, false, false)
         .unwrap();
     assert_eq!(

@@ -96,7 +96,7 @@ impl Network {
             }
             shared.as_ref().unwrap().clone()
         };
-        let loopback = Rc::new(std::cell::Cell::new(false));
+        let loopback = std::sync::Arc::new(netdev::Loopback::new(false));
         let namespace = Rc::new(self.1.isolated(loopback.clone())?);
         let view = netdev::View {
             graph: namespace.graph.clone(),
@@ -112,13 +112,13 @@ impl Network {
     }
     pub fn devices(&self) -> Vec<Device> {
         self.1.refresh_native();
-        self.1.graph.borrow().devices(self.namespace_id())
+        self.1.graph.read().unwrap().devices(self.namespace_id())
     }
     pub fn set_device_up(&self, index: u32, up: bool) -> Result<()> {
         if self.1.native.get().is_some() {
             self.1.root_stack()?;
         }
-        self.1.graph.borrow_mut().change_link(
+        self.1.graph.write().unwrap().change_link(
             self.namespace_id(),
             index,
             None,
@@ -140,7 +140,8 @@ impl Network {
         let namespace = Rc::new(netlink::Namespace::default());
         namespace
             .graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .add_space(namespace.id(), None, native.info());
         namespace
             .native
@@ -156,7 +157,8 @@ impl Network {
         namespace.nft_packet_hooks.set(false);
         namespace
             .graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .add_space(namespace.id(), None, Some(stack.info()));
         namespace
             .stack
@@ -166,32 +168,39 @@ impl Network {
         Ok(Self(Backend::Virtual(stack), namespace))
     }
     pub fn forwarding(&self, ipv6: bool) -> bool {
-        self.1.graph.borrow().forwarding(self.namespace_id(), ipv6)
+        self.1
+            .graph
+            .read()
+            .unwrap()
+            .forwarding(self.namespace_id(), ipv6)
     }
     pub fn set_forwarding(&self, ipv6: bool, enabled: bool) {
         self.1
             .graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .set_forwarding(self.namespace_id(), ipv6, enabled);
     }
     pub fn bridge_filter(&self, ipv6: bool) -> bool {
         self.1
             .graph
-            .borrow()
+            .read()
+            .unwrap()
             .bridge_filter(self.namespace_id(), ipv6)
     }
     pub fn set_bridge_filter(&self, ipv6: bool, enabled: bool) {
         self.1
             .graph
-            .borrow_mut()
+            .write()
+            .unwrap()
             .set_bridge_filter(self.namespace_id(), ipv6, enabled);
     }
     pub fn routes(&self) -> Vec<DeviceRoute> {
         self.1.refresh_native();
-        self.1.graph.borrow().routes(self.namespace_id())
+        self.1.graph.read().unwrap().routes(self.namespace_id())
     }
     pub fn device_carrier(&self, d: &Device) -> bool {
-        self.1.graph.borrow().carrier(d)
+        self.1.graph.read().unwrap().carrier(d)
     }
     pub fn live_sockets(&self) -> usize {
         self.1.socket_count.live()
@@ -361,7 +370,7 @@ impl Socket {
         mut info: PacketInfo,
     ) -> Result<usize> {
         self.namespace.refresh_native();
-        let graph = self.namespace.graph.borrow();
+        let graph = self.namespace.graph.read().unwrap();
         let owned_ip = match info.address {
             std::net::IpAddr::V6(ip) => ip
                 .to_ipv4_mapped()

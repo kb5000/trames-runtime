@@ -105,12 +105,15 @@ impl Socket {
         // Namespace/firewall authority changes retain their joined boundary.
         // A live ruleset can depend on packet content and conntrack; never
         // replace that decision with a cached "allow".
-        if self
-            .policy
-            .borrow()
-            .as_ref()
-            .is_some_and(|ns| ns.graph.borrow().firewall(ns.id()).borrow().has_rules())
-        {
+        if self.policy.borrow().as_ref().is_some_and(|ns| {
+            ns.graph
+                .read()
+                .unwrap()
+                .firewall(ns.id())
+                .read()
+                .unwrap()
+                .has_rules()
+        }) {
             return false;
         }
         true

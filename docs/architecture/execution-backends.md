@@ -951,3 +951,57 @@ Remaining work is complete Linux namespace/policy ownership, shared socket OFD
 publication and production factory/control/accept routing, plus Unix/task/VM
 ownership. These prerequisites do not themselves remove more cohort joins or
 establish an application performance gain.
+
+## Shared routing, filtering and connection tracking (2026-11-02)
+
+The actual topology and View now use Arc/RwLock ownership. Spaces retain the
+same Arc rule and connection-state objects, with no owner Rc/RefCell graph in
+these resources. Loopback is one shared relaxed atomic flag used by both topology
+and its packet-stack view. The complete Linux namespace, virtual fabric/socket
+projections and production guest socket factory remain owner-side.
+
+Topology readers coexist; only structural changes acquire its writer. Packet
+tracking synchronizes the original mutable NAT/flow invariants per namespace,
+never a global networking lock. A route releases one namespace's conntrack guard
+before entering another namespace or bridge. Packet lock order is topology read,
+namespace conntrack, then ruleset read. Rule/ctnetlink handlers capture their
+resource under topology read and release topology before taking the object
+transaction lock. Native interface queries also finish before topology access.
+Nested topology read acquisitions in route selection were removed, so a waiting
+writer cannot deadlock a reader trying to re-enter a writer-preferring RwLock.
+
+Native refresh first compares current metadata under a reader. The unchanged
+path allocates no address vector and never obtains a topology writer. Changed
+metadata is rechecked/published under the original writer transaction. Existing
+mode, route and interface-comparison semantics are preserved. Packet accounting
+also needs no writer: each stored link owns its actual relaxed atomic counters;
+Device remains an owned public reporting snapshot. Cross-namespace link moves
+carry the same counter resource. These statistics do not publish packet or guest
+bytes, and they do not add ordinary guest-memory barriers.
+
+nf_tables batches hold the original ruleset's writer from cloning through
+validation, output-capacity preflight and publication. Concurrent batches cannot
+both clone an old generation and silently overwrite a successful commit. Dumps
+clone under a reader and format privately. Existing counters use relaxed atomic
+RMWs, preserving wrapping totals under packet readers. Batch publication excludes
+those readers while copying counters, so it does not discard intervening packet
+counts. Redirect previews still use private rule/conntrack copies and have no
+live counter, NAT or flow effects.
+
+ctnetlink's original staged mutation similarly holds its namespace state mutex
+through output preflight and commit. A concurrent delete cannot restore another
+delete's records or erase new packet state by publishing an obsolete clone.
+The production owner handlers and shared-resource tests invoke the same protocol
+transaction helpers; there is no alternate parser, shadow authority, new errno,
+quota, resource-service thread, message bus or polling loop.
+
+Concurrency tests cover independent namespace progress while another namespace's
+state is locked, simultaneous topology readers, exact packet/drop counts with no
+writer, link-move counter continuity, unchanged native refresh under a held
+reader, concurrent batch generations, counters surviving live rule publication,
+and concurrent flow deletion/insertion. Original routing, bridge/NAT/firewall,
+netlink, rollback and permission coverage is retained on Apple and ARM64 Linux.
+These changes remove ownership and per-packet writer dependencies, not production
+socket dispatch. Namespace/fabric lifetime, full shared socket OFDs, factory and
+bind/connect/listen/accept dispatch still need migration, alongside Unix/task/VM
+work. No whole-app performance gain is inferred from the resource tests.

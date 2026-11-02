@@ -172,7 +172,7 @@ pub(crate) fn request(
         request
     };
     let ns = namespace.id();
-    let mut graph = namespace.graph.borrow_mut();
+    let mut graph = namespace.graph.write().unwrap();
     let mut changes = vec![];
     let mut out = vec![];
     let mut execute = || -> Result<()> {
@@ -251,7 +251,7 @@ pub(crate) fn request(
                 let target = get(&a, 28).map(|fd| resolve(u32v(fd)?)).transpose()?;
                 if target
                     .as_ref()
-                    .is_some_and(|n| !std::rc::Rc::ptr_eq(&n.1.graph, &namespace.graph))
+                    .is_some_and(|n| !std::sync::Arc::ptr_eq(&n.1.graph, &namespace.graph))
                 {
                     return Err(NetError(22));
                 }
@@ -301,10 +301,9 @@ pub(crate) fn request(
                                 return Err(NetError(95));
                             }
                             let pn = get(&pa, 28).map(|v| resolve(u32v(v)?)).transpose()?;
-                            if pn
-                                .as_ref()
-                                .is_some_and(|n| !std::rc::Rc::ptr_eq(&n.1.graph, &namespace.graph))
-                            {
+                            if pn.as_ref().is_some_and(|n| {
+                                !std::sync::Arc::ptr_eq(&n.1.graph, &namespace.graph)
+                            }) {
                                 return Err(NetError(22));
                             }
                             let peer_ns = pn.as_ref().map_or(ns, Network::namespace_id);

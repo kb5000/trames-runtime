@@ -162,7 +162,8 @@ fn default_route(n: &Network, device: u32, gateway: &str) {
         protocol: 3,
     };
     n.1.graph
-        .borrow_mut()
+        .write()
+        .unwrap()
         .route(n.namespace_id(), r, true, false, false)
         .unwrap();
 }
@@ -246,7 +247,8 @@ fn l3_forwarding_is_per_family_and_hop_limit_and_routes_really_apply() {
     assert!(a
         .1
         .graph
-        .borrow()
+        .read()
+        .unwrap()
         .route_packet(
             a.namespace_id(),
             None,
