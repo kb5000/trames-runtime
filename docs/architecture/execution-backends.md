@@ -802,4 +802,3 @@ ownership. Socket creation, bind/connect/listen/accept, owner projections, broad
 close, AF_UNIX/SCM_RIGHTS and epoll registration remain follow-up work. Short
 admitted calls keep their existing single-caller owner service; their existence
 must not be counted as a whole-cohort pause.
-
