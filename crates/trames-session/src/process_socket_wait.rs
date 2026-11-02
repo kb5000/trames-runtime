@@ -1142,3 +1142,305 @@ fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reu
     assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
     assert!(p.retained_message_owner.is_none());
 }
+
+#[test]
+fn unix_blocking_accept_returns_its_slot_for_a_connecting_peer_without_services() {
+    for filtered in [false, true] {
+        for slots in [1, 2] {
+            let mut p = super::tests::process();
+            let mut k = super::tests::kernel();
+            let listener = p.linux.vfs.local_create(1, 0).unwrap();
+            let server = p.linux.vfs.local_socket(listener).unwrap().unwrap();
+            let address = b"\x01\x00/unix-one-slot\0";
+            p.linux.vfs.local_bind(&server, address).unwrap();
+            p.linux.vfs.local_listen(&server, 1).unwrap();
+            p.memory.write(0x1000, address).unwrap();
+            p.memory.write(0x1030, b"x").unwrap();
+            if filtered {
+                filter(&mut k, &mut p, 0x7fff0000);
+            }
+            let mut peer = p.fork();
+            peer.parent = 1;
+            peer.tgid = 2;
+            let park = [
+                mov(0, 0x1060),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ];
+            let mut parent = vec![
+                mov(0, listener),
+                mov(1, 0),
+                mov(2, 0),
+                mov(8, 202),
+                0xd4000001,
+                mov(10, 0x1800),
+                0xf9000140,
+                mov(0, 4),
+                mov(1, 0x1100),
+                mov(2, 1),
+                mov(8, 63),
+                0xd4000001,
+                mov(10, 0x1808),
+                0xf9000140,
+                mov(0, 4),
+                mov(8, 57),
+                0xd4000001,
+            ];
+            parent.extend(park);
+            let mut child = vec![
+                mov(0, 1),
+                mov(1, 1),
+                mov(2, 0),
+                mov(8, 198),
+                0xd4000001,
+                mov(0, 4),
+                mov(1, 0x1000),
+                mov(2, address.len() as u32),
+                mov(8, 203),
+                0xd4000001,
+                mov(10, 0x1800),
+                0xf9000140,
+                mov(0, 4),
+                mov(1, 0x1030),
+                mov(2, 1),
+                mov(8, 64),
+                0xd4000001,
+                mov(0, 4),
+                mov(8, 57),
+                0xd4000001,
+            ];
+            child.extend(park);
+            program(&mut p, parent);
+            program(&mut peer, child);
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            // Bound test observation after both tasks park; resource waits
+            // still release their slot and retain one syscall entry.
+            let until = Instant::now() + Duration::from_secs(3);
+            while k.syscalls < 9 {
+                let limit = k.instructions + 100_000;
+                assert!(k
+                    .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
+                    .unwrap());
+                assert!(
+                    Instant::now() < until,
+                    "filtered={filtered} slots={slots}: Unix accept/connect did not progress"
+                );
+            }
+            assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 4);
+            assert_eq!(k.processes[&1].memory.read_u64(0x1808).unwrap(), 1);
+            assert_eq!(
+                k.processes[&1].memory.read_array::<1>(0x1100).unwrap(),
+                *b"x"
+            );
+            assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 0);
+            assert_eq!(k.service_requests, 0);
+            assert_eq!(k.syscalls, 9);
+            if filtered {
+                assert_eq!(k.processes[&1].seccomp.evaluations(), 9);
+            }
+            assert!(k.worker_io_waits > 0);
+        }
+    }
+}
+
+#[test]
+fn filtered_unix_path_bind_connect_accept_and_bytes_finish_locally_on_one_or_two_slots() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.memory.write(0x1040, b"x").unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        let mut code = Vec::new();
+        for i in 0..8 {
+            let name = format!("/unix-task1-{i}");
+            let other = format!("/unix-task2-{i}");
+            let address = [b"\x01\x00".as_slice(), name.as_bytes(), b"\0"].concat();
+            let other = [b"\x01\x00".as_slice(), other.as_bytes(), b"\0"].concat();
+            let path = 0x1200 + i * 32;
+            p.memory.write(path as u64, &address).unwrap();
+            peer.memory.write(path as u64, &other).unwrap();
+            let base = 0x1800 + i * 96;
+            let mut call = |setup: &[u32], number, offset| {
+                code.extend_from_slice(setup);
+                code.extend([
+                    mov(8, number),
+                    0xd4000001,
+                    mov(10, base + offset),
+                    0xf9000140,
+                ]);
+            };
+            call(&[mov(0, 1), mov(1, 1), mov(2, 0)], 198, 0);
+            call(&[mov(0, 1), mov(1, 1), mov(2, 0)], 198, 8);
+            call(
+                &[mov(0, 3), mov(1, path), mov(2, address.len() as u32)],
+                200,
+                16,
+            );
+            call(&[mov(0, 3), mov(1, 1)], 201, 24);
+            call(
+                &[mov(0, 4), mov(1, path), mov(2, address.len() as u32)],
+                203,
+                32,
+            );
+            call(
+                &[
+                    mov(0, 3),
+                    mov(1, 0),
+                    mov(2, 0),
+                    0xd2a00103, // movz x3, #8, lsl #16 (O_CLOEXEC)
+                ],
+                242,
+                40,
+            );
+            call(&[mov(0, 5), mov(1, 1)], 25, 48);
+            call(&[mov(0, 4), mov(1, 0x1040), mov(2, 1)], 64, 56);
+            call(&[mov(0, 5), mov(1, 0x1048), mov(2, 1)], 63, 64);
+            call(&[mov(0, 5)], 57, 72);
+            call(&[mov(0, 4)], 57, 80);
+            call(&[mov(0, 3)], 57, 88);
+        }
+        code.extend([
+            mov(0, 0x1060),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..8 {
+                for (j, expected) in [3, 4, 0, 0, 0, 5, 1, 1, 1, 0, 0, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + i * 96 + j as u64 * 8).unwrap(),
+                        expected,
+                        "slots={slots} iteration={i} call={j} services={}",
+                        k.service_requests
+                    );
+                }
+            }
+            assert_eq!(p.memory.read_array::<1>(0x1048).unwrap(), *b"x");
+            assert_eq!(p.seccomp.evaluations(), 194);
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 194);
+    }
+}
+
+#[test]
+fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        let listener = p.linux.vfs.local_create(1, 0).unwrap();
+        let server = p.linux.vfs.local_socket(listener).unwrap().unwrap();
+        let address = b"\x01\x00\0saturated-backlog";
+        p.linux.vfs.local_bind(&server, address).unwrap();
+        p.linux.vfs.local_listen(&server, 0).unwrap();
+        let first = p.linux.vfs.local_create(1, 0).unwrap();
+        p.linux
+            .vfs
+            .local_connect(&p.linux.vfs.local_socket(first).unwrap().unwrap(), address)
+            .unwrap();
+        let client = p.linux.vfs.local_create(1, 0).unwrap();
+        assert_eq!(client, 5);
+        p.memory.write(0x1000, address).unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        let park = [
+            mov(0, 0x1060),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ];
+        let mut parent = vec![
+            mov(0, client),
+            mov(1, 0x1000),
+            mov(2, address.len() as u32),
+            mov(8, 203),
+            0xd4000001,
+            mov(10, 0x1800),
+            0xf9000140,
+        ];
+        parent.extend(park);
+        let mut child = Vec::new();
+        for offset in [0, 8] {
+            child.extend([
+                mov(0, listener),
+                mov(1, 0),
+                mov(2, 0),
+                mov(8, 202),
+                0xd4000001,
+                mov(10, 0x1800 + offset),
+                0xf9000140,
+            ]);
+        }
+        child.extend([
+            mov(0, 6),
+            mov(8, 57),
+            0xd4000001,
+            mov(0, 7),
+            mov(8, 57),
+            0xd4000001,
+        ]);
+        child.extend(park);
+        program(&mut p, parent);
+        program(&mut peer, child);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        let until = Instant::now() + Duration::from_secs(3);
+        while k.syscalls < 7 {
+            let limit = k.instructions + 100_000;
+            assert!(k
+                .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
+                .unwrap());
+            assert!(
+                Instant::now() < until,
+                "slots={slots}: backlog wait did not progress"
+            );
+        }
+        assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 0);
+        assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 6);
+        assert_eq!(k.processes[&2].memory.read_u64(0x1808).unwrap(), 7);
+        assert_eq!(k.processes[&1].seccomp.evaluations(), 7);
+        assert_eq!(k.service_requests, 0);
+        if slots == 1 {
+            assert!(k.worker_io_waits > 0);
+        }
+    }
+}

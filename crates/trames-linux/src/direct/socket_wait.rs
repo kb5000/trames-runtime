@@ -2,8 +2,17 @@
 //! Accepted socket control lifetime across parking, epochs and owner fallback.
 use super::*;
 #[derive(Clone)]
+enum Control {
+    Network(trames_vfs::SocketOperation),
+    Unix {
+        socket: trames_vfs::LocalOperation,
+        address: Option<Vec<u8>>,
+        connection: Option<trames_vfs::LocalConnection>,
+    },
+}
+#[derive(Clone)]
 pub struct RetainedSocket {
-    socket: trames_vfs::SocketOperation,
+    socket: Control,
     factory: trames_vfs::DescriptorFactory,
     pub number: u32,
     pub args: [u64; 6],
@@ -11,11 +20,27 @@ pub struct RetainedSocket {
     connecting: bool,
 }
 impl RetainedSocket {
-    pub fn shares_resources(&self, fds: &DirectFds) -> bool {
-        self.socket.shares_resources(fds)
+    pub fn external_wait(&self) -> bool {
+        matches!(self.socket, Control::Network(_))
     }
-    pub fn socket_handle(&self) -> Arc<trames_net::Socket> {
-        self.socket.socket_handle()
+    pub fn shares_resources(&self, fds: &DirectFds) -> bool {
+        match &self.socket {
+            Control::Network(socket) => socket.shares_resources(fds),
+            Control::Unix {
+                socket, connection, ..
+            } => {
+                socket.shares_resources(fds)
+                    || connection
+                        .as_ref()
+                        .is_some_and(|connection| connection.shares_resources(fds))
+            }
+        }
+    }
+    pub fn socket_handle(&self) -> Option<Arc<trames_net::Socket>> {
+        match &self.socket {
+            Control::Network(socket) => Some(socket.socket_handle()),
+            Control::Unix { .. } => None,
+        }
     }
     pub fn events(&self) -> u16 {
         if self.number == 203 {
@@ -24,31 +49,91 @@ impl RetainedSocket {
             1
         }
     }
-    fn attempt(&mut self, memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        let result = if self.number == 203 && self.connecting {
-            self.socket.with_tcp_publication(|| {
-                self.socket
-                    .resume_connect()
-                    .map_err(|e| Errno(e.0))
-                    .and_then(|ready| if ready { Ok(0) } else { Err(Errno(11)) })
-            })
-        } else if crate::network::control_publishes(self.number, self.args) {
-            self.socket.with_tcp_publication(|| {
-                crate::network::control(&self.factory, &self.socket, self.number, self.args, memory)
-                    .expect("accepted control ABI")
-            })
-        } else {
-            crate::network::control(&self.factory, &self.socket, self.number, self.args, memory)
-                .expect("accepted control ABI")
-        };
-        if self.number == 203 && matches!(result, Err(Errno(11 | 115))) {
-            self.connecting = true;
+    fn blocking(&self) -> bool {
+        match &self.socket {
+            Control::Network(socket) => {
+                socket.flags() & trames_vfs::O_NONBLOCK == 0
+                    && (self.number != 203 || socket.info().is_some_and(|info| info.kind == 1))
+            }
+            Control::Unix { socket, .. } => {
+                socket.flags() & trames_vfs::O_NONBLOCK == 0
+                    && (self.number != 203 || socket.kind() != 2)
+            }
         }
-        result
+    }
+    fn attempt(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        paths: Option<&trames_vfs::PathQueries>,
+    ) -> Option<Result<u64, Errno>> {
+        match &mut self.socket {
+            Control::Network(socket) => {
+                let result = if self.number == 203 && self.connecting {
+                    socket.with_tcp_publication(|| {
+                        socket
+                            .resume_connect()
+                            .map_err(|e| Errno(e.0))
+                            .and_then(|ready| if ready { Ok(0) } else { Err(Errno(11)) })
+                    })
+                } else if crate::network::control_publishes(self.number, self.args) {
+                    socket.with_tcp_publication(|| {
+                        crate::network::control(
+                            &self.factory,
+                            socket,
+                            self.number,
+                            self.args,
+                            memory,
+                        )
+                        .expect("accepted control ABI")
+                    })
+                } else {
+                    crate::network::control(&self.factory, socket, self.number, self.args, memory)
+                        .expect("accepted control ABI")
+                };
+                if self.number == 203 && matches!(result, Err(Errno(11 | 115))) {
+                    self.connecting = true;
+                }
+                Some(result)
+            }
+            Control::Unix {
+                socket,
+                address,
+                connection,
+            } => {
+                if self.number == 200 {
+                    return paths?
+                        .local_bind(socket, address.as_deref().expect("accepted bind address"))
+                        .map(|result| result.map(|()| 0));
+                }
+                if self.number == 203 {
+                    if connection.is_none() {
+                        match paths?.local_connection(
+                            socket,
+                            address.as_deref().expect("accepted connect address"),
+                            self.factory.local_peer_identity(),
+                        )? {
+                            Ok(prepared) => {
+                                *connection = Some(prepared);
+                                *address = None;
+                            }
+                            Err(error) => return Some(Err(error)),
+                        }
+                    }
+                    return Some(connection.as_ref().unwrap().attempt().map(|()| 0));
+                }
+                Some(crate::network::unix::accept(
+                    &self.factory,
+                    socket,
+                    self.number,
+                    self.args,
+                    memory,
+                ))
+            }
+        }
     }
     fn waits(&self, result: &Result<u64, Errno>) -> bool {
         matches!(self.number, 202 | 203 | 242)
-            && self.socket.flags() & trames_vfs::O_NONBLOCK == 0
+            && self.blocking()
             && matches!(result, Err(Errno(11)) | Err(Errno(115)))
             && !self.deadline.is_some_and(|d| Instant::now() >= d)
     }
@@ -61,6 +146,46 @@ impl RetainedSocket {
     }
 }
 impl DirectSyscalls {
+    fn prepare_socket_call(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<RetainedSocket, Errno>> {
+        if !matches!(number, 200 | 202 | 203 | 242) || !self.supports_socket_control(number) {
+            return None;
+        }
+        let factory = self.resources.as_ref()?;
+        let accepted = factory.socket_control_operation(args[0] as u32)?;
+        Some((|| {
+            let socket = match accepted? {
+                trames_vfs::SocketControlOperation::Network(socket) => Control::Network(socket),
+                trames_vfs::SocketControlOperation::Unix(socket) => Control::Unix {
+                    socket,
+                    address: if matches!(number, 200 | 203) {
+                        Some(crate::network::address(memory, args[1], args[2])?)
+                    } else {
+                        None
+                    },
+                    connection: None,
+                },
+            };
+            let deadline = match &socket {
+                Control::Network(socket) => socket
+                    .io_timeout(number != 203)
+                    .and_then(|d| Instant::now().checked_add(d)),
+                Control::Unix { .. } => None,
+            };
+            Ok(RetainedSocket {
+                socket,
+                factory: factory.clone(),
+                number,
+                args,
+                deadline,
+                connecting: false,
+            })
+        })())
+    }
     pub fn start_socket_control(
         &self,
         number: u32,
@@ -69,177 +194,18 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
-        if !matches!(number, 202 | 203 | 242) || !self.supports_socket_control(number) {
-            return None;
-        }
-        let factory = self.resources.as_ref()?;
-        let socket = match factory.socket_operation(args[0] as u32)? {
-            Ok(s) => s,
-            Err(e) => return Some(self.complete_socket(Err(e))),
-        };
-        let blocking = socket.flags() & trames_vfs::O_NONBLOCK == 0
-            && (number != 203 || socket.info().is_some_and(|info| info.kind == 1));
-        let deadline = blocking
-            .then(|| socket.io_timeout(number != 203))
-            .flatten()
-            .and_then(|d| Instant::now().checked_add(d));
-        let result = if crate::network::control_publishes(number, args) {
-            socket.with_tcp_publication(|| {
-                crate::network::control(factory, &socket, number, args, memory)
-                    .expect("control ABI")
-            })
-        } else {
-            crate::network::control(factory, &socket, number, args, memory).expect("control ABI")
-        };
-        if !blocking
-            || !matches!(result, Err(Errno(11 | 115)))
-            || deadline.is_some_and(|d| Instant::now() >= d)
-        {
-            return Some(self.complete_socket(result));
-        }
-        Some(self.start_retained_socket(
-            RetainedSocket {
-                socket,
-                factory: factory.clone(),
-                number,
-                args,
-                deadline,
-                connecting: number == 203,
-            },
-            memory,
-            pid,
-            target,
-        ))
+        Some(match self.prepare_socket_call(number, args, memory)? {
+            Ok(call) => self.start_retained_socket(call, memory, pid, target),
+            Err(error) => self.complete_socket(Err(error)),
+        })
     }
     fn complete_socket(&self, result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
         IoAttempt::Complete(result)
     }
-    pub fn start_retained_socket(
-        &self,
-        mut call: RetainedSocket,
-        memory: &mut impl CpuMemory,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-    ) -> IoAttempt {
-        let result = call.attempt(memory);
-        if !call.waits(&result) {
-            return self.complete_socket(call.finish(result));
-        }
-        let signal = IoSignal::new(pid, target.clone());
-        let mut pending = PendingIo {
-            number: call.number,
-            args: call.args,
-            deadline: call.deadline,
-            signal,
-            retained_socket: Some(call),
-            retained_byte: None,
-            native_tcp: None,
-            flock: None,
-            retained_poll: None,
-            resource_deadline: None,
-            epoll_revision: None,
-            _subscriptions: Vec::new(),
-            socket_subscriptions: Vec::new(),
-            host_subscription: None,
-            uring: None,
-            poll_uring: None,
-            target: target.clone(),
-        };
-        if !self.arm_socket(&mut pending) {
-            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
-        }
-        self.retry_socket(pending, memory)
-    }
-    fn arm_socket(&self, pending: &mut PendingIo) -> bool {
-        let Some(events) = pending.target.upgrade().and_then(|t| t.host_events()) else {
-            return false;
-        };
-        let call = pending.retained_socket.as_ref().unwrap();
-        let Ok((fds, delay)) = call.socket.wait_sources() else {
-            return false;
-        };
-        let mut subscriptions = Vec::new();
-        for fd in fds {
-            let Ok(subscription) = events.subscribe(fd, false, &pending.signal) else {
-                return false;
-            };
-            subscriptions.push(subscription);
-        }
-        // Keep host subscriptions separate from resource notifications.
-        // Their original event queues are drained before the deciding retry.
-        pending.socket_subscriptions = subscriptions;
-        pending.resource_deadline = delay.and_then(|d| Instant::now().checked_add(d));
-        true
-    }
-    pub(super) fn resume_socket(
-        &self,
-        mut pending: PendingIo,
-        memory: &mut impl CpuMemory,
-    ) -> IoAttempt {
-        pending.signal.reset();
-        if !self.arm_socket(&mut pending) {
-            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
-        }
-        self.retry_socket(pending, memory)
-    }
-    fn retry_socket(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
-        let call = pending.retained_socket.as_mut().unwrap();
-        let result = call.attempt(memory);
-        if call.waits(&result) {
-            IoAttempt::Blocked(pending)
-        } else {
-            self.complete_socket(call.finish(result))
-        }
-    }
-    pub fn start_owned_socket_control(
-        &self,
-        number: u32,
-        args: [u64; 6],
-        memory: &mut impl CpuMemory,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-    ) -> Option<IoAttempt> {
-        if !matches!(number, 202 | 203 | 242) {
-            return None;
-        }
-        let factory = self.resources.as_ref()?;
-        let socket = match factory.socket_operation(args[0] as u32)? {
-            Ok(s) => s,
-            Err(e) => return Some(self.complete_socket(Err(e))),
-        };
-        let deadline = socket
-            .io_timeout(number != 203)
-            .and_then(|d| Instant::now().checked_add(d));
-        Some(self.retry_owned_socket(
-            RetainedSocket {
-                socket,
-                factory: factory.clone(),
-                number,
-                args,
-                deadline,
-                connecting: false,
-            },
-            memory,
-            pid,
-            target,
-        ))
-    }
-    /// Existing joined executor fallback retains the same operation and uses
-    /// its opaque socket in the original native/fabric wait path.
-    pub fn retry_owned_socket(
-        &self,
-        mut call: RetainedSocket,
-        memory: &mut impl CpuMemory,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-    ) -> IoAttempt {
-        let result = call.attempt(memory);
-        if !call.waits(&result) {
-            return self.complete_socket(call.finish(result));
-        }
-        let pending = PendingIo {
+    fn socket_wait(&self, call: RetainedSocket, pid: u32, target: &Weak<dyn IoWake>) -> PendingIo {
+        PendingIo {
             number: call.number,
             args: call.args,
             deadline: call.deadline,
@@ -257,8 +223,154 @@ impl DirectSyscalls {
             uring: None,
             poll_uring: None,
             target: target.clone(),
+        }
+    }
+    pub fn start_retained_socket(
+        &self,
+        mut call: RetainedSocket,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+            return IoAttempt::SocketCheckpoint(call);
         };
-        IoAttempt::Blocked(pending)
+        if !call.waits(&result) {
+            return self.complete_socket(call.finish(result));
+        }
+        let mut pending = self.socket_wait(call, pid, target);
+        if !self.arm_socket(&mut pending) {
+            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+        }
+        self.retry_socket(pending, memory)
+    }
+    fn arm_socket(&self, pending: &mut PendingIo) -> bool {
+        let call = pending.retained_socket.as_ref().unwrap();
+        if let Control::Unix {
+            socket, connection, ..
+        } = &call.socket
+        {
+            let subscription = if let Some(connection) = connection {
+                connection.subscribe(&pending.signal)
+            } else {
+                socket.subscribe(&pending.signal)
+            };
+            pending._subscriptions = vec![subscription];
+            return true;
+        }
+        let Control::Network(socket) = &call.socket else {
+            unreachable!()
+        };
+        let Some(events) = pending.target.upgrade().and_then(|t| t.host_events()) else {
+            return false;
+        };
+        let Ok((fds, delay)) = socket.wait_sources() else {
+            return false;
+        };
+        let mut subscriptions = Vec::new();
+        for fd in fds {
+            let Ok(subscription) = events.subscribe(fd, false, &pending.signal) else {
+                return false;
+            };
+            subscriptions.push(subscription);
+        }
+        pending.socket_subscriptions = subscriptions;
+        pending.resource_deadline = delay.and_then(|d| Instant::now().checked_add(d));
+        true
+    }
+    pub(super) fn resume_socket(
+        &self,
+        mut pending: PendingIo,
+        memory: &mut impl CpuMemory,
+    ) -> IoAttempt {
+        pending.signal.reset();
+        if !self.arm_socket(&mut pending) {
+            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+        }
+        self.retry_socket(pending, memory)
+    }
+    fn retry_socket(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
+        let call = pending.retained_socket.as_mut().unwrap();
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+        };
+        if call.waits(&result) {
+            IoAttempt::Blocked(pending)
+        } else {
+            self.complete_socket(call.finish(result))
+        }
+    }
+    pub fn start_owned_socket_control(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<IoAttempt> {
+        Some(match self.prepare_socket_call(number, args, memory)? {
+            Ok(call) => self.retry_owned_socket(call, memory, pid, target),
+            Err(error) => self.complete_socket(Err(error)),
+        })
+    }
+    /// Resolve excluded owner paths through the real VFS, using the accepted
+    /// original OFD and address bytes. Normal worker waits never enter here.
+    pub fn retry_owned_socket_vfs(
+        &self,
+        mut call: RetainedSocket,
+        vfs: &mut trames_vfs::Vfs,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        if let Control::Unix {
+            socket,
+            address,
+            connection,
+        } = &mut call.socket
+        {
+            if call.number == 200 {
+                return self.complete_socket(
+                    vfs.local_bind_operation(
+                        socket,
+                        address.as_deref().expect("accepted bind address"),
+                    )
+                    .map(|()| 0),
+                );
+            }
+            if call.number == 203 && connection.is_none() {
+                match vfs.local_connection_operation(
+                    socket,
+                    address.as_deref().expect("accepted connect address"),
+                    call.factory.local_peer_identity(),
+                ) {
+                    Ok(prepared) => {
+                        *connection = Some(prepared);
+                        *address = None;
+                    }
+                    Err(error) => return self.complete_socket(Err(error)),
+                }
+            }
+        }
+        self.retry_owned_socket(call, memory, pid, target)
+    }
+    pub fn retry_owned_socket(
+        &self,
+        mut call: RetainedSocket,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
+            return IoAttempt::SocketCheckpoint(call);
+        };
+        if !call.waits(&result) {
+            return self.complete_socket(call.finish(result));
+        }
+        if matches!(call.socket, Control::Unix { .. }) {
+            return self.start_retained_socket(call, memory, pid, target);
+        }
+        IoAttempt::Blocked(self.socket_wait(call, pid, target))
     }
 }
 
@@ -492,5 +604,194 @@ mod tests {
             }
         }
         assert!(receiver.accept().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod unix_tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions};
+    use trames_vfs::Vfs;
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    fn memory(address: &[u8]) -> Memory {
+        let mut m = Memory::default();
+        m.map(0x1000, 4096, Permissions::RW).unwrap();
+        m.write(0x1000, address).unwrap();
+        m
+    }
+    fn listener(v: &mut Vfs, address: &[u8]) -> u32 {
+        let fd = v.local_create(1, 0).unwrap();
+        let s = v.local_socket(fd).unwrap().unwrap();
+        v.local_bind(&s, address).unwrap();
+        v.local_listen(&s, 0).unwrap();
+        fd
+    }
+    fn direct(v: &Vfs) -> DirectSyscalls {
+        DirectSyscalls::new(v.direct_descriptors())
+            .with_resources(v.descriptor_factory())
+            .with_paths(v.path_queries())
+    }
+    fn blocked(attempt: IoAttempt) -> PendingIo {
+        match attempt {
+            IoAttempt::Blocked(wait) => {
+                assert!(!wait.external_wait());
+                wait
+            }
+            _ => panic!("expected local resource wait"),
+        }
+    }
+    fn target() -> Arc<dyn IoWake> {
+        Arc::new(Wake)
+    }
+    #[test]
+    fn full_backlog_connect_parks_then_uses_original_client_and_resolved_target() {
+        let mut v = Vfs::default();
+        let address = b"\x01\x00\0retained-connect";
+        let listener = listener(&mut v, address);
+        let first = v.local_create(1, 0).unwrap();
+        v.local_connect(&v.local_socket(first).unwrap().unwrap(), address)
+            .unwrap();
+        let client = v.local_create(1, 0).unwrap();
+        let original = v.local_socket(client).unwrap().unwrap();
+        let d = direct(&v);
+        let mut m = memory(address);
+        let target = target();
+        let wait = blocked(
+            d.start_socket_control(
+                203,
+                [client as u64, 0x1000, address.len() as u64, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            )
+            .unwrap(),
+        );
+        v.close(client).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), client);
+        m.write(0x1000, &vec![0xff; address.len()]).unwrap();
+        v.local_accept(&v.local_socket(listener).unwrap().unwrap(), 0)
+            .unwrap();
+        assert!(wait.signal.ready());
+        assert!(matches!(d.resume(wait, &mut m), IoAttempt::Complete(Ok(0))));
+        let (accepted, _) = v
+            .local_accept(&v.local_socket(listener).unwrap().unwrap(), 0)
+            .unwrap();
+        v.write(accepted, b"x").unwrap();
+        assert_eq!(original.recv(1, 0).unwrap().data, b"x");
+        assert_eq!(v.read(client, 8).unwrap(), 99u64.to_le_bytes());
+    }
+    #[test]
+    fn closing_the_original_listener_wakes_connect_and_does_not_follow_rebind() {
+        let mut v = Vfs::default();
+        let address = b"\x01\x00\0closed-listener";
+        let listener_fd = listener(&mut v, address);
+        let first = v.local_create(1, 0).unwrap();
+        v.local_connect(&v.local_socket(first).unwrap().unwrap(), address)
+            .unwrap();
+        let client = v.local_create(1, 0).unwrap();
+        let d = direct(&v);
+        let mut m = memory(address);
+        let target = target();
+        let wait = blocked(
+            d.start_socket_control(
+                203,
+                [client as u64, 0x1000, address.len() as u64, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            )
+            .unwrap(),
+        );
+        v.close(listener_fd).unwrap();
+        assert!(wait.signal.ready());
+        let replacement = listener(&mut v, address);
+        assert!(matches!(
+            d.resume(wait, &mut m),
+            IoAttempt::Complete(Err(Errno(111)))
+        ));
+        assert_eq!(
+            v.local_socket(replacement)
+                .unwrap()
+                .unwrap()
+                .accept_address_size(),
+            Err(Errno(11))
+        );
+    }
+    #[test]
+    fn accepted_listener_ofd_survives_close_reuse_until_accept_returns() {
+        let mut v = Vfs::default();
+        let address = b"\x01\x00\0accepted-listener";
+        let listener = listener(&mut v, address);
+        let client = v.local_create(1, 0).unwrap();
+        let d = direct(&v);
+        let mut m = memory(address);
+        let target = target();
+        let wait = blocked(
+            d.start_socket_control(
+                202,
+                [listener as u64, 0, 0, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            )
+            .unwrap(),
+        );
+        v.close(listener).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), listener);
+        assert!(matches!(
+            d.start_socket_control(
+                203,
+                [client as u64, 0x1000, address.len() as u64, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target)
+            )
+            .unwrap(),
+            IoAttempt::Complete(Ok(0))
+        ));
+        assert!(wait.signal.ready());
+        let accepted = match d.resume(wait, &mut m) {
+            IoAttempt::Complete(Ok(fd)) => fd as u32,
+            _ => panic!("expected original listener acceptance"),
+        };
+        v.write(client, b"x").unwrap();
+        assert_eq!(v.read(accepted, 1).unwrap(), b"x");
+        assert_eq!(v.read(listener, 8).unwrap(), 99u64.to_le_bytes());
+    }
+    #[test]
+    fn deferred_bind_handoff_keeps_accepted_ofd_and_original_address_bytes() {
+        let mut v = Vfs::default();
+        let fd = v.local_create(1, 0).unwrap();
+        let original = v.local_socket(fd).unwrap().unwrap();
+        let address = b"\x01\x00/original-bind\0";
+        let mut m = memory(address);
+        let target = target();
+        let d = DirectSyscalls::default().with_resources(v.descriptor_factory());
+        let call = match d
+            .start_socket_control(
+                200,
+                [fd as u64, 0x1000, address.len() as u64, 0, 0, 0],
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            )
+            .unwrap()
+        {
+            IoAttempt::SocketCheckpoint(call) => call,
+            _ => panic!("expected excluded pathname authority"),
+        };
+        assert_eq!(original.name(false).unwrap(), [1, 0]);
+        v.close(fd).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+        m.write(0x1000, &vec![0xff; address.len()]).unwrap();
+        assert!(matches!(
+            d.retry_owned_socket_vfs(call, &mut v, &mut m, 1, &Arc::downgrade(&target)),
+            IoAttempt::Complete(Ok(0))
+        ));
+        assert_eq!(original.name(false).unwrap(), address);
+        assert_eq!(v.read(fd, 8).unwrap(), 99u64.to_le_bytes());
     }
 }

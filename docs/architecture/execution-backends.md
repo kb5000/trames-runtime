@@ -1452,3 +1452,61 @@ before choosing Unix or IP, so concurrent numeric reuse cannot redirect a second
 lookup. Tests exercise immediate and parked raw read/readv with legacy rights,
 replacement eventfds, final peer hangup, and a message handoff whose descriptor
 is closed/reused before the owner receives the worker reply.
+
+## Worker Unix namespace controls and connection waits (2026-11-03)
+
+Ordinary pathname and abstract bind/connect, and accept/accept4, now use the
+executing worker. Pathname operations use the same sealed PathQueries resolver,
+original filesystem/inode objects, credentials and shared pathname routing domain.
+Only that actual Arc routing resource is added to the private control island;
+returned LocalConnection capabilities cannot reach its Rc/RefCell control state.
+Excluded owner paths defer before effects and retain the accepted original full
+OFD plus copied address bytes for the original VFS resolver on joined execution.
+
+Binding uses exclusive filesystem insertion. Two concurrent pathname binders
+cannot overwrite the winning inode between existence checking and insertion;
+losers retain EADDRINUSE and an unbound endpoint. Abstract namespace lookup and
+publication use the original namespace object lock. There is no global socket,
+VFS or algorithm service lock.
+
+A resolved connection keeps the original client resource and a weak target
+listener identity, together with the listener's original readiness source. A
+backlog wait cannot prolong the listener's open lifetime or follow a pathname or
+abstract-name replacement. Final listener close wakes it and returns the original
+connection-refused result. Per-client transition and per-listener queue guards
+cover actual structural changes; ordinary byte I/O does not acquire them.
+Accepting an item frees backlog capacity and notifies after releasing the queue
+lock. Blocking connect/accept park the task and release its execution slot.
+
+Accept selects its peer address and preflights that exact item under the same
+listener guard. It preserves the guest ABI's pending-item/preflight/flags/capacity
+error order, reserves an actual Files number, removes the chosen item, then drops
+the queue guard before callbacks and output. Copyout and unwind cannot publish a
+partial FD or retain its reservation. The common original OFD constructor preserves
+per-description status flags and per-FD CLOEXEC. Concurrent acceptors publish
+distinct FDs, without relooking up a closed/reused listening number.
+
+Unix and IP control waits share retained-call scheduling. Unix waits subscribe to
+actual internal resource notifications; IP waits retain their original host wait
+sources/timeouts. Merely having a socket control call no longer classifies a wait
+as an external host-network event. This distinction is required both for keeping
+a single execution slot available and for headless runs without a host event hub.
+No timer polling, busy wait, forwarding bus or new service thread is introduced.
+
+Tests exercise eight competing pathname binders, eight concurrent acceptors,
+exact peer address/item association, preflight/panic rollback, backlog wakeups,
+last-listener close and name replacement, original accepted endpoints after FD
+reuse, and copied address bytes across an owner fallback. Filtered/unfiltered
+one-slot accept/connect tests use only internal notifications. A filtered two-task
+lifecycle covers 192 bind/listen/connect/accept/flags/byte/membership calls plus two
+final waits with one filter decision per entry and no coordinator services.
+The same implementation is built for Mac and iPad. Addressed unpaired-datagram
+I/O, Unix-bearing ancillary owning graphs, native-service adapters and structural
+task/mount/VM transitions remain separate ownership migrations.
+
+Worker task identity is applied to DescriptorFactory in either builder order,
+without altering its captured effective credentials or adding permission checks.
+This keeps forked children from reporting a retained parent PID through socket
+creation or SO_PEERCRED on connect/listen. Separate one/two-slot saturated-backlog
+tests verify that connect parks until accept releases capacity, with one filter
+decision per entry and zero coordinator services.

@@ -150,7 +150,7 @@ impl DescriptorFactory {
     pub fn local_global_pid(&self, local: u32) -> Result<u32> {
         self.pid_namespace.global(local).ok_or(Errno(3))
     }
-    fn open_id(&self) -> u64 {
+    pub(super) fn open_id(&self) -> u64 {
         next_id(&self.ids)
     }
     /// IP and Unix creation retain their actual namespace and credentials.

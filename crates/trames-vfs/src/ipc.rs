@@ -4,7 +4,9 @@ use super::*;
 mod binding;
 pub(crate) use binding::{PathBinding, PathBindings};
 pub(super) mod channel;
+mod control;
 mod datagram;
+pub use control::LocalConnection;
 mod native;
 #[cfg(test)]
 mod shared_graph_tests;
@@ -789,17 +791,6 @@ impl Vfs {
             cloexec: (flags & O_CLOEXEC != 0).into(),
         }
     }
-    fn local_descriptor(&mut self, fd: u32, local: Rc<LocalSocket>, flags: u32) {
-        self.fds.insert(
-            fd,
-            Self::local_description(
-                self.open_id(),
-                (self.credentials.fsuid, self.credentials.fsgid),
-                local.core.clone(),
-                flags,
-            ),
-        );
-    }
     pub fn local_create(&mut self, kind: u32, protocol: u32) -> Result<u32> {
         self.descriptor_factory().local_create(kind, protocol)
     }
@@ -829,139 +820,32 @@ impl Vfs {
         )
     }
     pub fn local_bind(&mut self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
-        let _transition = socket.transition.lock().unwrap();
-        let (name, abstract_) = Self::local_address(bytes)?;
-        if socket.name.borrow().len() != 2 {
-            return Err(Errno(22));
-        }
-        if abstract_ {
-            let mut ns = socket.namespace.borrow_mut();
-            if ns
-                .abstract_names
-                .get(&name)
-                .and_then(std::sync::Weak::upgrade)
-                .is_some()
-            {
-                return Err(Errno(98));
-            }
-            ns.abstract_names
-                .insert(name.clone(), Arc::downgrade(&socket.core));
-        } else {
-            let p = self.resolve_final(-100, &name[2..name.len() - 1], false)?;
-            match self.node(&p) {
-                Ok(_) => return Err(Errno(98)),
-                Err(Errno(2)) => {}
-                Err(e) => return Err(e),
-            }
-            self.check_parent_write(&p)?;
-            let binding = self.path_bindings.bind(&socket.core);
-            self.insert(
-                p,
-                Content::Socket(binding.path()),
-                0o140000 | (0o777 & !self.umask()),
-            )?;
-            // A failed insert drops the unpublished binding and its route.
-            let _ = socket.pathname_binding.set(binding);
-        }
-        *socket.name.borrow_mut() = name;
-        Ok(())
+        self.local_bind_core(&socket.core, bytes)
     }
     fn local_destination(&self, socket: &LocalSocket, bytes: &[u8]) -> Result<Rc<LocalSocket>> {
-        let (name, abstract_) = Self::local_address(bytes)?;
-        let peer = if abstract_ {
-            socket
-                .namespace
-                .borrow()
-                .abstract_names
-                .get(&name)
-                .and_then(std::sync::Weak::upgrade)
-                .ok_or(Errno(111))?
-        } else {
-            let p = self.resolve_final(-100, &name[2..name.len() - 1], true)?;
-            let node = self.node(&p)?;
-            let n = node.borrow();
-            if !self.allowed(&n, 2) {
-                return Err(Errno(13));
-            }
-            let Content::Socket(peer) = &n.content else {
-                return Err(Errno(111));
-            };
-            self.path_bindings.resolve(peer).ok_or(Errno(111))?
-        };
-        if peer.kind != socket.kind {
-            return Err(Errno(91));
-        }
+        let peer = self.local_destination_core(&socket.core, bytes)?;
         Ok(LocalSocket::view(peer, self.local_rights.clone()))
     }
     pub fn local_connect(&self, socket: &Rc<LocalSocket>, bytes: &[u8]) -> Result<()> {
-        let _transition = socket.transition.lock().unwrap();
-        if socket.connected() {
-            return Err(Errno(106));
-        }
-        if socket.listening() {
-            return Err(Errno(22));
-        }
-        let peer = self.local_destination(socket, bytes)?;
-        if socket.kind == 2 {
-            *socket.datagram_peer.borrow_mut() = Arc::downgrade(&peer.core);
-            *socket.peer_name.borrow_mut() = peer.name.borrow().clone();
-            socket.datagram_connected.store(true, Ordering::Release);
-            return Ok(());
-        }
-        if peer.kind != socket.kind {
-            return Err(Errno(91));
-        }
-        let mut listener = peer.listener.borrow_mut();
-        let l = listener.as_mut().ok_or(Errno(111))?;
-        if l.pending.len() > l.backlog {
-            return Err(Errno(11));
-        }
-        let accepted = self.new_local_in(socket.kind, &peer.network)?;
-        accepted.credentials.set(peer.credentials.get());
-        socket.credentials.set([
-            self.lock_owner,
-            self.credentials.euid,
-            self.credentials.egid,
-        ]);
-        *accepted.name.borrow_mut() = peer.name.borrow().clone();
-        accepted.set_reuse(16, peer.reuse(16))?;
-        if peer.timestamp.load(Ordering::Relaxed) != 0 {
-            accepted.set_reuse(peer.timestamp.load(Ordering::Relaxed), 1)?;
-        }
-        LocalResource::pair(&socket.core, &accepted.core);
-        // Connect changes an already published OFD's direct eligibility.
-        // Fresh socketpairs need only their ordinary Files publication.
-        FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
-        l.pending.push_back(accepted.core.clone());
-        peer.listen_epoch.fetch_add(1, Ordering::Relaxed);
-        drop(listener);
-        drop(_transition);
-        peer.notify();
-        socket.notify();
-        Ok(())
+        self.local_connection_core(
+            &socket.core,
+            bytes,
+            [
+                self.lock_owner,
+                self.credentials.euid,
+                self.credentials.egid,
+            ],
+        )?
+        .attempt()
     }
     pub fn local_accept(&mut self, socket: &LocalSocket, flags: u32) -> Result<(u32, Vec<u8>)> {
-        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
-        let fd = self.available(0)?;
-        let accepted = socket
-            .listener
-            .borrow_mut()
-            .as_mut()
-            .ok_or(Errno(22))?
-            .pending
-            .pop_front()
-            .ok_or(Errno(11))?;
-        let name = accepted.peer_name.borrow().clone();
-        socket.listen_epoch.fetch_add(1, Ordering::Relaxed);
-        socket.notify();
-        self.local_descriptor(
-            fd,
-            LocalSocket::view(accepted, self.local_rights.clone()),
+        self.descriptor_factory().accept_local_output(
+            socket,
             flags,
-        );
-        Ok((fd, name))
+            &mut (),
+            |_, _| Ok(()),
+            |_, _, _| Ok(()),
+        )
     }
 
     pub fn send_rights(&self, fds: &[u32]) -> Result<LocalRights> {

@@ -245,3 +245,67 @@ fn unix_owner_and_worker_controls_share_original_abi_and_error_order() {
         }
     }
 }
+
+#[test]
+fn worker_creation_and_connection_use_the_actual_task_identity_in_either_capture_order() {
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    for resources_first in [false, true] {
+        let mut v = Vfs::default();
+        v.credentials = trames_vfs::Credentials::user(501, 502);
+        v.credentials.euid = 601;
+        v.credentials.egid = 602;
+        let d = if resources_first {
+            DirectSyscalls::default()
+                .with_resources(v.descriptor_factory())
+                .with_local_identity([42, 501, 502])
+        } else {
+            DirectSyscalls::default()
+                .with_local_identity([42, 501, 502])
+                .with_resources(v.descriptor_factory())
+        }
+        .with_paths(v.path_queries());
+        let mut m = memory();
+        assert_eq!(
+            d.invoke_creation(199, [1, 1, 0, 0x1000, 0, 0], &mut m),
+            Some(Ok(0))
+        );
+        let fd = u32::from_le_bytes(m.read_array(0x1000).unwrap());
+        assert_eq!(
+            v.local_socket(fd).unwrap().unwrap().peer_credentials(),
+            [42, 601, 602]
+        );
+        let listener = v.local_create(1, 0).unwrap();
+        let server = v.local_socket(listener).unwrap().unwrap();
+        let address = b"\x01\x00\0actual-worker-identity";
+        v.local_bind(&server, address).unwrap();
+        v.local_listen(&server, 1).unwrap();
+        let client = d
+            .invoke_creation(198, [1, 1, 0, 0, 0, 0], &mut m)
+            .unwrap()
+            .unwrap() as u32;
+        m.write(0x1000, address).unwrap();
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        assert!(matches!(
+            d.start_socket_control(
+                203,
+                [client as u64, 0x1000, address.len() as u64, 0, 0, 0],
+                &mut m,
+                42,
+                &Arc::downgrade(&wake)
+            )
+            .unwrap(),
+            IoAttempt::Complete(Ok(0))
+        ));
+        let (accepted, _) = v.local_accept(&server, 0).unwrap();
+        assert_eq!(
+            v.local_socket(accepted)
+                .unwrap()
+                .unwrap()
+                .peer_credentials(),
+            [42, 601, 602]
+        );
+    }
+}

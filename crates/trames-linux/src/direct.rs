@@ -83,7 +83,9 @@ impl PendingIo {
             .map_or_else(Vec::new, |file| file.fd.native_wait_fds())
     }
     pub fn external_wait(&self) -> bool {
-        self.retained_socket.is_some()
+        self.retained_socket
+            .as_ref()
+            .is_some_and(RetainedSocket::external_wait)
             || self.host_subscription.is_some()
             || self._subscriptions.iter().any(|s| s.external())
             || self.uring.as_ref().is_some_and(|w| w.external())
@@ -200,7 +202,10 @@ impl DirectSyscalls {
             completed: Cell::new(0),
         }
     }
-    pub fn with_resources(mut self, resources: trames_vfs::DescriptorFactory) -> Self {
+    pub fn with_resources(mut self, mut resources: trames_vfs::DescriptorFactory) -> Self {
+        if let Some(identity) = self.local_identity {
+            resources = resources.with_local_identity(identity);
+        }
         self.resources = Some(resources);
         self
     }
@@ -344,6 +349,9 @@ impl DirectSyscalls {
     }
     pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
         self.local_identity = Some(identity);
+        if let Some(resources) = self.resources.take() {
+            self.resources = Some(resources.with_local_identity(identity));
+        }
         self
     }
     pub fn published_file(&self, fd: u32) -> bool {

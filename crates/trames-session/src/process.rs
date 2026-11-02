@@ -2956,13 +2956,16 @@ impl<C: Cpu> Kernel<C> {
             )
         } else if let Some(socket) = socket {
             p.byte_wait = None;
-            Some(trames_linux::DirectSyscalls::default().retry_owned_socket(
-                socket,
-                &mut p.memory,
-                pid,
-                &Arc::downgrade(&self.byte_target),
-            ))
-        } else if !p.linux.trace && matches!(number, 202 | 203 | 242) {
+            Some(
+                trames_linux::DirectSyscalls::default().retry_owned_socket_vfs(
+                    socket,
+                    &mut p.linux.vfs,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ),
+            )
+        } else if !p.linux.trace && matches!(number, 200 | 202 | 203 | 242) {
             trames_linux::DirectSyscalls::default()
                 .with_resources(p.linux.vfs.descriptor_factory())
                 .start_owned_socket_control(
@@ -3003,6 +3006,15 @@ impl<C: Cpu> Kernel<C> {
             None
         };
         let byte = match byte {
+            Some(trames_linux::IoAttempt::SocketCheckpoint(call)) => Some(
+                trames_linux::DirectSyscalls::default().retry_owned_socket_vfs(
+                    call,
+                    &mut p.linux.vfs,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ),
+            ),
             Some(trames_linux::IoAttempt::ByteCheckpoint(file)) if file.is_unix() => Some(
                 trames_linux::DirectSyscalls::default()
                     .with_local_identity([
@@ -5049,7 +5061,9 @@ impl<C: Cpu> Kernel<C> {
                     .as_ref()
                     .and_then(|wait| wait.retained_socket.as_ref())
             }) {
-                sockets.push((call.socket_handle(), call.events()));
+                if let Some(socket) = call.socket_handle() {
+                    sockets.push((socket, call.events()));
+                }
                 continue;
             }
             let mut add = |fd, events| {

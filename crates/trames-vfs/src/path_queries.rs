@@ -59,7 +59,8 @@ pub struct PathQueries {
 // Source resources cross only as their existing Send+Sync Arc capabilities.
 // Query-local clones never escape a method. Send moves the entire private island
 // exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
-// Methods return only owned bytes/results and numeric FDs. Inotify registration
+// Methods return owned bytes/results, numeric FDs and original shared socket
+// capabilities. No returned capability reaches private island control state. Inotify registration
 // mutates only the original Arc-backed instance/inode marks, never query-local Rc.
 // Ordinary opens publish
 // Arc-backed descriptions; no Rc-backed owner control enters shared membership.
@@ -107,6 +108,7 @@ impl Vfs {
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
         view.ptys = self.ptys.clone();
+        view.path_bindings = self.path_bindings.clone();
         view.pseudo.borrow_mut().enabled = self.pseudo.borrow().enabled;
         view.query = Some(Authority {
             files: self.shared_files(),
@@ -120,6 +122,21 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn local_bind(&self, socket: &LocalOperation, address: &[u8]) -> Option<Result<()>> {
+        let mut view = self.view.borrow_mut();
+        let deferred = view.query.as_ref().unwrap().deferred.clone();
+        deferred.set(false);
+        let result = view.local_bind_core(socket.core(), address);
+        (!deferred.replace(false)).then_some(result)
+    }
+    pub fn local_connection(
+        &self,
+        socket: &LocalOperation,
+        address: &[u8],
+        identity: [u32; 3],
+    ) -> Option<Result<LocalConnection>> {
+        self.query(|view| view.local_connection_core(socket.core(), address, identity))
+    }
     pub fn getdents(
         &self,
         fd: u32,

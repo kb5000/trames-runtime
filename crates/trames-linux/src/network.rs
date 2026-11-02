@@ -192,7 +192,7 @@ fn u32_at(memory: &impl CpuMemory, address: u64) -> Result<u32> {
 fn u64_at(memory: &impl CpuMemory, address: u64) -> Result<u64> {
     memory.read_u64(address).map_err(|_| Errno(14))
 }
-fn address(memory: &impl CpuMemory, pointer: u64, length: u64) -> Result<Vec<u8>> {
+pub(super) fn address(memory: &impl CpuMemory, pointer: u64, length: u64) -> Result<Vec<u8>> {
     if !(2..=128).contains(&length) {
         return Err(Errno(22));
     }

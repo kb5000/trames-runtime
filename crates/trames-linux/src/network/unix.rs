@@ -26,16 +26,7 @@ impl Linux {
             }
             201 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("Unix listen ABI"),
-            202 | 242 => {
-                let output =
-                    AddressOutput::prepare(memory, a[1], a[2], socket.accept_address_size()?)?;
-                let (fd, peer) =
-                    vfs.local_accept(socket, if number == 242 { a[3] as u32 } else { 0 })?;
-                if let Some(output) = output {
-                    output.write_bytes(memory, &peer)?;
-                }
-                Ok(fd as u64)
-            }
+            202 | 242 => accept(&vfs.descriptor_factory(), socket, number as u32, a, memory),
             204 | 205 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("Unix address ABI"),
             206 => {
@@ -94,6 +85,27 @@ impl Linux {
             _ => Err(Errno(95)),
         }
     }
+}
+
+pub(crate) fn accept(
+    factory: &trames_vfs::DescriptorFactory,
+    socket: &trames_vfs::LocalResource,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Result<u64> {
+    factory
+        .accept_local_output(
+            socket,
+            if number == 242 { a[3] as u32 } else { 0 },
+            memory,
+            |memory, size| AddressOutput::prepare(memory, a[1], a[2], size),
+            |memory, output, peer| match output {
+                Some(output) => output.write_bytes(memory, peer),
+                None => Ok(()),
+            },
+        )
+        .map(|(fd, _)| fd as u64)
 }
 
 /// Shared original Unix control decoder for owner and worker execution.
