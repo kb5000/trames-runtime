@@ -5,18 +5,21 @@ use super::*;
 enum Buffer {
     Scalar(u64, usize),
     Vectored(Vectors),
+    RawVectors(Vec<(u64, usize)>, usize),
 }
 impl Buffer {
     fn size(&self) -> usize {
         match self {
             Self::Scalar(_, size) => *size,
             Self::Vectored(vectors) => vectors.size,
+            Self::RawVectors(_, size) => *size,
         }
     }
     fn write(&self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
         match self {
             Self::Scalar(pointer, _) => memory.write(*pointer, bytes).map_err(|_| Errno(14)),
             Self::Vectored(vectors) => vectors.write(memory, bytes),
+            Self::RawVectors(parts, _) => Linux::scatter(memory, parts, bytes),
         }
     }
 }
@@ -61,6 +64,13 @@ impl Prepared {
                     Linux::check(memory, pointer, size, Access::Write)?;
                 }
             }
+            Buffer::RawVectors(parts, _) => {
+                for &(pointer, size) in parts {
+                    if size != 0 {
+                        Linux::check(memory, pointer, size, Access::Write)?;
+                    }
+                }
+            }
         }
         if let Some(output) = message {
             Linux::check(memory, output.header, 56, Access::Write)?;
@@ -76,6 +86,50 @@ impl Prepared {
             )?;
         }
         Ok(())
+    }
+    /// Raw byte calls retain their original scalar/vector ABI, including its
+    /// caps, empty records, error order and one-packet gather/scatter behavior.
+    pub fn raw(number: u32, a: [u64; 6], memory: &impl CpuMemory, flags: u32) -> Result<Self> {
+        let read = matches!(number, 63 | 65);
+        let transfer = if read {
+            let buffer = if number == 63 {
+                Buffer::Scalar(a[1], Linux::read_parameters(a, memory)?)
+            } else {
+                let (parts, size) = Linux::readv_parts(memory, a)?;
+                Buffer::RawVectors(parts, size)
+            };
+            Transfer::Receive {
+                buffer,
+                address: None,
+                message: None,
+            }
+        } else {
+            let mut bytes = Vec::new();
+            if number == 64 {
+                Linux::write_transport(a, memory, &mut bytes, |_| Ok(0))?;
+            } else {
+                Linux::writev_transport_mode(a, memory, &mut bytes, false, |_| Ok(0))?;
+            }
+            Transfer::Send {
+                bytes,
+                peer: None,
+                info: None,
+            }
+        };
+        // The original VFS checks access after the raw ABI imports its buffers.
+        // O_PATH read behavior and the original write access order are retained.
+        if if read {
+            flags & trames_vfs::O_PATH != 0 || flags & 3 == 1
+        } else {
+            flags & 3 == 0
+        } {
+            return Err(Errno(9));
+        }
+        Ok(Self {
+            flags: 0,
+            address_size: 0,
+            transfer,
+        })
     }
     pub fn new(
         number: u32,

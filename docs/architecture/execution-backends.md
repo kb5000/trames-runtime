@@ -1677,3 +1677,35 @@ packet-info output, nonblocking/timeout behavior and netlink exclusion.
 This does not remove raw UDP read/write ownership, netlink control, Unix owning
 ancillary graphs, io_uring owner controls, task/job control, or structural VM/task
 transitions. recvmmsg remains unimplemented, not a removed coordinator dependency.
+
+## Retained raw IP byte operations (2026-11-03)
+
+IPv4/IPv6 read, write, readv and writev no longer require the owner when the
+socket lacks a connected-native TCP byte capability. UDP, packet-stack TCP and
+other admitted IP transports use the original full SocketOperation and the
+existing retained-message/event-wait mechanism. Native connected TCP still takes
+its existing capability before this fallback; admitted pipe/device/Unix byte
+resources also return before any new socket lookup. No extra membership lookup,
+heap allocation or publication guard is added to those accepted paths.
+
+Raw calls use the original Linux scalar/vector preparation helpers rather than
+the sendmsg decoder. Scalar transfer caps, vector count/signed-length errors,
+empty-vector behavior, access-versus-buffer fault order, and one-packet UDP
+gather/scatter are preserved. The common scalar receive preflight is factored out
+without adding a second check. Input bytes or receive destinations are captured
+once for an accepted operation; only a parked receive rechecks its original output
+ranges before dequeue. Numeric FD reuse or a later iovec edit cannot redirect it.
+The original VFS access check follows raw buffer import; no native-only policy is
+added. Socket transport algorithms, namespace policy and accounting remain shared.
+
+The original live O_NONBLOCK status and accepted SO_RCVTIMEO/SO_SNDTIMEO govern
+waiting. Existing host events/packet-stack timers release execution slots;
+cancellation releases their interests and the real OFD. Raw IP writes do not gain
+a TCP-publication algorithm lock that the original raw VFS path did not have.
+Virtual TCP EPIPE retains its terminal result and original socket through task
+handoff, so SIGPIPE needs no resend or numeric-FD lookup. Filtered real guest tests
+cover native/packet-stack IPv4/IPv6 TCP/UDP with one/two execution slots: all ten
+calls, including the final waits, finish on workers with one decision per entry
+and no coordinator service. Netlink byte/control operations remain owner-bound
+before guest input import. Structural VM/task, Unix owning ancillary graphs and
+native-service/io_uring controls are separate remaining boundaries.

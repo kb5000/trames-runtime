@@ -4,6 +4,180 @@ use trames_cpu::Cpu as Interpreter;
 use trames_memory::{Permissions, PAGE_SIZE};
 
 #[test]
+fn raw_ip_scalar_vector_pairs_run_without_owner_on_native_and_packet_stack_transports() {
+    for virtual_network in [false, true] {
+        for family in [2, 10] {
+            for stream in [false, true] {
+                for slots in [1, 2] {
+                    let mut p = super::tests::process();
+                    let mut k = super::tests::kernel();
+                    if virtual_network {
+                        p.linux
+                            .vfs
+                            .configure_local_fabric(trames_vfs::NetworkMode::Full)
+                            .unwrap();
+                    } else {
+                        p.linux
+                            .vfs
+                            .configure_network(trames_vfs::NetworkMode::Loopback)
+                            .unwrap();
+                    }
+                    let kind = if stream { 1 } else { 2 };
+                    let left = p.linux.vfs.socket(family, kind, 0).unwrap();
+                    let right = p.linux.vfs.socket(family, kind, 0).unwrap();
+                    let bind = |fd| {
+                        let socket = p.linux.vfs.socket_fd(fd).unwrap();
+                        socket
+                            .bind(
+                                if family == 2 {
+                                    "127.0.0.1:0"
+                                } else {
+                                    "[::1]:0"
+                                }
+                                .parse()
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        socket
+                    };
+                    let left_socket = bind(left);
+                    let right_socket = bind(right);
+                    let left = if stream {
+                        left_socket.listen(2).unwrap();
+                        assert!(matches!(
+                            right_socket.connect(left_socket.local_addr().unwrap()),
+                            Ok(()) | Err(trames_net::NetError(115))
+                        ));
+                        let until = Instant::now() + Duration::from_secs(2);
+                        let accepted = loop {
+                            match p.linux.vfs.accept(left, 0) {
+                                Ok((fd, _)) => break fd,
+                                Err(trames_vfs::Errno(11)) => {
+                                    assert!(Instant::now() < until);
+                                    std::thread::yield_now();
+                                }
+                                other => panic!("{other:?}"),
+                            }
+                        };
+                        while !right_socket.connect_complete().unwrap() {
+                            assert!(Instant::now() < until);
+                            std::thread::yield_now();
+                        }
+                        p.linux.vfs.close(left).unwrap();
+                        accepted
+                    } else {
+                        left_socket
+                            .connect(right_socket.local_addr().unwrap())
+                            .unwrap();
+                        right_socket
+                            .connect(left_socket.local_addr().unwrap())
+                            .unwrap();
+                        left
+                    };
+                    drop((left_socket, right_socket));
+                    if virtual_network {
+                        assert!(p.linux.vfs.direct_network().get(left).is_none());
+                    }
+                    p.memory.write(0x1400, b"defghi").unwrap();
+                    for (at, value) in [
+                        (0x1200, 0x1308u64),
+                        (0x1208, 1),
+                        (0x1210, 0x1309),
+                        (0x1218, 2),
+                        (0x1500, 0x1403),
+                        (0x1508, 1),
+                        (0x1510, 0x1404),
+                        (0x1518, 2),
+                    ] {
+                        p.memory.write_array(at, value.to_le_bytes()).unwrap();
+                    }
+                    filter(&mut k, &mut p, 0x7fff0000);
+                    let mut peer = p.fork();
+                    peer.parent = 1;
+                    peer.tgid = 2;
+                    peer.memory.write(0x1400, b"abcxyz").unwrap();
+                    let finish = [
+                        mov(0, 0x1900),
+                        mov(1, 128),
+                        mov(2, 0),
+                        mov(3, 0),
+                        mov(8, 98),
+                        0xd4000001,
+                        0x14000000,
+                    ];
+                    let make = |calls: &[(u32, [u32; 3])]| {
+                        let mut code = Vec::new();
+                        for (index, (number, args)) in calls.iter().enumerate() {
+                            for (r, value) in args.iter().enumerate() {
+                                code.push(mov(r as u32, *value));
+                            }
+                            code.extend([
+                                mov(8, *number),
+                                0xd4000001,
+                                mov(10, 0x1800 + index as u32 * 8),
+                                0xf9000140,
+                            ]);
+                        }
+                        code.extend(finish);
+                        code
+                    };
+                    program(
+                        &mut p,
+                        make(&[
+                            (63, [left, 0x1300, 3]),
+                            (65, [left, 0x1200, 2]),
+                            (64, [left, 0x1400, 3]),
+                            (66, [left, 0x1500, 2]),
+                        ]),
+                    );
+                    program(
+                        &mut peer,
+                        make(&[
+                            (64, [right, 0x1400, 3]),
+                            (66, [right, 0x1500, 2]),
+                            (63, [right, 0x1300, 3]),
+                            (65, [right, 0x1200, 2]),
+                        ]),
+                    );
+                    if slots == 2 {
+                        peer.affinity = 2;
+                    }
+                    k.cpu_count = 2;
+                    k.workers = crate::workers::Pool::new(slots);
+                    k.per_cpu = vec![Duration::ZERO; 2];
+                    k.processes.insert(1, p);
+                    k.processes.insert(2, peer);
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while k.syscalls < 10 {
+                        let limit = k.instructions + 100_000;
+                        assert!(k.parallel_epoch(&mut trames_linux::CapturedOutput::default(),limit,true).unwrap(),"virtual={virtual_network} family={family} stream={stream} slots={slots} calls={}",k.syscalls);
+                        assert!(Instant::now() < until);
+                    }
+                    for (pid, first, second) in [(1, b"abc", b"xyz"), (2, b"def", b"ghi")] {
+                        let p = &k.processes[&pid];
+                        for i in 0..4 {
+                            assert_eq!(p.memory.read_u64(0x1800+i*8).unwrap(),3,"virtual={virtual_network} family={family} stream={stream} slots={slots} pid={pid} call={i}");
+                        }
+                        assert_eq!(p.memory.read_array::<3>(0x1300).unwrap(), *first);
+                        assert_eq!(p.memory.read_array::<3>(0x1308).unwrap(), *second);
+                        assert_eq!(p.seccomp.evaluations(), 10);
+                    }
+                    assert_eq!(k.syscalls, 10);
+                    assert_eq!(k.worker_syscalls,10,"raw IP joined owner: virtual={virtual_network} family={family} stream={stream} slots={slots}");
+                    assert_eq!(k.service_requests, 0);
+                    if slots == 1 {
+                        assert!(
+                            k.worker_io_waits > 0,
+                            "single-slot exchange must park a real socket wait"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
     for family in [2, 10] {
         for slots in [1, 2] {

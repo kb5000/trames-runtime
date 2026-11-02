@@ -571,9 +571,10 @@ impl DirectSyscalls {
         if self.network.get(fd).is_some() {
             return matches!(number, 63..=66);
         }
-        self.descriptors
-            .get(fd)
-            .is_some_and(|fd| Self::supports_fd(number, &fd))
+        if let Some(fd) = self.descriptors.get(fd) {
+            return Self::supports_fd(number, &fd);
+        }
+        matches!(number, 63..=66) && self.raw_ip_socket(fd).is_some()
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
         if number == 62 {
@@ -998,6 +999,9 @@ impl DirectSyscalls {
                 Ok(file) => self.start_retained_byte(file, number, args, memory, pid, target),
                 Err(error) => self.complete(number, args, Err(error)),
             });
+        }
+        if let Some(attempt) = self.start_raw_ip(number, args, memory, pid, target) {
+            return Some(attempt);
         }
         if matches!(number, 28 | 86 | 87) {
             return self

@@ -234,11 +234,15 @@ impl Linux {
         memory: &mut impl CpuMemory,
         read: impl FnOnce(usize) -> Result<Vec<u8>>,
     ) -> Result<u64> {
-        let count = a[2].min(MAX_WRITE as u64) as usize;
-        Self::check(memory, a[1], count, Access::Write)?;
+        let count = Self::read_parameters(a, memory)?;
         let bytes = read(count)?;
         memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
         Ok(bytes.len() as u64)
+    }
+    pub(crate) fn read_parameters(a: [u64; 6], memory: &impl CpuMemory) -> Result<usize> {
+        let count = a[2].min(MAX_WRITE as u64) as usize;
+        Self::check(memory, a[1], count, Access::Write)?;
+        Ok(count)
     }
     fn read_bytes(&mut self, fd: u32, count: usize, io: &mut impl GuestOutput) -> Result<Vec<u8>> {
         let kind = self.vfs.fd_kind(fd)?.clone();

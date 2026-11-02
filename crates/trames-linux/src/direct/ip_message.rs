@@ -24,6 +24,20 @@ struct State {
     recheck: bool,
 }
 impl Message {
+    pub fn raw(
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+        flags: u32,
+    ) -> Result<Self, Errno> {
+        Ok(Self {
+            pipe: AtomicBool::new(false),
+            state: Mutex::new(State {
+                active: Some(Prepared::raw(number, args, memory, flags)?),
+                ..State::default()
+            }),
+        })
+    }
     pub fn new(
         number: u32,
         args: [u64; 6],
@@ -186,6 +200,225 @@ mod tests {
         let fd = v.socket(2, 2, 0).unwrap();
         let op = v.socket_operation(fd).unwrap();
         (v, fd, op)
+    }
+    #[test]
+    fn raw_ip_nonblocking_timeout_and_netlink_exclusion_use_existing_semantics() {
+        let (mut v, fd, socket) = socket();
+        let netlink = v.socket(16, 3, 0).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let d = DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory());
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut m = memory();
+        for number in [63, 64, 65, 66] {
+            assert!(!d.supports_call(number, [netlink as u64, u64::MAX, 1, 0, 0, 0]));
+            assert!(d
+                .start(
+                    number,
+                    [netlink as u64, u64::MAX, 1, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None
+                )
+                .is_none());
+        }
+        for number in [63, 65] {
+            for timeout in [false, true] {
+                v.set_nonblocking(fd, !timeout).unwrap();
+                socket.set_io_timeout(true, timeout.then_some(Duration::ZERO));
+                let a = if number == 63 {
+                    [fd as u64, 0x3000, 3, 0, 0, 0]
+                } else {
+                    [fd as u64, 0x1300, 1, 0, 0, 0]
+                };
+                assert!(matches!(
+                    d.start(number, a, &mut m, 1, &Arc::downgrade(&target), None),
+                    Some(IoAttempt::Complete(Err(Errno(11))))
+                ));
+            }
+        }
+    }
+    #[test]
+    fn virtual_tcp_raw_epipe_retains_terminal_result_through_owner_handoff_and_fd_reuse() {
+        for number in [64, 66] {
+            let mut v = Vfs::default();
+            v.configure_local_fabric(NetworkMode::Full).unwrap();
+            let listener = v.socket(2, 1, 0).unwrap();
+            let l = v.socket_fd(listener).unwrap();
+            l.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            l.listen(1).unwrap();
+            let fd = v.socket(2, 1, 0).unwrap();
+            let socket = v.socket_fd(fd).unwrap();
+            assert!(matches!(
+                socket.connect(l.local_addr().unwrap()),
+                Ok(()) | Err(trames_net::NetError(115))
+            ));
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                match v.accept(listener, 0) {
+                    Ok(_) => break,
+                    Err(Errno(11)) => {
+                        assert!(Instant::now() < until);
+                        std::thread::yield_now();
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            while !socket.connect_complete().unwrap() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            socket.shutdown(1).unwrap();
+            drop(socket);
+            let d = DirectSyscalls::new(v.direct_descriptors())
+                .with_network(v.direct_network())
+                .with_resources(v.descriptor_factory());
+            let mut m = memory();
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let a = if number == 64 {
+                [fd as u64, 0x1400, 3, 0, 0, 0]
+            } else {
+                [fd as u64, 0x1300, 1, 0, 0, 0]
+            };
+            let call = match d
+                .start(number, a, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap()
+            {
+                IoAttempt::SocketCheckpoint(call) => call,
+                _ => panic!("raw EPIPE must retain task handoff"),
+            };
+            assert!(call.pipe_signal());
+            v.close(fd).unwrap();
+            assert_eq!(v.eventfd(0, 0).unwrap(), fd);
+            assert!(matches!(
+                d.retry_owned_socket(call, &mut m, 1, &Arc::downgrade(&target)),
+                IoAttempt::Complete(Err(Errno(32)))
+            ));
+        }
+    }
+    #[test]
+    fn raw_ip_bytes_keep_one_packet_and_the_original_vector_fault_order() {
+        let (v, fd, socket) = socket();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket.connect(peer.local_addr().unwrap()).unwrap();
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_membership(v.shared_files())
+            .with_resources(v.descriptor_factory());
+        let mut m = memory();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        for (at, value) in [
+            (0x1300, 0x1400u64),
+            (0x1308, 1),
+            (0x1310, 0x1401),
+            (0x1318, 2),
+        ] {
+            m.write_array(at, value.to_le_bytes()).unwrap();
+        }
+        let invoke = |number, args, memory: &mut Memory| {
+            assert!(direct.supports_call(number, args));
+            match direct
+                .start(number, args, memory, 1, &Arc::downgrade(&target), None)
+                .unwrap()
+            {
+                IoAttempt::Complete(result) => result,
+                _ => panic!("ready raw IP call did not complete"),
+            }
+        };
+        assert_eq!(invoke(66, [fd as u64, 0x1300, 2, 0, 0, 0], &mut m), Ok(3));
+        let mut bytes = [0; 16];
+        assert_eq!(peer.recv(&mut bytes).unwrap(), 3);
+        assert_eq!(&bytes[..3], b"abc");
+        peer.send_to(b"abcdef", socket.local_addr().unwrap())
+            .unwrap();
+        peer.send_to(b"next", socket.local_addr().unwrap()).unwrap();
+        trames_net::wait(&[(socket.socket_handle(), 1)], Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            invoke(65, [fd as u64, 0x1300, 1025, 0, 0, 0], &mut m),
+            Err(Errno(22))
+        );
+        m.write_array(0x1310, u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(
+            invoke(65, [fd as u64, 0x1300, 2, 0, 0, 0], &mut m),
+            Err(Errno(14))
+        );
+        m.write_array(0x1310, 0x1401u64.to_le_bytes()).unwrap();
+        assert_eq!(invoke(65, [fd as u64, 0x1300, 2, 0, 0, 0], &mut m), Ok(3));
+        assert_eq!(m.read_array::<3>(0x1400).unwrap(), *b"abc");
+        assert_eq!(invoke(63, [fd as u64, 0x1500, 16, 0, 0, 0], &mut m), Ok(4));
+        assert_eq!(m.read_array::<4>(0x1500).unwrap(), *b"next");
+        m.write_array(0x1310, u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(
+            invoke(66, [fd as u64, 0x1300, 2, 0, 0, 0], &mut m),
+            Err(Errno(14))
+        );
+        assert_eq!(
+            invoke(66, [fd as u64, 0x1300, 1025, 0, 0, 0], &mut m),
+            Err(Errno(22))
+        );
+        for number in [63, 64, 65, 66] {
+            let a = [fd as u64, u64::MAX, 1, 0, 0, 0];
+            assert!(matches!(
+                Prepared::raw(number, a, &m, if matches!(number, 63 | 65) { 1 } else { 0 }),
+                Err(Errno(14))
+            ));
+        }
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.recv(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn parked_raw_ip_call_retains_scalar_or_vector_outputs_and_full_ofd() {
+        for number in [63, 65] {
+            for fault in [false, true] {
+                let (mut v, fd, socket) = socket();
+                socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let address = socket.local_addr().unwrap();
+                drop(socket);
+                let direct = DirectSyscalls::new(v.direct_descriptors())
+                    .with_resources(v.descriptor_factory());
+                let target: Arc<dyn IoWake> = Arc::new(Target);
+                let mut m = memory();
+                m.write_array(0x1300, 0x3000u64.to_le_bytes()).unwrap();
+                let args = if number == 63 {
+                    [fd as u64, 0x3000, 3, 0, 0, 0]
+                } else {
+                    [fd as u64, 0x1300, 1, 0, 0, 0]
+                };
+                let call = match direct
+                    .start(number, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap()
+                {
+                    IoAttempt::SocketCheckpoint(call) => call,
+                    _ => panic!("expected accepted raw IP wait"),
+                };
+                let old = call.socket_handle().unwrap();
+                v.close(fd).unwrap();
+                assert_eq!(v.eventfd(0, 0).unwrap(), fd);
+                m.write_array(0x1300, 0x1500u64.to_le_bytes()).unwrap();
+                if fault {
+                    m.unmap(0x3000, PAGE_SIZE).unwrap();
+                }
+                let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                peer.send_to(b"abc", address).unwrap();
+                trames_net::wait(&[(old.clone(), 1)], Duration::from_secs(2)).unwrap();
+                match direct.retry_owned_socket(call, &mut m, 1, &Arc::downgrade(&target)) {
+                    IoAttempt::Complete(result) => {
+                        assert_eq!(result, if fault { Err(Errno(14)) } else { Ok(3) })
+                    }
+                    _ => panic!("raw receive did not finish"),
+                }
+                if fault {
+                    assert_eq!(old.recv(3, 0).unwrap().data, b"abc");
+                } else {
+                    assert_eq!(m.read_array::<3>(0x3000).unwrap(), *b"abc");
+                    assert_eq!(m.read_array::<3>(0x1500).unwrap(), [0; 3]);
+                }
+            }
+        }
     }
     #[test]
     fn ip_admission_preserves_empty_batch_errors_nonblocking_timeout_and_netlink_boundary() {

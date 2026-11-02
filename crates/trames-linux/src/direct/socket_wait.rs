@@ -49,7 +49,7 @@ impl RetainedSocket {
             .is_some_and(|message| message.pipe_signal())
     }
     pub fn events(&self) -> u16 {
-        if matches!(self.number, 203 | 206 | 211 | 269) {
+        if matches!(self.number, 64 | 66 | 203 | 206 | 211 | 269) {
             4
         } else {
             1
@@ -163,6 +163,44 @@ impl RetainedSocket {
     }
 }
 impl DirectSyscalls {
+    pub(super) fn raw_ip_socket(&self, fd: u32) -> Option<trames_vfs::SocketOperation> {
+        let socket = self.resources.as_ref()?.socket_operation(fd)?.ok()?;
+        matches!(socket.address_size(), 16 | 28).then_some(socket)
+    }
+    pub(super) fn start_raw_ip(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> Option<IoAttempt> {
+        if !matches!(number, 63..=66) {
+            return None;
+        }
+        let socket = self.raw_ip_socket(args[0] as u32)?;
+        let message = match ip_message::Message::raw(number, args, memory, socket.flags()) {
+            Ok(message) => Arc::new(message),
+            Err(error) => return Some(self.complete_socket(Err(error))),
+        };
+        let deadline = socket
+            .io_timeout(matches!(number, 63 | 65))
+            .and_then(|d| Instant::now().checked_add(d));
+        Some(self.start_retained_socket(
+            RetainedSocket {
+                socket: Control::Network(socket),
+                factory: self.resources.as_ref()?.clone(),
+                number,
+                args,
+                deadline,
+                connecting: false,
+                message: Some(message),
+            },
+            memory,
+            pid,
+            target,
+        ))
+    }
     fn prepare_socket_call(
         &self,
         number: u32,
