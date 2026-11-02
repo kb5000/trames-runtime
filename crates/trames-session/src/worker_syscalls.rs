@@ -43,6 +43,7 @@ pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
     match cpu.x(8) as u32 {
         57 => snapshot.seccomp.mode() == 0 && snapshot.direct.socket_descriptor(cpu.x(0) as u32),
         number if snapshot.seccomp.mode() == 0 && network_service_candidate(number) => true,
+        20 => snapshot.seccomp.mode() == 0,
         62 | 80 => true,
         63..=66 => {
             let fd = cpu.x(0) as u32;
@@ -312,6 +313,7 @@ impl Snapshot {
         // carries their exact decision through an owner-resource fallback.
         if self.direct.supports_creation(cpu.x(8) as u32)
             || self.direct.supports_path_query(cpu.x(8) as u32)
+            || self.direct.supports_epoll_control(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {
@@ -356,6 +358,13 @@ impl Snapshot {
             return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
         }
         if self.seccomp.mode() == 0 {
+            if let Some(result) = self.direct.invoke_epoll_control(
+                cpu.x(8) as u32,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            ) {
+                return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+            }
             if let Some(result) = self.direct.invoke_socket_control(
                 cpu.x(8) as u32,
                 std::array::from_fn(|i| cpu.x(i)),
@@ -369,7 +378,7 @@ impl Snapshot {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }
-            number @ (48 | 56 | 78..=80 | 291 | 437 | 439) => {
+            number @ (27 | 48 | 56 | 78..=80 | 291 | 437 | 439) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }

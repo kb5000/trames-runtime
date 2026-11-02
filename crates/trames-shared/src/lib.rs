@@ -19,7 +19,7 @@ use std::{
 mod logical_size;
 pub use logical_size::{LogicalSize, SizeCycle};
 mod readiness;
-pub use readiness::{IoSignal, IoSubscription, IoWake, Readiness};
+pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness};
 mod host_events;
 pub use host_events::{HostEvents, HostFd, HostSubscription};
 mod pipe;

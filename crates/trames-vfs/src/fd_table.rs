@@ -35,15 +35,14 @@ impl Slot {
         Self {
             open: match &d.open {
                 OpenHandle::Shared(open) => SlotOpen::Shared(open.clone()),
-                OpenHandle::Owner(_) => SlotOpen::Owner(
-                    d.open.identity(),
-                    d.open.borrow().query_metadata(),
-                    d.open
-                        .borrow()
-                        .socket
-                        .as_ref()
-                        .map(|_| Arc::downgrade(&d.open.borrow().shared)),
-                ),
+                OpenHandle::Owner(_) => {
+                    SlotOpen::Owner(d.open.identity(), d.open.borrow().query_metadata(), {
+                        let open = d.open.borrow();
+                        (open.socket.is_some()
+                            || matches!(open.control, Some(events::SharedControl::Epoll(_))))
+                        .then(|| Arc::downgrade(&open.shared))
+                    })
+                }
             },
             cloexec: d.cloexec.clone(),
         }
@@ -91,7 +90,8 @@ impl MembershipEntries {
     }
 }
 /// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
-/// owner slots carry no worker endpoint/control authority.
+/// owner slots publish weak metadata/control capabilities while their Rc
+/// projections remain on the owner.
 #[derive(Clone)]
 pub struct SharedFiles(
     pub(super) Arc<Membership>,
@@ -192,21 +192,50 @@ impl Drop for ReservedPair {
         }
     }
 }
+pub(super) enum PollOpen {
+    Shared(SharedFd),
+    Epoll(Arc<SharedOpenDescription>),
+}
 impl SharedFiles {
-    pub(super) fn socket_control(&self, fd: u32) -> Option<Arc<SharedOpenDescription>> {
+    pub(super) fn control_open(&self, fd: u32) -> Option<Arc<SharedOpenDescription>> {
         let entries = self.0.entries.lock().unwrap();
         let open = match &entries.get(&fd)?.open {
             SlotOpen::Shared(open) => open.clone(),
             SlotOpen::Owner(_, _, open) => open.as_ref()?.upgrade()?,
         };
+        Some(open)
+    }
+    /// Poll admission may use an epoll's complete shared interest core without
+    /// promoting its owner projection into a transferable/shared descriptor.
+    pub(super) fn poll_lookup(&self, fd: u32) -> Option<Result<PollOpen>> {
+        let entries = self.0.entries.lock().unwrap();
+        let Some(slot) = entries.get(&fd) else {
+            return Some(Err(Errno(9)));
+        };
+        match &slot.open {
+            SlotOpen::Shared(_) => Some(
+                slot.shared_open()?
+                    .map(|open| PollOpen::Shared(SharedFd::new(open.clone()))),
+            ),
+            SlotOpen::Owner(_, _, metadata) => {
+                let open = metadata.as_ref()?.upgrade()?;
+                if matches!(&open.control,Some(events::SharedControl::Epoll(live)) if live.owner_count()==0)
+                {
+                    Some(Ok(PollOpen::Epoll(open)))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    pub(super) fn socket_control(&self, fd: u32) -> Option<Arc<SharedOpenDescription>> {
+        let open = self.control_open(fd)?;
         open.socket_control.as_ref()?;
         Some(open)
     }
     pub(super) fn is_socket(&self, fd: u32) -> bool {
-        matches!(
-            self.0.entries.lock().unwrap().get(&fd).map(|s| &s.open),
-            Some(SlotOpen::Owner(_, _, Some(_)))
-        )
+        self.control_open(fd)
+            .is_some_and(|open| open.kind == FdKind::Socket)
     }
     pub(super) fn tcp_lookup(&self, fd: u32) -> Option<DirectTcpFd> {
         let entries = self.0.entries.lock().unwrap();
@@ -344,7 +373,7 @@ impl SharedFiles {
                 Ok(open) => open,
                 Err(error) => return Some(Err(error)),
             },
-            // Only socket slots already publish this weak shared OFD. Expose
+            // Socket/epoll slots publish this weak shared OFD. Expose
             // its existing atomic FD bits, never endpoint/namespace control.
             SlotOpen::Owner(_, _, open) => {
                 retained = open.as_ref()?.upgrade()?;

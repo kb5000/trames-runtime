@@ -58,7 +58,9 @@ pub struct PathQueries {
 // Source resources cross only as their existing Send+Sync Arc capabilities.
 // Query-local clones never escape a method. Send moves the entire private island
 // exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
-// Methods return only owned bytes/results and numeric FDs. Ordinary opens publish
+// Methods return only owned bytes/results and numeric FDs. Inotify registration
+// mutates only the original Arc-backed instance/inode marks, never query-local Rc.
+// Ordinary opens publish
 // Arc-backed descriptions; no Rc-backed owner control enters shared membership.
 // The dummy FD table remains private and empty. Adding an API that
 // leaks/retains a local Rc outside this island requires revisiting this proof.
@@ -164,6 +166,9 @@ impl PathQueries {
     pub fn mount_id_fd(&self, fd: u32) -> Option<Result<u64>> {
         self.query(|v| v.mount_id_fd(fd))
     }
+    pub fn inotify_add(&self, fd: u32, path: &[u8], mask: u32) -> Option<Result<i32>> {
+        self.query(|v| v.inotify_add(fd, path, mask))
+    }
     pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Option<Result<Vec<u8>>> {
         self.query(|v| v.readlink_at(dirfd, path))
     }
@@ -181,6 +186,32 @@ impl PathQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_inotify_registration_uses_original_instances_and_inode_marks() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"old".to_vec()).unwrap();
+        owner.set_runtime_info(1, RuntimeInfo::default());
+        let notify = owner.inotify_init(O_NONBLOCK).unwrap();
+        let query = owner.path_queries();
+        let wd = std::thread::spawn(move || {
+            assert_eq!(
+                query.inotify_add(notify, b"/missing", 2),
+                Some(Err(Errno(2)))
+            );
+            query.inotify_add(notify, b"/file", 2).unwrap().unwrap()
+        })
+        .join()
+        .unwrap();
+        let fd = owner.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+        owner.write(fd, b"new").unwrap();
+        let events = owner.read(notify, 4096).unwrap();
+        assert_eq!(i32::from_le_bytes(events[..4].try_into().unwrap()), wd);
+        assert_eq!(u32::from_le_bytes(events[4..8].try_into().unwrap()) & 2, 2);
+        assert_eq!(owner.inotify_remove(notify, wd), Ok(()));
+        let query = owner.path_queries();
+        assert_eq!(query.inotify_add(notify, b"/proc/self/status", 2), None);
+        assert_eq!(query.inotify_add(999, b"/file", 2), Some(Err(Errno(9))));
+    }
     #[test]
     fn worker_open_publishes_live_membership_and_io_without_recapture() {
         let mut owner = Vfs::default();

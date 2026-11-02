@@ -937,6 +937,20 @@ impl Linux {
         cpu.set_x(0, raw);
         SyscallOutcome::Continue
     }
+    pub(super) fn epoll_control_parameters(
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Result<(u32, u64)> {
+        if a[1] == 2 {
+            return Ok((0, 0));
+        }
+        Self::check(memory, a[3], 16, Access::Read)?;
+        let bytes = memory.read_array::<4>(a[3]).map_err(|_| Errno(14))?;
+        Ok((
+            u32::from_le_bytes(bytes),
+            memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
+        ))
+    }
     pub(crate) fn syscall(
         &mut self,
         number: u64,
@@ -996,17 +1010,7 @@ impl Linux {
             .expect("creation ABI"),
             20 => Ok(self.vfs.epoll_create(a[0] as u32)? as u64),
             21 => {
-                let (events, data) = if a[1] == 2 {
-                    (0, 0)
-                } else {
-                    Self::check(memory, a[3], 16, Access::Read)?;
-                    let mut bytes = [0; 4];
-                    memory.read(a[3], &mut bytes).map_err(|_| Errno(14))?;
-                    (
-                        u32::from_le_bytes(bytes),
-                        memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
-                    )
-                };
+                let (events, data) = Self::epoll_control_parameters(a, memory)?;
                 self.vfs
                     .epoll_ctl(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
                 Ok(0)

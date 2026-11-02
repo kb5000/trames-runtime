@@ -211,7 +211,7 @@ enum ByteResource {
     Event(Arc<EventCounter>),
     Timer(Arc<TimerFd>),
     Inotify(inotify::Capability),
-    Epoll(Arc<DirectEpoll>),
+    Epoll(DirectEpoll),
     Unix {
         data: Arc<ipc::channel::Resource>,
         side: usize,
@@ -227,12 +227,26 @@ enum ByteResource {
         initial_write_epoch: u64,
     },
 }
-enum WatchResource {
+#[derive(Clone)]
+pub(super) enum WatchResource {
     Shared(std::sync::Weak<SharedOpenDescription>),
     Owner(DirectFd),
 }
 impl WatchResource {
-    fn capture(
+    pub(super) fn live(&self) -> bool {
+        match self {
+            Self::Shared(open) => open.strong_count() != 0,
+            Self::Owner(fd) => fd.origin.as_ref().is_none_or(OfdIdentity::is_live),
+        }
+    }
+    fn accepted(fd: &DirectFd) -> Self {
+        if let Some(file) = &fd._file {
+            Self::Shared(Arc::downgrade(&file.open))
+        } else {
+            Self::Owner(fd.clone())
+        }
+    }
+    pub(super) fn capture(
         open: &OpenWeak,
         polls: Option<&BTreeMap<usize, Arc<dyn DirectPoll>>>,
     ) -> Option<Self> {
@@ -249,7 +263,7 @@ impl WatchResource {
             }
         }
     }
-    fn resolve(&self) -> Option<DirectFd> {
+    pub(super) fn resolve(&self) -> Option<DirectFd> {
         match self {
             Self::Shared(open) => SharedFd::new(open.upgrade()?).direct_byte(),
             Self::Owner(fd) => fd
@@ -260,10 +274,28 @@ impl WatchResource {
         }
     }
 }
-type DirectWatch = ((u32, u64), Arc<Mutex<events::WatchState>>, WatchResource);
+pub(super) type DirectWatch = ((u32, u64), Arc<Mutex<events::WatchState>>, WatchResource);
+#[derive(Clone)]
 struct DirectEpoll {
-    watches: Vec<DirectWatch>,
-    cursor: Arc<Mutex<Option<(u32, u64)>>>,
+    watches: Option<Arc<Vec<DirectWatch>>>,
+    live: Arc<epoll::LiveEpoll>,
+}
+struct WatchSnapshot<'a> {
+    live: Arc<Vec<DirectWatch>>,
+    frozen: &'a [DirectWatch],
+}
+impl WatchSnapshot<'_> {
+    fn iter(&self) -> impl Iterator<Item = &DirectWatch> {
+        epoll::ordered(&self.live, self.frozen, None)
+    }
+}
+impl DirectEpoll {
+    fn snapshot(&self) -> WatchSnapshot<'_> {
+        WatchSnapshot {
+            live: self.live.snapshot(),
+            frozen: self.watches.as_deref().map_or(&[], |w| w.as_slice()),
+        }
+    }
 }
 /// Retained byte authority with immutable access bits and live OFD status.
 /// It is Send + Sync by composition; no unsafe Rc/RefCell conversion is used.
@@ -304,6 +336,15 @@ impl DirectFd {
             Some(events::SharedControl::Inotify(instance)) => {
                 ByteResource::Inotify(instance.capability())
             }
+            Some(events::SharedControl::Epoll(live)) => {
+                if live.owner_count() != 0 {
+                    return None;
+                }
+                ByteResource::Epoll(DirectEpoll {
+                    watches: None,
+                    live: live.clone(),
+                })
+            }
             None => {
                 let end = open.pipe.as_ref()?;
                 ByteResource::Pipe {
@@ -327,17 +368,17 @@ impl DirectFd {
         self
     }
     // A conservative scheduling hint, never an access/FD authority check.
-    // Watches share their underlying byte resources; nested epoll is rejected
-    // at registration, so this traversal cannot cycle.
+    // Live interests exclude nested epoll; frozen owner captures follow the
+    // validated acyclic owner graph, so this traversal cannot cycle.
     fn shares_resource(&self, other: &Self) -> bool {
         match (&self.resource, &other.resource) {
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Epoll(a), _) => a
-                .watches
+                .snapshot()
                 .iter()
                 .any(|(_, _, fd)| fd.resolve().is_some_and(|fd| fd.shares_resource(other))),
             (_, ByteResource::Epoll(b)) => b
-                .watches
+                .snapshot()
                 .iter()
                 .any(|(_, _, fd)| fd.resolve().is_some_and(|fd| self.shares_resource(&fd))),
             (ByteResource::Event(a), ByteResource::Event(b)) => Arc::ptr_eq(a, b),
@@ -362,7 +403,7 @@ impl DirectFd {
             #[cfg(all(feature = "hostfs", unix))]
             ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
             ByteResource::Epoll(epoll) => epoll
-                .watches
+                .snapshot()
                 .iter()
                 .filter(|(_, state, _)| state.lock().unwrap().armed)
                 .filter_map(|(_, _, fd)| fd.resolve())
@@ -379,20 +420,25 @@ impl DirectFd {
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => vec![timer.subscribe(signal)],
-            ByteResource::Inotify(queue) => vec![queue.subscribe(signal)],
+            ByteResource::Inotify(queue) => vec![queue.queue.subscribe(signal)],
             ByteResource::Pipe { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Unix { data, .. } => vec![data.readiness.subscribe(signal)],
             ByteResource::Pty { data, .. } => vec![data.subscribe(signal)],
-            ByteResource::Epoll(epoll) => epoll
-                .watches
-                .iter()
-                .filter(|(_, state, _)| state.lock().unwrap().armed)
-                .flat_map(|(_, _, fd)| {
-                    fd.resolve()
-                        .map(|fd| fd.subscribe(signal))
-                        .unwrap_or_default()
-                })
-                .collect(),
+            ByteResource::Epoll(epoll) => {
+                let mut subscriptions = vec![epoll.live.changed.subscribe(signal)];
+                subscriptions.extend(
+                    epoll
+                        .snapshot()
+                        .iter()
+                        .filter(|(_, state, _)| state.lock().unwrap().armed)
+                        .flat_map(|(_, _, fd)| {
+                            fd.resolve()
+                                .map(|fd| fd.subscribe(signal))
+                                .unwrap_or_default()
+                        }),
+                );
+                subscriptions
+            }
         }
     }
     pub(super) fn snapshot(open: &OpenDescription) -> Option<Self> {
@@ -406,7 +452,10 @@ impl DirectFd {
             ByteResource::Timer(timer.clone())
         } else if let Some(events::Anonymous::Inotify(instance)) = &open.anonymous {
             ByteResource::Inotify(instance.capability())
-        } else if let Some(events::Anonymous::Epoll { watches, cursor }) = &open.anonymous {
+        } else if let Some(events::Anonymous::Epoll {
+            watches, shared, ..
+        }) = &open.anonymous
+        {
             let mut direct = Vec::new();
             for (&key, watch) in watches {
                 if watch.open.strong_count() != 0 {
@@ -417,10 +466,10 @@ impl DirectFd {
                     ));
                 }
             }
-            ByteResource::Epoll(Arc::new(DirectEpoll {
-                watches: direct,
-                cursor: cursor.clone(),
-            }))
+            ByteResource::Epoll(DirectEpoll {
+                watches: (!direct.is_empty()).then(|| Arc::new(direct)),
+                live: shared.clone(),
+            })
         } else if matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
             let end = open.pipe.as_ref()?;
             ByteResource::Pipe {
@@ -478,7 +527,9 @@ impl DirectFd {
             Some(events::Anonymous::Uring(ring)) => {
                 ByteResource::PollOnly(polls.get(&(Rc::as_ptr(ring) as usize))?.clone())
             }
-            Some(events::Anonymous::Epoll { watches, cursor }) => {
+            Some(events::Anonymous::Epoll {
+                watches, shared, ..
+            }) => {
                 let mut direct = Vec::new();
                 for (&key, watch) in watches {
                     if watch.open.strong_count() != 0 {
@@ -489,10 +540,10 @@ impl DirectFd {
                         ));
                     }
                 }
-                ByteResource::Epoll(Arc::new(DirectEpoll {
-                    watches: direct,
-                    cursor: cursor.clone(),
-                }))
+                ByteResource::Epoll(DirectEpoll {
+                    watches: (!direct.is_empty()).then(|| Arc::new(direct)),
+                    live: shared.clone(),
+                })
             }
             _ => return Self::snapshot(open),
         };
@@ -514,7 +565,7 @@ impl DirectFd {
         match &self.resource {
             ByteResource::PollOnly(poll) => vec![poll.identity()],
             ByteResource::Epoll(epoll) => epoll
-                .watches
+                .snapshot()
                 .iter()
                 .filter(|(_, state, _)| state.lock().unwrap().armed)
                 .flat_map(|(_, _, fd)| {
@@ -600,7 +651,7 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Timer(timer) => timer.deadline(),
             ByteResource::Epoll(epoll) => epoll
-                .watches
+                .snapshot()
                 .iter()
                 .filter_map(|(_, state, fd)| {
                     let fd = fd.resolve()?;
@@ -646,7 +697,7 @@ impl DirectFd {
         }
         ready
     }
-    fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
+    pub(super) fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular => (events & 5, [0; 2]),
@@ -683,7 +734,7 @@ impl DirectFd {
             ByteResource::Epoll(epoll) => {
                 let mut ready = false;
                 let mut generation = 0u64;
-                for (_, state, resource) in &epoll.watches {
+                for (_, state, resource) in epoll.snapshot().iter() {
                     let state = state.lock().unwrap();
                     if state.armed {
                         if let Some(fd) = resource.resolve() {
@@ -701,33 +752,23 @@ impl DirectFd {
         let ByteResource::Epoll(epoll) = &self.resource else {
             return Err(Errno(22));
         };
-        // One delivery cursor per epoll object, shared with the joined path.
-        // This also arbitrates ET and ONESHOT between concurrent waiters.
-        let mut cursor = epoll.cursor.lock().unwrap();
-        let start = cursor.map_or(0, |c| {
-            epoll.watches.partition_point(|(key, _, _)| *key <= c)
-        });
-        let mut result = Vec::new();
-        for (key, state, fd) in epoll.watches[start..].iter().chain(&epoll.watches[..start]) {
-            let Some(fd) = fd.resolve() else { continue };
-            let mut state = state.lock().unwrap();
-            if !state.armed {
-                continue;
-            }
-            let (ready, epoch) = fd.peek_poll(state.events as u16);
-            if let Some(event) = state.observe(ready, epoch) {
-                if let ByteResource::Mounts(watch) = &fd.resource {
-                    watch.acknowledge(epoch[0]);
-                }
-                *cursor = Some(*key);
-                result.push(event);
-                if result.len() == max {
-                    break;
-                }
-            }
-        }
-        Ok(result)
+        epoll
+            .live
+            .wait(max, epoll.watches.as_deref().map_or(&[], |w| w.as_slice()))
     }
+    pub fn epoll_revision(&self) -> Option<u64> {
+        if let ByteResource::Epoll(epoll) = &self.resource {
+            Some(epoll.live.revision())
+        } else {
+            None
+        }
+    }
+    pub(super) fn acknowledge(&self, epoch: [u64; 2]) {
+        if let ByteResource::Mounts(watch) = &self.resource {
+            watch.acknowledge(epoch[0]);
+        }
+    }
+
     pub fn is_eventfd(&self) -> bool {
         matches!(self.resource, ByteResource::Event(_))
     }
@@ -860,10 +901,62 @@ impl DirectFds {
         self.1.clone()
     }
     pub fn get(&self, fd: u32) -> Option<DirectFd> {
-        if let Some(result) = self.1.as_ref().and_then(|files| files.lookup(fd)) {
-            return result.ok()?.direct_poll();
+        if let Some(result) = self.1.as_ref().and_then(|files| files.poll_lookup(fd)) {
+            return match result.ok()? {
+                fd_table::PollOpen::Shared(file) => file.direct_poll(),
+                fd_table::PollOpen::Epoll(open) => {
+                    let mut fd = DirectFd::shared_byte(&open)?;
+                    fd.origin = Some(OfdIdentity::new(&open));
+                    Some(fd)
+                }
+            };
         }
-        self.0.get(fd as usize)?.clone()
+        if let Some(open) = self.1.as_ref().and_then(|files| files.control_open(fd)) {
+            if let Some(events::SharedControl::Epoll(live)) = &open.control {
+                if live.owner_count() == 0 {
+                    let mut result = DirectFd::shared_byte(&open)?;
+                    result.origin = Some(OfdIdentity::new(&open));
+                    return Some(result);
+                }
+                let cached = self.0.get(fd as usize)?.as_ref()?;
+                if let ByteResource::Epoll(epoll) = &cached.resource {
+                    return Arc::ptr_eq(live, &epoll.live).then(|| cached.clone());
+                }
+            }
+            return None;
+        }
+        let cached = self.0.get(fd as usize)?.clone()?;
+        (!cached.is_epoll()).then_some(cached)
+    }
+    pub fn epoll_control(
+        &self,
+        fd: u32,
+        op: u32,
+        target: u32,
+        events: u32,
+        data: u64,
+    ) -> Option<Result<()>> {
+        let open = self.1.as_ref()?.control_open(fd)?;
+        let Some(events::SharedControl::Epoll(live)) = &open.control else {
+            return None;
+        };
+        let target_fd = self.get(target)?;
+        let identity = target_fd.ofd_identity();
+        let target_open = identity.open()?;
+        if Arc::ptr_eq(&open, &target_open) {
+            return Some(Err(Errno(22)));
+        }
+        if target_fd.is_epoll() {
+            return None;
+        }
+        if matches!(target_fd.resource, ByteResource::Regular) {
+            return Some(Err(Errno(1)));
+        }
+        let key = (target, target_open.id);
+        if live.owner_count() != 0 && !live.contains(key) {
+            return None;
+        }
+        Some(live.update(key, op, events, data, WatchResource::accepted(&target_fd)))
     }
     fn candidates(&self) -> Vec<DirectFd> {
         self.0
@@ -995,11 +1088,21 @@ fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
             .map(Into::into)
             .into_iter()
             .collect(),
-        Some(events::Anonymous::Epoll { watches, .. }) => watches
-            .values()
-            .filter(|watch| watch.state.lock().unwrap().armed)
-            .filter_map(|watch| watch.open.upgrade())
-            .flat_map(|open| native_wait_open(&open.borrow()))
+        Some(events::Anonymous::Epoll {
+            watches, shared, ..
+        }) => shared
+            .snapshot()
+            .iter()
+            .filter(|w| w.1.lock().unwrap().armed)
+            .filter_map(|w| w.2.resolve())
+            .flat_map(|fd| fd.native_wait_fds())
+            .chain(
+                watches
+                    .values()
+                    .filter(|watch| watch.state.lock().unwrap().armed)
+                    .filter_map(|watch| watch.open.upgrade())
+                    .flat_map(|open| native_wait_open(&open.borrow())),
+            )
             .collect(),
         _ => Vec::new(),
     }
@@ -1014,6 +1117,108 @@ impl RetainedFd {
 mod tests {
     use super::*;
     use std::{thread, time::Duration};
+    #[test]
+    fn live_epoll_controls_reach_old_views_and_never_retarget_reused_numbers() {
+        let mut v = Vfs::default();
+        let direct = v.direct_descriptors(); // before either resource exists
+        let ep = v.epoll_create(0).unwrap();
+        let event = v.eventfd(1, 0).unwrap();
+        let alias = v.dup(event, 0, false).unwrap();
+        let wait = direct.get(ep).unwrap();
+        assert_eq!(
+            direct.epoll_control(ep, 1, event, 0xc0000001, 42),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            direct.epoll_control(ep, 1, event, 1, 99),
+            Some(Err(Errno(17)))
+        );
+        assert_eq!(wait.epoll_wait(1).unwrap(), vec![(1, 42)]);
+        assert!(wait.epoll_wait(1).unwrap().is_empty());
+        assert_eq!(
+            direct.epoll_control(ep, 3, event, 0xc0000001, 43),
+            Some(Ok(()))
+        );
+        assert_eq!(wait.epoll_wait(1).unwrap(), vec![(1, 43)]);
+        assert_eq!(direct.epoll_control(ep, 3, event, 1, 44), Some(Ok(())));
+        v.close(event).unwrap();
+        let replacement = v.eventfd(0, 0).unwrap();
+        assert_eq!(replacement, event);
+        assert_eq!(
+            direct.epoll_control(ep, 2, replacement, 0, 0),
+            Some(Err(Errno(2)))
+        );
+        assert_eq!(wait.epoll_wait(1).unwrap(), vec![(1, 44)]); // real alias remains
+        v.close(alias).unwrap();
+        assert!(wait.epoll_wait(1).unwrap().is_empty());
+        assert_eq!(
+            direct.epoll_control(ep, 1, replacement, 1, 45),
+            Some(Ok(()))
+        );
+        assert!(wait.epoll_wait(1).unwrap().is_empty());
+        v.write(replacement, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(wait.epoll_wait(1).unwrap(), vec![(1, 45)]);
+        assert_eq!(direct.epoll_control(ep, 2, replacement, 0, 0), Some(Ok(())));
+        assert!(wait.epoll_wait(1).unwrap().is_empty());
+    }
+    #[test]
+    fn live_shared_and_owner_interests_share_the_original_limit_and_cursor() {
+        let mut v = Vfs::default();
+        let ep = v.epoll_create(0).unwrap();
+        let signal = v.signalfd(-1, 1 << 10, 0).unwrap();
+        v.epoll_ctl(ep, 1, signal, 1, 100).unwrap();
+        let mut events = Vec::new();
+        for i in 0..1023 {
+            let fd = v.eventfd(u32::from(i == 0), 0).unwrap();
+            v.epoll_ctl(ep, 1, fd, 1, i).unwrap();
+            events.push(fd);
+        }
+        let extra = v.eventfd(0, 0).unwrap();
+        assert_eq!(v.epoll_ctl(ep, 1, extra, 1, 2000), Err(Errno(28)));
+        v.close(*events.last().unwrap()).unwrap();
+        assert_eq!(v.epoll_ctl(ep, 1, extra, 1, 2000), Ok(()));
+        let a = v
+            .epoll_wait_signals(ep, 1, 1 << 10, |_, _| Ok(None))
+            .unwrap();
+        let b = v
+            .epoll_wait_signals(ep, 1, 1 << 10, |_, _| Ok(None))
+            .unwrap();
+        assert_eq!(a, vec![(1, 100)]);
+        assert_eq!(b, vec![(1, 0)]);
+        // A signal-dependent interest still uses its original owner authority.
+        assert!(v.direct_descriptors().get(ep).is_none());
+    }
+    #[test]
+    fn concurrent_live_epoll_registration_has_one_winner_and_one_oneshot() {
+        let mut v = Vfs::default();
+        let ep = v.epoll_create(0).unwrap();
+        let event = v.eventfd(1, 0).unwrap();
+        let direct = v.direct_descriptors();
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        direct.epoll_control(ep, 1, event, 0x40000001, 1).unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|r| **r == Err(Errno(17))).count(), 7);
+        let deliveries: usize = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| direct.get(ep).unwrap().epoll_wait(1).unwrap().len()))
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(deliveries, 1);
+    }
     #[test]
     fn live_byte_lookup_follows_reuse_and_new_aliases_while_accepted_calls_keep_original_ofds() {
         let mut v = Vfs::default();

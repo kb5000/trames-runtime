@@ -155,6 +155,66 @@ fn native_watch_rearms_on_worker_poller_and_mask_updates_release_interests() {
 }
 
 #[test]
+fn first_native_watch_updates_already_subscribed_reads_and_epoll() {
+    struct Wake(Arc<HostEvents>);
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> Option<Arc<HostEvents>> {
+            Some(self.0.clone())
+        }
+    }
+    for epoll in [false, true] {
+        let f = Fixture::new();
+        std::fs::write(f.0.join("file"), b"initial").unwrap();
+        let mut v = f.vfs(false);
+        let notify = v.inotify_init(O_NONBLOCK).unwrap();
+        let fd = if epoll {
+            let ep = v.epoll_create(0).unwrap();
+            v.epoll_ctl(ep, 1, notify, 1, 42).unwrap();
+            ep
+        } else {
+            notify
+        };
+        let direct = v.direct_descriptors();
+        let hub = HostEvents::new().unwrap();
+        let wake: Arc<dyn IoWake> = Arc::new(Wake(hub.clone()));
+        let signal = IoSignal::new(1, Arc::downgrade(&wake));
+        let subscriptions = direct.get(fd).unwrap().subscribe(&signal);
+        assert!(!subscriptions.iter().any(|s| s.external()));
+        let query = v.path_queries();
+        let wd =
+            std::thread::spawn(move || query.inotify_add(notify, b"/host", 2).unwrap().unwrap())
+                .join()
+                .unwrap();
+        assert!(
+            signal.ready(),
+            "native topology wakes existing resource listeners"
+        );
+        signal.reset();
+        for sub in &subscriptions {
+            sub.rearm_host().unwrap();
+        }
+        assert!(subscriptions.iter().any(|s| s.external()));
+        std::fs::write(f.0.join("file"), b"changed").unwrap();
+        hub.wait(Some(Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+        assert!(signal.ready());
+        if epoll {
+            assert_eq!(
+                direct.get(fd).unwrap().epoll_wait(1).unwrap(),
+                vec![(1, 42)]
+            );
+        }
+        assert!(events(&mut v, notify).iter().any(|e| e.1 & 2 != 0));
+        v.inotify_remove(notify, wd).unwrap();
+        for sub in &subscriptions {
+            sub.rearm_host().unwrap();
+        }
+        assert!(!subscriptions.iter().any(|s| s.external()));
+    }
+}
+
+#[test]
 fn short_lived_guest_names_are_preserved_and_native_echoes_are_coalesced() {
     let f = Fixture::new();
     let mut v = f.vfs(false);

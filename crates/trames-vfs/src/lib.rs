@@ -47,6 +47,7 @@ pub use direct_io::{DirectFd, DirectFds, DirectPoll};
 pub use readiness::{IoSignal, IoSubscription, IoWake};
 pub use timer_io::TimerFd;
 pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness};
+mod epoll;
 mod events;
 mod uring;
 pub use uring::{

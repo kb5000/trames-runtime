@@ -802,3 +802,58 @@ ownership. Socket creation, bind/connect/listen/accept, owner projections, broad
 close, AF_UNIX/SCM_RIGHTS and epoll registration remain follow-up work. Short
 admitted calls keep their existing single-caller owner service; their existence
 must not be counted as a whole-cohort pause.
+
+## Live epoll interests and worker inotify registration (2026-11-02)
+
+Admitted epoll interests now belong to the original object's shared live index.
+ADD/MOD/DEL and waits use that same index, watch state and delivery cursor. The
+index publishes immutable Arc vectors; updates reuse their allocation when no
+reader retains a version. There is no per-wait vector allocation in the normal
+shared-only case. ET, ONESHOT rearm, duplicate-FD keys and cursor rotation retain
+their original per-object synchronization. Removed interests disarm outstanding
+read snapshots, and resource destructors/notifications run after index locks.
+
+The key remains (numeric FD, original OFD ID); stored interests do not retain a
+watched OFD. Closing/reusing a number does not retarget a watch, and a surviving
+alias preserves the original interest. Poll admission of an epoll core is separate
+from descriptor transfer/dup/close authority: it does not turn an owner projection
+into a transferable shared descriptor. Owner-only interests retain their original
+Rc/weak targets in the owner projection, not in the Send+Sync core. The original
+combined watch bound is preserved, including reclamation after last close.
+
+Worker epoll control handles retained shared byte/poll resources, including pipes,
+eventfds, timerfds, inotify and admitted Unix/PTY resources. Allowed seccomp entries
+use one decision; denied or unsupported calls carry the existing entry token to
+the owner without effects or a second BPF evaluation. Nested epoll, task-signal
+sources and unsupported/native-TCP poll interests retain owner authority. Admitted
+interest changes no longer invalidate global descriptor snapshots; only changes
+to owner-only captures keep that boundary. Blocking waits resubscribe when the
+same object's control revision changes, using existing run-queue notifications.
+
+Epoll creation now uses the existing single-caller owner service, publishing the
+actual descriptor to already-running workers. It no longer needs a whole-cohort
+join. Factory and epoll close/dup ownership themselves remain owner-side. This
+stage does not introduce a resource thread, message bus or polling loop.
+
+Inotify add-watch runs through the existing sealed PathQueries resolver and the
+actual Arc-backed instance/inode marks. Its API returns only an owned result;
+query-private Rc state never escapes. Host-directory registration uses the same
+native attachment/rollback code as the owner. Existing subscriptions can acquire
+or retire a native event source through HostSource: resource topology changes
+notify their existing listeners, and those tasks refresh registrations on the
+existing host poller. Ordinary subscriptions keep their static representation;
+dynamic state is boxed only for resources that need it. Host-source notifications
+and cancelled registrations are released outside resource/publication locks.
+
+Tests cover live ADD/MOD/DEL through an old view, original aliases and FD reuse,
+concurrent ADD/one-shot delivery, mixed owner/shared limits and fair delivery,
+parked-wait resubscription, first host-watch attachment to an already-subscribed
+read or epoll, guest ABI layout/fault ordering, single seccomp decisions and
+owner-only fallback. Native ARM64 Linux tests additionally exercise its distinct
+inotify/epoll host backend. Guest CPU, memory permissions and ordering models are
+unchanged; there is no new guest quota, race errno or guest-memory barrier.
+
+Remaining work includes socket factory/full teardown, connection/accept and
+namespace-dependent controls, native TCP/signal/nested epoll interests, task and
+signal ownership, and scoped structural VM/device registration. The shared live
+index is not a claim that all epoll or coordinator paths have been removed.

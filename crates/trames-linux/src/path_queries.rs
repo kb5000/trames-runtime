@@ -12,6 +12,16 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64>> {
     match number {
+        27 => {
+            let path = match Linux::path(memory, a[1]) {
+                Ok(path) => path,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(
+                q.inotify_add(a[0] as u32, &path, a[2] as u32)?
+                    .map(|wd| wd as u64),
+            )
+        }
         79 => {
             let path = match Linux::stat_parameters(a, memory) {
                 Ok(p) => p,

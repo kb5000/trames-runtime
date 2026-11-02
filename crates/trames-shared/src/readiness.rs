@@ -49,12 +49,66 @@ pub struct Readiness {
     next: AtomicU64,
     listeners: Mutex<BTreeMap<u64, Weak<IoSignal>>>,
 }
+/// A resource can acquire a native event source after a task already parked.
+/// Publish changes through its Readiness; the existing executor rearms it.
+pub trait HostSource: Send + Sync {
+    fn revision(&self) -> u64;
+    fn fd(&self) -> std::io::Result<Option<crate::HostFd>>;
+}
+struct DynamicHost {
+    source: Weak<dyn HostSource>,
+    signal: Weak<IoSignal>,
+    state: Mutex<DynamicState>,
+}
+#[derive(Default)]
+struct DynamicState {
+    revision: Option<u64>,
+    host: Option<crate::HostSubscription>,
+    external: bool,
+}
+impl DynamicHost {
+    fn rearm(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let Some(source) = self.source.upgrade() else {
+            let previous = state.host.take();
+            state.external = false;
+            state.revision = None;
+            drop(state);
+            drop(previous);
+            return Ok(());
+        };
+        let revision = source.revision();
+        if state.revision != Some(revision) {
+            let fd = source.fd()?;
+            let external = fd.is_some();
+            let signal = self.signal.upgrade();
+            let events = signal
+                .as_ref()
+                .and_then(|s| s.target.upgrade())
+                .and_then(|t| t.host_events());
+            let host = match (fd, events, signal.as_ref()) {
+                (Some(fd), Some(events), Some(signal)) => {
+                    Some(events.subscribe(fd, false, signal)?)
+                }
+                _ => None,
+            };
+            let previous = std::mem::replace(&mut state.host, host);
+            state.external = external;
+            state.revision = Some(revision);
+            drop(state);
+            drop(previous);
+            return Ok(());
+        }
+        state.host.as_ref().map_or(Ok(()), |host| host.rearm())
+    }
+}
 pub struct IoSubscription {
     source: Arc<Readiness>,
     id: u64,
     host: Option<crate::HostSubscription>,
     host_failed: bool,
     external: bool,
+    dynamic: Option<Box<DynamicHost>>,
 }
 impl Readiness {
     pub fn subscribe(self: &Arc<Self>, signal: &Arc<IoSignal>) -> IoSubscription {
@@ -72,6 +126,7 @@ impl Readiness {
             host: None,
             host_failed: false,
             external: false,
+            dynamic: None,
         }
     }
     pub fn notify_atomic(&self) {
@@ -120,12 +175,32 @@ impl IoSubscription {
         }
         self
     }
+    pub fn with_host_source(
+        mut self,
+        source: Weak<dyn HostSource>,
+        signal: &Arc<IoSignal>,
+    ) -> Self {
+        self.dynamic = Some(Box::new(DynamicHost {
+            source,
+            signal: Arc::downgrade(signal),
+            state: Mutex::default(),
+        }));
+        if self.dynamic.as_ref().unwrap().rearm().is_err() {
+            self.host_failed = true;
+        }
+        self
+    }
     pub fn external(&self) -> bool {
-        self.external
+        self.dynamic
+            .as_ref()
+            .map_or(self.external, |d| d.state.lock().unwrap().external)
     }
     pub fn rearm_host(&self) -> std::io::Result<()> {
         if self.host_failed {
             return Err(std::io::Error::other("native subscription failed"));
+        }
+        if let Some(dynamic) = &self.dynamic {
+            return dynamic.rearm();
         }
         self.host.as_ref().map_or(Ok(()), |host| host.rearm())
     }

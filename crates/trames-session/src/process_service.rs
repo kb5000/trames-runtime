@@ -265,6 +265,15 @@ impl<C: Cpu> Kernel<C> {
             // EAGAIN. Replaying a connect/accept can change its meaning.
             return result.map(|value| value.unwrap_or_else(error));
         }
+        if request.number == 20 && p.seccomp.mode() == 0 {
+            return Some(
+                p.linux
+                    .vfs
+                    .epoll_create(a[0] as u32)
+                    .map(u64::from)
+                    .unwrap_or_else(error),
+            );
+        }
         if request.number == 222 && p.seccomp.mode() == 0 {
             let began = Instant::now();
             let result = p.linux.mmap_additive(a, &mut p.memory)?;

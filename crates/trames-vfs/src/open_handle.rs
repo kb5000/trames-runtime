@@ -8,6 +8,9 @@ use super::*;
 #[derive(Clone)]
 pub struct OfdIdentity(std::sync::Weak<SharedOpenDescription>);
 impl OfdIdentity {
+    pub(super) fn open(&self) -> Option<Arc<SharedOpenDescription>> {
+        self.0.upgrade()
+    }
     pub(super) fn is_live(&self) -> bool {
         self.0.strong_count() != 0
     }
@@ -135,6 +138,7 @@ impl OpenDescription {
     }
     fn shareable(&self) -> bool {
         if self.socket.is_some()
+            || matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
             || self.anonymous.is_some() && self.control.is_none()
             || self.local.is_some()
             || self.pty.is_some()

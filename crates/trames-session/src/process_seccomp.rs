@@ -740,6 +740,90 @@ mod tests {
         }
     }
     #[test]
+    fn filtered_epoll_and_inotify_controls_keep_one_decision_and_original_fallbacks() {
+        for (number, nested, decision) in [
+            (21, false, ALLOW),
+            (21, true, ALLOW),
+            (21, false, 0x5007b),
+            (27, false, ALLOW),
+            (27, false, 0x5007b),
+        ] {
+            let mut p = super::super::tests::process();
+            let event = p.linux.vfs.eventfd(0, 0).unwrap();
+            let ep = p.linux.vfs.epoll_create(0).unwrap();
+            let child = p.linux.vfs.epoll_create(0).unwrap();
+            p.linux.vfs.epoll_ctl(child, 1, event, 1, 100).unwrap();
+            let watched = if nested { child } else { event };
+            p.linux.vfs.epoll_ctl(ep, 1, watched, 1, 7).unwrap();
+            p.linux.vfs.import_file(b"/file", b"data".to_vec()).unwrap();
+            let notify = p.linux.vfs.inotify_init(trames_vfs::O_NONBLOCK).unwrap();
+            p.memory.write(0x1234, b"/file\0").unwrap();
+            p.memory.write_array(0x1800, 1u32.to_le_bytes()).unwrap();
+            p.memory.write_array(0x1808, 42u64.to_le_bytes()).unwrap();
+            let fd = if number == 21 { ep } else { notify };
+            let words = [0xd2800000u32 | (fd << 5), 0xd4000001, 0x17fffffe];
+            for (index, word) in words.into_iter().enumerate() {
+                p.memory
+                    .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu = Cpu::new(0x4000, 0);
+            p.cpu.set_x(8, number);
+            if number == 21 {
+                p.cpu.set_x(1, 3);
+                p.cpu.set_x(2, watched as u64);
+                p.cpu.set_x(3, 0x1800);
+            } else {
+                p.cpu.set_x(1, 0x1234);
+                p.cpu.set_x(2, 2);
+            }
+            p.affinity = 3;
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+            ));
+            let mut peer = p.fork();
+            peer.parent = 1;
+            let mut kernel = super::super::tests::kernel();
+            kernel.cpu_count = 2;
+            kernel.workers = crate::workers::Pool::new(2);
+            kernel.per_cpu = vec![Duration::ZERO; 2];
+            kernel.processes.insert(1, p);
+            kernel.processes.insert(2, peer);
+            assert!(kernel
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                .unwrap());
+            assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+            assert_eq!(kernel.service_requests, 0);
+            let direct = decision == ALLOW && !nested;
+            if number == 21 {
+                assert_eq!(kernel.worker_fd_syscalls > 100, direct);
+                let v = &mut kernel.processes.get_mut(&1).unwrap().linux.vfs;
+                v.write(event, &1u64.to_le_bytes()).unwrap();
+                assert_eq!(
+                    v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(),
+                    vec![(1, if decision == ALLOW { 42 } else { 7 })]
+                );
+            } else {
+                assert_eq!(kernel.worker_file_syscalls > 100, direct);
+                let v = &mut kernel.processes.get_mut(&1).unwrap().linux.vfs;
+                let file = v.open_at(-100, b"/file", 2, 0).unwrap();
+                v.write(file, b"x").unwrap();
+                if direct {
+                    assert!(!v.read(notify, 4096).unwrap().is_empty());
+                } else {
+                    assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+                }
+            }
+        }
+    }
+    #[test]
     fn filtered_path_queries_complete_or_defer_with_one_entry_decision() {
         for (path, decision, direct) in [
             (b"/file\0".as_slice(), ALLOW, true),

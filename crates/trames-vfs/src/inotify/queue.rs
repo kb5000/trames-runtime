@@ -25,6 +25,8 @@ pub(crate) struct Queue {
     pub(crate) readiness: Arc<Readiness>,
     #[cfg(all(feature = "hostfs", unix))]
     native: std::sync::OnceLock<Arc<hostfs::notify::Native>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    native_revision: AtomicU64,
 }
 impl Queue {
     fn change<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -90,7 +92,11 @@ impl Queue {
         // backend again while its source is being destroyed.
         if registered {
             if let Some(native) = self.native.get() {
+                let active = native.active();
                 native.remove(wd);
+                if active && !native.active() {
+                    self.native_changed();
+                }
             }
         }
     }
@@ -108,6 +114,7 @@ impl Queue {
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(native) = self.native.get() {
             native.close();
+            self.native_changed();
         }
     }
     pub(super) fn send(
@@ -146,12 +153,14 @@ impl Queue {
         }
         alive
     }
-    pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+    pub(crate) fn subscribe(self: &Arc<Self>, signal: &Arc<IoSignal>) -> IoSubscription {
         let subscription = self.readiness.subscribe(signal);
         #[cfg(all(feature = "hostfs", unix))]
-        if let Some(fd) = self.native_fd() {
-            return subscription.with_host(fd, signal);
+        {
+            let source: Arc<dyn trames_shared::HostSource> = self.clone();
+            subscription.with_host_source(Arc::downgrade(&source), signal)
         }
+        #[cfg(not(all(feature = "hostfs", unix)))]
         subscription
     }
     pub(crate) fn has_native(&self) -> bool {
@@ -186,6 +195,7 @@ impl Queue {
             self.retire_native(wd);
             return Ok(());
         }
+        let was_native = self.has_native();
         if self.native.get().is_none() {
             let _ = self.native.set(Arc::new(hostfs::notify::Native::new()?));
         }
@@ -199,8 +209,21 @@ impl Queue {
         } else {
             drop(state);
             self.native.get().unwrap().remove(wd);
+            if !was_native && self.has_native() {
+                self.native_changed();
+            }
+            return Ok(());
+        }
+        drop(state);
+        if !was_native && self.has_native() {
+            self.native_changed();
         }
         Ok(())
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    fn native_changed(&self) {
+        self.native_revision.fetch_add(1, Ordering::Relaxed);
+        self.readiness.notify_atomic();
     }
     fn pump_native(&self) {
         #[cfg(all(feature = "hostfs", unix))]
@@ -328,5 +351,21 @@ impl State {
             out.extend(event);
         }
         Ok(out)
+    }
+}
+
+#[cfg(all(feature = "hostfs", unix))]
+impl trames_shared::HostSource for Queue {
+    fn revision(&self) -> u64 {
+        self.native_revision.load(Ordering::Relaxed)
+    }
+    fn fd(&self) -> std::io::Result<Option<crate::HostFd>> {
+        match self.native.get().filter(|n| n.active()) {
+            None => Ok(None),
+            Some(native) => native
+                .fd()
+                .map(|fd| Some(fd.into()))
+                .ok_or_else(|| std::io::Error::other("inotify native descriptor unavailable")),
+        }
     }
 }

@@ -32,6 +32,7 @@ pub struct PendingIo {
     native_tcp: Option<trames_vfs::DirectTcpFd>,
     resource_deadline: Option<Instant>,
     pub retained_poll: Option<crate::poll::RetainedPoll>,
+    epoll_revision: Option<u64>,
     _subscriptions: Vec<IoSubscription>,
     host_subscription: Option<trames_vfs::HostSubscription>,
     uring: Option<Box<uring::Wait>>,
@@ -194,6 +195,28 @@ impl DirectSyscalls {
         self.record_fd_control();
         Some(result)
     }
+    pub fn supports_epoll_control(&self, number: u32) -> bool {
+        number == 21 && self.membership.is_some()
+    }
+    pub fn invoke_epoll_control(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        if !self.supports_epoll_control(number) {
+            return None;
+        }
+        let (events, data) = match Linux::epoll_control_parameters(a, memory) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        let result =
+            self.descriptors
+                .epoll_control(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
+        self.record_fd_control();
+        Some(result.map(|()| 0))
+    }
     pub fn invoke_socket_control(
         &self,
         number: u32,
@@ -220,7 +243,7 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_path_query(&self, number: u32) -> bool {
-        matches!(number, 48 | 56 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
+        matches!(number, 27 | 48 | 56 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
     }
     pub fn invoke_path(
         &self,
@@ -641,6 +664,7 @@ impl DirectSyscalls {
                 retained_byte: None,
                 flock: None,
                 resource_deadline: None,
+                epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: Vec::new(),
                 host_subscription: Some(subscription),
@@ -923,6 +947,13 @@ impl DirectSyscalls {
                 })
             }
         };
+        let epoll_revision = matches!(number, 22 | 441)
+            .then(|| {
+                self.descriptors
+                    .get(args[0] as u32)
+                    .and_then(|fd| fd.epoll_revision())
+            })
+            .flatten();
         let signal = IoSignal::new(pid, target.clone());
         let mut host_subscription = None;
         let subscriptions = if number == 116 {
@@ -961,6 +992,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 signal,
+                epoll_revision,
                 retained_poll: poll,
                 resource_deadline: None,
                 flock: None,
@@ -1006,6 +1038,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 signal,
+                epoll_revision: None,
                 retained_poll: Some(poll),
                 retained_byte: None,
                 native_tcp: None,
@@ -1079,6 +1112,7 @@ impl DirectSyscalls {
                 retained_byte: Some(file),
                 native_tcp: None,
                 resource_deadline: None,
+                epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
                 host_subscription: None,
@@ -1116,6 +1150,7 @@ impl DirectSyscalls {
                 retained_byte: None,
                 native_tcp: None,
                 resource_deadline: None,
+                epoll_revision: None,
                 retained_poll: None,
                 _subscriptions: subscriptions,
                 host_subscription: None,
@@ -1159,6 +1194,17 @@ impl DirectSyscalls {
             return self.urings.resume(pending, memory);
         }
         pending.signal.reset();
+        if matches!(pending.number, 22 | 441) {
+            let Some(fd) = self.descriptors.get(pending.args[0] as u32) else {
+                return IoAttempt::Checkpoint;
+            };
+            let revision = fd.epoll_revision();
+            if pending.epoll_revision != revision {
+                pending._subscriptions = fd.subscribe(&pending.signal);
+                pending.poll_uring = None;
+                pending.epoll_revision = revision;
+            }
+        }
         if pending
             ._subscriptions
             .iter()
@@ -2596,6 +2642,80 @@ mod tests {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
     }
 
+    #[test]
+    fn worker_epoll_control_matches_owner_event_layout_flags_and_fault_order() {
+        for (op, address, events) in [
+            (1, 0x1200, 1),
+            (2, u64::MAX, 1),
+            (3, 0x1200, 0xc0000001u32),
+            (3, 0x1200, 0x10000),
+            (0, 0x1200, 1),
+            (3, 0x9000, 1),
+            (0x100000002, u64::MAX, 1),
+        ] {
+            let mut outcomes = Vec::new();
+            for worker in [false, true] {
+                let mut linux = Linux::new(0x10000);
+                let ep = linux.vfs.epoll_create(0).unwrap();
+                let event = linux.vfs.eventfd(1, 0).unwrap();
+                linux.vfs.epoll_ctl(ep, 1, event, 1, 7).unwrap();
+                let mut m = memory();
+                m.write_array(0x1200, events.to_le_bytes()).unwrap();
+                m.write_array(0x1208, 99u64.to_le_bytes()).unwrap();
+                let args = [ep as u64, op, event as u64, address, 0, 0];
+                let result = if worker {
+                    DirectSyscalls::new(linux.vfs.direct_descriptors())
+                        .invoke_epoll_control(21, args, &m)
+                        .expect("admitted epoll control")
+                } else {
+                    linux.syscall(21, args, &mut m, &mut crate::CapturedOutput::default())
+                };
+                outcomes.push((
+                    result,
+                    linux.vfs.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "op {op} addr {address:x}");
+        }
+    }
+    #[test]
+    fn parked_epoll_subscribes_to_a_new_interest_without_a_cohort_restart() {
+        let mut vfs = Vfs::default();
+        let ep = vfs.epoll_create(0).unwrap();
+        let direct = DirectSyscalls::new(vfs.direct_descriptors());
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let weak = Arc::downgrade(&target);
+        let mut m = memory();
+        let args = [ep as u64, 0x1100, 1, 2000, 0, 0];
+        let IoAttempt::Blocked(wait) = direct.start(22, args, &mut m, 1, &weak, None).unwrap()
+        else {
+            panic!("empty epoll must park");
+        };
+        let event = vfs.eventfd(0, 0).unwrap();
+        m.write_array(0x1200, 1u32.to_le_bytes()).unwrap();
+        m.write_array(0x1208, 42u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            direct.invoke_epoll_control(21, [ep as u64, 1, event as u64, 0x1200, 0, 0], &m),
+            Some(Ok(0))
+        );
+        assert!(wait.signal.ready());
+        let IoAttempt::Blocked(wait) = direct.resume(wait, &mut m) else {
+            panic!("new unready source must remain parked");
+        };
+        assert!(!wait.signal.ready());
+        vfs.write(event, &1u64.to_le_bytes()).unwrap();
+        assert!(
+            wait.signal.ready(),
+            "new source is subscribed after ctl notification"
+        );
+        assert_eq!(complete(direct.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_array::<8>(0x1108).unwrap(), 42u64.to_le_bytes());
+        // DEL ignores its guest event pointer, including an invalid one.
+        assert_eq!(
+            direct.invoke_epoll_control(21, [ep as u64, 2, event as u64, u64::MAX, 0, 0], &m),
+            Some(Ok(0))
+        );
+    }
     #[test]
     fn shared_byte_wait_and_fresh_dispatch_keep_original_ofd_after_close_and_reuse() {
         let mut vfs = Vfs::default();

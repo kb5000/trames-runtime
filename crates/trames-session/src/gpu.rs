@@ -48,6 +48,9 @@ pub(super) struct Pending {
     peer_started: u64,
     deadline: Option<Instant>,
 }
+// Move the pending record into the existing task; boxing this result would
+// allocate on every parked GPU call just to reduce the transient enum size.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Attempt {
     Complete(Result<Return, Error>),
     Blocked(Pending),
