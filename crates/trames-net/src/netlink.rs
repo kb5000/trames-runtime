@@ -12,7 +12,7 @@ static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 pub(super) struct Namespace {
     id: u64,
     pub(crate) native: std::cell::OnceCell<native::Network>,
-    pub(crate) socket_count: Cell<usize>,
+    pub(crate) socket_count: std::sync::Arc<crate::socket_quota::Quota>,
     pub(crate) nft_packet_hooks: Cell<bool>,
     // Netlink sockets also pin the complete stack, not just link metadata.
     pub(crate) stack: std::cell::OnceCell<virtualnet::Network>,
@@ -35,7 +35,7 @@ impl Default for Namespace {
         Self {
             id,
             native: std::cell::OnceCell::new(),
-            socket_count: Cell::new(0),
+            socket_count: std::sync::Arc::default(),
             nft_packet_hooks: Cell::new(true),
             stack: std::cell::OnceCell::new(),
             graph,

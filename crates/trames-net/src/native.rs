@@ -8,11 +8,12 @@ mod state;
 pub use control::DirectControl;
 pub(crate) use control::SavedOptions;
 mod endpoint;
+use crate::socket_quota::{Quota, Reservation};
 use direct::Links;
 pub use direct::{DirectTcp, TcpPoll};
+use endpoint::Endpoint;
 pub use endpoint::TcpLease;
-use endpoint::{Endpoint, Quota, Reservation};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[path = "native_events.rs"]
 mod edge;
 #[path = "native_pktinfo.rs"]
@@ -121,12 +122,39 @@ fn unmapped(a: SocketAddr) -> SocketAddr {
 struct Namespace {
     mode: NetworkMode,
     sockets: Arc<Quota>,
-    dns: Rc<direct_dns::Service>,
-    interfaces: RefCell<Option<(Instant, Option<crate::NetworkInfo>)>>,
+    dns: Arc<direct_dns::Service>,
+    interfaces: Mutex<Option<(Instant, Option<crate::NetworkInfo>)>>,
     links: Arc<Links>,
 }
 #[derive(Clone)]
-pub struct Network(Rc<Namespace>);
+pub struct Network(Arc<Namespace>);
+/// Actual transport and creating native namespace, before owner-only socket
+/// projections are attached. Creation/cancellation can run on an executor;
+/// finishing attaches controls to this same endpoint, without another quota.
+struct PreparedSocket {
+    native: Arc<Endpoint>,
+    network: Network,
+    family: u32,
+    kind: u32,
+}
+impl PreparedSocket {
+    fn finish(self) -> Rc<Socket> {
+        Rc::new(Socket {
+            native: self.native,
+            network: self.network,
+            family: self.family,
+            kind: self.kind,
+            dns: RefCell::default(),
+            dns_target: Cell::new(direct_dns::ADDRESS),
+            dns_peer: Cell::new(false),
+            dns_receive_errors: Cell::new(false),
+            echo: RefCell::default(),
+            policy: RefCell::default(),
+            receive_packet_info: Cell::new(false),
+            policy_forward: RefCell::default(),
+        })
+    }
+}
 impl Default for Network {
     fn default() -> Self {
         Self::new(NetworkMode::Off)
@@ -137,11 +165,11 @@ impl Network {
         self.0.mode
     }
     pub fn new(mode: NetworkMode) -> Self {
-        Self(Rc::new(Namespace {
+        Self(Arc::new(Namespace {
             mode,
             sockets: Arc::default(),
             dns: direct_dns::Service::new(mode),
-            interfaces: RefCell::new(None),
+            interfaces: Mutex::new(None),
             links: Arc::default(),
         }))
     }
@@ -149,7 +177,7 @@ impl Network {
         if matches!(self.0.mode, NetworkMode::Off | NetworkMode::Loopback) {
             return None;
         }
-        let mut cached = self.0.interfaces.borrow_mut();
+        let mut cached = self.0.interfaces.lock().unwrap();
         if cached
             .as_ref()
             .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(1))
@@ -169,6 +197,9 @@ impl Network {
         self.0.sockets.live()
     }
     pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
+        Ok(self.prepare_socket(family, kind, protocol)?.finish())
+    }
+    fn prepare_socket(&self, family: u32, kind: u32, protocol: u32) -> Result<PreparedSocket> {
         let domain = match family {
             2 => Domain::IPV4,
             10 => Domain::IPV6,
@@ -195,19 +226,19 @@ impl Network {
                 .set_only_v6(native_protocol == Protocol::ICMPV6)
                 .map_err(from_io)?;
         }
-        Ok(self.wrap(
-            native,
-            reservation,
+        let kind = if kind == 3 {
+            4
+        } else if kind == 2 && matches!(protocol, 1 | 58) {
+            3
+        } else {
+            kind
+        };
+        Ok(PreparedSocket {
+            native: Endpoint::new(native, kind, reservation, Connection::Idle),
+            network: self.clone(),
             family,
-            if kind == 3 {
-                4
-            } else if kind == 2 && matches!(protocol, 1 | 58) {
-                3
-            } else {
-                kind
-            },
-            Connection::Idle,
-        ))
+            kind,
+        })
     }
     fn reserve(&self) -> Result<Reservation> {
         if self.0.mode == NetworkMode::Off {
@@ -224,20 +255,13 @@ impl Network {
         kind: u32,
         connection: Connection,
     ) -> Rc<Socket> {
-        Rc::new(Socket {
+        PreparedSocket {
             native: Endpoint::new(native, kind, reservation, connection),
             network: self.clone(),
             family,
             kind,
-            dns: RefCell::default(),
-            dns_target: Cell::new(direct_dns::ADDRESS),
-            dns_peer: Cell::new(false),
-            dns_receive_errors: Cell::new(false),
-            echo: RefCell::default(),
-            policy: RefCell::default(),
-            receive_packet_info: Cell::new(false),
-            policy_forward: RefCell::default(),
-        })
+        }
+        .finish()
     }
     fn destination(&self, address: SocketAddr) -> Result<()> {
         let ip = address.ip();
@@ -325,7 +349,7 @@ pub struct Socket {
     network: Network,
     family: u32,
     kind: u32,
-    dns: RefCell<std::collections::BTreeMap<SocketAddr, Rc<direct_dns::Endpoint>>>,
+    dns: RefCell<std::collections::BTreeMap<SocketAddr, Arc<direct_dns::Endpoint>>>,
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
     dns_receive_errors: Cell<bool>,
@@ -471,7 +495,7 @@ impl Socket {
             Err(NetError(13))
         }
     }
-    fn dns_endpoint(&self, address: SocketAddr) -> Result<Rc<direct_dns::Endpoint>> {
+    fn dns_endpoint(&self, address: SocketAddr) -> Result<Arc<direct_dns::Endpoint>> {
         self.network.destination(address)?;
         if self.family != 2 || !matches!(self.kind, 1 | 2) {
             return Err(NetError(97));
@@ -1245,6 +1269,62 @@ fn from_errno(error: HostErrno) -> NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_native_namespace_reserves_real_transports_and_cancels_on_workers() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Network>();
+        shared::<PreparedSocket>();
+        let network = Network::new(NetworkMode::Loopback);
+        let ready = std::sync::Barrier::new(9);
+        let release = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (network, ready, release) = (network.clone(), &ready, &release);
+                scope.spawn(move || {
+                    let sockets: Vec<_> = (0..8)
+                        .map(|_| network.prepare_socket(2, 2, 0).unwrap())
+                        .collect();
+                    ready.wait();
+                    release.wait();
+                    drop(sockets);
+                });
+            }
+            ready.wait();
+            assert_eq!(network.live_sockets(), MAX_SOCKETS);
+            assert!(matches!(network.prepare_socket(2, 2, 0), Err(NetError(24))));
+            release.wait();
+        });
+        assert_eq!(network.live_sockets(), 0);
+        assert!(matches!(
+            Network::new(NetworkMode::Off).prepare_socket(2, 1, 0),
+            Err(NetError(13))
+        ));
+    }
+    #[test]
+    fn prepared_socket_attaches_original_namespace_and_can_outlive_its_creator() {
+        let network = Network::new(NetworkMode::Loopback);
+        let worker = network.clone();
+        let prepared = std::thread::spawn(move || worker.prepare_socket(2, 2, 0).unwrap())
+            .join()
+            .unwrap();
+        let original = prepared.native.clone();
+        assert_eq!(network.live_sockets(), 1);
+        let socket = prepared.finish();
+        assert!(Arc::ptr_eq(&socket.native, &original));
+        assert!(Arc::ptr_eq(&socket.network.0, &network.0));
+        let dns = socket.dns_endpoint(direct_dns::ADDRESS).unwrap();
+        drop(socket);
+        assert_eq!(network.live_sockets(), 1); // actual endpoint lease
+        std::thread::spawn(move || drop(original)).join().unwrap();
+        assert_eq!(network.live_sockets(), 0);
+        drop(dns);
+        let prepared = network.prepare_socket(10, 1, 0).unwrap();
+        let namespace = Arc::downgrade(&network.0);
+        drop(network);
+        assert!(namespace.upgrade().is_some());
+        std::thread::spawn(move || drop(prepared)).join().unwrap();
+        assert!(namespace.upgrade().is_none());
+    }
     #[test]
     fn sockaddr_roundtrip_network_port_and_flow_host_scope() {
         for address in [

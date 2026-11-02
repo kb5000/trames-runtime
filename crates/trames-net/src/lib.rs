@@ -10,6 +10,7 @@ mod netdev;
 mod netlink;
 mod nftables;
 mod rtnetlink;
+mod socket_quota;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
 pub use native::{
@@ -193,7 +194,7 @@ impl Network {
         self.1.graph.borrow().carrier(d)
     }
     pub fn live_sockets(&self) -> usize {
-        self.1.socket_count.get()
+        self.1.socket_count.live()
     }
     pub fn info(&self) -> Option<NetworkInfo> {
         self.1.refresh_native();
@@ -216,9 +217,7 @@ impl Network {
         }
     }
     pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Rc<Socket>> {
-        if self.live_sockets() >= MAX_SOCKETS {
-            return Err(NetError(24));
-        }
+        let reservation = self.1.socket_count.reserve()?;
         if family == 16 {
             return Ok(Socket::wrap(
                 SocketBackend::Netlink(netlink::Socket::new(
@@ -228,6 +227,7 @@ impl Network {
                     protocol,
                 )?),
                 self.1.clone(),
+                reservation,
             ));
         }
         let backend = match &self.0 {
@@ -240,14 +240,16 @@ impl Network {
             )?),
             Backend::Virtual(n) => SocketBackend::Virtual(n.socket(family, kind, protocol)?),
         };
-        Ok(Socket::wrap(backend, self.1.clone()))
+        Ok(Socket::wrap(backend, self.1.clone(), reservation))
     }
 }
-pub struct Socket(
-    SocketBackend,
-    Rc<netlink::Namespace>,
-    [Cell<Option<Duration>>; 2],
-);
+pub struct Socket {
+    backend: SocketBackend,
+    namespace: Rc<netlink::Namespace>,
+    timeouts: [Cell<Option<Duration>>; 2],
+    // Drop after the backend and namespace; the lease itself contains no Rc.
+    _reservation: socket_quota::Reservation,
+}
 enum SocketBackend {
     Hybrid(Rc<hybrid::Socket>),
     Netlink(Rc<netlink::Socket>),
@@ -257,38 +259,41 @@ enum SocketBackend {
 macro_rules! delegate {
     ($name:ident($($arg:ident:$ty:ty),*) -> $ret:ty) => {
         pub fn $name(&self,$($arg:$ty),*) -> $ret {
-            match &self.0 {SocketBackend::Hybrid(s)=>s.$name($($arg),*), SocketBackend::Native(s)=>s.$name($($arg),*),SocketBackend::Virtual(s)=>s.$name($($arg),*), SocketBackend::Netlink(s)=>s.$name($($arg),*) }
+            match &self.backend {SocketBackend::Hybrid(s)=>s.$name($($arg),*), SocketBackend::Native(s)=>s.$name($($arg),*),SocketBackend::Virtual(s)=>s.$name($($arg),*), SocketBackend::Netlink(s)=>s.$name($($arg),*) }
         }
     }
 }
-impl Drop for Socket {
-    fn drop(&mut self) {
-        self.1.socket_count.set(self.1.socket_count.get() - 1);
-    }
-}
 impl Socket {
-    fn wrap(backend: SocketBackend, namespace: Rc<netlink::Namespace>) -> Rc<Self> {
-        namespace.socket_count.set(namespace.socket_count.get() + 1);
-        Rc::new(Self(backend, namespace, [Cell::new(None), Cell::new(None)]))
+    fn wrap(
+        backend: SocketBackend,
+        namespace: Rc<netlink::Namespace>,
+        reservation: socket_quota::Reservation,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            backend,
+            namespace,
+            timeouts: [Cell::new(None), Cell::new(None)],
+            _reservation: reservation,
+        })
     }
     /// Frozen connected-native transport capability, rebuilt each cohort.
     /// Descriptor/namespace/policy mutation still requires all workers joined.
     pub fn quiescent_tcp(&self) -> bool {
-        match &self.0 {
+        match &self.backend {
             SocketBackend::Native(s) => s.quiescent_tcp(),
             SocketBackend::Hybrid(s) => s.quiescent_tcp(),
             _ => false,
         }
     }
     pub fn idle_tcp(&self) -> bool {
-        match &self.0 {
+        match &self.backend {
             SocketBackend::Native(socket) => socket.idle_tcp(),
             SocketBackend::Hybrid(socket) => socket.idle_tcp(),
             _ => false,
         }
     }
     pub fn direct_control(&self) -> Option<DirectControl> {
-        let mut control = match &self.0 {
+        let mut control = match &self.backend {
             SocketBackend::Native(s) => s.direct_control(),
             SocketBackend::Hybrid(s) => s.direct_control(),
             _ => None,
@@ -297,7 +302,7 @@ impl Socket {
         Some(control)
     }
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
-        match &self.0 {
+        match &self.backend {
             SocketBackend::Native(s) => s.direct_tcp(),
             SocketBackend::Hybrid(s) => s.direct_tcp(),
             _ => None,
@@ -306,13 +311,13 @@ impl Socket {
     /// Guest socket timeouts are enforced by the virtual task scheduler; host
     /// sockets remain nonblocking. The shared socket owns them across dup/fork.
     pub fn set_io_timeout(&self, receive: bool, timeout: Option<Duration>) {
-        self.2[usize::from(receive)].set(timeout);
+        self.timeouts[usize::from(receive)].set(timeout);
     }
     pub fn io_timeout(&self, receive: bool) -> Option<Duration> {
-        self.2[usize::from(receive)].get()
+        self.timeouts[usize::from(receive)].get()
     }
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
-        match &self.0 {
+        match &self.backend {
             SocketBackend::Netlink(s) => Some(s.poll_epoch()),
             SocketBackend::Native(s) => s.poll_epoch(),
             SocketBackend::Hybrid(s) => s.poll_epoch(),
@@ -320,23 +325,23 @@ impl Socket {
         }
     }
     pub fn info(&self) -> Option<SocketInfo> {
-        let mut info = match &self.0 {
+        let mut info = match &self.backend {
             SocketBackend::Hybrid(s) => Some(s.info()),
             SocketBackend::Virtual(s) => Some(s.info()),
             SocketBackend::Native(s) => Some(s.info()),
             SocketBackend::Netlink(_) => None,
         }?;
-        info.namespace_id = self.1.id();
+        info.namespace_id = self.namespace.id();
         Some(info)
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
-        if let SocketBackend::Hybrid(s) = &self.0 {
+        if let SocketBackend::Hybrid(s) = &self.backend {
             return s.set_option_bytes(level, name, value);
         }
-        if let SocketBackend::Native(s) = &self.0 {
+        if let SocketBackend::Native(s) = &self.backend {
             return s.set_option_bytes(level, name, value);
         }
-        if let SocketBackend::Virtual(s) = &self.0 {
+        if let SocketBackend::Virtual(s) = &self.backend {
             return s.set_option_bytes(level, name, value);
         }
         if value.len() < 4 {
@@ -355,8 +360,8 @@ impl Socket {
         destination: Option<SocketAddr>,
         mut info: PacketInfo,
     ) -> Result<usize> {
-        self.1.refresh_native();
-        let graph = self.1.graph.borrow();
+        self.namespace.refresh_native();
+        let graph = self.namespace.graph.borrow();
         let owned_ip = match info.address {
             std::net::IpAddr::V6(ip) => ip
                 .to_ipv4_mapped()
@@ -364,7 +369,7 @@ impl Socket {
             ip => ip,
         };
         if info.interface != 0 {
-            let device = graph.device(self.1.id(), info.interface)?;
+            let device = graph.device(self.namespace.id(), info.interface)?;
             if info.address.is_unspecified() {
                 info.address = device
                     .addresses
@@ -381,11 +386,11 @@ impl Socket {
                 return Err(NetError(99));
             }
         }
-        if !owned_ip.is_unspecified() && !graph.own(self.1.id(), owned_ip) {
+        if !owned_ip.is_unspecified() && !graph.own(self.namespace.id(), owned_ip) {
             return Err(NetError(99));
         }
         drop(graph);
-        match &self.0 {
+        match &self.backend {
             SocketBackend::Native(s) => s.send_packet(bytes, flags, destination, info),
             SocketBackend::Virtual(s) => s.send_control(bytes, flags, destination, Some(info)),
             SocketBackend::Hybrid(s) => s.send_control(bytes, flags, destination, Some(info)),
@@ -393,19 +398,19 @@ impl Socket {
         }
     }
     pub fn ancillary_hop(&self) -> Option<(u32, u32, u8)> {
-        if let SocketBackend::Hybrid(s) = &self.0 {
+        if let SocketBackend::Hybrid(s) = &self.backend {
             return s.ancillary_hop();
         }
-        if let SocketBackend::Virtual(s) = &self.0 {
+        if let SocketBackend::Virtual(s) = &self.backend {
             s.ancillary_hop()
-        } else if let SocketBackend::Native(s) = &self.0 {
+        } else if let SocketBackend::Native(s) = &self.backend {
             s.ancillary_hop()
         } else {
             None
         }
     }
     pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
-        if let SocketBackend::Netlink(s) = &self.0 {
+        if let SocketBackend::Netlink(s) = &self.backend {
             s.bind_bytes(bytes)
         } else {
             self.bind(decode_address(bytes)?)
@@ -415,7 +420,7 @@ impl Socket {
         if self.info().is_some_and(|s| matches!(s.protocol, 6 | 17)) {
             let address = decode_address(bytes)?;
             if address.port() != 0
-                && address.port() < self.1.unprivileged_port.get()
+                && address.port() < self.namespace.unprivileged_port.get()
                 && !can_bind_service
             {
                 return Err(NetError(13));
@@ -424,28 +429,28 @@ impl Socket {
         self.bind_bytes(bytes)
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
-        if let SocketBackend::Netlink(s) = &self.0 {
+        if let SocketBackend::Netlink(s) = &self.backend {
             s.connect_bytes(bytes)
         } else {
             self.connect(decode_address(bytes)?)
         }
     }
     pub fn local_bytes(&self) -> Result<Vec<u8>> {
-        if let SocketBackend::Netlink(s) = &self.0 {
+        if let SocketBackend::Netlink(s) = &self.backend {
             s.local_bytes()
         } else {
             self.local_addr().map(encode_address)
         }
     }
     pub fn peer_bytes(&self) -> Result<Vec<u8>> {
-        if let SocketBackend::Netlink(s) = &self.0 {
+        if let SocketBackend::Netlink(s) = &self.backend {
             s.peer_bytes()
         } else {
             self.peer_addr().map(encode_address)
         }
     }
     pub fn received_address(&self, received: &Received) -> Vec<u8> {
-        if matches!(self.0, SocketBackend::Netlink(_)) {
+        if matches!(self.backend, SocketBackend::Netlink(_)) {
             received
                 .netlink_address
                 .map_or_else(|| netlink::address(0), Vec::from)
@@ -478,7 +483,7 @@ impl Socket {
         net_admin: bool,
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
-        if let SocketBackend::Netlink(s) = &self.0 {
+        if let SocketBackend::Netlink(s) = &self.backend {
             s.send_with_namespace(bytes, flags, destination, net_admin, resolve)
         } else {
             self.send(bytes, flags, destination.map(decode_address).transpose()?)
@@ -499,10 +504,8 @@ impl Socket {
     delegate!(set_option(level: u32, name: u32, value: i32) -> Result<()>);
     delegate!(get_option(level: u32, name: u32) -> Result<i32>);
     pub fn accept(&self) -> Result<(Rc<Self>, SocketAddr)> {
-        if self.1.socket_count.get() >= MAX_SOCKETS {
-            return Err(NetError(24));
-        }
-        let (backend, peer) = match &self.0 {
+        let reservation = self.namespace.socket_count.reserve()?;
+        let (backend, peer) = match &self.backend {
             SocketBackend::Hybrid(s) => s.accept()?,
             SocketBackend::Netlink(_) => return Err(NetError(95)),
             SocketBackend::Native(s) => {
@@ -514,7 +517,7 @@ impl Socket {
                 (SocketBackend::Virtual(s), peer)
             }
         };
-        let accepted = Self::wrap(backend, self.1.clone());
+        let accepted = Self::wrap(backend, self.namespace.clone(), reservation);
         for receive in [false, true] {
             accepted.set_io_timeout(receive, self.io_timeout(receive));
         }
@@ -533,7 +536,7 @@ pub fn wait_with_fds(
     let mut native = Vec::new();
     let mut fabrics: Vec<Fabric> = Vec::new();
     for (s, events) in sockets {
-        match &s.0 {
+        match &s.backend {
             SocketBackend::Hybrid(s) => {
                 let (n, f) = s.waiters(*events);
                 if let Some(n) = n {

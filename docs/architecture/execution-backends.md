@@ -897,3 +897,57 @@ Socket factory/full OFD teardown, bind/connect/listen/accept ownership, AF_UNIX
 control/SCM_RIGHTS, task/signal ownership and scoped structural VM/device changes
 still need migration. Connected TCP readiness is one completed part of that work,
 not completion of the coordinator-removal objective.
+
+## Shared native network lifetime and socket reservations (2026-11-02)
+
+The native transport namespace is now an Arc-owned, Send+Sync resource by
+composition. Its immutable mode, original host-socket quota, DNS service and
+atomic link counters have one authority. The existing timed interface cache
+uses its own mutex. This is not the complete Linux network namespace: topology,
+netlink/virtual stacks, routing and owner socket projections still need migration.
+
+Native socket construction separates the actual prepared endpoint from its
+owner projection. PreparedSocket owns the one host descriptor, its original
+quota reservation and creating native namespace. It can be constructed and
+cancelled on a worker; attaching owner controls reuses that same endpoint and
+quota. The production guest socket syscall still uses its existing owner route.
+No worker socket opcode or complete shared OFD publication is claimed here.
+
+The Linux namespace's existing aggregate socket bound now also uses a shared
+reservation, acquired before socket creation or accept. Failure/cancellation
+returns the slot; successful construction transfers it into the actual Socket.
+Final teardown releases it after the backend and namespace projection, without
+calling back into Rc state. Native transport and aggregate guest counts retain
+their distinct original scopes and limits, using the same reservation primitive.
+Metadata counters use relaxed atomics; they do not publish guest memory.
+
+The native DNS service and endpoints likewise use actual Arc/Weak ownership.
+Only this namespace's resolver table/receiver and each endpoint's queues are
+synchronized. Pending-plus-reply capacity is reserved atomically under the
+endpoint queue lock; malformed/local replies and host results convert that same
+reservation into a reply. Resolver backpressure rolls it back. Outstanding
+requests keep weak endpoints, so they cannot prolong socket lifetime.
+
+Stream input/framing has its own per-endpoint transaction. It may call the
+resolver and complete a reply without recursively borrowing the input buffer.
+The lock order is input -> resolver -> endpoint state; no state guard calls the
+resolver or takes input. UDP does not take the stream-input lock. Completion
+updates the existing readiness epoch with a relaxed atomic under the queue
+boundary. Buffered frames survive backpressure and half-close; concurrent writers
+and readers cannot duplicate frames or overrun the original eight-entry bound.
+Submitting a complete frame now borrows the owned input slice instead of making
+an intermediate packet copy. Ordinary native TCP bytes/poll never take these DNS
+or interface-cache locks. Existing bounded host resolver workers are unchanged;
+no new service thread, bus, polling loop or guest-memory synchronization is added.
+
+Tests exercise parallel real endpoint construction/cancellation at the existing
+bound, exact endpoint/creating-namespace identity across projection attachment,
+last native namespace release on a worker, aggregate socket quota rollback and
+worker release, and accept-at-capacity preserving the queued host connection.
+DNS coverage includes simultaneous datagrams, concurrent framed stream writes
+with partial reads, shared asynchronous resolver results, dead weak requests,
+backpressure rollback and half-close retry. Mac/iPad share this implementation.
+Remaining work is complete Linux namespace/policy ownership, shared socket OFD
+publication and production factory/control/accept routing, plus Unix/task/VM
+ownership. These prerequisites do not themselves remove more cohort joins or
+establish an application performance gain.

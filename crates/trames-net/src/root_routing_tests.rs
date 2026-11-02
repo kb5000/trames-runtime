@@ -6,6 +6,65 @@ fn addr(ip: &str, port: u16) -> SocketAddr {
     SocketAddr::new(ip.parse().unwrap(), port)
 }
 #[test]
+fn socket_admission_lease_rolls_back_errors_and_releases_without_namespace_rc() {
+    let root = Network::new(NetworkMode::Loopback);
+    for _ in 0..MAX_SOCKETS * 2 {
+        assert!(matches!(root.socket(2, 1, 17), Err(NetError(93))));
+        assert_eq!(root.live_sockets(), 0);
+    }
+    let socket = root.socket(2, 2, 0).unwrap();
+    let alias = socket.clone();
+    assert_eq!(root.live_sockets(), 1);
+    drop(alias);
+    assert_eq!(root.live_sockets(), 1);
+    // The real accounting lease has no owner graph. Split only in this
+    // ownership test; ordinary sockets retain it through backend teardown.
+    let Socket {
+        backend,
+        namespace,
+        timeouts: _,
+        _reservation,
+    } = Rc::try_unwrap(socket).ok().unwrap();
+    drop((backend, namespace));
+    assert_eq!(root.live_sockets(), 1);
+    std::thread::spawn(move || drop(_reservation))
+        .join()
+        .unwrap();
+    assert_eq!(root.live_sockets(), 0);
+}
+#[test]
+fn full_namespace_does_not_consume_an_accepted_native_connection() {
+    use std::time::{Duration, Instant};
+    let root = Network::new(NetworkMode::Loopback);
+    let server = root.socket(2, 1, 0).unwrap();
+    server.bind(addr("127.0.0.1", 0)).unwrap();
+    server.listen(2).unwrap();
+    let mut netlink: Vec<_> = (1..MAX_SOCKETS)
+        .map(|_| root.socket(16, 3, 0).unwrap())
+        .collect();
+    let _client = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+    assert_eq!(root.live_sockets(), MAX_SOCKETS);
+    assert!(matches!(server.accept(), Err(NetError(24))));
+    netlink.pop();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let accepted = loop {
+        match server.accept() {
+            Ok((socket, _)) => break socket,
+            Err(NetError(11)) => {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
+    assert_eq!(root.live_sockets(), MAX_SOCKETS);
+    drop(accepted);
+    assert_eq!(root.live_sockets(), MAX_SOCKETS - 1);
+    // A retry with no pending connection must return its reservation too.
+    assert!(matches!(server.accept(), Err(NetError(11))));
+    assert_eq!(root.live_sockets(), MAX_SOCKETS - 1);
+}
+#[test]
 fn root_wildcard_accepts_native_and_guest_and_guest_can_use_bridge_service() {
     let root = Network::new(NetworkMode::Full);
     let child = root.isolated().unwrap();
@@ -62,7 +121,7 @@ fn root_reaches_private_tcp_udp_without_routing_regular_sockets_through_the_stac
     recv.send(b"reply", 0, received.address).unwrap();
     assert_eq!(sender.recv(64, 0).unwrap().data, b"reply");
     let ordinary = root.socket(2, 2, 0).unwrap();
-    assert!(matches!(&ordinary.0,SocketBackend::Hybrid(s) if s.waiters(1).1.is_none()));
+    assert!(matches!(&ordinary.backend,SocketBackend::Hybrid(s) if s.waiters(1).1.is_none()));
 }
 #[test]
 fn root_bind_conflict_rolls_back_native_half_and_preserves_socket_quota() {

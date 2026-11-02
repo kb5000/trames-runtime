@@ -510,7 +510,7 @@ mod tests {
     fn direct_tcp_option_updates_are_replayed_to_the_real_guest_branch() {
         let root = Network::new(NetworkMode::Full);
         let socket = root.socket(2, 1, 0).unwrap();
-        let SocketBackend::Hybrid(hybrid) = &socket.0 else {
+        let SocketBackend::Hybrid(hybrid) = &socket.backend else {
             unreachable!()
         };
         let control = socket.direct_control().unwrap();
@@ -530,7 +530,7 @@ mod tests {
     fn missing_native_descriptor_cannot_bypass_guest_low_port_authorization() {
         let root = Network::new(NetworkMode::Full);
         let socket = root.socket(2, 1, 0).unwrap();
-        let super::super::SocketBackend::Hybrid(hybrid) = &socket.0 else {
+        let super::super::SocketBackend::Hybrid(hybrid) = &socket.backend else {
             unreachable!()
         };
         hybrid.native.borrow_mut().take();
