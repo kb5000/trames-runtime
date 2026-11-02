@@ -510,6 +510,124 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
 }
 
 #[test]
+fn worker_devpts_create_unlock_peer_and_close_need_no_coordinator_services() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.linux.vfs.set_runtime_info(1, Default::default());
+        p.linux
+            .vfs
+            .mkdir_at(trames_vfs::AT_FDCWD, b"/pts", 0o755)
+            .unwrap();
+        p.linux
+            .vfs
+            .mount(
+                Some(b"devpts"),
+                b"/pts",
+                Some(b"devpts"),
+                0,
+                Some(b"newinstance,ptmxmode=0666,max=4"),
+            )
+            .unwrap();
+        p.memory.write(0x1000, b"/pts/ptmx\0").unwrap();
+        p.memory.write_array(0x1010, 0u32.to_le_bytes()).unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut code = Vec::new();
+        for i in 0..8 {
+            let base = 0x1800 + i * 40;
+            code.extend([
+                mov(0, 0),
+                mov(1, 0x1000),
+                mov(2, 2 | 0x100),
+                mov(3, 0),
+                mov(8, 56),
+                0xd4000001,
+                0xaa0003f3,
+                mov(1, base),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1303e0,
+                mov(1, 0x5431),
+                0xf2a80081,
+                mov(2, 0x1010),
+                mov(8, 29),
+                0xd4000001,
+                mov(1, base + 8),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1303e0,
+                mov(1, 0x5441),
+                mov(2, 2 | 0x100),
+                mov(8, 29),
+                0xd4000001,
+                0xaa0003f4,
+                mov(1, base + 16),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1403e0,
+                mov(8, 57),
+                0xd4000001,
+                mov(1, base + 24),
+                0xf9000020,
+            ]);
+            code.extend([
+                0xaa1303e0,
+                mov(8, 57),
+                0xd4000001,
+                mov(1, base + 32),
+                0xf9000020,
+            ]);
+        }
+        // Park completed tasks so a fast CPU cannot spend the shared test
+        // instruction budget spinning while a peer finishes host metadata.
+        code.extend([
+            mov(0, 0x1040),
+            mov(1, 128),
+            mov(2, 0),
+            mov(3, 0),
+            mov(8, 98),
+            0xd4000001,
+            0x14000000,
+        ]);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        program(&mut p, code.clone());
+        program(&mut peer, code);
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        for p in k.processes.values() {
+            for i in 0..8 {
+                for (j, expected) in [3, 0, 4, 0, 0].into_iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1800 + i * 40 + j as u64 * 8).unwrap(),
+                        expected,
+                        "slots={slots} iteration={i} call={j}, pc={:#x}, syscall={}, x0={}, completed={}, services={}, returns={:?}",
+                        p.cpu.pc, p.cpu.x(8), p.cpu.x(0), k.syscalls, k.service_requests, k.cohort_return_syscalls
+                    );
+                }
+            }
+            assert_eq!(p.seccomp.evaluations(), 82);
+            assert!(p.linux.vfs.live_ptys().is_empty());
+        }
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.syscalls, 82);
+    }
+}
+
+#[test]
 fn joined_pty_wait_and_signal_handoff_keep_accepted_endpoints_after_fd_reuse() {
     let mut p = super::tests::process();
     let mut k = super::tests::kernel();

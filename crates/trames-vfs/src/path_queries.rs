@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pathname authority over the original filesystem and inode objects.
 //! The resolver is the owner VFS's resolver, in a sealed private control view.
-//! Ordinary file/directory opens publish complete shared OFDs into live Files.
+//! File, directory and admitted devpts opens publish real OFDs into live Files.
 use super::*;
 
 #[derive(Clone)]
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
+    pub(super) devices: Arc<cgroup::DeviceAccess>,
     deferred: Rc<Cell<bool>>,
     // Keep the private weak mount registry alive, including detached mounts.
     _mounts: Vec<Rc<Mount>>,
@@ -32,7 +33,7 @@ impl Authority {
 }
 pub(super) fn ordinary_mount(mount: &Mount) -> bool {
     if mount.devpts.is_some() {
-        return false;
+        return true;
     }
     matches!(
         mount.kind,
@@ -105,9 +106,11 @@ impl Vfs {
         view.context.share_mask(&self.context);
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
+        view.ptys = self.ptys.clone();
         view.pseudo.borrow_mut().enabled = self.pseudo.borrow().enabled;
         view.query = Some(Authority {
             files: self.shared_files(),
+            devices: self.device_access(),
             deferred: Rc::new(Cell::new(false)),
             _mounts: mounts.into_values().collect(),
         });

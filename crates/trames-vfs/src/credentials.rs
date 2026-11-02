@@ -16,6 +16,24 @@ pub struct Credentials {
     pub caps: capabilities::Capabilities,
 }
 impl Credentials {
+    pub(super) fn allows_node(&self, node: &Node, bits: u32) -> bool {
+        let c = self;
+        let shift = if c.fsuid == node.uid {
+            6
+        } else if c.in_group(node.gid) {
+            3
+        } else {
+            0
+        };
+        (node.mode >> shift) & bits == bits
+            || c.has_cap(capabilities::DAC_OVERRIDE)
+                && (bits & 1 == 0
+                    || matches!(node.content, Content::Directory)
+                    || node.mode & 0o111 != 0)
+            || c.has_cap(capabilities::DAC_READ_SEARCH)
+                && bits & 2 == 0
+                && (bits & 1 == 0 || matches!(node.content, Content::Directory))
+    }
     pub fn user(uid: u32, gid: u32) -> Self {
         Self {
             uid,
@@ -263,22 +281,7 @@ impl Vfs {
         Ok(())
     }
     pub(super) fn allowed(&self, node: &Node, bits: u32) -> bool {
-        let c = &self.credentials;
-        let shift = if c.fsuid == node.uid {
-            6
-        } else if c.in_group(node.gid) {
-            3
-        } else {
-            0
-        };
-        (node.mode >> shift) & bits == bits
-            || c.has_cap(capabilities::DAC_OVERRIDE)
-                && (bits & 1 == 0
-                    || matches!(node.content, Content::Directory)
-                    || node.mode & 0o111 != 0)
-            || c.has_cap(capabilities::DAC_READ_SEARCH)
-                && bits & 2 == 0
-                && (bits & 1 == 0 || matches!(node.content, Content::Directory))
+        self.credentials.allows_node(node, bits)
     }
     fn chown_node(&self, node: NodeRef, uid: u32, gid: u32, persistent: bool) -> Result<()> {
         self.pseudo_immutable(&node)?;

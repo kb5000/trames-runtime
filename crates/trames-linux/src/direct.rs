@@ -567,7 +567,8 @@ impl DirectSyscalls {
             && (number != 29
                 || args[1] as u32 == 0x541b
                 || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413)
-                || fd.pty_endpoint().is_some() && crate::pty_control_request(args[1] as u32))
+                || fd.pty_endpoint().is_some()
+                    && (crate::pty_control_request(args[1] as u32) || args[1] as u32 == 0x5441))
     }
     fn invoke_control(
         &self,
@@ -624,7 +625,8 @@ impl DirectSyscalls {
                     .get(args[0] as u32)
                     .is_some_and(|fd| fd.is_pty())
                     && (matches!(args[1] as u32, 0x5401 | 0x5413)
-                        || crate::pty_control_request(args[1] as u32)))
+                        || crate::pty_control_request(args[1] as u32)
+                        || args[1] as u32 == 0x5441 && self.resources.is_some()))
     }
     fn transfer(
         &self,
@@ -749,6 +751,14 @@ impl DirectSyscalls {
         }
         if matches!(number, 211 | 212) && self.resources.is_some() {
             return self.local_message(fd, number, args, memory);
+        }
+        if number == 29 && args[1] as u32 == 0x5441 {
+            return Some(
+                self.resources
+                    .as_ref()?
+                    .open_pty_peer(fd.pty_endpoint()?, args[2] as u32)
+                    .map(u64::from),
+            );
         }
         let deferred = Cell::new(false);
         let flags = socket_flags(number, args);
@@ -2036,6 +2046,39 @@ mod tests {
             Some(Err(Errno(11)))
         );
     }
+    #[test]
+    fn pty_peer_creation_preserves_type_flags_lock_limit_and_permission_order() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let master = v.open_at(trames_vfs::AT_FDCWD, b"/dev/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        let mut m = memory();
+        let invoke = |v: &Vfs, fd, flags, m: &mut Memory| {
+            DirectSyscalls::new(v.direct_descriptors())
+                .with_resources(v.descriptor_factory())
+                .invoke(29, [fd as u64, 0x5441, flags as u64, 0, 0, 0], m)
+        };
+        v.set_descriptor_limit(master + 1);
+        assert_eq!(invoke(&v, master, 0, &mut m), Some(Err(Errno(22))));
+        assert_eq!(invoke(&v, master, 2, &mut m), Some(Err(Errno(5))));
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(invoke(&v, master, 2, &mut m), Some(Err(Errno(24))));
+        v.set_descriptor_limit(master + 4);
+        let slave = invoke(&v, master, 2 | trames_vfs::O_CLOEXEC | O_NONBLOCK, &mut m)
+            .unwrap()
+            .unwrap() as u32;
+        assert_eq!(
+            v.flags(slave).unwrap() & (trames_vfs::O_CLOEXEC | O_NONBLOCK),
+            trames_vfs::O_CLOEXEC | O_NONBLOCK
+        );
+        assert_eq!(invoke(&v, slave, 0, &mut m), Some(Err(Errno(25))));
+        v.close(slave).unwrap();
+        v.credentials = trames_vfs::Credentials::user(1000, 1000);
+        assert_eq!(invoke(&v, master, 2, &mut m), Some(Err(Errno(13))));
+        assert_eq!(v.eventfd(0, 0).unwrap(), slave);
+    }
+
     #[test]
     fn pty_short_controls_keep_original_endpoint_fault_order_and_shared_state() {
         let mut v = Vfs::default();

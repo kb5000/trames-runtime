@@ -2029,12 +2029,25 @@ impl Vfs {
             Ok(node) => {
                 if let Some(query) = &self.query {
                     let n = node.borrow();
-                    if n.volatile
-                        || n.seals.is_some()
-                        || !matches!(
-                            n.content,
-                            Content::File(storage::FileData::Plain(_)) | Content::Directory
-                        )
+                    let pty = p
+                        .mount
+                        .as_ref()
+                        .is_some_and(|m| m.devpts.is_some() && m.shared_resources().is_some())
+                        && flags & O_PATH == 0
+                        && match n.content {
+                            Content::Device(pseudo::Device::Ptmx) => true,
+                            // Opening a slave may acquire a controlling terminal.
+                            // That task transition keeps its original joined path.
+                            Content::Device(pseudo::Device::Pts(_, _)) => flags & 0x100 != 0,
+                            _ => false,
+                        };
+                    if !pty
+                        && (n.volatile
+                            || n.seals.is_some()
+                            || !matches!(
+                                n.content,
+                                Content::File(storage::FileData::Plain(_)) | Content::Directory
+                            ))
                     {
                         return query.defer();
                     }

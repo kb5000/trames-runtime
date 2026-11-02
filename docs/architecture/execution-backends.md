@@ -1329,3 +1329,46 @@ Completion releases the lease; blocked signal/job-control calls keep it. The sam
 handoff applies when a previously parked PTY operation becomes a task-control
 case. A regression closes and reuses both the slave waiting for input and the
 master publishing control-C, proving original bytes/signals and final close.
+
+## Worker devpts creation and live device policy (2026-11-03)
+
+Device cgroup attachments now live in their original shared per-group DeviceAccess
+objects: immutable parent Arcs and one object lock for that group's actual program
+list and attachment flags. Owner attach/detach/query and worker access checks use
+these same fields and immutable BPF programs. No copied effective-policy list,
+allow/deny cache, whole-cgroup lock or policy service thread is introduced. Cgroup
+structure/task membership remains joined; a worker capture retains the actual
+current task domain and original credentials for that execution epoch. Attachment
+changes remain visible to retained captures through the same objects. Ordinary
+inode permission checks use one common Credentials implementation.
+
+TIOCGPTPEER accepts an original full master OFD and reserves a real live Files slot
+before permissions, preserving the existing type/flag/lock/FD-limit/permission/device
+policy error order. It opens the original slave inode and devpts mount even after
+namespace changes; it does not reopen a pathname or resolve its numeric FD again.
+Owner and worker use the same factory/constructor. Failed permission and policy
+checks release the hidden FD reservation without opening a slave lease. CLOEXEC
+stays per FD; status flags and endpoint counts retain their original semantics.
+
+The existing sealed PathQueries resolver can now publish PTY masters and explicit
+O_NOCTTY slave opens from real shared devpts mounts. The query view shares the real
+PTY registry and device-policy capability, while its Rc namespace/control island
+remains exclusively owned. Allocation validates its resource boundary before any
+PTY effects. Scheduler ID selection/publication share the existing short registry
+lock; a devpts-local number and its node are selected/inserted under one filesystem
+write guard. Concurrent creators cannot publish the same number or replace a live
+slave node. No registry lock spans a notification callback or normal terminal I/O.
+
+Tests cover eight simultaneous creators retaining unique scheduler IDs, unique local
+numbers and the original slave nodes; worker final closes remove those nodes. Other
+checks cover live ancestor device deny/detach through an already captured factory,
+original credentials, failed FD reservation/permission/policy/quota rollback, locked
+slaves, namespace-pinned peers, and explicit task-transition fallback. A filtered
+two-task interpreter test runs create/unlock/peer/close on one and two slots, with
+zero coordinator services and exactly one filter decision per entry.
+
+Legacy pseudo-devpts allocation still owns its dynamic pseudo-node cache and remains
+joined. Non-O_NOCTTY slave pathname opens may acquire a controlling terminal, and
+therefore defer before effects. O_PATH/dynamic pseudo controls, task/job-control
+ioctls, SIGHUP/SIGCONT and host signal/resize routing retain their original task
+boundary. This migration grants no arbitrary device native-memory authority.

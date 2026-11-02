@@ -8,7 +8,7 @@ pub use shared::{PtyIo, PtySlaveEndpoint, TerminalAccess};
 pub struct Pty {
     pub number: u32,
     pub(super) mount: Option<Arc<mounts::MountData>>,
-    slave: NodeRef,
+    pub(super) slave: NodeRef,
     pub(super) io: Arc<PtyIo>,
     pub locked: std::sync::atomic::AtomicBool,
     pub hangup_notified: std::sync::atomic::AtomicBool,
@@ -121,29 +121,22 @@ impl Vfs {
                 .and_then(|p| p.mount)
                 .filter(|m| m.kind == mounts::Kind::Devpts)
         };
+        // Only actual devpts resources are admitted by the private query view.
+        // Pseudo devpts allocation still needs its owner-side node cache.
+        if let Some(query) = &self.query {
+            if !mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
+                return query.defer();
+            }
+        }
+        let mut registry = self.ptys.lock().unwrap();
         let id = (1..4096)
-            .find(|id| self.pty_by_id(*id).is_none())
+            .find(|id| registry.get(id).is_none_or(|p| p.strong_count() == 0))
             .ok_or(Errno(28))?;
         let mut tty = Terminal::default();
         tty.session = 0;
         tty.foreground = 0;
         let (number, slave) = if let Some(pts) = mount.as_ref().and_then(|m| m.devpts.as_ref()) {
-            let number = (0..pts.max)
-                .find(|n| {
-                    !pts.fs
-                        .borrow()
-                        .paths
-                        .contains_key(format!("/{n}").as_bytes())
-                })
-                .ok_or(Errno(28))?;
-            let node = pts.node(
-                format!("/{number}").into_bytes(),
-                Content::Device(pseudo::Device::Pts(id, number)),
-                0o20000 | pts.mode,
-                pts.uid.unwrap_or(self.credentials.fsuid),
-                pts.gid.unwrap_or(self.credentials.fsgid),
-            );
-            (number, node)
+            pts.allocate_slave(id, &self.credentials)?
         } else {
             let path = format!("/dev/pts/{id}").into_bytes();
             let mut pseudo = self.pseudo.borrow_mut();
@@ -168,70 +161,59 @@ impl Vfs {
             host_resize_pending: std::sync::atomic::AtomicBool::new(false),
             host_signals: AtomicU64::new(0),
         });
-        self.ptys.lock().unwrap().insert(id, Arc::downgrade(&pair));
+        registry.insert(id, Arc::downgrade(&pair));
         Ok(PtyEnd::new(pair, true))
     }
     /// TIOCGPTPEER follows the master's devpts identity even after chroot or
     /// lazy unmount, rather than reopening a path in the caller's namespace.
     pub fn open_pty_peer(&mut self, fd: u32, flags: u32) -> Result<u32> {
         let end = self.pty(fd)?.filter(|end| end.master).ok_or(Errno(25))?;
-        if flags & !(3 | 0x100 | O_NONBLOCK | O_CLOEXEC) != 0 || flags & 3 != 2 {
-            return Err(Errno(22));
-        }
-        if end.pair.locked.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(Errno(5));
-        }
-        let fd = self.available(0)?;
-        let node = end.pair.slave.clone();
-        if !self.allowed(&node.borrow(), 6) {
-            return Err(Errno(13));
-        }
-        self.check_device_open(&node.borrow(), flags)?;
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        socket: None,
-                        _disk_file: None,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file: None,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        directory_mount: Default::default(),
-                        namespace_resource: None,
-                        file_authority: Default::default(),
-                        tcp_publication: Default::default(),
-                        socket_control: None,
-                        control: None,
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: FdKind::Terminal,
-                        flags: (flags & !O_CLOEXEC).into(),
-                        file_position: Arc::default(),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: Some(node),
-                        pipe: None,
-                        pty: Some(PtyEnd::new(end.pair.clone(), false)),
-                        bridge: None,
-                        kernel_log: None,
-                        notification: None,
-                    }),
-                    position: 0,
-                    anonymous: None,
-                    local: None,
-                    namespace: None,
-                    network_control: None,
-                    mount_file: None,
-                    oom: None,
-                    mount: end.pair.mount.clone().map(OpenMount::Shared),
-                }),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
-        Ok(fd)
+        self.descriptor_factory().open_pty_peer(&end, flags)
+    }
+}
+
+pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u32)) -> Descriptor {
+    let node = end.pair.slave.clone();
+    Descriptor {
+        open: OpenHandle::new(OpenDescription {
+            shared: Arc::new(SharedOpenDescription {
+                socket: None,
+                _disk_file: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
+                native_image: None,
+                mount_resource: std::sync::OnceLock::new(),
+                directory_mount: Default::default(),
+                namespace_resource: None,
+                file_authority: Default::default(),
+                tcp_publication: Default::default(),
+                socket_control: None,
+                control: None,
+                read_node: None,
+                id,
+                owner,
+                kind: FdKind::Terminal,
+                flags: (flags & !O_CLOEXEC).into(),
+                file_position: Arc::default(),
+                flock: std::sync::OnceLock::new(),
+                ofd_records: Default::default(),
+                node: Some(node),
+                pipe: None,
+                pty: Some(PtyEnd::new(end.pair.clone(), false)),
+                bridge: None,
+                kernel_log: None,
+                notification: None,
+            }),
+            position: 0,
+            anonymous: None,
+            local: None,
+            namespace: None,
+            network_control: None,
+            mount_file: None,
+            oom: None,
+            mount: end.pair.mount.clone().map(OpenMount::Shared),
+        }),
+        cloexec: (flags & O_CLOEXEC != 0).into(),
     }
 }
 
@@ -300,8 +282,33 @@ impl Devpts {
         );
         Ok(out)
     }
-    fn node(&self, path: Vec<u8>, content: Content, mode: u32, uid: u32, gid: u32) -> NodeRef {
+    fn allocate_slave(&self, id: u32, credentials: &Credentials) -> Result<(u32, NodeRef)> {
         let mut fs = self.fs.borrow_mut();
+        let number = (0..self.max)
+            .find(|number| !fs.paths.contains_key(format!("/{number}").as_bytes()))
+            .ok_or(Errno(28))?;
+        let node = self.insert_node(
+            &mut fs,
+            format!("/{number}").into_bytes(),
+            Content::Device(pseudo::Device::Pts(id, number)),
+            0o20000 | self.mode,
+            self.uid.unwrap_or(credentials.fsuid),
+            self.gid.unwrap_or(credentials.fsgid),
+        );
+        Ok((number, node))
+    }
+    fn node(&self, path: Vec<u8>, content: Content, mode: u32, uid: u32, gid: u32) -> NodeRef {
+        self.insert_node(&mut self.fs.borrow_mut(), path, content, mode, uid, gid)
+    }
+    fn insert_node(
+        &self,
+        fs: &mut Filesystem,
+        path: Vec<u8>,
+        content: Content,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> NodeRef {
         // Linux devpts inode numbers are local to st_dev: root=1, ptmx=2,
         // slave=index+3. runc validates ptmx's inode before using the handle.
         let inode = match &content {
@@ -349,6 +356,215 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn worker_devpts_open_defers_task_transitions_and_rolls_back_failed_creation() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        mount(&mut v, b"/pts");
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let query = v.path_queries();
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/dev/ptmx", 2, 0, 0, &files),
+            None
+        );
+        let master = query
+            .open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/pts/0", 2, 0, 0, &files),
+            None
+        );
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/pts/0", 2 | 0x100, 0, 0, &files),
+            Some(Err(Errno(5)))
+        );
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/pts/ptmx", O_PATH, 0, 0, &files),
+            None
+        );
+        let second = query
+            .open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let next = v.available(0).unwrap();
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files),
+            Some(Err(Errno(28)))
+        );
+        assert_eq!(v.available(0).unwrap(), next);
+        let root = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup", O_DIRECTORY, 0)
+            .unwrap();
+        let deny = v
+            .bpf_load_device(&[0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        v.bpf_attach_device(root, deny, 2, 0).unwrap();
+        assert_eq!(
+            query.open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files),
+            Some(Err(Errno(1)))
+        );
+        v.bpf_detach_device(root, deny).unwrap();
+        v.close(master).unwrap();
+        let replacement = query
+            .open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let new = v.pty(replacement).unwrap().unwrap().pair.clone();
+        assert_eq!(new.number, 0);
+        assert_ne!(new.id, pair.id);
+        assert!(!pair.master_alive.load(Ordering::Relaxed));
+        v.close(replacement).unwrap();
+        v.close(second).unwrap();
+        epoch.finish();
+    }
+
+    #[test]
+    fn worker_peer_uses_live_ancestor_device_policy_and_original_credentials() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let master = v.open_at(AT_FDCWD, b"/dev/ptmx", 2, 0).unwrap();
+        let end = v.pty(master).unwrap().unwrap();
+        end.pair.locked.store(false, Ordering::Relaxed);
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/child", 0o755)
+            .unwrap();
+        let root = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup", O_DIRECTORY, 0)
+            .unwrap();
+        let child = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/child", O_DIRECTORY, 0)
+            .unwrap();
+        let procs = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/child/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(procs, b"0").unwrap();
+        let factory = v.descriptor_factory();
+        let open = || {
+            let factory = factory.clone();
+            let end = end.clone();
+            std::thread::spawn(move || factory.open_pty_peer(&end, 2 | O_CLOEXEC))
+                .join()
+                .unwrap()
+        };
+        let first = open().unwrap();
+        assert!(v.flags(first).unwrap() & O_CLOEXEC != 0);
+        v.close(first).unwrap();
+        let deny = v
+            .bpf_load_device(&[0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        v.bpf_attach_device(root, deny, 2, 0).unwrap();
+        assert_eq!(open(), Err(Errno(1)));
+        assert_eq!(v.bpf_query_device(child, true).unwrap().1.len(), 1);
+        v.bpf_detach_device(root, deny).unwrap();
+        let second = open().unwrap();
+        v.close(second).unwrap();
+        v.credentials = Credentials::user(1000, 1000);
+        // The retained capture is an accepted epoch's original credentials.
+        let old = open().unwrap();
+        v.close(old).unwrap();
+        let user = v.descriptor_factory();
+        let next = v.available(0).unwrap();
+        assert_eq!(user.open_pty_peer(&end, 2), Err(Errno(13)));
+        assert_eq!(end.pair.slaves.load(Ordering::Relaxed), 0);
+        assert_eq!(v.descriptor_factory().eventfd(0, 0).unwrap(), next);
+    }
+
+    #[test]
+    fn concurrent_worker_devpts_creation_publishes_unique_ids_and_original_nodes() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.mkdir_at(AT_FDCWD, b"/pts", 0o755).unwrap();
+        v.mount(
+            Some(b"devpts"),
+            b"/pts",
+            Some(b"devpts"),
+            0,
+            Some(b"newinstance,ptmxmode=0666,mode=0620,max=8"),
+        )
+        .unwrap();
+        let mut epoch = FileEpoch::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut release = Vec::new();
+        let mut jobs = Vec::new();
+        for _ in 0..8 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            release.push(tx);
+            let sender = sender.clone();
+            let query = v.path_queries();
+            let files = epoch.capture(&v, true);
+            let membership = v.shared_files();
+            let factory = v.descriptor_factory();
+            jobs.push(std::thread::spawn(move || {
+                let master = query
+                    .open_at_resolve(AT_FDCWD, b"/pts/ptmx", 2, 0, 0, &files)
+                    .unwrap()
+                    .unwrap();
+                let original = membership.lookup(master).unwrap().unwrap();
+                let end = original.open.pty.as_ref().unwrap();
+                end.pair.locked.store(false, Ordering::Relaxed);
+                let slave = factory.open_pty_peer(end, 2).unwrap();
+                let path = format!("/pts/{}", end.pair.number);
+                let independent = query
+                    .open_at_resolve(AT_FDCWD, path.as_bytes(), 2 | 0x100, 0, 0, &files)
+                    .unwrap()
+                    .unwrap();
+                sender
+                    .send((end.pair.clone(), master, slave, independent))
+                    .unwrap();
+                rx.recv().unwrap();
+                drop(original);
+                for fd in [independent, slave, master] {
+                    membership.close(fd, 0).unwrap().unwrap();
+                }
+            }));
+        }
+        drop(sender);
+        let rows: Vec<_> = (0..8)
+            .map(|_| {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.0.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            8
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.0.number)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            8
+        );
+        for (pair, _, _, _) in &rows {
+            assert_eq!(pair.slaves.load(Ordering::Relaxed), 2);
+            assert!(v
+                .stat_at(AT_FDCWD, format!("/pts/{}", pair.number).as_bytes())
+                .is_ok());
+        }
+        for tx in release {
+            tx.send(()).unwrap();
+        }
+        for job in jobs {
+            job.join().unwrap();
+        }
+        for (pair, _, _, _) in rows {
+            assert_eq!(pair.slaves.load(Ordering::Relaxed), 0);
+            assert!(!pair.master_alive.load(Ordering::Relaxed));
+            assert!(matches!(
+                v.stat_at(AT_FDCWD, format!("/pts/{}", pair.number).as_bytes()),
+                Err(Errno(2))
+            ));
+        }
+        epoch.finish();
+    }
+
     #[test]
     fn retained_pty_bytes_do_not_keep_guest_endpoints_open() {
         let mut v = Vfs::default();

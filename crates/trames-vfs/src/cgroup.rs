@@ -29,9 +29,45 @@ const FILES: &[(&str, u32)] = &[
     // advertised and no throttling request can silently succeed.
     ("io.max", 0o644),
 ];
+#[derive(Default)]
+struct DeviceRules {
+    programs: Vec<Arc<bpf::Program>>,
+    flags: u32,
+}
+/// The actual device attachment graph. Structural task/cgroup changes still
+/// join; live program attachments and their parent resources are shared.
+pub(super) struct DeviceAccess {
+    parent: Option<Arc<DeviceAccess>>,
+    rules: SharedCell<DeviceRules>,
+}
+impl DeviceAccess {
+    pub(super) fn check(&self, mode: u32, rdev: u64, access: u32) -> Result<()> {
+        let kind = match mode & 0o170000 {
+            0o20000 => 2,
+            0o60000 => 1,
+            _ => return Ok(()),
+        };
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xfffff000);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & 0xffffff00);
+        let context = [kind | (access << 16), major as u32, minor as u32];
+        let mut at = Some(self);
+        while let Some(group) = at {
+            if group
+                .rules
+                .borrow()
+                .programs
+                .iter()
+                .any(|p| !p.allows(context))
+            {
+                return Err(Errno(1));
+            }
+            at = group.parent.as_deref();
+        }
+        Ok(())
+    }
+}
 struct Group {
-    device_programs: Vec<Arc<bpf::Program>>,
-    device_attach_flags: u32,
+    devices: Arc<DeviceAccess>,
     path: Vec<u8>,
     parent: Option<u64>,
     freeze: bool,
@@ -134,8 +170,10 @@ impl Cgroups {
         self.groups.insert(
             id,
             Group {
-                device_programs: Vec::new(),
-                device_attach_flags: 0,
+                devices: Arc::new(DeviceAccess {
+                    parent: parent.map(|id| self.groups[&id].devices.clone()),
+                    rules: SharedCell::default(),
+                }),
                 path,
                 parent,
                 freeze: false,
@@ -253,62 +291,63 @@ impl Vfs {
         } else {
             None
         };
-        let mut cg = self.cgroups.borrow_mut();
-        // ALLOW_OVERRIDE is not supported. A single ancestor attachment keeps
-        // the hierarchy closed to descendant attachment, as on Linux.
+        let cg = self.cgroups.borrow();
+        // ALLOW_OVERRIDE is not supported. Preserve the original ancestor and
+        // descendant constraints; each attachment's fields share one lock.
         if cg.ancestors(id).iter().skip(1).any(|a| {
-            !cg.groups[a].device_programs.is_empty() && cg.groups[a].device_attach_flags == 0
+            let rules = cg.groups[a].devices.rules.borrow();
+            !rules.programs.is_empty() && rules.flags == 0
         }) {
             return Err(Errno(1));
         }
         if flags == 0
-            && cg.groups.iter().any(|(other, g)| {
+            && cg.groups.iter().any(|(other, group)| {
                 *other != id
-                    && below(&g.path, &cg.groups[&id].path)
-                    && !g.device_programs.is_empty()
+                    && below(&group.path, &cg.groups[&id].path)
+                    && !group.devices.rules.borrow().programs.is_empty()
             })
         {
             return Err(Errno(1));
         }
-        let group = cg.groups.get_mut(&id).unwrap();
-        if !group.device_programs.is_empty() && group.device_attach_flags != flags & 2 {
+        let mut rules = cg.groups[&id].devices.rules.borrow_mut();
+        if !rules.programs.is_empty() && rules.flags != flags & 2 {
             return Err(Errno(22));
         }
-        if group.device_programs.iter().any(|p| p.id == program.id) {
+        if rules.programs.iter().any(|p| p.id == program.id) {
             return Err(Errno(17));
         }
         if let Some(old) = replace {
-            let slot = group
-                .device_programs
+            let slot = rules
+                .programs
                 .iter_mut()
                 .find(|p| p.id == old.id)
                 .ok_or(Errno(2))?;
             *slot = program;
         } else if flags == 0 {
-            group.device_programs = vec![program];
+            rules.programs = vec![program];
         } else {
-            if group.device_programs.len() >= 16 {
+            if rules.programs.len() >= 16 {
                 return Err(Errno(7));
             }
-            group.device_programs.push(program);
+            rules.programs.push(program);
         }
-        group.device_attach_flags = flags & 2;
+        rules.flags = flags & 2;
         Ok(())
     }
     pub fn bpf_detach_device(&self, target: u32, program: u32) -> Result<()> {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let program = self.bpf_program(program)?;
-        let mut cg = self.cgroups.borrow_mut();
-        let group = cg.groups.get_mut(&id).unwrap();
-        let index = group
-            .device_programs
+        let cg = self.cgroups.borrow();
+        let mut rules = cg.groups[&id].devices.rules.borrow_mut();
+        let index = rules
+            .programs
             .iter()
             .position(|p| p.id == program.id)
             .ok_or(Errno(2))?;
-        group.device_programs.remove(index);
-        if group.device_programs.is_empty() {
-            group.device_attach_flags = 0;
+        rules.programs.remove(index);
+        if rules.programs.is_empty() {
+            rules.flags = 0;
         }
         Ok(())
     }
@@ -321,40 +360,27 @@ impl Vfs {
         } else {
             vec![id]
         };
-        Ok((
-            if effective {
-                0
-            } else {
-                cg.groups[&id].device_attach_flags
-            },
-            groups
-                .iter()
-                .flat_map(|g| cg.groups[g].device_programs.iter().map(|p| p.id))
-                .collect(),
-        ))
+        let mut ids = Vec::new();
+        let mut flags = 0;
+        for group in groups {
+            let rules = cg.groups[&group].devices.rules.borrow();
+            ids.extend(rules.programs.iter().map(|p| p.id));
+            if !effective {
+                flags = rules.flags;
+            }
+        }
+        Ok((flags, ids))
+    }
+    pub(super) fn device_access(&self) -> Arc<DeviceAccess> {
+        if let Some(query) = &self.query {
+            return query.devices.clone();
+        }
+        let cg = self.cgroups.borrow();
+        let id = cg.tasks.get(&self.pid).map_or(ROOT, |(_, group)| *group);
+        cg.groups[&id].devices.clone()
     }
     pub(super) fn cgroup_device(&self, mode: u32, rdev: u64, access: u32) -> Result<()> {
-        let kind = match mode & 0o170000 {
-            0o20000 => 2,
-            0o60000 => 1,
-            _ => return Ok(()),
-        };
-        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xfffff000);
-        let minor = (rdev & 0xff) | ((rdev >> 12) & 0xffffff00);
-        let cg = self.cgroups.borrow();
-        let mut id = Some(cg.tasks.get(&self.pid).map_or(ROOT, |(_, g)| *g));
-        while let Some(current) = id {
-            let group = &cg.groups[&current];
-            if group
-                .device_programs
-                .iter()
-                .any(|p| !p.allows([kind | (access << 16), major as u32, minor as u32]))
-            {
-                return Err(Errno(1));
-            }
-            id = group.parent;
-        }
-        Ok(())
+        self.device_access().check(mode, rdev, access)
     }
     pub(super) fn check_device_open(&self, node: &Node, flags: u32) -> Result<()> {
         if flags & O_PATH != 0 {

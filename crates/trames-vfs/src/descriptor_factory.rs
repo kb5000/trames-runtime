@@ -11,6 +11,7 @@ pub struct DescriptorFactory {
     credentials: Credentials,
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
+    devices: Arc<cgroup::DeviceAccess>,
 }
 pub(super) fn next_id(ids: &AtomicU64) -> u64 {
     (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)
@@ -25,10 +26,36 @@ impl Vfs {
             credentials: self.credentials.clone(),
             local_identity: self.local_sender_credentials(),
             pid_namespace: self.pid_namespace().clone(),
+            devices: self.device_access(),
         }
     }
 }
 impl DescriptorFactory {
+    /// TIOCGPTPEER accepts the original full master OFD; no pathname relookup.
+    pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
+        if !end.master {
+            return Err(Errno(25));
+        }
+        if flags & !(3 | 0x100 | O_NONBLOCK | O_CLOEXEC) != 0 || flags & 3 != 2 {
+            return Err(Errno(22));
+        }
+        if end.pair.locked.load(Ordering::Relaxed) {
+            return Err(Errno(5));
+        }
+        let reservation = self.files.reserve()?;
+        {
+            let node = end.pair.slave.borrow();
+            if !self.credentials.allows_node(&node, 6) {
+                return Err(Errno(13));
+            }
+            let Content::Device(device) = node.content else {
+                unreachable!("PTY slave device");
+            };
+            self.devices.check(node.mode, device.rdev(), 6)?;
+        }
+        let descriptor = pty::peer_descriptor(end, flags, self.open_id(), self.owner);
+        Ok(reservation.publish(descriptor, None))
+    }
     /// Signals belong to the reading task, while the mask belongs to this OFD.
     /// None defers an owner-only type before any mask or membership effects.
     pub fn signalfd(&self, fd: i32, mask: u64, flags: u32) -> Option<Result<u32>> {
