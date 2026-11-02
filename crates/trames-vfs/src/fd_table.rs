@@ -7,7 +7,11 @@ use std::sync::Mutex;
 #[derive(Clone)]
 pub(super) enum SlotOpen {
     Shared(Arc<SharedOpenDescription>),
-    Owner(usize, Option<std::sync::Weak<SharedOpenDescription>>),
+    Owner(
+        usize,
+        Option<std::sync::Weak<SharedOpenDescription>>,
+        Option<std::sync::Weak<SharedOpenDescription>>,
+    ),
 }
 #[derive(Clone)]
 pub(super) struct Slot {
@@ -31,9 +35,15 @@ impl Slot {
         Self {
             open: match &d.open {
                 OpenHandle::Shared(open) => SlotOpen::Shared(open.clone()),
-                OpenHandle::Owner(_) => {
-                    SlotOpen::Owner(d.open.identity(), d.open.borrow().query_metadata())
-                }
+                OpenHandle::Owner(_) => SlotOpen::Owner(
+                    d.open.identity(),
+                    d.open.borrow().query_metadata(),
+                    d.open
+                        .borrow()
+                        .socket
+                        .as_ref()
+                        .map(|_| Arc::downgrade(&d.open.borrow().shared)),
+                ),
             },
             cloexec: d.cloexec.clone(),
         }
@@ -183,6 +193,18 @@ impl Drop for ReservedPair {
     }
 }
 impl SharedFiles {
+    pub(super) fn tcp_lookup(&self, fd: u32) -> Option<DirectTcpFd> {
+        let entries = self.0.entries.lock().unwrap();
+        let open = match &entries.get(&fd)?.open {
+            SlotOpen::Shared(open) => open.clone(),
+            SlotOpen::Owner(_, _, open) => open.as_ref()?.upgrade()?,
+        };
+        let mut tcp = open.tcp_publication.lock().unwrap().clone()?;
+        // Accepted I/O retains its transport while membership is locked. The
+        // stored capability remains weak, so snapshots do not delay FIN.
+        tcp.lease = Some(tcp.tcp.retain().ok()?);
+        Some(tcp)
+    }
     pub(super) fn reserve_pair(&self) -> Result<ReservedPair> {
         let mut entries = self.0.entries.lock().unwrap();
         let free = entries.free.first(2);
@@ -341,7 +363,7 @@ impl SharedFiles {
         };
         let file = match &slot.open {
             SlotOpen::Shared(open) => SharedFd::new(open.clone()),
-            SlotOpen::Owner(_, metadata) => SharedFd::new(metadata.as_ref()?.upgrade()?),
+            SlotOpen::Owner(_, metadata, _) => SharedFd::new(metadata.as_ref()?.upgrade()?),
         };
         Some(file.ready().map(|()| file))
     }
@@ -493,7 +515,7 @@ impl Entries<'_> {
         Entry {
             open: match &slot.open {
                 SlotOpen::Shared(open) => OpenView::Shared(open),
-                SlotOpen::Owner(identity, _) => {
+                SlotOpen::Owner(identity, _, _) => {
                     let descriptor = self
                         .owners
                         .entries
@@ -635,7 +657,7 @@ impl DescriptorTable {
     fn descriptor(&self, fd: u32, slot: &Slot) -> Descriptor {
         let open = match &slot.open {
             SlotOpen::Shared(open) => OpenHandle::Shared(open.clone()),
-            SlotOpen::Owner(identity, _) => {
+            SlotOpen::Owner(identity, _, _) => {
                 let state = self.0.borrow();
                 let descriptor = state
                     .entries

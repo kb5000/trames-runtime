@@ -3,7 +3,9 @@
 //! effects. Never pass guest structs, flags, descriptors or pointers to the OS.
 use super::Linux;
 use std::net::SocketAddr;
-use trames_memory::{Access, CpuMemory, Memory};
+#[cfg(test)]
+use trames_memory::Memory;
+use trames_memory::{Access, CpuMemory};
 use trames_net::{encode_address, NetError, MSG_TRUNC};
 use trames_vfs::Errno;
 type Result<T> = std::result::Result<T, Errno>;
@@ -14,7 +16,7 @@ fn net(error: NetError) -> Errno {
 }
 
 fn packet_control(
-    memory: &Memory,
+    memory: &impl CpuMemory,
     address: u64,
     size: u64,
 ) -> Result<Option<trames_net::PacketInfo>> {
@@ -80,7 +82,7 @@ fn u32_at(memory: &impl CpuMemory, address: u64) -> Result<u32> {
 fn u64_at(memory: &impl CpuMemory, address: u64) -> Result<u64> {
     memory.read_u64(address).map_err(|_| Errno(14))
 }
-fn address(memory: &Memory, pointer: u64, length: u64) -> Result<Vec<u8>> {
+fn address(memory: &impl CpuMemory, pointer: u64, length: u64) -> Result<Vec<u8>> {
     if !(2..=128).contains(&length) {
         return Err(Errno(22));
     }
@@ -121,7 +123,7 @@ impl AddressOutput {
             capacity: capacity as usize,
         }))
     }
-    fn write(self, memory: &mut Memory, address: Option<SocketAddr>) -> Result<()> {
+    fn write(self, memory: &mut impl CpuMemory, address: Option<SocketAddr>) -> Result<()> {
         let bytes = address.map_or_else(Vec::new, encode_address);
         self.write_bytes(memory, &bytes)
     }
@@ -198,7 +200,7 @@ impl Vectors {
         }
         Ok(Self { parts, size })
     }
-    fn read(&self, memory: &Memory) -> Result<Vec<u8>> {
+    fn read(&self, memory: &impl CpuMemory) -> Result<Vec<u8>> {
         let mut bytes = vec![0; self.size];
         let mut offset = 0;
         for &(pointer, size) in &self.parts {
@@ -225,7 +227,11 @@ impl Vectors {
     }
 }
 impl Linux {
-    pub(super) fn network_ioctl(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+    pub(super) fn network_ioctl(
+        &mut self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64> {
         if self.vfs.local_socket(a[0] as u32)?.is_none() {
             self.vfs.socket_fd(a[0] as u32)?;
         }
@@ -372,15 +378,47 @@ impl Linux {
         &mut self,
         number: u64,
         a: [u64; 6],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
     ) -> Result<u64> {
         Self::network_vfs(&mut self.vfs, number, a, memory)
+    }
+    /// Short control operations on the existing owner, without stopping peer
+    /// CPUs. Reject before effects when waits or other owner domains are needed.
+    pub fn network_service(
+        &mut self,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64>> {
+        if number == 198 {
+            if !matches!(a[0] as u32, 2 | 10) {
+                return None;
+            }
+        } else {
+            if !matches!(number, 200..=205 | 208..=210 | 242) {
+                return None;
+            }
+            let socket = self.vfs.socket_fd(a[0] as u32).ok()?;
+            if !matches!(socket.address_size(), 16 | 28) {
+                return None;
+            }
+            if matches!(number, 202 | 203 | 242)
+                && self.vfs.flags(a[0] as u32).ok()? & trames_vfs::O_NONBLOCK == 0
+            {
+                return None;
+            }
+        }
+        let result = Self::network_vfs(&mut self.vfs, number as u64, a, memory);
+        if number != 198 {
+            self.vfs.refresh_tcp(a[0] as u32);
+        }
+        Some(result)
     }
     pub(crate) fn network_vfs(
         vfs: &mut trames_vfs::Vfs,
         number: u64,
         a: [u64; 6],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
     ) -> Result<u64> {
         if number == 198 {
             return Ok(vfs.socket(a[0] as u32, a[1] as u32, a[2] as u32)? as u64);
@@ -418,11 +456,14 @@ impl Linux {
             }
             202 | 242 => {
                 let output = AddressOutput::prepare(memory, a[1], a[2], socket.address_size())?;
-                let (fd, peer) =
-                    vfs.accept(a[0] as u32, if number == 242 { a[3] as u32 } else { 0 })?;
-                if let Some(output) = output {
-                    output.write(memory, Some(peer))?;
-                }
+                let (fd, _) = vfs.accept_output(
+                    a[0] as u32,
+                    if number == 242 { a[3] as u32 } else { 0 },
+                    |peer| match output {
+                        Some(output) => output.write(memory, Some(peer)),
+                        None => Ok(()),
+                    },
+                )?;
                 Ok(fd as u64)
             }
             204 | 205 => {
@@ -670,6 +711,79 @@ mod tests {
     use std::{io::Write, net::TcpStream};
     use trames_memory::{Permissions, PAGE_SIZE};
     use trames_vfs::NetworkMode;
+    #[test]
+    fn network_services_use_live_views_and_defer_blocking_before_effects() {
+        let mut linux = Linux::new(0x10000);
+        linux.vfs.configure_network(NetworkMode::Loopback).unwrap();
+        let capture = linux.vfs.direct_network();
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        memory
+            .write(0x1000, &encode_address(peer.local_addr().unwrap()))
+            .unwrap();
+        memory.write(0x1100, &4u32.to_le_bytes()).unwrap();
+        let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+        let fd = linux
+            .network_service(198, [2, 1, 0, 0, 0, 0], &mut view)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            linux.network_service(203, [fd, 0x1000, 16, 0, 0, 0], &mut view),
+            None
+        );
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        linux.vfs.set_nonblocking(fd as u32, true).unwrap();
+        let result = linux
+            .network_service(203, [fd, 0x1000, 16, 0, 0, 0], &mut view)
+            .unwrap();
+        assert!(matches!(result, Ok(0) | Err(Errno(115))));
+        peer.set_nonblocking(false).unwrap();
+        let (_peer, _) = peer.accept().unwrap();
+        assert_eq!(
+            linux.vfs.socket_fd(fd as u32).unwrap().connect_complete(),
+            Ok(true)
+        );
+        assert_eq!(
+            linux.network_service(209, [fd, 1, 4, 0x1110, 0x1100, 0], &mut view),
+            Some(Ok(0))
+        );
+        assert!(capture.get(fd as u32).is_some());
+        let local = linux
+            .network_service(
+                198,
+                [2, 1 | trames_vfs::O_NONBLOCK as u64, 0, 0, 0, 0],
+                &mut view,
+            )
+            .unwrap()
+            .unwrap();
+        linux
+            .vfs
+            .socket_fd(local as u32)
+            .unwrap()
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            linux.network_service(201, [local, 1, 0, 0, 0, 0], &mut view),
+            Some(Ok(0))
+        );
+        assert_eq!(
+            linux.network_service(242, [local, 0, 0, 0, 0, 0], &mut view),
+            Some(Err(Errno(11)))
+        );
+        assert_eq!(
+            linux.network_service(198, [1, 1, 0, 0, 0, 0], &mut view),
+            None
+        );
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(u32_at(&memory, 0x1110), Ok(0));
+    }
+
     #[test]
     fn udp_pktinfo_cmsg_roundtrip_and_invalid_receive_are_transactional() {
         let mut linux = Linux::new(0x10000);

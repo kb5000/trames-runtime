@@ -1062,6 +1062,7 @@ impl Vfs {
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 file_authority: Default::default(),
+                tcp_publication: Default::default(),
                 control: None,
                 read_node: None,
                 id: self.open_id(),
@@ -1305,6 +1306,7 @@ impl Vfs {
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 file_authority: Default::default(),
+                tcp_publication: Default::default(),
                 control: None,
                 read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
                     original

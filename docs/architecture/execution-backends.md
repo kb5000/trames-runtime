@@ -627,3 +627,37 @@ This does not migrate epoll creation/watch ownership, signalfd/task masks,
 socket/connect/accept/SCM_RIGHTS publication, inotify add-watch pathname control,
 signal-producing pipe operations, structural VM changes or native-device
 registration. Their existing owner/synchronization boundaries remain explicit.
+
+### Live TCP publication and short socket services (2026-11-02)
+
+Unfiltered Internet `socket`, `bind`, `listen`, address/option queries and updates,
+`shutdown`, and nonblocking `connect`/`accept` use the existing single-caller owner
+service. Only the caller releases its execution slot; peer CPUs and their memory
+views continue. The original namespace, hybrid routing and connection state stay
+on their owner. No Rc/RefCell graph is sent to workers, and no resource thread,
+polling bus or second network-policy implementation is introduced. This removes
+cohort drains, **not** the owner hop for control operations.
+
+The shared OFD publishes a weak connected-TCP capability under its own mutex.
+Actual Files membership carries a socket-only weak projection of that OFD.
+Existing worker captures consult live membership, so connections established or
+accepted during an epoch immediately support the existing direct TCP byte path.
+Accepted lookup retains the actual transport while holding the existing Files
+lock; stored publications and overlap captures remain weak and do not delay FIN.
+Metadata admission remains separate. In particular, unrelated owner resources
+such as io_uring retain their exclusive-construction contract.
+
+Socket creation and accept reserve an FD using the same Files allocator as CPU
+worker resource creation. Accept validates the destination first, copies the
+address before publishing its complete descriptor, and releases the reservation
+and accepted endpoint if copyout fails. Every admitted result is final, including
+EAGAIN and EINPROGRESS; fallback is allowed only before effects. The common Linux
+ABI accepts the caller's CpuMemory view and retains the original buffer checks.
+
+Blocking connect/accept retain their joined wait/restart path. AF_UNIX/SCM_RIGHTS,
+netlink, namespace/routing/firewall mutation, socket close/replacement, and
+seccomp-filtered socket controls retain their prior boundaries. Seccomp decisions
+and denied-entry effects are unchanged. Pending TCP I/O's existing close/join
+contract is preserved; this stage does not claim arbitrary cross-epoch FD reuse
+for an unfinished numeric-FD TCP request. Connection/options updates publish only
+that OFD; namespace authority is refreshed at the original joined boundary.

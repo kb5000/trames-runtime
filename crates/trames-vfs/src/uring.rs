@@ -59,6 +59,7 @@ impl RetainedFd {
     pub fn direct_tcp(&self) -> Option<DirectTcpFd> {
         let open = self.0.open.borrow();
         Some(DirectTcpFd {
+            lease: None,
             tcp: open.socket.as_ref()?.direct_tcp()?,
             flags: open.flags.get(),
             status: open.flags.clone(),

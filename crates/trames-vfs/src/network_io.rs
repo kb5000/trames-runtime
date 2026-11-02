@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Rebuilt per cohort: connect and firewall changes need not change an FD table.
+//! Live OFD TCP publication; namespace policy is prepared at joined boundaries.
 use super::*;
 #[derive(Clone)]
 pub struct DirectTcpFd {
     pub tcp: trames_net::DirectTcp,
+    pub(super) lease: Option<trames_net::TcpLease>,
     pub flags: u32,
     pub(super) status: StatusFlags,
     pub timeouts: [Option<std::time::Duration>; 2],
@@ -14,10 +15,10 @@ impl DirectTcpFd {
     }
 }
 #[derive(Clone, Default)]
-pub struct DirectNetwork(Arc<[Option<DirectTcpFd>]>);
+pub struct DirectNetwork(Arc<[Option<DirectTcpFd>]>, Option<SharedFiles>);
 impl DirectNetwork {
-    pub fn get(&self, fd: u32) -> Option<&DirectTcpFd> {
-        self.0.get(fd as usize)?.as_ref()
+    pub fn get(&self, fd: u32) -> Option<DirectTcpFd> {
+        self.1.as_ref()?.tcp_lookup(fd)
     }
     pub fn shares_resources(&self, other: &Self) -> bool {
         self.0.iter().flatten().any(|a| {
@@ -58,24 +59,31 @@ impl Vfs {
         let socket = open.socket.as_ref()?;
         Some(DirectTcpFd {
             tcp: socket.direct_tcp()?,
+            lease: None,
             flags: open.flags.get(),
             status: open.flags.clone(),
             timeouts: [false, true].map(|receive| socket.io_timeout(receive)),
         })
     }
-    pub fn direct_network(&self) -> DirectNetwork {
-        if self.network.live_sockets() == 0 {
-            return DirectNetwork::default();
+    /// Owner-only control publishes transport authority to existing workers.
+    /// Routing/firewall changes still require the original joined boundary.
+    pub fn refresh_tcp(&self, fd: u32) {
+        if let Some(descriptor) = self.fds.get(&fd) {
+            let open = descriptor.open.borrow();
+            *open.shared.tcp_publication.lock().unwrap() = Self::direct_tcp_open(&open);
         }
+    }
+    pub fn direct_network(&self) -> DirectNetwork {
         let mut entries = Vec::new();
         for (&fd, descriptor) in self.fds.entries().iter() {
-            let Some(tcp) = Self::direct_tcp_open(&descriptor.open.borrow()) else {
-                continue;
-            };
+            let open = descriptor.open.borrow();
+            let tcp = Self::direct_tcp_open(&open);
+            *open.shared.tcp_publication.lock().unwrap() = tcp.clone();
+            let Some(tcp) = tcp else { continue };
             entries.resize_with(fd as usize + 1, || None);
             entries[fd as usize] = Some(tcp);
         }
-        DirectNetwork(entries.into())
+        DirectNetwork(entries.into(), Some(self.fds.worker_membership()))
     }
 }
 
@@ -87,6 +95,95 @@ mod tests {
         net::{Ipv4Addr, TcpListener},
         time::Duration,
     };
+    #[test]
+    fn existing_empty_capture_observes_new_connections_and_actual_close_reuse() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let capture = v.direct_network();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        v.refresh_tcp(fd);
+        let accepted = capture.get(fd).unwrap();
+        assert_eq!(
+            std::thread::spawn(move || {
+                let result = accepted.tcp.send(b"live", 0);
+                drop(accepted);
+                result
+            })
+            .join()
+            .unwrap(),
+            Ok(4)
+        );
+        let mut bytes = [0; 4];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"live");
+        let retained = capture.get(fd).unwrap();
+        drop(socket);
+        v.close(fd).unwrap();
+        assert_eq!(v.socket(2, 2, 0).unwrap(), fd);
+        assert!(capture.get(fd).is_none());
+        assert_eq!(retained.tcp.send(b"held", 0), Ok(4));
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"held");
+        drop(retained);
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(peer.read(&mut bytes).unwrap(), 0);
+    }
+    #[test]
+    fn accept_copyout_reserves_slot_without_locking_or_partial_publication() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_fd(fd).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.listen(2).unwrap();
+        let capture = v.direct_network();
+        let factory = v.descriptor_factory();
+        let mut client = std::net::TcpStream::connect(socket.local_addr().unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let failed = loop {
+            let factory = factory.clone();
+            let result = v.accept_output(fd, 0, |_| {
+                let other = std::thread::spawn(move || factory.eventfd(0, 0).unwrap())
+                    .join()
+                    .unwrap();
+                assert_eq!(other, fd + 2);
+                Err(Errno(14))
+            });
+            if result != Err(Errno(11)) {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(failed, Err(Errno(14)));
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        let _client = std::net::TcpStream::connect(socket.local_addr().unwrap()).unwrap();
+        let (new, _) = loop {
+            match v.accept(fd, O_CLOEXEC | O_NONBLOCK) {
+                Ok(result) => break result,
+                Err(Errno(11)) => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(new, fd + 1);
+        assert!(capture.get(new).unwrap().nonblocking());
+        assert!(v.descriptor(new).unwrap().cloexec.get());
+    }
+
     #[test]
     fn tcp_capabilities_refresh_without_fd_mutation_and_do_not_delay_last_close() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -118,14 +215,13 @@ mod tests {
         assert!(v.direct_tcp_fd(u32::MAX).is_none());
         drop(epoch);
         drop(shared);
+        let weak_tcp = capability.get(fd).unwrap().tcp.clone();
         drop(socket);
         v.close(fd).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
-        assert_eq!(
-            capability.get(fd).unwrap().tcp.send(b"closed", 0),
-            Err(trames_net::NetError(9))
-        );
+        assert_eq!(weak_tcp.send(b"closed", 0), Err(trames_net::NetError(9)));
+        assert!(capability.get(fd).is_none());
         assert!(v.direct_network().get(fd).is_none());
         assert!(NetworkEpoch::default().capture(&v).get(fd).is_none());
     }

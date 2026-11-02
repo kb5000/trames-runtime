@@ -250,6 +250,21 @@ impl<C: Cpu> Kernel<C> {
             return None;
         }
         let a = request.args;
+        // Filtered networking retains its existing joined security boundary.
+        if p.seccomp.mode() == 0
+            && crate::worker_syscalls::network_service_candidate(request.number)
+        {
+            let began = self.profile_syscalls.then(Instant::now);
+            let result = p
+                .linux
+                .network_service(request.number, a, request.memory_mut());
+            if let Some(began) = began {
+                self.syscall_total += began.elapsed();
+            }
+            // An admitted network result is final, including EINPROGRESS and
+            // EAGAIN. Replaying a connect/accept can change its meaning.
+            return result.map(|value| value.unwrap_or_else(error));
+        }
         if request.number == 222 && p.seccomp.mode() == 0 {
             let began = Instant::now();
             let result = p.linux.mmap_additive(a, &mut p.memory)?;
@@ -432,6 +447,76 @@ mod tests {
             .unwrap();
         done
     }
+    #[test]
+    fn socket_creation_and_address_errors_finish_through_existing_service() {
+        let mut p = super::super::tests::process();
+        p.linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let (mut k, mut request, control) = pending(p, 198, [2, 1, 0, 0, 0, 0]);
+        let result = k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
+        assert_eq!(result, Some(3));
+        finish(&mut k, request, control, result);
+        let mut p = k.processes.remove(&1).unwrap();
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        p.memory.write_array(0x1000, 16u32.to_le_bytes()).unwrap();
+        let (mut k, mut request, control) = pending(p, 204, [3, 0x9000, 0x1000, 0, 0, 0]);
+        let result = k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
+        assert_eq!(result, Some(error(Errno(14))));
+        finish(&mut k, request, control, result);
+        assert_eq!(k.processes[&1].linux.vfs.fd_snapshot().len(), 4);
+    }
+    #[test]
+    fn short_socket_controls_do_not_checkpoint_peer_cpus() {
+        let mut p = super::super::tests::process();
+        p.linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let fd = p.linux.vfs.socket(2, 1, 0).unwrap();
+        p.memory.write(0x1800, &16u32.to_le_bytes()).unwrap();
+        // mov x0,fd; mov x1,0x1900; mov x2,0x1800; mov x8,204; svc; b loop
+        for (index, word) in [
+            0xd2800000u32 | (fd << 5),
+            0xd2832001,
+            0xd2830002,
+            0xd2801988,
+            0xd4000001,
+            0x17fffffb,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.memory
+                .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RX)
+            .unwrap();
+        p.cpu = Cpu::new(0x4000, 0);
+        p.affinity = 3;
+        let mut peer = p.fork();
+        peer.parent = 1;
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        assert!(k.service_requests > 100, "services={}", k.service_requests);
+        assert!(k.parallel_rounds <= 4, "rounds={}", k.parallel_rounds);
+        for p in k.processes.values() {
+            assert_eq!(p.memory.read_array::<2>(0x1900).unwrap(), [2, 0]);
+        }
+    }
+
     fn disk_process() -> (std::path::PathBuf, Box<Process>, u32) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(

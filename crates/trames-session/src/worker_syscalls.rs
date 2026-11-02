@@ -36,8 +36,12 @@ pub(super) fn vm_call(number: u32) -> bool {
 
 /// These calls can request the coordinator without stopping peer CPUs. The
 /// service still admits the actual descriptor kind before doing any effects.
+pub(super) fn network_service_candidate(number: u32) -> bool {
+    matches!(number, 198 | 200..=205 | 208..=210 | 242)
+}
 pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
     match cpu.x(8) as u32 {
+        number if snapshot.seccomp.mode() == 0 && network_service_candidate(number) => true,
         62 | 80 => true,
         63..=66 => {
             let fd = cpu.x(0) as u32;

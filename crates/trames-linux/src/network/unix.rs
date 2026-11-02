@@ -7,7 +7,7 @@ impl Linux {
         socket: &std::rc::Rc<trames_vfs::LocalSocket>,
         number: u64,
         a: [u64; 6],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
     ) -> Result<u64> {
         let nonblocking = if vfs.flags(a[0] as u32)? & trames_vfs::O_NONBLOCK != 0 {
             0x40
@@ -315,7 +315,7 @@ struct Message {
     destination: Option<Vec<u8>>,
 }
 impl Message {
-    fn prepare(memory: &Memory, pointer: u64, receive: bool, stream: bool) -> Result<Self> {
+    fn prepare(memory: &impl CpuMemory, pointer: u64, receive: bool, stream: bool) -> Result<Self> {
         if receive {
             Linux::check(memory, pointer, 56, Access::Write)?;
         }

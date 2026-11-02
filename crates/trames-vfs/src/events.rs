@@ -686,6 +686,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
                 file_authority: Default::default(),
+                tcp_publication: Default::default(),
                 control: SharedControl::capture(&anonymous),
                 read_node: None,
                 id,

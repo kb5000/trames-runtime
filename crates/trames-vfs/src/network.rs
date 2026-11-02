@@ -220,55 +220,53 @@ impl Vfs {
         if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
             return Err(Errno(22));
         }
-        let fd = self.available(0)?;
+        let reserved = self.fds.membership().reserve()?;
         let socket = self
             .network
             .socket(family, kind & 0xf, protocol)
             .map_err(|e| Errno(e.0))?;
-        self.socket_descriptor(fd, socket, kind);
-        Ok(fd)
+        let descriptor = self.socket_descriptor(socket, kind);
+        Ok(reserved.publish(descriptor, Some(&self.fds)))
     }
-    fn socket_descriptor(&mut self, fd: u32, socket: Rc<NetSocket>, flags: u32) {
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(OpenDescription {
-                    shared: Arc::new(SharedOpenDescription {
-                        _disk_file: None,
-                        #[cfg(all(feature = "hostfs", unix))]
-                        host_file: None,
-                        native_image: None,
-                        mount_resource: std::sync::OnceLock::new(),
-                        file_authority: Default::default(),
-                        control: None,
-                        read_node: None,
-                        id: self.open_id(),
-                        owner: (self.credentials.fsuid, self.credentials.fsgid),
-                        kind: FdKind::Socket,
-                        flags: (2 | (flags & O_NONBLOCK)).into(),
-                        file_position: Arc::default(),
-                        flock: std::sync::OnceLock::new(),
-                        ofd_records: Default::default(),
-                        node: None,
-                        pipe: None,
-                        bridge: None,
-                        kernel_log: None,
-                        notification: None,
-                    }),
-                    position: 0,
-                    socket: Some(socket),
-                    anonymous: None,
-                    local: None,
-                    pty: None,
-                    namespace: None,
-                    network_control: None,
-                    mount_file: None,
-                    oom: None,
-                    mount: None,
+    fn socket_descriptor(&self, socket: Rc<NetSocket>, flags: u32) -> Descriptor {
+        Descriptor {
+            open: OpenHandle::new(OpenDescription {
+                shared: Arc::new(SharedOpenDescription {
+                    _disk_file: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_file: None,
+                    native_image: None,
+                    mount_resource: std::sync::OnceLock::new(),
+                    file_authority: Default::default(),
+                    tcp_publication: Default::default(),
+                    control: None,
+                    read_node: None,
+                    id: self.open_id(),
+                    owner: (self.credentials.fsuid, self.credentials.fsgid),
+                    kind: FdKind::Socket,
+                    flags: (2 | (flags & O_NONBLOCK)).into(),
+                    file_position: Arc::default(),
+                    flock: std::sync::OnceLock::new(),
+                    ofd_records: Default::default(),
+                    node: None,
+                    pipe: None,
+                    bridge: None,
+                    kernel_log: None,
+                    notification: None,
                 }),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
+                position: 0,
+                socket: Some(socket),
+                anonymous: None,
+                local: None,
+                pty: None,
+                namespace: None,
+                network_control: None,
+                mount_file: None,
+                oom: None,
+                mount: None,
+            }),
+            cloexec: (flags & O_CLOEXEC != 0).into(),
+        }
     }
     pub fn socket_fd(&self, fd: u32) -> Result<Rc<NetSocket>> {
         self.descriptor(fd)?
@@ -279,13 +277,26 @@ impl Vfs {
             .ok_or(Errno(88))
     }
     pub fn accept(&mut self, fd: u32, flags: u32) -> Result<(u32, SocketAddr)> {
+        self.accept_output(fd, flags, |_| Ok(()))
+    }
+    /// Copyout completes before FD publication; errors release the reservation
+    /// and accepted socket instead of leaking an unreachable descriptor.
+    pub fn accept_output(
+        &mut self,
+        fd: u32,
+        flags: u32,
+        output: impl FnOnce(SocketAddr) -> Result<()>,
+    ) -> Result<(u32, SocketAddr)> {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
         let socket = self.socket_fd(fd)?;
-        let new = self.available(0)?;
+        let reserved = self.fds.membership().reserve()?;
         let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
-        self.socket_descriptor(new, socket, flags);
+        output(address)?;
+        let descriptor = self.socket_descriptor(socket, flags);
+        let new = reserved.publish(descriptor, Some(&self.fds));
+        self.refresh_tcp(new);
         Ok((new, address))
     }
     pub fn live_sockets(&self) -> usize {

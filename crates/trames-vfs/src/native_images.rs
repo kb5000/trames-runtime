@@ -35,6 +35,7 @@ impl ImageFds for Images {
             native_image: Some(image),
             mount_resource: Default::default(),
             file_authority: Default::default(),
+            tcp_publication: Default::default(),
             control: None,
             id: NEXT_IMAGE_OFD.fetch_add(1, Ordering::Relaxed),
             owner: self.owner,
