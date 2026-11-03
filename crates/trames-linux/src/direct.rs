@@ -77,8 +77,8 @@ impl RetainedByte {
     }
 }
 impl PendingIo {
-    /// Passive lifetime only across a cohort handoff. The next cohort still
-    /// resolves its current FD/policy before accepting new native byte authority.
+    /// Passive original-socket lifetime across a cohort handoff. Accepted TCP
+    /// retries observe that socket's live policy, independently of numeric reuse.
     pub fn tcp_liveness(&self) -> Option<trames_net::TcpLease> {
         self.native_tcp
             .as_ref()

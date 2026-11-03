@@ -67,19 +67,10 @@ impl Message {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
         factory: &trames_vfs::DescriptorFactory,
-        owner: bool,
-    ) -> Option<Result<u64, Errno>> {
-        let mut deferred = false;
-        let result = self.progress_context(
-            socket,
-            number,
-            a,
-            memory,
-            owner,
-            &mut deferred,
-            |bytes, flags, peer| factory.send_socket_bytes(socket, bytes, flags, peer),
-        );
-        (!deferred).then_some(result)
+    ) -> Result<u64, Errno> {
+        self.progress_context(socket, number, a, memory, |bytes, flags, peer| {
+            factory.send_socket_bytes(socket, bytes, flags, peer)
+        })
     }
     #[cfg(test)]
     fn progress_with(
@@ -90,17 +81,14 @@ impl Message {
         memory: &mut impl CpuMemory,
         send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
-        self.progress_context(socket, number, a, memory, false, &mut false, send)
+        self.progress_context(socket, number, a, memory, send)
     }
-    #[allow(clippy::too_many_arguments)]
     fn progress_context(
         &self,
         socket: &trames_vfs::SocketOperation,
         number: u32,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
-        owner: bool,
-        deferred: &mut bool,
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
         let mut state = self.state.lock().unwrap();
@@ -134,10 +122,6 @@ impl Message {
                         socket.address_size(),
                     )?);
                 }
-                if !owner && !state.active.as_ref().unwrap().worker_admitted(socket) {
-                    *deferred = true;
-                    return Err(Errno(11));
-                }
                 if state.recheck {
                     state.active.as_ref().unwrap().recheck(memory)?;
                     state.recheck = false;
@@ -167,9 +151,6 @@ impl Message {
                 }
                 Ok(sent)
             })();
-            if *deferred {
-                return Err(Errno(11));
-            }
             match result {
                 Ok(sent) if !batch => state.terminal = Some(Ok(sent)),
                 Ok(sent) => {

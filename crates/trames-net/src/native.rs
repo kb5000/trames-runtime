@@ -148,7 +148,7 @@ impl PreparedSocket {
             dns_peer: Cell::new(false),
             dns_receive_errors: Cell::new(false),
             echo: SharedState::default(),
-            policy: SharedState::default(),
+            policy: None,
             receive_packet_info: Cell::new(false),
             policy_forward: SharedState::default(),
         })
@@ -343,6 +343,10 @@ impl AsFd for NativeSocket {
         }
     }
 }
+struct Policy {
+    namespace: Arc<crate::netlink::Namespace>,
+    firewall: Arc<crate::nftables::Firewall>,
+}
 pub struct Socket {
     native: Arc<Endpoint>,
     network: Network,
@@ -354,7 +358,8 @@ pub struct Socket {
     dns_receive_errors: Cell<bool>,
     echo: SharedState<icmp::Echo>,
     receive_packet_info: Cell<bool>,
-    policy: SharedState<Option<Arc<crate::netlink::Namespace>>>,
+    // Attached while this socket is unique, before any capability/publication.
+    policy: Option<Policy>,
     policy_forward: SharedState<
         std::collections::BTreeMap<
             (SocketAddr, SocketAddr),
@@ -382,8 +387,17 @@ impl Socket {
         }
         Some(epoch)
     }
-    pub(crate) fn attach_policy(&self, namespace: Arc<crate::netlink::Namespace>) {
-        *self.policy.borrow_mut() = Some(namespace);
+    pub(crate) fn attach_policy(self: &mut Arc<Self>, namespace: Arc<crate::netlink::Namespace>) {
+        let firewall = namespace.graph.read().unwrap().firewall(namespace.id());
+        Arc::get_mut(self)
+            .expect("policy attachment precedes socket publication")
+            .policy = Some(Policy {
+            namespace,
+            firewall,
+        });
+    }
+    fn filtered(&self) -> bool {
+        self.policy.as_ref().is_some_and(|p| p.firewall.has_rules())
     }
     fn policy_check(&self, input: bool, peer: SocketAddr, bytes: &[u8], flags: u8) -> Result<()> {
         self.policy_check_source(input, peer, bytes, flags, None)
@@ -400,21 +414,13 @@ impl Socket {
             return Err(NetError(92));
         }
 
-        let policy = self.policy.borrow();
-        let Some(namespace) = policy.as_ref() else {
+        let Some(policy) = self.policy.as_ref() else {
             return Ok(());
         };
-        if !namespace
-            .graph
-            .read()
-            .unwrap()
-            .firewall(namespace.id())
-            .read()
-            .unwrap()
-            .has_rules()
-        {
+        if !policy.firewall.has_rules() {
             return Ok(());
         }
+        let namespace = &policy.namespace;
         namespace.refresh_native();
         let mut local = self.local_addr()?;
         let peer = unmapped(peer);
@@ -624,11 +630,11 @@ impl Socket {
         let (native, peer) = self.native.control().accept().map_err(from_io)?;
         configure(&native)?;
         let peer = peer.as_socket().ok_or(NetError(5))?;
-        let accepted =
+        let mut accepted =
             self.network
                 .wrap(native, reservation, self.family, 1, Connection::Connected);
-        if let Some(policy) = self.policy.borrow().as_ref() {
-            accepted.attach_policy(policy.clone());
+        if let Some(policy) = &self.policy {
+            accepted.attach_policy(policy.namespace.clone());
         }
         if accepted.policy_check(true, peer, &[], 2).is_err()
             || accepted.policy_check(false, peer, &[], 18).is_err()
@@ -710,8 +716,10 @@ impl Socket {
     /// Called with the actual Files membership locked. Every normal worker
     /// byte admission retains Endpoint under that same lock. Snapshot controls
     /// remain weak, and their read gate is excluded by the caller's writer.
-    pub fn quiescent_tcp(&self) -> bool {
-        (self.idle_tcp() || self.direct_tcp_admitted()) && Arc::strong_count(&self.native) == 1
+    pub fn quiescent_tcp(self: &Arc<Self>) -> bool {
+        (self.idle_tcp() || self.direct_tcp_admitted())
+            && Arc::strong_count(self) == 1
+            && Arc::strong_count(&self.native) == 1
     }
     pub fn idle_tcp(&self) -> bool {
         self.kind == 1

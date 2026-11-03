@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Actual shared netlink I/O, readiness and original owner publication boundary.
+//! Actual shared netlink I/O, readiness and worker ruleset publication.
 use super::*;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
 use trames_vfs::Vfs;
@@ -171,7 +171,7 @@ fn netlink_receive_and_poll_waits_wake_without_reactor_and_survive_close_reuse()
     );
 }
 #[test]
-fn nf_tables_batch_keeps_original_owner_boundary_and_completed_message_progress() {
+fn nf_tables_batch_completes_every_message_on_worker() {
     let mut v = Vfs::default();
     let fd = v.socket(16, 3, 12).unwrap();
     let d = DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory());
@@ -199,22 +199,10 @@ fn nf_tables_batch_keeps_original_owner_boundary_and_completed_message_progress(
     }
     let target: Arc<dyn IoWake> = Arc::new(Target);
     let a = [fd as u64, 0x1000, 2, 0, 0, 0];
-    let call = match d.start_socket_control(269, a, &mut m, 1, &Arc::downgrade(&target)) {
-        Some(IoAttempt::SocketCheckpoint(call)) => call,
-        _ => panic!("nf_tables publication must retain its joined boundary"),
-    };
-    assert_eq!(m.read_array::<4>(0x1038).unwrap(), 20u32.to_le_bytes());
-    assert_eq!(m.read_array::<4>(0x1078).unwrap(), [0; 4]);
-    v.close(fd).unwrap();
-    assert_eq!(v.eventfd(0, 0).unwrap(), fd);
     assert_eq!(
-        complete(Some(d.retry_owned_socket(
-            call,
-            &mut m,
-            1,
-            &Arc::downgrade(&target)
-        ))),
+        complete(d.start_socket_control(269, a, &mut m, 1, &Arc::downgrade(&target))),
         Ok(2)
     );
+    assert_eq!(m.read_array::<4>(0x1038).unwrap(), 20u32.to_le_bytes());
     assert_eq!(m.read_array::<4>(0x1078).unwrap(), 20u32.to_le_bytes());
 }

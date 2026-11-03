@@ -1748,3 +1748,43 @@ workers wake a distinct process's poll and recvmsg; all six calls finish on work
 with one filter decision per entry and zero coordinator services. Unix owning
 ancillary graphs, policy publication, native services, io_uring controls and
 structural VM/task transitions remain separate boundaries.
+
+## Worker nf_tables publication and live native TCP policy (2026-11-03)
+
+nf_tables batches now execute in the calling worker using the existing ruleset
+writer and bounded transaction. There is no whole-cohort publication barrier.
+Validation, rollback, generation, response capacity, permission checks and shared
+counters remain in the original algorithm. Route, conntrack and Netlink queue
+notifications keep their existing object transactions and post-lock callbacks.
+
+The actual firewall object stores its rules and a relaxed atomic empty-hook
+selector. Successful publication updates both under the existing rules writer;
+failed/over-capacity batches update neither. TCP capabilities refer to their original shared socket and this actual object,
+rather than a captured allow decision. Policy attachment is immutable before
+socket publication; byte/poll capability size and per-admission reference-count
+operations stay unchanged. Each byte attempt reads the selector.
+With no hook, the existing host data path takes no namespace/rules lock or new
+allocation. With active hooks, it invokes the original socket's packet policy,
+conntrack, counters, error and receive-shutdown behavior. Rule removal restores the
+same fast path. This necessary live-state read replaces the former all-worker join;
+no guest-memory fence, generation polling, message bus or service thread is added.
+The selector publishes no packet/guest bytes; active evaluation still synchronizes
+through the real rules object. Calls overlapping publication may observe either
+policy in the original concurrency model; an accepted wait does not cache an allow.
+
+Accepted TCP leases retain the complete original shared native socket, including
+its creating namespace, across close/reuse and parked retries. Capability/control
+and poll snapshots remain weak and cannot extend final transport/namespace close.
+The existing conditional-close admission checks both socket and transport leases.
+Host wait registries retain the same Arc without allocating a wrapper. SO_ERROR
+also selects live policy before connection completion; a control captured before
+new rules cannot complete a connection with a stale unfiltered callback. Ordinary
+byte calls do not take the connection-completion or socket-control algorithm lock.
+
+Actual guest tests on one/two execution slots publish DROP rules, use a previously
+captured native TCP path, remove rules and send again while another process uses
+an eventfd. All seven calls finish on workers with seven filter decisions and zero
+services. Network tests cover active counters, existing-capability send/receive,
+rule removal, retained close identity, namespace teardown and SO_ERROR denial.
+Unix owning ancillary graphs, native services, io_uring, task/job control and
+structural file/VM/task transitions remain separate coordinator dependencies.

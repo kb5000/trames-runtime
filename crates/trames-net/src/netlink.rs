@@ -573,11 +573,6 @@ impl Socket {
     ) -> trames_shared::IoSubscription {
         self.readiness.subscribe(signal)
     }
-    pub fn worker_send_supported(&self, bytes: &[u8]) -> bool {
-        // A valid nf_tables batch is the only ruleset publication path. Its
-        // joined boundary invalidates already captured policy-free TCP views.
-        !(self.protocol == 12 && bytes.len() >= 16 && bytes[4..6] == 16u16.to_le_bytes())
-    }
     pub fn address_size(&self) -> usize {
         12
     }

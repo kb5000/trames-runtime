@@ -113,6 +113,30 @@ pub(crate) struct Ruleset {
     active_hooks: u8,
     tables: BTreeMap<(u8, String), Table>,
 }
+/// The published rules and their empty-policy selector are one resource. The
+/// selector only skips evaluation when no hook exists; actual filtering still
+/// takes the original rules transaction. It publishes no packet/guest bytes.
+#[derive(Default)]
+pub(crate) struct Firewall {
+    rules: std::sync::RwLock<Ruleset>,
+    active: std::sync::atomic::AtomicBool,
+}
+impl From<Ruleset> for Firewall {
+    fn from(rules: Ruleset) -> Self {
+        Self {
+            active: std::sync::atomic::AtomicBool::new(rules.has_rules()),
+            rules: std::sync::RwLock::new(rules),
+        }
+    }
+}
+impl Firewall {
+    pub fn has_rules(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, Ruleset>> {
+        self.rules.read()
+    }
+}
 #[derive(Clone)]
 struct Table {
     handle: u64,
@@ -1236,7 +1260,7 @@ pub(crate) fn request(
 }
 // The actual object transaction, also usable without a namespace owner graph.
 fn request_rules(
-    shared: &std::sync::RwLock<Ruleset>,
+    shared: &Firewall,
     packet_hooks: bool,
     requests: &[&[u8]],
     port: u32,
@@ -1245,7 +1269,7 @@ fn request_rules(
     capacity: usize,
 ) -> Result<Vec<Vec<u8>>> {
     let batch = kind(requests[0]) == 16;
-    let mut publication = batch.then(|| shared.write().unwrap());
+    let mut publication = batch.then(|| shared.rules.write().unwrap());
     let mut staged = match &publication {
         Some(current) => (**current).clone(),
         None => shared.read().unwrap().clone(),
@@ -1334,6 +1358,13 @@ fn request_rules(
             .filter_map(|c| c.hook)
             .fold(0, |mask, (h, _)| mask | (1 << h));
         **publication.as_mut().unwrap() = staged;
+        // Keep this inside the real publication transaction. A concurrent fast
+        // call observing the previous empty selector overlaps this commit;
+        // later calls evaluate the actual current rules, never a cached allow.
+        shared.active.store(
+            publication.as_ref().unwrap().has_rules(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(out)
 }
@@ -1894,4 +1925,4 @@ fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
 }
 #[cfg(test)]
 #[path = "nftables_tests.rs"]
-mod tests;
+pub(crate) mod tests;

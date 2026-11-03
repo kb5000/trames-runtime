@@ -1,32 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! TCP controls over the existing host transport. No namespace/routing authority.
+//! TCP controls over the original shared socket, without membership/path authority.
 use super::*;
 use std::sync::{Mutex, Weak};
 pub(crate) type SavedOptions = Arc<Mutex<Vec<(u32, u32, Vec<u8>)>>>;
 #[derive(Clone)]
 pub struct DirectControl {
-    socket: Weak<Endpoint>,
+    socket: Weak<Socket>,
     family: u32,
-    unfiltered: bool,
     links: Arc<direct::Links>,
     pub(crate) timeouts: [Option<Duration>; 2],
     pub(crate) options: Option<SavedOptions>,
 }
 impl Socket {
-    pub fn direct_control(&self) -> Option<DirectControl> {
+    pub fn direct_control(self: &Arc<Self>) -> Option<DirectControl> {
         (self.kind == 1 && !self.dns_peer.get() && self.dns.borrow().is_empty()).then(|| {
             DirectControl {
-                socket: Arc::downgrade(&self.native),
+                socket: Arc::downgrade(self),
                 family: self.family,
-                unfiltered: !self.policy.borrow().as_ref().is_some_and(|ns| {
-                    ns.graph
-                        .read()
-                        .unwrap()
-                        .firewall(ns.id())
-                        .read()
-                        .unwrap()
-                        .has_rules()
-                }),
                 links: self.network.0.links.clone(),
                 timeouts: [None; 2],
                 options: None,
@@ -48,14 +38,20 @@ impl DirectControl {
     pub fn address(&self, peer: bool) -> Result<SocketAddr> {
         let socket = self.socket.upgrade().ok_or(NetError(9))?;
         let address = if peer {
-            socket.control().peer_addr()
+            socket.native.control().peer_addr()
         } else {
-            socket.control().local_addr()
+            socket.native.control().local_addr()
         };
         address.map_err(from_io)?.as_socket().ok_or(NetError(5))
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
-        let socket = self.socket.upgrade().ok_or(NetError(9))?;
+        let owner = self.socket.upgrade().ok_or(NetError(9))?;
+        if (level, name) == (1, 4) {
+            // Completion evaluates the current original policy. This view never
+            // captures an unfiltered callback or caches a connection decision.
+            return owner.get_option(level, name);
+        }
+        let socket = &owner.native;
         match (level, name) {
             (1, 3) => Ok(1),
             (1, 38) => Ok(6),
@@ -63,21 +59,6 @@ impl DirectControl {
             (1, 30) => Ok(i32::from(
                 socket.state.connection() == Connection::Listening,
             )),
-            (1, 4) if self.unfiltered => {
-                if socket.state.connection() == Connection::Connecting {
-                    // Admission excludes live namespace policy. The owner uses
-                    // this same completion primitive with its policy callback.
-                    let _ = socket.complete_connect(|_| Ok(()));
-                }
-                if let Some(error) = socket.state.take_error() {
-                    return Ok(error as i32);
-                }
-                Ok(socket
-                    .control()
-                    .take_error()
-                    .map_err(from_io)?
-                    .map_or(0, |error| from_io(error).0 as i32))
-            }
             _ => socket.get_option(self.family, 1, level, name),
         }
     }
@@ -90,7 +71,6 @@ impl DirectControl {
             ),
             209 => {
                 matches!((level, name), (1, 2..=4 | 7..=9 | 30 | 38 | 39) | (6, 1 | 4..=6) | (41, 26))
-                    && ((level, name) != (1, 4) || self.unfiltered)
             }
             _ => false,
         }
@@ -98,13 +78,12 @@ impl DirectControl {
     pub fn io_timeout(&self, receive: bool) -> Option<Duration> {
         self.timeouts[usize::from(receive)]
     }
-    /// Publish only original connected, policy-free native byte authority.
+    /// Publish original connected native byte authority with live policy.
     /// A pending/failed connection never becomes a worker TCP capability.
     pub fn direct_tcp(&self) -> Option<DirectTcp> {
         let socket = self.socket.upgrade()?;
-        if !self.unfiltered
-            || socket.state.connection() != Connection::Connected
-            || socket.state.pending_error().is_some()
+        if socket.native.state.connection() != Connection::Connected
+            || socket.native.state.pending_error().is_some()
         {
             return None;
         }
@@ -124,6 +103,7 @@ impl DirectControl {
         self.socket
             .upgrade()
             .ok_or(NetError(9))?
+            .native
             .control()
             .shutdown(how)
             .map_err(from_io)
@@ -141,7 +121,7 @@ impl DirectControl {
         {
             return Err(NetError(105));
         }
-        socket.set_option(
+        socket.native.set_option(
             self.family,
             1,
             level,
@@ -255,6 +235,36 @@ impl Endpoint {
 mod tests {
     use super::*;
     #[test]
+    fn captured_so_error_uses_policy_published_after_control_admission() {
+        use crate::nftables::tests::{batch, chain, table};
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let network = Network::new(NetworkMode::Loopback);
+        let mut socket = network.socket(2, 1, 0).unwrap();
+        let namespace = Arc::new(crate::netlink::Namespace::default());
+        socket.attach_policy(namespace.clone());
+        let control = socket.direct_control().unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(NetError(115))
+        ));
+        let (_peer, _) = listener.accept().unwrap();
+        // Force the pending-completion state deterministically on the same real
+        // connected transport; no synthetic completion result is substituted.
+        socket.native.state.set_connection(Connection::Connecting);
+        batch(
+            &namespace,
+            &[
+                table("completion"),
+                chain("completion", "in", Some(1), 0, 0),
+            ],
+        );
+        assert!(control.supports_operation(209, 1, 4));
+        assert_eq!(control.get_option(1, 4), Ok(13));
+        assert_eq!(control.get_option(1, 4), Ok(0));
+        assert_eq!(socket.connect_complete(), Err(NetError(13)));
+        assert!(control.direct_tcp().is_none());
+    }
+    #[test]
     fn original_connection_error_is_consumed_once_across_workers_and_owner() {
         let network = Network::new(NetworkMode::Loopback);
         let socket = network.socket(2, 1, 0).unwrap();
@@ -333,10 +343,8 @@ mod tests {
             .unwrap();
         assert_eq!(socket.get_option(6, 1), Ok(1));
         assert_eq!(control.get_option(1, 39), Ok(2));
-        let mut restricted = control.clone();
-        restricted.unfiltered = false;
-        assert!(!restricted.supports_operation(209, 1, 4));
-        assert_eq!(restricted.get_option(1, 4), Err(NetError(92)));
+        assert!(control.supports_operation(209, 1, 4));
+        assert_eq!(control.get_option(1, 4), Ok(0));
         let accepted = control.retain().unwrap();
         drop(socket);
         assert_eq!(network.live_sockets(), 1);

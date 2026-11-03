@@ -59,11 +59,11 @@ impl std::ops::Deref for Endpoint {
     }
 }
 
-/// An accepted connected-TCP operation may outlive its original FD/owner.
-/// Capability snapshots never hold this lease. No owner-only control or guest
-/// namespace authority is made Send by keeping the host transport alive.
+/// An accepted connected-TCP operation retains its original shared socket,
+/// including live namespace policy, across close/reuse and parked retries.
+/// Capability/poll snapshots stay weak; no owner-only projection is retained.
 #[derive(Clone)]
-pub struct TcpLease(pub(super) Arc<Endpoint>);
+pub struct TcpLease(pub(super) Arc<Socket>);
 impl TcpLease {
     /// Transfer the existing Arc to a host wait registry without allocating a
     /// wrapper or granting the registry socket/namespace control.
@@ -72,6 +72,6 @@ impl TcpLease {
     }
     /// Compare actual transport lifetime, independently of numeric guest FDs.
     pub fn shares_socket(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0.native, &other.0.native)
     }
 }

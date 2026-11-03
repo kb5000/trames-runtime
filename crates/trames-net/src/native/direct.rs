@@ -76,7 +76,7 @@ pub(super) fn read_tcp(socket: &TcpStream, data: &mut [u8], flags: u32) -> Resul
 /// the host FD with its actual socket owner; stale snapshots cannot delay FIN.
 #[derive(Clone)]
 pub struct DirectTcp {
-    pub(super) socket: Weak<Endpoint>,
+    pub(super) socket: Weak<Socket>,
     pub(super) links: Arc<Links>,
     pub(super) peer: SocketAddr,
 }
@@ -84,7 +84,7 @@ pub struct DirectTcp {
 /// to one weak pointer, so ordinary DirectFd snapshots do not grow to carry
 /// unused peer addresses or accounting resources.
 #[derive(Clone)]
-pub struct TcpPoll(Weak<Endpoint>);
+pub struct TcpPoll(Weak<Socket>);
 impl TcpPoll {
     pub fn shares_socket(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.0, &other.0)
@@ -94,36 +94,18 @@ impl Socket {
     /// Pure owner metadata: also used under Files during conditional close.
     /// Host address queries and transport I/O stay outside that table lock.
     pub(super) fn direct_tcp_admitted(&self) -> bool {
-        if self.kind != 1
-            || self.native.state.connection() != Connection::Connected
-            || self.dns_peer.get()
-            || !self.dns.borrow().is_empty()
-            || self.native.state.pending_error().is_some()
-        {
-            return false;
-        }
-        // Namespace/firewall authority changes retain their joined boundary.
-        // A live ruleset can depend on packet content and conntrack; never
-        // replace that decision with a cached "allow".
-        if self.policy.borrow().as_ref().is_some_and(|ns| {
-            ns.graph
-                .read()
-                .unwrap()
-                .firewall(ns.id())
-                .read()
-                .unwrap()
-                .has_rules()
-        }) {
-            return false;
-        }
-        true
+        self.kind == 1
+            && self.native.state.connection() == Connection::Connected
+            && !self.dns_peer.get()
+            && self.dns.borrow().is_empty()
+            && self.native.state.pending_error().is_none()
     }
-    pub(crate) fn direct_tcp(&self) -> Option<DirectTcp> {
+    pub(crate) fn direct_tcp(self: &Arc<Self>) -> Option<DirectTcp> {
         if !self.direct_tcp_admitted() {
             return None;
         }
         Some(DirectTcp {
-            socket: Arc::downgrade(&self.native),
+            socket: Arc::downgrade(self),
             links: self.network.0.links.clone(),
             peer: self.peer_addr().ok()?,
         })
@@ -134,7 +116,10 @@ impl TcpPoll {
     /// Reuse the owner's poll and persistent edge observer, including HUP/ERR.
     pub fn poll(&self, events: u16) -> Result<(u16, [u64; 2])> {
         let socket = self.0.upgrade().ok_or(NetError(9))?;
-        Ok((socket.poll(events)?, socket.poll_epoch().unwrap_or([0; 2])))
+        Ok((
+            socket.native.poll(events)?,
+            socket.native.poll_epoch().unwrap_or([0; 2]),
+        ))
     }
     /// Duplicate the persistent event queue, not the socket. Its registration
     /// does not retain Endpoint, delay FIN or consume socket quota after close.
@@ -145,6 +130,7 @@ impl TcpPoll {
         self.0
             .upgrade()
             .ok_or_else(|| io::Error::from_raw_os_error(9))?
+            .native
             .poll_event_fd()
     }
 }
@@ -160,7 +146,7 @@ impl DirectTcp {
     /// The original host edge observer, shared with the serial socket path.
     /// Sampling does not re-register a level-ready descriptor as a new edge.
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
-        self.socket.upgrade()?.poll_epoch()
+        self.socket.upgrade()?.native.poll_epoch()
     }
     /// Scheduling identity only; not an authority or a readiness result.
     pub fn shares_socket(&self, other: &Self) -> bool {
@@ -169,36 +155,41 @@ impl DirectTcp {
     /// A wait-scoped lease, released before any joined FD/namespace mutation.
     /// Ordinary capability snapshots remain weak and never delay guest FIN.
     pub fn readiness_fd(&self) -> io::Result<(std::os::fd::OwnedFd, TcpLease)> {
-        let socket = self
-            .socket
-            .upgrade()
-            .ok_or_else(|| io::Error::from_raw_os_error(9))?;
-        let fd = socket.as_fd().try_clone_to_owned()?;
-        Ok((fd, TcpLease(socket)))
+        let lease = self
+            .retain()
+            .map_err(|e| io::Error::from_raw_os_error(e.0 as i32))?;
+        let fd = lease.0.native.as_fd().try_clone_to_owned()?;
+        Ok((fd, lease))
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
+        let socket = self.socket.upgrade().ok_or(NetError(9))?;
+        if socket.filtered() {
+            return socket.send(bytes, flags, None);
+        }
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
             return Err(NetError(95));
         }
         if bytes.len() > MAX_TRANSFER {
             return Err(NetError(90));
         }
-        let socket = self.socket.upgrade().ok_or(NetError(9))?;
-        let n = send_connected(&socket, bytes)?;
+        let n = send_connected(&socket.native, bytes)?;
         if n != 0 {
             self.links.account(Some(self.peer.ip()), n, true);
         }
         Ok(n)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Vec<u8>> {
+        let socket = self.socket.upgrade().ok_or(NetError(9))?;
+        if socket.filtered() {
+            return socket.recv(count, flags).map(|r| r.data);
+        }
         if flags & !(MSG_PEEK | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
         }
         if count > MAX_TRANSFER {
             return Err(NetError(22));
         }
-        let socket = self.socket.upgrade().ok_or(NetError(9))?;
-        let NativeSocket::Tcp(tcp) = &socket.socket else {
+        let NativeSocket::Tcp(tcp) = &socket.native.socket else {
             unreachable!("TCP capability");
         };
         if count == 0 {
@@ -387,7 +378,7 @@ mod tests {
         let lease = direct.retain().unwrap();
         drop(socket);
         peer.shutdown(Shutdown::Write).unwrap();
-        let mut polls = [PollFd::new(lease.0.as_fd(), PollFlags::POLLIN)];
+        let mut polls = [PollFd::new(lease.0.native.as_fd(), PollFlags::POLLIN)];
         poll(
             &mut polls,
             PollTimeout::try_from(Duration::from_secs(2)).unwrap(),

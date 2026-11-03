@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared socket OFDs and live TCP publication; policy captures remain joined.
+//! Shared socket OFDs, live TCP publication and original shared namespace policy.
 use super::*;
 #[derive(Clone)]
 pub struct DirectTcpFd {
@@ -76,7 +76,7 @@ impl DirectNetwork {
     }
 }
 /// Reuse TCP capabilities while preparing one stopped execution cohort.
-/// Discard before running guests: connect, timeout and policy changes need not
+/// Discard before running guests: connect and timeout changes need not
 /// change FD membership. Key by actual Files membership: forks can share a
 /// content version while owning independently mutable numeric tables. Captures
 /// retain that membership allocation, preventing address reuse during the epoch.
@@ -115,8 +115,8 @@ impl Vfs {
             timeouts: [false, true].map(|receive| socket.io_timeout(receive)),
         })
     }
-    /// Owner-only control publishes transport authority to existing workers.
-    /// Routing/firewall changes still require the original joined boundary.
+    /// Publish this original socket's current connected transport authority.
+    /// Firewall policy is live in its shared rules object, not this capture.
     pub fn refresh_tcp(&self, fd: u32) {
         if let Some(descriptor) = self.fds.get(&fd) {
             let open = descriptor.open.borrow();

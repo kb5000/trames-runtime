@@ -4,6 +4,154 @@ use trames_cpu::Cpu as Interpreter;
 use trames_memory::{Permissions, PAGE_SIZE};
 
 #[test]
+fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
+    fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+        out.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(data);
+        out.resize((out.len() + 3) & !3, 0);
+    }
+    fn message(kind: u16, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&7u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+    let mut table = vec![2, 0, 0, 0];
+    attr(&mut table, 1, b"worker-policy\0");
+    let mut chain = table.clone();
+    attr(&mut chain, 3, b"out\0");
+    let mut hook = Vec::new();
+    attr(&mut hook, 1, &3u32.to_be_bytes());
+    attr(&mut hook, 2, &0u32.to_be_bytes());
+    attr(&mut chain, 4 | 0x8000, &hook);
+    attr(&mut chain, 5, &0u32.to_be_bytes());
+    attr(&mut chain, 7, b"filter\0");
+    let begin = message(16, 1, &[0, 0, 0, 10]);
+    let end = message(17, 1, &[0, 0, 0, 10]);
+    let publish = [
+        begin.clone(),
+        message(0xa00, 0x401, &table),
+        message(0xa03, 0x405, &chain),
+        end.clone(),
+    ]
+    .concat();
+    let remove = [begin, message(0xa02, 5, &table), end].concat();
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        p.linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tcp = p.linux.vfs.socket(2, 1, 0).unwrap();
+        let socket = p.linux.vfs.socket_fd(tcp).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut host, _) = listener.accept().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        while !socket.connect_complete().unwrap() {
+            std::thread::yield_now();
+        }
+        drop(socket);
+        let nf = p.linux.vfs.socket(16, 3, 12).unwrap();
+        let event = p.linux.vfs.eventfd(0, 0).unwrap();
+        p.memory.write(0x1400, &publish).unwrap();
+        p.memory.write(0x1500, &remove).unwrap();
+        p.memory.write(0x1800, b"x").unwrap();
+        p.memory.write_array(0x1810, 1u64.to_le_bytes()).unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut peer = p.fork();
+        peer.parent = 1;
+        peer.tgid = 2;
+        peer.vm_id = 2;
+        let make = |calls: &[(u32, u32, u32)]| {
+            let mut code = Vec::new();
+            for (index, &(fd, address, size)) in calls.iter().enumerate() {
+                code.extend([
+                    mov(0, fd),
+                    mov(1, address),
+                    mov(2, size),
+                    mov(8, 64),
+                    0xd4000001,
+                    mov(10, 0x1c00 + index as u32 * 8),
+                    0xf9000140,
+                ]);
+            }
+            code.extend([
+                mov(0, 0x1900),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ]);
+            code
+        };
+        program(
+            &mut p,
+            make(&[
+                (nf, 0x1400, publish.len() as u32),
+                (tcp, 0x1800, 1),
+                (nf, 0x1500, remove.len() as u32),
+                (tcp, 0x1800, 1),
+            ]),
+        );
+        program(&mut peer, make(&[(event, 0x1810, 8)]));
+        if slots == 2 {
+            peer.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        let until = Instant::now() + Duration::from_secs(5);
+        while k.syscalls < 7 {
+            let limit = k.instructions + 100_000;
+            assert!(k
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+                .unwrap());
+            assert!(Instant::now() < until);
+        }
+        let p = &k.processes[&1];
+        for (index, expected) in [
+            publish.len() as u64,
+            (-13i64) as u64,
+            remove.len() as u64,
+            1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                p.memory.read_u64(0x1c00 + index as u64 * 8).unwrap(),
+                expected,
+                "slots={slots} index={index}"
+            );
+        }
+        assert_eq!(k.processes[&2].memory.read_u64(0x1c00).unwrap(), 8);
+        let mut bytes = [0; 1];
+        std::io::Read::read_exact(&mut host, &mut bytes).unwrap();
+        assert_eq!(bytes, *b"x");
+        for p in k.processes.values() {
+            assert_eq!(p.seccomp.evaluations(), 7);
+        }
+        assert_eq!(k.syscalls, 7);
+        assert_eq!(k.worker_syscalls, 7);
+        assert_eq!(k.service_requests, 0);
+    }
+}
+
+#[test]
 fn netlink_link_changes_wake_poll_and_message_receivers_on_one_or_two_workers() {
     fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
         out.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());

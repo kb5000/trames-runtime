@@ -6,12 +6,12 @@ fn req(op: u16, family: u8, flags: u16, a: &[u8]) -> Vec<u8> {
     d.extend_from_slice(a);
     message(SUBSYSTEM | op, 1 | flags, 10 + op as u32, 0, &d)
 }
-fn table(n: &str) -> Vec<u8> {
+pub(crate) fn table(n: &str) -> Vec<u8> {
     let mut a = vec![];
     string(&mut a, 1, n);
     req(0, 2, 0x400, &a)
 }
-fn chain(t: &str, n: &str, hook: Option<u32>, priority: i32, policy: u32) -> Vec<u8> {
+pub(crate) fn chain(t: &str, n: &str, hook: Option<u32>, priority: i32, policy: u32) -> Vec<u8> {
     let mut a = vec![];
     string(&mut a, 1, t);
     string(&mut a, 3, n);
@@ -53,7 +53,7 @@ fn rule(t: &str, c: &str, e: &[u8]) -> Vec<u8> {
     attr(&mut a, 4 | 0x8000, e);
     req(6, 2, 0x400 | 0x800, &a)
 }
-fn batch(ns: &Namespace, r: &[Vec<u8>]) -> Vec<Vec<u8>> {
+pub(crate) fn batch(ns: &Namespace, r: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let start = message(16, 1, 1, 0, &[0, 0, 0, 10]);
     let end = message(17, 1, 100, 0, &[0, 0, 0, 10]);
     let mut rs = vec![start.as_slice()];
@@ -61,7 +61,7 @@ fn batch(ns: &Namespace, r: &[Vec<u8>]) -> Vec<Vec<u8>> {
     rs.push(&end);
     request(ns, &rs, 1, true, 128, MAX_BYTES).unwrap()
 }
-fn shared_batch(shared: &std::sync::RwLock<Ruleset>, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+fn shared_batch(shared: &Firewall, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     let start = message(16, 1, 1, 0, &[0, 0, 0, 10]);
     let end = message(17, 1, 100, 0, &[0, 0, 0, 10]);
     let mut requests = vec![start.as_slice()];
@@ -71,7 +71,7 @@ fn shared_batch(shared: &std::sync::RwLock<Ruleset>, r: &[Vec<u8>]) -> Result<Ve
 }
 #[test]
 fn concurrent_rule_batches_preserve_every_commit_and_generation() {
-    let rules = std::sync::Arc::new(std::sync::RwLock::new(Ruleset::default()));
+    let rules = std::sync::Arc::new(Firewall::default());
     let start = std::sync::Barrier::new(9);
     std::thread::scope(|scope| {
         for index in 0..8 {
@@ -110,7 +110,7 @@ fn concurrent_rule_batches_preserve_every_commit_and_generation() {
 }
 #[test]
 fn counters_keep_parallel_packets_across_live_rule_publication() {
-    let rules = std::sync::Arc::new(std::sync::RwLock::new(Ruleset::default()));
+    let rules = std::sync::Arc::new(Firewall::default());
     assert_eq!(
         errno(
             &shared_batch(
@@ -525,28 +525,94 @@ fn native_root_input_and_output_policy_enforces_real_socket_io() {
 }
 
 #[test]
-fn connected_native_tcp_capability_is_rebuilt_after_firewall_changes() {
+fn captured_tcp_uses_live_policy_and_retains_original_socket_after_close() {
+    use std::io::{Read, Write};
     let root = Network::new(NetworkMode::Loopback);
     let listener = root.socket(2, 1, 0).unwrap();
     listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     listener.listen(1).unwrap();
-    let _host = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let mut host = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    host.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
     crate::wait(&[(listener.clone(), 1)], std::time::Duration::from_secs(1)).unwrap();
     let (accepted, _) = listener.accept().unwrap();
-    assert!(accepted.direct_tcp().is_some());
+    let direct = accepted.direct_tcp().unwrap();
+    let control = accepted.direct_control().unwrap();
+    let lease = direct.retain().unwrap();
+    assert!(lease.shares_socket(&control.retain().unwrap()));
+    assert_eq!(direct.send(b"a", 0), Ok(1));
+    let mut byte = [0];
+    host.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"a");
     assert_eq!(
         errno(&batch(
             &root.1,
             &[
                 table("tcp-guard"),
-                chain("tcp-guard", "input", Some(1), 0, 1)
+                chain("tcp-guard", "output", Some(3), 0, 1),
+                rule("tcp-guard", "output", &expression("counter", &[]))
             ]
         )),
         0
     );
-    assert!(accepted.direct_tcp().is_none()); // Even an ACCEPT chain needs accounting.
+    assert!(accepted.direct_tcp().is_some());
+    drop(accepted);
+    assert_eq!(direct.send(b"b", 0), Ok(1));
+    host.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"b");
+    let rules = root.1.graph.read().unwrap().firewall(root.1.id());
+    assert!(rules.has_rules());
+    {
+        let current = rules.read().unwrap();
+        let e = &current.tables[&(2, "tcp-guard".into())].chains["output"].rules[0].expressions[0];
+        assert!(
+            matches!(e, Expr::Counter { packets, bytes } if packets.get() == 1 && bytes.get() > 1)
+        );
+    }
+    assert_eq!(
+        errno(&batch(
+            &root.1,
+            &[chain("tcp-guard", "output", Some(3), 0, 0)]
+        )),
+        0
+    );
+    assert_eq!(direct.send(b"blocked", 0), Err(NetError(13)));
     let mut attrs = vec![];
     string(&mut attrs, 1, "tcp-guard");
     assert_eq!(errno(&batch(&root.1, &[req(2, 2, 0, &attrs)])), 0);
-    assert!(accepted.direct_tcp().is_some());
+    assert!(!rules.has_rules());
+    assert_eq!(direct.send(b"c", 0), Ok(1));
+    host.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"c");
+    // Re-enable input DROP on this same pre-publication capability. The original
+    // receive consumes the denied packet and shuts down the actual TCP endpoint.
+    assert_eq!(
+        errno(&batch(
+            &root.1,
+            &[table("input"), chain("input", "in", Some(1), 0, 0)]
+        )),
+        0
+    );
+    host.write_all(b"denied").unwrap();
+    let (ready, _lease) = direct.readiness_fd().unwrap();
+    let mut fds = [nix::poll::PollFd::new(
+        std::os::fd::AsFd::as_fd(&ready),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    assert_eq!(
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(2000u16)).unwrap(),
+        1
+    );
+    assert_eq!(direct.recv(100, 0), Err(NetError(13)));
+    assert_eq!(host.read(&mut byte).unwrap(), 0);
+    drop(lease);
+    drop(_lease);
+    assert_eq!(direct.send(b"stale", 0), Err(NetError(9)));
+    drop(listener);
+    let namespace = std::sync::Arc::downgrade(&root.1);
+    drop(root);
+    assert!(
+        namespace.upgrade().is_none(),
+        "weak capabilities must not pin namespace lifetime"
+    );
 }

@@ -139,7 +139,7 @@ struct Space {
     routes: Vec<Route>,
     direct: bool,
     forwarding: [bool; 2],
-    firewall: Arc<RwLock<crate::nftables::Ruleset>>,
+    firewall: Arc<crate::nftables::Firewall>,
     connections: Arc<Mutex<crate::conntrack::State>>,
     bridge_filter: [bool; 2],
 }
@@ -859,7 +859,7 @@ impl Topology {
     pub fn connections(&self, id: u64) -> Arc<Mutex<crate::conntrack::State>> {
         self.spaces[&id].connections.clone()
     }
-    pub fn firewall(&self, id: u64) -> Arc<RwLock<crate::nftables::Ruleset>> {
+    pub fn firewall(&self, id: u64) -> Arc<crate::nftables::Firewall> {
         self.spaces[&id].firewall.clone()
     }
     pub fn peer_device(&self, index: u32) -> Option<Device> {

@@ -78,19 +78,17 @@ impl RetainedSocket {
         &mut self,
         memory: &mut impl CpuMemory,
         paths: Option<&trames_vfs::PathQueries>,
-        owner: bool,
     ) -> Option<Result<u64, Errno>> {
         match &mut self.socket {
             Control::Network(socket) => {
                 if let Some(message) = &self.message {
-                    return message.progress(
+                    return Some(message.progress(
                         socket,
                         self.number,
                         self.args,
                         memory,
                         &self.factory,
-                        owner,
-                    );
+                    ));
                 }
                 let result = if self.number == 203 && self.connecting {
                     socket.with_tcp_publication(|| {
@@ -318,7 +316,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let Some(result) = call.attempt(memory, self.paths.as_ref(), false) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(call);
         };
         if call.pipe_signal() {
@@ -384,7 +382,7 @@ impl DirectSyscalls {
     }
     fn retry_socket(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         let call = pending.retained_socket.as_mut().unwrap();
-        let Some(result) = call.attempt(memory, self.paths.as_ref(), false) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
         };
         if call.pipe_signal() {
@@ -456,7 +454,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let Some(result) = call.attempt(memory, self.paths.as_ref(), true) else {
+        let Some(result) = call.attempt(memory, self.paths.as_ref()) else {
             return IoAttempt::SocketCheckpoint(call);
         };
         if !call.waits(&result) {

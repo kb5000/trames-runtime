@@ -64,7 +64,7 @@ impl Socket {
         kind: u32,
         protocol: u32,
     ) -> Result<Arc<Self>> {
-        let native = network.socket(family, kind, protocol)?;
+        let mut native = network.socket(family, kind, protocol)?;
         native.attach_policy(namespace.clone());
         Ok(Arc::new(Self {
             network,
@@ -90,7 +90,7 @@ impl Socket {
         if let Some(s) = branch.as_ref() {
             return Ok(s.clone());
         }
-        let s = self.network.socket(self.family, self.kind, self.protocol)?;
+        let mut s = self.network.socket(self.family, self.kind, self.protocol)?;
         s.attach_policy(self.namespace.clone());
         for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;

@@ -292,8 +292,8 @@ impl Socket {
             _reservation: reservation,
         })
     }
-    /// Frozen connected-native transport capability, rebuilt each cohort.
-    /// Descriptor/namespace/policy mutation still requires all workers joined.
+    /// Connected-native transport capability with the original live policy.
+    /// Ordinary snapshots stay weak; accepted calls retain the actual socket.
     pub fn quiescent_tcp(&self) -> bool {
         let _operation = self.operation.read_recursive();
         match &self.backend {
@@ -580,12 +580,6 @@ impl Socket {
     delegate!(write, shutdown(how: u32) -> Result<()>);
     pub fn is_netlink(&self) -> bool {
         matches!(self.backend, SocketBackend::Netlink(_))
-    }
-    pub fn worker_send_supported(&self, bytes: &[u8]) -> bool {
-        match &self.backend {
-            SocketBackend::Netlink(socket) => socket.worker_send_supported(bytes),
-            _ => true,
-        }
     }
     pub fn subscribe(
         &self,

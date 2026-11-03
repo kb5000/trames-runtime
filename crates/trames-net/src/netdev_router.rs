@@ -305,7 +305,7 @@ impl Topology {
         let mut copy = self.clone();
         let space = copy.spaces.get_mut(&ns).unwrap();
         let firewall = space.firewall.read().unwrap().clone();
-        space.firewall = Arc::new(RwLock::new(firewall));
+        space.firewall = Arc::new(firewall.into());
         let connections = if bound {
             space.connections.lock().unwrap().clone()
         } else {
