@@ -92,7 +92,7 @@ pub(crate) struct Process<C: Cpu> {
     poll_deadline: Option<Instant>,
     socket_deadline: Option<Instant>,
     poll_mask: Option<u64>,
-    uring_wait: Option<(u32, Rc<trames_vfs::Uring>, Option<Instant>)>,
+    uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
     flock_wait: Option<(trames_vfs::FlockRequest, Option<trames_vfs::RetainedFd>)>,
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
@@ -225,13 +225,10 @@ impl<C: Cpu> Process<C> {
             return !self.linux.trace
                 && self.seccomp.mode() == 0
                 && a[3] & !9 == 0
-                && self.uring_wait.as_ref().is_some_and(|(_, ring, _)| {
-                    self.linux
-                        .vfs
-                        .uring(a[0] as u32)
-                        .is_ok_and(|current| Rc::ptr_eq(&current, ring))
-                        && trames_linux::UringEpoch::can_adopt(ring)
-                });
+                && self
+                    .uring_wait
+                    .as_ref()
+                    .is_some_and(|(_, ring, _)| trames_linux::UringEpoch::can_adopt(ring));
         }
         if let State::Blocked(number @ (22 | 73 | 441), args) = self.state {
             if !self.linux.trace
@@ -428,7 +425,7 @@ pub(crate) struct Kernel<C: Cpu> {
     cohort_return_native: BTreeMap<(u64, u64), u64>,
     vm_checkpoint_groups: u64,
     vm_checkpoint_spaces: u64,
-    vm_checkpoint_calls: [u64; 8],
+    vm_checkpoint_calls: [u64; 9],
     vm_checkpoint_time: [Duration; 7],
     vm_checkpoint_wait_bins: [u64; 8],
     vm_checkpoint_batch: [u64; 3],
@@ -3939,6 +3936,22 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn parallel_candidate(&self) -> bool {
+        if self
+            .processes
+            .iter()
+            .any(|(&id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
+        {
+            let runnable = self.processes.iter().any(|(&id, p)| {
+                !p.frozen(id) && (matches!(p.state, State::Ready) || p.worker_gpu_candidate())
+            });
+            if runnable
+                || self.processes.iter().any(|(&id, p)| {
+                    !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_event(&p.memory, id)
+                })
+            {
+                return true;
+            }
+        }
         let mut active = self.processes.iter().filter(|(id, p)| {
             (matches!(p.state, State::Ready) || p.worker_gpu_candidate()) && !p.frozen(**id)
         });
@@ -4059,7 +4072,9 @@ impl<C: Cpu> Kernel<C> {
                         }
                         _ => false,
                     };
-                if !local_ring {
+                if p.linux.uring_requires_owner()
+                    || !local_ring && (p.linux.trace || !p.linux.worker_uring_pending())
+                {
                     p.linux.progress_uring(&mut p.memory, id);
                 }
                 self.resume_event(&mut p);
@@ -4104,7 +4119,11 @@ impl<C: Cpu> Kernel<C> {
             if p.frozen(id) {
                 return None;
             }
-            ((matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
+            ((!p.linux.trace
+                && p.linux.worker_uring_pending()
+                && !matches!(p.state, State::Ready | State::Zombie(_) | State::Stopped)
+                && !p.worker_gpu_candidate())
+                || (matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
                 || (matches!(p.state, State::Sleep(..))
                     && !p.linux.trace
                     && vms.contains(&p.vm_id))
@@ -4112,9 +4131,10 @@ impl<C: Cpu> Kernel<C> {
             .then_some((id, 0))
         }));
         if members.len() < 2
-            && !members
-                .iter()
-                .any(|(id, _)| self.processes[id].worker_gpu_candidate())
+            && !members.iter().any(|(id, _)| {
+                self.processes[id].worker_gpu_candidate()
+                    || self.processes[id].linux.worker_uring_pending()
+            })
         {
             return Ok(false);
         }
@@ -4181,6 +4201,11 @@ impl<C: Cpu> Kernel<C> {
                     deadline,
                     remaining,
                 })
+            } else if !matches!(p.state, State::Ready)
+                && !p.worker_io_candidate(id)
+                && !p.worker_gpu_candidate()
+            {
+                Some(crate::run_queue::WaitState::OwnerEvent)
             } else {
                 None
             };
@@ -4191,7 +4216,11 @@ impl<C: Cpu> Kernel<C> {
                 Default::default()
             };
             let retained_files = if !p.linux.trace {
-                file_epoch.capture_uring(&p.linux.vfs, p.file_size_limit.get().0 == u64::MAX)
+                file_epoch.capture_uring_rings(
+                    &p.linux.vfs,
+                    p.file_size_limit.get().0 == u64::MAX,
+                    p.linux.uring_rings(),
+                )
             } else {
                 Default::default()
             };
@@ -4232,14 +4261,19 @@ impl<C: Cpu> Kernel<C> {
                         .with_membership(p.linux.vfs.shared_files())
                         .with_paths(p.linux.vfs.path_queries())
                         .with_resources(p.linux.vfs.descriptor_factory())
+                        .with_uring_disk(self.workers.uring_disk())
                         .with_kernel_log(p.linux.vfs.kernel_log_capability())
-                        .with_urings(uring_epoch.capture_all(
-                            &p.linux.vfs,
-                            p.memory.instruction_identity().0,
-                            id,
-                            &direct_files,
-                            &retained_files,
-                        ))
+                        .with_urings(
+                            uring_epoch
+                                .capture_all(
+                                    &p.linux.vfs,
+                                    p.memory.instruction_identity().0,
+                                    id,
+                                    &direct_files,
+                                    &retained_files,
+                                )
+                                .with_actor(p.linux.uring_actor_root()),
+                        )
                         .with_network(network_epoch.capture(&p.linux.vfs))
                         .with_clock(self.started)
                         .with_terminal(trames_vfs::TerminalAccess {
@@ -4255,20 +4289,6 @@ impl<C: Cpu> Kernel<C> {
                 }),
             };
             let mut job = crate::run_queue::Job::<C>::new(work, p.affinity, p.last_cpu, waiting);
-            if let State::Blocked(426, args) = p.state {
-                if job
-                    .work
-                    .syscalls
-                    .as_ref()
-                    .is_some_and(|s| s.direct.supports_call(426, args))
-                {
-                    if let Some((submitted, ring, deadline)) = &p.uring_wait {
-                        if uring_epoch.adopt_wait(id, ring, *submitted, *deadline) {
-                            p.uring_wait = None;
-                        }
-                    }
-                }
-            }
             if let State::Gpu {
                 job: compile,
                 pc,
@@ -4307,6 +4327,13 @@ impl<C: Cpu> Kernel<C> {
                     .and_then(|wait| wait.retained_byte)
                     .or_else(|| p.retained_byte.take());
                 job.retry = Some(crate::run_queue::IoCall {
+                    uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {
+                        trames_linux::UringEnter {
+                            submitted,
+                            ring,
+                            deadline,
+                        }
+                    }),
                     flock: if p.flock_wait.as_ref().is_some_and(|(r, _)| r.retains_file()) {
                         // The parked owner must not delay a worker's final
                         // close/notification until the next cohort join.
@@ -4450,16 +4477,7 @@ impl<C: Cpu> Kernel<C> {
         }
         self.parallel_stop_time += began.elapsed();
         let completed = epoch.drain();
-        for handoff in uring_epoch.finish() {
-            let p = self
-                .processes
-                .get_mut(&handoff.task)
-                .expect("io_uring cohort task");
-            p.linux.track_uring(&handoff.ring);
-            if let Some(submitted) = handoff.submitted {
-                p.uring_wait = Some((submitted, handoff.ring, handoff.deadline));
-            }
-        }
+        let _ = uring_epoch.finish();
         self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
         file_epoch.finish();
         if let Some(error) = checkpoint_error {
@@ -4524,6 +4542,9 @@ impl<C: Cpu> Kernel<C> {
                     instructions: self.instructions,
                 }
             } else if let Some(call) = done.io {
+                if let Some(uring) = call.uring {
+                    p.uring_wait = Some((uring.submitted, uring.ring, uring.deadline));
+                }
                 if matches!(call.number, 63..=66 | 202 | 203 | 242) {
                     p.socket_deadline = call.deadline;
                 } else {
@@ -4531,7 +4552,9 @@ impl<C: Cpu> Kernel<C> {
                 }
                 State::Blocked(call.number, call.args)
             } else {
-                p.poll_deadline = None;
+                if !matches!(done.waiting, Some(crate::run_queue::WaitState::OwnerEvent)) {
+                    p.poll_deadline = None;
+                }
                 done.waiting.map_or(State::Ready, |w| match w {
                     crate::run_queue::WaitState::Futex { wait, deadline } => {
                         State::Futex { wait, deadline }
@@ -4540,6 +4563,7 @@ impl<C: Cpu> Kernel<C> {
                         deadline,
                         remaining,
                     } => State::Sleep(deadline, remaining),
+                    crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
                 })
             };
             if let Some((pc, module, function)) = done.rejected_native {
@@ -4619,7 +4643,7 @@ impl<C: Cpu> Kernel<C> {
             outcomes.push((done.pid, outcome));
         }
         self.parallel_rounds += 1;
-        self.next_parallel_pid = chosen.last().expect("two workers").0;
+        self.next_parallel_pid = chosen.last().expect("cohort task").0;
         // Successful worker wakes are already committed. Publish readiness
         // before any returned syscall (requeue/exit/signal) can change tasks.
         self.resume_futex_ready();
@@ -5224,7 +5248,7 @@ pub(super) fn run<C: Cpu>(
         cohort_return_native: BTreeMap::new(),
         vm_checkpoint_groups: 0,
         vm_checkpoint_spaces: 0,
-        vm_checkpoint_calls: [0; 8],
+        vm_checkpoint_calls: [0; 9],
         vm_checkpoint_time: [Duration::ZERO; 7],
         vm_checkpoint_wait_bins: [0; 8],
         vm_checkpoint_batch: [0; 3],
@@ -5687,6 +5711,7 @@ mod tests {
         p.linux.vfs.flock(b, 6).unwrap();
         let (request, file) = p.linux.vfs.retain_flock(a, 2).unwrap();
         let call = crate::run_queue::IoCall {
+            uring: None,
             number: 32,
             args: [a as u64, 2, 0, 0, 0, 0],
             deadline: None,
@@ -6238,6 +6263,7 @@ mod tests {
         let b = p.linux.vfs.open_at(-100, b"/lock", 2, 0).unwrap();
         let (shared, _) = p.linux.vfs.retain_flock(a, 1).unwrap();
         let mut call = crate::run_queue::IoCall {
+            uring: None,
             number: 32,
             args: [a as u64, 1, 0, 0, 0, 0],
             deadline: None,
@@ -6701,7 +6727,7 @@ mod tests {
             cohort_return_native: BTreeMap::new(),
             vm_checkpoint_groups: 0,
             vm_checkpoint_spaces: 0,
-            vm_checkpoint_calls: [0; 8],
+            vm_checkpoint_calls: [0; 9],
             vm_checkpoint_time: [Duration::ZERO; 7],
             vm_checkpoint_wait_bins: [0; 8],
             vm_checkpoint_batch: [0; 3],
@@ -8430,7 +8456,7 @@ mod boundary_tests {
         p.linux.vfs.close(fd).unwrap();
         let (replacement, _) = p.linux.vfs.uring_create(2, 4).unwrap();
         assert_eq!(replacement, fd);
-        assert!(!p.worker_io_candidate(1));
+        assert!(p.worker_io_candidate(1));
     }
     #[test]
     fn blocked_uring_ext_arg_retains_deadline_without_reimporting_guest_memory() {

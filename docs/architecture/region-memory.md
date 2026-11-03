@@ -1137,3 +1137,31 @@ bytes after truncation/regrowth, executable EOF faults and history expiry. A
 domain check and five page checks. The paired Firefox observation reduced checks
 to 37.4 million and aggregate preparation to 5.91 seconds; short ordered runs and
 remaining cold-start gaps are recorded in the integration validation record.
+
+
+## Native io_uring protocol words and fixed buffers (2026-11-03)
+
+Ring kernel access retains the original mapped FilePage and SharedPage owners,
+so mmap and native execution see one byte domain. Native ARM64 queue protocol
+loads use aligned LDAR for guest SQ tail (offset 4) and CQ head (offset 64);
+kernel SQ head (offset 0) and CQ tail (offset 68) publish with aligned STLR.
+x86_64 uses aligned MOV with compiler memory effects. Payload/header copies keep
+the existing raw-copy instructions and do not acquire additional ordering.
+Bounded queue geometry guarantees each fixed-size access stays within a retained
+page. Unsupported host architectures keep the existing excluded-actor contract.
+
+No Rust or LLVM atomic reference is constructed over concurrently accessed guest
+bytes on ARM64/x86_64. Inline asm has memory effects and the required architecture
+ordering; no nomem/readonly assumption allows moving payload across publication.
+The same region ownership and original HardwareStorage host-borrow gate retain
+storage/lifetimes. An actual ARM64 publication/acknowledgement regression checks
+payload ordering; a race on ordinary bytes retains architectural guest outcomes.
+
+A PinnedBuffer holds Arc<SharedPage> plus its original residency charge, not an
+old raw pointer. A cold Heap-to-hardware transfer holds every region bit; later
+pin reads/writes acquire their actual range and the existing hardware borrow gate.
+Consequently live pins need not reject HVF admission. Outstanding pins survive
+unmap/FD close and continue referring to old bytes, while a replacement guest VA
+uses its new allocation. Child private COW keeps the parent's registered storage.
+Owner mapping changes still require all execution Views to join. Tests cover pin
+access before/after hardware export, balanced host borrows and unmap/remap identity.

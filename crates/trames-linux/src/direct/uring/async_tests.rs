@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+use trames_memory::PAGE_SIZE;
+use trames_vfs::URING_CQES;
 
 #[test]
 fn invalid_selected_data_waits_for_readiness_without_consuming_pool_or_bytes() {
@@ -16,7 +18,7 @@ fn invalid_selected_data_waits_for_readiness_without_consuming_pool_or_bytes() {
         let state = s.rings[&fd].state.lock().unwrap();
         assert_eq!(state.provided[&7].slots(), 1);
         assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.tail, s.rings[&fd].queue.load(64));
+        assert_eq!(state.tail, s.rings[&fd].load_queue(64));
     }
     l.vfs.write(writer, b"x").unwrap();
     complete(start(&s, fd, 0, 1, &mut m), 0);
@@ -91,7 +93,7 @@ fn selected_buffers_preserve_vm_authority_errors_and_empty_retry() {
     );
     drop(child_s);
     epoch.finish();
-    assert_eq!(r.state.borrow().provided[&9].slots(), 1);
+    assert_eq!(r.state.lock().unwrap().provided[&9].slots(), 1);
 }
 
 #[test]
@@ -140,7 +142,7 @@ fn multishot_poll_preserves_epochs_and_update_remove_rules() {
         complete(start(&s, fd, 0, 1, &mut m), 0);
         assert_eq!(flags(&mut m, &r), (1, 1, 2));
         complete(start(&s, fd, 0, 0, &mut m), 0);
-        assert_eq!(s.rings[&fd].queue.load(64), s.rings[&fd].queue.load(68));
+        assert_eq!(s.rings[&fd].load_queue(64), s.rings[&fd].load_queue(68));
     }
     let mut update = data(7, u32::MAX, 1, 6, 3, 0);
     update[8..16].copy_from_slice(&2u64.to_le_bytes());
@@ -224,7 +226,8 @@ fn ext_arg_wait_handoff_keeps_original_deadline_without_reimport_or_resubmit() {
     drop(wait);
     drop(s);
     let handoff = epoch.finish();
-    assert_eq!(handoff[0].deadline, Some(original));
+    assert!(handoff.is_empty());
+    assert_eq!(r.state.lock().unwrap().waits[&7].1, Some(original));
     let mut epoch = UringEpoch::default();
     let s = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
     assert!(epoch.adopt_wait(7, &r, 0, Some(original)));
@@ -305,16 +308,16 @@ fn registered_descriptor_ring_keeps_original_pin_and_controls_stay_local() {
     descriptor[12..14].copy_from_slice(&65535u16.to_le_bytes());
     pin.write(16, &descriptor).unwrap();
     pin.write(14, &0u16.to_le_bytes()).unwrap();
-    r.state.borrow_mut().provided.insert(
+    r.state.lock().unwrap().provided.insert(
         7,
-        UringBufferGroup {
+        UringBufferGroup::new(
             owner,
-            source: UringBufferSource::Ring {
+            UringBufferSource::Ring {
                 memory: pin.clone(),
                 head: u16::MAX,
                 entries: 2,
             },
-        },
+        ),
     );
     m.unmap(0x3000, PAGE_SIZE).unwrap();
     m.map(0x3000, PAGE_SIZE, Permissions::RW).unwrap();
@@ -361,7 +364,7 @@ fn registered_descriptor_ring_keeps_original_pin_and_controls_stay_local() {
     assert!(s.rings[&fd].state.lock().unwrap().provided.is_empty());
     drop(s);
     assert!(epoch.finish().is_empty());
-    assert!(r.state.borrow().provided.is_empty());
+    assert!(r.state.lock().unwrap().provided.is_empty());
 }
 
 #[test]
@@ -386,7 +389,7 @@ fn worker_unregister_buffers_keeps_accepted_pin_and_rejects_new_fixed_io() {
     assert_eq!(m.read_array::<1>(0x3000).unwrap(), *b"x");
     drop(s);
     assert!(epoch.finish().is_empty());
-    assert!(r.state.borrow().buffers.is_none());
+    assert!(r.state.lock().unwrap().buffers.is_none());
 }
 
 #[test]
@@ -440,9 +443,8 @@ fn multishot_backpressure_reserves_terminal_space_and_rotates_past_budget() {
     complete(start(&s, fd, 0, 1, &mut m), 0);
     assert!(
         s.rings[&fd]
-            .queue
-            .load(68)
-            .wrapping_sub(s.rings[&fd].queue.load(64))
+            .load_queue(68)
+            .wrapping_sub(s.rings[&fd].load_queue(64))
             > 0
     );
 }
@@ -585,7 +587,7 @@ fn cq_observer_does_not_borrow_another_tasks_guest_memory() {
                 None
             )
             .unwrap(),
-        IoAttempt::Checkpoint
+        IoAttempt::Blocked(_)
     ));
     assert_eq!(m.read_array::<1>(0x2200).unwrap(), [0]);
     assert_eq!(l.vfs.read(reader, 1).unwrap(), b"x");

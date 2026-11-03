@@ -11,7 +11,7 @@ mod coordination_cost;
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -320,10 +320,11 @@ struct DiskWorker {
 enum DiskJob {
     Read(usize, trames_vfs::DiskReadJob, Vec<u8>),
     Sync(usize, trames_vfs::DiskSyncJob),
+    UringSync(trames_vfs::DiskSyncJob, Arc<trames_linux::UringDiskResult>),
 }
 impl DiskJob {
-    fn run<C: Cpu>(self, cache: &mut trames_vfs::DiskReadCache) -> Event<C> {
-        match self {
+    fn run<C: Cpu>(self, cache: &mut trames_vfs::DiskReadCache) -> Option<Event<C>> {
+        Some(match self {
             Self::Read(id, job, bytes) => Event::DiskRead(
                 id,
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -336,7 +337,100 @@ impl DiskJob {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
                     .unwrap_or(Err(trames_vfs::Errno(5))),
             ),
+            Self::UringSync(job, result) => {
+                result.complete(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                        .unwrap_or(Err(trames_vfs::Errno(5))),
+                );
+                return None;
+            }
+        })
+    }
+}
+struct DiskPool<C: Cpu> {
+    workers: Mutex<Vec<DiskWorker>>,
+    next: AtomicUsize,
+    limit: usize,
+    send: mpsc::Sender<Event<C>>,
+    closed: AtomicBool,
+}
+impl<C: Cpu> DiskPool<C> {
+    fn submit(&self, job: DiskJob) {
+        let mut workers = self.workers.lock().unwrap();
+        if self.closed.load(Ordering::Relaxed) {
+            drop(workers);
+            if let DiskJob::UringSync(_, result) = job {
+                result.complete(Err(trames_vfs::Errno(5)));
+            }
+            return;
         }
+        // The existing lazy pool keeps at most two host workers. Ordinary
+        // requests and bounded ring submissions share these same queues.
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.limit;
+        if index >= workers.len() {
+            let (send, receive) = mpsc::channel::<DiskJob>();
+            let done = self.send.clone();
+            if let Ok(join) = thread::Builder::new()
+                .name("trames-disk".into())
+                .spawn(move || {
+                    let mut cache = trames_vfs::DiskReadCache::default();
+                    loop {
+                        let work = match receive.recv_timeout(Duration::from_millis(250)) {
+                            Ok(work) => work,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                // Open host descriptors can retain deleted data
+                                // blocks even after their Weak object expires.
+                                // Release idle handles, then sleep without a
+                                // recurring idle timer until the next request.
+                                cache = trames_vfs::DiskReadCache::default();
+                                match receive.recv() {
+                                    Ok(work) => work,
+                                    Err(_) => break,
+                                }
+                            }
+                        };
+                        if let Some(event) = work.run::<C>(&mut cache) {
+                            if done.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                })
+            {
+                workers.push(DiskWorker { send, join });
+            }
+        }
+        let send = workers.get(index).map(|worker| worker.send.clone());
+        drop(workers);
+        let job = if let Some(send) = send {
+            match send.send(job) {
+                Ok(()) => return,
+                Err(error) => error.0,
+            }
+        } else {
+            job
+        };
+        // Thread resource failure preserves one execution and one completion.
+        if let Some(event) = job.run::<C>(&mut trames_vfs::DiskReadCache::default()) {
+            let _ = self.send.send(event);
+        }
+    }
+    fn shutdown(&self) {
+        let workers = {
+            let mut workers = self.workers.lock().unwrap();
+            self.closed.store(true, Ordering::Relaxed);
+            std::mem::take(&mut *workers)
+        };
+        for worker in workers {
+            drop(worker.send);
+            let _ = worker.join.join();
+        }
+    }
+}
+impl<C: Cpu> trames_linux::UringDiskExecutor for DiskPool<C> {
+    fn submit(&self, job: trames_vfs::DiskSyncJob, result: Arc<trames_linux::UringDiskResult>) {
+        self.submit(DiskJob::UringSync(job, result));
     }
 }
 pub(super) struct Pool<C: Cpu> {
@@ -348,8 +442,7 @@ pub(super) struct Pool<C: Cpu> {
     pub peak_native: Arc<AtomicUsize>,
     active_native: Arc<AtomicUsize>,
     profile_native_overlap: bool,
-    disk_workers: Vec<DiskWorker>,
-    next_disk_worker: usize,
+    disk: Arc<DiskPool<C>>,
     disk_buffers: Vec<Vec<u8>>,
 }
 impl<C: Cpu> Pool<C> {
@@ -364,6 +457,13 @@ impl<C: Cpu> Pool<C> {
         let (send, receive) = mpsc::channel();
         Self {
             workers: (0..count).map(|_| None).collect(),
+            disk: Arc::new(DiskPool {
+                workers: Mutex::new(Vec::new()),
+                next: AtomicUsize::new(0),
+                limit: count.clamp(1, 2),
+                send: send.clone(),
+                closed: AtomicBool::new(false),
+            }),
             send,
             receive,
             active: Arc::new(AtomicUsize::new(0)),
@@ -371,8 +471,6 @@ impl<C: Cpu> Pool<C> {
             peak_native: Arc::new(AtomicUsize::new(0)),
             active_native: Arc::new(AtomicUsize::new(0)),
             profile_native_overlap,
-            disk_workers: Vec::new(),
-            next_disk_worker: 0,
             disk_buffers: Vec::new(),
         }
     }
@@ -410,6 +508,7 @@ impl<C: Cpu> Pool<C> {
                     let mut parked_hardware = None;
                     let mut parked_io = None;
                     let mut parked_gpu = None;
+                    let mut maintenance = false;
                     let mut yielded = false;
                     let mut service = false;
                     let mut vm_checkpoint = false;
@@ -439,6 +538,24 @@ impl<C: Cpu> Pool<C> {
                             if domain.as_ref().is_some_and(|domain| domain.paused()) {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
+                            }
+                            if let Some(epoch) = &epoch {
+                                if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
+                                if let Some(ring) = &mut job.uring {
+                                    if !ring.progress(work.memory.as_deref_mut().expect("source task View")) {
+                                        maintenance = true;
+                                        work.control.stop();
+                                        break SliceOutcome::Yield { instructions: 0 };
+                                    }
+                                    if !ring.active() { job.uring = None; }
+                                }
+                                if job.hardware_wait.as_ref().is_some_and(|wait| !wait.ready())
+                                    || job.waiting.is_some()
+                                    || job.io.as_ref().is_some_and(|io| !io.signal.ready() && !io.wake_deadline().is_some_and(|d| d <= Instant::now()))
+                                    || job.gpu_pending.as_ref().is_some_and(|gpu| gpu.waiting()) {
+                                    maintenance = true; break SliceOutcome::Yield { instructions: 0 };
+                                }
+                                job.hardware_wait = None;
                             }
                             if let Some(pending) = job.gpu_pending.take() {
                                 let accepted = pending.compile.is_some();
@@ -479,7 +596,9 @@ impl<C: Cpu> Pool<C> {
                                     let call = job.retry.take().unwrap();
                                     let tcp_handoff=call.tcp_liveness.is_some();
                                     let _tcp_liveness=call.tcp_liveness;
-                                    if let Some(socket) = call.retained_socket {
+                                    if let Some(uring) = call.uring {
+                                        snapshot.direct.start_retained_uring(uring, call.args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(socket) = call.retained_socket {
                                         snapshot.direct.start_retained_socket(socket,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
                                     } else if let Some(request) = call.flock {
                                         snapshot.direct.start_flock(request, call.args, work.memory.as_deref_mut().expect("worker view"),
@@ -711,8 +830,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                 // effects. Evaluate BPF once on its mm owner;
                                 // only an allowed call may mutate that domain.
                                 if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
-                                    && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0)
-                                    && crate::worker_syscalls::vm_call(work.cpu.x(8) as u32)
+                                    && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0 || work.cpu.x(8) as u32 == 427)
+                                    && crate::worker_syscalls::vm_entry(&work.cpu)
                                     && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
                                 {
                                     vm_checkpoint = true;
@@ -821,7 +940,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                         && snapshot.seccomp.mode() == 0
-                                        && crate::worker_syscalls::vm_call(work.cpu.x(8) as u32)
+                                        && crate::worker_syscalls::vm_entry(&work.cpu)
                                     {
                                         vm_checkpoint = true;
                                         break result;
@@ -989,6 +1108,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         }
                     }))
                     .ok();
+                    if let Some(epoch) = &epoch {
+                        if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
+                        if let Some(ring) = &mut job.uring {
+                            if !ring.progress(work.memory.as_deref_mut().expect("source task View")) { work.control.stop(); }
+                            if !ring.active() { job.uring = None; }
+                        }
+                    }
                     // Withdraw before requesting a checkpoint: this worker is
                     // already out of guest code and must not kick its next job.
                     drop(execution_guard.take());
@@ -997,7 +1123,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     // Syscall, deferred native, fault and yield request a checkpoint
                     // immediately, before the coordinator receives this message.
-                    if parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
+                    if !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
                     let elapsed = began.elapsed().saturating_sub(service_wait);
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
@@ -1047,6 +1173,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                             assert!(done.send(Event::<C>::Service(Box::new(request))).is_ok(), "coordinator receiver");
                             continue;
                         }
+                        if maintenance { epoch.park_maintenance(job); continue; }
                         if let Some(wait) = parked_hardware { epoch.park_hardware(job, wait); continue; }
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
@@ -1100,55 +1227,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
     pub fn disk_sync(&mut self, id: usize, job: trames_vfs::DiskSyncJob) {
         self.disk_job(DiskJob::Sync(id, job));
     }
+    pub fn uring_disk(&self) -> Arc<dyn trames_linux::UringDiskExecutor> {
+        self.disk.clone()
+    }
     fn disk_job(&mut self, job: DiskJob) {
-        // Lazy persistent workers; at most one outstanding request per guest
-        // CPU bounds queued jobs/buffers. Never create a thread per syscall.
-        let index = self.next_disk_worker % self.workers.len().clamp(1, 2);
-        self.next_disk_worker = self.next_disk_worker.wrapping_add(1);
-        if index >= self.disk_workers.len() {
-            let (send, receive) = mpsc::channel::<DiskJob>();
-            let done = self.send.clone();
-            if let Ok(join) = thread::Builder::new()
-                .name("trames-disk".into())
-                .spawn(move || {
-                    let mut cache = trames_vfs::DiskReadCache::default();
-                    loop {
-                        let work = match receive.recv_timeout(Duration::from_millis(250)) {
-                            Ok(work) => work,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                // Open host descriptors can retain deleted data
-                                // blocks even after their Weak object expires.
-                                // Release idle handles, then sleep without a
-                                // recurring idle timer until the next request.
-                                cache = trames_vfs::DiskReadCache::default();
-                                match receive.recv() {
-                                    Ok(work) => work,
-                                    Err(_) => break,
-                                }
-                            }
-                        };
-                        if done.send(work.run::<C>(&mut cache)).is_err() {
-                            break;
-                        }
-                    }
-                })
-            {
-                self.disk_workers.push(DiskWorker { send, join });
-            }
-        }
-        let job = if let Some(worker) = self.disk_workers.get(index) {
-            match worker.send.send(job) {
-                Ok(()) => return,
-                Err(error) => error.0,
-            }
-        } else {
-            job
-        };
-        // Thread resource failure preserves one execution and one completion.
-        let _ = self
-            .send
-            .send(job.run::<C>(&mut trames_vfs::DiskReadCache::default()));
+        self.disk.submit(job);
     }
     pub fn recycle_disk_buffer(&mut self, bytes: Vec<u8>) {
         // Keep initialized lengths so equal-size reads need no repeated zeroing.
@@ -1249,10 +1332,7 @@ impl<C: Cpu> Drop for Pool<C> {
             drop(worker.send);
             let _ = worker.join.join();
         }
-        for worker in self.disk_workers.drain(..) {
-            drop(worker.send);
-            let _ = worker.join.join();
-        }
+        self.disk.shutdown();
     }
 }
 
@@ -1323,6 +1403,7 @@ mod tests {
             None,
         );
         job.retry = Some(crate::run_queue::IoCall {
+            uring: None,
             number: 212,
             args,
             deadline: None,
@@ -3640,3 +3721,7 @@ mod tests {
         drop(pool);
     }
 }
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "workers_uring_tests.rs"]
+mod uring_tests;

@@ -33,6 +33,9 @@ impl Vfs {
     }
 }
 impl DescriptorFactory {
+    pub fn files(&self) -> &SharedFiles {
+        &self.files
+    }
     fn local_parameters(kind: u32, protocol: u32) -> Result<()> {
         if kind & !(0xf | O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));

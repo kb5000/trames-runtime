@@ -19,6 +19,8 @@ pub(super) use domains::{Checkpoint, Domain};
 
 #[derive(Clone)]
 pub(super) enum WaitState {
+    /// A lifecycle-owned wait; ring maintenance must not retire its syscall.
+    OwnerEvent,
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -33,6 +35,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
+            Self::OwnerEvent => None,
         }
     }
     fn woken(&self) -> bool {
@@ -62,6 +65,7 @@ pub(super) struct IoCall {
     pub retained_socket: Option<trames_linux::RetainedSocket>,
     pub tcp_liveness: Option<trames_net::TcpLease>,
     pub retained_poll: Option<trames_linux::RetainedPoll>,
+    pub uring: Option<trames_linux::UringEnter>,
     pub deadline: Option<Instant>,
 }
 impl IoCall {
@@ -76,6 +80,7 @@ impl IoCall {
             flock: None,
             tcp_liveness: None,
             retained_poll: None,
+            uring: None,
         }
     }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
@@ -88,6 +93,7 @@ impl IoCall {
             retained_byte: None,
             tcp_liveness: None,
             retained_poll: None,
+            uring: None,
         }
     }
 }
@@ -101,6 +107,7 @@ impl From<&trames_linux::PendingIo> for IoCall {
             retained_socket: io.retained_socket.clone(),
             tcp_liveness: io.tcp_liveness(),
             retained_poll: io.retained_poll.clone(),
+            uring: io.uring_enter(),
             deadline: io.deadline,
         }
     }
@@ -144,6 +151,7 @@ pub(super) struct Job<C: Cpu> {
     pub affinity: u64,
     pub waiting: Option<WaitState>,
     pub io: Option<trames_linux::PendingIo>,
+    pub uring: Option<trames_linux::UringBackground>,
     pub retry: Option<IoCall>,
     pub hardware_wait: Option<Arc<trames_memory::HardwareWait>>,
     pub gpu_pending: Option<crate::gpu::Pending>,
@@ -169,6 +177,7 @@ impl<C: Cpu> Job<C> {
             affinity,
             waiting,
             io: None,
+            uring: None,
             retry: None,
             hardware_wait: None,
             gpu_pending: None,
@@ -182,6 +191,32 @@ impl<C: Cpu> Job<C> {
                 worker: last_cpu,
                 ..Default::default()
             },
+        })
+    }
+    pub(super) fn guest_waiting(&self) -> bool {
+        self.hardware_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready())
+            || self.waiting.as_ref().is_some_and(|wait| !wait.woken())
+            || self.io.as_ref().is_some_and(|io| {
+                !io.signal.ready() && !io.wake_deadline().is_some_and(|d| d <= Instant::now())
+            })
+            || self.gpu_pending.as_ref().is_some_and(|gpu| gpu.waiting())
+    }
+    fn wake_deadline(&self) -> Option<Instant> {
+        [
+            self.waiting.as_ref().and_then(WaitState::deadline),
+            self.io.as_ref().and_then(|io| io.wake_deadline()),
+            self.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()),
+            self.uring.as_ref().and_then(|ring| ring.deadline()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+    fn ring_ready(&self) -> bool {
+        self.uring.as_ref().is_some_and(|ring| {
+            ring.signal.ready() || ring.deadline().is_some_and(|d| d <= Instant::now())
         })
     }
     pub fn finish(self, outcome: Option<SliceOutcome>, peer: u64) -> Done<C> {
@@ -439,18 +474,22 @@ impl<C: Cpu> Epoch<C> {
     /// Only before launch: every View is prepared/admitted before any CPU runs.
     pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
         let pid = job.work.pid;
+        if let Some(snapshot) = &job.work.syscalls {
+            job.uring = snapshot.direct.uring_background(pid, &self.io_target);
+        }
         let mut q = self.queues.lock().unwrap();
         assert!(q.members.insert(pid), "duplicate cohort task");
         q.domains.register(&mut job);
         if let Some(waiting) = &job.waiting {
             waiting.bind(self);
-            if !waiting.woken() {
+            if waiting.woken() {
+                job.work.cpu.set_x(0, 0);
+                job.waiting = None;
+            } else if job.uring.is_none() {
                 self.publish_deadline(waiting.deadline());
                 q.parked.insert(pid, job);
                 return;
             }
-            job.work.cpu.set_x(0, 0);
-            job.waiting = None;
         }
         self.ready(&mut q, job);
     }
@@ -519,14 +558,8 @@ impl<C: Cpu> Epoch<C> {
                 || job.waiting.is_some()
                 || job.io.as_ref().is_some_and(|io| !io.signal.ready())
                 || job.gpu_pending.as_ref().is_some_and(|gpu| gpu.waiting());
-            if pending {
-                self.publish_deadline(
-                    job.waiting
-                        .as_ref()
-                        .and_then(WaitState::deadline)
-                        .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
-                        .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline())),
-                );
+            if pending && !job.ring_ready() {
+                self.publish_deadline(job.wake_deadline());
                 assert!(q.parked.insert(job.work.pid, job).is_none());
             } else {
                 self.ready(&mut q, job);
@@ -567,37 +600,26 @@ impl<C: Cpu> Epoch<C> {
                 .parked
                 .iter()
                 .filter_map(|(&pid, job)| {
-                    (job.waiting
-                        .as_ref()
-                        .and_then(WaitState::deadline)
-                        .or_else(|| job.io.as_ref().and_then(|io| io.wake_deadline()))
-                        .or_else(|| job.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
-                        .is_some_and(|d| d <= now))
-                    .then_some(pid)
+                    (job.wake_deadline().is_some_and(|d| d <= now)).then_some(pid)
                 })
                 .collect();
             for pid in expired {
                 let mut job = q.parked.remove(&pid).unwrap();
-                if let Some(waiting) = job.waiting.take() {
-                    let value = waiting.expire();
-                    job.work.cpu.set_x(0, value);
+                if job
+                    .waiting
+                    .as_ref()
+                    .and_then(WaitState::deadline)
+                    .is_some_and(|d| d <= now)
+                {
+                    let waiting = job.waiting.take().unwrap();
+                    job.work.cpu.set_x(0, waiting.expire());
                 }
                 // I/O must perform a final resource check and scatter, even on
                 // timeout. Keep its pending call and do not execute SVC twice.
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             }
-            let deadline = q
-                .parked
-                .values()
-                .filter_map(|j| {
-                    j.waiting
-                        .as_ref()
-                        .and_then(WaitState::deadline)
-                        .or_else(|| j.io.as_ref().and_then(|io| io.wake_deadline()))
-                        .or_else(|| j.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()))
-                })
-                .min();
+            let deadline = q.parked.values().filter_map(|j| j.wake_deadline()).min();
             self.next_deadline.store(
                 deadline.map_or(u64::MAX, |d| self.deadline_ticks(d)),
                 Ordering::Relaxed,
@@ -611,10 +633,10 @@ impl<C: Cpu> Epoch<C> {
                     j.affinity & (1 << slot) != 0 && !q.initial_slots.contains_key(&j.work.pid)
                 })
             });
-            let external = q
-                .parked
-                .values()
-                .any(|j| j.io.as_ref().is_some_and(|io| io.external_wait()));
+            let external = q.parked.values().any(|j| {
+                j.io.as_ref().is_some_and(|io| io.external_wait())
+                    || j.uring.as_ref().is_some_and(|ring| ring.external())
+            });
             if external && !q.host_waiting && (available.is_none() || !dispatched) {
                 // A parked eventfd can acquire its first native producer on
                 // another worker. Its resource metadata wakes us; initialize
@@ -730,13 +752,48 @@ impl<C: Cpu> Epoch<C> {
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             } else {
-                self.publish_deadline(waiting.deadline());
                 job.waiting = Some(waiting);
-                assert!(q.parked.insert(pid, job).is_none());
+                self.publish_deadline(job.wake_deadline());
+                if job.ring_ready() {
+                    self.ready(&mut q, job);
+                } else {
+                    assert!(q.parked.insert(pid, job).is_none());
+                }
             }
         } else {
             job.stats.yields += 1;
             self.ready(&mut q, job);
+        }
+        self.notify(&mut q);
+    }
+    /// Source-task maintenance reuses the task's existing wait subscriptions.
+    /// It cannot complete an unrelated syscall or rearm a hardware/GPU wait.
+    pub fn park_maintenance(&self, mut job: Box<Job<C>>) {
+        let mut q = self.queues.lock().unwrap();
+        q.running -= 1;
+        q.domains.returned(job.work.pid);
+        if q.domains.paused(job.work.pid) {
+            q.domains.hold(job);
+            q.domains.notify_ready();
+        } else {
+            if job.waiting.as_ref().is_some_and(WaitState::woken) {
+                job.waiting = None;
+                job.work.cpu.set_x(0, 0);
+            } else if job
+                .waiting
+                .as_ref()
+                .and_then(WaitState::deadline)
+                .is_some_and(|d| d <= Instant::now())
+            {
+                let waiting = job.waiting.take().unwrap();
+                job.work.cpu.set_x(0, waiting.expire());
+            }
+            if job.ring_ready() || !job.guest_waiting() {
+                self.ready(&mut q, job);
+            } else {
+                self.publish_deadline(job.wake_deadline());
+                assert!(q.parked.insert(job.work.pid, job).is_none());
+            }
         }
         self.notify(&mut q);
     }
@@ -787,11 +844,11 @@ impl<C: Cpu> Epoch<C> {
         if q.domains.paused(job.work.pid) {
             q.domains.hold(job);
             q.domains.notify_ready();
-        } else if ready {
+        } else if ready || job.ring_ready() {
             job.stats.resumes += 1;
             self.ready(&mut q, job);
         } else {
-            self.publish_deadline(job.io.as_ref().and_then(|io| io.wake_deadline()));
+            self.publish_deadline(job.wake_deadline());
             assert!(q.parked.insert(job.work.pid, job).is_none());
         }
         self.notify(&mut q);
@@ -802,12 +859,12 @@ impl<C: Cpu> Epoch<C> {
         q.domains.returned(job.work.pid);
         job.stats.gpu.waits += 1;
         let ready = !pending.waiting();
-        self.publish_deadline(pending.deadline());
         job.gpu_pending = Some(pending);
+        self.publish_deadline(job.wake_deadline());
         if q.domains.paused(job.work.pid) {
             q.domains.hold(job);
             q.domains.notify_ready();
-        } else if ready {
+        } else if ready || job.ring_ready() {
             job.stats.resumes += 1;
             self.ready(&mut q, job);
         } else {
@@ -941,6 +998,10 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
                     .gpu_pending
                     .as_ref()
                     .is_some_and(|gpu| Arc::ptr_eq(gpu.signal(), signal))
+                || job
+                    .uring
+                    .as_ref()
+                    .is_some_and(|ring| Arc::ptr_eq(&ring.signal, signal))
         }) {
             let mut job = q.parked.remove(&signal.pid).unwrap();
             job.stats.resumes += 1;

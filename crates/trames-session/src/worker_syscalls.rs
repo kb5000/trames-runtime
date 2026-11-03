@@ -34,6 +34,10 @@ pub(super) fn vm_call(number: u32) -> bool {
     matches!(number, 214..=216 | 222 | 226 | 232 | 233)
 }
 
+pub(super) fn vm_entry<C: Cpu>(cpu: &C) -> bool {
+    vm_call(cpu.x(8) as u32) || cpu.x(8) as u32 == 427 && matches!(cpu.x(1), 0 | 22)
+}
+
 /// These calls can request the coordinator without stopping peer CPUs. The
 /// service still admits the actual descriptor kind before doing any effects.
 pub(super) fn network_service_candidate(number: u32) -> bool {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Concurrent guest bytes, never LLVM/Rust references. These copies use ordinary
-//! host instructions; no fence, atomics, speculative overread or stronger order.
+//! host instructions without speculative overread or added ordering. Explicit
+//! protocol-word helpers retain only their required acquire/release order.
 //! The caller retains both allocations and excludes overlapping Rust borrows.
 
 /// Copy exactly `len` nonoverlapping bytes. Either endpoint may be guest RAM.
@@ -98,6 +99,63 @@ pub(crate) unsafe fn copy(mut source: *const u8, mut destination: *mut u8, len: 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     unsafe {
         std::ptr::copy_nonoverlapping(source, destination, len);
+    }
+}
+
+/// An aligned guest protocol word with its original acquire publication order.
+/// No Rust/LLVM reference aliases concurrent native guest accesses.
+///
+/// # Safety
+/// `source` is aligned to four, live and initialized. The caller retains its
+/// allocation and excludes overlapping Rust references. Unsupported hosts must
+/// exclude all concurrent byte actors, as for `copy`.
+#[inline]
+pub(crate) unsafe fn load_acquire_u32(source: *const u8) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let value: u32;
+        unsafe {
+            core::arch::asm!("ldar {value:w}, [{source}]", source=in(reg) source,
+            value=out(reg) value, options(nostack, preserves_flags));
+        }
+        value
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u32;
+        unsafe {
+            core::arch::asm!("mov {value:e}, dword ptr [{source}]", source=in(reg) source,
+            value=out(reg) value, options(nostack, preserves_flags));
+        }
+        value
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    unsafe {
+        (&*source.cast::<std::sync::atomic::AtomicU32>()).load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Release publication paired with a guest protocol's acquire load.
+///
+/// # Safety
+/// The aligned destination is live, initialized and writable, with the same
+/// allocation/reference/exclusion conditions as `load_acquire_u32`.
+#[inline]
+pub(crate) unsafe fn store_release_u32(destination: *mut u8, value: u32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("stlr {value:w}, [{destination}]", destination=in(reg) destination,
+        value=in(reg) value, options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov dword ptr [{destination}], {value:e}", destination=in(reg) destination,
+        value=in(reg) value, options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    unsafe {
+        (&*destination.cast::<std::sync::atomic::AtomicU32>())
+            .store(value, std::sync::atomic::Ordering::Release);
     }
 }
 

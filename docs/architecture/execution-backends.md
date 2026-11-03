@@ -1923,3 +1923,40 @@ unsafe or broader Send implementation is required by this batch.
 Structural guest mapping import, task-exit/context cancellation, io_uring controls
 and filesystem/VM/task topology still have genuine owner boundaries. This batch
 does not claim a whole application or the complete runtime is coordinator-free.
+
+
+## Canonical io_uring subsystem (2026-11-03)
+
+The original Arc<Uring> owns shared SQ/CQ/SQE pages, registration tables and all
+pending/overflow/link/timer/multishot state. Worker and joined paths share one
+importer and progression engine. The per-ring mutex protects metadata claims;
+resource algorithms, guest byte accesses, notifications and final OFD release run
+outside it. Live Files authority admits newly created/transferred rings directly.
+A blocked enter carries its accepted original ring across epochs and numeric FD
+reuse; no queue snapshot/handoff restoration is required.
+
+Each source task lazily retains a private sealed path-query island over original
+shared Files/namespace/device resources. Accepted requests retain a cleanup token
+with a weak actor link; rings never own the source task or Files root. Pending
+owner-accepted SQEs acquire this source context before worker maintenance without
+re-reading guest metadata. Existing run-queue jobs service actual notifications
+and deadlines while the source guest sleeps or waits elsewhere. The unrelated
+main wait is preserved. Real owner fallback is remembered until owner progress,
+so a compatibility request cannot repeatedly stop an otherwise empty cohort.
+No new coordinator/service thread, polling bus or per-poll RPC is introduced.
+
+Original native TCP/Unix controls and message algorithms remain responsible for
+resource semantics. Pinning is an affected-mm mutation through the original VM
+checkpoint; supported fixed buffers then share canonical guest pages with CPU
+and native memory access. Provided-buffer unregister/reuse cannot retarget an
+in-flight buffer generation. Unix SCM_RIGHTS and ring fixed/pending resources use
+one owning graph, with retired original handles dropped outside graph/ring locks.
+Owner-only Rc descriptions remain in their original owner ledger; their worker
+tokens cannot clone/drop Rc or bypass the existing supported-resource filter.
+
+Plain disk fsync submits an original retained OFD/job to the existing bounded disk
+pool and wakes the source directly through readiness. No coordinator response is
+required. Disk/mapped/overlay allocation and truncation, O_TRUNC open, backing
+write growth/append, owner-only task/mount/proc resources and lifecycle/VM topology
+remain explicit compatibility checkpoints. Common code is shared by Mac/iPad;
+HVF only supplies CPU/MMU execution.

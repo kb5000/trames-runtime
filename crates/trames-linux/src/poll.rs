@@ -168,6 +168,10 @@ impl Poll {
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
         self.direct().flat_map(|fd| fd.subscribe(signal)).collect()
     }
+    pub fn poll_resources(&self) -> Vec<Arc<dyn trames_vfs::DirectPoll>> {
+        self.direct().flat_map(|fd| fd.poll_resources()).collect()
+    }
+    #[cfg(test)]
     pub fn poll_identities(&self) -> Vec<usize> {
         self.direct().flat_map(|fd| fd.poll_identities()).collect()
     }
@@ -277,6 +281,10 @@ impl RetainedPoll {
     pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
         self.0.subscribe(signal)
     }
+    pub(crate) fn poll_resources(&self) -> Vec<Arc<dyn trames_vfs::DirectPoll>> {
+        self.0.poll_resources()
+    }
+    #[cfg(test)]
     pub(crate) fn poll_identities(&self) -> Vec<usize> {
         self.0.poll_identities()
     }
@@ -363,78 +371,44 @@ impl RetainedSelect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::rc::Rc;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
-    use trames_vfs::DirectPoll;
 
-    struct EpochPoll {
-        id: usize,
-        counter: DirectFd,
-    }
-    impl DirectPoll for EpochPoll {
-        fn identity(&self) -> usize {
-            self.id
-        }
-        fn poll(&self, events: u16) -> (u16, [u64; 2]) {
-            self.counter.poll_state(events).unwrap()
-        }
-        fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
-            self.counter.subscribe(signal).pop().unwrap()
-        }
-    }
     #[test]
-    fn owner_poll_rebinds_epoch_capability_only_for_the_same_actual_ofd() {
+    fn accepted_poll_keeps_the_live_ring_across_captures_and_numeric_fd_replacement() {
         let mut v = Vfs::default();
         let (fd, ring) = v.uring_create(2, 4).unwrap();
-        let mut counters = Vfs::default();
-        let old_counter = counters.eventfd(0, 0).unwrap();
-        let new_counter = counters.eventfd(1, 0).unwrap();
-        let counter_caps = counters.direct_descriptors();
         let mut m = Memory::default();
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         m.write_array(0x1000, fd.to_le_bytes()).unwrap();
         m.write_array(0x1004, 1u32.to_le_bytes()).unwrap();
-        let key = Rc::as_ptr(&ring) as usize;
-        let old: Arc<dyn DirectPoll> = Arc::new(EpochPoll {
-            id: 1,
-            counter: counter_caps.get(old_counter).unwrap(),
-        });
-        let fresh: Arc<dyn DirectPoll> = Arc::new(EpochPoll {
-            id: 2,
-            counter: counter_caps.get(new_counter).unwrap(),
-        });
-        let before = v.direct_descriptors_with_polls(&BTreeMap::from([(key, old)]));
-        let poll = Poll::prepare(&before, &m, [0x1000, 1, 0, 0, 0, 0])
+        let key = Arc::as_ptr(&ring) as usize;
+        let poll = Poll::prepare(&v.direct_descriptors(), &m, [0x1000, 1, 0, 0, 0, 0])
             .unwrap()
             .unwrap()
             .retain();
-        assert_eq!(poll.poll_identities(), [1]);
-        assert_eq!(poll.check(&mut m, None), Err(Errno(11)));
-        let after = v.direct_descriptors_with_polls(&BTreeMap::from([(key, fresh.clone())]));
-        let resumed = poll.rearm(&after).unwrap();
-        assert_eq!(resumed.poll_identities(), [2]);
-        assert_eq!(resumed.check(&mut m, None), Ok(1));
+        assert_eq!(poll.poll_identities(), [key]);
         assert_eq!(poll.check(&mut m, None), Err(Errno(11)));
         let joined = RetainedPoll::prepare_joined(&v, &m, [0x1000, 1, 0, 0, 0, 0]).unwrap();
         assert!(joined.supports_worker(&v));
-        let joined_rearmed = joined.rearm(&after).unwrap();
-        assert_eq!(joined_rearmed.poll_identities(), [2]);
-        assert_eq!(joined_rearmed.check(&mut m, None), Ok(1));
-
-        // An independent VFS starts with the same numeric descriptor and local
-        // counters. Its actual OFD must never satisfy the old weak identity.
+        let resumed = poll.rearm(&v.direct_descriptors()).unwrap();
+        assert_eq!(resumed.poll_identities(), [key]);
+        {
+            let mut state = ring.state.lock().unwrap();
+            state.overflow.push_back((1, 0, 0));
+            ring.flush(&mut state).unwrap();
+        }
+        assert_eq!(poll.check(&mut m, None), Ok(1));
+        assert_eq!(resumed.check(&mut m, None), Ok(1));
         let mut unrelated = Vfs::default();
-        let (other_fd, other_ring) = unrelated.uring_create(2, 4).unwrap();
+        let (other_fd, other) = unrelated.uring_create(2, 4).unwrap();
         assert_eq!(fd, other_fd);
-        let other = unrelated.direct_descriptors_with_polls(&BTreeMap::from([(
-            Rc::as_ptr(&other_ring) as usize,
-            fresh,
-        )]));
-        let invalid = poll.rearm(&other).unwrap();
-        assert!(joined.rearm(&other).is_none());
-        assert!(invalid.poll_identities().is_empty());
-        assert_eq!(invalid.check(&mut m, None), Ok(1));
-        assert_eq!(m.read_array::<2>(0x1006).unwrap(), 32u16.to_le_bytes());
+        let rearmed = joined.rearm(&unrelated.direct_descriptors()).unwrap();
+        assert_eq!(rearmed.poll_identities(), [key]);
+        assert_eq!(rearmed.check(&mut m, None), Ok(1));
+        let fresh = Poll::prepare(&unrelated.direct_descriptors(), &m, [0x1000, 1, 0, 0, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.poll_identities(), [Arc::as_ptr(&other) as usize]);
+        assert_eq!(fresh.check(&mut m, None), Err(Errno(11)));
     }
 }

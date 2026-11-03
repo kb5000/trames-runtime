@@ -130,9 +130,11 @@ struct OwnerEntry {
 #[derive(Default)]
 pub(super) struct OwnerLedger {
     entries: RefCell<BTreeMap<(usize, u64), OwnerEntry>>,
+    pub(super) uring: RefCell<BTreeMap<u64, (std::sync::Weak<()>, RetainedFd)>>,
 }
 impl OwnerLedger {
     fn reap(&self) {
+        self.reap_uring();
         loop {
             let removed: Vec<_> = {
                 let mut entries = self.entries.borrow_mut();
@@ -159,7 +161,30 @@ impl OwnerLedger {
             drop(removed);
         }
     }
+    pub(super) fn reap_uring(&self) {
+        // Owner projections never cross threads. A worker drops only its Arc
+        // token; original Rc descriptions retire at the next owner boundary.
+        let removed: Vec<_> = {
+            let mut entries = self.uring.borrow_mut();
+            let dead: Vec<_> = entries
+                .iter()
+                .filter_map(|(id, (live, _))| (live.strong_count() == 0).then_some(*id))
+                .collect();
+            dead.into_iter()
+                .filter_map(|id| entries.remove(&id))
+                .collect()
+        };
+        drop(removed);
+    }
     fn needs_reap(&self) -> bool {
+        if self
+            .uring
+            .borrow()
+            .values()
+            .any(|(live, _)| live.strong_count() == 0)
+        {
+            return true;
+        }
         self.entries.borrow().values().any(|entry| {
             entry
                 .channel

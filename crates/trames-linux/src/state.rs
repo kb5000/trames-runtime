@@ -23,7 +23,7 @@ const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 pub struct Linux {
     pub(crate) batch_pipe_signal: bool,
     pub(crate) uring_clock: std::time::Instant,
-    pub(crate) uring_active: Vec<std::rc::Weak<trames_vfs::Uring>>,
+    pub(crate) uring_actor: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::UringActor>>>,
     pub vfs: Vfs,
     pub trace: bool,
     /// Initial session capacity for guest processes and threads. Jobs and
@@ -59,7 +59,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: self.uring_clock,
-            uring_active: self.uring_active.clone(),
+            uring_actor: Default::default(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
             trace: self.trace,
             task_limit: self.task_limit,
@@ -103,7 +103,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: std::time::Instant::now(),
-            uring_active: Vec::new(),
+            uring_actor: Default::default(),
             vfs: Vfs::default(),
             trace: false,
             task_limit: trames_vfs::MAX_TASKS,
@@ -662,7 +662,7 @@ impl Linux {
         vfs: &Vfs,
         a: [u64; 6],
         path: &[u8],
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
     ) -> Result<u64> {
         let flags = a[2] as u32;
         if flags & !0x7900 != 0 || flags & 0x6000 == 0x6000 || a[3] as u32 & 0x80000000 != 0 {

@@ -373,6 +373,48 @@ impl MutablePage {
         self.changed(&mut raw.ownership, offset, bytes.len());
         raw.write_from(offset, bytes);
     }
+    /// Read a protocol publication word without exposing native guest bytes as
+    /// Rust references. Ordinary page access does not gain a memory barrier.
+    ///
+    /// # Safety
+    /// The storage address at `offset` is four-byte aligned and
+    /// `offset + 4 <= PAGE_SIZE`. Kernel queue mappings are page-aligned.
+    pub unsafe fn load_acquire_u32(&self, offset: usize) -> u32 {
+        debug_assert!(offset.is_multiple_of(4) && offset <= PAGE - 4);
+        let raw = self.raw_lock(offset, 4);
+        // SAFETY: private protocol offsets satisfy the caller's contract;
+        // region ownership retains storage and excludes all Rust byte borrows.
+        unsafe {
+            crate::raw::load_acquire_u32(
+                raw.ownership
+                    .page()
+                    .storage()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset),
+            )
+        }
+    }
+    /// Publish one protocol word with the original release order and monitor
+    /// bookkeeping, without constructing a Rust/LLVM atomic byte reference.
+    ///
+    /// # Safety
+    /// The same alignment/range contract as `load_acquire_u32` applies.
+    pub unsafe fn store_release_u32(&self, offset: usize, value: u32) {
+        debug_assert!(offset.is_multiple_of(4) && offset <= PAGE - 4);
+        let mut raw = self.raw_lock(offset, 4);
+        self.changed(&mut raw.ownership, offset, 4);
+        let page = raw.ownership.page();
+        unsafe {
+            crate::raw::store_release_u32(
+                page.storage().write_ptr(&page.unmaterialized).add(offset),
+                value,
+            );
+        }
+        if let Bytes::Hardware(storage) = page.storage() {
+            storage.publish_host_write(offset, 4);
+        }
+    }
     pub(crate) fn raw_lock(&self, offset: usize, len: usize) -> RawGuard<'_> {
         let regions = self.lock_regions(mask(offset, len));
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -768,6 +810,49 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn native_queue_publication_orders_payload_and_acknowledgement() {
+        #[repr(align(4096))]
+        struct Storage(UnsafeCell<[u8; PAGE]>);
+        // SAFETY: storage is touched only by the native raw transport and the
+        // original SharedPage guards. The protocol orders payload ownership;
+        // neither thread constructs a reference into concurrent native bytes.
+        unsafe impl Sync for Storage {}
+        let storage = std::sync::Arc::new(Storage(UnsafeCell::new([0; PAGE])));
+        let pointer = storage.0.get().cast::<u8>();
+        let address = pointer as usize;
+        // SAFETY: the initialized aligned page stays owned by this Arc. No
+        // storage reference or mutable Rust slice survives its publication.
+        let page = unsafe { MutablePage::from_mapping(pointer, storage) };
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let pointer = address as *mut u8;
+                for sequence in 1..=4096u32 {
+                    // Test-only rendezvous models a native guest producer.
+                    while unsafe { crate::raw::load_acquire_u32(pointer.add(4)) } != sequence - 1 {
+                        std::thread::yield_now();
+                    }
+                    let payload = [sequence as u8; 32];
+                    unsafe {
+                        crate::raw::copy(payload.as_ptr(), pointer.add(64), payload.len());
+                        crate::raw::store_release_u32(pointer, sequence);
+                    }
+                }
+            });
+            for sequence in 1..=4096u32 {
+                while unsafe { page.load_acquire_u32(0) } != sequence {
+                    std::thread::yield_now();
+                }
+                let mut payload = [0; 32];
+                page.copy_read(64, &mut payload);
+                assert_eq!(payload, [sequence as u8; 32]);
+                unsafe {
+                    page.store_release_u32(4, sequence);
+                }
+            }
+        });
+    }
     #[test]
     fn unpublished_bytes_keep_one_allocation_and_switch_to_guarded_publication() {
         let page = MutablePage::zero();

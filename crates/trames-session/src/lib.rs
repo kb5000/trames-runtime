@@ -198,7 +198,7 @@ pub struct RuntimeMetrics {
     pub vm_checkpoint_spaces: u64,
     /// Calls requiring an mm checkpoint: brk, munmap, mremap, mmap, mprotect,
     /// mincore, destructive madvise, advisory madvise. Counts are not pauses.
-    pub vm_checkpoint_calls: [u64; 8],
+    pub vm_checkpoint_calls: [u64; 9],
     /// Group wall times: quiescence, owner queue, commit, syscalls, rebuild, resume, exclusive CPU.
     /// Disjoint groups can overlap, so summed durations are not session wall time.
     pub vm_checkpoint_time: [std::time::Duration; 7],

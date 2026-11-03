@@ -15,9 +15,12 @@ mod local_message;
 #[cfg(test)]
 mod netlink;
 mod socket_wait;
-mod uring;
+pub(crate) mod uring;
 pub use socket_wait::RetainedSocket;
-pub use uring::{UringEpoch, UringSnapshot};
+pub use uring::{
+    UringActor, UringBackground, UringDiskExecutor, UringDiskResult, UringEnter, UringEpoch,
+    UringSnapshot,
+};
 
 fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
     let (fd, lease) = tcp.readiness_fd()?;
@@ -170,6 +173,7 @@ pub struct DirectSyscalls {
     paths: Option<trames_vfs::PathQueries>,
     resources: Option<trames_vfs::DescriptorFactory>,
     urings: UringSnapshot,
+    uring_disk: Option<Arc<dyn UringDiskExecutor>>,
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
     terminal: Option<trames_vfs::TerminalAccess>,
@@ -195,6 +199,7 @@ impl DirectSyscalls {
             paths: None,
             resources: None,
             urings: Default::default(),
+            uring_disk: None,
             descriptors,
             network: Default::default(),
             terminal: None,
@@ -222,7 +227,11 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_creation(&self, number: u32) -> bool {
-        matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199) && self.resources.is_some()
+        if number == 425 {
+            self.paths.is_some()
+        } else {
+            matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199) && self.resources.is_some()
+        }
     }
     pub fn invoke_creation(
         &self,
@@ -230,6 +239,19 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if number == 425 {
+            let paths = self.paths.as_ref()?;
+            let result = (|| {
+                let (entries, cq_entries, output) = crate::uring::setup_parameters(a, memory)?;
+                paths
+                    .uring_create_with_output(entries, cq_entries, || {
+                        memory.write(a[1], &output).map_err(|_| Errno(14))
+                    })
+                    .map(u64::from)
+            })();
+            self.urings.record_completed();
+            return Some(result);
+        }
         let result = crate::descriptor_create::call(self.resources.as_ref()?, number, a, memory)?;
         self.record_fd_control();
         Some(result)
@@ -423,6 +445,10 @@ impl DirectSyscalls {
     }
     pub fn with_network(mut self, network: trames_vfs::DirectNetwork) -> Self {
         self.network = network;
+        self
+    }
+    pub fn with_uring_disk(mut self, disk: Arc<dyn UringDiskExecutor>) -> Self {
+        self.uring_disk = Some(disk);
         self
     }
     pub fn with_urings(mut self, snapshot: UringSnapshot) -> Self {
@@ -648,7 +674,7 @@ impl DirectSyscalls {
             return self.files.get(args[0] as u32).is_some();
         }
         if number == 426 {
-            return self.urings.contains(args[0] as u32);
+            return self.urings.available();
         }
         if number == 427 {
             return self.urings.supports_register(args);
@@ -1030,6 +1056,12 @@ impl DirectSyscalls {
             return self.urings.register(args, memory, pid);
         }
         if number == 426 {
+            self.urings.ensure_context(
+                self.paths.as_ref(),
+                self.resources.as_ref(),
+                &self.files,
+                self.uring_disk.as_ref(),
+            );
             let attempt = self.urings.start(args, memory, pid, target)?;
             return Some(attempt);
         }
@@ -1047,7 +1079,7 @@ impl DirectSyscalls {
                 Some(Err(error)) => return Some(self.complete(number, args, Err(error))),
                 None => return Some(IoAttempt::Checkpoint),
             };
-            if !self.urings.poll_pump(&prepared.poll_identities(), memory) {
+            if !self.urings.poll_pump(&prepared.poll_resources(), memory) {
                 return Some(IoAttempt::Checkpoint);
             }
             match prepared.check(memory, deadline) {
@@ -1072,7 +1104,7 @@ impl DirectSyscalls {
                             .descriptors
                             .get(args[0] as u32)
                             .unwrap()
-                            .poll_identities(),
+                            .poll_resources(),
                         memory,
                     ) {
                         return Some(IoAttempt::Checkpoint);
@@ -1420,12 +1452,12 @@ impl DirectSyscalls {
         }
         if pending.poll_uring.is_none() {
             let ids = if let Some(poll) = &pending.retained_poll {
-                poll.poll_identities()
+                poll.poll_resources()
             } else if matches!(pending.number, 22 | 441) {
                 self.descriptors
                     .get(pending.args[0] as u32)
                     .unwrap()
-                    .poll_identities()
+                    .poll_resources()
             } else {
                 Vec::new()
             };
@@ -1560,7 +1592,7 @@ impl DirectSyscalls {
             let result = match poll_deadline(memory, args[2], None) {
                 Ok(deadline) => {
                     let poll = crate::poll::Poll::prepare(&self.descriptors, memory, args)?;
-                    if poll.as_ref().is_ok_and(|p| !p.poll_identities().is_empty()) {
+                    if poll.as_ref().is_ok_and(|p| !p.poll_resources().is_empty()) {
                         return None;
                     }
                     poll.and_then(|p| p.check(memory, deadline))
@@ -1650,14 +1682,17 @@ mod tests {
         assert_eq!(v.flags(writer), Err(Errno(9)));
         assert_eq!(direct.fd_control_completed(), 4);
         let (owner, _ring) = v.uring_create(2, 4).unwrap();
-        assert!(direct
-            .invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0])
-            .is_none());
-        assert!(direct
-            .invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0])
-            .is_none());
-        assert_eq!(v.fd_kind(owner), Ok(trames_vfs::FdKind::Anonymous));
-        assert_eq!(direct.fd_control_completed(), 4); // owner fallback had no effects
+        assert_eq!(
+            direct.invoke_membership(24, [reader as u64, owner as u64, 0, 0, 0, 0]),
+            Some(Ok(owner as u64))
+        );
+        assert_eq!(v.fd_kind(owner), Ok(trames_vfs::FdKind::PipeWrite));
+        assert_eq!(
+            direct.invoke_membership(57, [owner as u64, 0, 0, 0, 0, 0]),
+            Some(Ok(0))
+        );
+        assert_eq!(v.fd_kind(owner), Err(Errno(9)));
+        assert_eq!(direct.fd_control_completed(), 6);
     }
     #[test]
     fn shared_anonymous_waits_keep_original_event_timer_and_inotify_after_fd_reuse() {

@@ -53,8 +53,10 @@ mod epoll;
 mod events;
 mod uring;
 pub use uring::{
-    RetainedFd, Uring, UringBufferGroup, UringBufferSource, UringProvidedBuffer, UringRequest,
-    UringSqe, UringState, URING_CQES, URING_MAX_ENTRIES, URING_OPS, URING_SQ_ARRAY,
+    RetainedFd, Uring, UringBufferGroup, UringBufferSource, UringExecutionLease, UringFile,
+    UringFileView, UringObject, UringProvidedBuffer, UringRequest, UringResource, UringRetirement,
+    UringRunning, UringSource, UringSqe, UringState, URING_CQES, URING_MAX_ENTRIES, URING_OPS,
+    URING_SQ_ARRAY,
 };
 mod executable;
 pub use executable::ExecutableFile;

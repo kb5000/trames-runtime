@@ -8,6 +8,7 @@ use super::*;
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
     pub(super) devices: Arc<cgroup::DeviceAccess>,
+    pub(super) retained: Option<(u32, SharedFd)>,
     deferred: Rc<Cell<bool>>,
     // Keep the private weak mount registry alive, including detached mounts.
     _mounts: Vec<Rc<Mount>>,
@@ -18,6 +19,14 @@ impl Authority {
         Err(Errno(95)) // internal only; PathQueries returns None, not this errno
     }
     pub(super) fn descriptor(&self, fd: u32) -> Result<Descriptor> {
+        if let Some((alias, file)) = &self.retained {
+            if *alias == fd {
+                return Ok(Descriptor {
+                    open: OpenHandle::Shared(file.open.clone()),
+                    cloexec: false.into(),
+                });
+            }
+        }
         let Some(file) = self.files.query_lookup(fd) else {
             return self.defer();
         };
@@ -110,6 +119,7 @@ impl Vfs {
             .collect();
         *view.mount_registry.borrow_mut() = registry.iter().map(Rc::downgrade).collect();
         view.credentials = self.credentials.clone();
+        view.file_size_limit = self.file_size_limit;
         view.context.share_mask(&self.context);
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
@@ -122,8 +132,15 @@ impl Vfs {
             pseudo.nodes = source.nodes.clone();
         }
         view.query = Some(Authority {
-            files: self.shared_files(),
-            devices: self.device_access(),
+            files: self
+                .query
+                .as_ref()
+                .map_or_else(|| self.shared_files(), |q| q.files.clone()),
+            retained: None,
+            devices: self
+                .query
+                .as_ref()
+                .map_or_else(|| self.device_access(), |q| q.devices.clone()),
             deferred: Rc::new(Cell::new(false)),
             _mounts: mounts.into_values().collect(),
         });
@@ -133,6 +150,146 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    /// Fresh private control graph; only the original shared Files/resources
+    /// are retained. No Rc from this query island escapes to the new one.
+    pub fn retain_context(&self) -> Self {
+        self.view.borrow().path_queries()
+    }
+    pub fn uring_file_control(
+        &self,
+        file: &UringFile,
+        opcode: u8,
+        flags: u32,
+        offset: u64,
+        address: u64,
+        length: u32,
+    ) -> Option<Result<()>> {
+        file.shared_file()?;
+        self.uring_query(|view| {
+            view.with_uring_fd(file, |view, fd| {
+                let descriptor = view.descriptor(fd)?;
+                let open = descriptor.open.borrow();
+                let filesystem = open.mount.as_ref().map_or(&view.fs, |m| &m.fs);
+                if filesystem.has_overlay()
+                    || filesystem.borrow().disk.is_some()
+                    || open.node.as_ref().is_some_and(|n| {
+                        matches!(&n.borrow().content, Content::File(data)
+                    if !matches!(data, storage::FileData::Plain(p) if p.disk_source().is_none()))
+                    })
+                {
+                    return view.query.as_ref().unwrap().defer();
+                }
+                #[cfg(all(feature = "hostfs", unix))]
+                if open.host_file.is_some() {
+                    return view.query.as_ref().unwrap().defer();
+                }
+                drop(open);
+                match opcode {
+                    3 => view.sync_fd(fd, flags & 1 != 0),
+                    17 => view.allocate_fd(fd, length as u64, offset, address),
+                    55 => view.truncate_fd(fd, offset),
+                    _ => unreachable!("sealed io_uring file operation"),
+                }
+            })
+        })
+    }
+    pub fn uring_disk_sync(
+        &self,
+        file: &UringFile,
+        data_only: bool,
+    ) -> Option<Result<Option<DiskSyncJob>>> {
+        file.shared_file()?;
+        self.uring_query(|view| {
+            view.with_uring_fd(file, |view, fd| {
+                view.prepare_disk_sync(fd, data_only)
+                    .map(|prepared| prepared.map(|(_, job)| job))
+            })
+        })
+    }
+    #[allow(clippy::too_many_arguments)] // Original openat2 operands and source Files authority.
+    pub fn uring_open(
+        &self,
+        file: Option<&UringFile>,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        policy: u64,
+        files: &DirectFiles,
+    ) -> Option<Result<u32>> {
+        if flags & O_PATH == 0 && flags & 0x200 != 0 {
+            return None;
+        }
+        if file.is_some_and(|f| f.shared_file().is_none()) {
+            return None;
+        }
+        self.uring_query(|v| {
+            if let Some(file) = file {
+                v.with_uring_path_fd(file, |v, alias| {
+                    v.open_at_resolve_published(
+                        alias as i32,
+                        path,
+                        flags,
+                        mode,
+                        policy,
+                        Some(files),
+                    )
+                })
+            } else {
+                v.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files))
+            }
+        })
+    }
+    pub fn uring_stat(
+        &self,
+        file: Option<&UringFile>,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+    ) -> Option<Result<([u8; 128], u64)>> {
+        if file.is_some_and(|f| f.shared_file().is_none()) {
+            return None;
+        }
+        self.uring_query(|v| {
+            let operation = |v: &mut Vfs, dirfd: i32| {
+                if path.is_empty() && flags & 0x1000 != 0 {
+                    if dirfd == AT_FDCWD {
+                        v.stat_at_with_mount(AT_FDCWD, b".", false)
+                    } else {
+                        v.stat_fd_with_mount(dirfd as u32)
+                    }
+                } else {
+                    v.stat_at_with_mount(dirfd, path, flags & 0x100 != 0)
+                }
+            };
+            if let Some(file) = file {
+                v.with_uring_path_fd(file, |v, alias| operation(v, alias as i32))
+            } else {
+                operation(v, dirfd)
+            }
+        })
+    }
+    fn uring_query<T>(&self, operation: impl FnOnce(&mut Vfs) -> Result<T>) -> Option<Result<T>> {
+        let mut view = self.view.borrow_mut();
+        let deferred = view.query.as_ref().unwrap().deferred.clone();
+        deferred.set(false);
+        let result = operation(&mut view);
+        (!deferred.replace(false)).then_some(result)
+    }
+    /// Anonymous kernel resources use the original filesystem/budget and live
+    /// Files domain, with no pathname lookup or owner control projection.
+    pub fn uring_create_with_output(
+        &self,
+        entries: u32,
+        cq_entries: u32,
+        output: impl FnOnce() -> Result<()>,
+    ) -> Result<u32> {
+        self.view
+            .borrow_mut()
+            .uring_create_with_output(entries, cq_entries, output)
+            .map(|(fd, _)| fd)
+    }
+
     pub fn local_datagram(
         &self,
         socket: &LocalOperation,

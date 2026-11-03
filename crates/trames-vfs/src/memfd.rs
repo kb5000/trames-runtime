@@ -79,7 +79,7 @@ impl Vfs {
         Ok(fd)
     }
     // Construct before publication: io_uring uses the same backing allocator,
-    // but its final OFD also owns an owner-local ring control graph.
+    // and publishes its complete shared queue/control graph in one operation.
     pub(super) fn memfd_description(
         &mut self,
         name: &[u8],
@@ -92,6 +92,10 @@ impl Vfs {
             return Err(Errno(22));
         }
         let fd = self.available(0)?;
+        Ok((fd, self.memfd_open(name, flags)?))
+    }
+    /// Caller validates the fixed creation parameters and reserves its FD first.
+    pub(super) fn memfd_open(&mut self, name: &[u8], flags: u32) -> Result<OpenDescription> {
         let mut fs = self.fs.borrow_mut();
         fs.admit_inode()?;
         let inode = fs.next_inode;
@@ -159,7 +163,7 @@ impl Vfs {
             oom: None,
             mount: None,
         };
-        Ok((fd, open))
+        Ok(open)
     }
     /// A managed shared inode capability for native protocol FD translation.
     /// Guest descriptor numbers and guest-selected host paths never cross here.

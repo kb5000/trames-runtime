@@ -309,6 +309,12 @@ pub struct SharedFd {
     pub(super) open: Arc<SharedOpenDescription>,
 }
 impl SharedFd {
+    pub fn uring(&self) -> Option<Arc<Uring>> {
+        match &self.open.control {
+            Some(events::SharedControl::Uring(ring)) => Some(ring.clone()),
+            _ => None,
+        }
+    }
     pub(super) fn native_image(&self) -> Option<Arc<dyn trames_graphics::Image>> {
         self.open.native_image.clone()
     }
@@ -352,6 +358,10 @@ impl SharedFd {
         Some(fd.with_ofd(self))
     }
     pub(super) fn direct_poll(self) -> Option<DirectFd> {
+        if let Some(ring) = self.uring() {
+            return Some(DirectFd::uring_poll(&self.open, ring).with_ofd(self));
+        }
+
         if self.open.kind == FdKind::Socket && self.open.local.is_none() {
             if let Some(mut fd) = DirectFd::netlink_poll(&self.open) {
                 fd.origin = Some(OfdIdentity::new(&self.open));
@@ -671,7 +681,7 @@ type PreparedBytes = Arc<[Option<DirectFd>]>;
 pub(super) struct DescriptorVersion {
     pub(super) io: OnceCell<(FdMask, FdMask)>,
     pub(super) direct: RefCell<Option<(u64, PreparedBytes)>>,
-    pub(super) urings: OnceCell<Vec<Weak<Uring>>>,
+    pub(super) urings: OnceCell<Vec<std::sync::Weak<Uring>>>,
     pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
 }
 impl DescriptorTable {
@@ -1063,15 +1073,15 @@ mod tests {
         assert_eq!(v.read(reader, 1).unwrap(), b"");
     }
     #[test]
-    fn owner_control_slots_are_excluded_before_structural_effects() {
+    fn shared_ring_slots_support_structural_effects_without_owner_projections() {
         let mut v = Vfs::default();
         let [_, writer] = v.pipe(O_NONBLOCK).unwrap();
         let (owner, _ring) = v.uring_create(2, 4).unwrap();
         let files = v.shared_files();
-        assert!(files.close(owner, 0).is_none());
-        assert!(files.duplicate(owner, 160, false).is_none());
-        assert!(files.duplicate_to(writer, owner, 0, 0).is_none());
-        assert!(v.flags(owner).is_ok());
+        assert_eq!(files.duplicate(owner, 160, false), Some(Ok(160)));
+        assert_eq!(files.duplicate_to(writer, owner, 0, 0), Some(Ok(owner)));
+        assert_eq!(v.fd_kind(owner), Ok(FdKind::PipeWrite));
+        assert_eq!(files.close(160, 0), Some(Ok(())));
         assert_eq!(v.flags(160), Err(Errno(9)));
     }
     #[test]

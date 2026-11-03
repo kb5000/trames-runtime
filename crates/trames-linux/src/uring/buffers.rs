@@ -3,10 +3,9 @@
 //! ranges; only a registered descriptor ring is pinned, never implicitly the data.
 use super::{u32_at, u64_at, Linux, Result};
 use std::collections::{BTreeMap, VecDeque};
-use trames_memory::{Access, Memory, MemoryError, PAGE_SIZE};
+use trames_memory::{Access, MemoryError, PAGE_SIZE};
 use trames_vfs::{
-    Errno, UringBufferGroup, UringBufferSource, UringProvidedBuffer, UringRequest, UringSqe,
-    UringState,
+    Errno, UringBufferGroup, UringBufferSource, UringProvidedBuffer, UringSqe, UringState,
 };
 const MAX_SLOTS: usize = 65536;
 const MAX_GROUPS: usize = 256;
@@ -22,111 +21,6 @@ fn capacity(
     }
     Ok(())
 }
-impl Linux {
-    pub(super) fn uring_buffer_register(
-        &mut self,
-        state: &mut UringState,
-        a: [u64; 6],
-        memory: &mut Memory,
-    ) -> Result<u64> {
-        if matches!(a[1], 23 | 26) {
-            return ring_control(&mut state.provided, a, memory);
-        }
-        if a[3] != 1 {
-            return Err(Errno(22));
-        }
-        let bytes = memory.read_array::<40>(a[2]).map_err(|_| Errno(14))?;
-        let id = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
-        if bytes[14..].iter().any(|b| *b != 0) {
-            return Err(Errno(22));
-        }
-        let address = u64_at(&bytes, 0);
-        let entries = u32_at(&bytes, 8);
-        if !address.is_multiple_of(PAGE_SIZE)
-            || entries == 0
-            || entries > 32768
-            || !entries.is_power_of_two()
-        {
-            return Err(Errno(22));
-        }
-        if state.provided.contains_key(&id) {
-            return Err(Errno(17));
-        }
-        capacity(&state.provided, entries as usize, true)?;
-        let ring = memory
-            .pin_rw(address, entries as usize * 16)
-            .map_err(|e| match e {
-                MemoryError::Limit => Errno(12),
-                MemoryError::BackingIo(95) => Errno(95),
-                _ => Errno(14),
-            })?;
-        state.provided.insert(
-            id,
-            UringBufferGroup {
-                owner: memory.instruction_identity().0,
-                source: UringBufferSource::Ring {
-                    memory: std::sync::Arc::new(ring),
-                    head: 0,
-                    entries: entries as u16,
-                },
-            },
-        );
-        Ok(0)
-    }
-    pub(super) fn uring_provide(
-        &mut self,
-        request: &UringRequest,
-        state: &mut UringState,
-    ) -> Result<(i32, bool)> {
-        provide(&request.sqe, request.owner, &mut state.provided)
-    }
-    pub(super) fn uring_selected_io(
-        &mut self,
-        request: &UringRequest,
-        state: &mut UringState,
-        memory: &mut Memory,
-    ) -> (Result<(i32, bool)>, u32) {
-        let selected = match peek(&request.sqe, request.owner, &state.provided) {
-            Ok(b) => b,
-            Err(e) => return (Err(e), 0),
-        };
-        if request.file.as_ref().is_some_and(|f| f.poll(1) == 0) {
-            return (Err(Errno(11)), 0);
-        }
-        let count = if request.sqe.opcode() == 27 && request.sqe.length() == 0 {
-            selected.length
-        } else {
-            selected.length.min(request.sqe.length())
-        };
-        let mut view = request.clone();
-        view.sqe.0[16..24].copy_from_slice(&selected.address.to_le_bytes());
-        view.sqe.0[24..28].copy_from_slice(&count.to_le_bytes());
-        view.requested = count as u64;
-        let result = if view.sqe.opcode() == 22 {
-            self.uring_rw(&view, memory)
-        } else {
-            self.uring_network(&view, memory)
-        };
-        // A failed readiness probe consumes no buffer. The descriptor/payload
-        // stays owned by the application until a non-EAGAIN completion.
-        if result == Err(Errno(11)) {
-            return (result, 0);
-        }
-        match &mut state
-            .provided
-            .get_mut(&request.sqe.buffer_group())
-            .unwrap()
-            .source
-        {
-            UringBufferSource::Classic(buffers) => {
-                buffers.pop_front();
-            }
-            UringBufferSource::Ring { head, .. } => *head = head.wrapping_add(1),
-        }
-        (result, 1 | ((selected.id as u32) << 16))
-    }
-}
-
 pub(crate) fn provide(
     s: &UringSqe,
     owner: u64,
@@ -167,9 +61,8 @@ pub(crate) fn provide(
         return Err(Errno(17));
     }
     capacity(provided, count, old.is_none())?;
-    let group = provided.entry(id).or_insert_with(|| UringBufferGroup {
-        owner,
-        source: UringBufferSource::Classic(VecDeque::new()),
+    let group = provided.entry(id).or_insert_with(|| {
+        UringBufferGroup::new(owner, UringBufferSource::Classic(VecDeque::new()))
     });
     let UringBufferSource::Classic(buffers) = &mut group.source else {
         unreachable!()
@@ -224,10 +117,11 @@ pub(crate) fn peek(
 }
 
 pub(crate) fn ring_control(
-    provided: &mut BTreeMap<u16, UringBufferGroup>,
+    state: &mut UringState,
     a: [u64; 6],
     memory: &mut impl trames_memory::CpuMemory,
 ) -> Result<u64> {
+    let provided = &mut state.provided;
     if a[3] != 1 {
         return Err(Errno(22));
     }
@@ -254,16 +148,72 @@ pub(crate) fn ring_control(
         if bytes[..12].iter().any(|b| *b != 0) {
             return Err(Errno(22));
         }
-        match provided.get(&id) {
-            Some(UringBufferGroup {
-                source: UringBufferSource::Ring { .. },
-                ..
-            }) => {
-                provided.remove(&id);
-                return Ok(0);
-            }
-            _ => return Err(Errno(2)),
+        if !provided
+            .get(&id)
+            .is_some_and(|g| matches!(g.source, UringBufferSource::Ring { .. }))
+        {
+            return Err(Errno(2));
         }
+        let group = provided.remove(&id).unwrap();
+        if state.busy_groups.contains(&group.identity) {
+            state.retired_groups.insert(group.identity, group);
+        }
+        return Ok(0);
     }
     unreachable!("only status/unregister passed to ring control")
+}
+
+pub(crate) fn register_ring(
+    state: &mut UringState,
+    a: [u64; 6],
+    memory: &mut impl trames_memory::CpuMemory,
+    deferred: &std::cell::Cell<bool>,
+) -> Result<u64> {
+    if matches!(a[1], 23 | 26) {
+        return ring_control(state, a, memory);
+    }
+    if a[3] != 1 {
+        return Err(Errno(22));
+    }
+    let bytes = memory.read_array::<40>(a[2]).map_err(|_| Errno(14))?;
+    let id = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+    if bytes[14..].iter().any(|b| *b != 0) {
+        return Err(Errno(22));
+    }
+    let address = u64_at(&bytes, 0);
+    let entries = u32_at(&bytes, 8);
+    if !address.is_multiple_of(PAGE_SIZE)
+        || entries == 0
+        || entries > 32768
+        || !entries.is_power_of_two()
+    {
+        return Err(Errno(22));
+    }
+    if state.provided.contains_key(&id) {
+        return Err(Errno(17));
+    }
+    capacity(&state.provided, entries as usize, true)?;
+    let ring = memory
+        .pin_buffer_rw(address, entries as usize * 16)
+        .unwrap_or_else(|| {
+            deferred.set(true);
+            Err(MemoryError::BackingIo(95))
+        })
+        .map_err(|e| match e {
+            MemoryError::Limit => Errno(12),
+            MemoryError::BackingIo(95) => Errno(95),
+            _ => Errno(14),
+        })?;
+    state.provided.insert(
+        id,
+        UringBufferGroup::new(
+            memory.instruction_identity().0,
+            UringBufferSource::Ring {
+                memory: std::sync::Arc::new(ring),
+                head: 0,
+                entries: entries as u16,
+            },
+        ),
+    );
+    Ok(0)
 }

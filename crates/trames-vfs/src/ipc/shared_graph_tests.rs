@@ -616,3 +616,82 @@ fn concurrent_acceptors_get_distinct_real_ofds_and_exact_peer_addresses() {
         assert!(v.fds.get(&fd).unwrap().cloexec.get());
     }
 }
+
+#[test]
+fn ring_registration_and_queued_rights_observe_cycles_in_both_admission_orders() {
+    for queued_first in [false, true] {
+        let mut v = Vfs::default();
+        let (fd, ring) = v.uring_create(4, 8).unwrap();
+        let [a, b] = v.socketpair(1, 1, 0).unwrap();
+        let factory = v.descriptor_factory();
+        let tx = v.direct_descriptors().get(a).unwrap();
+        let file = v.retain_uring_file(b).unwrap();
+        let rights = factory.send_local_rights(&[fd]).unwrap().unwrap();
+        if queued_first {
+            assert_eq!(
+                tx.send_local_message(b"r", 0, &rights, [1, 0, 0]),
+                Some(Ok(1))
+            );
+            assert!(matches!(ring.bind_file(&file), Err(Errno(95))));
+        } else {
+            ring.state.lock().unwrap().files = Some(vec![Some(ring.bind_file(&file).unwrap())]);
+            assert_eq!(
+                tx.send_local_message(b"r", 0, &rights, [1, 0, 0]),
+                Some(Err(Errno(95)))
+            );
+            let retired = ring.state.lock().unwrap().files.take();
+            drop(retired);
+            assert_eq!(
+                tx.send_local_message(b"r", 0, &rights, [1, 0, 0]),
+                Some(Ok(1))
+            );
+        }
+        let weak = Arc::downgrade(&ring);
+        drop(rights);
+        drop(file);
+        drop(ring);
+        v.close(fd).unwrap();
+        assert!(weak.upgrade().is_some()); // the real received FD still owns it
+        v.close(b).unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn concurrent_ring_registration_and_fd_transfer_cannot_publish_a_reciprocal_cycle() {
+    let mut v = Vfs::default();
+    let (fd, ring) = v.uring_create(4, 8).unwrap();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let tx = v.direct_descriptors().get(a).unwrap();
+    let rights = v
+        .descriptor_factory()
+        .send_local_rights(&[fd])
+        .unwrap()
+        .unwrap();
+    let file = v.retain_uring_file(b).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let r = ring.clone();
+    let registration = std::thread::spawn(move || {
+        other.wait();
+        r.bind_file(&file)
+    });
+    let send = std::thread::spawn(move || {
+        barrier.wait();
+        tx.send_local_message(b"r", 0, &rights, [1, 0, 0]).unwrap()
+    });
+    let registration = registration.join().unwrap();
+    let send = send.join().unwrap();
+    assert_eq!(
+        usize::from(registration.is_ok()) + usize::from(send.is_ok()),
+        1
+    );
+    assert!(registration.as_ref().err() == Some(&Errno(95)) || send == Err(Errno(95)));
+    drop(registration);
+    let weak = Arc::downgrade(&ring);
+    drop(ring);
+    for descriptor in [a, b, fd] {
+        v.close(descriptor).unwrap();
+    }
+    assert!(weak.upgrade().is_none());
+}

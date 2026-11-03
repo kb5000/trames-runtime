@@ -40,7 +40,7 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     let mut a = WaitSources::default();
     let mut b = WaitSources::default();
     let opens = Cell::new(0);
-    a.host((1, false), &first, &weak, || {
+    a.host((1, false), 0, &first, &weak, || {
         opens.set(opens.get() + 1);
         socket.as_fd().try_clone_to_owned().map(Into::into)
     })
@@ -48,11 +48,11 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     // An unrelated wake must neither duplicate the host FD nor register again.
     for _ in 0..128 {
         mark_unused(&mut a);
-        a.host((1, false), &first, &weak, || panic!("reopened host FD"))
+        a.host((1, false), 0, &first, &weak, || panic!("reopened host FD"))
             .unwrap();
     }
     assert_eq!(opens.get(), 1);
-    b.host((1, false), &second, &weak, || {
+    b.host((1, false), 0, &second, &weak, || {
         socket.as_fd().try_clone_to_owned().map(Into::into)
     })
     .unwrap();
@@ -63,14 +63,16 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     first.reset();
     second.reset();
     mark_unused(&mut a);
-    a.host((1, false), &first, &weak, || panic!("rearm must reuse FD"))
-        .unwrap();
+    a.host((1, false), 0, &first, &weak, || {
+        panic!("rearm must reuse FD")
+    })
+    .unwrap();
     hub.wait(Some(Instant::now())).unwrap();
     assert!(!first.ready() && !second.ready());
     // Cancel the first actor. Only the independently rearmed second may wake.
     drop(a);
     mark_unused(&mut b);
-    b.host((1, false), &second, &weak, || {
+    b.host((1, false), 0, &second, &weak, || {
         panic!("second actor reopened FD")
     })
     .unwrap();
@@ -79,7 +81,7 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     assert!(!first.ready() && second.ready());
     assert_eq!(socket.read(&mut [0]).unwrap(), 0);
     // No pending interest means no wait-scoped FD lease remains.
-    assert!(b.refresh(&[], 0, 8, &second, &weak));
+    assert!(b.refresh(&[], 0, 8, &second, &weak, &UringActor::default()));
     assert!(!b.external());
     drop(socket);
     // Last-close EOF is immediate on this local socketpair. A nonblocking read
@@ -99,7 +101,7 @@ fn host_interest_distinguishes_direction_and_replacement_ofd() {
     let mut sources = WaitSources::default();
     for write in [false, true] {
         sources
-            .host((1, write), &signal, &weak, || {
+            .host((1, write), 0, &signal, &weak, || {
                 a.as_fd().try_clone_to_owned().map(Into::into)
             })
             .unwrap();
@@ -107,10 +109,10 @@ fn host_interest_distinguishes_direction_and_replacement_ofd() {
     assert_eq!(sources.hosts.len(), 2);
     // A reused guest FD has a different retained OFD identity. It must acquire
     // a new lease; a stale event may never target the replacement description.
-    assert!(sources.refresh(&[], 0, 7, &signal, &weak));
+    assert!(sources.refresh(&[], 0, 7, &signal, &weak, &UringActor::default()));
     signal.reset();
     sources
-        .host((2, false), &signal, &weak, || {
+        .host((2, false), 0, &signal, &weak, || {
             b.as_fd().try_clone_to_owned().map(Into::into)
         })
         .unwrap();
@@ -142,7 +144,7 @@ fn native_wait_retains_transport_and_releases_it_on_worker_cancellation() {
     let signal = IoSignal::new(7, weak.clone());
     let mut sources = WaitSources::default();
     sources
-        .host((1, false), &signal, &weak, || tcp_wait_fd(&tcp))
+        .host((1, false), 0, &signal, &weak, || tcp_wait_fd(&tcp))
         .unwrap();
     drop(socket);
     vfs.close(fd).unwrap();
@@ -246,7 +248,7 @@ fn local_ring_retries_deduplicate_resources_and_drop_finished_interests() {
     let mut sources = WaitSources::default();
     for _ in 0..32 {
         signal.reset();
-        assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t)));
+        assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t), s.actor()));
         assert_eq!(sources.local.len(), 2); // CQ plus one original pipe.
         assert!(!signal.ready());
     }
@@ -256,7 +258,7 @@ fn local_ring_retries_deduplicate_resources_and_drop_finished_interests() {
         s.start([fd as u64, 0, 2, 1, 0, 0], &mut m, 7, &Arc::downgrade(&t)),
         Some(IoAttempt::Complete(Ok(0)))
     ));
-    assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t)));
+    assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t), s.actor()));
     assert_eq!(sources.local.len(), 1); // Only CQ after both reads complete.
     signal.reset();
     l.vfs.write(writer, b"z").unwrap();
@@ -284,7 +286,10 @@ fn cq_aliases_do_not_multiply_a_rings_progress_budget() {
     ));
     let direct = &s.rings[&fd];
     let before_tail = direct.state.lock().unwrap().tail;
-    assert!(s.poll_pump(&[direct.identity; 4], &mut m));
+    assert!(s.poll_pump(
+        &vec![direct.clone() as Arc<dyn trames_vfs::DirectPoll>; 4],
+        &mut m
+    ));
     assert_eq!(
         direct.state.lock().unwrap().tail.wrapping_sub(before_tail),
         64
@@ -316,7 +321,7 @@ fn subscription_lifetime_cost() {
         for _ in 0..N {
             mark_unused(&mut sources);
             sources
-                .host((1, false), &signal, &weak, || {
+                .host((1, false), 0, &signal, &weak, || {
                     socket.as_fd().try_clone_to_owned().map(Into::into)
                 })
                 .unwrap();

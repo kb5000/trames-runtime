@@ -575,6 +575,50 @@ mod tests {
     }
 
     #[test]
+    fn pinned_bytes_follow_canonical_hardware_storage_and_keep_the_borrow_gate() {
+        let mut memory = crate::Memory::default();
+        memory
+            .map(0x1000, PAGE_SIZE, crate::Permissions::RW)
+            .unwrap();
+        let pin = memory.pin_rw(0x1000, 16).unwrap();
+        pin.write(0, b"before").unwrap();
+        memory.prepare_hardware().unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let storage = Arc::new(Storage {
+            bytes: Box::new(UnsafeCell::new([0; PAGE_SIZE as usize])),
+            borrows: AtomicUsize::new(0),
+        });
+        // SAFETY: cold export has no old hardware alias; pin accesses use the
+        // same SharedPage region guards. The mock hardware is stopped here.
+        unsafe {
+            view.export_hardware_page(0x1000, crate::Access::Write, |bytes| {
+                if let Some(bytes) = bytes {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.pointer(), bytes.len());
+                }
+                Ok(storage.clone())
+            })
+            .unwrap();
+        }
+        assert_eq!(pin.read(0, 6).unwrap(), b"before");
+        pin.write(0, b"native").unwrap();
+        let mut out = [0; 6];
+        crate::CpuMemory::read(&view, 0x1000, &mut out).unwrap();
+        assert_eq!(out, *b"native");
+        assert_eq!(storage.borrows.load(Ordering::Relaxed), 0);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        memory.unmap(0x1000, PAGE_SIZE).unwrap();
+        memory
+            .map(0x1000, PAGE_SIZE, crate::Permissions::RW)
+            .unwrap();
+        memory.write(0x1000, b"new VA").unwrap();
+        assert_eq!(pin.read(0, 6).unwrap(), b"native");
+    }
+
+    #[test]
     fn private_hardware_ram_is_canonical_without_per_page_fake_dirty_writes() {
         use crate::{Memory, Permissions};
         let mut memory = Memory::default();

@@ -2,7 +2,7 @@
 //! Linux io_uring shared queues and retained open descriptions. Execution lives
 //! in trames-linux; no guest FD or guest-selected path becomes a host FD/path.
 use super::*;
-use std::{sync::atomic::AtomicU32, time::Instant};
+use std::time::Instant;
 use trames_memory::PAGE_SIZE;
 pub const URING_MAX_ENTRIES: u32 = 4096;
 pub const URING_SQ_ARRAY: usize = 128;
@@ -113,6 +113,144 @@ impl RetainedFd {
         self.0.open.borrow().socket.clone()
     }
 }
+/// A complete accepted shared OFD, independent of its numeric descriptor.
+/// No owner-local descriptor projection is stored in a shared ring.
+#[derive(Clone)]
+pub struct UringFile {
+    lease: Option<Arc<ipc::ownership::Link>>,
+    file: SharedFd,
+    owner: Option<(u64, Arc<()>)>,
+}
+impl UringFile {
+    pub fn socket_control(&self) -> Option<Result<SocketControlOperation>> {
+        let file = self.shared_file()?;
+        Some(if file.open.local.is_some() {
+            LocalOperation::from_shared(file).map(SocketControlOperation::Unix)
+        } else {
+            SocketOperation::from_shared(file).map(SocketControlOperation::Network)
+        })
+    }
+    pub fn shared_file(&self) -> Option<SharedFd> {
+        self.owner.is_none().then(|| self.file.clone())
+    }
+    pub fn is_eventfd(&self) -> bool {
+        matches!(
+            self.file.open.control,
+            Some(events::SharedControl::Event(_))
+        )
+    }
+    pub fn identity(&self) -> usize {
+        self.file.identity()
+    }
+    pub fn ofd_identity(&self) -> OfdIdentity {
+        self.file.ofd_identity()
+    }
+    pub fn retained(&self) -> RetainedFd {
+        assert!(self.owner.is_none(), "owner control needs its original VFS");
+        self.file.clone().retained()
+    }
+    fn retained_in(&self, vfs: &Vfs) -> RetainedFd {
+        if let Some((id, _)) = &self.owner {
+            vfs.local_rights
+                .uring
+                .borrow()
+                .get(id)
+                .expect("original owner control ledger")
+                .1
+                .clone()
+        } else {
+            self.retained()
+        }
+    }
+    pub fn same_file(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+    pub fn local_socket(&self, vfs: &Vfs) -> Option<Rc<LocalSocket>> {
+        self.retained_in(vfs).local_socket(vfs)
+    }
+    pub fn close_notification(&self) -> Option<Arc<FileClose>> {
+        self.shared_file()?.retained().close_notification()
+    }
+    pub fn inotify_instance(&self) -> Option<Arc<InotifyInstance>> {
+        self.shared_file()?.retained().inotify_instance()
+    }
+    pub fn pipe_endpoint(&self) -> Option<Arc<PipeEndpoint>> {
+        self.shared_file()?.retained().pipe_endpoint()
+    }
+    pub fn direct_byte(&self) -> Option<DirectFd> {
+        self.shared_file()?.retained().direct_byte()
+    }
+    pub fn tcp_lease(&self) -> Option<trames_net::TcpLease> {
+        self.shared_file()?.retained().tcp_lease()
+    }
+    pub fn socket(&self) -> Option<Arc<NetSocket>> {
+        self.file.open.socket.clone()
+    }
+    pub fn direct_tcp(&self) -> Option<DirectTcpFd> {
+        self.shared_file()?.retained().direct_tcp()
+    }
+    pub fn kind(&self) -> FdKind {
+        self.file.open.kind.clone()
+    }
+    pub fn stream(&self) -> bool {
+        self.file.clone().retained().stream()
+    }
+    pub fn poll(&self, events: u16) -> u16 {
+        self.file.clone().retained().poll(events)
+    }
+    pub fn datagram(&self) -> bool {
+        self.file.clone().retained().datagram()
+    }
+    pub fn readiness(&self, events: u16) -> (u16, [u64; 2]) {
+        self.file.clone().retained().readiness(events)
+    }
+    pub fn native_wait_fds(&self) -> Vec<HostFd> {
+        self.file.clone().retained().native_wait_fds()
+    }
+}
+impl RetainedFd {
+    fn uring_supported(open: &OpenDescription) -> Result<()> {
+        // Retaining another ring could form an uncollectable RC cycle. These
+        // descriptor classes need additional process/signal/terminal authority.
+        if open.anonymous.as_ref().is_some_and(|a| {
+            matches!(
+                a,
+                events::Anonymous::Uring(_)
+                    | events::Anonymous::Signal(_)
+                    | events::Anonymous::Epoll { .. }
+            )
+        }) || matches!(
+            open.kind,
+            FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::Terminal
+        ) {
+            return Err(Errno(95));
+        }
+        Ok(())
+    }
+    pub fn uring_file(&self) -> Result<UringFile> {
+        Self::uring_supported(&self.0.open.borrow())?;
+        self.shared_file()
+            .map(|file| UringFile {
+                lease: None,
+                file,
+                owner: None,
+            })
+            .ok_or(Errno(95))
+    }
+}
+pub trait UringFileView {
+    fn with_retained<T>(&self, vfs: &Vfs, operation: impl FnOnce(&RetainedFd) -> T) -> T;
+}
+impl UringFileView for RetainedFd {
+    fn with_retained<T>(&self, _vfs: &Vfs, operation: impl FnOnce(&RetainedFd) -> T) -> T {
+        operation(self)
+    }
+}
+impl UringFileView for UringFile {
+    fn with_retained<T>(&self, vfs: &Vfs, operation: impl FnOnce(&RetainedFd) -> T) -> T {
+        operation(&self.retained_in(vfs))
+    }
+}
 #[derive(Clone)]
 pub struct UringSqe(pub [u8; 64]);
 impl UringSqe {
@@ -163,12 +301,31 @@ impl UringSqe {
     }
 }
 #[derive(Clone)]
+pub enum UringObject {
+    Byte(DirectFd),
+    Tcp(DirectTcpFd),
+    File(DirectFile),
+}
+#[derive(Clone)]
+pub struct UringResource {
+    pub object: UringObject,
+    pub identity: usize,
+}
+
+/// Lifetime hook for source-task execution state. The ring never owns the task,
+/// Files root, path island or factory; only this weak cleanup token crosses it.
+pub trait UringExecutionLease: Send + Sync {}
+pub trait UringSource: Send + Sync {}
+#[derive(Clone)]
 pub struct UringRequest {
     pub owner: u64,
     pub task: u32,
     pub sequence: u64,
     pub sqe: UringSqe,
-    pub file: Option<RetainedFd>,
+    pub resource: Option<UringResource>,
+    pub execution: Option<Arc<dyn UringExecutionLease>>,
+    pub source: Option<std::sync::Weak<dyn UringSource>>,
+    pub file: Option<UringFile>,
     pub buffer: Option<Arc<trames_memory::PinnedBuffer>>,
     pub error: Option<Errno>,
     pub dependency: Option<(u64, bool)>,
@@ -200,10 +357,19 @@ pub enum UringBufferSource {
     },
 }
 pub struct UringBufferGroup {
+    pub identity: u64,
     pub owner: u64,
     pub source: UringBufferSource,
 }
 impl UringBufferGroup {
+    pub fn new(owner: u64, source: UringBufferSource) -> Self {
+        Self {
+            identity: trames_memory::new_backing_identity(),
+            owner,
+            source,
+        }
+    }
+
     pub fn slots(&self) -> usize {
         match &self.source {
             UringBufferSource::Classic(b) => b.len(),
@@ -211,8 +377,26 @@ impl UringBufferGroup {
         }
     }
 }
+pub struct UringRunning {
+    pub owner: u64,
+    pub key: Option<usize>,
+    pub data: u64,
+    pub opcode: u8,
+}
 #[derive(Default)]
 pub struct UringState {
+    pub active: std::collections::BTreeSet<u64>,
+    pub drains: std::collections::BTreeSet<u64>,
+    pub dependencies: BTreeMap<u64, usize>,
+    pub inflight: usize,
+    pub inflight_metadata: usize,
+    pub waits: BTreeMap<u32, (u32, Option<Instant>)>,
+    pub scratch: Vec<u8>,
+    pub cache: DiskReadCache,
+    pub busy_groups: std::collections::BTreeSet<u64>,
+    pub contended_groups: std::collections::BTreeSet<u64>,
+    pub running: BTreeMap<u64, UringRunning>,
+    pub shot_reservations: usize,
     pub head: u32,
     pub tail: u32,
     pub dropped: u32,
@@ -222,80 +406,138 @@ pub struct UringState {
     pub completed: BTreeMap<u64, bool>,
     pub overflow: VecDeque<(u64, i32, u32)>,
     pub provided: BTreeMap<u16, UringBufferGroup>,
+    pub retired_groups: BTreeMap<u64, UringBufferGroup>,
     pub multishot_cursor: u64,
-    pub files: Option<Vec<Option<RetainedFd>>>,
+    pub files: Option<Vec<Option<UringFile>>>,
     pub buffers: Option<Vec<Arc<trames_memory::PinnedBuffer>>>,
-    pub eventfd: Option<RetainedFd>,
+    pub eventfd: Option<UringFile>,
+}
+/// Opaque traversal lifetimes, retired after the caller releases ring metadata.
+pub struct UringRetirement(ipc::ownership::Retirement);
+impl UringRetirement {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 pub struct Uring {
     pub entries: u32,
     pub cq_entries: u32,
     pub ring_bytes: u64,
     pub sqe_bytes: u64,
-    memory: trames_shared::Mapping,
-    pub state: RefCell<UringState>,
+    pages: Vec<Arc<trames_memory::SharedPage>>,
+    _file_pages: Vec<Arc<mapped::FilePage>>,
+    pub state: std::sync::Mutex<UringState>,
+    pub readiness: Arc<Readiness>,
+    pub(crate) ownership: std::sync::Weak<ipc::ownership::Ownership>,
 }
 impl Uring {
-    fn load(&self, offset: usize) -> u32 {
-        // SAFETY: owned, page-aligned mapping and fixed aligned u32 offsets.
-        // Acquire pairs with the guest's queue publication. This object is
-        // coordinator-local; SQE copies happen only after all workers joined.
-        unsafe { (&*self.memory.pointer().add(offset).cast::<AtomicU32>()).load(Ordering::Acquire) }
+    pub fn bind_file(self: &Arc<Self>, file: &UringFile) -> Result<UringFile> {
+        self.bind_file_deferred(file).0
     }
-    fn store(&self, offset: usize, value: u32) {
-        unsafe {
-            (&*self.memory.pointer().add(offset).cast::<AtomicU32>())
-                .store(value, Ordering::Release);
+    pub fn bind_file_deferred(
+        self: &Arc<Self>,
+        file: &UringFile,
+    ) -> (Result<UringFile>, UringRetirement) {
+        if file
+            .lease
+            .as_ref()
+            .is_some_and(|link| link.belongs_to_ring(self))
+        {
+            return (Ok(file.clone()), UringRetirement(Default::default()));
         }
+        let (lease, retired) = ipc::ownership::Ownership::ring(self, &file.file.open);
+        (
+            lease.map(|lease| UringFile {
+                lease,
+                file: file.file.clone(),
+                owner: file.owner.clone(),
+            }),
+            UringRetirement(retired),
+        )
+    }
+
+    pub fn queue_pages(&self) -> Vec<Arc<trames_memory::SharedPage>> {
+        self.pages.clone()
+    }
+    pub fn read_queue<const N: usize>(&self, offset: usize) -> [u8; N] {
+        let mut bytes = [0; N];
+        self.pages[offset / PAGE_SIZE as usize].copy_read(offset % PAGE_SIZE as usize, &mut bytes);
+        bytes
+    }
+    pub fn write_queue(&self, offset: usize, bytes: &[u8]) {
+        self.pages[offset / PAGE_SIZE as usize].copy_write(offset % PAGE_SIZE as usize, bytes);
+    }
+    pub fn load_queue(&self, offset: usize) -> u32 {
+        if matches!(offset, 4 | 64) {
+            // SAFETY: fixed aligned publication cells in the original queue.
+            unsafe { self.pages[0].load_acquire_u32(offset) }
+        } else {
+            u32::from_le_bytes(self.read_queue(offset))
+        }
+    }
+    pub fn store_queue(&self, offset: usize, value: u32) {
+        if matches!(offset, 0 | 68) {
+            // SAFETY: the same fixed publication cells, under the ring lock.
+            unsafe {
+                self.pages[0].store_release_u32(offset, value);
+            }
+        } else {
+            self.write_queue(offset, &value.to_le_bytes());
+        }
+    }
+    pub fn completion_event(&self, state: &UringState, count: u64) -> Option<(UringFile, u64)> {
+        if count == 0 || !self.eventfd_enabled() {
+            return None;
+        }
+        state.eventfd.clone().map(|file| (file, count))
+    }
+    pub fn notify_completion(&self, event: Option<(UringFile, u64)>) {
+        if let Some((file, count)) = event {
+            if let Some(fd) = file.direct_byte() {
+                let _ = fd.write(&count.to_le_bytes());
+            }
+        }
+        self.readiness.notify_locked();
     }
     pub fn outstanding_limit(&self) -> usize {
         (self.entries as usize * 8).min(8192)
     }
     pub fn sq_tail(&self) -> u32 {
-        self.load(4)
+        self.load_queue(4)
     }
     pub fn cq_epoch(&self) -> [u64; 2] {
-        [self.state.borrow().tail as u64, 0]
+        [self.state.lock().unwrap().tail as u64, 0]
     }
     pub fn eventfd_enabled(&self) -> bool {
-        self.load(84) & 1 == 0
+        self.load_queue(84) & 1 == 0
     }
     pub fn cq_ready(&self) -> u32 {
         self.state
-            .borrow()
+            .lock()
+            .unwrap()
             .tail
-            .wrapping_sub(self.load(64))
+            .wrapping_sub(self.load_queue(64))
             .min(self.cq_entries)
     }
     pub fn cq_head(&self, state: &UringState) -> Result<u32> {
-        let head = self.load(64);
+        let head = self.load_queue(64);
         if state.tail.wrapping_sub(head) > self.cq_entries {
             return Err(Errno(22));
         }
         Ok(head)
     }
     pub fn sqe(&self, head: u32) -> Option<UringSqe> {
-        let index = self.load(URING_SQ_ARRAY + (head & (self.entries - 1)) as usize * 4);
+        let index = self.load_queue(URING_SQ_ARRAY + (head & (self.entries - 1)) as usize * 4);
         if index >= self.entries {
             return None;
         }
-        let mut bytes = [0; 64];
-        // SAFETY: kernel-private queue sizes bound the slot. Guest CPUs are
-        // joined, so no Rust slice or concurrent copy of mutable SQEs exists.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.memory
-                    .pointer()
-                    .add(self.ring_bytes as usize + index as usize * 64),
-                bytes.as_mut_ptr(),
-                64,
-            );
-        }
-        Some(UringSqe(bytes))
+        Some(UringSqe(
+            self.read_queue(self.ring_bytes as usize + index as usize * 64),
+        ))
     }
     pub fn publish_head(&self, state: &UringState) {
-        self.store(0, state.head);
-        self.store(20, state.dropped);
+        self.store_queue(0, state.head);
+        self.store_queue(20, state.dropped);
     }
     pub fn flush(&self, state: &mut UringState) -> Result<u64> {
         let head = self.cq_head(state)?;
@@ -309,20 +551,12 @@ impl Uring {
             bytes[..8].copy_from_slice(&data.to_le_bytes());
             bytes[8..12].copy_from_slice(&result.to_le_bytes());
             bytes[12..16].copy_from_slice(&flags.to_le_bytes());
-            // SAFETY: retained mapping, bounded slot; joined guest CPUs. CQ
-            // bytes precede the release tail store and remain valid after FD close.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    self.memory.pointer().add(offset),
-                    16,
-                );
-            }
+            self.write_queue(offset, &bytes);
             state.tail = state.tail.wrapping_add(1);
             count += 1;
         }
-        self.store(68, state.tail);
-        self.store(16, if state.overflow.is_empty() { 0 } else { 2 });
+        self.store_queue(68, state.tail);
+        self.store_queue(16, if state.overflow.is_empty() { 0 } else { 2 });
         Ok(count)
     }
     pub fn mapping_offset(&self, offset: u64, len: u64, shared: bool) -> Result<u64> {
@@ -342,7 +576,7 @@ impl Uring {
         })
     }
     pub fn next_deadline(&self) -> Option<Instant> {
-        let state = self.state.borrow();
+        let state = self.state.lock().unwrap();
         let blocked = self.backpressured(&state);
         state
             .pending
@@ -354,7 +588,7 @@ impl Uring {
             .min()
     }
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
-        let state = self.state.borrow();
+        let state = self.state.lock().unwrap();
         let blocked = self.backpressured(&state);
         state
             .pending
@@ -369,7 +603,7 @@ impl Uring {
             .collect()
     }
     pub fn sockets(&self) -> Vec<(Arc<NetSocket>, u16)> {
-        let state = self.state.borrow();
+        let state = self.state.lock().unwrap();
         let blocked = self.backpressured(&state);
         state
             .pending
@@ -399,8 +633,8 @@ impl Uring {
 impl Vfs {
     /// Read-only admission hint for a CQ observer. Actual capabilities are
     /// rebuilt at dispatch; no owner state is moved during scheduler queries.
-    pub fn uring_poll_rings(&self, fd: u32) -> Option<Vec<Rc<Uring>>> {
-        fn visit(open: &OpenDescription, rings: &mut Vec<Rc<Uring>>) -> Option<()> {
+    pub fn uring_poll_rings(&self, fd: u32) -> Option<Vec<Arc<Uring>>> {
+        fn visit(open: &OpenDescription, rings: &mut Vec<Arc<Uring>>) -> Option<()> {
             match &open.anonymous {
                 Some(events::Anonymous::Uring(r)) => rings.push(r.clone()),
                 Some(events::Anonymous::Epoll { watches, .. }) => {
@@ -432,7 +666,7 @@ impl Vfs {
         pages.extend(self.mapping_pages(fd, 0x1000_0000, ring.sqe_bytes, true, true)?);
         Ok(pages)
     }
-    pub fn uring_descriptors(&self) -> Vec<(u32, Rc<Uring>)> {
+    pub fn uring_descriptors(&self) -> Vec<(u32, Arc<Uring>)> {
         // Reuse the lazy ring index to avoid scanning unrelated FD tables.
         if self.urings().is_empty() {
             return Vec::new();
@@ -446,7 +680,15 @@ impl Vfs {
             })
             .collect()
     }
-    pub fn uring_create(&mut self, entries: u32, cq_entries: u32) -> Result<(u32, Rc<Uring>)> {
+    pub fn uring_create(&mut self, entries: u32, cq_entries: u32) -> Result<(u32, Arc<Uring>)> {
+        self.uring_create_with_output(entries, cq_entries, || Ok(()))
+    }
+    pub fn uring_create_with_output(
+        &mut self,
+        entries: u32,
+        cq_entries: u32,
+        output: impl FnOnce() -> Result<()>,
+    ) -> Result<(u32, Arc<Uring>)> {
         if entries == 0
             || entries > URING_MAX_ENTRIES
             || !entries.is_power_of_two()
@@ -459,56 +701,58 @@ impl Vfs {
         let page = PAGE_SIZE;
         let ring_bytes = (URING_CQES as u64 + cq_entries as u64 * 16).div_ceil(page) * page;
         let sqe_bytes = (entries as u64 * 64).div_ceil(page) * page;
-        let (fd, mut open) = self.memfd_description(b"io_uring", 1)?;
-        Arc::get_mut(&mut open.shared).unwrap().kind = FdKind::Anonymous;
-        // This OFD will own Rc ring controls. Publish that final ownership
-        // class from construction; never publish then demote a shared OFD.
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::Owner(Rc::new(RefCell::new(open))),
-                cloexec: true.into(),
-            },
-        );
-        let result = (|| {
-            self.truncate_fd(fd, ring_bytes + sqe_bytes)?;
-            let memory = self
-                .shared_file(fd)?
-                .map(0, (ring_bytes + sqe_bytes) as usize)
-                .map_err(storage::host_errno)?;
-            let ring = Rc::new(Uring {
-                entries,
-                cq_entries,
-                ring_bytes,
-                sqe_bytes,
-                memory,
-                state: RefCell::default(),
-            });
-            for (offset, value) in [
-                (8, entries - 1),
-                (12, entries),
-                (72, cq_entries - 1),
-                (76, cq_entries),
-            ] {
-                ring.store(offset, value);
-            }
-            let open_descriptor = self.descriptor(fd)?;
-            let mut open = open_descriptor.open.borrow_mut();
-            open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
-            Ok((fd, ring))
-        })();
-        if result.is_err() {
-            let _ = self.close(fd);
+        let files = self
+            .query
+            .as_ref()
+            .map_or_else(|| self.shared_files(), |q| q.files.clone());
+        let reservation = files.reserve()?;
+        let mut open = self.memfd_open(b"io_uring", 1)?;
+        let file = Self::shared_file_open(&open)?;
+        if ring_bytes + sqe_bytes > self.file_size_limit {
+            return Err(Errno(27));
         }
-        result
+        file.set_len((ring_bytes + sqe_bytes) as usize)
+            .map_err(storage::host_errno)?;
+        let (_file_pages, pages) =
+            mapped::uring_pages(open.node.as_ref().unwrap(), ring_bytes + sqe_bytes)?;
+        let ring = Arc::new(Uring {
+            entries,
+            cq_entries,
+            ring_bytes,
+            sqe_bytes,
+            pages,
+            _file_pages,
+            state: Default::default(),
+            readiness: Arc::default(),
+            ownership: Arc::downgrade(&files.0.local_ownership),
+        });
+        for (offset, value) in [
+            (8, entries - 1),
+            (12, entries),
+            (72, cq_entries - 1),
+            (76, cq_entries),
+        ] {
+            ring.store_queue(offset, value);
+        }
+        let shared = Arc::get_mut(&mut open.shared).unwrap();
+        shared.kind = FdKind::Anonymous;
+        shared.control = Some(events::SharedControl::Uring(ring.clone()));
+        open.anonymous = Some(events::Anonymous::Uring(ring.clone()));
+        let descriptor = Descriptor {
+            open: OpenHandle::new(open),
+            cloexec: true.into(),
+        };
+        output()?;
+        let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds));
+        Ok((fd, ring))
     }
-    pub fn uring(&self, fd: u32) -> Result<Rc<Uring>> {
+    pub fn uring(&self, fd: u32) -> Result<Arc<Uring>> {
         match &self.descriptor(fd)?.open.borrow().anonymous {
             Some(events::Anonymous::Uring(ring)) => Ok(ring.clone()),
             _ => Err(Errno(9)),
         }
     }
-    pub fn urings(&self) -> Vec<Rc<Uring>> {
+    pub fn urings(&self) -> Vec<Arc<Uring>> {
         self.fds
             .identity()
             .urings
@@ -518,36 +762,44 @@ impl Vfs {
                     if let Some(events::Anonymous::Uring(ring)) = &d.open.borrow().anonymous {
                         if !rings
                             .iter()
-                            .any(|r: &Weak<Uring>| r.ptr_eq(&Rc::downgrade(ring)))
+                            .any(|r: &std::sync::Weak<Uring>| r.ptr_eq(&Arc::downgrade(ring)))
                         {
-                            rings.push(Rc::downgrade(ring));
+                            rings.push(Arc::downgrade(ring));
                         }
                     }
                 }
                 rings
             })
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
             .collect()
+    }
+    pub fn retain_uring_file(&self, fd: u32) -> Result<UringFile> {
+        let retained = self.retain_uring_fd(fd)?;
+        if retained.shared_file().is_some() {
+            return retained.uring_file();
+        }
+        self.reap_uring_files();
+        let id = trames_memory::new_backing_identity();
+        let token = Arc::new(());
+        let file = SharedFd::new(retained.0.open.borrow().shared.clone());
+        self.local_rights
+            .uring
+            .borrow_mut()
+            .insert(id, (Arc::downgrade(&token), retained));
+        Ok(UringFile {
+            lease: None,
+            file,
+            owner: Some((id, token)),
+        })
+    }
+    pub fn reap_uring_files(&self) {
+        self.local_rights.reap_uring();
     }
     pub fn retain_uring_fd(&self, fd: u32) -> Result<RetainedFd> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
-        // Retaining another ring could form an uncollectable RC cycle. These
-        // descriptor classes need additional process/signal/terminal authority.
-        if open.anonymous.as_ref().is_some_and(|a| {
-            matches!(
-                a,
-                events::Anonymous::Uring(_)
-                    | events::Anonymous::Signal(_)
-                    | events::Anonymous::Epoll { .. }
-            )
-        }) || matches!(
-            open.kind,
-            FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::Terminal
-        ) {
-            return Err(Errno(95));
-        }
+        RetainedFd::uring_supported(&open)?;
         Ok(RetainedFd(descriptor.clone()))
     }
     /// A private descriptor view lets existing VFS operations act on the exact
@@ -556,19 +808,25 @@ impl Vfs {
     /// Only joined resource operations run here; no guest code/callback runs.
     pub fn with_uring_fd<T>(
         &mut self,
-        file: &RetainedFd,
+        file: &impl UringFileView,
         f: impl FnOnce(&mut Self, u32) -> T,
     ) -> T {
-        self.with_uring_view(file, false, f)
+        {
+            let retained = file.with_retained(self, Clone::clone);
+            self.with_uring_view(&retained, false, f)
+        }
     }
     /// Path resolution must still see the original /proc/self/fd namespace.
     /// Only metadata/path operations pay for cloning that private table.
     pub fn with_uring_path_fd<T>(
         &mut self,
-        file: &RetainedFd,
+        file: &impl UringFileView,
         f: impl FnOnce(&mut Self, u32) -> T,
     ) -> T {
-        self.with_uring_view(file, true, f)
+        {
+            let retained = file.with_retained(self, Clone::clone);
+            self.with_uring_view(&retained, true, f)
+        }
     }
     fn with_uring_view<T>(
         &mut self,
@@ -579,10 +837,14 @@ impl Vfs {
         struct Restore<'a> {
             vfs: &'a mut Vfs,
             saved: DescriptorTable,
+            retained: Option<(u32, SharedFd)>,
         }
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
                 self.vfs.fds = std::mem::take(&mut self.saved);
+                if let Some(query) = &mut self.vfs.query {
+                    query.retained = self.retained.take();
+                }
             }
         }
         let saved = std::mem::take(&mut self.fds);
@@ -593,28 +855,47 @@ impl Vfs {
             0
         };
         self.fds.insert(alias, file.0.clone());
-        let guard = Restore { vfs: self, saved };
+        let retained = if let Some(query) = &mut self.query {
+            let old = query.retained.take();
+            query.retained = Some((
+                alias,
+                file.shared_file()
+                    .expect("query has shared retained authority"),
+            ));
+            old
+        } else {
+            None
+        };
+        let guard = Restore {
+            vfs: self,
+            saved,
+            retained,
+        };
         f(guard.vfs, alias)
     }
     /// Install a descriptor produced by an operation on a retained OFD into
     /// the original guest table, rather than losing it with the private view.
     pub fn with_uring_install(
         &mut self,
-        file: &RetainedFd,
+        file: &impl UringFileView,
         f: impl FnOnce(&mut Self, u32) -> Result<u32>,
     ) -> Result<u32> {
-        let target = self.available(0)?;
-        let operation = |v: &mut Self, fd| {
-            let created = f(v, fd)?;
-            v.descriptor(created)
-        };
-        let descriptor = if matches!(file.kind(), FdKind::Node(_)) {
-            self.with_uring_path_fd(file, operation)
-        } else {
-            self.with_uring_fd(file, operation)
-        }?;
-        self.fds.insert(target, descriptor);
-        Ok(target)
+        let retained = file.with_retained(self, Clone::clone);
+        let file = &retained;
+        {
+            let target = self.available(0)?;
+            let operation = |v: &mut Self, fd| {
+                let created = f(v, fd)?;
+                v.descriptor(created)
+            };
+            let descriptor = if matches!(file.kind(), FdKind::Node(_)) {
+                self.with_uring_path_fd(file, operation)
+            } else {
+                self.with_uring_fd(file, operation)
+            }?;
+            self.fds.insert(target, descriptor);
+            Ok(target)
+        }
     }
     pub fn uring_eventfd(&self, fd: u32) -> Result<RetainedFd> {
         let file = self.retain_uring_fd(fd)?;
@@ -625,5 +906,34 @@ impl Vfs {
             return Err(Errno(22));
         }
         Ok(file)
+    }
+}
+
+impl DirectPoll for Uring {
+    fn into_uring(self: Arc<Self>) -> Option<Arc<Uring>> {
+        Some(self)
+    }
+    fn identity(&self) -> usize {
+        self as *const Self as usize
+    }
+    fn poll(&self, events: u16) -> (u16, [u64; 2]) {
+        let state = self.state.lock().unwrap();
+        let ready = state
+            .tail
+            .wrapping_sub(self.load_queue(64))
+            .min(self.cq_entries);
+        (
+            if ready != 0 { events & 1 } else { 0 },
+            [state.tail as u64, 0],
+        )
+    }
+    fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.readiness.subscribe(signal)
+    }
+}
+
+impl Drop for Uring {
+    fn drop(&mut self) {
+        self.readiness.notify_locked();
     }
 }

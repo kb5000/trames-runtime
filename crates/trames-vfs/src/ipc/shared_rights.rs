@@ -54,7 +54,8 @@ impl LocalRights {
             .iter()
             .map(|open| match open {
                 OpenHandle::Shared(open) => {
-                    unix |= open.local.is_some();
+                    unix |= open.local.is_some()
+                        || matches!(open.control, Some(events::SharedControl::Uring(_)));
                     Some(open.clone())
                 }
                 OpenHandle::Owner(_) => None,
@@ -162,7 +163,8 @@ impl DescriptorFactory {
                 Ok(open) => open,
                 Err(e) => return Some(Err(e)),
             };
-            unix |= open.local.is_some();
+            unix |= open.local.is_some()
+                || matches!(open.control, Some(events::SharedControl::Uring(_)));
             rights.push(open.clone());
         }
         Some(Ok(SharedRights::new(rights, unix)))

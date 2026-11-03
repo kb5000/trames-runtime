@@ -65,7 +65,7 @@ fn signal_mask_lifecycle_is_shared_but_readiness_stays_with_the_reading_task() {
     );
     let (owner, _ring) = v.uring_create(2, 4).unwrap();
     let factory = v.descriptor_factory();
-    assert_eq!(factory.signalfd(owner as i32, a, 0), None);
+    assert_eq!(factory.signalfd(owner as i32, a, 0), Some(Err(Errno(22))));
     assert_eq!(v.signalfd(owner as i32, a, 0), Err(Errno(22)));
     assert_eq!(factory.signalfd(alias as i32, a, 1), Some(Err(Errno(22))));
     assert_eq!(v.signalfd_mask(alias), Ok(Some(b)));

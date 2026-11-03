@@ -202,9 +202,17 @@ impl FileEpoch {
     /// Snapshot retained io_uring OFDs even after their numeric descriptors
     /// were closed/reused. Use the same file authority/algorithms as normal FDs.
     pub fn capture_uring(&mut self, vfs: &Vfs, unlimited: bool) -> BTreeMap<usize, PreparedFile> {
+        self.capture_uring_rings(vfs, unlimited, vfs.urings())
+    }
+    pub fn capture_uring_rings(
+        &mut self,
+        vfs: &Vfs,
+        unlimited: bool,
+        rings: impl IntoIterator<Item = Arc<Uring>>,
+    ) -> BTreeMap<usize, PreparedFile> {
         let mut files = BTreeMap::new();
-        for ring in vfs.urings() {
-            let state = ring.state.borrow();
+        for ring in rings {
+            let state = ring.state.lock().unwrap();
             let retained = state
                 .files
                 .iter()
@@ -215,7 +223,9 @@ impl FileEpoch {
                 if let std::collections::btree_map::Entry::Vacant(slot) =
                     files.entry(file.identity())
                 {
-                    if let Some(cap) = self.capture_open(vfs, &file.0.open.borrow(), unlimited) {
+                    if let Some(cap) = file.with_retained(vfs, |file| {
+                        self.capture_open(vfs, &file.0.open.borrow(), unlimited)
+                    }) {
                         slot.insert(cap);
                     }
                 }

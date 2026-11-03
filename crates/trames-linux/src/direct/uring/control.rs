@@ -2,76 +2,35 @@
 //! The original timeout/cancel rules over the worker-owned request index.
 use super::*;
 
-pub(super) struct Running {
-    owner: u64,
-    key: Option<usize>,
-    data: u64,
-    opcode: u8,
+pub(super) trait TimerRequestOps: Sized {
+    fn running(&self) -> Running;
+    fn selected(&self) -> bool;
 }
-impl Request {
-    pub(super) fn import_timer(&mut self, memory: &impl CpuMemory, clock: Instant) {
-        if self.error.is_some() {
-            return;
-        }
-        let s = &self.sqe;
-        let address = match s.opcode() {
-            11 => {
-                if s.length() != 1 || s.multishot() && s.op_flags() & 1 != 0 {
-                    self.error = Some(Errno(22));
-                    return;
-                }
-                s.address()
-            }
-            15 => {
-                self.timeout_target = self.dependency.map(|d| d.0);
-                if self.dependency.is_none() || s.length() != 1 || s.offset() != 0 {
-                    self.error = Some(Errno(22));
-                    return;
-                }
-                s.address()
-            }
-            12 if s.op_flags() & 18 != 0 => {
-                if s.op_flags() & 18 == 18 || s.op_flags() & !31 != 0 {
-                    self.error = Some(Errno(22));
-                    return;
-                }
-                s.offset()
-            }
-            _ => return,
-        };
-        let flags = if s.opcode() == 11 {
-            s.op_flags() & !64
-        } else if s.opcode() == 12 {
-            s.op_flags() & !18
-        } else {
-            s.op_flags()
-        };
-        match crate::uring::time::deadline(memory, address, flags, clock) {
-            Ok((deadline, duration)) => {
-                self.timeout_duration = Some(duration);
-                if s.opcode() != 11 || flags & 1 != 0 {
-                    self.deadline = Some(deadline);
-                }
-            }
-            Err(e) => self.error = Some(e),
-        }
-    }
-    pub(super) fn running(&self) -> Running {
+impl TimerRequestOps for Request {
+    fn running(&self) -> Running {
         Running {
             owner: self.owner,
-            key: self.resource.as_ref().map(|f| f.identity),
+            key: self.file.as_ref().map(|f| f.identity()),
             data: self.sqe.user_data(),
             opcode: self.sqe.opcode(),
         }
     }
-    pub(super) fn selected(&self) -> bool {
+    fn selected(&self) -> bool {
         self.sqe.flags() & 32 != 0
     }
 }
-impl State {
+pub(super) trait ControlStateOps: Sized {
+    fn control(
+        &mut self,
+        r: &mut Request,
+        retired: &mut Vec<Request>,
+    ) -> Option<Result<(i32, bool)>>;
+    fn cancel_or_update(&mut self, r: &Request, retired: &mut Vec<Request>) -> Result<(i32, bool)>;
+}
+impl ControlStateOps for State {
     /// Metadata-only operations run under this ring's lock. No guest byte I/O,
     /// file/socket operation or another VM's memory is executed here.
-    pub(super) fn control(
+    fn control(
         &mut self,
         r: &mut Request,
         retired: &mut Vec<Request>,
@@ -226,7 +185,7 @@ impl State {
                 } else if flags & 2 != 0 {
                     target
                         .key
-                        .zip(r.resource.as_ref().map(|f| f.identity))
+                        .zip(r.file.as_ref().map(|f| f.identity()))
                         .is_some_and(|(a, b)| a == b)
                 } else {
                     target.data == s.address()

@@ -896,6 +896,31 @@ impl Drop for FileMapping {
         drop(self.writer.take());
     }
 }
+type UringPages = (Vec<Arc<FilePage>>, Vec<Arc<SharedPage>>);
+
+/// Pin the original mapped page objects before publishing an io_uring OFD.
+/// Kernel queue access and guest mappings therefore use the same byte domain.
+pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> {
+    let mut n = node.borrow_mut();
+    let logical = node.length_for(&n);
+    let Content::File(data) = &mut n.content else {
+        return Err(Errno(19));
+    };
+    if !matches!(data, FileData::Mapped(_)) {
+        let original = std::mem::replace(data, FileData::memory(Vec::new()));
+        *data = FileData::Mapped(Box::new(MappedData::with_inode(
+            original,
+            true,
+            Some(logical),
+        )));
+    }
+    let FileData::Mapped(data) = data else {
+        unreachable!()
+    };
+    let pages = data.batch(0, length)?;
+    let bytes = pages.iter().map(|p| p.shared_page()).collect();
+    Ok((pages, bytes))
+}
 impl Vfs {
     pub fn mapping_pages(
         &self,

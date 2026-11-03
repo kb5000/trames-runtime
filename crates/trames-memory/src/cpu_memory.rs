@@ -26,6 +26,16 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Kernel resource registration may require this mm's structural owner to
+    /// stabilize/relocate pages. Ordinary byte access never queries this hook.
+    fn pin_buffer_rw(
+        &mut self,
+        _address: u64,
+        _length: usize,
+    ) -> Option<Result<crate::PinnedBuffer, MemoryError>> {
+        None
+    }
+
     /// Structural replacement requires the same joined mapping boundary as mmap.
     fn can_import_mapping(&self) -> bool {
         false
@@ -132,6 +142,14 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn pin_buffer_rw(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Option<Result<crate::PinnedBuffer, MemoryError>> {
+        Some(Memory::pin_rw(self, address, length))
+    }
+
     fn can_import_mapping(&self) -> bool {
         true
     }

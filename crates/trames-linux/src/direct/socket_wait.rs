@@ -18,9 +18,91 @@ pub struct RetainedSocket {
     pub args: [u64; 6],
     pub deadline: Option<Instant>,
     connecting: bool,
+    accepted_address: Option<Vec<u8>>,
     message: Option<Arc<ip_message::Message>>,
 }
 impl RetainedSocket {
+    pub(super) fn uring(
+        factory: &trames_vfs::DescriptorFactory,
+        request: &trames_vfs::UringRequest,
+        memory: &impl CpuMemory,
+    ) -> Option<Result<Self, Errno>> {
+        let s = &request.sqe;
+        let (number, args) = match s.opcode() {
+            13 if s.length() == 0 => (242, [0, s.address(), s.offset(), s.op_flags() as u64, 0, 0]),
+            16 | 56 if s.op_flags() == 0 && s.length() == 0 => (
+                if s.opcode() == 16 { 203 } else { 200 },
+                [0, s.address(), s.offset(), 0, 0, 0],
+            ),
+            26 | 27 if s.offset() == 0 => (
+                if s.opcode() == 26 { 206 } else { 207 },
+                [0, s.address(), s.length() as u64, s.op_flags() as u64, 0, 0],
+            ),
+            34 | 57 if s.op_flags() == 0 => (
+                if s.opcode() == 34 { 210 } else { 201 },
+                [0, s.length() as u64, 0, 0, 0, 0],
+            ),
+            _ => return Some(Err(Errno(22))),
+        };
+        let accepted = request.file.as_ref()?.socket_control()?;
+        Some((|| {
+            let socket = match accepted? {
+                trames_vfs::SocketControlOperation::Network(socket) => Control::Network(socket),
+                trames_vfs::SocketControlOperation::Unix(socket) => Control::Unix {
+                    socket,
+                    address: request.path.clone(),
+                    connection: None,
+                },
+            };
+            let message = match &socket {
+                Control::Network(socket) if matches!(number, 206 | 207) => Some(Arc::new(
+                    ip_message::Message::new(number, args, memory, socket.address_size())?,
+                )),
+                _ => None,
+            };
+            Ok(Self {
+                socket,
+                factory: factory.clone(),
+                number,
+                args,
+                deadline: None,
+                connecting: false,
+                accepted_address: request.path.clone(),
+                message,
+            })
+        })())
+    }
+    pub(super) fn uring_wait_kind(&self) -> u8 {
+        match &self.socket {
+            Control::Network(_) => 0,
+            Control::Unix { connection, .. } => 1 + u8::from(connection.is_some()),
+        }
+    }
+    pub(super) fn uring_subscribe(
+        &self,
+        signal: &Arc<IoSignal>,
+    ) -> Option<trames_vfs::IoSubscription> {
+        match &self.socket {
+            Control::Network(socket) => socket.subscribe(signal),
+            Control::Unix {
+                socket, connection, ..
+            } => Some(if let Some(connection) = connection {
+                connection.subscribe(signal)
+            } else {
+                socket.subscribe(signal)
+            }),
+        }
+    }
+    pub(super) fn uring_attempt(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        paths: Option<&trames_vfs::PathQueries>,
+    ) -> Option<Result<u64, Errno>> {
+        if matches!(&self.socket, Control::Unix { .. }) && matches!(self.number, 206 | 207) {
+            return None;
+        }
+        self.attempt(memory, paths)
+    }
     pub fn external_wait(&self) -> bool {
         matches!(&self.socket, Control::Network(socket) if !socket.is_netlink())
     }
@@ -90,7 +172,26 @@ impl RetainedSocket {
                         &self.factory,
                     ));
                 }
-                let result = if self.number == 203 && self.connecting {
+                let result = if let Some(address) = &self.accepted_address {
+                    socket.with_tcp_publication(|| {
+                        let result = if self.number == 200 {
+                            socket.bind_authorized(address, self.factory.can_bind_service())
+                        } else if self.connecting {
+                            socket.resume_connect().and_then(|ready| {
+                                if ready {
+                                    Ok(())
+                                } else {
+                                    Err(trames_net::NetError(11))
+                                }
+                            })
+                        } else {
+                            socket.connect_bytes(address)
+                        };
+                        result
+                            .map(|()| 0)
+                            .map_err(|e| Errno(if e.0 == 115 { 11 } else { e.0 }))
+                    })
+                } else if self.number == 203 && self.connecting {
                     socket.with_tcp_publication(|| {
                         socket
                             .resume_connect()
@@ -142,6 +243,15 @@ impl RetainedSocket {
                         }
                     }
                     return Some(connection.as_ref().unwrap().attempt().map(|()| 0));
+                }
+                if matches!(self.number, 201 | 210) {
+                    return crate::network::unix::control(
+                        &self.factory,
+                        socket,
+                        self.number,
+                        self.args,
+                        memory,
+                    );
                 }
                 Some(crate::network::unix::accept(
                     &self.factory,
@@ -200,6 +310,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 connecting: false,
+                accepted_address: None,
                 message: Some(message),
             },
             memory,
@@ -266,6 +377,7 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 connecting: false,
+                accepted_address: None,
                 message,
             })
         })())

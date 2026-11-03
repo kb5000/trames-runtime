@@ -1986,7 +1986,8 @@ impl View {
     ///
     /// # Safety
     /// Every execution View of this VM uses hardware mode; coordinator mapping
-    /// mutation and unpublished/pinned actors are excluded until all Views join.
+    /// mutation and unpublished byte aliases are excluded until all Views join.
+    /// PinnedBuffer actors retain this same SharedPage and its region/hardware gate.
     pub unsafe fn export_hardware_page(
         &self,
         address: u64,
@@ -2072,13 +2073,10 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().prepare_hardware();
         }
-        // Most hardware address spaces never register fixed I/O buffers. An
-        // empty pin table proves that no mapped page can be pinned; do not walk
-        // the entire resident image at every CPU admission in that case.
-        if !self.parallel_views_quiescent()
-            || (!self.pinned.is_empty()
-                && self.frames.iter().flatten().any(|p| self.page_pinned(p)))
-        {
+        // Pins retain the original SharedPage, never a cached byte pointer.
+        // Its complete region guard serializes cold storage transfer, and each
+        // later pin access enters the existing HardwareStorage borrow gate.
+        if !self.parallel_views_quiescent() {
             return Err(MemoryError::BackingIo(95));
         }
         // A canonical SharedPage can transfer Heap -> hardware storage during
@@ -2241,13 +2239,15 @@ mod tests {
     }
 
     #[test]
-    fn hardware_admission_rejects_only_mapped_live_pins() {
+    fn hardware_admission_accepts_canonical_pins_and_retained_unmapped_bytes() {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
         memory.prepare_hardware().unwrap();
 
         let pin = memory.pin_rw(0x1000, 16).unwrap();
-        assert_eq!(memory.prepare_hardware(), Err(MemoryError::BackingIo(95)));
+        memory.prepare_hardware().unwrap();
+        pin.write(0, b"live").unwrap();
+        assert_eq!(memory.read_array::<4>(0x1000).unwrap(), *b"live");
         drop(pin);
         // The weak registration remains, but no byte actor owns the old pin.
         memory.prepare_hardware().unwrap();

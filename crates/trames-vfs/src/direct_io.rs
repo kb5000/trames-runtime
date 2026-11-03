@@ -211,6 +211,9 @@ impl Drop for PipeGuard<'_> {
 
 /// A frozen poll-only capability; no FD table, Rc or guest memory is retained.
 pub trait DirectPoll: Send + Sync {
+    fn into_uring(self: Arc<Self>) -> Option<Arc<Uring>> {
+        None
+    }
     fn identity(&self) -> usize;
     fn poll(&self, events: u16) -> (u16, [u64; 2]);
     fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription;
@@ -347,6 +350,16 @@ pub struct DirectFd {
     pub(super) origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    pub(super) fn uring_poll(open: &Arc<SharedOpenDescription>, ring: Arc<Uring>) -> Self {
+        Self {
+            resource: ByteResource::PollOnly(ring),
+            flags: open.flags.get(),
+            status: open.flags.clone(),
+            _file: None,
+            origin: Some(OfdIdentity::new(open)),
+        }
+    }
+
     pub(super) fn tcp_poll(open: &Arc<SharedOpenDescription>, tcp: trames_net::TcpPoll) -> Self {
         Self {
             resource: ByteResource::TcpPoll(tcp),
@@ -414,9 +427,11 @@ impl DirectFd {
             match &open.control {
                 // Sharing OFD ownership grants no creator-task signal queue or
                 // BPF byte authority. These retain their original ABI handling.
-                Some(events::SharedControl::Signal(_) | events::SharedControl::Bpf(_)) => {
-                    return None
-                }
+                Some(
+                    events::SharedControl::Uring(_)
+                    | events::SharedControl::Signal(_)
+                    | events::SharedControl::Bpf(_),
+                ) => return None,
                 Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
                 Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
                 Some(events::SharedControl::Inotify(instance)) => {
@@ -648,7 +663,7 @@ impl DirectFd {
         }
         let resource = match &open.anonymous {
             Some(events::Anonymous::Uring(ring)) => {
-                ByteResource::PollOnly(polls.get(&(Rc::as_ptr(ring) as usize))?.clone())
+                ByteResource::PollOnly(polls.get(&(Arc::as_ptr(ring) as usize))?.clone())
             }
             Some(events::Anonymous::Epoll {
                 watches, shared, ..
@@ -688,6 +703,22 @@ impl DirectFd {
                 | ByteResource::Regular
                 | ByteResource::Mounts(_)
         )
+    }
+    pub fn poll_resources(&self) -> Vec<Arc<dyn DirectPoll>> {
+        match &self.resource {
+            ByteResource::PollOnly(poll) => vec![poll.clone()],
+            ByteResource::Epoll(epoll) => epoll
+                .snapshot()
+                .iter()
+                .filter(|(_, state, _)| state.lock().unwrap().armed)
+                .flat_map(|(_, _, fd)| {
+                    fd.resolve()
+                        .map(|fd| fd.poll_resources())
+                        .unwrap_or_default()
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
     pub fn poll_identities(&self) -> Vec<usize> {
         match &self.resource {

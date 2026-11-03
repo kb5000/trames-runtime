@@ -81,7 +81,7 @@ impl<C: Cpu> Kernel<C> {
                 let mut used_window = false;
                 loop {
                     let number = p.cpu.x(8) as u32;
-                    assert!(crate::worker_syscalls::vm_call(number));
+                    assert!(crate::worker_syscalls::vm_entry(&p.cpu));
                     let args = std::array::from_fn(|i| p.cpu.x(i));
                     let kind = match number {
                         214 => 0,
@@ -92,6 +92,7 @@ impl<C: Cpu> Kernel<C> {
                         232 => 5,
                         233 if args[2] as u32 == 4 => 6,
                         233 => 7,
+                        427 => 8,
                         _ => unreachable!(),
                     };
                     self.vm_checkpoint_calls[kind] += 1;
@@ -130,7 +131,7 @@ impl<C: Cpu> Kernel<C> {
                     self.vm_checkpoint_batch[1] += 1;
                     used_window = true;
                     if matches!(outcome, SliceOutcome::Syscall { .. })
-                        && crate::worker_syscalls::vm_call(p.cpu.x(8) as u32)
+                        && crate::worker_syscalls::vm_entry(&p.cpu)
                     {
                         p.cpu.clear_exclusive();
                         extra = true;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::uring::tests::{add, cq, setup, sqe};
-use trames_memory::{Memory, MemoryError, Permissions};
+use trames_memory::{Memory, MemoryError, Permissions, PAGE_SIZE};
+use trames_vfs::{URING_CQES, URING_SQ_ARRAY};
 struct Target;
 impl IoWake for Target {
     fn wake_io(&self, _: &Arc<IoSignal>) {}
@@ -128,8 +129,8 @@ fn shared_pending_pipe_keeps_original_across_handoff_and_releases_at_completion(
     drop(wait);
     drop(snapshot);
     let handoff = epoch.finish();
-    assert_eq!(handoff.len(), 1);
-    assert_eq!(handoff[0].submitted, Some(1));
+    assert!(handoff.is_empty());
+    assert_eq!(r.state.lock().unwrap().waits[&7].0, 1);
     let mut epoch = UringEpoch::default();
     let snapshot = epoch.capture(&l.vfs, owner, 7);
     assert!(epoch.adopt_wait(7, &r, 1, None));
@@ -194,7 +195,7 @@ fn accepted_shared_file_releases_at_completion_or_cancel_after_handoff_and_reuse
         assert!(close.upgrade().is_some());
         assert_eq!(l.vfs.read(notify, 1024), Err(Errno(11)));
         drop(snapshot);
-        assert_eq!(epoch.finish().len(), 1);
+        assert!(epoch.finish().is_empty());
         files.finish();
         let mut files = trames_vfs::FileEpoch::default();
         let caps = files.capture(&l.vfs, true);
@@ -242,7 +243,7 @@ fn fixed_request_keeps_pin_and_ofd_across_unmap_unregister_and_epoch_handoff() {
     let owner = m.instruction_identity().0;
     let [reader, writer] = l.vfs.pipe(0).unwrap();
     register_buffers(&mut l, &mut m, fd, 0x3ffe, 4);
-    let pin = r.state.borrow().buffers.as_ref().unwrap()[0].clone();
+    let pin = r.state.lock().unwrap().buffers.as_ref().unwrap()[0].clone();
     register_files(&mut l, &mut m, fd, &[reader as i32]);
     l.vfs.close(reader).unwrap();
     let [replacement, _] = l.vfs.pipe(0).unwrap();
@@ -259,8 +260,8 @@ fn fixed_request_keeps_pin_and_ofd_across_unmap_unregister_and_epoch_handoff() {
     };
     drop(wait);
     drop(s);
-    let handoff = epoch.finish();
-    assert_eq!(handoff[0].submitted, Some(1));
+    assert!(epoch.finish().is_empty());
+    assert_eq!(r.state.lock().unwrap().waits[&7].0, 1);
     l.uring_register([fd as u64, 1, 0, 0, 0, 0], &mut m)
         .unwrap();
     l.uring_register([fd as u64, 3, 0, 0, 0, 0], &mut m)
@@ -384,11 +385,30 @@ fn linked_eagain_and_drain_survive_owner_handoff_without_early_effects() {
     complete(start(&s, fd, 3, 0, &mut m), 3);
     drop(s);
     let handoff = epoch.finish();
-    assert_eq!(handoff.len(), 1);
-    assert_eq!(handoff[0].submitted, None);
-    assert_eq!(r.state.borrow().pending.len(), 3);
-    assert_eq!(r.state.borrow().pending[1].dependency, Some((1, false)));
-    assert!(!r.state.borrow().pending[1].started);
+    assert!(handoff.is_empty());
+    assert!(!r.state.lock().unwrap().waits.contains_key(&7));
+    assert_eq!(r.state.lock().unwrap().pending.len(), 3);
+    assert_eq!(
+        r.state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .find(|r| r.sequence == 2)
+            .unwrap()
+            .dependency,
+        Some((1, false))
+    );
+    assert!(
+        !r.state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .find(|r| r.sequence == 2)
+            .unwrap()
+            .started
+    );
     l.vfs.write(writer, b"l").unwrap();
     assert_eq!(
         l.uring_enter([fd as u64, 0, 3, 1, 0, 0], &mut m, None, 7),
@@ -449,20 +469,10 @@ fn ring_fd_aliases_share_one_fixed_table_per_task_and_execute_same_queue() {
     let mut epoch = UringEpoch::default();
     let a = epoch.capture(&l.vfs, owner, 7);
     let b = epoch.capture(&l.vfs, owner, 8);
-    assert!(
-        Arc::ptr_eq(&a.fixed[&fd], &a.fixed[&alias])
-            && Arc::ptr_eq(&a.fixed[&alias], &a.fixed[&second])
-    );
     assert!(Arc::ptr_eq(&a.rings[&fd], &a.rings[&alias]));
-    assert!(!Arc::ptr_eq(&a.fixed[&fd], &b.fixed[&fd]));
-    let entry = &epoch.owners[&(Rc::as_ptr(&r) as usize)];
-    assert_eq!(entry.tasks.len(), 2);
-    // Shared fixed resources already own their actual registration in the
-    // ring and fixed capabilities; no extra owner lease is needed at a join.
-    assert_eq!(entry.fixed.len(), 0);
-    assert!(a.fixed[&fd][0]
-        .as_ref()
-        .unwrap()
+    assert!(Arc::ptr_eq(&a.rings[&alias], &a.rings[&second]));
+    assert!(Arc::ptr_eq(&a.rings[&fd], &b.rings[&fd]));
+    assert!(r.state.lock().unwrap().files.as_ref().unwrap()[0]
         .as_ref()
         .unwrap()
         .shared_file()
@@ -611,3 +621,75 @@ fn concurrent_drain_waits_for_claimed_io_but_unrelated_work_uses_same_ring() {
 
 #[path = "async_tests.rs"]
 mod asynchronous;
+
+#[test]
+fn unregister_and_reuse_buffer_group_keeps_the_inflight_original_generation() {
+    let (mut l, mut m, fd, r) = setup(8);
+    let [reader, writer] = l.vfs.pipe(0).unwrap();
+    m.write_array(0x3000, 0x2200u64.to_le_bytes()).unwrap();
+    m.write_array(0x3008, 1u32.to_le_bytes()).unwrap();
+    m.write_array(0x300c, 42u16.to_le_bytes()).unwrap();
+    m.write_array(0x300e, 1u16.to_le_bytes()).unwrap();
+    m.write(0x1200, &[0; 40]).unwrap();
+    m.write_array(0x1200, 0x3000u64.to_le_bytes()).unwrap();
+    m.write_array(0x1208, 1u32.to_le_bytes()).unwrap();
+    m.write_array(0x120c, 9u16.to_le_bytes()).unwrap();
+    l.uring_register([fd as u64, 22, 0x1200, 1, 0, 0], &mut m)
+        .unwrap();
+    // A different mm can register its own descriptor page while this mm's
+    // original byte operation is in flight; no root Memory aliases a live View.
+    let mut child = m.clone();
+    child.write_array(0x4000, 0x2300u64.to_le_bytes()).unwrap();
+    child.write_array(0x4008, 1u32.to_le_bytes()).unwrap();
+    child.write_array(0x400c, 43u16.to_le_bytes()).unwrap();
+    child.write_array(0x400e, 1u16.to_le_bytes()).unwrap();
+    let mut read = data(22, reader, 0, 1, 77, 32);
+    read[40..42].copy_from_slice(&9u16.to_le_bytes());
+    add(&mut m, &r, read);
+    l.vfs.write(writer, b"o").unwrap();
+    let mut epoch = UringEpoch::default();
+    let s = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
+    let view = m.parallel_view(&mut Default::default()).unwrap();
+    let (entered, receive) = std::sync::mpsc::sync_channel(1);
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let job = scope.spawn(move || {
+            let mut gated = Gate {
+                inner: view,
+                entered,
+                release: blocked,
+                once: Cell::new(false),
+            };
+            complete(start(&s, fd, 1, 1, &mut gated), 1);
+        });
+        receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let original = r.state.lock().unwrap().provided[&9].identity;
+        child.write(0x1200, &[0; 40]).unwrap();
+        child.write_array(0x120c, 9u16.to_le_bytes()).unwrap();
+        l.uring_register([fd as u64, 23, 0x1200, 1, 0, 0], &mut child)
+            .unwrap();
+        assert!(r
+            .state
+            .lock()
+            .unwrap()
+            .retired_groups
+            .contains_key(&original));
+        child.write_array(0x1200, 0x4000u64.to_le_bytes()).unwrap();
+        child.write_array(0x1208, 1u32.to_le_bytes()).unwrap();
+        l.uring_register([fd as u64, 22, 0x1200, 1, 0, 0], &mut child)
+            .unwrap();
+        assert_ne!(r.state.lock().unwrap().provided[&9].identity, original);
+        release.send(()).unwrap();
+        job.join().unwrap();
+    });
+    m.commit_parallel().unwrap();
+    assert_eq!(cq(&mut m, &r), (77, 1));
+    assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"o");
+    let state = r.state.lock().unwrap();
+    assert!(state.retired_groups.is_empty() && state.busy_groups.is_empty());
+    assert!(matches!(
+        &state.provided[&9].source,
+        trames_vfs::UringBufferSource::Ring { head: 0, .. }
+    ));
+    assert_eq!(child.read_array::<1>(0x2300).unwrap(), [0]);
+}

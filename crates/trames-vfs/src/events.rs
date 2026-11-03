@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
-    Uring(Rc<Uring>),
+    Uring(Arc<Uring>),
     Bpf(Arc<bpf::Program>),
     Inotify(Arc<inotify::InotifyInstance>),
     Signal(Arc<SignalMask>),
@@ -34,6 +34,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Uring(Arc<Uring>),
     Signal(Arc<SignalMask>),
     Bpf(Arc<bpf::Program>),
     Event(Arc<direct_io::EventCounter>),
@@ -44,17 +45,18 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Uring(ring) => Self::Uring(ring.clone()),
             Anonymous::Signal(mask) => Self::Signal(mask.clone()),
             Anonymous::Bpf(program) => Self::Bpf(program.clone()),
             Anonymous::Event(counter) => Self::Event(counter.clone()),
             Anonymous::Timer(timer) => Self::Timer(timer.clone()),
             Anonymous::Inotify(instance) => Self::Inotify(instance.clone()),
             Anonymous::Epoll { shared, .. } => Self::Epoll(shared.clone()),
-            _ => return None,
         })
     }
     pub(super) fn owner_projection(&self) -> Anonymous {
         match self {
+            Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
             Self::Event(counter) => Anonymous::Event(counter.clone()),

@@ -6,6 +6,7 @@ use super::*;
 enum LocalSource {
     Ring(usize),
     Byte(usize),
+    Control(usize, u64),
 }
 struct Subscription<T> {
     value: T,
@@ -18,7 +19,8 @@ struct Subscription<T> {
 #[derive(Default)]
 pub(super) struct WaitSources {
     local: BTreeMap<LocalSource, Subscription<Vec<trames_vfs::IoSubscription>>>,
-    hosts: BTreeMap<(usize, bool), Subscription<trames_vfs::HostSubscription>>,
+    hosts: BTreeMap<(usize, bool, usize), Subscription<trames_vfs::HostSubscription>>,
+    deadline: Option<Instant>,
 }
 impl WaitSources {
     fn local(
@@ -37,12 +39,13 @@ impl WaitSources {
     fn host(
         &mut self,
         key: (usize, bool),
+        slot: usize,
         signal: &Arc<IoSignal>,
         target: &Weak<dyn IoWake>,
         fd: impl FnOnce() -> std::io::Result<trames_vfs::HostFd>,
     ) -> Option<()> {
         use std::collections::btree_map::Entry;
-        match self.hosts.entry(key) {
+        match self.hosts.entry((key.0, key.1, slot)) {
             Entry::Occupied(mut entry) => {
                 let subscription = entry.get_mut();
                 if !subscription.used {
@@ -67,6 +70,9 @@ impl WaitSources {
                 .values()
                 .any(|entry| entry.value.iter().any(|s| s.external()))
     }
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
     pub(super) fn refresh(
         &mut self,
         rings: &[Arc<Ring>],
@@ -74,7 +80,9 @@ impl WaitSources {
         task: u32,
         signal: &Arc<IoSignal>,
         target: &Weak<dyn IoWake>,
+        actor: &UringActor,
     ) -> bool {
+        self.deadline = None;
         for subscription in self.local.values_mut() {
             subscription.used = false;
         }
@@ -82,7 +90,7 @@ impl WaitSources {
             subscription.used = false;
         }
         for ring in rings {
-            if !ring.subscribe_requests(owner, task, signal, target, self) {
+            if !ring.subscribe_requests(owner, task, signal, target, self, actor) {
                 return false;
             }
         }
@@ -97,55 +105,115 @@ impl WaitSources {
     }
 }
 
-impl Ring {
-    pub(super) fn waitable(&self, state: &State, r: &Request) -> bool {
-        state.eligible(r)
-            && !self.backpressured(state, r)
-            && !(r.selected() && state.busy_groups.contains(&r.sqe.buffer_group()))
-    }
-    pub(super) fn subscribe_requests(
+pub(super) trait RingWaitOps {
+    fn waitable(&self, state: &State, r: &Request) -> bool;
+    fn subscribe_requests(
         &self,
         owner: u64,
         task: u32,
         signal: &Arc<IoSignal>,
         target: &Weak<dyn IoWake>,
         sources: &mut WaitSources,
+        actor: &UringActor,
+    ) -> bool;
+    fn request_deadline(&self, owner: u64, task: u32) -> Option<Instant>;
+}
+impl RingWaitOps for Ring {
+    fn waitable(&self, state: &State, r: &Request) -> bool {
+        state.eligible(r)
+            && !self.backpressured(state, r)
+            && !(r.selected()
+                && state
+                    .provided
+                    .get(&r.sqe.buffer_group())
+                    .is_some_and(|g| state.busy_groups.contains(&g.identity)))
+    }
+    fn subscribe_requests(
+        &self,
+        owner: u64,
+        task: u32,
+        signal: &Arc<IoSignal>,
+        target: &Weak<dyn IoWake>,
+        sources: &mut WaitSources,
+        actor: &UringActor,
     ) -> bool {
-        let state = self.state.lock().unwrap();
-        sources.local(LocalSource::Ring(self.identity), || {
+        sources.local(LocalSource::Ring(self as *const Self as usize), || {
             vec![self.readiness.subscribe(signal)]
         });
-        for r in state
-            .pending
-            .iter()
-            .filter(|r| r.owner == owner && r.task == task && self.waitable(&state, r))
-        {
-            let Some(resource) = &r.resource else {
+        let interests: Vec<_> = {
+            let state = self.state.lock().unwrap();
+            state
+                .pending
+                .iter()
+                .filter(|r| r.owner == owner && r.task == task && self.waitable(&state, r))
+                .map(|r| (r.sequence, r.resource.clone(), r.file.clone(), r.events()))
+                .collect()
+        };
+        // Resource subscriptions may enter their actual native socket or host
+        // event object. Never retain the ring's metadata lock across them.
+        for (sequence, resource, file, events) in interests {
+            if let Some(subscription) = actor.subscribe(self, sequence, signal) {
+                let key = LocalSource::Control(self as *const Uring as usize, sequence);
+                sources.local.remove(&key);
+                sources.local(key, || vec![subscription]);
+                continue;
+            }
+            if let Some(resource) = &resource {
+                match &resource.object {
+                    Object::Byte(f) => {
+                        sources.local(LocalSource::Byte(resource.identity), || f.subscribe(signal));
+                        continue;
+                    }
+                    Object::Tcp(f) => {
+                        if sources
+                            .host(
+                                (resource.identity, events & 4 != 0),
+                                0,
+                                signal,
+                                target,
+                                || tcp_wait_fd(&f.tcp),
+                            )
+                            .is_none()
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    Object::File(_) => continue,
+                }
+            }
+            let Some(file) = file else {
                 continue;
             };
-            match &resource.object {
-                Object::Byte(f) => {
-                    sources.local(LocalSource::Byte(resource.identity), || f.subscribe(signal))
+            if let Some(socket) = file.socket() {
+                let Ok((fds, delay)) = socket.wait_sources() else {
+                    return false;
+                };
+                if let Some(deadline) = delay.and_then(|d| Instant::now().checked_add(d)) {
+                    sources.deadline = [sources.deadline, Some(deadline)]
+                        .into_iter()
+                        .flatten()
+                        .min();
                 }
-                Object::Tcp(f) => {
+                for (i, fd) in fds.into_iter().enumerate() {
                     if sources
                         .host(
-                            (resource.identity, r.events() & 4 != 0),
+                            (file.identity(), events & 4 != 0),
+                            i,
                             signal,
                             target,
-                            || tcp_wait_fd(&f.tcp),
+                            || Ok(fd.into()),
                         )
                         .is_none()
                     {
                         return false;
                     }
                 }
-                Object::File(_) => {}
             }
         }
         true
     }
-    pub(super) fn request_deadline(&self, owner: u64, task: u32) -> Option<Instant> {
+    fn request_deadline(&self, owner: u64, task: u32) -> Option<Instant> {
         let state = self.state.lock().unwrap();
         state
             .pending
