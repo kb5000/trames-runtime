@@ -51,6 +51,7 @@ impl Slot {
 #[derive(Default)]
 pub(super) struct Membership {
     pub(super) entries: Mutex<MembershipEntries>,
+    pub(super) local_ownership: Arc<ipc::ownership::Ownership>,
     revision: AtomicU64,
 }
 #[derive(Default)]
@@ -959,6 +960,7 @@ impl Clone for DescriptorTable {
             })),
             SharedFiles(
                 Arc::new(Membership {
+                    local_ownership: self.1 .0.local_ownership.clone(),
                     entries: Mutex::new(MembershipEntries {
                         slots: entries,
                         wayland: None,

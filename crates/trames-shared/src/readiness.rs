@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex, Weak,
+    Arc, Mutex, OnceLock, Weak,
 };
 
 pub trait IoWake: Send + Sync {
@@ -48,6 +48,13 @@ pub struct Readiness {
     armed: AtomicUsize,
     next: AtomicU64,
     listeners: Mutex<BTreeMap<u64, Weak<IoSignal>>>,
+    driver: OnceLock<Weak<dyn ReadinessDriver>>,
+}
+/// A shared native adapter attaches its existing event queue to the caller's
+/// idle executor. The resource keeps only a weak reference, never a service
+/// thread or a cycle through the adapter's owned guest endpoint.
+pub trait ReadinessDriver: Send + Sync {
+    fn attach(&self, events: Arc<crate::HostEvents>) -> std::io::Result<()>;
 }
 /// A resource can acquire a native event source after a task already parked.
 /// Publish changes through its Readiness; the existing executor rearms it.
@@ -111,6 +118,18 @@ pub struct IoSubscription {
     dynamic: Option<Box<DynamicHost>>,
 }
 impl Readiness {
+    pub fn set_driver(&self, driver: Weak<dyn ReadinessDriver>) {
+        if let Some(current) = self.driver.get() {
+            assert!(current.ptr_eq(&driver), "one native driver per resource");
+            return;
+        }
+        if let Err(driver) = self.driver.set(driver) {
+            assert!(
+                self.driver.get().unwrap().ptr_eq(&driver),
+                "one native driver per resource"
+            );
+        }
+    }
     pub fn subscribe(self: &Arc<Self>, signal: &Arc<IoSignal>) -> IoSubscription {
         let mut listeners = self.listeners.lock().unwrap();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -120,12 +139,21 @@ impl Readiness {
         // or the changer sees this subscription. Separate flag/counter loads
         // would allow store buffering and a lost wake on ARM.
         self.armed.fetch_or(1, Ordering::AcqRel);
+        drop(listeners);
+        let driver = self.driver.get().and_then(Weak::upgrade);
+        let host_failed = driver.as_ref().is_some_and(|driver| {
+            signal
+                .target
+                .upgrade()
+                .and_then(|t| t.host_events())
+                .is_some_and(|events| driver.attach(events).is_err())
+        });
         IoSubscription {
             source: Some(self.clone()),
             id,
             host: None,
-            host_failed: false,
-            external: false,
+            host_failed,
+            external: driver.is_some(),
             dynamic: None,
         }
     }

@@ -146,7 +146,7 @@ impl PipeData {
 // happen after unlock, so a wake callback can safely retry the same pipe.
 pub(super) struct PipeResource {
     data: Mutex<PipeData>,
-    readiness: Arc<Readiness>,
+    pub(super) readiness: Arc<Readiness>,
 }
 pub(super) struct PipeGuard<'a> {
     guard: Option<MutexGuard<'a, PipeData>>,
@@ -1010,7 +1010,13 @@ impl DirectFd {
     /// None requests the original owner before consuming any bytes or rights.
     pub fn read_attempt(&self, count: usize) -> Option<Result<Vec<u8>>> {
         if self.is_unix() {
-            return self.recv(count, 0);
+            if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+                return Some(Err(Errno(9)));
+            }
+            let (data, side) = self.local_data()?;
+            return data
+                .recv_portable(side, count, 0)
+                .map(|r| r.map(|r| r.data));
         }
         if let ByteResource::SimpleDevice(kind) = self.resource {
             return Some(

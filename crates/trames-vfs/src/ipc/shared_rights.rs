@@ -3,44 +3,80 @@
 use super::*;
 
 #[derive(Clone, Default)]
-pub struct SharedRights(Option<Arc<[Arc<SharedOpenDescription>]>>);
+pub struct SharedRights(Option<Arc<[Arc<SharedOpenDescription>]>>, bool);
 #[derive(Clone)]
 pub(super) enum QueuedRights {
     Owner(u64),
+    OwnerGraph {
+        id: u64,
+        _graph: Arc<ownership::Link>,
+    },
     Shared(SharedRights),
+    Owned(Arc<ownership::Link>),
 }
 impl QueuedRights {
     pub fn owner(&self) -> Option<u64> {
         match self {
-            Self::Owner(id) => Some(*id),
-            Self::Shared(_) => None,
+            Self::Owner(id) | Self::OwnerGraph { id, .. } => Some(*id),
+            Self::Shared(_) | Self::Owned(_) => None,
         }
+    }
+    pub fn into_shared(self) -> Option<SharedRights> {
+        match self {
+            Self::Shared(rights) => Some(rights),
+            Self::Owned(link) => Some(link.rights()),
+            _ => None,
+        }
+    }
+    pub fn for_receiver(
+        receiver: &Arc<LocalResource>,
+        rights: SharedRights,
+    ) -> Result<Option<Self>> {
+        if rights.is_empty() {
+            Ok(None)
+        } else if rights.1 {
+            ownership::Ownership::shared(receiver, rights).map(|link| Some(Self::Owned(link)))
+        } else {
+            Ok(Some(Self::Shared(rights)))
+        }
+    }
+    pub fn legacy(id: u64, link: Option<Arc<ownership::Link>>) -> Self {
+        link.map_or(Self::Owner(id), |link| Self::OwnerGraph {
+            id,
+            _graph: link,
+        })
     }
 }
 impl LocalRights {
     pub(super) fn shared(&self) -> Option<SharedRights> {
+        let mut unix = false;
         self.0
             .iter()
             .map(|open| match open {
-                OpenHandle::Shared(open) if open.local.is_none() => Some(open.clone()),
-                OpenHandle::Shared(_) => None,
+                OpenHandle::Shared(open) => {
+                    unix |= open.local.is_some();
+                    Some(open.clone())
+                }
                 OpenHandle::Owner(_) => None,
             })
             .collect::<Option<Vec<_>>>()
-            .map(SharedRights::new)
+            .map(|opens| SharedRights::new(opens, unix))
     }
 }
 impl SharedRights {
-    fn new(opens: Vec<Arc<SharedOpenDescription>>) -> Self {
-        Self((!opens.is_empty()).then(|| opens.into()))
+    pub(super) fn new(opens: Vec<Arc<SharedOpenDescription>>, unix: bool) -> Self {
+        Self((!opens.is_empty()).then(|| opens.into()), unix)
     }
     pub fn is_empty(&self) -> bool {
         self.0.is_none()
     }
-    fn len(&self) -> usize {
+    pub(super) fn owns_unix(&self) -> bool {
+        self.1
+    }
+    pub(super) fn len(&self) -> usize {
         self.0.as_ref().map_or(0, |opens| opens.len())
     }
-    fn iter(&self) -> impl Iterator<Item = &Arc<SharedOpenDescription>> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &Arc<SharedOpenDescription>> {
         self.0.iter().flat_map(|opens| opens.iter())
     }
     pub fn local(&self) -> LocalRights {
@@ -71,9 +107,8 @@ impl channel::Resource {
         self.recv_portable(side, count, flags).map(|result| {
             result.map(|received| {
                 let rights = match received.rights {
-                    Some(QueuedRights::Shared(rights)) => rights,
+                    Some(rights) => rights.into_shared().expect("portable receive preflight"),
                     None => SharedRights::default(),
-                    Some(QueuedRights::Owner(_)) => unreachable!("portable receive preflight"),
                 };
                 let kind = received.options[1];
                 LocalReceived {
@@ -117,6 +152,7 @@ impl DescriptorFactory {
         }
         let entries = self.files.0.entries.lock().unwrap();
         let mut rights = Vec::with_capacity(fds.len());
+        let mut unix = false;
         for fd in fds {
             let Some(slot) = entries.get(fd) else {
                 return Some(Err(Errno(9)));
@@ -126,14 +162,10 @@ impl DescriptorFactory {
                 Ok(open) => open,
                 Err(e) => return Some(Err(e)),
             };
-            // Unix-bearing rights retain the original owner cycle/ledger path.
-            // Sharing the OFD does not make its owning reference graph portable.
-            if open.local.is_some() {
-                return None;
-            }
+            unix |= open.local.is_some();
             rights.push(open.clone());
         }
-        Some(Ok(SharedRights::new(rights)))
+        Some(Ok(SharedRights::new(rights, unix)))
     }
     /// Import into the original real Files domain as one publication. Excess
     /// rights are dropped after releasing Files; no resource destructor or

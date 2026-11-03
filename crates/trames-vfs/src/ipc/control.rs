@@ -47,6 +47,7 @@ impl LocalConnection {
             self.client.kind,
             peer.credentials.get(),
             peer.network.clone(),
+            peer.ownership.clone(),
         )?;
         self.client.credentials.set(self.identity);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();

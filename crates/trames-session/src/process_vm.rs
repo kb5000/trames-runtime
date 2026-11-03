@@ -187,11 +187,9 @@ impl<C: Cpu> Kernel<C> {
             {
                 return Ok(true);
             }
-            // Keep Rc/SCM_RIGHTS bookkeeping on this owner, while workers use
-            // the same shared byte queues and pipe readiness. Pumping imports
-            // owned host resources; it neither accesses guest memory nor
-            // installs guest FDs, so it does not require returning their Views.
-            root.linux.vfs.pump_native_services();
+            // Only actual owner-only control projections require this join.
+            // Ordinary Unix rights and native-service transport run directly
+            // on resource notifications / the existing idle executor.
             if root.linux.vfs.local_rights_need_owner() {
                 return Ok(true);
             }
@@ -832,7 +830,7 @@ mod tests {
             .vfs
             .local_connect(&socket, b"\x01\x00/run/user/0/wayland-0\0")
             .unwrap();
-        a.linux.vfs.pump_native_services();
+        a.linux.vfs.dispatch_native_events();
         assert!(a.linux.vfs.has_native_services());
         let sender = a.linux.vfs.direct_descriptors().get(fd).unwrap();
         let completed = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
@@ -884,6 +882,7 @@ mod tests {
             Err(RuntimeError::Cancelled)
         ));
         assert_eq!(count(&completed), 24);
+        assert_eq!(k.service_requests, 0);
         assert_eq!(
             k.processes[&1].memory.read_array::<4>(0x1000).unwrap(),
             2u32.to_ne_bytes()

@@ -3,6 +3,226 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
+fn owning_rights_include_unaccepted_listener_children_without_a_connect_graph_lock() {
+    let mut v = Vfs::default();
+    let listener = v.local_create(1, 0).unwrap();
+    let server = v.local_socket(listener).unwrap().unwrap();
+    let address = b"\x01\x00\0pending-rights-cycle";
+    v.local_bind(&server, address).unwrap();
+    v.local_listen(&server, 4).unwrap();
+    let client = v.local_create(1, 0).unwrap();
+    v.local_connect(&v.local_socket(client).unwrap().unwrap(), address)
+        .unwrap();
+    let pending = Arc::downgrade(
+        server
+            .listener
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .pending
+            .front()
+            .unwrap(),
+    );
+    assert_eq!(
+        v.local_socket(client).unwrap().unwrap().send_rights(
+            b"cycle",
+            0,
+            v.send_rights(&[listener]).unwrap()
+        ),
+        Err(Errno(95))
+    );
+    drop(server);
+    v.close(listener).unwrap();
+    assert!(pending.upgrade().is_none());
+    assert_eq!(v.read(client, 1).unwrap(), b"");
+}
+
+#[test]
+fn queued_unix_final_close_can_reenter_the_same_ownership_graph_from_notification() {
+    struct SendAgain {
+        tx: DirectFd,
+        rights: SharedRights,
+        done: std::sync::mpsc::Sender<()>,
+    }
+    impl IoWake for SendAgain {
+        fn wake_io(&self, _: &Arc<IoSignal>) {
+            assert_eq!(
+                self.tx
+                    .send_local_message(b"new", 0, &self.rights, [1, 0, 0]),
+                Some(Ok(3))
+            );
+            self.done.send(()).unwrap();
+        }
+    }
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let [c, d] = v.socketpair(1, 1, 0).unwrap();
+    let [out, _input] = v.socketpair(1, 1, 0).unwrap();
+    let [carried, _peer] = v.socketpair(1, 1, 0).unwrap();
+    let factory = v.descriptor_factory();
+    let (done, wait) = std::sync::mpsc::channel();
+    let target: Arc<dyn IoWake> = Arc::new(SendAgain {
+        tx: v.direct_descriptors().get(out).unwrap(),
+        rights: factory.send_local_rights(&[carried]).unwrap().unwrap(),
+        done,
+    });
+    let signal = IoSignal::new(1, Arc::downgrade(&target));
+    let _subscription = factory
+        .local_operation(d)
+        .unwrap()
+        .unwrap()
+        .subscribe(&signal);
+    v.local_socket(a)
+        .unwrap()
+        .unwrap()
+        .send_rights(b"old", 0, v.send_rights(&[c]).unwrap())
+        .unwrap();
+    v.close(c).unwrap();
+    let worker = std::thread::spawn(move || factory.files.close(b, 1).unwrap().unwrap());
+    wait.recv_timeout(std::time::Duration::from_secs(3))
+        .expect("final close ran under an ownership/queue lock");
+    worker.join().unwrap();
+    drop(_subscription);
+}
+
+#[test]
+fn concurrent_unix_rights_cannot_publish_a_reciprocal_owning_cycle() {
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let [c, d] = v.socketpair(1, 1, 0).unwrap();
+    let factory = v.descriptor_factory();
+    let weak =
+        [b, c].map(|fd| Arc::downgrade(factory.local_operation(fd).unwrap().unwrap().core()));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let jobs: Vec<_> = [(a, c), (d, b)]
+        .into_iter()
+        .map(|(source, carried)| {
+            let fd = v.direct_descriptors().get(source).unwrap();
+            let rights = factory.send_local_rights(&[carried]).unwrap().unwrap();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                fd.send_local_message(b"x", 0, &rights, [1, 0, 0]).unwrap()
+            })
+        })
+        .collect();
+    let results: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|&&r| r == Ok(1)).count(), 1);
+    assert_eq!(results.iter().filter(|&&r| r == Err(Errno(95))).count(), 1);
+    for fd in [a, b, c, d] {
+        v.close(fd).unwrap();
+    }
+    assert!(weak.iter().all(|p| p.upgrade().is_none()));
+    assert!(!v.local_rights_need_owner());
+}
+
+#[test]
+fn shared_unix_rights_keep_original_ofd_across_reuse_peek_and_worker_import() {
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 5, 0).unwrap();
+    let [c, d] = v.socketpair(1, 1, 0).unwrap();
+    let factory = v.descriptor_factory();
+    let rights = factory.send_local_rights(&[c]).unwrap().unwrap();
+    v.close(c).unwrap();
+    assert_eq!(v.eventfd(99, 0).unwrap(), c);
+    let tx = v.direct_descriptors().get(a).unwrap();
+    assert_eq!(
+        std::thread::spawn(move || tx.send_local_message(b"fd", 0, &rights, [1, 0, 0]).unwrap())
+            .join()
+            .unwrap(),
+        Ok(2)
+    );
+    let rx = v.direct_descriptors().get(b).unwrap();
+    let peek = rx.recv_local_message(1, 2).unwrap().unwrap();
+    assert_eq!(peek.data, b"f");
+    assert!(peek.truncated);
+    let (first, cut) = factory.receive_local_rights(peek.rights, 1, true);
+    assert!(!cut);
+    let received = std::thread::spawn(move || rx.recv_local_message(9, 0).unwrap().unwrap())
+        .join()
+        .unwrap();
+    let (second, cut) = factory.receive_local_rights(received.rights, 1, false);
+    assert!(!cut);
+    assert_eq!(received.data, b"fd");
+    assert_ne!(v.flags(first[0]).unwrap() & O_CLOEXEC, 0);
+    assert_eq!(v.flags(second[0]).unwrap() & O_CLOEXEC, 0);
+    v.write(first[0], b"one").unwrap();
+    assert_eq!(v.read(d, 3).unwrap(), b"one");
+    v.write(second[0], b"two").unwrap();
+    assert_eq!(v.read(d, 3).unwrap(), b"two");
+    assert_eq!(v.read(c, 8).unwrap(), 99u64.to_le_bytes());
+    assert!(v.local_rights.entries.borrow().is_empty());
+}
+
+#[test]
+fn raw_worker_read_discards_unix_rights_and_releases_the_original_socket() {
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let [c, _d] = v.socketpair(1, 1, 0).unwrap();
+    let factory = v.descriptor_factory();
+    let weak = Arc::downgrade(factory.local_operation(c).unwrap().unwrap().core());
+    v.local_socket(a)
+        .unwrap()
+        .unwrap()
+        .send_rights(b"x", 0, v.send_rights(&[c]).unwrap())
+        .unwrap();
+    v.close(c).unwrap();
+    assert_eq!(v.eventfd(73, 0).unwrap(), c);
+    assert!(weak.upgrade().is_some());
+    let rx = v.direct_descriptors().get(b).unwrap();
+    assert_eq!(
+        std::thread::spawn(move || rx.read(1)).join().unwrap(),
+        Ok(b"x".to_vec())
+    );
+    assert!(weak.upgrade().is_none());
+    assert_eq!(v.read(c, 8).unwrap(), 73u64.to_le_bytes());
+    assert!(!v.local_rights_need_owner());
+}
+
+#[test]
+fn owner_only_mixed_rights_and_shared_unix_rights_observe_one_cycle_graph() {
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let [c, d] = v.socketpair(1, 1, 0).unwrap();
+    v.set_runtime_info(
+        1,
+        RuntimeInfo {
+            processes: vec![ProcessInfo {
+                pid: 1,
+                tgid: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let legacy = v
+        .open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
+        .unwrap();
+    let factory = v.descriptor_factory();
+    assert!(factory.send_local_rights(&[legacy]).is_none());
+    v.local_socket(a)
+        .unwrap()
+        .unwrap()
+        .send_rights(b"x", 0, v.send_rights(&[legacy, c]).unwrap())
+        .unwrap();
+    let tx = v.direct_descriptors().get(d).unwrap();
+    let rights = factory.send_local_rights(&[b]).unwrap().unwrap();
+    assert_eq!(
+        tx.send_local_message(b"cycle", 0, &rights, [1, 0, 0]),
+        Some(Err(Errno(95)))
+    );
+    let received = v.local_socket(b).unwrap().unwrap().recv(1, 0).unwrap();
+    let (fds, cut) = v.receive_rights(received.rights, 2, false);
+    assert!(!cut);
+    assert_eq!(fds.len(), 2);
+    assert_eq!(
+        tx.send_local_message(b"allowed", 0, &rights, [1, 0, 0]),
+        Some(Ok(7))
+    );
+    assert!(v.local_rights.entries.borrow().is_empty());
+}
+
+#[test]
 fn concurrent_socket_creation_uses_the_original_complete_namespace_and_ofds() {
     fn shared<T: Send + Sync>() {}
     shared::<LocalResource>();
@@ -176,7 +396,7 @@ fn preconnect_subscriptions_and_options_survive_connection_publication() {
 }
 
 #[test]
-fn worker_final_close_defers_only_legacy_rights_destruction_to_the_owner() {
+fn worker_final_close_releases_shared_unix_rights_without_owner_reap() {
     let mut v = Vfs::default();
     let [a, b] = v.socketpair(1, 1, 0).unwrap();
     let [queued, _peer] = v.socketpair(1, 1, 0).unwrap();
@@ -190,7 +410,7 @@ fn worker_final_close_defers_only_legacy_rights_destruction_to_the_owner() {
             .unwrap(),
     );
     let factory = v.descriptor_factory();
-    assert!(factory.send_local_rights(&[queued]).is_none());
+    assert!(factory.send_local_rights(&[queued]).unwrap().is_ok());
     let sender = v.local_socket(a).unwrap().unwrap();
     sender
         .send_rights(b"x", 0, v.send_rights(&[queued]).unwrap())
@@ -201,8 +421,7 @@ fn worker_final_close_defers_only_legacy_rights_destruction_to_the_owner() {
     std::thread::spawn(move || factory.files.close(b, 1).unwrap().unwrap())
         .join()
         .unwrap();
-    assert!(v.local_rights_need_owner());
-    v.reap_local_rights();
+    assert!(!v.local_rights_need_owner());
     assert!(weak.upgrade().is_none());
     assert!(!v.local_rights_need_owner());
 }

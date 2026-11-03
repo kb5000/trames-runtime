@@ -53,6 +53,7 @@ struct Control {
     wake: UnixStream,
     snapshot: Arc<Mutex<Snapshot>>,
     changes: Arc<trames_shared::Readiness>,
+    command_space: Arc<trames_shared::Readiness>,
     next: AtomicU64,
     guest_clock: OnceLock<std::time::Instant>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -72,10 +73,19 @@ impl Control {
 }
 impl Drop for Control {
     fn drop(&mut self) {
-        // Teardown is outside GPU/frame callbacks and holds no guest byte guard.
+        let worker = self.worker.get_mut().ok().and_then(Option::take);
+        if worker
+            .as_ref()
+            .is_some_and(|worker| worker.thread().id() == thread::current().id())
+        {
+            // A resource acknowledgement can release the last server lease on
+            // this loop. Closing sender/wake stops it; never send into its own
+            // full command queue or join the current thread.
+            return;
+        }
         let _ = self.sender.send(Command::Stop);
         let _ = (&self.wake).write(&[1]);
-        if let Some(worker) = self.worker.get_mut().ok().and_then(Option::take) {
+        if let Some(worker) = worker {
             let _ = worker.join();
         }
     }
@@ -101,14 +111,17 @@ impl Server {
         let output = snapshot.clone();
         let changes = Arc::new(trames_shared::Readiness::default());
         let notifications = changes.clone();
+        let command_space = Arc::new(trames_shared::Readiness::default());
+        let commands = command_space.clone();
         let worker = thread::Builder::new()
             .name("trames-wayland".into())
-            .spawn(move || run(compositor, read, receiver, output, notifications))?;
+            .spawn(move || run(compositor, read, receiver, output, notifications, commands))?;
         Ok(Self(Arc::new(Control {
             sender,
             wake,
             snapshot,
             changes,
+            command_space,
             next: AtomicU64::new(1),
             guest_clock: OnceLock::new(),
             worker: Mutex::new(Some(worker)),
@@ -161,6 +174,12 @@ impl Server {
         signal: &Arc<trames_shared::IoSignal>,
     ) -> trames_shared::IoSubscription {
         self.0.changes.subscribe(signal)
+    }
+    pub fn subscribe_commands(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.0.command_space.subscribe(signal)
     }
     pub fn snapshot(&self) -> Snapshot {
         self.0
@@ -229,11 +248,14 @@ fn run(
     receiver: mpsc::Receiver<Command>,
     output: Arc<Mutex<Snapshot>>,
     changes: Arc<trames_shared::Readiness>,
+    command_space: Arc<trames_shared::Readiness>,
 ) {
     let mut stopped = false;
     let mut published = u64::MAX;
     while !stopped {
+        let mut commands_consumed = false;
         while let Ok(command) = receiver.try_recv() {
+            commands_consumed = true;
             match command {
                 Command::ConnectXwm(socket, key) => {
                     if compositor.state.xwayland.managers.len() < 4
@@ -271,6 +293,9 @@ fn run(
                 Command::ClipboardChanged => compositor.state.host_clipboard_changed(),
                 Command::Stop => stopped = true,
             }
+        }
+        if commands_consumed {
+            command_space.notify_locked();
         }
         if stopped {
             break;
@@ -357,6 +382,36 @@ fn run(
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+    #[test]
+    fn native_acknowledgement_can_release_the_last_server_on_its_event_loop() {
+        struct LastServer {
+            server: Mutex<Option<Server>>,
+            done: mpsc::Sender<()>,
+        }
+        impl trames_shared::IoWake for LastServer {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+                let server = self.server.lock().unwrap().take();
+                if server.is_some() {
+                    drop(server);
+                    self.done.send(()).unwrap();
+                }
+            }
+        }
+        let (send, receive) = mpsc::channel();
+        let target = Arc::new(LastServer {
+            server: Mutex::new(Some(Server::new().unwrap())),
+            done: send,
+        });
+        let erased: Arc<dyn trames_shared::IoWake> = target.clone();
+        let signal = trames_shared::IoSignal::new(0, Arc::downgrade(&erased));
+        let server = target.server.lock().unwrap();
+        let _subscription = server.as_ref().unwrap().subscribe_commands(&signal);
+        server.as_ref().unwrap().resize(1, 640, 480).unwrap();
+        drop(server);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(target.server.lock().unwrap().is_none());
+    }
+
     use std::time::{Duration, Instant};
 
     #[test]
@@ -371,6 +426,7 @@ mod clock_tests {
             wake,
             snapshot: Arc::new(Mutex::new(Snapshot::default())),
             changes: Arc::new(trames_shared::Readiness::default()),
+            command_space: Arc::default(),
             next: AtomicU64::new(1),
             guest_clock: clock,
             worker: Mutex::new(None),

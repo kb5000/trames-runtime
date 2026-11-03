@@ -1788,3 +1788,88 @@ services. Network tests cover active counters, existing-capability send/receive,
 rule removal, retained close identity, namespace teardown and SO_ERROR denial.
 Unix owning ancillary graphs, native services, io_uring, task/job control and
 structural file/VM/task transitions remain separate coordinator dependencies.
+
+## Shared Unix owning rights and worker reclamation (2026-11-03)
+
+Complete shared Unix OFDs can travel through sendmsg/sendmmsg and recvmsg on the
+calling worker. The real owning relation belongs to one shared object inherited
+across fork and CLONE_FILES, including later network-namespace changes. Its entries
+hold the actual accepted OFDs. Queues hold reference-counted links with weak graph
+identity, not strong Unix OFDs or an owner-thread ledger ID. Consequently a queue
+cannot form a strong ownership cycle back through the graph; closing a receiver
+or consuming/truncating its rights releases them immediately on that worker.
+Receiver identities and ordinary capability caches stay weak; queued contents
+retain the actual carried OFDs.
+
+The graph's existing owning-map responsibility becomes an object-local metadata
+transaction: cycle validation and a provisional entry publish together, including
+another send not yet enqueued. Failed, empty-stream or backpressured sends retire
+that entry. The guard spans no Files lookup, queue I/O, notification or resource
+destruction. Actual FDs and upgraded endpoint leases release after it; cascading
+queue destruction drains iteratively on the same thread. Final-close callbacks
+can reenter the same graph. No coordinator/resource thread, message bus, polling
+loop, unsafe code, ordinary guest-memory fence or native-only access rule is added.
+
+Original queued-rights cycles remain rejected. Validation also follows a listener's
+unaccepted server ownership, preventing a listener from being sent into its own
+pending connection. It reads that real listener state only during Unix-rights
+validation; connect retains its original object locks and gains no graph gate.
+Non-Unix portable rights keep direct queue storage without this graph transaction.
+Portable receive moves its existing rights Arc instead of cloning it; owning
+receive resolves its actual entry only after releasing the queue guard.
+Paired resources reuse their existing weak endpoint identities instead of adding
+a second set. Ordinary bytes and socket creation acquire no ownership-graph lock.
+
+The original ancillary ABI, exact source OFDs, credentials, flags, message progress,
+peek, truncation, faults and accepted output ranges are reused. Raw reads discard
+shared ancillary outside queue locks without owner handoff. Snapshot-only message
+entry still defers metadata it cannot import; it cannot silently discard a CMSG.
+Truly owner-only control projections, such as sysctl OFDs, retain their original
+fallback. Mixed legacy sets contribute weak graph edges, so owner and worker
+paths apply the same cycle policy without sharing any Rc controls across threads.
+
+Actual guest tests with distinct processes/file tables and one/two slots close and
+reuse both original numeric slots, transfer a Unix endpoint and operate on that
+same endpoint through its imported FD. All ten calls finish on workers, with ten
+filter decisions and zero coordinator services. Tests also cover reciprocal sends,
+owner/shared mixed cycles, listener children, 600-level iterative release, reentrant
+close, original identity after reuse, peek/import and fault before dequeue. Native
+services/device and io_uring controls, task/job control, mount/proc ownership and
+structural file/VM/task transitions remain separate coordinator dependencies.
+
+
+### Event-driven native Unix adapters (2026-11-03)
+
+Wayland/XWM listeners, connections and clipboard relays contain actual shared
+endpoints and OFDs, with no VFS Rc/owner ledger in their transport state. A guest
+queue notification advances its connection on the calling worker. Native socket
+and pipe interests are one-shot registrations in an adapter event queue nested in
+the existing idle executor's HostEvents. Subscribing an accepted guest resource
+attaches that queue to its current executor; no resource/service thread, polling
+bus or cohort-control pump is introduced. The joined single-task executor waits
+on that same queue and dispatches actual events, without scanning connections.
+The existing native compositor/presenter thread and UI affinity are unchanged.
+
+Only connection membership/auth revisions use a registry mutex; callbacks, native
+connect/I/O and final connection destruction occur outside it. Partial messages,
+native read/write interest and pipe relay state synchronize per connection.
+Reentrant readiness coalesces on the original signal: a contended callback returns,
+and the current driver drains pending changes before and after releasing its gate.
+This is a resource retry protocol, not a worker polling loop or message bus.
+
+Native import allocates inode identity from the original shared filesystem and
+uses original open IDs. Ancillary transfers carry complete shared OFDs without
+installing guest FDs on a service thread. The existing Files/guest ABI publishes
+them on the receiving task. Shared-file export acknowledgement notifies after the
+inode registry unlocks. Export-command capacity is subscribed only on real
+backpressure; ordinary compositor commands do not wake every connection. Pipe
+relays use their original PipeGuard notifications and real host readiness, pause
+native reads while the guest queue is full, and rearm when a guest drains it.
+All readiness/driver edges back to adapters are weak. Existing native protocol
+resource limits and original unsupported ancillary-type errors are retained.
+
+Ordinary Unix bytes, connected/addressed messages, control operations and
+Unix-bearing SCM_RIGHTS are worker paths. Passing an actually owner-only task,
+mount or proc control projection still crosses that resource's owner boundary;
+sharing a Unix carrier cannot manufacture Send/Sync authority for it. GPU auth
+snapshot refresh and structural VM/task/mount changes are separate subsystems.

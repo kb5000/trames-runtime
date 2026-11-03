@@ -4828,7 +4828,7 @@ impl<C: Cpu> Kernel<C> {
             }
             let mut progress = self.pump_terminal(io)?;
             if let Some(root) = self.processes.get(&1) {
-                progress |= root.linux.vfs.pump_native_services();
+                root.linux.vfs.dispatch_native_events();
             }
             if self.parallel_epoch(io, limit, true)? {
                 continue;
@@ -5019,6 +5019,9 @@ impl<C: Cpu> Kernel<C> {
         let mut timeout = Duration::from_millis(20);
         if self.terminal.is_some() {
             timeout = Duration::from_millis(1);
+        }
+        if let Some(root) = self.processes.get(&1) {
+            native_fds.extend(root.linux.vfs.native_service_event_fd());
         }
         for timer in self.timers.values() {
             if let Some(d) = timer.deadline {

@@ -19,7 +19,7 @@ use std::{
 mod logical_size;
 pub use logical_size::{LogicalSize, SizeCycle};
 mod readiness;
-pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness};
+pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness, ReadinessDriver};
 mod host_events;
 pub use host_events::{HostEvents, HostFd, HostSubscription};
 mod pipe;
@@ -37,12 +37,16 @@ struct Entry {
 struct Transfer {
     _file: SharedFile,
     claimed: AtomicBool,
+    readiness: Arc<Readiness>,
 }
 /// Keeps the original inode, logical EOF and budget through an in-flight FD.
 /// The receiving service retains this until import acknowledgement or disconnect.
 #[derive(Clone)]
 pub struct ExportLease(Arc<Transfer>);
 impl ExportLease {
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.0.readiness.subscribe(signal)
+    }
     pub fn claimed(&self) -> bool {
         self.0.claimed.load(Ordering::Acquire)
     }
@@ -187,12 +191,18 @@ impl SharedFile {
             if let Some(owner) = entry.owner.upgrade() {
                 // One acknowledgement per delivered FD, even when the same inode
                 // is exported several times or across independent connections.
+                let mut acknowledged = None;
                 while let Some(weak) = entry.transfers.pop_front() {
                     if let Some(lease) = weak.upgrade() {
                         if !lease.claimed.swap(true, Ordering::AcqRel) {
+                            acknowledged = Some(lease);
                             break;
                         }
                     }
+                }
+                drop(registry);
+                if let Some(lease) = acknowledged {
+                    lease.readiness.notify_locked();
                 }
                 return Ok(Self(owner));
             }
@@ -235,6 +245,7 @@ impl SharedFile {
         let lease = Arc::new(Transfer {
             _file: self.clone(),
             claimed: AtomicBool::new(false),
+            readiness: Arc::default(),
         });
         let mut registry = registry().lock().map_err(lock_error)?;
         let entry = registry.get_mut(&self.key()).ok_or_else(invalid)?;
@@ -512,6 +523,41 @@ impl Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn export_acknowledgement_notifies_after_releasing_the_shared_inode_registry() {
+        struct Target {
+            file: SharedFile,
+            calls: AtomicUsize,
+        }
+        impl IoWake for Target {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                // Re-entering export needs the same registry as import.
+                drop(self.file.export().unwrap());
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let file = SharedFile::anonymous().unwrap();
+        let (fd, lease) = file.export().unwrap();
+        let target = Arc::new(Target {
+            file,
+            calls: AtomicUsize::new(0),
+        });
+        let erased: Arc<dyn IoWake> = target.clone();
+        let signal = IoSignal::new(1, Arc::downgrade(&erased));
+        let _subscription = lease.subscribe(&signal);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(SharedFile::import(fd).unwrap()).unwrap();
+        });
+        let imported = receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(imported.key(), target.file.key());
+        assert!(lease.claimed());
+        assert_eq!(target.calls.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn in_flight_fds_preserve_logical_eof_and_budget_before_receiver_import() {
         let budget = SharedBudget::new(host_page());

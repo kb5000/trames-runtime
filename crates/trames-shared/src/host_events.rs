@@ -70,6 +70,11 @@ pub struct HostSubscription {
     id: u64,
 }
 impl HostEvents {
+    /// Nest this queue in an existing executor's wait set. The duplicate and
+    /// lease retain the original poller until its outer registration is gone.
+    pub fn event_fd(self: &Arc<Self>) -> io::Result<HostFd> {
+        Ok(HostFd::retained(self.backend.duplicate()?, self.clone()))
+    }
     pub fn new() -> io::Result<Arc<Self>> {
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
@@ -385,6 +390,9 @@ mod backend {
     use std::os::fd::{FromRawFd, RawFd};
     pub struct Poller(OwnedFd);
     impl Poller {
+        pub fn duplicate(&self) -> io::Result<OwnedFd> {
+            self.0.try_clone()
+        }
         pub fn new(wake: RawFd) -> io::Result<Self> {
             // SAFETY: new owned FD; all epoll buffers below are initialized POD
             // and bounded. FDs are retained by HostEvents/registration guards.
@@ -474,6 +482,9 @@ mod backend {
     use std::os::fd::{FromRawFd, RawFd};
     pub struct Poller(OwnedFd);
     impl Poller {
+        pub fn duplicate(&self) -> io::Result<OwnedFd> {
+            self.0.try_clone()
+        }
         pub fn new(wake: RawFd) -> io::Result<Self> {
             // SAFETY: fresh kqueue FD; initialized public kevent ABI. udata
             // stores opaque IDs only and is never dereferenced as a pointer.

@@ -9,6 +9,7 @@ mod datagram;
 pub use control::LocalConnection;
 pub use datagram::LocalDatagram;
 mod native;
+pub(super) mod ownership;
 #[cfg(test)]
 mod shared_graph_tests;
 mod shared_rights;
@@ -56,8 +57,12 @@ impl LocalRights {
 }
 struct Channel {
     resource: Arc<channel::Resource>,
-    ends: [std::sync::Weak<LocalResource>; 2],
     next_right: AtomicU64,
+}
+impl Channel {
+    fn ends(&self) -> &[std::sync::Weak<LocalResource>; 2] {
+        &self.resource.ends
+    }
 }
 struct Binding {
     channel: Arc<Channel>,
@@ -87,7 +92,6 @@ impl LocalChannel {
         Self {
             initial: std::sync::Mutex::new(Some(Arc::new(Channel {
                 resource: channel::Resource::new(kind, false),
-                ends: Default::default(),
                 next_right: AtomicU64::new(0),
             }))),
             paired: Default::default(),
@@ -195,6 +199,7 @@ pub struct LocalSocket {
     // Fields drop in declaration order: release the core before reaping its
     // legacy owner rights on this owner-only view's thread.
     owner: OwnerView,
+    _ownership: Option<Arc<ownership::Ownership>>,
 }
 #[derive(Clone, Default)]
 pub(super) struct OwnerView(Rc<OwnerLedger>);
@@ -221,6 +226,7 @@ struct Ancillary {
     rights: LocalRights,
 }
 pub struct LocalResource {
+    ownership: std::sync::Weak<ownership::Ownership>,
     namespace: Arc<SharedCell<LocalNamespace>>,
     network: Arc<linux_namespace::RootNetwork>,
     pathname_binding: std::sync::OnceLock<binding::OwnedBinding>,
@@ -313,6 +319,7 @@ impl LocalResource {
         kind: u32,
         credentials: [u32; 3],
         network: Arc<linux_namespace::RootNetwork>,
+        ownership: std::sync::Weak<ownership::Ownership>,
     ) -> Result<Arc<Self>> {
         let mut ns = network.local.borrow_mut();
         ns.sockets.retain(|socket| socket.strong_count() != 0);
@@ -321,7 +328,7 @@ impl LocalResource {
         if ns.sockets.len() >= 1024 {
             return Err(Errno(23));
         }
-        let core = Self::new(kind, credentials, network.clone());
+        let core = Self::new(kind, credentials, network.clone(), ownership);
         ns.sockets.push(Arc::downgrade(&core));
         Ok(core)
     }
@@ -329,8 +336,10 @@ impl LocalResource {
         kind: u32,
         credentials: [u32; 3],
         network: Arc<linux_namespace::RootNetwork>,
+        ownership: std::sync::Weak<ownership::Ownership>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            ownership,
             namespace: network.local.clone(),
             network,
             pathname_binding: std::sync::OnceLock::new(),
@@ -351,13 +360,16 @@ impl LocalResource {
         })
     }
     pub(super) fn pair(a: &Arc<Self>, b: &Arc<Self>) {
+        let mut resource = channel::Resource::with_readiness(
+            a.kind,
+            true,
+            a.channel.borrow().resource.readiness.clone(),
+        );
+        Arc::get_mut(&mut resource)
+            .expect("pair before resource publication")
+            .ends = [Arc::downgrade(a), Arc::downgrade(b)];
         let channel = Arc::new(Channel {
-            resource: channel::Resource::with_readiness(
-                a.kind,
-                true,
-                a.channel.borrow().resource.readiness.clone(),
-            ),
-            ends: [Arc::downgrade(a), Arc::downgrade(b)],
+            resource,
             next_right: AtomicU64::new(0),
         });
         for (side, (end, peer)) in [(a, b), (b, a)].into_iter().enumerate() {
@@ -565,41 +577,10 @@ impl LocalSocket {
             );
         }
         binding.resource.send_check(self.side(), flags)?;
-        let peer = binding.ends[1 - self.side()]
+        let peer = binding.ends()[1 - self.side()]
             .upgrade()
             .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
-        // Keep the existing no-owning-cycle rule. The shared queues only carry
-        // IDs; their Rc rights ledger is touched/dropped on this owner thread.
-        let mut pending: Vec<_> = rights
-            .0
-            .iter()
-            .filter_map(|open| open.borrow().local.clone())
-            .collect();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(socket) = pending.pop() {
-            if Arc::ptr_eq(&socket, &peer) {
-                return Err(Errno(95));
-            }
-            if !visited.insert(Arc::as_ptr(&socket) as usize) {
-                continue;
-            }
-            let channel = socket.channel.borrow();
-            let ids = channel.resource.right_ids(socket.side());
-            let ledger = self.owner.entries.borrow();
-            for id in ids {
-                for open in &ledger
-                    .get(&(Arc::as_ptr(&channel) as usize, id))
-                    .expect("queued rights")
-                    .data
-                    .rights
-                    .0
-                {
-                    if let Some(socket) = &open.borrow().local {
-                        pending.push(socket.clone());
-                    }
-                }
-            }
-        }
+        let graph = ownership::Ownership::legacy(&peer, &rights)?;
         if self.kind == 1 && bytes.is_empty() {
             return Ok(0);
         }
@@ -609,12 +590,13 @@ impl LocalSocket {
             .map_err(|_| Errno(75))?;
         self.owner
             .insert(&binding, 1 - self.side(), id, Ancillary { rights });
-        let result = binding.resource.send_credentials(
+        let result = binding.resource.send_ancillary(
             self.side(),
             bytes,
             flags,
-            Some(id),
+            Some(shared_rights::QueuedRights::legacy(id, graph)),
             Some(credentials),
+            Vec::new(),
         );
         if result.is_err() {
             let unused = self.owner.remove(&binding, id);
@@ -637,16 +619,17 @@ impl LocalSocket {
             .resource
             .recv(self.side(), count, flags, true)
             .expect("owner may receive rights")?;
-        let ancillary = if let Some(shared_rights::QueuedRights::Shared(rights)) = &received.rights
-        {
-            Ancillary {
-                rights: rights.local(),
-            }
-        } else if let Some(shared_rights::QueuedRights::Owner(id)) = received.rights {
-            if flags & 2 != 0 {
-                self.owner.get(&binding, id)
+        let ancillary = if let Some(rights) = received.rights {
+            if let Some(id) = rights.owner() {
+                if flags & 2 != 0 {
+                    self.owner.get(&binding, id)
+                } else {
+                    self.owner.remove(&binding, id).expect("received rights")
+                }
             } else {
-                self.owner.remove(&binding, id).expect("received rights")
+                Ancillary {
+                    rights: rights.into_shared().expect("shared rights").local(),
+                }
             }
         } else {
             Ancillary {
@@ -703,7 +686,12 @@ impl Drop for LocalResource {
 }
 impl LocalSocket {
     pub(super) fn view(core: Arc<LocalResource>, owner: OwnerView) -> Rc<Self> {
-        Rc::new(Self { core, owner })
+        let ownership = core.ownership.upgrade();
+        Rc::new(Self {
+            core,
+            owner,
+            _ownership: ownership,
+        })
     }
 }
 
@@ -733,6 +721,7 @@ impl Vfs {
                 self.credentials.egid,
             ],
             network.clone(),
+            Arc::downgrade(&self.shared_files().0.local_ownership),
         )?;
         Ok(LocalSocket::view(core, self.local_rights.clone()))
     }

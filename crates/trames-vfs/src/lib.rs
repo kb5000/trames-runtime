@@ -579,7 +579,7 @@ impl ProcRefresh {
 pub struct Vfs {
     query: Option<path_queries::Authority>,
     network: trames_net::Network,
-    native_services: Rc<RefCell<Option<Rc<RefCell<ipc::NativeServices>>>>>,
+    native_services: Arc<SharedCell<Option<Arc<ipc::NativeServices>>>>,
     fs: FsHandle,
     fds: DescriptorTable,
     context: FsContext,
@@ -695,7 +695,7 @@ impl Vfs {
         Self {
             query: None,
             network,
-            native_services: Rc::default(),
+            native_services: Arc::default(),
             fs,
             fds: DescriptorTable::default(),
             context: FsContext::default(),

@@ -36,6 +36,7 @@ pub(crate) struct Received {
     pub(super) options: [u32; 2],
 }
 pub(crate) struct Resource {
+    pub(super) ends: [std::sync::Weak<super::LocalResource>; 2],
     kind: u32,
     data: Mutex<Data>,
     pub readiness: Arc<Readiness>,
@@ -56,6 +57,7 @@ impl Resource {
         readiness: Arc<Readiness>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            ends: Default::default(),
             kind,
             data: Mutex::new(Data {
                 queues: [VecDeque::new(), VecDeque::new()],
@@ -141,12 +143,6 @@ impl Resource {
         data.epochs[side][1] = data.epochs[side][1].wrapping_add(1);
         data.epochs[1 - side][1] = data.epochs[1 - side][1].wrapping_add(1);
     }
-    pub fn right_ids(&self, side: usize) -> Vec<u64> {
-        self.data.lock().unwrap().queues[side]
-            .iter()
-            .filter_map(|p| p.rights.as_ref().and_then(QueuedRights::owner))
-            .collect()
-    }
     pub fn shutdown(&self, side: usize, how: u32) -> Result<()> {
         if how > 2 {
             return Err(Errno(22));
@@ -212,7 +208,15 @@ impl Resource {
         rights: SharedRights,
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
-        let rights = (!rights.is_empty()).then_some(QueuedRights::Shared(rights));
+        let rights = if rights.owns_unix() {
+            self.send_check(side, flags)?;
+            let receiver = self.ends[1 - side]
+                .upgrade()
+                .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
+            QueuedRights::for_receiver(&receiver, rights)?
+        } else {
+            (!rights.is_empty()).then_some(QueuedRights::Shared(rights))
+        };
         self.send_ancillary(side, bytes, flags, rights, identity, Vec::new())
     }
     pub(super) fn send_addressed(
@@ -225,7 +229,7 @@ impl Resource {
     ) -> Result<usize> {
         self.send_ancillary(1, bytes, flags, rights, Some(identity), source)
     }
-    fn send_ancillary(
+    pub(super) fn send_ancillary(
         &self,
         side: usize,
         bytes: &[u8],
@@ -295,8 +299,8 @@ impl Resource {
             Ok(count)
         })
     }
-    /// None is before effects: descriptor-rights reception belongs to the
-    /// original owner. Ordinary byte sends may still queue behind such packets.
+    /// None is before effects for actual owner-only rights. Shared metadata is
+    /// returned outside Data, including when a raw byte read discards rights.
     pub fn recv(
         &self,
         side: usize,
@@ -509,7 +513,7 @@ mod tests {
             tx.send_credentials(b"def", 0, Some([43, 1002, 1003])),
             Ok(3)
         );
-        assert_eq!(rx.read_attempt(9), None);
+        assert_eq!(rx.recv_local_message(9, 2).unwrap().unwrap().data, b"abc");
         let first = receiver.recv(1, 0).unwrap();
         assert_eq!(first.data, b"a");
         assert_eq!(first.credentials, Some([42, 1000, 1001]));
@@ -519,6 +523,9 @@ mod tests {
         let next = receiver.recv(9, 0).unwrap();
         assert_eq!(next.data, b"def");
         assert_eq!(next.credentials, Some([43, 1002, 1003]));
+        tx.send_credentials(b"raw", 0, Some([44, 1003, 1004]))
+            .unwrap();
+        assert_eq!(rx.read_attempt(9).unwrap().unwrap(), b"raw");
         assert_eq!(tx.send(b"missing-identity", 0), Err(Errno(95)));
         assert_eq!(vfs.readable_bytes(b), Ok(Some(0)));
     }
@@ -533,7 +540,7 @@ mod tests {
         assert_eq!(vfs.readable_bytes(b), Ok(Some(3)));
         assert_eq!(vfs.read(b, 1).unwrap(), b"a");
         vfs.write(a, b"def").unwrap();
-        assert_eq!(rx.recv(9, 2).unwrap().unwrap(), b"bcdef");
+        assert_eq!(rx.recv_local_message(9, 2).unwrap().unwrap().data, b"bcdef");
         assert_eq!(rx.readable_bytes(), 5);
         assert_eq!(rx.read(2).unwrap(), b"bc");
         assert_eq!(vfs.read(b, 9).unwrap(), b"def");
@@ -545,7 +552,7 @@ mod tests {
         assert!(snapshot.get(a).is_none());
     }
     #[test]
-    fn rights_force_no_effect_deferral_and_keep_original_peek_and_partial_delivery() {
+    fn shared_rights_keep_original_peek_and_partial_delivery_on_workers() {
         let mut vfs = Vfs::default();
         let [a, b] = vfs.socketpair(1, 1, 0).unwrap();
         let [reader, writer] = vfs.pipe(0).unwrap();
@@ -558,16 +565,19 @@ mod tests {
         snapshot.get(a).unwrap().write(b"def").unwrap();
         let rx = snapshot.get(b).unwrap();
         assert_eq!(rx.read_attempt(3).unwrap().unwrap(), b"pre");
-        assert_eq!(rx.read_attempt(8), None);
+        assert_eq!(
+            rx.recv_local_message(8, 2).unwrap().unwrap().data,
+            b"fixabc"
+        );
         assert_eq!(rx.read_attempt(3).unwrap().unwrap(), b"fix");
-        assert_eq!(rx.read_attempt(2), None);
+        assert_eq!(rx.recv_local_message(2, 2).unwrap().unwrap().data, b"ab");
         assert_eq!(vfs.readable_bytes(b), Ok(Some(6)));
         let receiver = vfs.local_socket(b).unwrap().unwrap();
         let peek = receiver.recv(2, 2).unwrap();
         assert_eq!(peek.data, b"ab");
         assert!(!peek.rights.is_empty());
         drop(peek);
-        assert_eq!(rx.read_attempt(2), None);
+        assert_eq!(rx.recv_local_message(2, 2).unwrap().unwrap().data, b"ab");
         let received = receiver.recv(1, 0).unwrap();
         assert_eq!(received.data, b"a");
         let (fds, truncated) = vfs.receive_rights(received.rights, 1, false);

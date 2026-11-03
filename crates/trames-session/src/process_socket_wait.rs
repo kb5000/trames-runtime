@@ -4,6 +4,124 @@ use trames_cpu::Cpu as Interpreter;
 use trames_memory::{Permissions, PAGE_SIZE};
 
 #[test]
+fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services() {
+    for slots in [1, 2] {
+        let mut p = super::tests::process();
+        let mut k = super::tests::kernel();
+        let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+        let [carried, peer_fd] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
+        for (at, value) in [
+            (0x1010, 0x1080u64),
+            (0x1018, 1),
+            (0x1020, 0x1300),
+            (0x1028, 24),
+            (0x1080, 0x1200),
+            (0x1088, 1),
+        ] {
+            p.memory.write_array(at, value.to_le_bytes()).unwrap();
+        }
+        p.memory.write(0x1200, b"x").unwrap();
+        p.memory.write(0x1800, b"z").unwrap();
+        p.memory.write_array(0x1300, 20u64.to_le_bytes()).unwrap();
+        p.memory.write_array(0x1308, 1u32.to_le_bytes()).unwrap();
+        p.memory.write_array(0x130c, 1u32.to_le_bytes()).unwrap();
+        p.memory.write_array(0x1310, carried.to_le_bytes()).unwrap();
+        filter(&mut k, &mut p, 0x7fff0000);
+        let mut sender = p.fork();
+        sender.parent = 1;
+        sender.tgid = 2;
+        sender.vm_id = 2;
+        let make = |receive: bool| {
+            let mut code = Vec::new();
+            let mut call = |args: Vec<u32>, number: u32, index: u32| {
+                code.extend(args);
+                code.extend([
+                    mov(8, number),
+                    0xd4000001,
+                    mov(10, 0x1c00 + index * 8),
+                    0xf9000140,
+                ]);
+            };
+            if receive {
+                call(vec![mov(0, carried)], 57, 0);
+                call(vec![mov(0, 42), mov(1, 0)], 19, 1);
+                call(vec![mov(0, rx), mov(1, 0x1000), mov(2, 0)], 212, 2);
+                call(
+                    vec![mov(10, 0x1310), 0xb9400140, mov(1, 0x1800), mov(2, 1)],
+                    64,
+                    3,
+                );
+                call(vec![mov(10, 0x1310), 0xb9400140], 57, 4);
+            } else {
+                call(vec![mov(0, tx), mov(1, 0x1000), mov(2, 0)], 211, 0);
+                call(vec![mov(0, carried)], 57, 1);
+                call(vec![mov(0, 99), mov(1, 0)], 19, 2);
+            }
+            code.extend([
+                mov(0, 0x1900),
+                mov(1, 128),
+                mov(2, 0),
+                mov(3, 0),
+                mov(8, 98),
+                0xd4000001,
+                0x14000000,
+            ]);
+            code
+        };
+        program(&mut p, make(true));
+        program(&mut sender, make(false));
+        if slots == 2 {
+            sender.affinity = 2;
+        }
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, sender);
+        let until = Instant::now() + Duration::from_secs(5);
+        while k.syscalls < 10 {
+            let limit = k.instructions + 100_000;
+            assert!(k
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+                .unwrap());
+            assert!(Instant::now() < until);
+        }
+        for (pid, expected, counter) in [
+            (1, vec![0, carried as u64, 1, 1, 0], 42u64),
+            (2, vec![1, 0, carried as u64], 99u64),
+        ] {
+            let task = k.processes.get_mut(&pid).unwrap();
+            for (index, value) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    task.memory.read_u64(0x1c00 + index as u64 * 8).unwrap(),
+                    value,
+                    "slots={slots} pid={pid} index={index}"
+                );
+            }
+            assert_eq!(
+                task.linux.vfs.read(carried, 8).unwrap(),
+                counter.to_le_bytes()
+            );
+            assert_eq!(task.seccomp.evaluations(), 10);
+            assert!(!task.linux.vfs.local_rights_need_owner());
+        }
+        assert_eq!(
+            k.processes
+                .get_mut(&1)
+                .unwrap()
+                .linux
+                .vfs
+                .read(peer_fd, 1)
+                .unwrap(),
+            b"z"
+        );
+        assert_eq!(k.syscalls, 10);
+        assert_eq!(k.worker_syscalls, 10);
+        assert_eq!(k.service_requests, 0);
+    }
+}
+
+#[test]
 fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
     fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
         out.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
@@ -761,6 +879,21 @@ fn native_message_epipe_hands_only_saved_task_effects_to_owner() {
     }
 }
 
+fn owner_control(v: &mut trames_vfs::Vfs) -> u32 {
+    v.set_runtime_info(
+        1,
+        trames_vfs::RuntimeInfo {
+            processes: vec![trames_vfs::ProcessInfo {
+                pid: 1,
+                tgid: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    v.open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
+        .unwrap()
+}
 fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
     for (i, word) in code.into_iter().enumerate() {
         p.memory
@@ -1803,7 +1936,7 @@ fn joined_unix_raw_reads_keep_legacy_ancillary_and_original_wait_after_reuse() {
             let mut p = super::tests::process();
             let mut k = super::tests::kernel();
             let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
-            let legacy = p.linux.vfs.local_create(1, 0).unwrap();
+            let legacy = owner_control(&mut p.linux.vfs);
             p.memory
                 .write_array(0x1080, 0x1100u64.to_le_bytes())
                 .unwrap();
@@ -1845,7 +1978,7 @@ fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reu
     let mut p = super::tests::process();
     let mut k = super::tests::kernel();
     let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
-    let legacy = p.linux.vfs.local_create(1, 0).unwrap();
+    let legacy = owner_control(&mut p.linux.vfs);
     let mut header = [0; 56];
     header[16..24].copy_from_slice(&0x1080u64.to_le_bytes());
     header[24..32].copy_from_slice(&1u64.to_le_bytes());

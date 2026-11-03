@@ -482,8 +482,93 @@ mod tests {
     fn word(m: &Memory, at: u64) -> u32 {
         u32::from_le_bytes(m.read_array(at).unwrap())
     }
+    fn owner_control(v: &mut Vfs) -> u32 {
+        v.set_runtime_info(
+            1,
+            trames_vfs::RuntimeInfo {
+                processes: vec![trames_vfs::ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        v.open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
+            .unwrap()
+    }
     fn direct(v: &Vfs) -> DirectSyscalls {
         DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory())
+    }
+    #[test]
+    fn unix_owning_rights_preserve_fault_before_dequeue_and_original_fd_after_reuse() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let [carried, peer] = v.socketpair(1, 1, 0).unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        rights(&mut m, &[carried]);
+        assert_eq!(
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        v.close(carried).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), carried);
+        header(&mut m, 24);
+        m.write_array(0x1100, 0x9000u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            d.invoke(212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Err(Errno(14)))
+        );
+        assert_eq!(v.readable_bytes(rx).unwrap(), Some(4));
+        header(&mut m, 24);
+        m.write_array(0x1100, 0x1200u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            d.invoke(212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
+        );
+        let imported = word(&m, 0x1310);
+        v.write(imported, b"alive").unwrap();
+        assert_eq!(v.read(peer, 5).unwrap(), b"alive");
+        assert_eq!(v.read(carried, 8).unwrap(), 99u64.to_le_bytes());
+        assert!(!v.local_rights_need_owner());
+    }
+    #[test]
+    fn parked_shared_unix_rights_receive_resumes_without_an_owner_checkpoint() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let [carried, peer] = v.socketpair(1, 1, 0).unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let args = [rx as u64, 0x1000, 0, 0, 0, 0];
+        let pending = match d
+            .start(212, args, &mut m, 1, &Arc::downgrade(&target), None)
+            .unwrap()
+        {
+            IoAttempt::Blocked(wait) => wait,
+            _ => panic!("receive must park before a sender runs"),
+        };
+        m.write(0x1000, &[0xff; 56]).unwrap();
+        m.write(0x1100, &[0xff; 16]).unwrap();
+        let mut outgoing = memory();
+        rights(&mut outgoing, &[carried]);
+        assert_eq!(
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut outgoing),
+            Some(Ok(4))
+        );
+        v.close(carried).unwrap();
+        assert_eq!(v.eventfd(73, 0).unwrap(), carried);
+        assert!(pending.signal.ready());
+        assert!(matches!(
+            d.resume(pending, &mut m),
+            IoAttempt::Complete(Ok(4))
+        ));
+        let imported = word(&m, 0x1310);
+        assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"abcd");
+        v.write(imported, b"original").unwrap();
+        assert_eq!(v.read(peer, 8).unwrap(), b"original");
+        assert_eq!(v.read(carried, 8).unwrap(), 73u64.to_le_bytes());
     }
     #[test]
     fn independent_files_receive_actual_ofds_credentials_and_timestamps_on_workers() {
@@ -758,7 +843,7 @@ mod tests {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
         let event = v.eventfd(1, 0).unwrap();
-        let owner_socket = v.socket(1, 1, 0).unwrap();
+        let owner_socket = owner_control(&mut v);
         let d = direct(&v);
         let mut m = memory();
         rights(&mut m, &[event, owner_socket]);
@@ -834,7 +919,7 @@ mod tests {
     fn blocked_receive_and_owner_fallback_keep_original_transport_and_output_ranges() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        let owner_socket = v.socket(1, 1, 0).unwrap();
+        let owner_socket = owner_control(&mut v);
         let d = direct(&v);
         let mut m = memory();
         let target: Arc<dyn IoWake> = Arc::new(Target);
@@ -1007,7 +1092,7 @@ mod tests {
             // may redirect copyout after wait/owner handoff.
             m.write_array(0x1100, 0x9000u64.to_le_bytes()).unwrap();
             m.write_array(0x1460, 0u32.to_le_bytes()).unwrap();
-            let owner_socket = v.local_create(1, 0).unwrap();
+            let owner_socket = owner_control(&mut v);
             v.local_socket(tx)
                 .unwrap()
                 .unwrap()
@@ -1169,7 +1254,7 @@ mod tests {
         let (mut v, tx, rx) = datagrams();
         v.local_connect(&v.local_socket(tx).unwrap().unwrap(), b"\x01\x00/target\0")
             .unwrap();
-        let legacy = v.local_create(1, 0).unwrap();
+        let legacy = owner_control(&mut v);
         let d = datagram_direct(&v);
         let mut m = memory();
         batch_headers(&mut m, 3);

@@ -33,7 +33,7 @@ impl Vfs {
         rights: LocalRights,
         credentials: [u32; 3],
     ) -> Result<usize> {
-        if socket.kind != 2 || socket.channel.borrow().ends[0].strong_count() != 0 {
+        if socket.kind != 2 || socket.channel.borrow().ends()[0].strong_count() != 0 {
             if destination.is_some() {
                 return Err(Errno(106));
             }
@@ -80,12 +80,12 @@ impl LocalDatagram {
         rights: SharedRights,
         identity: [u32; 3],
     ) -> Result<usize> {
-        let _receiver = self.receiver()?;
+        let receiver = self.receiver()?;
         let source = self.source.name.borrow().clone();
         self.channel.resource.send_addressed(
             bytes,
             flags,
-            (!rights.is_empty()).then_some(shared_rights::QueuedRights::Shared(rights)),
+            shared_rights::QueuedRights::for_receiver(&receiver, rights)?,
             identity,
             source,
         )
@@ -104,42 +104,12 @@ impl LocalDatagram {
             return self.channel.resource.send_addressed(
                 bytes,
                 flags,
-                (!shared.is_empty()).then_some(shared_rights::QueuedRights::Shared(shared)),
+                shared_rights::QueuedRights::for_receiver(&peer, shared)?,
                 credentials,
                 source,
             );
         }
-        // The rights graph stays in the VFS owner domain. Queues hold opaque
-        // IDs and the same bounded data/resource lock as paired Unix sockets.
-        let mut pending: Vec<_> = rights
-            .0
-            .iter()
-            .filter_map(|open| open.borrow().local.clone())
-            .collect();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(endpoint) = pending.pop() {
-            if Arc::ptr_eq(&endpoint, &peer) {
-                return Err(Errno(95));
-            }
-            if !visited.insert(Arc::as_ptr(&endpoint) as usize) {
-                continue;
-            }
-            let channel = endpoint.channel.borrow();
-            let ledger = owner.entries.borrow();
-            for id in channel.resource.right_ids(endpoint.side()) {
-                for open in &ledger
-                    .get(&(Arc::as_ptr(&channel) as usize, id))
-                    .expect("queued metadata")
-                    .data
-                    .rights
-                    .0
-                {
-                    if let Some(local) = &open.borrow().local {
-                        pending.push(local.clone());
-                    }
-                }
-            }
-        }
+        let graph = ownership::Ownership::legacy(&peer, &rights)?;
         let channel = &self.channel;
         let id = channel
             .next_right
@@ -150,7 +120,7 @@ impl LocalDatagram {
         let result = channel.resource.send_addressed(
             bytes,
             flags,
-            Some(shared_rights::QueuedRights::Owner(id)),
+            Some(shared_rights::QueuedRights::legacy(id, graph)),
             credentials,
             source,
         );

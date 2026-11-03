@@ -54,6 +54,7 @@ impl DescriptorFactory {
                 self.credentials.egid,
             ],
             self.local_network.clone(),
+            Arc::downgrade(&self.files.0.local_ownership),
         )
     }
     pub fn local_create(&self, kind: u32, protocol: u32) -> Result<u32> {
