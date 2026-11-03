@@ -55,7 +55,16 @@ impl Linux {
     pub fn set_file_executor(&mut self, executor: Arc<dyn crate::FileExecutor>) {
         self.file_executor = Some(executor);
     }
+    pub fn boot_clock(&self) -> trames_shared::boottime::Boottime {
+        self.boot_clock
+    }
+    pub fn set_boot_clock(&mut self, clock: trames_shared::boottime::Boottime) {
+        self.boot_clock = clock
+    }
     pub fn set_uring_clock(&mut self, started: Instant) {
+        if self.uring_clock != started {
+            self.boot_clock = trames_shared::boottime::Boottime::from_start(started);
+        }
         self.uring_clock = started;
     }
 

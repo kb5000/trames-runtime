@@ -22,6 +22,16 @@ pub fn timerfd_control(
     memory: &mut impl CpuMemory,
     started: Instant,
 ) -> Result<u64, Errno> {
+    timerfd_control_with_boot(timer, number, a, memory, started, None)
+}
+pub fn timerfd_control_with_boot(
+    timer: &TimerFd,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+    started: Instant,
+    boot: Option<trames_shared::boottime::Boottime>,
+) -> Result<u64, Errno> {
     let output = if number == 87 { a[1] } else { a[3] };
     if number == 87 || output != 0 {
         Linux::check(memory, output, 32, Access::Write)?;
@@ -39,6 +49,8 @@ pub fn timerfd_control(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|_| Errno(5))?
+            } else if timer.clock == 7 {
+                boot.map_or_else(|| started.elapsed(), |b| b.elapsed())
             } else {
                 started.elapsed()
             };

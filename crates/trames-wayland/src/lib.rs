@@ -5,6 +5,7 @@ use wayland_server::{backend::ClientData, Display, Resource};
 mod frame;
 mod gpu;
 mod input;
+mod output;
 mod selection;
 mod wsi;
 pub use selection::HostClipboard;
@@ -49,6 +50,7 @@ struct State {
     serial: u32,
     revision: u64,
     viewport: (u32, u32),
+    outputs: output::Outputs,
     seat: input::Seat,
     selection: selection::Selection,
     text: text::TextInputs,
@@ -63,6 +65,7 @@ impl Default for State {
             serial: 0,
             revision: 0,
             viewport: (1024, 768),
+            outputs: Default::default(),
             seat: Default::default(),
             selection: Default::default(),
             text: Default::default(),
@@ -76,7 +79,7 @@ impl Compositor {
     pub fn new() -> io::Result<Self> {
         let display = Display::new().map_err(io::Error::other)?;
         let mut state = State::default();
-        State::globals(&display.handle(), state.xwayland.authorized.clone());
+        state.globals(&display.handle(), state.xwayland.authorized.clone());
         state.initialize_input()?;
         Ok(Self {
             display,
@@ -88,6 +91,26 @@ impl Compositor {
     }
     pub fn windows(&self) -> Vec<WindowSnapshot> {
         scene::snapshot(&self.state.surfaces)
+    }
+    /// Host logical points stay unchanged; only the preferred buffer density changes.
+    pub fn output_scale(&mut self, window: u64, scale: i32) {
+        if !(1..=4).contains(&scale) {
+            return;
+        }
+        self.state.ensure_output(&self.display.handle(), scale);
+        if window == 0 {
+            self.state.outputs.default_scale = scale;
+        }
+        let ids: Vec<_> = self
+            .state
+            .surfaces
+            .keys()
+            .copied()
+            .filter(|id| window == 0 || self.state.is_descendant(*id, window))
+            .collect();
+        for id in ids {
+            self.state.surface_output(id, scale);
+        }
     }
     pub fn resize(&mut self, id: u64, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 || width > 4096 || height > 4096 {

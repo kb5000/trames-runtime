@@ -35,7 +35,8 @@ mod timer;
 pub use syslog::syslog;
 mod uring;
 pub use state::Linux;
-pub use timer::timerfd_control;
+pub use timer::{timerfd_control, timerfd_control_with_boot};
+pub use trames_shared::boottime::Boottime;
 
 pub fn fill_entropy(bytes: &mut [u8]) -> Result<(), trames_vfs::Errno> {
     getrandom::fill(bytes).map_err(|_| trames_vfs::Errno(5))

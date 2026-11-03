@@ -750,6 +750,7 @@ dependencies = [
  "trames-execution",
  "trames-memory",
  "trames-net",
+ "trames-shared",
  "trames-vfs",
 ]
 

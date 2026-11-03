@@ -37,6 +37,7 @@ enum Command {
     Connect(UnixStream, ClientIdentity),
     ConnectXwm(UnixStream, crate::xwm::Identity),
     Resize(u64, u32, u32),
+    OutputScale(u64, i32),
     Mode(u64, WindowMode),
     Close(u64),
     Presented(u64, u64, u32),
@@ -188,6 +189,9 @@ impl Server {
             .map(|s| s.clone())
             .unwrap_or_default()
     }
+    pub fn output_scale(&self, window: u64, scale: i32) -> io::Result<()> {
+        self.0.send(Command::OutputScale(window, scale))
+    }
     pub fn resize(&self, id: u64, w: u32, h: u32) -> io::Result<()> {
         self.0.send(Command::Resize(id, w, h))
     }
@@ -276,6 +280,7 @@ fn run(
                 Command::Resize(id, w, h) => {
                     compositor.resize(id, w, h);
                 }
+                Command::OutputScale(window, scale) => compositor.output_scale(window, scale),
                 Command::Mode(id, mode) => compositor.set_mode(id, mode),
                 Command::Close(id) => compositor.close(id),
                 Command::Presented(id, revision, time) => compositor.presented(id, revision, time),

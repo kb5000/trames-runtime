@@ -79,6 +79,10 @@ The relevant scopes are:
   result. This is not evidence of a successful compatibility fallback.
 - AppKit/UIKit presentation has its own UI-thread affinity. Ordinary window input,
   Wayland bytes and frame presentation are not the Kernel's owner syscall RPC.
+  HiDPI events use the existing Wayland queue. iPad PiP retains the selected
+  session's normal background lifecycle control; GPU suspension waits on actual
+  context locks/readiness rather than creating a coordinator or service thread.
+  See [display lifecycle](display-lifecycle.md) for the background GPU limitation.
 
 ## Remaining cost and interpretation of evidence
 

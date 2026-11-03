@@ -511,6 +511,9 @@ impl Backend {
             capabilities: Default::default(),
         }
     }
+    pub(crate) fn host_display(&self) -> crate::Display {
+        self.display.clone()
+    }
     pub fn with_display(mut self, display: crate::Display) -> Self {
         self.display = display;
         self

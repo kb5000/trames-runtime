@@ -200,6 +200,7 @@ pub struct DirectSyscalls {
     poll_completed: Cell<u64>,
     fd_control_completed: Cell<u64>,
     started: Option<Instant>,
+    boot_clock: Option<trames_shared::boottime::Boottime>,
     scratch: RefCell<Vec<u8>>,
     completed: Cell<u64>,
 }
@@ -227,6 +228,7 @@ impl DirectSyscalls {
             poll_completed: Cell::new(0),
             fd_control_completed: Cell::new(0),
             started: None,
+            boot_clock: None,
             scratch: RefCell::new(Vec::new()),
             completed: Cell::new(0),
         }
@@ -516,6 +518,13 @@ impl DirectSyscalls {
     pub fn record_fd_control(&self) {
         self.fd_control_completed
             .set(self.fd_control_completed.get() + 1);
+    }
+    pub fn with_boot_clock(mut self, clock: trames_shared::boottime::Boottime) -> Self {
+        self.boot_clock = Some(clock);
+        self
+    }
+    pub fn boot_clock(&self) -> Option<trames_shared::boottime::Boottime> {
+        self.boot_clock
     }
     pub fn with_clock(mut self, started: Instant) -> Self {
         self.started = Some(started);
@@ -849,12 +858,13 @@ impl DirectSyscalls {
         let result = match number {
             62 => fd.byte_seek(args[1] as i64, args[2] as u32),
             28 => fd.inotify_remove(args[1] as i32),
-            86 | 87 => crate::timerfd_control(
+            86 | 87 => crate::timer::timerfd_control_with_boot(
                 fd.timer().expect("timerfd resource"),
                 number,
                 args,
                 memory,
                 self.started.unwrap_or_else(Instant::now),
+                self.boot_clock,
             ),
             29 => (|| {
                 if crate::pty_control_request(args[1] as u32) {

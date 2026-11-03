@@ -13,8 +13,14 @@ use trames_wayland::{InputEvent, Server, WindowMode};
 #[ignore = "build original C client with scripts/test-wayland.sh"]
 fn original_c_client_two_windows_resize_frames_and_native_close() {
     let client = std::env::var("TRAMES_WAYLAND_C_CLIENT").expect("original C fixture path");
-    for close in [false, true] {
+    for (close, density, legacy) in [
+        (false, 1, false),
+        (true, 1, false),
+        (false, 2, false),
+        (false, 2, true),
+    ] {
         let server = Server::new().unwrap();
+        server.output_scale(0, density).unwrap();
         struct Wake {
             server: Server,
             sender: std::sync::mpsc::SyncSender<()>,
@@ -52,9 +58,13 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                 }
             });
         }
+        if density > 1 {
+            command.arg(if legacy { "legacy-hidpi" } else { "hidpi" });
+        }
         let mut child = command.spawn().unwrap();
         drop(socket);
         let began = Instant::now();
+        let mut switched = false;
         let mut resized = false;
         let mut verified = false;
         let mut closed = false;
@@ -92,10 +102,21 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                     }
                     resized = true;
                 }
-                if snapshot.windows[0].scene[0].buffer.shm().unwrap().width == 320
-                    && snapshot.windows[0].scene[0].buffer.shm().unwrap().height == 200
+                let scale = if switched { 1 } else { density as u32 };
+                if snapshot.windows[0].scene[0].buffer.shm().unwrap().width == 320 * scale
+                    && snapshot.windows[0].scene[0].buffer.shm().unwrap().height == 200 * scale
                 {
                     verified = true;
+                }
+                if density > 1 && verified && !switched {
+                    server.output_scale(snapshot.windows[0].id, 1).unwrap();
+                    switched = true;
+                    verified = false;
+                }
+                if density > 1 && verified {
+                    assert_eq!(snapshot.windows[0].scene[0].scale, 1);
+                    assert_eq!(snapshot.windows[1].scene[0].scale, density);
+                    assert_eq!(snapshot.windows[0].width, 320);
                 }
                 if close && verified && !closed {
                     server.close(snapshot.windows[0].id).unwrap();
@@ -134,6 +155,11 @@ fn original_c_client_two_windows_resize_frames_and_native_close() {
                 );
                 let text = String::from_utf8_lossy(&output.stdout);
                 assert!(text.contains("wayland-client-ok"));
+                if density > 1 {
+                    assert!(switched);
+                    assert!(text.contains("wayland-scale window=1 factor=2"));
+                    assert!(text.contains("wayland-scale window=1 factor=1"));
+                }
                 for window in [1, 2] {
                     let prefix = format!("wayland-window-state window={window} activated=");
                     let states = text

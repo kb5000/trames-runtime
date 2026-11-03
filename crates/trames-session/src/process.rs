@@ -636,6 +636,20 @@ impl<C: Cpu> Kernel<C> {
         self.native
             .authorize_stateful(&p.memory, pc, module, function)?;
         let backend = self.gpu_context(p);
+        let Some(mut lease) = backend.try_lock() else {
+            // Zero is not a backend job (IDs start at one). No native body has
+            // run; retain the original HLT/registers and retry after availability.
+            p.state = State::Gpu {
+                retired: false,
+                peer_instructions: 0,
+                job: 0,
+                pc,
+                operation: a[0],
+                instructions: self.instructions,
+                began: Instant::now(),
+            };
+            return Ok(None);
+        };
         let authenticated = if matches!(a[0], 110 | 111) && a[2] == 128 {
             let address = a[1]
                 .checked_add(8)
@@ -651,7 +665,7 @@ impl<C: Cpu> Kernel<C> {
             None
         };
         let images = matches!(a[0], 14 | 240..=242).then(|| p.linux.vfs.image_fds());
-        let (value, transfers) = backend.invoke_with_images(
+        let (value, transfers) = lease.invoke_with_images(
             &mut p.memory,
             a[0],
             a[1],
@@ -755,6 +769,13 @@ impl<C: Cpu> Kernel<C> {
         else {
             return false;
         };
+        if job == 0 {
+            if self.gpu_context(p).try_lock().is_none() {
+                return false;
+            }
+            p.state = State::Ready;
+            return true;
+        }
         let result = self
             .gpu
             .borrow_mut()
@@ -1830,6 +1851,8 @@ impl<C: Cpu> Kernel<C> {
             runtime.linux.vfs.set_dumpable(execute_vfs.dumpable())?;
             runtime.linux.trace = p.linux.trace;
             runtime.linux.task_limit = p.linux.task_limit;
+            runtime.linux.set_uring_clock(clock_origin);
+            runtime.linux.set_boot_clock(p.linux.boot_clock());
             p.linux = runtime.linux;
             runtime.cpu.inherit_exec(&p.cpu);
             p.cpu = runtime.cpu;
@@ -2615,10 +2638,15 @@ impl<C: Cpu> Kernel<C> {
                 p.state = State::Sleep(deadline, remaining);
                 Ok(None)
             }
-            113 | 114 => {
-                crate::worker_syscalls::clock(&mut p.memory, number, a[0], a[1], self.started)
-                    .map(Some)
-            }
+            113 | 114 => crate::worker_syscalls::clock_with_boot(
+                &mut p.memory,
+                number,
+                a[0],
+                a[1],
+                self.started,
+                Some(p.linux.boot_clock()),
+            )
+            .map(Some),
             179 => {
                 Linux::check(&p.memory, a[0], 112, Access::Write)?;
                 let used = self.other_memory(p.vm_id) + p.memory.resident_bytes();
@@ -4367,6 +4395,7 @@ impl<C: Cpu> Kernel<C> {
                         )
                         .with_network(network_epoch.capture(&p.linux.vfs))
                         .with_clock(self.started)
+                        .with_boot_clock(p.linux.boot_clock())
                         .with_terminal(trames_vfs::TerminalAccess {
                             session: p.session,
                             group: p.group,
@@ -5267,6 +5296,7 @@ pub(super) fn run<C: Cpu>(
         .vfs
         .wayland_server()
         .map_or_else(Instant::now, |server| server.guest_clock_origin());
+    runtime.linux.set_uring_clock(started);
     super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, started)?;
     let mut root = Process::<C> {
         cpu: std::mem::take(&mut runtime.cpu),

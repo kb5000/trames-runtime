@@ -24,6 +24,7 @@ pub struct Linux {
     pub(crate) batch_pipe_signal: bool,
     pub(crate) file_executor: Option<std::sync::Arc<dyn crate::FileExecutor>>,
     pub(crate) uring_clock: std::time::Instant,
+    pub(crate) boot_clock: trames_shared::boottime::Boottime,
     pub(crate) uring_actor: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::UringActor>>>,
     pub vfs: Vfs,
     pub trace: bool,
@@ -60,6 +61,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: self.uring_clock,
+            boot_clock: self.boot_clock,
             file_executor: self.file_executor.clone(),
             uring_actor: Default::default(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
@@ -105,6 +107,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: std::time::Instant::now(),
+            boot_clock: Default::default(),
             file_executor: None,
             uring_actor: Default::default(),
             vfs: Vfs::default(),

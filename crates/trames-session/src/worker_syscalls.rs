@@ -56,12 +56,23 @@ pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
     }
 }
 
+#[cfg(all(test, trames_interpreter_conformance))]
 pub(super) fn clock(
     memory: &mut impl CpuMemory,
     number: u32,
     id: u64,
     address: u64,
     started: Instant,
+) -> Result<u64, Errno> {
+    clock_with_boot(memory, number, id, address, started, None)
+}
+pub(super) fn clock_with_boot(
+    memory: &mut impl CpuMemory,
+    number: u32,
+    id: u64,
+    address: u64,
+    started: Instant,
+    boot: Option<trames_linux::Boottime>,
 ) -> Result<u64, Errno> {
     // clockid_t is a signed 32-bit Linux ABI argument, including raw SVCs.
     let id = id as u32;
@@ -85,6 +96,8 @@ pub(super) fn clock(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Errno(5))?
+        } else if id == 7 {
+            boot.map_or_else(|| started.elapsed(), |b| b.elapsed())
         } else {
             started.elapsed()
         };
@@ -429,7 +442,14 @@ impl Snapshot {
             166 => Ok(self.umask.swap(cpu.x(0) as u32) as u64),
             214 if cpu.x(0) == 0 => Ok(self.program_break.get()),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
-            number @ (113 | 114) => clock(memory, number, cpu.x(0), cpu.x(1), self.started),
+            number @ (113 | 114) => clock_with_boot(
+                memory,
+                number,
+                cpu.x(0),
+                cpu.x(1),
+                self.started,
+                self.direct.boot_clock(),
+            ),
             168 => (|| {
                 let cpu_address = cpu.x(0);
                 let node_address = cpu.x(1);

@@ -3,7 +3,7 @@ use super::*;
 use crate::scene::*;
 use std::sync::Mutex;
 use wayland_server::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_region, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -15,12 +15,13 @@ pub(crate) struct Pool {
 }
 impl State {
     pub fn globals(
+        &mut self,
         handle: &DisplayHandle,
         xwayland: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::xwm::Identity>>>,
     ) {
-        handle.create_global::<Self, wl_compositor::WlCompositor, _>(4, ());
+        handle.create_global::<Self, wl_compositor::WlCompositor, _>(6, ());
         handle.create_global::<Self, wl_shm::WlShm, _>(1, ());
-        handle.create_global::<Self, wl_output::WlOutput, _>(3, ());
+        self.ensure_output(handle, 1);
         crate::shell::globals(handle);
         crate::input::globals(handle);
         crate::selection::globals(handle);
@@ -42,6 +43,7 @@ impl State {
     }
     pub fn commit(&mut self, id: u64) {
         self.xcommit(id);
+        self.inherit_output(id);
         let synchronized = self.effectively_synchronized(id);
         let Some(s) = self.surfaces.get_mut(&id) else {
             return;
@@ -170,6 +172,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for State {
                 state
                     .surfaces
                     .insert(key.0, Surface::new(surface, connection));
+                state.surface_output(key.0, state.outputs.default_scale);
                 state.changed();
             }
             wl_compositor::Request::CreateRegion { id } => {
@@ -234,9 +237,16 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
         match request {
             wl_surface::Request::Destroy => {}
             wl_surface::Request::Attach { buffer, x, y } => {
-                s.pending_offset = Some((x, y));
+                if r.version() >= 5 && (x != 0 || y != 0) {
+                    r.post_error(3u32, "nonzero attach offset on wl_surface v5+");
+                    return;
+                }
+                if r.version() < 5 {
+                    s.pending_offset = Some((x, y));
+                }
                 s.pending_buffer = Some(buffer);
             }
+            wl_surface::Request::Offset { x, y } => s.pending_offset = Some((x, y)),
             wl_surface::Request::Damage { width, height, .. }
             | wl_surface::Request::DamageBuffer { width, height, .. } => {
                 if width < 0 || height < 0 {
@@ -403,8 +413,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, Mutex<Pool>> for State {
                 let valid = offset >= 0
                     && width > 0
                     && height > 0
-                    && width <= 4096
-                    && height <= 4096
+                    && width <= 16384
+                    && height <= 16384
                     && stride >= width * 4;
                 if !valid {
                     r.post_error(1u32, "invalid shared memory buffer extent");
@@ -456,50 +466,6 @@ impl Dispatch<wl_buffer::WlBuffer, BufferData> for State {
         _: &wl_buffer::WlBuffer,
         _: wl_buffer::Request,
         _: &BufferData,
-        _: &DisplayHandle,
-        _: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-impl GlobalDispatch<wl_output::WlOutput, ()> for State {
-    fn bind(
-        state: &mut Self,
-        _: &DisplayHandle,
-        _: &Client,
-        r: New<wl_output::WlOutput>,
-        _: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let r = init.init(r, ());
-        r.geometry(
-            0,
-            0,
-            260,
-            195,
-            wl_output::Subpixel::Unknown,
-            "Trames".into(),
-            "Wayland output".into(),
-            wl_output::Transform::Normal,
-        );
-        r.mode(
-            wl_output::Mode::Current | wl_output::Mode::Preferred,
-            state.viewport.0 as i32,
-            state.viewport.1 as i32,
-            crate::frame::REFRESH_MILLIHERTZ,
-        );
-        if r.version() >= 2 {
-            r.scale(1);
-            r.done();
-        }
-    }
-}
-impl Dispatch<wl_output::WlOutput, ()> for State {
-    fn request(
-        _: &mut Self,
-        _: &Client,
-        _: &wl_output::WlOutput,
-        _: wl_output::Request,
-        _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {

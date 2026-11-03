@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Host-owned display capability. Guest code never supplies a native pointer.
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, Weak,
 };
 
 #[derive(Clone, Default)]
-pub struct Display(Arc<Mutex<Option<Arc<Target>>>>);
+pub struct Display(Arc<Mutex<Option<Arc<Target>>>>, Arc<Activity>);
+#[derive(Default)]
+struct Activity {
+    suspended: AtomicBool,
+    contexts: Mutex<Vec<Weak<dyn SuspensionFence>>>,
+}
+pub(crate) trait SuspensionFence: Send + Sync {
+    fn quiesce(&self);
+    fn resume(&self);
+}
 pub(crate) struct Target {
     pub layer: usize,
     pub width: u32,
@@ -29,6 +38,33 @@ impl Drop for Target {
     }
 }
 impl Display {
+    pub fn suspended(&self) -> bool {
+        self.1.suspended.load(Ordering::Acquire)
+    }
+    /// Called at host lifecycle transitions, never on ordinary CPU/memory access.
+    /// Existing native entries finish before the host returns to its background.
+    pub fn set_suspended(&self, suspended: bool) {
+        self.1.suspended.store(suspended, Ordering::Release);
+        let contexts = {
+            let mut entries = self.1.contexts.lock().unwrap();
+            let live: Vec<_> = entries.iter().filter_map(Weak::upgrade).collect();
+            entries.retain(|entry| entry.strong_count() != 0);
+            live
+        };
+        for context in contexts {
+            if suspended {
+                context.quiesce();
+            } else {
+                context.resume();
+            }
+        }
+    }
+    pub(crate) fn register_context(&self, context: &Arc<dyn SuspensionFence>) {
+        let mut contexts = self.1.contexts.lock().unwrap();
+        contexts.retain(|entry| entry.strong_count() != 0);
+        contexts.push(Arc::downgrade(context));
+    }
+
     /// # Safety
     /// On Apple, `layer` is a live CAMetalLayer created/configured by the native
     /// main thread. Its fixed bounds/drawable size must not change while attached.

@@ -42,7 +42,15 @@ impl<C: Cpu> Kernel<C> {
                 .map(|fd| Some(fd as u64));
         }
         let timer = p.linux.vfs.timerfd_resource(a[0] as u32)?;
-        trames_linux::timerfd_control(&timer, number, a, &mut p.memory, self.started).map(Some)
+        trames_linux::timerfd_control_with_boot(
+            &timer,
+            number,
+            a,
+            &mut p.memory,
+            self.started,
+            Some(p.linux.boot_clock()),
+        )
+        .map(Some)
     }
     pub(super) fn epoll(
         &self,

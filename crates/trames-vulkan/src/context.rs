@@ -21,6 +21,7 @@ unsafe impl Send for OwnedBackend {}
 struct Inner {
     backend: Mutex<OwnedBackend>,
     available: Arc<trames_shared::Readiness>,
+    display: crate::Display,
 }
 #[derive(Clone)]
 pub struct Context(Arc<Inner>);
@@ -95,20 +96,32 @@ impl Lease<'_> {
         self.backend.as_ref().unwrap().0.subscribe_job(job, signal)
     }
 }
+impl crate::display::SuspensionFence for Inner {
+    fn quiesce(&self) {
+        drop(self.backend.lock().expect("GPU context poisoned"));
+    }
+    fn resume(&self) {
+        self.available.notify_atomic();
+    }
+}
 impl Context {
     pub fn new(backend: Backend) -> Self {
-        Self(Arc::new(Inner {
+        let display = backend.host_display();
+        let inner = Arc::new(Inner {
             backend: Mutex::new(OwnedBackend(backend)),
             available: Arc::default(),
-        }))
+            display: display.clone(),
+        });
+        display.register_context(&(inner.clone() as Arc<dyn crate::display::SuspensionFence>));
+        Self(inner)
     }
     pub fn try_lock(&self) -> Option<Lease<'_>> {
         match self.0.backend.try_lock() {
-            Ok(backend) => Some(Lease {
+            Ok(backend) if !self.0.display.suspended() => Some(Lease {
                 backend: Some(backend),
                 available: &self.0.available,
             }),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+            Ok(_) | Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("GPU context poisoned"),
         }
     }
@@ -190,6 +203,40 @@ mod tests {
         signal.reset();
         drop(context.try_lock().unwrap());
         assert!(!signal.ready());
+    }
+    #[test]
+    fn host_background_fences_entries_and_foreground_wakes_the_original_waiter() {
+        let display = crate::Display::default();
+        let context = Context::new(Backend::new().with_display(display.clone()));
+        let lease = context.try_lock().unwrap();
+        let (entered, started) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let host = display.clone();
+        let thread = thread::spawn(move || {
+            entered.send(()).unwrap();
+            host.set_suspended(true);
+            done.send(()).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(completed.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(lease);
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        assert!(context.try_lock().is_none());
+        let (wake, woken) = mpsc::channel();
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Unlocked(context.clone(), wake));
+        let signal = trames_shared::IoSignal::new(7, Arc::downgrade(&target));
+        let _subscription = context.subscribe(&signal);
+        assert!(context.try_lock().is_none());
+        display.set_suspended(false);
+        woken.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(signal.ready());
+        assert!(context.try_lock().is_some());
+        display.set_suspended(true);
+        let later = Context::new(Backend::new().with_display(display.clone()));
+        assert!(later.try_lock().is_none());
+        display.set_suspended(false);
+        assert!(later.try_lock().is_some());
     }
     fn view() -> (Memory, trames_memory::parallel::View) {
         let mut memory = Memory::default();

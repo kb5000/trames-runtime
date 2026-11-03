@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One timerfd object, shared with workers; no host timer/service thread.
+mod boottime;
 mod clock_watch;
 use crate::readiness::Readiness;
 use crate::{Errno, Result};
+use boottime::BootTimer;
 use clock_watch::ClockWatch;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct State {
     deadline: Option<Instant>,
+    boot: Option<BootTimer>,
     interval: Duration,
     pending: u64,
     epoch: u64,
@@ -27,6 +30,7 @@ impl TimerFd {
             clock,
             state: Mutex::new(State {
                 deadline: None,
+                boot: None,
                 interval: Duration::ZERO,
                 pending: 0,
                 epoch: 0,
@@ -64,18 +68,34 @@ impl TimerFd {
         } else {
             None
         };
+        let boot = if self.clock == 7 {
+            new.and_then(|(_, deadline, _)| deadline)
+                .map(BootTimer::new)
+                .transpose()?
+        } else {
+            None
+        };
         self.change(|state, now| {
             state.tick(now);
             let old = (
                 state.interval,
-                state
-                    .deadline
-                    .map_or(Duration::ZERO, |d| d.saturating_duration_since(now)),
+                state.boot.as_ref().map_or_else(
+                    || {
+                        state
+                            .deadline
+                            .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
+                    },
+                    |boot| {
+                        boot.deadline
+                            .saturating_sub(trames_shared::boottime::continuous())
+                    },
+                ),
             );
             let was_cancelled = state.cancelled;
             if let Some((interval, deadline, absolute)) = new {
                 state.interval = interval;
                 state.deadline = deadline;
+                state.boot = boot;
                 state.pending = 0;
                 state.cancel = watcher;
                 state.absolute = absolute;
@@ -90,12 +110,12 @@ impl TimerFd {
         })
     }
     pub(crate) fn native_fd(&self) -> Option<crate::HostFd> {
-        self.state
-            .lock()
-            .unwrap()
-            .cancel
+        let state = self.state.lock().unwrap();
+        state
+            .boot
             .as_ref()
-            .and_then(ClockWatch::fd)
+            .and_then(BootTimer::fd)
+            .or_else(|| state.cancel.as_ref().and_then(ClockWatch::fd))
     }
     pub(crate) fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> crate::IoSubscription {
         let subscription = self.readiness.subscribe(signal);
@@ -105,6 +125,12 @@ impl TimerFd {
         }
     }
     pub(crate) fn deadline(&self) -> Option<Instant> {
+        if self.clock == 7 {
+            return self.change(|state, now| {
+                state.tick(now);
+                state.deadline
+            });
+        }
         self.state.lock().unwrap().deadline
     }
     pub(crate) fn poll(&self, events: u16) -> (u16, [u64; 2]) {
@@ -142,7 +168,48 @@ impl TimerFd {
     }
 }
 impl State {
+    fn tick_boot(&mut self, now: Instant, continuous: Duration) {
+        let Some(boot) = self.boot.as_mut() else {
+            return;
+        };
+        if continuous < boot.deadline {
+            if continuous >= boot.armed {
+                boot.drain();
+                boot.arm(boot.deadline - continuous)
+                    .expect("rearm original native boottime timer");
+            }
+            self.deadline = now.checked_add(boot.deadline - continuous);
+            return;
+        }
+        boot.drain();
+        let elapsed = continuous - boot.deadline;
+        let count = if self.interval.is_zero() {
+            1
+        } else {
+            elapsed.as_nanos() / self.interval.as_nanos() + 1
+        };
+        self.pending = self
+            .pending
+            .saturating_add(count.min(u64::MAX as u128) as u64);
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.interval.is_zero() {
+            self.boot = None;
+            self.deadline = None;
+        } else {
+            let left = self.interval.as_nanos() - elapsed.as_nanos() % self.interval.as_nanos();
+            let left = Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32);
+            boot.deadline = continuous + left;
+            self.deadline = now.checked_add(left);
+            boot.arm(left)
+                .expect("rearm original native boottime timer");
+        }
+    }
     fn tick(&mut self, now: Instant) {
+        if self.boot.is_some() {
+            self.tick_boot(now, trames_shared::boottime::continuous());
+            return;
+        }
+
         if self.cancel.as_ref().is_some_and(ClockWatch::changed) {
             // The absolute target remains in realtime coordinates after a
             // clock step. Cancellation is reported once; an unrearmed timer
@@ -202,6 +269,7 @@ mod tests {
         let now = Instant::now();
         let mut state = State {
             deadline: Some(now - Duration::from_millis(9)),
+            boot: None,
             interval: Duration::from_millis(1),
             pending: 0,
             epoch: 0,
@@ -251,5 +319,57 @@ mod tests {
             .epoll_wait(1)
             .unwrap()
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sleep_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    #[test]
+    fn sleep_elapsed_expires_boottime_and_preserves_periodic_phase_without_advancing_monotonic() {
+        let now = Instant::now();
+        let timer = TimerFd::new(7);
+        timer.update(Some((
+            Duration::from_secs(2),
+            Some(now + Duration::from_secs(1)),
+        )));
+        let mut state = timer.state.lock().unwrap();
+        let target = state.boot.as_ref().unwrap().deadline;
+        state.tick_boot(now, target + Duration::from_secs(9));
+        assert_eq!(state.pending, 5);
+        assert_eq!(state.deadline, Some(now + Duration::from_secs(1)));
+        drop(state);
+        let monotonic = TimerFd::new(1);
+        monotonic.update(Some((Duration::ZERO, Some(now + Duration::from_secs(1)))));
+        monotonic.state.lock().unwrap().tick(now);
+        assert_eq!(monotonic.state.lock().unwrap().pending, 0);
+    }
+    #[test]
+    fn large_boottime_interval_keeps_canonical_remaining_without_overflowing_native_units() {
+        let now = Instant::now();
+        let timer = TimerFd::new(7);
+        timer.update(Some((Duration::from_secs(i64::MAX as u64), Some(now))));
+        let mut state = timer.state.lock().unwrap();
+        let target = state.boot.as_ref().unwrap().deadline;
+        state.tick_boot(now, target + Duration::from_millis(1));
+        assert_eq!(state.pending, 1);
+        assert!(state.boot.as_ref().unwrap().deadline > target + Duration::from_secs(100));
+    }
+    #[test]
+    fn sleep_aware_timer_uses_a_native_readiness_fd() {
+        let timer = TimerFd::new(7);
+        timer.update(Some((
+            Duration::ZERO,
+            Some(Instant::now() + Duration::from_millis(5)),
+        )));
+        let fd = timer.native_fd().unwrap();
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+        assert_eq!(timer.read(8).unwrap(), 1u64.to_le_bytes());
     }
 }

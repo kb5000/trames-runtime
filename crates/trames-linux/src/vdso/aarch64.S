@@ -10,8 +10,6 @@ __kernel_clock_gettime:
     cmp w0,#4
     b.eq .Lmono
     cmp w0,#6
-    b.eq .Lmono
-    cmp w0,#7
     b.ne .Lclock_syscall
 .Lmono:
     adr x9,vdso_data
