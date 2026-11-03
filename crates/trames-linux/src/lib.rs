@@ -11,9 +11,10 @@ mod bpf;
 mod descriptor_create;
 mod direct;
 pub use direct::{
-    epoll_parameters, epoll_scatter, DirectSyscalls, FileBoundary, FileCheckpoint, FileExecutor,
-    FileOutput, FilePending, FileResult, IoAttempt, PendingIo, RetainedByte, RetainedSocket,
-    UringActor, UringBackground, UringEnter, UringEpoch, UringFileLayout, UringSnapshot,
+    epoll_parameters, epoll_scatter, Aio, DirectSyscalls, FileBoundary, FileCheckpoint,
+    FileExecutor, FileOutput, FilePending, FileResult, IoAttempt, PendingIo, RetainedAio,
+    RetainedByte, RetainedSocket, UringActor, UringBackground, UringEnter, UringEpoch,
+    UringFileLayout, UringSnapshot,
 };
 mod file_calls;
 mod heap;

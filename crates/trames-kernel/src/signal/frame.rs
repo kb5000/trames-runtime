@@ -3,7 +3,74 @@ use super::*;
 use trames_execution::{Aarch64State, Registers, SmeConfig, SmeState};
 
 const FRAME_SIZE: usize = 4688;
+pub struct FrameState {
+    pub actions: Actions,
+    pub mask: u64,
+    pub frames: u32,
+    pub alt_stack: AltStack,
+}
 impl Signals {
+    fn frame_state(&self) -> FrameState {
+        FrameState {
+            actions: self.actions.shared(),
+            mask: self.mask,
+            frames: self.frames,
+            alt_stack: self.alt_stack,
+        }
+    }
+    fn commit_frame(&mut self, frame: FrameState) {
+        self.mask = frame.mask;
+        self.frames = frame.frames;
+        self.alt_stack = frame.alt_stack;
+    }
+    pub fn enter(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &mut impl CpuMemory,
+        sig: u32,
+        info: Info,
+        action: Action,
+    ) -> Result<(), Errno> {
+        self.enter_sme(state, memory, sig, info, action, None)
+    }
+    pub fn enter_sme(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &mut impl CpuMemory,
+        sig: u32,
+        info: Info,
+        action: Action,
+        sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
+    ) -> Result<(), Errno> {
+        let mut frame = self.frame_state();
+        frame.enter_sme(state, memory, sig, info, action, sme)?;
+        self.commit_frame(frame);
+        Ok(())
+    }
+    pub fn restore(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &impl CpuMemory,
+    ) -> Result<(), Errno> {
+        let mut frame = self.frame_state();
+        frame.restore(state, memory)?;
+        self.commit_frame(frame);
+        Ok(())
+    }
+    pub fn restore_sme(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &impl CpuMemory,
+        config: SmeConfig,
+        sme2: bool,
+    ) -> Result<Option<Box<SmeState>>, Errno> {
+        let mut frame = self.frame_state();
+        let result = frame.restore_sme(state, memory, config, sme2)?;
+        self.commit_frame(frame);
+        Ok(result)
+    }
+}
+impl FrameState {
     /// Publish a complete signal frame before changing architectural/task state.
     pub fn enter(
         &mut self,

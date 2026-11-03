@@ -11,7 +11,7 @@ impl<C: Cpu> Process<C> {
     }
     pub(super) fn take_signal(&mut self, sig: u32, shared: bool) -> Info {
         let mut info = self.signals.take_signal(sig, shared);
-        if info.fault.is_none() {
+        if info.fault.is_none() && info.poll.is_none() {
             info.sender = self.linux.vfs.visible_pid(info.sender);
         }
         info

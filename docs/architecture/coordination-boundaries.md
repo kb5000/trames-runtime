@@ -3,8 +3,8 @@
 This is the consolidated implementation audit after the namespace subsystem
 batch, 2026-11-03. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
-batch does not make the whole runtime coordinator-free. Further removal work is
-on hold at the owner's request.
+batch does not make the whole runtime coordinator-free. The Docker I/O additions
+below, 2026-11-04, use calling workers and shared resources from their first implementation.
 
 ## Execution model
 
@@ -43,10 +43,27 @@ The relevant scopes are:
 
 ## Remaining owner dependencies
 
+### Docker I/O additions
+
+| Interface | Normal execution | Current limits |
+| --- | --- | --- |
+| FIOASYNC / O_ASYNC, F_SETOWN/EX and F_SETSIG | OFD-owned subscriptions on pipe, Unix-socket and PTY readiness enqueue into shared task/process signal mailboxes. The target worker enters the existing ARM64 signal frame and restores it with local sigreturn. PID namespaces, group/TID ownership, credentials, standard coalescing and realtime queues use original identities. Only status/list changes synchronize per OFD; byte I/O and GETFL keep atomic flag reads. | Native TCP and other unsupported FASYNC descriptor kinds return EOPNOTSUPP. Signalfd and masked owner waits retain their existing owner paths. Other signal sources have not been migrated by this addition. |
+| io_setup/destroy/submit/cancel/getevents | One demand-zero, read-only context-header page is reserved during ELF load. Setup changes only the shared per-mm context registry. Buffered scalar/vector reads/writes and fsync/fdatasync use the existing disk pool, park the source task, copy results on its worker and publish CQ then eventfd. Accepted waits retain their original context across destruction, handle reuse and cohort handoff. | Buffered io_submit can wait for its batch, as Linux permits; this is not an O_DIRECT DMA/pinned-buffer implementation. Context metadata is bounded to 128 contexts and 65,536 requested credits per context. Zero ring magic selects the library syscall fallback; userspace ring reaping is not advertised. Unsupported opcodes, I/O priority/RWF flags, temporary pgetevents masks and live mapped-file layout work return explicit errors instead of requesting a new owner service. In-flight buffered cancellation returns EAGAIN; already-completed requests return EINVAL. |
+| EPOLLEXCLUSIVE | Shared readiness wakes ordinary subscribers and selects an eligible exclusive waiter per original OFD. Native one-shot registrations are driven by an existing idle executor and rearmed as interests retire. No polling bus or reactor thread is added. | ADD-only, no ONESHOT or nested-epoll target; MOD of an exclusive registration returns EINVAL. Existing owner-only descriptors and masked/traced epoll waits retain their prior boundaries. |
+
+The signal-frame implementation is shared by owner delivery, source-worker I/O
+delivery and sigreturn. The normal caught-SIGIO worker test asserts zero service
+requests and a worker-retired sigreturn. The C fixture `tests/fixtures/async-io.c`
+in trames-ipad compares the same AIO, SIGIO and epoll cases against native Linux
+on one and four CPUs. Mac acceptance additionally runs the unmodified Debian
+Docker/containerd/runc packages and the default four-worker nginx container.
+
+### Other boundaries
+
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Joined owner path. Child/task/VM ownership and pending contexts are changed on the owner. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
-| Signals and mutable security/task policy | Delivery and signal frames, signal masks/return, STOP/CONT/KILL, SIGPIPE/SIGXFSZ completion, credentials/capabilities, affinity/limits, seccomp installation/TSYNC and non-ALLOW actions | Owner task effects. Allowed admitted filtered calls run on workers with one retained decision; tracing disables worker syscall snapshots. Pending native/file effects retire before their source completion is handled. | [entry and delivery](../../crates/trames-session/src/process.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
+| Signals and mutable security/task policy | Other signal delivery, mutating signal masks/actions, STOP/CONT/KILL, credentials/capabilities, affinity/limits, seccomp installation/TSYNC and non-ALLOW actions | Owner task effects remain. FASYNC notifications enqueue directly into task/process mailboxes; caught handlers and admitted sigreturn execute on the source worker. Default termination/stop still uses the lifecycle boundary. Allowed admitted filtered calls retain one decision; tracing disables snapshots. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, owner cgroup/proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and owner Rc control graphs have not been migrated. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are now separate shared resources. Do not classify every network socket or netlink message as owner-only. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted cgroup/nsfs/mqueue mounts, volatile owner descriptors, controlling-terminal acquisition and excluded open types | Before-effects defer. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, old epoll creation, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |

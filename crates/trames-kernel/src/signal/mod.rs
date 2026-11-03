@@ -5,12 +5,15 @@ mod actions;
 mod alt_stack;
 mod fault;
 mod frame;
+pub use frame::FrameState;
 mod info;
+mod io;
 mod pending;
 pub use actions::{Action, Actions};
 pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
+pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask};
 pub use pending::Pending;
 use std::{cell::RefCell, rc::Rc};
 use trames_memory::{Access, CpuMemory};
@@ -20,6 +23,8 @@ pub const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
 
 #[derive(Default)]
 pub struct Signals {
+    pub io: std::sync::Arc<IoTask>,
+    pub io_directory: std::sync::Arc<IoDirectory>,
     pub actions: Actions,
     pub mask: u64,
     pub pending: Pending,
@@ -32,6 +37,8 @@ impl Signals {
     /// CLONE_THREAD additionally adopts the existing process pending queue.
     pub fn fork(&self, shared_actions: bool) -> Self {
         Self {
+            io: Default::default(),
+            io_directory: self.io_directory.clone(),
             actions: if shared_actions {
                 self.actions.shared()
             } else {
@@ -50,22 +57,35 @@ impl Signals {
         self.alt_stack = AltStack::default();
     }
     pub fn pending_bits(&self) -> u64 {
-        self.pending.bits() | self.shared_pending.borrow().bits()
+        self.pending.bits()
+            | self.shared_pending.borrow().bits()
+            | self.io.inbox.bits()
+            | self.io.process().bits()
     }
     /// Linux selects a task's private queue before its process queue.
     pub fn next_signal(&self, mask: u64) -> Option<(u32, bool)> {
-        self.pending.next(mask).map(|sig| (sig, false)).or_else(|| {
-            self.shared_pending
-                .borrow()
-                .next(mask)
-                .map(|sig| (sig, true))
-        })
+        self.pending
+            .next(mask)
+            .or_else(|| self.io.inbox.next(mask))
+            .map(|sig| (sig, false))
+            .or_else(|| {
+                self.shared_pending
+                    .borrow()
+                    .next(mask)
+                    .or_else(|| self.io.process().next(mask))
+                    .map(|sig| (sig, true))
+            })
     }
     pub fn take_signal(&mut self, sig: u32, shared: bool) -> Info {
         if shared {
-            self.shared_pending.borrow_mut().remove(&sig)
+            self.shared_pending
+                .borrow_mut()
+                .remove(&sig)
+                .or_else(|| self.io.process().take(sig))
         } else {
-            self.pending.remove(&sig)
+            self.pending
+                .remove(&sig)
+                .or_else(|| self.io.inbox.take(sig))
         }
         .expect("selected pending signal")
     }
@@ -79,6 +99,8 @@ impl Signals {
     pub fn discard(&mut self, sig: u32) {
         self.pending.discard(sig);
         self.shared_pending.borrow_mut().discard(sig);
+        self.io.inbox.discard(sig);
+        self.io.process().discard(sig);
     }
     pub fn clear_opposing(&mut self, sig: u32) {
         if sig == 18 {

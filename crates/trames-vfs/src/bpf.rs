@@ -23,6 +23,7 @@ enum Reg {
 // executing workers. The weak registry never prolongs a program's lifetime.
 pub(super) struct Program {
     pub id: u32,
+    pub kind: u32,
     code: Vec<Insn>,
 }
 #[derive(Default)]
@@ -31,14 +32,20 @@ pub(super) struct Registry {
     programs: BTreeMap<u32, std::sync::Weak<Program>>,
 }
 impl Registry {
-    fn load(&mut self, bytes: &[u8]) -> Result<Arc<Program>> {
+    fn load(&mut self, kind: u32, bytes: &[u8]) -> Result<Arc<Program>> {
         let code = verify(bytes)?;
+        // CGroupSKB loading is needed by older libbpf/cilium attach probes.
+        // Accept genuinely executable, context-independent programs only.
+        // Packet context access and SKB attachment remain unsupported.
+        if kind == 8 && code.iter().any(|i| i.code == 0x61) {
+            return Err(Errno(22));
+        }
         self.programs.retain(|_, p| p.strong_count() != 0);
         if self.programs.len() >= MAX_PROGRAMS {
             return Err(Errno(28));
         }
         let id = self.next.checked_add(1).ok_or(Errno(28))?;
-        let p = Arc::new(Program { id, code });
+        let p = Arc::new(Program { id, kind, code });
         self.next = id;
         self.programs.insert(id, Arc::downgrade(&p));
         Ok(p)
@@ -176,9 +183,15 @@ impl Vfs {
         Ok(())
     }
     pub fn bpf_load_device(&mut self, code: &[u8]) -> Result<u32> {
+        self.bpf_load_program(15, code)
+    }
+    pub fn bpf_load_program(&mut self, kind: u32, code: &[u8]) -> Result<u32> {
         self.bpf_authorized()?;
         self.available(0)?;
-        let program = self.cgroups.borrow_mut().bpf.load(code)?;
+        if !matches!(kind, 8 | 15) {
+            return Err(Errno(22));
+        }
+        let program = self.cgroups.borrow_mut().bpf.load(kind, code)?;
         self.anonymous(O_CLOEXEC, events::Anonymous::Bpf(program))
     }
     pub fn bpf_get_fd(&mut self, id: u32) -> Result<u32> {
@@ -192,6 +205,14 @@ impl Vfs {
             .and_then(std::sync::Weak::upgrade)
             .ok_or(Errno(2))?;
         self.anonymous(O_CLOEXEC, events::Anonymous::Bpf(program))
+    }
+    /// Stable info prefix supported by the guest device-program registry.
+    pub fn bpf_program_identity(&self, fd: u32) -> Result<[u8; 8]> {
+        let program = self.bpf_program(fd)?;
+        let mut info = [0; 8];
+        info[..4].copy_from_slice(&program.kind.to_le_bytes());
+        info[4..].copy_from_slice(&program.id.to_le_bytes());
+        Ok(info)
     }
     pub(super) fn bpf_program(&self, fd: u32) -> Result<Arc<Program>> {
         let o_descriptor = self.descriptor(fd)?;
@@ -274,6 +295,7 @@ mod tests {
         .concat();
         let p = Program {
             id: 1,
+            kind: 15,
             code: verify(&bytes).unwrap(),
         };
         for access in 1..=7 {
@@ -288,6 +310,21 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn scalar_skb_load_has_real_identity_but_cannot_bypass_device_type() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let fd = v.bpf_load_program(8, &constant(1)).unwrap();
+        assert_eq!(
+            &v.bpf_program_identity(fd).unwrap()[..4],
+            &8u32.to_le_bytes()
+        );
+        assert!(v.bpf_program(fd).unwrap().allows([0; 3]));
+        let context = [insn(0x61, 0, 1, 0, 0), insn(0x95, 0, 0, 0, 0)].concat();
+        assert_eq!(v.bpf_load_program(8, &context), Err(Errno(22)));
+        let group = v.open_at(AT_FDCWD, b"/sys/fs/cgroup", O_PATH, 0).unwrap();
+        assert_eq!(v.bpf_attach_device(group, fd, 2, 0), Err(Errno(22)));
     }
     #[test]
     fn attachments_survive_close_replace_atomically_and_follow_membership() {
@@ -351,11 +388,11 @@ mod tests {
         let mut registry = Registry::default();
         let mut programs = Vec::new();
         for _ in 0..MAX_PROGRAMS {
-            programs.push(registry.load(&constant(1)).unwrap());
+            programs.push(registry.load(15, &constant(1)).unwrap());
         }
-        assert!(matches!(registry.load(&constant(1)), Err(Errno(28))));
+        assert!(matches!(registry.load(15, &constant(1)), Err(Errno(28))));
         programs.pop();
-        assert!(registry.load(&constant(1)).is_ok());
+        assert!(registry.load(15, &constant(1)).is_ok());
     }
     #[test]
     fn worker_program_lease_keeps_identity_and_releases_registry_quota() {

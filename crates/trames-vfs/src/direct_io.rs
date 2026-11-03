@@ -260,12 +260,22 @@ impl WatchResource {
             Self::Owner(fd) => fd.origin.as_ref().is_none_or(OfdIdentity::is_live),
         }
     }
-    fn accepted(fd: &DirectFd) -> Self {
+    pub(super) fn accepted(fd: &DirectFd) -> Self {
         if let Some(file) = &fd._file {
             Self::Shared(Arc::downgrade(&file.open))
         } else {
             Self::Owner(fd.clone())
         }
+    }
+    pub(super) fn notification(fd: &DirectFd) -> Self {
+        let mut target = Self::accepted(fd);
+        if let Self::Owner(fd) = &mut target {
+            // An OFD-owned notification must not retain its own async status
+            // through an owner-only poll projection. Polling uses no mutable
+            // byte-I/O flags; liveness still follows the weak original OFD.
+            fd.status = StatusFlags::from(fd.status.get());
+        }
+        target
     }
     pub(super) fn capture(
         open: &OpenWeak,
@@ -350,6 +360,33 @@ pub struct DirectFd {
     pub(super) origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    pub(super) fn set_async(&self, number: u32, enabled: bool) -> Result<u64> {
+        let _update = self.status.lock_update();
+        if self.status.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        self.status.async_state().enable(self, number, enabled)?;
+        self.status.set_async(enabled);
+        Ok(0)
+    }
+    pub(super) fn set_status(&self, number: u32, flags: u32) -> Result<u64> {
+        let _update = self.status.lock_update();
+        self.status
+            .async_state()
+            .enable(self, number, flags & 0x2000 != 0)?;
+        self.status.store_locked(flags)?;
+        Ok(0)
+    }
+    pub(super) fn supports_async(&self) -> bool {
+        matches!(
+            self.resource,
+            ByteResource::Pipe { .. }
+                | ByteResource::Unix { .. }
+                | ByteResource::UnixDatagram(_)
+                | ByteResource::UnixControl(_)
+                | ByteResource::Pty { .. }
+        )
+    }
     pub(super) fn uring_poll(open: &Arc<SharedOpenDescription>, ring: Arc<Uring>) -> Self {
         Self {
             resource: ByteResource::PollOnly(ring),
@@ -562,10 +599,36 @@ impl DirectFd {
                         .snapshot()
                         .iter()
                         .filter(|(_, state, _)| state.lock().unwrap().armed)
-                        .flat_map(|(_, _, fd)| {
-                            fd.resolve()
-                                .map(|fd| fd.subscribe(signal))
-                                .unwrap_or_default()
+                        .flat_map(|(key, state, target)| {
+                            let Some(fd) = target.resolve() else {
+                                return Vec::new();
+                            };
+                            if state.lock().unwrap().events & epoll::EXCLUSIVE == 0 {
+                                return fd.subscribe(signal);
+                            }
+                            let target = target.clone();
+                            let baseline =
+                                Mutex::new(fd.peek_poll(state.lock().unwrap().events as u16));
+                            let state = Arc::downgrade(state);
+                            let exclusive = IoSignal::exclusive(signal, key.1, move || {
+                                let (Some(state), Some(fd)) = (state.upgrade(), target.resolve())
+                                else {
+                                    return false;
+                                };
+                                let state = state.lock().unwrap();
+                                let (ready, epoch) = fd.peek_poll(state.events as u16);
+                                let mut previous = baseline.lock().unwrap();
+                                let changed = ready & !previous.0 != 0
+                                    || ready & 3 != 0 && epoch[0] != previous.1[0]
+                                    || ready & 4 != 0 && epoch[1] != previous.1[1]
+                                    || ready & (8 | 16) != 0;
+                                *previous = (ready, epoch);
+                                state.armed && ready != 0 && changed && state.ready(ready, epoch)
+                            });
+                            fd.subscribe(&exclusive)
+                                .into_iter()
+                                .map(|s| s.retain_signal(exclusive.clone()))
+                                .collect()
                         }),
                 );
                 subscriptions
@@ -1242,6 +1305,9 @@ impl DirectFds {
             return Some(Err(Errno(22)));
         }
         if target_fd.is_epoll() {
+            if op != 2 && events & epoll::EXCLUSIVE != 0 {
+                return Some(Err(Errno(22)));
+            }
             return None;
         }
         if matches!(

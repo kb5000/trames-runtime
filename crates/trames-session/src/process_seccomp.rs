@@ -379,6 +379,7 @@ impl<C: Cpu> Kernel<C> {
                         code: 1,
                         timer: None,
                         fault: Some(p.cpu.pc()),
+                        poll: None,
                     },
                 );
                 if self.deliver(pid, p).is_err() {
@@ -414,6 +415,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -618,6 +622,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -687,6 +694,9 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    io_signals: Default::default(),
+                    io_routes: Default::default(),
+                    io_wake: None,
                     seccomp: p.seccomp.clone(),
                     identities: [0; 7],
                     started: Instant::now(),
@@ -794,6 +804,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1325,6 +1338,9 @@ mod tests {
             .wait((0, 7, 0x1000), 3, 1, || Ok::<_, ()>(()))
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [0; 7],
             started: Instant::now(),
@@ -1577,6 +1593,9 @@ mod tests {
                         .unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    io_signals: Default::default(),
+                    io_routes: Default::default(),
+                    io_wake: None,
                     seccomp: p.seccomp.clone(),
                     identities: [0; 7],
                     started: Instant::now(),
@@ -1613,6 +1632,9 @@ mod tests {
             ));
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1658,6 +1680,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1696,6 +1721,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1736,6 +1764,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1784,6 +1815,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1834,6 +1868,9 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                io_signals: Default::default(),
+                io_routes: Default::default(),
+                io_wake: None,
                 seccomp: p.seccomp.clone(),
                 identities: [0; 7],
                 started: Instant::now(),
@@ -1879,6 +1916,9 @@ mod tests {
                 ));
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    io_signals: Default::default(),
+                    io_routes: Default::default(),
+                    io_wake: None,
                     seccomp: p.seccomp.clone(),
                     identities: [0; 7],
                     started: Instant::now(),

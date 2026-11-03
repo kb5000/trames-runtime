@@ -364,6 +364,7 @@ impl DirectSyscalls {
             return self.complete_byte(&file, result);
         }
         IoAttempt::Blocked(PendingIo {
+            aio: None,
             number,
             args,
             deadline: None,

@@ -1068,6 +1068,7 @@ impl UringSnapshot {
         let signal = IoSignal::new(pid, target.clone());
         self.resume(
             PendingIo {
+                aio: None,
                 number: 426,
                 args,
                 deadline,

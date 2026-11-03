@@ -1826,6 +1826,7 @@ fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creato
         code: -6,
         timer: None,
         fault: None,
+        poll: None,
     };
     p.signals.pending.enqueue(10, info(31)).unwrap();
     peer.signals.pending.enqueue(12, info(41)).unwrap();

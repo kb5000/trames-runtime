@@ -10,7 +10,9 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+mod aio;
 pub(crate) mod file;
+pub use aio::{Aio, RetainedAio};
 mod ip_message;
 mod local_message;
 pub(crate) mod namespace;
@@ -32,6 +34,7 @@ fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostF
 /// A stopped syscall, not a re-executed SVC. Subscriptions do not retain guest
 /// FD table entries or count as additional pipe endpoints.
 pub struct PendingIo {
+    pub aio: Option<RetainedAio>,
     pub number: u32,
     pub args: [u64; 6],
     pub deadline: Option<Instant>,
@@ -104,7 +107,7 @@ impl PendingIo {
         self.file.clone()
     }
     pub fn external_wait(&self) -> bool {
-        if self.file.is_some() {
+        if self.file.is_some() || DirectSyscalls::aio_call(self.number) {
             return true;
         }
         self.retained_socket
@@ -180,6 +183,8 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    task_signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
+    aio: Option<(Aio, trames_vfs::NativeEvents)>,
     paths: Option<trames_vfs::PathQueries>,
     file_prepared: RefCell<Option<file::PreparedFileCall>>,
     resources: Option<trames_vfs::DescriptorFactory>,
@@ -205,9 +210,18 @@ pub struct DirectSyscalls {
     completed: Cell<u64>,
 }
 impl DirectSyscalls {
+    pub fn with_task_signal(mut self, task: Arc<dyn trames_vfs::TaskSignal>) -> Self {
+        self.task_signal = Some(task);
+        self
+    }
+    pub fn descriptors(&self) -> DirectFds {
+        self.descriptors.clone()
+    }
     pub fn new(descriptors: DirectFds) -> Self {
         let membership = descriptors.shared_files();
         Self {
+            task_signal: None,
+            aio: None,
             paths: None,
             file_prepared: Default::default(),
             resources: None,
@@ -646,6 +660,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if Self::aio_call(number) {
+            return self.aio.is_some();
+        }
         if self.file_prepared(number, args) {
             return true;
         }
@@ -766,6 +783,7 @@ impl DirectSyscalls {
         };
         self.resume(
             PendingIo {
+                aio: None,
                 number,
                 args,
                 deadline,
@@ -1001,6 +1019,9 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if Self::aio_call(number) {
+            return self.start_aio(number, args, memory, pid, target, saved_deadline);
+        }
         if matches!(number, 206 | 207 | 211 | 212 | 269) && self.resources.is_some() {
             if let Some(attempt) = self.start_local_message(number, args, memory, pid, target) {
                 return Some(attempt);
@@ -1165,6 +1186,7 @@ impl DirectSyscalls {
         };
         Some(self.resume(
             PendingIo {
+                aio: None,
                 number,
                 args,
                 deadline,
@@ -1217,6 +1239,7 @@ impl DirectSyscalls {
         let subscriptions = poll.subscribe(&signal);
         self.resume(
             PendingIo {
+                aio: None,
                 number: 73,
                 args,
                 deadline,
@@ -1317,6 +1340,7 @@ impl DirectSyscalls {
         let subscriptions = file.subscribe(&signal);
         self.resume_inner(
             PendingIo {
+                aio: None,
                 number,
                 args,
                 deadline: None,
@@ -1358,6 +1382,7 @@ impl DirectSyscalls {
         let subscriptions = vec![request.subscribe(&signal)];
         self.resume(
             PendingIo {
+                aio: None,
                 number: 32,
                 args,
                 deadline: None,
@@ -1409,6 +1434,14 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         checkpoint_pipe: bool,
     ) -> IoAttempt {
+        if Self::aio_call(pending.number) {
+            return self.start_retained_aio(
+                pending.aio.take().expect("accepted AIO"),
+                memory,
+                pending.signal.pid,
+                &pending.target,
+            );
+        }
         if pending.retained_socket.is_some() {
             return self.resume_socket(pending, memory);
         }

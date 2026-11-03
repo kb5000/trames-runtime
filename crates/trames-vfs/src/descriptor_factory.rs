@@ -225,7 +225,10 @@ impl DescriptorFactory {
                 &|fd| {
                     let file = self
                         .files
-                        .lookup(fd)
+                        // A bound nsfs FD can retain an owner mount while
+                        // its network identity remains shared metadata. No
+                        // namespace mutation or owner projection is needed.
+                        .query_lookup(fd)
                         .unwrap_or(Err(Errno(22)))
                         .map_err(|e| trames_net::NetError(e.0))?;
                     let network = match &file.open.namespace_resource {
@@ -393,81 +396,114 @@ mod tests {
             out.extend_from_slice(data);
             out.resize((out.len() + 3) & !3, 0);
         }
-        let mut root = Vfs::default();
-        root.configure_network(NetworkMode::Loopback).unwrap();
-        let mut child = root.clone();
-        child.unshare_net().unwrap();
-        let descriptor = Descriptor {
-            open: root
-                .namespace_description(NamespaceHandle::Net(child.root_network.clone()), None),
-            cloexec: false.into(),
-        };
-        let nsfd = root
-            .shared_files()
-            .reserve()
-            .unwrap()
-            .publish(descriptor, None);
-        drop(child);
-        let factory = root.descriptor_factory();
-        let fd = factory.socket(16, 3, 0).unwrap();
-        let socket = factory.socket_operation(fd).unwrap().unwrap();
-        for (target, expected, name) in [
-            (9999, -9i32, b"missing\0".as_slice()),
-            (0, -22, b"wrong\0".as_slice()),
-            (nsfd, 0, b"shared-v0\0".as_slice()),
-        ] {
-            let mut body = vec![0; 16];
-            attr(&mut body, 3, name);
-            attr(&mut body, 28, &target.to_le_bytes());
-            let mut info = Vec::new();
-            attr(&mut info, 1, b"veth\0");
-            let mut peer = vec![0; 16];
-            attr(&mut peer, 3, b"peer-shared\0");
-            attr(&mut peer, 28, &target.to_le_bytes());
-            let mut data = Vec::new();
-            attr(&mut data, 1, &peer);
-            attr(&mut info, 2, &data);
-            attr(&mut body, 18, &info);
-            let mut request = Vec::new();
-            request.extend_from_slice(&((16 + body.len()) as u32).to_le_bytes());
-            request.extend_from_slice(&16u16.to_le_bytes());
-            request.extend_from_slice(&0x405u16.to_le_bytes());
-            request.extend_from_slice(&1u32.to_le_bytes());
-            request.extend_from_slice(&0u32.to_le_bytes());
-            request.extend(body);
-            assert_eq!(
-                factory.send_socket_bytes(&socket, &request, 0, None),
-                Ok(request.len())
-            );
-            let reply = socket.recv(4096, 0).unwrap();
-            assert_eq!(
-                i32::from_le_bytes(reply.data[16..20].try_into().unwrap()),
-                expected
-            );
-            let mut limited = factory.clone();
-            limited.credentials = Credentials::user(1000, 1000);
-            assert_eq!(
-                limited.send_socket_bytes(&socket, &request, 0, None),
-                Ok(request.len())
-            );
-            let denied = socket.recv(4096, 0).unwrap();
-            assert_eq!(
-                i32::from_le_bytes(denied.data[16..20].try_into().unwrap()),
-                -1
-            );
+        for bound in [false, true] {
+            let mut root = Vfs::default();
+            root.configure_network(NetworkMode::Loopback).unwrap();
+            let mut child = root.clone();
+            child.unshare_net().unwrap();
+            let descriptor = Descriptor {
+                open: root
+                    .namespace_description(NamespaceHandle::Net(child.root_network.clone()), None),
+                cloexec: false.into(),
+            };
+            let nsfd = root
+                .shared_files()
+                .reserve()
+                .unwrap()
+                .publish(descriptor, None);
+            let nsfd = if bound {
+                root.set_runtime_info(
+                    1,
+                    RuntimeInfo {
+                        processes: vec![ProcessInfo {
+                            pid: 1,
+                            tgid: 1,
+                            fds: root.fd_snapshot(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                root.import_file(b"/bound-netns", Vec::new()).unwrap();
+                root.mount(
+                    Some(format!("/proc/self/fd/{nsfd}").as_bytes()),
+                    b"/bound-netns",
+                    None,
+                    4096,
+                    None,
+                )
+                .unwrap();
+                let fd = root
+                    .open_at(AT_FDCWD, b"/bound-netns", O_CLOEXEC, 0)
+                    .unwrap();
+                assert!(root.shared_files().lookup(fd).is_none());
+                root.close(nsfd).unwrap();
+                fd
+            } else {
+                nsfd
+            };
+            drop(child);
+            let factory = root.descriptor_factory();
+            let fd = factory.socket(16, 3, 0).unwrap();
+            let socket = factory.socket_operation(fd).unwrap().unwrap();
+            for (target, expected, name) in [
+                (9999, -9i32, b"missing\0".as_slice()),
+                (0, -22, b"wrong\0".as_slice()),
+                (nsfd, 0, b"shared-v0\0".as_slice()),
+            ] {
+                let mut body = vec![0; 16];
+                attr(&mut body, 3, name);
+                attr(&mut body, 28, &target.to_le_bytes());
+                let mut info = Vec::new();
+                attr(&mut info, 1, b"veth\0");
+                let mut peer = vec![0; 16];
+                attr(&mut peer, 3, b"peer-shared\0");
+                attr(&mut peer, 28, &target.to_le_bytes());
+                let mut data = Vec::new();
+                attr(&mut data, 1, &peer);
+                attr(&mut info, 2, &data);
+                attr(&mut body, 18, &info);
+                let mut request = Vec::new();
+                request.extend_from_slice(&((16 + body.len()) as u32).to_le_bytes());
+                request.extend_from_slice(&16u16.to_le_bytes());
+                request.extend_from_slice(&0x405u16.to_le_bytes());
+                request.extend_from_slice(&1u32.to_le_bytes());
+                request.extend_from_slice(&0u32.to_le_bytes());
+                request.extend(body);
+                assert_eq!(
+                    factory.send_socket_bytes(&socket, &request, 0, None),
+                    Ok(request.len())
+                );
+                let reply = socket.recv(4096, 0).unwrap();
+                assert_eq!(
+                    i32::from_le_bytes(reply.data[16..20].try_into().unwrap()),
+                    expected
+                );
+                let mut limited = factory.clone();
+                limited.credentials = Credentials::user(1000, 1000);
+                assert_eq!(
+                    limited.send_socket_bytes(&socket, &request, 0, None),
+                    Ok(request.len())
+                );
+                let denied = socket.recv(4096, 0).unwrap();
+                assert_eq!(
+                    i32::from_le_bytes(denied.data[16..20].try_into().unwrap()),
+                    -1
+                );
+            }
+            root.setns(nsfd, CLONE_NEWNET).unwrap();
+            assert!(root
+                .network
+                .devices()
+                .iter()
+                .any(|d| d.name == b"shared-v0"));
+            root.close(nsfd).unwrap();
+            assert!(factory
+                .network
+                .devices()
+                .iter()
+                .all(|d| d.name != b"shared-v0"));
         }
-        root.setns(nsfd, CLONE_NEWNET).unwrap();
-        assert!(root
-            .network
-            .devices()
-            .iter()
-            .any(|d| d.name == b"shared-v0"));
-        root.close(nsfd).unwrap();
-        assert!(factory
-            .network
-            .devices()
-            .iter()
-            .all(|d| d.name != b"shared-v0"));
     }
     #[test]
     fn worker_socket_creation_publishes_complete_ofds_and_keeps_creating_authority() {

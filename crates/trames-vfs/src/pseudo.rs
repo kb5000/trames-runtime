@@ -519,6 +519,26 @@ mod tests {
         assert_eq!(v.stat_at(AT_FDCWD, b"/proc/1/status"), Err(Errno(2)));
     }
     #[test]
+    fn tmpfs_alias_to_proc_stderr_reopens_the_pipe_without_writing_procfs() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/aliases", 0o755).unwrap();
+        v.mount(None, b"/aliases", Some(b"tmpfs"), 0, None).unwrap();
+        v.symlink_at(b"/proc/self/fd/2", AT_FDCWD, b"/aliases/stderr")
+            .unwrap();
+        v.symlink_at(b"/aliases/stderr", AT_FDCWD, b"/error.log")
+            .unwrap();
+        let [reader, writer] = v.pipe(0).unwrap();
+        v.dup3(writer, 2, 0).unwrap();
+        v.close(writer).unwrap();
+        snapshot(&mut v);
+        for path in [b"/aliases/stderr".as_slice(), b"/error.log"] {
+            let fd = v.open_at(AT_FDCWD, path, 1 | 0x40 | 0x400, 0o666).unwrap();
+            v.write(fd, b"logged").unwrap();
+            assert_eq!(v.read(reader, 6).unwrap(), b"logged");
+            v.close(fd).unwrap();
+        }
+    }
+    #[test]
     fn fd_magic_links_keep_deleted_inodes_and_pipe_identity() {
         let mut v = Vfs::default();
         v.import_file(b"/data", b"content".to_vec()).unwrap();
@@ -1019,44 +1039,26 @@ impl Vfs {
         if !self.pseudo.borrow().enabled {
             return Ok(None);
         }
-        let link_path = self.resolve_final(dirfd, path, false)?;
-        if let Some(ns) = link_path.mount.as_ref().and_then(|m| m.namespace.clone()) {
-            return Ok(Some(
-                self.namespace_description(ns, link_path.mount.map(OpenMount::Owner)),
-            ));
+        // Use the common walker's normal mount, permission and symlink rules,
+        // stopping at the complete proc endpoint before following display text.
+        // The alias itself can live on overlayfs or tmpfs, such as nginx's
+        // error.log -> /dev/stderr -> /proc/self/fd/2 chain.
+        let actual = self
+            .resolve_entry_policy(dirfd, path, true, false, 0, true)?
+            .0;
+        if actual.mount.as_ref().is_some_and(|m| m.namespace.is_some()) || self.uses_pseudo(&actual)
+        {
+            if let Some(ns) = self.namespace_for_path(&actual)? {
+                return Ok(Some(
+                    self.namespace_description(ns, actual.mount.map(OpenMount::Owner)),
+                ));
+            }
         }
-        if !self.uses_pseudo(&link_path) {
+        if !self.uses_pseudo(&actual) {
             return Ok(None);
-        }
-        let mut actual = link_path;
-        if matches!(
-            actual.as_slice(),
-            b"/dev/stdin" | b"/dev/stdout" | b"/dev/stderr"
-        ) {
-            let fd = if actual == b"/dev/stdin" {
-                0
-            } else if actual == b"/dev/stdout" {
-                1
-            } else {
-                2
-            };
-            actual =
-                self.resolve_final(AT_FDCWD, format!("/proc/self/fd/{fd}").as_bytes(), false)?;
-        }
-        if let Some(ns) = self.namespace_for_path(&actual)? {
-            return Ok(Some(self.namespace_description(ns, None)));
         }
         if let Some(open) = self.proc_fd_description_normalized(&actual)? {
             return Ok(Some(open));
-        }
-        if self
-            .node(&actual)
-            .is_ok_and(|n| matches!(n.borrow().content, Content::Symlink(_)))
-        {
-            let resolved = self.resolve_final(dirfd, path, true)?;
-            if let Some(ns) = self.namespace_for_path(&resolved)? {
-                return Ok(Some(self.namespace_description(ns, None)));
-            }
         }
         let Some((node, label, mount)) = self.proc_exe_node_normalized(&actual)? else {
             return Ok(None);
@@ -1104,7 +1106,10 @@ impl Vfs {
             mount: mount.map(OpenMount::Owner),
         })))
     }
-    fn proc_fd_description_normalized(&self, actual: &ResolvedPath) -> Result<Option<OpenHandle>> {
+    pub(super) fn proc_fd_description_normalized(
+        &self,
+        actual: &ResolvedPath,
+    ) -> Result<Option<OpenHandle>> {
         let Some(rest) = actual.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
@@ -1171,7 +1176,10 @@ impl Vfs {
         }
         self.proc_exe_node_normalized(path)
     }
-    fn proc_exe_node_normalized(&self, path: &ResolvedPath) -> Result<Option<ResolvedInode>> {
+    pub(super) fn proc_exe_node_normalized(
+        &self,
+        path: &ResolvedPath,
+    ) -> Result<Option<ResolvedInode>> {
         let Some(rest) = path.strip_prefix(b"/proc/") else {
             return Ok(None);
         };
@@ -1460,7 +1468,13 @@ impl Vfs {
         let content = self.pseudo_content(at)?;
         if let Some((content, mode)) = content {
             let node = self.pseudo.borrow_mut().cache(
-                if path.starts_with(b"/proc") && self.proc_namespace(at).is_nested() {
+                if path.starts_with(b"/proc")
+                    && self.proc_namespace(at).is_nested()
+                    // The rootfs mountpoint placeholder is shared by every
+                    // PID namespace. Changing its inode would lose its mount
+                    // target marker before entering the actual proc mount.
+                    && !at.mount().is_some_and(|m| m.kind == mounts::Kind::Root)
+                {
                     self.proc_namespace(at).id()
                 } else {
                     0

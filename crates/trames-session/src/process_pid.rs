@@ -29,6 +29,7 @@ impl<C: Cpu> Kernel<C> {
                         code: 0,
                         timer: None,
                         fault: None,
+                        poll: None,
                     },
                 );
             }
@@ -204,6 +205,7 @@ impl<C: Cpu> Kernel<C> {
                         code,
                         timer: None,
                         fault: None,
+                        poll: None,
                     },
                 );
                 out[20..24].copy_from_slice(&uid.to_le_bytes());

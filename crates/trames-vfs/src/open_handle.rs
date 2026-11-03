@@ -121,6 +121,14 @@ impl OpenDescription {
     /// Metadata-only admission for remaining owner controls. The weak lease
     /// cannot extend last-close life or publish a complete shared OFD.
     pub(super) fn query_metadata(&self) -> Option<std::sync::Weak<SharedOpenDescription>> {
+        if matches!(
+            self.namespace_resource,
+            Some(linux_namespace::SharedNamespace::Net(_))
+        ) {
+            // A bound nsfs open retains owner mount control, but network
+            // identity lookup needs only this immutable shared capability.
+            return Some(Arc::downgrade(&self.shared));
+        }
         let node = self.node.as_ref()?.borrow();
         if node.volatile
             || node.seals.is_some()

@@ -595,6 +595,7 @@ impl DirectSyscalls {
                 }))
             }
             None => IoAttempt::Blocked(PendingIo {
+                aio: None,
                 number,
                 args,
                 deadline: None,
@@ -631,7 +632,7 @@ impl DirectSyscalls {
     }
 }
 
-fn import(
+pub(super) fn import(
     number: u32,
     a: [u64; 6],
     memory: &impl CpuMemory,

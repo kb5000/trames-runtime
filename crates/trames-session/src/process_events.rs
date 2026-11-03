@@ -247,6 +247,7 @@ impl<C: Cpu> Kernel<C> {
                     status: 0,
                     code: if id < 0 { 128 } else { -2 },
                     fault: None,
+                    poll: None,
                     timer: if id < 0 {
                         None
                     } else {

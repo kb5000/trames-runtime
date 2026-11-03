@@ -6,6 +6,9 @@ use super::*;
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
+    pub fn status_flags(&self) -> u32 {
+        self.0.open.flags.get()
+    }
     pub fn identity(&self) -> usize {
         self.0.identity()
     }

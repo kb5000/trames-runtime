@@ -3,6 +3,7 @@
 pub mod packages;
 pub mod rootfs;
 pub mod systemd;
+pub mod terminals;
 mod timezone;
 mod vulkan;
 mod xwayland;

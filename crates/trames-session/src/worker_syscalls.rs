@@ -11,6 +11,9 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub io_signals: Arc<trames_kernel::signal::IoTask>,
+    pub io_routes: trames_kernel::signal::IoRoutes,
+    pub io_wake: Option<Arc<trames_vfs::IoSignal>>,
     pub seccomp: crate::process::seccomp::Seccomp,
     /// getpid, getppid, getuid, geteuid, getgid, getegid, gettid.
     pub identities: [u64; 7],
@@ -252,6 +255,73 @@ pub(super) fn futex_queue(
 }
 
 impl Snapshot {
+    pub fn next_io_signal(&self) -> Option<(u32, bool)> {
+        self.io_signals.next(!self.io_signals.mask())
+    }
+    pub fn io_frame(&self) -> trames_kernel::signal::FrameState {
+        let context = *self.io_signals.context.lock().unwrap();
+        trames_kernel::signal::FrameState {
+            actions: self.actions.shared(),
+            mask: context.mask,
+            frames: context.frames,
+            alt_stack: context.alt_stack,
+        }
+    }
+    fn commit_io_frame(&self, frame: trames_kernel::signal::FrameState) {
+        self.io_signals.publish_mask(frame.mask);
+        *self.io_signals.context.lock().unwrap() = trames_kernel::signal::IoContext {
+            mask: frame.mask,
+            frames: frame.frames,
+            alt_stack: frame.alt_stack,
+        };
+    }
+    pub fn enter_io_signal<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        memory: &mut impl CpuMemory,
+        sig: u32,
+        info: trames_kernel::signal::Info,
+        action: trames_kernel::signal::Action,
+    ) -> Result<(), Errno> {
+        let mut frame = self.io_frame();
+        let mut state = cpu.architectural_state();
+        let sme = cpu
+            .sme_config()
+            .map(|c| (c, cpu.sme_state(), C::features().hwcap2 & (1 << 37) != 0));
+        frame.enter_sme(&mut state, memory, sig, info, action, sme)?;
+        let has_sme = sme.is_some();
+        cpu.restore_architectural_state(&state);
+        if has_sme {
+            cpu.set_sme_state(None);
+        }
+        self.commit_io_frame(frame);
+        Ok(())
+    }
+    pub fn return_io_signal<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        memory: &impl CpuMemory,
+    ) -> Result<(), Errno> {
+        let mut frame = self.io_frame();
+        let mut state = cpu.architectural_state();
+        let registers = if let Some(config) = cpu.sme_config() {
+            Some(frame.restore_sme(
+                &mut state,
+                memory,
+                config,
+                C::features().hwcap2 & (1 << 37) != 0,
+            )?)
+        } else {
+            frame.restore(&mut state, memory)?;
+            None
+        };
+        cpu.restore_architectural_state(&state);
+        if let Some(registers) = registers {
+            cpu.set_sme_state(registers);
+        }
+        self.commit_io_frame(frame);
+        Ok(())
+    }
     fn futex_wait<C: Cpu>(&self, cpu: &C) -> bool {
         cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 0 | 9)
     }
@@ -331,8 +401,8 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 166 | 168 | 172..=178
-        ) && !(cpu.x(8) as u32 == 29 && cpu.x(1) as u32 == 0x5421)
+            25 | 101 | 113..=115 | 124 | 139 | 166 | 168 | 172..=178
+        ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
             && !(cpu.x(8) as u32 == 134 && cpu.x(1) == 0)
@@ -381,6 +451,27 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            25 if matches!(cpu.x(1), 8..=11 | 15 | 16) => {
+                self.direct.record_fd_control();
+                self.fd_flags.async_control(
+                    cpu.x(0) as u32,
+                    cpu.x(1) as u32,
+                    cpu.x(2),
+                    memory,
+                    &self.io_routes,
+                )
+            }
+            29 if cpu.x(1) as u32 == 0x5452 => {
+                self.direct.record_fd_control();
+                let value = memory.read_array::<4>(cpu.x(2)).map_err(|_| Errno(14));
+                value.and_then(|v| {
+                    self.fd_flags.set_async(
+                        &self.direct.descriptors(),
+                        cpu.x(0) as u32,
+                        u32::from_le_bytes(v) != 0,
+                    )
+                })
+            }
             number @ (19 | 26 | 59 | 74 | 85 | 198 | 199) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
@@ -419,7 +510,15 @@ impl Snapshot {
                 if cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
                     return None;
                 }
-                let result = self.fd_flags.fcntl(cpu.x(0) as u32, cpu.x(1), cpu.x(2));
+                let result = if cpu.x(1) == 4 {
+                    self.fd_flags.set_status(
+                        &self.direct.descriptors(),
+                        cpu.x(0) as u32,
+                        cpu.x(2) as u32,
+                    )
+                } else {
+                    self.fd_flags.fcntl(cpu.x(0) as u32, cpu.x(1), cpu.x(2))
+                };
                 self.direct.record_fd_control();
                 result
             }
@@ -574,6 +673,9 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [0; 7],
             started: Instant::now(),
@@ -695,6 +797,9 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [0; 7],
             started: Instant::now(),
@@ -746,6 +851,9 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [0; 7],
             started: Instant::now(),
@@ -841,6 +949,9 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [0; 7],
             started: Instant::now(),
@@ -900,6 +1011,9 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: Default::default(),
             identities: [1, 0, 1000, 1001, 2000, 2001, 2],
             started: Instant::now(),

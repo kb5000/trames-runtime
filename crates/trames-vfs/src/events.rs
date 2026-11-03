@@ -445,12 +445,12 @@ impl Vfs {
                 }
             }
         }
-        if !matches!(op, 1..=3) {
-            return Err(Errno(22));
-        }
-        if op != 2 && events & !0xc000201f != 0 {
-            return Err(Errno(95));
-        }
+        epoll::validate(
+            op,
+            events,
+            watches.get(&key).map(|w| w.state.lock().unwrap().events),
+            matches!(target.borrow().anonymous, Some(Anonymous::Epoll { .. })),
+        )?;
         let result = match op {
             1 if watches.contains_key(&key) => Err(Errno(17)),
             2 | 3 if !watches.contains_key(&key) => Err(Errno(2)),
@@ -714,7 +714,7 @@ mod tests {
         let mut v = Vfs::default();
         let fd = v.eventfd(1, 0).unwrap();
         let ep = v.epoll_create(O_CLOEXEC).unwrap();
-        assert_eq!(v.epoll_ctl(ep, 1, fd, 0x10000001, 42), Err(Errno(95)));
+        assert_eq!(v.epoll_ctl(ep, 1, fd, 0x08000001, 42), Err(Errno(95)));
         assert_eq!(v.epoll_ctl(ep, 1, ep, 1, 42), Err(Errno(22)));
         assert_eq!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(), vec![]);
         v.epoll_ctl(ep, 1, fd, 1, 42).unwrap();

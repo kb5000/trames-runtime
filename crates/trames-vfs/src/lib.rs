@@ -13,8 +13,10 @@ mod hostfs;
 use fs_context::FsContext;
 pub use fs_context::Umask;
 use fs_data::{FsBorrow, FsHandle};
+mod async_io;
 mod credentials;
 mod fd_status;
+pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
 pub use pipe::PipeEndpoint;
@@ -1491,7 +1493,7 @@ impl Vfs {
         follow_final: bool,
         retain_magic: bool,
     ) -> Result<ResolvedEntry> {
-        self.resolve_entry_policy(dirfd, path, follow_final, retain_magic, 0)
+        self.resolve_entry_policy(dirfd, path, follow_final, retain_magic, 0, false)
     }
     fn resolve_entry_policy(
         &self,
@@ -1500,6 +1502,7 @@ impl Vfs {
         follow_final: bool,
         retain_magic: bool,
         policy: u64,
+        stop_magic: bool,
     ) -> Result<ResolvedEntry> {
         if path.is_empty() {
             return Err(Errno(2));
@@ -1588,6 +1591,17 @@ impl Vfs {
                     if policy & 1 != 0 {
                         return Err(Errno(18));
                     }
+                    return Ok((current, None));
+                }
+                if stop_magic
+                    && parts.is_empty()
+                    && !trailing
+                    && self.uses_pseudo(&current)
+                    && (self.proc_fd_description_normalized(&current)?.is_some()
+                        || self.proc_exe_node_normalized(&current)?.is_some())
+                {
+                    // Reopening/stat of an anonymous FD retains its full OFD,
+                    // even when no inode can represent it (pipes, sockets).
                     return Ok((current, None));
                 }
                 if self.uses_pseudo(&current) && (retain_magic || !parts.is_empty()) {
@@ -2058,7 +2072,7 @@ impl Vfs {
             while plain.len() > 1 && plain.last() == Some(&b'/') {
                 plain = &plain[..plain.len() - 1];
             }
-            self.resolve_entry_policy(dirfd, plain, true, false, policy)?;
+            self.resolve_entry_policy(dirfd, plain, true, false, policy, false)?;
             return Err(Errno(21));
         }
         if policy == 0 {
@@ -2077,6 +2091,7 @@ impl Vfs {
             flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0,
             policy != 0,
             policy,
+            false,
         )?;
         // Only NO_XDEV alone can follow a final magic link. Validate the entire
         // traversal first; syscall execution serializes namespace mutations.
@@ -2527,6 +2542,10 @@ impl Vfs {
         Ok(())
     }
     pub fn set_status_flags(&mut self, fd: u32, flags: u32) -> Result<()> {
+        self.check_status_flags(fd, flags)?;
+        self.descriptor(fd)?.open.borrow().flags.set(flags)
+    }
+    pub fn check_status_flags(&self, fd: u32, flags: u32) -> Result<()> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
         if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
@@ -2537,7 +2556,7 @@ impl Vfs {
                 return Err(Errno(1));
             }
         }
-        open.flags.set(flags)
+        fd_status::StatusFlags::validate(flags)
     }
     pub fn set_nonblocking(&self, fd: u32, enabled: bool) -> Result<()> {
         self.descriptor(fd)?

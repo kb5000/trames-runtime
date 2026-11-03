@@ -42,29 +42,61 @@ pub(super) fn mark_cloexec_range<'a>(
 #[derive(Clone)]
 pub(super) struct StatusFlags {
     fixed: u32,
-    mutable: Arc<AtomicU32>,
+    mutable: Arc<MutableStatus>,
 }
-const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME;
+struct MutableStatus {
+    bits: AtomicU32,
+    update: std::sync::Mutex<()>,
+    asynchronous: std::sync::OnceLock<Arc<async_io::AsyncState>>,
+}
+const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000;
 impl From<u32> for StatusFlags {
     fn from(flags: u32) -> Self {
         Self {
             fixed: flags & !CHANGEABLE,
-            mutable: Arc::new(AtomicU32::new(flags & CHANGEABLE)),
+            mutable: Arc::new(MutableStatus {
+                bits: AtomicU32::new(flags & CHANGEABLE),
+                update: Default::default(),
+                asynchronous: Default::default(),
+            }),
         }
     }
 }
 impl StatusFlags {
     pub(super) fn get(&self) -> u32 {
-        self.fixed | self.mutable.load(Ordering::Relaxed)
+        self.fixed | self.mutable.bits.load(Ordering::Relaxed)
+    }
+    pub(super) fn async_state(&self) -> Arc<async_io::AsyncState> {
+        self.mutable.asynchronous.get_or_init(Arc::default).clone()
+    }
+    pub(super) fn set_async(&self, enabled: bool) {
+        if enabled {
+            self.mutable.bits.fetch_or(0x2000, Ordering::Relaxed);
+        } else {
+            self.mutable.bits.fetch_and(!0x2000, Ordering::Relaxed);
+        }
     }
     pub(super) fn set(&self, flags: u32) -> Result<()> {
+        let _update = self.lock_update();
+        self.store_locked(flags)
+    }
+    pub(super) fn lock_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutable.update.lock().unwrap()
+    }
+    pub(super) fn store_locked(&self, flags: u32) -> Result<()> {
+        Self::validate(flags)?;
+        self.mutable
+            .bits
+            .store(flags & CHANGEABLE, Ordering::Relaxed);
+        Ok(())
+    }
+    pub(super) fn validate(flags: u32) -> Result<()> {
         if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | 0x101000) != 0 {
             return Err(Errno(22));
         }
         // Immutable authority is stored separately. Replacing the complete
         // mutable word needs one store, not a CAS loop or a resource lock.
         // This flag word publishes no guest bytes or descriptor membership.
-        self.mutable.store(flags & CHANGEABLE, Ordering::Relaxed);
         Ok(())
     }
     pub(super) fn nonblocking(&self, enabled: bool) -> Result<()> {
@@ -72,9 +104,9 @@ impl StatusFlags {
             return Err(Errno(9));
         }
         if enabled {
-            self.mutable.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+            self.mutable.bits.fetch_or(O_NONBLOCK, Ordering::Relaxed);
         } else {
-            self.mutable.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
+            self.mutable.bits.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -86,7 +118,7 @@ pub(super) struct DescriptorFlags {
     pub(super) cloexec: CloseOnExec,
 }
 impl FdFlags {
-    fn with_flags<T>(
+    pub(super) fn with_flags<T>(
         &self,
         fd: u32,
         access: impl Fn(&StatusFlags, &CloseOnExec) -> Result<T>,
@@ -286,7 +318,7 @@ mod tests {
         let [reader, _] = v.pipe(0).unwrap();
         let path = v.open_at(AT_FDCWD, b"/", O_PATH, 0).unwrap();
         let flags = v.fd_flags_snapshot();
-        assert_eq!(flags.fcntl(reader, 4, 0x2000), Err(Errno(22)));
+        assert_eq!(flags.fcntl(reader, 4, 0x80000000), Err(Errno(22)));
         assert_eq!(flags.fcntl(path, 4, O_NONBLOCK as u64), Err(Errno(9)));
         assert_eq!(flags.set_nonblocking(path, true), Err(Errno(9)));
         assert_eq!(flags.fcntl(u32::MAX, 4, 0), Err(Errno(9)));

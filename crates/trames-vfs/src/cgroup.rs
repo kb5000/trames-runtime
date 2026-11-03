@@ -287,6 +287,9 @@ impl Vfs {
         }
         let id = self.bpf_group(target)?;
         let program = self.bpf_program(program)?;
+        if program.kind != 15 {
+            return Err(Errno(22));
+        }
         let replace = if flags & 4 != 0 {
             Some(self.bpf_program(replace)?)
         } else {

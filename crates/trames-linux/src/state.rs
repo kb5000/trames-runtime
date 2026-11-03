@@ -21,6 +21,7 @@ pub(crate) struct VectorImport {
 const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 
 pub struct Linux {
+    pub aio: crate::Aio,
     pub(crate) batch_pipe_signal: bool,
     pub(crate) file_executor: Option<std::sync::Arc<dyn crate::FileExecutor>>,
     pub(crate) uring_clock: std::time::Instant,
@@ -59,6 +60,11 @@ impl Linux {
         shared_vm: bool,
     ) -> Self {
         Self {
+            aio: if shared_vm {
+                self.aio.clone()
+            } else {
+                self.aio.fork()
+            },
             batch_pipe_signal: false,
             uring_clock: self.uring_clock,
             boot_clock: self.boot_clock,
@@ -105,6 +111,7 @@ impl Linux {
     }
     pub fn new(brk_base: u64) -> Self {
         Self {
+            aio: Default::default(),
             batch_pipe_signal: false,
             uring_clock: std::time::Instant::now(),
             boot_clock: Default::default(),

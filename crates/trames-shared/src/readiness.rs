@@ -16,6 +16,12 @@ pub struct IoSignal {
     pub pid: u32,
     fired: AtomicBool,
     target: Weak<dyn IoWake>,
+    exclusive: Option<Box<ExclusiveWake>>,
+}
+struct ExclusiveWake {
+    key: u64,
+    parent: Weak<IoSignal>,
+    ready: Box<dyn Fn() -> bool + Send + Sync>,
 }
 impl IoSignal {
     pub fn new(pid: u32, target: Weak<dyn IoWake>) -> Arc<Self> {
@@ -23,7 +29,30 @@ impl IoSignal {
             pid,
             fired: AtomicBool::new(false),
             target,
+            exclusive: None,
         })
+    }
+    /// A wait-scoped exclusive interest. The predicate checks the original
+    /// resource after its mutation lock has been released. Weak ownership must
+    /// not keep an epoll target or a sleeping task alive after last close.
+    pub fn exclusive(
+        parent: &Arc<Self>,
+        key: u64,
+        ready: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            pid: parent.pid,
+            fired: AtomicBool::new(false),
+            target: parent.target.clone(),
+            exclusive: Some(Box::new(ExclusiveWake {
+                key,
+                parent: Arc::downgrade(parent),
+                ready: Box::new(ready),
+            })),
+        })
+    }
+    pub(crate) fn exclusive_key(&self) -> Option<u64> {
+        self.exclusive.as_ref().map(|w| w.key)
     }
     pub fn ready(&self) -> bool {
         self.fired.load(Ordering::Relaxed)
@@ -35,13 +64,36 @@ impl IoSignal {
         // both the notification and the counter update on ARM.
         self.fired.swap(false, Ordering::Acquire);
     }
-    pub(crate) fn fire(self: &Arc<Self>) {
+    pub fn notify(self: &Arc<Self>) {
+        self.fire();
+    }
+    pub(crate) fn fire(self: &Arc<Self>) -> bool {
+        if let Some(wake) = &self.exclusive {
+            return (wake.ready)() && wake.parent.upgrade().is_some_and(|p| p.fire());
+        }
         if !self.fired.swap(true, Ordering::Release) {
             if let Some(target) = self.target.upgrade() {
                 target.wake_io(self);
+                return true;
             }
         }
+        false
     }
+}
+/// Wake ordinary listeners and one eligible exclusive listener per original
+/// open description. Already-woken tasks do not consume another wakeup.
+pub(crate) fn notify(signals: &[Arc<IoSignal>]) -> std::collections::BTreeSet<u64> {
+    let mut selected = std::collections::BTreeSet::new();
+    for signal in signals {
+        if let Some(key) = signal.exclusive_key() {
+            if !selected.contains(&key) && signal.fire() {
+                selected.insert(key);
+            }
+        } else {
+            signal.fire();
+        }
+    }
+    selected
 }
 #[derive(Default)]
 pub struct Readiness {
@@ -122,6 +174,7 @@ pub struct IoSubscription {
     host_failed: bool,
     external: bool,
     dynamic: Option<Box<DynamicHost>>,
+    retained_signal: Option<Arc<IoSignal>>,
 }
 impl Readiness {
     pub fn set_driver(&self, driver: Weak<dyn ReadinessDriver>) {
@@ -164,6 +217,7 @@ impl Readiness {
             host_failed,
             external: false,
             dynamic: None,
+            retained_signal: None,
         }
     }
     pub fn notify_atomic(&self) {
@@ -187,12 +241,14 @@ impl Readiness {
             .filter_map(Weak::upgrade)
             .collect();
         // Never enter the scheduler holding a resource or subscription lock.
-        for signal in signals {
-            signal.fire();
-        }
+        notify(&signals);
     }
 }
 impl IoSubscription {
+    pub fn retain_signal(mut self, signal: Arc<IoSignal>) -> Self {
+        self.retained_signal = Some(signal);
+        self
+    }
     /// Register a native event queue directly, without inventing a guest
     /// readiness resource or a shared listener lock. The queue owns no watched
     /// socket; closing the guest socket is independent of this subscription.
@@ -205,6 +261,7 @@ impl IoSubscription {
             host_failed: false,
             external: true,
             dynamic: None,
+            retained_signal: None,
         };
         match fd {
             Ok(fd) => subscription.with_host(fd, signal),

@@ -58,6 +58,7 @@ impl WaitState {
 }
 #[derive(Clone)]
 pub(super) struct IoCall {
+    pub aio: Option<trames_linux::RetainedAio>,
     pub number: u32,
     pub args: [u64; 6],
     pub flock: Option<trames_vfs::FlockRequest>,
@@ -87,6 +88,7 @@ impl IoCall {
             uring: None,
             file: None,
             file_checkpoint: Some(file),
+            aio: None,
             deadline: None,
         }
     }
@@ -105,6 +107,7 @@ impl IoCall {
             uring: None,
             file: None,
             file_checkpoint: None,
+            aio: None,
         }
     }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
@@ -120,6 +123,7 @@ impl IoCall {
             uring: None,
             file: None,
             file_checkpoint: None,
+            aio: None,
         }
     }
 }
@@ -136,6 +140,7 @@ impl From<&trames_linux::PendingIo> for IoCall {
             uring: io.uring_enter(),
             file: io.file_pending(),
             file_checkpoint: None,
+            aio: io.aio.clone(),
             deadline: io.deadline,
         }
     }
@@ -243,7 +248,20 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
-        self.uring.as_ref().is_some_and(|ring| {
+        self.work.syscalls.as_ref().is_some_and(|s| {
+            s.next_io_signal().is_some_and(|(sig, _)| {
+                s.actions.get(sig as usize).handler <= 1
+                    || !(self.gpu_pending.is_some()
+                        || self
+                            .retry
+                            .as_ref()
+                            .is_some_and(|call| call.file.is_some() || call.number == 2)
+                        || self
+                            .io
+                            .as_ref()
+                            .is_some_and(|io| io.file_pending().is_some() || io.number == 2))
+            })
+        }) || self.uring.as_ref().is_some_and(|ring| {
             ring.signal.ready() || ring.deadline().is_some_and(|d| d <= Instant::now())
         })
     }
@@ -502,7 +520,10 @@ impl<C: Cpu> Epoch<C> {
     /// Only before launch: every View is prepared/admitted before any CPU runs.
     pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
         let pid = job.work.pid;
-        if let Some(snapshot) = &job.work.syscalls {
+        if let Some(snapshot) = &mut job.work.syscalls {
+            let signal = trames_vfs::IoSignal::new(pid, self.io_target.clone());
+            snapshot.io_signals.set_wake(&signal);
+            snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
         let mut q = self.queues.lock().unwrap();
@@ -513,7 +534,7 @@ impl<C: Cpu> Epoch<C> {
             if waiting.woken() {
                 job.work.cpu.set_x(0, 0);
                 job.waiting = None;
-            } else if job.uring.is_none() {
+            } else if job.uring.is_none() && !job.ring_ready() {
                 self.publish_deadline(waiting.deadline());
                 q.parked.insert(pid, job);
                 return;
@@ -1019,9 +1040,15 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             return;
         }
         if q.parked.get(&signal.pid).is_some_and(|job| {
-            job.io
+            job.work
+                .syscalls
                 .as_ref()
-                .is_some_and(|io| Arc::ptr_eq(&io.signal, signal))
+                .and_then(|s| s.io_wake.as_ref())
+                .is_some_and(|s| Arc::ptr_eq(s, signal))
+                || job
+                    .io
+                    .as_ref()
+                    .is_some_and(|io| Arc::ptr_eq(&io.signal, signal))
                 || job
                     .gpu_pending
                     .as_ref()

@@ -29,8 +29,10 @@ impl Linux {
             5 => {
                 // BPF_PROG_LOAD
                 tail(72)?;
-                if u32_at(0) != 15 || !matches!(u32_at(68), 0 | 6) {
-                    return Err(Errno(95));
+                if !matches!(u32_at(0), 8 | 15)
+                    || !matches!((u32_at(0), u32_at(68)), (15, 0 | 6) | (8, 0 | 1))
+                {
+                    return Err(Errno(22));
                 }
                 if u32_at(40) != 0 || u32_at(44) != 0 || u32_at(64) != 0 || u32_at(24) & !7 != 0 {
                     return Err(Errno(22));
@@ -67,7 +69,7 @@ impl Linux {
                 if log_size > 0 {
                     Self::check(memory, u64_at(32), log_size, Access::Write)?;
                 }
-                let result = self.vfs.bpf_load_device(&code);
+                let result = self.vfs.bpf_load_program(u32_at(0), &code);
                 if log_size > 0 {
                     let mut bytes = if result.is_ok() {
                         vec![0]
@@ -86,9 +88,8 @@ impl Linux {
                     return Err(Errno(95));
                 }
                 if command == 8 {
-                    if u32_at(12) & 4 == 0 && u32_at(16) != 0 {
-                        return Err(Errno(22));
-                    }
+                    // Linux ignores replace_bpf_fd without BPF_F_REPLACE.
+                    // Older cilium/runc passes -1 in this unused field.
                     self.vfs
                         .bpf_attach_device(u32_at(0), u32_at(4), u32_at(12), u32_at(16))?;
                 } else {
@@ -103,6 +104,47 @@ impl Linux {
                 // BPF_PROG_GET_FD_BY_ID
                 tail(4)?;
                 self.vfs.bpf_get_fd(u32_at(0)).map(u64::from)
+            }
+            15 => {
+                // BPF_OBJ_GET_INFO_BY_FD. Advertise only the implemented type/ID
+                // prefix; do not fabricate tags, JIT state or execution stats.
+                tail(16)?;
+                let info = self.vfs.bpf_program_identity(u32_at(0)).map_err(|e| {
+                    if e.0 == 9 {
+                        Errno(77)
+                    } else {
+                        e
+                    }
+                })?;
+                let length = u32_at(4) as usize;
+                if length > 4096 {
+                    return Err(Errno(7));
+                }
+                let count = length.min(info.len());
+                if length > info.len() {
+                    Self::check(
+                        memory,
+                        u64_at(8).checked_add(8).ok_or(Errno(14))?,
+                        length - 8,
+                        Access::Read,
+                    )?;
+                    let mut extra = vec![0; length - 8];
+                    memory
+                        .read(u64_at(8).checked_add(8).ok_or(Errno(14))?, &mut extra)
+                        .map_err(|_| Errno(14))?;
+                    if extra.iter().any(|b| *b != 0) {
+                        return Err(Errno(7));
+                    }
+                }
+                Self::check(memory, u64_at(8), count, Access::Write)?;
+                Self::check(memory, a[1] + 4, 4, Access::Write)?;
+                memory
+                    .write(u64_at(8), &info[..count])
+                    .map_err(|_| Errno(14))?;
+                memory
+                    .write(a[1] + 4, &(count as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                Ok(0)
             }
             16 => {
                 // BPF_PROG_QUERY
@@ -136,7 +178,10 @@ impl Linux {
                     Ok(0)
                 }
             }
-            _ => Err(Errno(95)),
+            // Unknown commands (including unsupported BTF operations) follow
+            // Linux's EINVAL feature-probe contract; EOPNOTSUPP makes libbpf
+            // and cilium treat the probe itself as an unexpected failure.
+            _ => Err(Errno(22)),
         }
     }
 }

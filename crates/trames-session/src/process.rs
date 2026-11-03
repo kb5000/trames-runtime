@@ -95,6 +95,7 @@ pub(crate) struct Process<C: Cpu> {
     poll_mask: Option<u64>,
     uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
     retained_file: Option<trames_linux::FilePending>,
+    retained_aio: Option<trames_linux::RetainedAio>,
     file_checkpoint: Option<trames_linux::FileCheckpoint>,
     file_entry: Option<(u64, u32, [u64; 6])>,
     file_pauses: u32,
@@ -259,8 +260,10 @@ impl<C: Cpu> Process<C> {
                 return true;
             }
         }
-        let State::Blocked(number @ (22 | 63..=66 | 73 | 206 | 207 | 211 | 212 | 441), args) =
-            self.state
+        let State::Blocked(
+            number @ (0..=4 | 22 | 63..=66 | 73 | 206 | 207 | 211 | 212 | 292 | 441),
+            args,
+        ) = self.state
         else {
             return false;
         };
@@ -270,6 +273,7 @@ impl<C: Cpu> Process<C> {
         // Most retained waits are poll/epoll, pipes or Unix sockets. Their
         // eligibility never depends on scanning every native TCP socket.
         trames_linux::DirectSyscalls::new(self.linux.vfs.direct_descriptors())
+            .with_aio(self.linux.aio.clone(), self.linux.vfs.native_events())
             .supports_call(number, args)
             || matches!(number, 63..=66) && self.linux.vfs.direct_tcp_fd(args[0] as u32).is_some()
     }
@@ -386,6 +390,7 @@ impl<C: Cpu> Process<C> {
             poll_mask: None,
             uring_wait: None,
             retained_file: None,
+            retained_aio: None,
             file_checkpoint: None,
             file_entry: None,
             file_pauses: 0,
@@ -574,6 +579,27 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
     Err(Errno(7))
 }
 impl<C: Cpu> Kernel<C> {
+    fn publish_io_tasks(&self, current: Option<(u32, &Process<C>)>) {
+        fn publish<C: Cpu>(id: u32, p: &Process<C>) {
+            if matches!(p.state, State::Zombie(_)) {
+                return;
+            }
+            p.signals.io_directory.publish(
+                &p.signals.io,
+                id,
+                p.tgid,
+                p.group,
+                p.linux.vfs.credentials.uid,
+                p.linux.vfs.credentials.suid,
+            );
+        }
+        for (&id, p) in &self.processes {
+            publish(id, p);
+        }
+        if let Some((id, p)) = current {
+            publish(id, p);
+        }
+    }
     fn native_call(
         &mut self,
         p: &mut Process<C>,
@@ -1109,6 +1135,7 @@ impl<C: Cpu> Kernel<C> {
                     code,
                     timer: None,
                     fault: None,
+                    poll: None,
                 },
             );
         }
@@ -1250,6 +1277,8 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        p.signals.io.exit();
+
         let members: Vec<_> = self
             .processes
             .iter()
@@ -1313,6 +1342,7 @@ impl<C: Cpu> Kernel<C> {
                     code: 0,
                     timer: None,
                     fault: None,
+                    poll: None,
                 },
             );
         }
@@ -1393,6 +1423,7 @@ impl<C: Cpu> Kernel<C> {
                     code: -6,
                     timer: None,
                     fault: None,
+                    poll: None,
                 },
             )?;
         }
@@ -1470,6 +1501,7 @@ impl<C: Cpu> Kernel<C> {
                         code: 0,
                         timer: None,
                         fault: None,
+                        poll: None,
                     },
                 )?;
                 queued.push(other.tgid);
@@ -1538,7 +1570,10 @@ impl<C: Cpu> Kernel<C> {
         // Submitted regular-file work is not restarted from a guest pointer.
         // Caught signals wait for its accepted result/copyout, like ordinary
         // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
-        if action.handler > 1 && p.file_entry.is_some() && matches!(p.state, State::Blocked(..)) {
+        if action.handler > 1
+            && (p.file_entry.is_some() || matches!(p.state, State::Blocked(2, _)))
+            && matches!(p.state, State::Blocked(..))
+        {
             return Ok(false);
         }
         let info = p.take_signal(sig, shared);
@@ -1594,6 +1629,7 @@ impl<C: Cpu> Kernel<C> {
                 p.record_wait = None;
                 p.byte_wait = None;
                 p.retained_file = None;
+                p.retained_aio = None;
                 p.file_checkpoint = None;
                 p.file_entry = None;
                 p.retained_socket = None;
@@ -1941,6 +1977,32 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
         match number {
+            25 | 29
+                if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
+                    || number == 29 && a[1] as u32 == 0x5452 =>
+            {
+                if number == 25 && matches!(a[1], 8 | 15) {
+                    self.publish_io_tasks(Some((pid, p)));
+                }
+                let flags = p.linux.vfs.fd_flags_snapshot();
+                let fds = p.linux.vfs.direct_descriptors();
+                let routes = trames_kernel::signal::IoRoutes {
+                    directory: p.signals.io_directory.clone(),
+                    namespace: p.linux.vfs.pid_namespace().clone(),
+                    uid: p.linux.vfs.credentials.uid,
+                    euid: p.linux.vfs.credentials.euid,
+                };
+                let value = if number == 29 {
+                    let b = p.memory.read_array::<4>(a[2]).map_err(|_| Errno(14))?;
+                    flags.set_async(&fds, a[0] as u32, u32::from_le_bytes(b) != 0)
+                } else if a[1] == 4 {
+                    p.linux.vfs.check_status_flags(a[0] as u32, a[2] as u32)?;
+                    flags.set_status(&fds, a[0] as u32, a[2] as u32)
+                } else {
+                    flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
+                };
+                value.map(Some)
+            }
             // The joined path uses the same bounded scratch as an existing
             // service call. Keep capacity across syscalls instead of allocating
             // and zeroing a new transfer buffer for every positioned write.
@@ -2358,6 +2420,7 @@ impl<C: Cpu> Kernel<C> {
                 if threaded {
                     child.oom = Arc::new(p.oom.thread());
                     child.signals.shared_pending = p.signals.shared_pending.clone();
+                    child.signals.io.share_process(&p.signals.io);
                     child.subreaper = p.subreaper;
                     child.file_size_limit = p.file_size_limit.clone();
                     child.core_limit = p.core_limit.clone();
@@ -3023,6 +3086,31 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 ),
             )
+        } else if trames_linux::DirectSyscalls::aio_call(number) {
+            let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                .with_task_signal(p.signals.io.clone())
+                .with_paths(p.linux.vfs.path_queries())
+                .with_file_executor(self.workers.file_executor());
+            if let Some(wait) = p.byte_wait.take() {
+                Some(direct.resume(wait, &mut p.memory))
+            } else if let Some(call) = p.retained_aio.take() {
+                Some(direct.start_retained_aio(
+                    call,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ))
+            } else {
+                direct.start(
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                    None,
+                )
+            }
         } else if !p.linux.trace && matches!(number, 200 | 202 | 203 | 242) {
             trames_linux::DirectSyscalls::default()
                 .with_resources(p.linux.vfs.descriptor_factory())
@@ -4288,6 +4376,7 @@ impl<C: Cpu> Kernel<C> {
             self.workers.events(),
             persistent,
         );
+        self.publish_io_tasks(None);
         let mut file_epoch = trames_vfs::FileEpoch::default();
         let mut uring_epoch = trames_linux::UringEpoch::default();
         let mut network_epoch = trames_vfs::NetworkEpoch::default();
@@ -4310,6 +4399,7 @@ impl<C: Cpu> Kernel<C> {
                 }
             });
             let p = self.processes.get_mut(&id).expect("cohort process");
+            p.signals.begin_io();
             let waiting = if let State::Futex { wait, deadline } = &p.state {
                 Some(crate::run_queue::WaitState::Futex {
                     wait: wait.clone(),
@@ -4369,9 +4459,19 @@ impl<C: Cpu> Kernel<C> {
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),
                     actions: p.signals.actions.shared(),
+                    io_signals: p.signals.io.clone(),
+                    io_wake: None,
+                    io_routes: trames_kernel::signal::IoRoutes {
+                        directory: p.signals.io_directory.clone(),
+                        namespace: p.linux.vfs.pid_namespace().clone(),
+                        uid: c.uid,
+                        euid: c.euid,
+                    },
                     program_break: p.linux.program_break(),
                     uts: Some(p.linux.vfs.uts_capability()),
                     direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                        .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                        .with_task_signal(p.signals.io.clone())
                         .with_local_identity([
                             p.tgid,
                             p.linux.vfs.credentials.uid,
@@ -4447,10 +4547,15 @@ impl<C: Cpu> Kernel<C> {
                     .as_ref()
                     .and_then(trames_linux::PendingIo::file_pending)
                     .or_else(|| p.retained_file.take());
+                let retained_aio = previous
+                    .as_ref()
+                    .and_then(|wait| wait.aio.clone())
+                    .or_else(|| p.retained_aio.take());
                 let retained_byte = previous
                     .and_then(|wait| wait.retained_byte)
                     .or_else(|| p.retained_byte.take());
                 job.retry = Some(crate::run_queue::IoCall {
+                    aio: retained_aio,
                     file: retained_file,
                     file_checkpoint: p.file_checkpoint.take(),
                     uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {
@@ -4622,6 +4727,7 @@ impl<C: Cpu> Kernel<C> {
                 .get_mut(&done.pid)
                 .expect("dispatched process");
             p.cpu = done.cpu;
+            p.signals.finish_io();
             if let Some(entry) = done.seccomp_entry {
                 p.seccomp_entry = Some(entry);
             }
@@ -4635,6 +4741,7 @@ impl<C: Cpu> Kernel<C> {
             p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
             p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
             p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
+            p.retained_aio = done.io.as_ref().and_then(|call| call.aio.clone());
             p.file_checkpoint = done
                 .io
                 .as_ref()
@@ -5319,6 +5426,7 @@ pub(super) fn run<C: Cpu>(
         poll_mask: None,
         uring_wait: None,
         retained_file: None,
+        retained_aio: None,
         file_checkpoint: None,
         file_entry: None,
         file_pauses: 0,
@@ -5832,6 +5940,7 @@ mod tests {
         p.linux.vfs.flock(b, 6).unwrap();
         let (request, file) = p.linux.vfs.retain_flock(a, 2).unwrap();
         let call = crate::run_queue::IoCall {
+            aio: None,
             file: None,
             file_checkpoint: None,
             uring: None,
@@ -6386,6 +6495,7 @@ mod tests {
         let b = p.linux.vfs.open_at(-100, b"/lock", 2, 0).unwrap();
         let (shared, _) = p.linux.vfs.retain_flock(a, 1).unwrap();
         let mut call = crate::run_queue::IoCall {
+            aio: None,
             file: None,
             file_checkpoint: None,
             uring: None,
@@ -6647,6 +6757,7 @@ mod tests {
             poll_mask: None,
             uring_wait: None,
             retained_file: None,
+            retained_aio: None,
             file_checkpoint: None,
             file_entry: None,
             file_pauses: 0,

@@ -7,13 +7,17 @@ pub struct Info {
     pub code: i32,
     pub timer: Option<(i32, i32, u64)>,
     pub fault: Option<u64>,
+    pub poll: Option<(u64, u32)>,
 }
 
 pub fn write_siginfo(out: &mut [u8], sig: u32, info: Info) {
     out[..128].fill(0);
     out[..4].copy_from_slice(&sig.to_le_bytes());
     out[8..12].copy_from_slice(&info.code.to_le_bytes());
-    if let Some(address) = info.fault {
+    if let Some((band, fd)) = info.poll {
+        out[16..24].copy_from_slice(&band.to_le_bytes());
+        out[24..28].copy_from_slice(&fd.to_le_bytes());
+    } else if let Some(address) = info.fault {
         out[16..24].copy_from_slice(&address.to_le_bytes());
         if sig == 31 && info.code == 1 {
             out[4..8].copy_from_slice(&info.sender.to_le_bytes());
@@ -34,7 +38,10 @@ pub fn write_signalfd(sig: u32, info: Info) -> [u8; 128] {
     let mut out = [0; 128];
     out[..4].copy_from_slice(&sig.to_le_bytes());
     out[8..12].copy_from_slice(&info.code.to_le_bytes());
-    if let Some((id, overrun, value)) = info.timer {
+    if let Some((band, fd)) = info.poll {
+        out[20..24].copy_from_slice(&fd.to_le_bytes());
+        out[28..32].copy_from_slice(&(band as u32).to_le_bytes());
+    } else if let Some((id, overrun, value)) = info.timer {
         out[24..28].copy_from_slice(&id.to_le_bytes());
         out[32..36].copy_from_slice(&overrun.to_le_bytes());
         out[44..48].copy_from_slice(&(value as u32).to_le_bytes());

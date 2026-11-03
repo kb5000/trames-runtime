@@ -467,4 +467,47 @@ mod tests {
         }
         assert!(root.0.registry.lock().unwrap().len() <= 2);
     }
+    #[test]
+    fn inherited_proc_mount_survives_nested_pid_namespace_and_mount_clone() {
+        let mut root = Vfs::default();
+        root.import_file(b"/file", b"data".to_vec()).unwrap();
+        let mut child = root.clone();
+        child.unshare_pid().unwrap();
+        child.activate_child_pid(42).unwrap();
+        child.unshare_mounts().unwrap();
+        let fd = child.open_at(AT_FDCWD, b"/file", O_PATH, 0).unwrap();
+        child.set_runtime_info(
+            42,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 42,
+                    tgid: 42,
+                    namespaces: child.namespace_snapshot(),
+                    fds: child.fd_snapshot(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        // The inherited proc mount uses the ancestor PID space, even though
+        // the calling task is PID 1 in its own newly-created namespace.
+        assert_eq!(child.readlink_at(AT_FDCWD, b"/proc/self").unwrap(), b"42");
+        assert_eq!(
+            child
+                .readlink_at(AT_FDCWD, format!("/proc/self/fd/{fd}").as_bytes())
+                .unwrap(),
+            b"/file"
+        );
+        child.mkdir_at(AT_FDCWD, b"/newproc", 0o755).unwrap();
+        child
+            .mount(None, b"/newproc", Some(b"proc"), 0, None)
+            .unwrap();
+        assert_eq!(child.readlink_at(AT_FDCWD, b"/newproc/self").unwrap(), b"1");
+        assert_eq!(
+            child
+                .readlink_at(AT_FDCWD, format!("/newproc/self/fd/{fd}").as_bytes())
+                .unwrap(),
+            b"/file"
+        );
+    }
 }

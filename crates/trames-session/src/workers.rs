@@ -18,6 +18,7 @@ use std::{
 };
 use trames_engine::{Cpu, DecodeStats, SliceOutcome};
 use trames_memory::parallel::View;
+use trames_memory::CpuMemory;
 
 /// Local interpreter polls, not scheduler quanta. Completing one of these does
 /// not send a message, wait for peers, or give up the CPU or memory view.
@@ -492,6 +493,52 @@ impl<C: Cpu> Pool<C> {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
+                            if let Some(snapshot) = &work.syscalls {
+                                if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
+                                if let Some((sig, shared)) = snapshot.next_io_signal() {
+                                    let action = snapshot.actions.get(sig as usize);
+                                    let disposition = trames_kernel::signal::disposition(sig, action);
+                                    let namespace_init = snapshot.io_routes.namespace.is_nested() && snapshot.identities[0] == 1;
+                                    if action.handler == 0 && namespace_init && !matches!(sig, 9 | 19) || disposition == trames_kernel::signal::Disposition::Ignore {
+                                        snapshot.io_signals.take(sig, shared);
+                                        continue;
+                                    }
+                                    if matches!(disposition, trames_kernel::signal::Disposition::Terminate | trames_kernel::signal::Disposition::Stop) {
+                                        // Lifecycle effects retain their existing exit/stop boundary.
+                                        // Caught I/O signals below never stop the other CPUs.
+                                        work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
+                                    }
+                                    let uninterruptible = job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some() || io.number == 2)
+                                        || job.retry.as_ref().is_some_and(|call| call.file.is_some() || call.number == 2);
+                                    if !uninterruptible {
+                                        if let Some(info) = snapshot.io_signals.take(sig, shared) {
+                                            if let Some(waiting) = job.waiting.take() {
+                                                if let crate::run_queue::WaitState::Sleep { deadline, remaining } = waiting {
+                                                    if remaining != 0 {
+                                                        let ns = deadline.saturating_duration_since(Instant::now()).as_nanos();
+                                                        let memory = work.memory.as_deref_mut().expect("signal View");
+                                                        let _ = memory.write_array(remaining, ((ns / 1_000_000_000) as u64).to_le_bytes());
+                                                        let _ = memory.write_array(remaining + 8, ((ns % 1_000_000_000) as u64).to_le_bytes());
+                                                    }
+                                                }
+                                                work.cpu.set_x(0, 0u64.wrapping_sub(4));
+                                            }
+                                            let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
+                                            if let Some(pending) = pending {
+                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 32 | 63..=66 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                    for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
+                                                    work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
+                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
+                                            }
+                                            if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, info, action).is_err() {
+                                                let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
+                                                work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(epoch) = &epoch {
                                 if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                                 if let Some(ring) = &mut job.uring {
@@ -549,7 +596,9 @@ impl<C: Cpu> Pool<C> {
                                     let call = job.retry.take().unwrap();
                                     let tcp_handoff=call.tcp_liveness.is_some();
                                     let _tcp_liveness=call.tcp_liveness;
-                                    if let Some(file) = call.file {
+                                    if let Some(aio) = call.aio {
+                                        snapshot.direct.start_retained_aio(aio, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(file) = call.file {
                                         snapshot.direct.start_retained_file(file,call.number,call.args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
                                     } else if let Some(uring) = call.uring {
                                         snapshot.direct.start_retained_uring(uring, call.args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
@@ -681,6 +730,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
+                                if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
+                                    if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { syscalls += 1; continue; }
+                                    let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
+                                    break result;
+                                }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
                                         && (trames_linux::DirectSyscalls::file_call(work.cpu.x(8) as u32)
@@ -1440,6 +1494,7 @@ mod tests {
             None,
         );
         job.retry = Some(crate::run_queue::IoCall {
+            aio: None,
             file: None,
             file_checkpoint: None,
             uring: None,
@@ -1549,6 +1604,9 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             futex: Default::default(),
             seccomp: Default::default(),
             identities: [21, 12, 1000, 1001, 2000, 2001, 22],
@@ -1564,6 +1622,210 @@ mod tests {
             uts: None,
             direct: Default::default(),
         }
+    }
+
+    #[test]
+    fn caught_io_signal_and_sigreturn_complete_on_the_source_worker() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(0x8000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        for (address, words) in [
+            (0x1000, vec![0xaa0003f3u32, 0xd2800ba8, 0xd4000001]),
+            (0x1100, vec![0xf90002a0u32, 0xd2801168, 0xd4000001]),
+        ] {
+            for (i, word) in words.into_iter().enumerate() {
+                memory
+                    .write_array(address + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+        }
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let mut cpu = Cpu::new(0x1000, 0xa000);
+        cpu.set_x(0, 77);
+        cpu.set_x(21, 0x2000);
+        let snapshot = syscall_snapshot();
+        snapshot.actions.set(
+            29,
+            trames_kernel::signal::Action {
+                handler: 0x1100,
+                ..Default::default()
+            },
+        );
+        snapshot
+            .io_signals
+            .inbox
+            .enqueue(29, trames_kernel::signal::Info::default())
+            .unwrap();
+        let signal_task = snapshot.io_signals.clone();
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        let control = Arc::new(Control::new(100));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let work = Work {
+            pid: 1,
+            cpu,
+            memory: Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            )),
+            control,
+            syscalls: Some(snapshot),
+            gpu: None,
+            audio: None,
+        };
+        epoch.add(crate::run_queue::Job::new(work, 1, 0, None));
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(done.cpu.x(19), 77);
+        assert_eq!(done.syscalls, 1, "sigreturn must retire on worker");
+        assert_eq!(done.serviced_syscalls, 0);
+        assert_eq!(signal_task.context.lock().unwrap().frames, 0);
+        memory.commit_parallel().unwrap();
+        assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
+    }
+
+    #[test]
+    fn aio_releases_the_only_slot_and_retains_its_batch_across_cohort_handoff() {
+        struct Disk(Mutex<Option<(trames_vfs::FileWork, Arc<trames_linux::FileResult>)>>);
+        impl trames_linux::FileExecutor for Disk {
+            fn submit_file(
+                &self,
+                work: trames_vfs::FileWork,
+                result: Arc<trames_linux::FileResult>,
+            ) {
+                *self.0.lock().unwrap() = Some((work, result));
+            }
+        }
+        let disk = Arc::new(Disk(Mutex::new(None)));
+        let mut v = trames_vfs::Vfs::default();
+        v.import_file(b"/data", b"payload".to_vec()).unwrap();
+        let fd = v.open_at(trames_vfs::AT_FDCWD, b"/data", 0, 0).unwrap();
+        let aio = trames_linux::Aio::default();
+        let mut memory = Memory::default();
+        memory.map(0x1000, 3 * PAGE_SIZE, Permissions::RW).unwrap();
+        aio.install(&mut memory).unwrap();
+        for (i, word) in [0xaa0003f3u32, 0xd2800ba8, 0xd4000001]
+            .into_iter()
+            .enumerate()
+        {
+            memory
+                .write_array(0x1000 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let direct = || {
+            trames_linux::DirectSyscalls::new(v.direct_descriptors())
+                .with_paths(v.path_queries())
+                .with_aio(aio.clone(), v.native_events())
+                .with_file_executor(disk.clone())
+        };
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        assert!(matches!(
+            direct().start(
+                0,
+                [8, 0x2000, 0, 0, 0, 0],
+                &mut memory,
+                1,
+                &epoch.io_target,
+                None
+            ),
+            Some(trames_linux::IoAttempt::Complete(Ok(0)))
+        ));
+        let context = u64::from_le_bytes(memory.read_array(0x2000).unwrap());
+        let mut cb = [0; 64];
+        cb[20..24].copy_from_slice(&fd.to_le_bytes());
+        cb[24..32].copy_from_slice(&0x3000u64.to_le_bytes());
+        cb[32..40].copy_from_slice(&7u64.to_le_bytes());
+        memory.write_array(0x2100, cb).unwrap();
+        memory.write_array(0x2200, 0x2100u64.to_le_bytes()).unwrap();
+        let pending = match direct()
+            .start(
+                2,
+                [context, 1, 0x2200, 0, 0, 0],
+                &mut memory,
+                1,
+                &epoch.io_target,
+                None,
+            )
+            .unwrap()
+        {
+            trames_linux::IoAttempt::Blocked(p) => p,
+            _ => panic!("disk work must park"),
+        };
+        let mut snapshot = syscall_snapshot();
+        snapshot.direct = direct();
+        let source = Work {
+            pid: 1,
+            cpu: Cpu::new(0x1000, 0),
+            memory: Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            )),
+            control: control.clone(),
+            syscalls: Some(snapshot),
+            gpu: None,
+            audio: None,
+        };
+        let mut source = crate::run_queue::Job::new(source, 1, 0, None);
+        source.io = Some(pending);
+        epoch.add(source);
+        epoch.add(crate::run_queue::Job::new(
+            work(2, &[0xd4000001], 0, control),
+            1,
+            0,
+            None,
+        ));
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let mut results = epoch.drain();
+        let source = results.remove(results.iter().position(|d| d.pid == 1).unwrap());
+        assert_eq!(
+            results[0].instructions, 1,
+            "peer must use the only slot while disk is pending"
+        );
+        assert!(source.io.as_ref().unwrap().aio.is_some());
+        assert_eq!(source.serviced_syscalls, 0);
+        memory.commit_parallel().unwrap();
+        let (work, result) = disk.0.lock().unwrap().take().unwrap();
+        result.complete(work.run());
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        let mut snapshot = syscall_snapshot();
+        snapshot.direct = direct();
+        let work = Work {
+            pid: 1,
+            cpu: source.cpu,
+            memory: Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            )),
+            control,
+            syscalls: Some(snapshot),
+            gpu: None,
+            audio: None,
+        };
+        let mut job = crate::run_queue::Job::new(work, 1, 0, None);
+        job.retry = source.io;
+        epoch.add(job);
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(done.cpu.x(19), 1);
+        assert_eq!(done.syscalls, 1);
+        assert_eq!(done.serviced_syscalls, 0);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<7>(0x3000).unwrap(), *b"payload");
     }
 
     #[test]

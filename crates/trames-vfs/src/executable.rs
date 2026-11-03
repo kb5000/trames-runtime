@@ -201,4 +201,40 @@ mod tests {
             Err(Errno(13))
         ));
     }
+    #[test]
+    fn reopen_exec_magic_link_after_memfd_exec_and_last_descriptor_close() {
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"runc_cloned:/proc/self/exe", 3).unwrap();
+        v.write(fd, b"payload").unwrap();
+        let file = v.executable_file_at(fd as i32, b"", 0x1000).unwrap();
+        v.close(fd).unwrap();
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    executable: v.executable_display(&file),
+                    executable_file: Some(Rc::downgrade(&file)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        v.symlink_at(b"/proc/self/exe", AT_FDCWD, b"/exec-alias")
+            .unwrap();
+        for path in [b"/proc/self/exe".as_slice(), b"/exec-alias"] {
+            let reopened = v.open_at(AT_FDCWD, path, O_CLOEXEC, 0).unwrap();
+            assert_eq!(v.read(reopened, 7).unwrap(), b"payload");
+            assert_eq!(
+                v.stat_fd(reopened).unwrap()[8..16],
+                file.node.borrow().inode.to_le_bytes()
+            );
+            v.close(reopened).unwrap();
+        }
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/proc/self/exe", O_NOFOLLOW, 0),
+            Err(Errno(40))
+        );
+    }
 }

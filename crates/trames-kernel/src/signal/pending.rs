@@ -84,6 +84,7 @@ mod tests {
             code: 0,
             timer: None,
             fault: None,
+            poll: None,
         };
         for i in 0..4096 {
             q.enqueue(34, info(i)).unwrap();

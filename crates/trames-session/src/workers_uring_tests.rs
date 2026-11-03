@@ -6,6 +6,9 @@ use trames_cpu::Cpu;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
+        io_signals: Default::default(),
+        io_routes: Default::default(),
+        io_wake: None,
         futex: Default::default(),
         seccomp: Default::default(),
         identities: [1; 7],

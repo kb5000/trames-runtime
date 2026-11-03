@@ -174,6 +174,9 @@ mod tests {
         cpu.set_x(8, number as u64);
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
+            io_signals: Default::default(),
+            io_routes: Default::default(),
+            io_wake: None,
             seccomp: p.seccomp.clone(),
             identities: [0; 7],
             started: Instant::now(),

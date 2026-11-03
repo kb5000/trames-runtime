@@ -162,8 +162,22 @@ impl HostEvents {
         };
         // Callbacks may re-enter the run queue and cancel subscriptions. Never
         // retain the registry or scheduler mutex across notification.
-        for signal in signals {
-            signal.fire();
+        let selected = crate::readiness::notify(&signals);
+        let mut r = self.registrations.lock().unwrap();
+        for id in ids {
+            let Some(entry) = r.entries.get_mut(&id) else {
+                continue;
+            };
+            if entry
+                .signal
+                .upgrade()
+                .and_then(|s| s.exclusive_key())
+                .is_some_and(|key| !selected.contains(&key))
+            {
+                self.backend
+                    .set(entry.fd.as_raw_fd(), entry.write, id, true)?;
+                entry.armed = true;
+            }
         }
         Ok(())
     }
@@ -193,6 +207,26 @@ impl Drop for HostSubscription {
             let removed = r.entries.remove(&self.id);
             if let Some(e) = &removed {
                 self.source.backend.remove(e.fd.as_raw_fd(), e.write);
+                // The selected epoll waiter has consumed its notification.
+                // Re-enable other one-shot interests for subsequent readiness
+                // without a polling loop or a new reactor thread.
+                if let Some(key) = e.signal.upgrade().and_then(|s| s.exclusive_key()) {
+                    for (&id, peer) in r.entries.iter_mut() {
+                        if !peer.armed
+                            && peer
+                                .signal
+                                .upgrade()
+                                .is_some_and(|s| s.exclusive_key() == Some(key))
+                            && self
+                                .source
+                                .backend
+                                .set(peer.fd.as_raw_fd(), peer.write, id, true)
+                                .is_ok()
+                        {
+                            peer.armed = true;
+                        }
+                    }
+                }
             }
             removed
         };

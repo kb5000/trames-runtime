@@ -5,6 +5,25 @@ use super::direct_io::{DirectWatch, WatchResource};
 use super::*;
 use std::sync::{atomic::AtomicUsize, Mutex, RwLock};
 
+pub(super) const EXCLUSIVE: u32 = 0x10000000;
+pub(super) fn validate(op: u32, events: u32, old: Option<u32>, nested: bool) -> Result<()> {
+    if !matches!(op, 1..=3) {
+        return Err(Errno(22));
+    }
+    if op == 2 {
+        return Ok(());
+    }
+    if events & EXCLUSIVE != 0 && (op != 1 || nested || events & !0xb000001d != 0)
+        || op == 3 && old.is_some_and(|old| old & EXCLUSIVE != 0)
+    {
+        return Err(Errno(22));
+    }
+    if events & !0xf000201f != 0 {
+        return Err(Errno(95));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(super) struct LiveEpoll {
     watches: RwLock<Arc<Vec<DirectWatch>>>,
@@ -64,16 +83,16 @@ impl LiveEpoll {
         data: u64,
         target: WatchResource,
     ) -> Result<()> {
-        if !matches!(op, 1..=3) {
-            return Err(Errno(22));
-        }
-        if op != 2 && events & !0xc000201f != 0 {
-            return Err(Errno(95));
-        }
         let mut removed = None;
         let mut retired = Vec::new();
         let mut index = self.watches.write().unwrap();
         let at = index.binary_search_by_key(&key, |w| w.0);
+        validate(
+            op,
+            events,
+            at.ok().map(|i| index[i].1.lock().unwrap().events),
+            false,
+        )?;
         match (op, at) {
             (1, Ok(_)) => return Err(Errno(17)),
             (2 | 3, Err(_)) => return Err(Errno(2)),
@@ -166,6 +185,7 @@ fn merge<'a>(a: &'a [DirectWatch], b: &'a [DirectWatch]) -> impl Iterator<Item =
         _ => a.next(),
     })
 }
+
 pub(super) fn ordered<'a>(
     a: &'a [DirectWatch],
     b: &'a [DirectWatch],
@@ -174,4 +194,59 @@ pub(super) fn ordered<'a>(
     let i = cursor.map_or(0, |c| a.partition_point(|w| w.0 <= c));
     let j = cursor.map_or(0, |c| b.partition_point(|w| w.0 <= c));
     merge(&a[i..], &b[j..]).chain(merge(&a[..i], &b[..j]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    #[test]
+    fn exclusive_waiters_wake_one_eligible_interest_and_all_ordinary_interests() {
+        let mut v = Vfs::default();
+        let event = v.eventfd(0, 0).unwrap();
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        let mut waits = Vec::new();
+        for (i, interest) in [EXCLUSIVE | 4, EXCLUSIVE | 1, EXCLUSIVE | 1, 1]
+            .into_iter()
+            .enumerate()
+        {
+            let epoll = v.epoll_create(0).unwrap();
+            v.epoll_ctl(epoll, 1, event, interest, i as u64).unwrap();
+            let fd = v.direct_descriptors().get(epoll).unwrap();
+            let signal = IoSignal::new(i as u32 + 1, Arc::downgrade(&wake));
+            let subscriptions = fd.subscribe(&signal);
+            waits.push((signal, subscriptions));
+        }
+        // OUT was already ready; a counter increment must notify IN listeners,
+        // not let the first, OUT-only exclusive interest consume their wakeup.
+        v.write(event, &1u64.to_le_bytes()).unwrap();
+        assert!(waits[3].0.ready());
+        assert_eq!(waits[1..3].iter().filter(|w| w.0.ready()).count(), 1);
+    }
+    #[test]
+    fn exclusive_registration_is_add_only_and_cannot_target_another_epoll() {
+        let mut v = Vfs::default();
+        let event = v.eventfd(0, 0).unwrap();
+        let epoll = v.epoll_create(0).unwrap();
+        let nested = v.epoll_create(0).unwrap();
+        assert_eq!(
+            v.epoll_ctl(epoll, 1, event, EXCLUSIVE | 0x40000001, 0),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            v.epoll_ctl(epoll, 1, nested, EXCLUSIVE | 1, 0),
+            Err(Errno(22))
+        );
+        v.epoll_ctl(epoll, 1, event, EXCLUSIVE | 1, 0).unwrap();
+        assert_eq!(v.epoll_ctl(epoll, 3, event, 1, 0), Err(Errno(22)));
+        v.epoll_ctl(epoll, 2, event, u32::MAX, 0).unwrap();
+        v.epoll_ctl(epoll, 1, event, 1, 0).unwrap();
+        assert_eq!(
+            v.epoll_ctl(epoll, 3, event, EXCLUSIVE | 1, 0),
+            Err(Errno(22))
+        );
+    }
 }
