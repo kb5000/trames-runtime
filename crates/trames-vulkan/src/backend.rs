@@ -458,6 +458,7 @@ pub struct Backend {
     coherent_pending: coherent::Scope,
     submissions: Vec<Submission>,
     compiles: BTreeMap<u64, Compile>,
+    teardowns: BTreeMap<u64, completion::Teardown>,
     pub transfers: TransferMetrics,
     display: crate::Display,
     wsi: wsi::Wsi,
@@ -500,6 +501,7 @@ impl Backend {
             coherent_pending: Default::default(),
             submissions: Vec::new(),
             compiles: BTreeMap::new(),
+            teardowns: BTreeMap::new(),
             transfers: TransferMetrics::default(),
             display: crate::Display::default(),
             wsi: wsi::Wsi::default(),
@@ -916,6 +918,17 @@ impl Backend {
     pub fn reap_abandoned(&mut self) {
         self.compiles
             .retain(|_, c| !c.abandoned || matches!(c.task.poll(), Ok(None)));
+        if self.teardown_ready() {
+            let jobs = self
+                .teardowns
+                .iter()
+                .filter_map(|(&id, job)| job.abandoned.then_some(id))
+                .collect::<Vec<_>>();
+            for id in jobs {
+                let job = self.teardowns.remove(&id).unwrap();
+                let _ = self.finish_teardown(job.operation, job.target);
+            }
+        }
     }
     pub fn invoke(
         &mut self,
@@ -950,7 +963,9 @@ impl Backend {
         {
             return Ok(Invocation::Checkpoint);
         }
-        let result = if matches!(operation, 201 | 202) {
+        let result = if matches!(operation, 2 | 9) {
+            self.start_teardown(operation, a[0])
+        } else if matches!(operation, 201 | 202) {
             self.start_wait(memory, operation, a)
         } else if operation == 27 {
             self.start_compile(memory, a).map(Invocation::Pending)
@@ -1011,7 +1026,8 @@ impl Backend {
         self.capabilities
             .compute
             .stage_controls(device.compute_features, a[11], a[12])?;
-        let task = crate::task::Task::spawn(move || {
+        let completion = Some(self.completion.clone());
+        let task = crate::task::Task::spawn_notifying(completion, move || {
             let _permit = permit;
             let specialization = vk::SpecializationInfo::default()
                 .map_entries(&entries)
@@ -1071,6 +1087,9 @@ impl Backend {
     }
     pub fn abandon(&mut self, job: u64) {
         self.waits.remove(&job);
+        if let Some(teardown) = self.teardowns.get_mut(&job) {
+            teardown.abandoned = true;
+        }
         if let Some(c) = self.compiles.get_mut(&job) {
             c.abandoned = true;
         }
@@ -1080,7 +1099,7 @@ impl Backend {
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
     ) -> Option<trames_shared::IoSubscription> {
-        if self.waits.contains_key(&job) {
+        if self.waits.contains_key(&job) || self.teardowns.contains_key(&job) {
             Some(self.completion.subscribe(signal))
         } else {
             self.compiles.get(&job).map(|c| c.task.subscribe(signal))
@@ -1097,6 +1116,13 @@ impl Backend {
         m: &mut impl CpuMemory,
         job: u64,
     ) -> std::result::Result<Option<u64>, MemoryError> {
+        if self.teardowns.contains_key(&job) {
+            return match self.poll_teardown(job) {
+                Ok(value) => Ok(value),
+                Err(Failure::Vk(e)) => Ok(Some(e.as_raw() as i64 as u64)),
+                Err(Failure::Memory(e)) => Err(e),
+            };
+        }
         if self.waits.contains_key(&job) {
             return match self.poll_wait(m, job) {
                 Ok(value) => Ok(value),
@@ -1276,18 +1302,7 @@ impl Backend {
             return Ok(());
         }
         if op == 2 {
-            if a[0] != self.instance_id {
-                return invalid();
-            }
-            self.clear_device();
-            self.wsi.surfaces.clear();
-            self.wayland.surfaces.clear();
-            self.instance = None;
-            self.wsi_enabled = false;
-            self.instance_id = 0;
-            self.physical_id = 0;
-            self.capabilities = Default::default();
-            return Ok(());
+            return self.finish_teardown(op, a[0]);
         }
         let instance = self
             .instance
@@ -1677,10 +1692,7 @@ impl Backend {
                 self.queue_id = self.id();
                 write(m, a[2], &self.device_id.to_le_bytes())?;
             }
-            9 => {
-                self.device(a[0])?;
-                self.clear_device();
-            }
+            9 => self.finish_teardown(op, a[0])?,
             10 => {
                 self.device(a[0])?;
                 if a[1] != self.family as u64 || a[2] != 0 {

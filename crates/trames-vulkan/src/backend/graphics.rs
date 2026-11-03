@@ -1085,7 +1085,8 @@ impl Backend {
             .budget
             .compile()
             .ok_or(Failure::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY))?;
-        let task = crate::task::Task::spawn(move || {
+        let completion = Some(self.completion.clone());
+        let task = crate::task::Task::spawn_notifying(completion, move || {
             let _permit = permit;
             let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)

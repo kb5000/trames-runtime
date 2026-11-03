@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned native work. No guest pointer, memory guard or coordinator Rc crosses.
 use std::{
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread,
 };
 use trames_shared::{IoSignal, IoSubscription, Readiness};
@@ -10,22 +13,43 @@ pub(super) struct Task<T> {
     result: mpsc::Receiver<T>,
     worker: Option<thread::JoinHandle<()>>,
     readiness: Arc<Readiness>,
+    completed: Arc<AtomicBool>,
 }
-struct Completed(Arc<Readiness>);
+struct Completed {
+    readiness: Arc<Readiness>,
+    aggregate: Option<Arc<Readiness>>,
+    completed: Arc<AtomicBool>,
+}
 impl Drop for Completed {
     fn drop(&mut self) {
-        self.0.notify_atomic();
+        self.completed.store(true, Ordering::Release);
+        self.readiness.notify_atomic();
+        if let Some(aggregate) = &self.aggregate {
+            aggregate.notify_atomic();
+        }
     }
 }
 impl<T: Send + 'static> Task<T> {
+    #[cfg(test)]
     pub fn spawn(work: impl FnOnce() -> T + Send + 'static) -> std::io::Result<Self> {
+        Self::spawn_notifying(None, work)
+    }
+    pub fn spawn_notifying(
+        aggregate: Option<Arc<Readiness>>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (sender, result) = mpsc::channel();
         let readiness = Arc::new(Readiness::default());
-        let completed = readiness.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let publication = Completed {
+            readiness: readiness.clone(),
+            aggregate,
+            completed: completed.clone(),
+        };
         let worker = thread::Builder::new()
             .name("trames-gpu-compile".into())
             .spawn(move || {
-                let _completed = Completed(completed);
+                let _completed = publication;
                 // This local sender drops BEFORE the completion guard, even
                 // when work panics. A wake must observe result or disconnect.
                 let sender = sender;
@@ -37,12 +61,21 @@ impl<T: Send + 'static> Task<T> {
             result,
             worker: Some(worker),
             readiness,
+            completed,
         })
     }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.readiness.subscribe(signal)
     }
+    pub fn completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
     pub fn poll(&mut self) -> Result<Option<T>, ()> {
+        // Result delivery precedes this publication. Ready callbacks are all
+        // that may remain, so consuming a result never joins unfinished work.
+        if !self.completed() {
+            return Ok(None);
+        }
         match self.result.try_recv() {
             Ok(value) => Ok(Some(value)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -52,10 +85,15 @@ impl<T: Send + 'static> Task<T> {
 }
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {
-        // Final context teardown joins before coordinator-held dependencies
-        // disappear. Ordinary polling never joins unfinished native work.
+        // Unfinished native work joins before its owned dependencies disappear.
+        // After completion publication only wake delivery remains; it can
+        // re-enter this context, so never join those callbacks under its lease.
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if !self.completed.load(Ordering::Acquire)
+                && worker.thread().id() != thread::current().id()
+            {
+                let _ = worker.join();
+            }
         }
     }
 }

@@ -57,7 +57,6 @@ pub(super) struct Membership {
 #[derive(Default)]
 pub(super) struct MembershipEntries {
     slots: BTreeMap<u32, Slot>,
-    wayland: Option<PreparedWayland>,
     free: crate::fd_allocator::FreeFds,
     reserved: std::collections::BTreeSet<u32>,
 }
@@ -430,12 +429,8 @@ impl SharedFiles {
         )?;
         Ok(0)
     }
-    pub(super) fn changed(&self, entries: &mut MembershipEntries) {
+    pub(super) fn changed(&self, _entries: &mut MembershipEntries) {
         self.0.revision.fetch_add(1, Ordering::Relaxed);
-        // Called under the membership lock by owner and worker mutations.
-        // Only retained host capabilities are retired here; no VFS callback.
-        let retired = entries.wayland.take();
-        drop(retired);
     }
     /// None means owner control is required, before any effects. A missing FD
     /// is an ordinary guest EBADF, not a concurrency-specific error.
@@ -593,16 +588,6 @@ pub(super) struct Entries<'a> {
     owners: std::cell::Ref<'a, TableState>,
 }
 impl Entries<'_> {
-    pub(super) fn cached_wayland(&self, identity: u64, revision: u64) -> Option<WaylandAuth> {
-        self.membership
-            .wayland
-            .as_ref()
-            .filter(|(owner, generation, _)| *owner == identity && *generation == revision)
-            .map(|(_, _, auth)| auth.clone())
-    }
-    pub(super) fn cache_wayland(&mut self, identity: u64, revision: u64, auth: WaylandAuth) {
-        self.membership.wayland = Some((identity, revision, auth));
-    }
     fn entry<'a>(&'a self, fd: u32, slot: &'a Slot) -> Entry<'a> {
         Entry {
             open: match &slot.open {
@@ -682,7 +667,6 @@ pub(super) struct DescriptorMetadata {
     pub(super) flags: RefCell<Option<(u64, FdFlags)>>,
 }
 type PreparedBytes = Arc<[Option<DirectFd>]>;
-type PreparedWayland = (u64, u64, WaylandAuth);
 #[derive(Clone, Default)]
 pub(super) struct DescriptorVersion {
     pub(super) io: OnceCell<(FdMask, FdMask)>,
@@ -963,7 +947,6 @@ impl Clone for DescriptorTable {
                     local_ownership: self.1 .0.local_ownership.clone(),
                     entries: Mutex::new(MembershipEntries {
                         slots: entries,
-                        wayland: None,
                         free,
                         reserved: Default::default(),
                     }),

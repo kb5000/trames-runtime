@@ -9,35 +9,64 @@ use std::{
 use trames_shared::{NativeSocket, SharedFile, MAX_BYTES_OUT, MAX_FDS_OUT};
 use trames_wayland::Server;
 
-enum Grant {
-    Connection(u64),
-    Shared(SharedFile),
-}
-struct Grants {
-    server: Server,
-    fds: BTreeMap<u32, Grant>,
-}
-/// Authenticated capabilities of a frozen FD table, never VFS Rc or raw FDs.
-/// The caller must end this snapshot before mutating/reusing that table.
+/// A live descriptor authority, not an epoch's copied grants. Resolving accepts
+/// one original OFD before native work; closed/reused slots cannot redirect it.
 #[derive(Clone, Default)]
-pub struct WaylandAuth(Option<Arc<Grants>>);
+pub struct WaylandAuth {
+    source: Option<(SharedFiles, std::sync::Weak<Services>)>,
+}
+pub struct WaylandGrant {
+    server: Server,
+    token: u64,
+    _file: SharedFd,
+}
+impl WaylandGrant {
+    pub fn connection(&self) -> (Server, u64) {
+        (self.server.clone(), self.token)
+    }
+}
 impl WaylandAuth {
-    pub fn resolve(&self, fd: u32) -> Option<(Server, u64)> {
-        let grants = self.0.as_ref()?;
-        let token = match grants.fds.get(&fd)? {
-            Grant::Connection(token) => *token,
-            // Resolve compositor registration live, keeping its original
-            // inode identity lease; copied bytes cannot manufacture a grant.
-            Grant::Shared(file) => {
-                grants
-                    .server
-                    .snapshot()
-                    .wsi_connections
-                    .get(&file.key())?
-                    .connection
+    pub fn resolve(&self, fd: u32) -> Result<WaylandGrant> {
+        let (files, services) = self.source.as_ref().ok_or(Errno(95))?;
+        let services = services.upgrade().ok_or(Errno(95))?;
+        let file = files.query_lookup(fd).unwrap_or(Err(Errno(95)))?;
+        let token = if let Some(socket) = &file.open.local {
+            services
+                .registry
+                .lock()
+                .unwrap()
+                .connections
+                .iter()
+                .find(|c| {
+                    !c.xwm && Arc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
+                })
+                .map(|c| c.token)
+                .ok_or(Errno(9))?
+        } else {
+            let flags = file.open.flags.get();
+            if flags & O_PATH != 0 || flags & 3 == 1 {
+                return Err(Errno(9));
             }
+            let node = file.open.node.as_ref().ok_or(Errno(19))?.borrow();
+            let Content::File(data) = &node.content else {
+                return Err(Errno(19));
+            };
+            let shared = data.shared_file().ok_or(Errno(95))?;
+            let key = shared.key();
+            drop(node);
+            services
+                .server
+                .snapshot()
+                .wsi_connections
+                .get(&key)
+                .ok_or(Errno(11))?
+                .connection
         };
-        Some((grants.server.clone(), token))
+        Ok(WaylandGrant {
+            server: services.server.clone(),
+            token,
+            _file: file,
+        })
     }
 }
 
@@ -140,12 +169,10 @@ struct Binding {
 struct Registry {
     bindings: Vec<Binding>,
     connections: Vec<Arc<Bridge>>,
-    revision: u64,
 }
 /// Only registry membership is shared across connections. Transport progress,
 /// partial messages and resource destruction belong to the connection itself.
 pub(crate) struct Services {
-    identity: u64,
     me: std::sync::Weak<Services>,
     server: Server,
     importer: Importer,
@@ -249,7 +276,6 @@ impl Services {
     fn new(vfs: &Vfs, server: Server) -> Result<Arc<Self>> {
         let events = HostEvents::new().map_err(io_errno)?;
         Ok(Arc::new_cyclic(|me: &std::sync::Weak<Self>| Self {
-            identity: trames_memory::new_backing_identity(),
             me: me.clone(),
             server,
             importer: Importer {
@@ -309,7 +335,6 @@ impl Services {
                             {
                                 let mut registry = self.registry.lock().unwrap();
                                 registry.connections.push(bridge.clone());
-                                registry.revision = registry.revision.wrapping_add(1);
                             }
                             bridge.drive();
                         }
@@ -336,7 +361,6 @@ impl Services {
             else {
                 return;
             };
-            registry.revision = registry.revision.wrapping_add(1);
             registry.connections.swap_remove(index)
         };
         drop(retired);
@@ -815,75 +839,18 @@ impl Vfs {
             .as_ref()
             .is_some_and(|services| !services.registry.lock().unwrap().connections.is_empty())
     }
-    /// Resolve an authenticated Wayland connection from a live guest descriptor.
-    pub fn wayland_connection(&self, fd: u32) -> Result<(Server, u64)> {
-        let services = self.native_services.borrow().clone().ok_or(Errno(95))?;
-        let registry = services.registry.lock().unwrap();
-        let token = if let Some(socket) = self.local_socket(fd)? {
-            registry
-                .connections
-                .iter()
-                .find(|c| {
-                    !c.xwm && Arc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
-                })
-                .map(|c| c.token)
-                .ok_or(Errno(9))?
-        } else {
-            // The compositor registered this same retained shared inode from
-            // SCM_RIGHTS on its actual connection. A socket pair, guessed
-            // object ID or a file containing copied bytes cannot mint a grant.
-            let file = self.shared_file(fd)?;
-            services
-                .server
-                .snapshot()
-                .wsi_connections
-                .get(&file.key())
-                .ok_or(Errno(11))?
-                .connection
-        };
-        Ok((services.server.clone(), token))
+    /// Only the resource identity and live Files domain cross to a worker.
+    pub fn wayland_auth(&self) -> WaylandAuth {
+        WaylandAuth {
+            source: self
+                .native_services
+                .borrow()
+                .as_ref()
+                .map(|services| (self.shared_files(), Arc::downgrade(services))),
+        }
     }
-    pub fn wayland_auth_snapshot(&self) -> WaylandAuth {
-        let services = self.native_services.borrow();
-        let Some(services) = services.as_ref() else {
-            return WaylandAuth::default();
-        };
-        let registry = services.registry.lock().unwrap();
-        if registry.connections.is_empty() {
-            return WaylandAuth::default();
-        }
-        // The same object lock orders cache capture and every owner/worker FD
-        // mutation. Cache before/after never owns a stale closed file's quota.
-        let mut entries = self.fds.entries();
-        // Resource identities cannot be reused while old grants remain.
-        // Connection changes matter even without an FD-table mutation.
-        if let Some(auth) = entries.cached_wayland(services.identity, registry.revision) {
-            return auth;
-        }
-        let mut fds = BTreeMap::new();
-        for (&fd, descriptor) in entries.iter() {
-            let description = descriptor.open.borrow();
-            let grant = if let Some(socket) = &description.local {
-                registry
-                    .connections
-                    .iter()
-                    .find(|c| {
-                        !c.xwm && Arc::ptr_eq(&c.local.channel.borrow(), &socket.channel.borrow())
-                    })
-                    .map(|c| Grant::Connection(c.token))
-            } else {
-                Self::shared_file_open(&description).ok().map(Grant::Shared)
-            };
-            if let Some(grant) = grant {
-                fds.insert(fd, grant);
-            }
-        }
-        let auth = WaylandAuth(Some(Arc::new(Grants {
-            server: services.server.clone(),
-            fds,
-        })));
-        entries.cache_wayland(services.identity, registry.revision, auth.clone());
-        auth
+    pub fn wayland_connection(&self, fd: u32) -> Result<WaylandGrant> {
+        self.wayland_auth().resolve(fd)
     }
     pub fn native_service_event_fd(&self) -> Option<HostFd> {
         self.native_services
@@ -1268,111 +1235,100 @@ mod tests {
         assert_eq!(reader.read(&mut bytes).unwrap(), 0);
     }
     #[test]
-    fn frozen_wayland_auth_carries_only_actual_connection_or_registered_inode_capabilities() {
+    fn live_wayland_authority_resolves_new_connections_and_never_retargets_a_grant() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<WaylandAuth>();
+        send_sync::<WaylandGrant>();
         let mut vfs = Vfs::default();
-        let _server = vfs.enable_wayland(b"/run/user/0").unwrap();
+        vfs.enable_wayland(b"/run/user/0").unwrap();
+        let auth = vfs.wayland_auth();
+        vfs.import_file(b"/wrong-mode", b"bytes".to_vec()).unwrap();
+        for flags in [1, O_PATH] {
+            let file = vfs.open_at(AT_FDCWD, b"/wrong-mode", flags, 0).unwrap();
+            assert!(matches!(auth.resolve(file), Err(Errno(9))));
+            vfs.close(file).unwrap();
+        }
         let fd = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
-        assert!(vfs.wayland_auth_snapshot().resolve(fd).is_none());
+        assert!(auth.resolve(fd).is_err());
         let socket = vfs.local_socket(fd).unwrap().unwrap();
-        let mut address = vec![1, 0];
-        address.extend_from_slice(b"/run/user/0/wayland-0\0");
-        vfs.local_connect(&socket, &address).unwrap();
-        let token = vfs.wayland_connection(fd).unwrap().1;
-        let first = vfs.wayland_auth_snapshot();
-        let repeated = vfs.wayland_auth_snapshot();
-        assert!(Arc::ptr_eq(
-            first.0.as_ref().unwrap(),
-            repeated.0.as_ref().unwrap()
-        ));
-        let peer = vfs.clone_with_files(true);
-        let shared = peer.wayland_auth_snapshot();
-        assert!(Arc::ptr_eq(
-            first.0.as_ref().unwrap(),
-            shared.0.as_ref().unwrap()
-        ));
-        drop(peer);
+        vfs.local_connect(&socket, b"\x01\x00/run/user/0/wayland-0\0")
+            .unwrap();
+        let grant = auth.resolve(fd).unwrap();
+        let token = grant.connection().1;
+        assert!(token > 0);
         let alias = vfs.dup(fd, 0, false).unwrap();
         let pair = vfs.socketpair(1, 1, 0).unwrap();
         let copied = vfs.memfd_create(b"unregistered-wayland", 0).unwrap();
         vfs.write(copied, b"copied capability bytes").unwrap();
-        let snapshot = vfs.wayland_auth_snapshot();
-        assert!(snapshot.resolve(copied).is_none());
-        assert!(snapshot.resolve(pair[0]).is_none());
-        assert!(snapshot.resolve(u32::MAX).is_none());
+        for invalid in [pair[0], copied, u32::MAX] {
+            assert!(auth.resolve(invalid).is_err());
+        }
+        let shared = vfs.clone_with_files(true).wayland_auth();
         std::thread::spawn(move || {
-            assert_eq!(snapshot.resolve(fd).unwrap().1, token);
-            assert_eq!(snapshot.resolve(alias).unwrap().1, token);
+            assert_eq!(shared.resolve(alias).unwrap().connection().1, token)
         })
         .join()
         .unwrap();
         vfs.close(fd).unwrap();
-        let replacement = vfs.local_create(1, 0).unwrap();
+        let replacement = vfs.eventfd(71, 0).unwrap();
         assert_eq!(replacement, fd);
-        assert!(vfs.wayland_auth_snapshot().resolve(fd).is_none());
-        assert_eq!(vfs.wayland_auth_snapshot().resolve(alias).unwrap().1, token);
+        assert!(auth.resolve(fd).is_err());
+        assert_eq!(grant.connection().1, token);
+        assert!(Arc::ptr_eq(
+            grant._file.open.local.as_ref().unwrap(),
+            &socket.core
+        ));
+        assert_eq!(auth.resolve(alias).unwrap().connection().1, token);
+        assert_eq!(vfs.read(fd, 8).unwrap(), 71u64.to_le_bytes());
     }
     #[test]
-    fn cached_auth_rechecks_connections_without_an_fd_membership_change() {
+    fn one_live_authority_observes_connect_without_any_membership_refresh() {
         let mut vfs = Vfs::default();
-        let _server = vfs.enable_wayland(b"/run/user/0").unwrap();
+        vfs.enable_wayland(b"/run/user/0").unwrap();
         let first = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
         let second = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
-        let mut address = vec![1, 0];
-        address.extend_from_slice(b"/run/user/0/wayland-0\0");
-        vfs.local_connect(&vfs.local_socket(first).unwrap().unwrap(), &address)
+        let auth = vfs.wayland_auth();
+        let address = b"\x01\x00/run/user/0/wayland-0\0";
+        vfs.local_connect(&vfs.local_socket(first).unwrap().unwrap(), address)
             .unwrap();
-        let token = vfs.wayland_connection(first).unwrap().1;
-        let before = vfs.wayland_auth_snapshot();
-        assert!(before.resolve(second).is_none());
+        let token = auth.resolve(first).unwrap().connection().1;
+        assert!(auth.resolve(second).is_err());
         let membership = vfs.shared_files().capture_identity();
-        vfs.local_connect(&vfs.local_socket(second).unwrap().unwrap(), &address)
+        vfs.local_connect(&vfs.local_socket(second).unwrap().unwrap(), address)
             .unwrap();
-        let other = vfs.wayland_connection(second).unwrap().1;
         assert_eq!(vfs.shared_files().capture_identity(), membership);
-        let after = vfs.wayland_auth_snapshot();
-        assert_eq!(after.resolve(first).unwrap().1, token);
-        assert_eq!(after.resolve(second).unwrap().1, other);
-        assert!(!Arc::ptr_eq(
-            before.0.as_ref().unwrap(),
-            after.0.as_ref().unwrap()
-        ));
+        assert_eq!(auth.resolve(first).unwrap().connection().1, token);
+        assert_ne!(auth.resolve(second).unwrap().connection().1, token);
     }
     #[test]
-    fn retired_auth_cache_does_not_retain_closed_worker_file_quota() {
+    fn live_authority_does_not_pin_unqueried_files_and_grant_keeps_only_accepted_ofd() {
         let mut vfs = Vfs::default();
-        let _server = vfs.enable_wayland(b"/run/user/0").unwrap();
-        let socket = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
-        let mut address = vec![1, 0];
-        address.extend_from_slice(b"/run/user/0/wayland-0\0");
-        vfs.local_connect(&vfs.local_socket(socket).unwrap().unwrap(), &address)
-            .unwrap();
-        vfs.wayland_connection(socket).unwrap();
+        vfs.enable_wayland(b"/run/user/0").unwrap();
+        let auth = vfs.wayland_auth();
         let before = vfs.memfd_available();
-        let fd = vfs.memfd_create(b"retire-auth", 0).unwrap();
-        vfs.truncate_fd(fd, 16384).unwrap();
-        vfs.write(fd, &[31; 16384]).unwrap();
+        let file = vfs.memfd_create(b"not-cached", 0).unwrap();
+        vfs.truncate_fd(file, 16384).unwrap();
+        vfs.write(file, &[31; 16384]).unwrap();
         assert!(vfs.memfd_available() < before);
-        let pipe = vfs.pipe(0).unwrap();
-        let snapshot = vfs.wayland_auth_snapshot();
-        let retired = Arc::downgrade(snapshot.0.as_ref().unwrap());
-        drop(snapshot);
-        let membership = vfs.shared_files();
-        std::thread::spawn(move || assert_eq!(membership.close(pipe[0], 0), Some(Ok(()))))
-            .join()
-            .unwrap();
-        assert!(
-            retired.upgrade().is_none(),
-            "worker membership changes must retire inactive auth grants"
-        );
-        drop(vfs.wayland_auth_snapshot());
+        assert!(auth.resolve(file).is_err());
+        vfs.close(file).unwrap();
+        assert_eq!(vfs.memfd_available(), before);
+        let fd = vfs.local_create(1 | O_NONBLOCK, 0).unwrap();
+        vfs.local_connect(
+            &vfs.local_socket(fd).unwrap().unwrap(),
+            b"\x01\x00/run/user/0/wayland-0\0",
+        )
+        .unwrap();
+        let grant = auth.resolve(fd).unwrap();
+        let original = Arc::downgrade(&grant._file.open);
         vfs.close(fd).unwrap();
-        assert_eq!(
-            vfs.memfd_available(),
-            before,
-            "inactive authorization caches cannot retain closed file allocations"
-        );
+        let replacement = vfs.eventfd(29, 0).unwrap();
+        assert_eq!(replacement, fd);
+        assert!(original.upgrade().is_some());
+        drop(grant);
+        assert!(original.upgrade().is_none());
+        assert!(auth.resolve(fd).is_err());
+        assert_eq!(vfs.read(fd, 8).unwrap(), 29u64.to_le_bytes());
     }
     #[test]
     fn guest_unix_stream_reaches_the_native_wayland_server_with_standard_wire_messages() {
@@ -1409,7 +1365,7 @@ mod tests {
         };
         assert_eq!(response.data.len(), 24);
         assert_eq!(&response.data[..4], &2u32.to_ne_bytes());
-        assert!(vfs.wayland_connection(fd).unwrap().1 > 0);
+        assert!(vfs.wayland_connection(fd).unwrap().connection().1 > 0);
         drop(server);
     }
     #[test]

@@ -171,8 +171,8 @@ impl Context {
         }
         result
     }
-    /// All operations complete promptly. Only surface creation resolves an FD
-    /// on the namespace owner; submissions and result access run on CPU workers.
+    /// The caller supplies the accepted notification resource; surface creation,
+    /// submissions and result access run on the executing guest thread.
     pub fn invoke(
         &self,
         memory: &mut impl CpuMemory,

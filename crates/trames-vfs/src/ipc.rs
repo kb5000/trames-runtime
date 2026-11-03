@@ -14,7 +14,7 @@ pub(super) mod ownership;
 mod shared_graph_tests;
 mod shared_rights;
 pub(crate) use native::Services as NativeServices;
-pub use native::WaylandAuth;
+pub use native::{WaylandAuth, WaylandGrant};
 pub use shared_rights::SharedRights;
 
 #[derive(Clone, Default)]

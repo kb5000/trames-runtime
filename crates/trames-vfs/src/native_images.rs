@@ -60,6 +60,7 @@ impl ImageFds for Images {
         let mut entries = self.files.0.entries.lock().unwrap();
         let fd = entries
             .available(0)
+            .filter(|fd| *fd < self.files.descriptor_limit())
             .ok_or_else(|| io::Error::from_raw_os_error(24))?;
         entries.insert(
             fd,
@@ -94,6 +95,24 @@ mod tests {
         unsafe fn metal_texture(&self, _: usize) -> io::Result<Arc<trames_graphics::Texture>> {
             Err(io::Error::from_raw_os_error(95))
         }
+    }
+    #[test]
+    fn native_image_publication_observes_the_live_task_fd_limit() {
+        let vfs = Vfs::default();
+        let files = vfs.image_fds();
+        vfs.set_descriptor_limit(0);
+        let image = Arc::new(TestImage);
+        assert_eq!(
+            files.insert(image.clone()).unwrap_err().raw_os_error(),
+            Some(24)
+        );
+        vfs.set_descriptor_limit(MAX_FDS);
+        let fd = files.insert(image.clone()).unwrap();
+        let weak = Arc::downgrade(&image);
+        drop(image);
+        assert!(weak.upgrade().is_some());
+        files.close(fd);
+        assert!(weak.upgrade().is_none());
     }
     #[test]
     fn worker_image_fd_survives_dup_rights_transfer_and_import_lease() {

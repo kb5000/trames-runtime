@@ -54,6 +54,12 @@ pub struct Readiness {
 /// idle executor. The resource keeps only a weak reference, never a service
 /// thread or a cycle through the adapter's owned guest endpoint.
 pub trait ReadinessDriver: Send + Sync {
+    fn external(&self) -> bool {
+        true
+    }
+    fn notification_only(&self) -> bool {
+        false
+    }
     fn attach(&self, events: Arc<crate::HostEvents>) -> std::io::Result<()>;
 }
 /// A resource can acquire a native event source after a task already parked.
@@ -141,19 +147,22 @@ impl Readiness {
         self.armed.fetch_or(1, Ordering::AcqRel);
         drop(listeners);
         let driver = self.driver.get().and_then(Weak::upgrade);
-        let host_failed = driver.as_ref().is_some_and(|driver| {
-            signal
-                .target
-                .upgrade()
-                .and_then(|t| t.host_events())
-                .is_some_and(|events| driver.attach(events).is_err())
-        });
+        let host_failed = driver
+            .as_ref()
+            .filter(|d| d.external())
+            .is_some_and(|driver| {
+                signal
+                    .target
+                    .upgrade()
+                    .and_then(|t| t.host_events())
+                    .is_some_and(|events| driver.attach(events).is_err())
+            });
         IoSubscription {
             source: Some(self.clone()),
             id,
             host: None,
             host_failed,
-            external: driver.is_some(),
+            external: false,
             dynamic: None,
         }
     }
@@ -239,7 +248,23 @@ impl IoSubscription {
         }
         self
     }
+    pub fn notification_external(&self) -> bool {
+        self.source
+            .as_ref()
+            .and_then(|s| s.driver.get())
+            .and_then(Weak::upgrade)
+            .is_some_and(|d| d.notification_only() && d.external())
+    }
     pub fn external(&self) -> bool {
+        if self
+            .source
+            .as_ref()
+            .and_then(|s| s.driver.get())
+            .and_then(Weak::upgrade)
+            .is_some_and(|d| d.external())
+        {
+            return true;
+        }
         self.dynamic
             .as_ref()
             .map_or(self.external, |d| d.state.lock().unwrap().external)

@@ -89,6 +89,11 @@ impl PendingIo {
             .as_ref()
             .map_or_else(Vec::new, |file| file.fd.native_wait_fds())
     }
+    pub fn notification_external(&self) -> bool {
+        self._subscriptions
+            .iter()
+            .any(|s| s.notification_external())
+    }
     pub fn external_wait(&self) -> bool {
         self.retained_socket
             .as_ref()

@@ -1873,3 +1873,53 @@ Unix-bearing SCM_RIGHTS are worker paths. Passing an actually owner-only task,
 mount or proc control projection still crosses that resource's owner boundary;
 sharing a Unix carrier cannot manufacture Send/Sync authority for it. GPU auth
 snapshot refresh and structural VM/task/mount changes are separate subsystems.
+
+## Live native device authority — 2026-11-03
+
+Native device controls form one shared Mac/iPad subsystem batch. Audio OPEN,
+video CREATE_SURFACE, WSI connection authorization and explicit Vulkan
+device/instance destruction no longer return a cohort solely for owner-side
+resource lookup or destruction. Workers use the existing shared Context and
+original Files domain; no new service thread, message bus, ordinary guest memory
+fence or native-only permission policy is introduced.
+
+`NativeEvents` captures live Files membership and the joined executor's fallback
+wake token before dispatch. A worker-created eventfd can be accepted immediately.
+The accepted counter, rather than its numerical FD, remains in each native
+callback. Closing/reusing a slot cannot redirect a late callback. A weak readiness
+driver is installed only when a native producer actually appears. Both first
+admission and last producer release notify existing subscriptions; classification
+is live even if the original FD has closed. Ordinary eventfd construction and
+notification keep their previous path. The existing idle executor initializes its
+host wait source under the run-queue arm lock when a late native producer appears;
+it does not require a new resource thread or guest polling.
+
+`WaylandAuth` resolves one live original OFD for the duration of a native call.
+It neither snapshots the descriptor table nor retains unqueried inodes. Actual
+connection identity, original flags, permissions and backend error behavior are
+shared with owner-side calls. A new connection is visible without a membership
+revision; copied bytes do not grant access. Invalid/unregistered FDs finish with
+the backend's original error rather than triggering an authorization refresh.
+Native image publication uses the Files domain's actual descriptor limit.
+
+Explicit GPU close accepts its original target once. Unfinished native compilation
+and observed GPU submissions become existing asynchronous jobs, subscribed to
+the original completion readiness; the caller gives up its execution slot while
+unrelated CPUs run. Native Wayland frame fences use that same pinned completion
+observer. The original final native idle/destruction algorithm remains on the
+calling worker, preserving safety against concurrent native submissions. No
+claim is made that native driver destruction itself has zero cost. Drivers without
+the completion observer retain their original native drain behavior.
+
+Compiler tasks publish a release completion flag after delivering the result or
+disconnecting and after their Send-owned work ends. Polling acquires that flag
+before consuming results and dropping backend-owned dependencies. Completed tasks
+do not join notification delivery while holding a context lease. Only Send-owned
+arrays/handles and Arc native devices reach the existing compiler thread; private
+Rc resource graphs stay under the existing context mutex. Final cancellation of
+unfinished tasks retains the original join/lifetime boundary. No new production
+unsafe or broader Send implementation is required by this batch.
+
+Structural guest mapping import, task-exit/context cancellation, io_uring controls
+and filesystem/VM/task topology still have genuine owner boundaries. This batch
+does not claim a whole application or the complete runtime is coordinator-free.

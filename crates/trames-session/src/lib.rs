@@ -7,6 +7,7 @@ use trames_elf::{ElfError, LoadedElf};
 use trames_engine::{Cpu, CpuFault};
 use trames_linux::{GuestOutput, Linux};
 mod clock;
+mod devices;
 mod futex;
 mod gpu;
 mod process;

@@ -40,8 +40,8 @@ impl Context {
             streams: Mutex::default(),
         }))
     }
-    /// OPEN resolves the notification FD on the namespace owner. Transfers,
-    /// positions and controls are dispatched on the existing CPU worker.
+    /// The caller supplies the accepted original notification resource. Open,
+    /// transfers and controls run on the same executing guest thread.
     pub fn invoke(
         &self,
         memory: &mut impl CpuMemory,

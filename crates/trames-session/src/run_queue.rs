@@ -616,11 +616,18 @@ impl<C: Cpu> Epoch<C> {
                 .values()
                 .any(|j| j.io.as_ref().is_some_and(|io| io.external_wait()));
             if external && !q.host_waiting && (available.is_none() || !dispatched) {
-                let events = self
+                // A parked eventfd can acquire its first native producer on
+                // another worker. Its resource metadata wakes us; initialize
+                // the existing host wait hub here before arming it.
+                let Some(events) = self
                     .host_events
-                    .get()
-                    .and_then(Option::as_ref)
-                    .expect("host wait source");
+                    .get_or_init(|| trames_vfs::HostEvents::new().ok())
+                    .as_ref()
+                else {
+                    self.control.stop();
+                    self.notify(&mut q);
+                    continue;
+                };
                 q.host_waiting = true;
                 #[cfg(all(test, trames_interpreter_conformance))]
                 self.changed.notify_all();
@@ -825,6 +832,17 @@ impl<C: Cpu> Epoch<C> {
             assert!(!self.control.stopped(), "cohort stopped before GPU park");
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "GPU did not park");
+            q = self.changed.wait_timeout(q, left).unwrap().0;
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn await_io_park(&self, pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut q = self.queues.lock().unwrap();
+        while !q.parked.get(&pid).is_some_and(|j| j.io.is_some()) {
+            assert!(!self.control.stopped(), "cohort stopped before I/O park");
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "I/O did not park");
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
     }

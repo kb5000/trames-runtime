@@ -102,10 +102,6 @@ impl Context {
             available: Arc::default(),
         }))
     }
-    /// Device/instance teardown can drain native work and remains joined.
-    pub fn worker_operation(operation: u64) -> bool {
-        !matches!(operation, 2 | 9)
-    }
     pub fn try_lock(&self) -> Option<Lease<'_>> {
         match self.0.backend.try_lock() {
             Ok(backend) => Some(Lease {
@@ -263,15 +259,7 @@ mod tests {
         root.commit_parallel().unwrap();
     }
     #[test]
-    fn only_device_teardown_stays_out_of_worker_admission() {
-        for op in [2, 9] {
-            assert!(!Context::worker_operation(op));
-        }
-        for op in [
-            1, 3, 8, 17, 19, 20, 27, 38, 47, 51, 70, 79, 87, 91, 109, 110, 111, 150,
-        ] {
-            assert!(Context::worker_operation(op));
-        }
+    fn device_calls_keep_original_wire_faults_on_worker_views() {
         let context = Context::new(Backend::new());
         let (_root, mut memory) = view();
         assert!(context.invoke(&mut memory, 79, 0, 128, None).0.is_err());

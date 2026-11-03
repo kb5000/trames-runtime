@@ -15,7 +15,9 @@ struct NativeWriter {
 }
 impl Drop for NativeWriter {
     fn drop(&mut self) {
-        self.counter.native_writers.fetch_sub(1, Ordering::Relaxed);
+        if self.counter.native_writers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.counter.readiness.notify_atomic();
+        }
     }
 }
 impl NativeEvent {
@@ -35,6 +37,17 @@ pub(super) struct EventCounter {
     semaphore: bool,
     readiness: Arc<Readiness>,
     epoch: [AtomicU64; 2],
+}
+impl trames_shared::ReadinessDriver for EventCounter {
+    fn external(&self) -> bool {
+        self.native_writers.load(Ordering::Relaxed) != 0
+    }
+    fn notification_only(&self) -> bool {
+        true
+    }
+    fn attach(&self, _: Arc<HostEvents>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 impl EventCounter {
     pub(super) fn new(count: u64, semaphore: bool) -> Self {
@@ -1243,20 +1256,41 @@ impl DirectFds {
             .any(|a| theirs.iter().any(|b| a.shares_resource(b)))
     }
 }
-impl Vfs {
-    pub fn native_event(&self, fd: u32) -> Result<NativeEvent> {
-        let descriptor = self.descriptor(fd)?;
-        let open = descriptor.open.borrow();
-        match &open.control {
-            Some(events::SharedControl::Event(counter)) if open.flags.get() & O_PATH == 0 => {
+/// Live notification authority for the original Files domain. The fallback
+/// wake token belongs to the joined executor, even when a worker opens a device.
+#[derive(Clone)]
+pub struct NativeEvents {
+    files: SharedFiles,
+    owner: std::thread::Thread,
+}
+impl NativeEvents {
+    pub fn event(&self, fd: u32) -> Result<NativeEvent> {
+        let file = self.files.lookup(fd).unwrap_or(Err(Errno(22)))?;
+        match &file.open.control {
+            Some(events::SharedControl::Event(counter)) if file.open.flags.get() & O_PATH == 0 => {
                 counter.native_writers.fetch_add(1, Ordering::Relaxed);
-                Ok(NativeEvent(Arc::new(NativeWriter {
+                let driver = Arc::downgrade(counter);
+                counter.readiness.set_driver(driver);
+                let event = NativeEvent(Arc::new(NativeWriter {
                     counter: counter.clone(),
-                    owner: std::thread::current(),
-                })))
+                    owner: self.owner.clone(),
+                }));
+                counter.readiness.notify_atomic();
+                Ok(event)
             }
             _ => Err(Errno(22)),
         }
+    }
+}
+impl Vfs {
+    pub fn native_events(&self) -> NativeEvents {
+        NativeEvents {
+            files: self.shared_files(),
+            owner: std::thread::current(),
+        }
+    }
+    pub fn native_event(&self, fd: u32) -> Result<NativeEvent> {
+        self.native_events().event(fd)
     }
     /// Live eventfds with retained native producers are external event sources,
     /// just like open native sockets. A plain guest eventfd is not one.
@@ -1371,6 +1405,41 @@ impl RetainedFd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_native_producer_can_appear_after_subscription_and_keeps_the_joined_wake_owner() {
+        struct Wake(AtomicU64);
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut vfs = Vfs::default();
+        let events = vfs.native_events();
+        let fd = vfs.eventfd(0, O_NONBLOCK).unwrap();
+        let original = vfs.direct_descriptors().get(fd).unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(Wake(AtomicU64::new(0)));
+        let signal = IoSignal::new(1, Arc::downgrade(&target));
+        let subscriptions = original.subscribe(&signal);
+        assert!(subscriptions.iter().all(|s| !s.external()));
+        let event = std::thread::spawn(move || events.event(fd).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(event.0.owner.id(), std::thread::current().id());
+        assert!(signal.ready());
+        assert!(subscriptions
+            .iter()
+            .any(|s| s.notification_external() && s.external()));
+        vfs.close(fd).unwrap();
+        let replacement = vfs.eventfd(13, 0).unwrap();
+        assert_eq!(replacement, fd);
+        event.notify();
+        assert_eq!(original.read(8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(vfs.read(fd, 8).unwrap(), 13u64.to_le_bytes());
+        signal.reset();
+        drop(event);
+        assert!(signal.ready());
+        assert!(subscriptions.iter().all(|s| !s.external()));
+    }
     use super::*;
     use std::{thread, time::Duration};
     #[test]

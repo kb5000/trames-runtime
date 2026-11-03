@@ -140,6 +140,11 @@ struct Chain {
     mailbox: bool,
 }
 impl Wayland {
+    pub(super) fn idle(&self) -> bool {
+        self.pending
+            .iter()
+            .all(|p| !matches!(p.frame.completion.ready(), Ok(false)))
+    }
     pub(super) fn has_chain(&self, id: u64) -> bool {
         self.chains.contains_key(&id)
     }
@@ -736,6 +741,7 @@ impl Backend {
                     self.wayland.chains.get_mut(&a[2]).unwrap().retired = true;
                     return Err(e.into());
                 }
+                self.observe_raw_fence(completion.fence.as_raw());
                 for s in &dependencies {
                     s.state.set(0);
                 }

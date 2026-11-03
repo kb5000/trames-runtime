@@ -67,7 +67,7 @@ pub(super) struct Work<C: Cpu> {
     pub control: Arc<Control>,
     pub syscalls: Option<crate::worker_syscalls::Snapshot>,
     pub gpu: Option<crate::gpu::Authority>,
-    pub audio: Option<trames_audio::Context>,
+    pub audio: Option<crate::devices::Audio>,
 }
 #[derive(Default)]
 pub(super) struct GpuStats {
@@ -888,20 +888,18 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                             {
                                 work.cpu.clear_exclusive();
                                 let args = [work.cpu.x(0), work.cpu.x(1), work.cpu.x(2)];
-                                let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && trames_vulkan::Context::worker_operation(args[0]) && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
-                                let video = work.gpu.as_ref().filter(|_| *module == trames_video::PROFILE && args[0] != trames_video::CREATE_SURFACE);
-                                let audio=work.audio.as_ref().filter(|_|*module==trames_audio::PROFILE && args[0]!=trames_audio::OPEN);
+                                let gpu = work.gpu.as_ref().filter(|_| *module == trames_vulkan::PROFILE && (epoch.is_some() || !matches!(args[0], 27 | 70 | 110 | 111 | 201 | 202)));
+                                let video = work.gpu.as_ref().filter(|_| *module == trames_video::PROFILE);
+                                let audio=work.audio.as_ref().filter(|_|*module==trames_audio::PROFILE);
                                 let native = if let Some(authority)=audio {
                                     registry.authorize_stateful(work.memory.as_deref().expect("worker view"),*pc,*module,*function)
-                                        .and_then(|()|authority.invoke(work.memory.as_deref_mut().expect("worker view"),args[0],args[1],args[2],None).map_err(trames_accel::native::Error::Memory))
+                                        .and_then(|()|crate::devices::audio(&authority.context,Some(&authority.events),work.memory.as_deref_mut().expect("worker view"),args[0],args[1],args[2]).map_err(trames_accel::native::Error::Memory))
                                         .map(|value|trames_accel::native::Return {value,fallback:false})
                                 } else if let Some(authority) = video {
                                     registry.authorize_stateful(work.memory.as_deref().expect("worker view"), *pc, *module, *function)
                                         .and_then(|()| {
                                             let memory=work.memory.as_deref_mut().expect("worker view");
-                                            if matches!(args[0],trames_video::EXPORT_FRAME|trames_video::ALLOCATE_IMAGE) {
-                                                crate::video::image_call(&authority.video,&**authority.images.as_ref().expect("native image FD authority"),memory,args[0],args[1],args[2])
-                                            } else {authority.video.invoke(memory,args[0],args[1],args[2],None)}
+                                            crate::devices::video(&authority.video,authority.events.as_ref(),authority.images.as_ref(),memory,args[0],args[1],args[2])
                                         }
                                         .map(|value| trames_accel::native::Return { value, fallback: false })
                                         .map_err(trames_accel::native::Error::Memory))
@@ -2508,6 +2506,146 @@ mod tests {
         )
     }
     #[test]
+    fn native_notification_source_can_appear_after_park_and_fd_close_without_owner_service() {
+        let mut vfs = trames_vfs::Vfs::default();
+        let events = vfs.native_events();
+        let fd = vfs.eventfd(0, 0).unwrap();
+        let (work, mut memory) = direct_read_work(&vfs, fd);
+        let control = work.control.clone();
+        let mut pool = Pool::new(1);
+        let epoch = crate::run_queue::Epoch::with_events(control.clone(), pool.events(), true);
+        epoch.add(crate::run_queue::Job::new(work, 1, 0, None));
+        epoch.assign(&[(1, 0)]);
+        pool.ensure(0).unwrap();
+        pool.launch(0, epoch.clone()).unwrap();
+        epoch.await_io_park(1);
+        let event = std::thread::spawn(move || events.event(fd).unwrap())
+            .join()
+            .unwrap();
+        vfs.close(fd).unwrap();
+        assert_eq!(vfs.eventfd(93, 0).unwrap(), fd);
+        event.notify();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match pool
+                .event_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Some(Event::Idle) => {}
+                Some(Event::EpochStopped(0)) => break,
+                _ => panic!("native notification did not complete the parked read"),
+            }
+        }
+        let done = epoch.drain().pop().unwrap();
+        memory.commit_parallel().unwrap();
+        assert_eq!(
+            done.syscalls,
+            1,
+            "outcome={:?} io={} x0={} data={:?} waits={}",
+            done.outcome,
+            done.io.is_some(),
+            done.cpu.x(0),
+            memory.read_u64(0x2000),
+            done.waits
+        );
+        assert_eq!(epoch.pending_services(), 0);
+        assert_eq!(memory.read_u64(0x2000).unwrap(), 1);
+        assert_eq!(vfs.read(fd, 8).unwrap(), 93u64.to_le_bytes());
+    }
+    #[test]
+    fn native_audio_open_and_video_surface_creation_use_live_notification_fds_on_workers() {
+        let vfs = trames_vfs::Vfs::default();
+        let events = vfs.native_events();
+        let factory = vfs.descriptor_factory();
+        let fd = std::thread::spawn(move || factory.eventfd(0, 0).unwrap())
+            .join()
+            .unwrap();
+        for audio in [false, true] {
+            let profile = if audio {
+                trames_audio::PROFILE
+            } else {
+                trames_video::PROFILE
+            };
+            let operation = if audio {
+                trames_audio::OPEN
+            } else {
+                trames_video::CREATE_SURFACE
+            };
+            for candidate in [fd, u32::MAX] {
+                let control = Arc::new(Control::new(100));
+                let (mut work, mut memory) = native_work(
+                    1,
+                    [operation, 0x2000, 128],
+                    Permissions::RW,
+                    control.clone(),
+                );
+                drop(work.memory.take());
+                memory.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+                memory
+                    .write_array(
+                        0x1000,
+                        (0xd2800010u32 | ((profile as u32 & 0xffff) << 5)).to_le_bytes(),
+                    )
+                    .unwrap();
+                memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+                let mut record = [0u8; 128];
+                record[..8].copy_from_slice(&(candidate as u64).to_le_bytes());
+                if !audio {
+                    record[8..16].copy_from_slice(&64u64.to_le_bytes());
+                    record[16..24].copy_from_slice(&64u64.to_le_bytes());
+                }
+                memory.write(0x2000, &record).unwrap();
+                work.memory = Some(Box::new(
+                    memory.parallel_view(&mut Default::default()).unwrap(),
+                ));
+                let video = trames_video::Context::default();
+                if audio {
+                    <Cpu as trames_engine::Cpu>::set_audio_calls(&mut work.cpu, true);
+                    work.audio = Some(crate::devices::Audio {
+                        context: trames_audio::Context::new(0),
+                        events: events.clone(),
+                    });
+                } else {
+                    <Cpu as trames_engine::Cpu>::set_video_calls(&mut work.cpu, true);
+                    let mut authority: crate::gpu::Authority =
+                        trames_vulkan::Context::new(trames_vulkan::Backend::new()).into();
+                    authority.video = video.clone();
+                    authority.events = Some(events.clone());
+                    work.gpu = Some(authority);
+                }
+                let epoch = crate::run_queue::Epoch::new(control);
+                epoch.add(crate::run_queue::Job::new(work, 1, 0, None));
+                epoch.assign(&[(1, 0)]);
+                let mut pool = Pool::new(1);
+                pool.ensure(0).unwrap();
+                pool.launch(0, epoch.clone()).unwrap();
+                assert!(matches!(
+                    pool.event_timeout(Duration::from_secs(2)).unwrap(),
+                    Some(Event::EpochStopped(0))
+                ));
+                let done = epoch.drain().pop().unwrap();
+                let expected = if candidate == u32::MAX {
+                    -22i64
+                } else if audio {
+                    -13
+                } else {
+                    1
+                };
+                assert_eq!(done.cpu.x(0), expected as u64);
+                assert_eq!(done.instructions, 6);
+                assert_eq!(done.native.checkpoint_retries, 0);
+                assert_eq!(epoch.pending_services(), 0);
+                memory.commit_parallel().unwrap();
+                if !audio && candidate == fd {
+                    assert!(vfs.has_native_event_sources());
+                    memory.write_array(0x2000, 1u64.to_le_bytes()).unwrap();
+                    assert_eq!(video.invoke(&mut memory, 4, 0x2000, 128, None).unwrap(), 0);
+                    assert!(!vfs.has_native_event_sources());
+                }
+            }
+        }
+    }
+    #[test]
     fn actual_futex_wake_commits_locally_and_requests_only_a_scheduling_boundary() {
         let table = crate::futex::Futexes::default();
         let wait = table
@@ -3007,7 +3145,7 @@ mod tests {
         assert_eq!(memory.read_array::<24>(0x3000).unwrap(), [0; 24]);
     }
     #[test]
-    fn wayland_gpu_auth_runs_locally_for_frozen_grants_and_defers_before_effects_otherwise() {
+    fn live_wayland_gpu_auth_finishes_real_and_invalid_grants_without_owner_handoff() {
         let mut vfs = trames_vfs::Vfs::default();
         let _server = vfs.enable_wayland(b"/run/user/0").unwrap();
         let fd = vfs.local_create(1 | trames_vfs::O_NONBLOCK, 0).unwrap();
@@ -3019,7 +3157,7 @@ mod tests {
         let foreign = vfs.socketpair(1, 1, 0).unwrap()[0];
         let copied = vfs.memfd_create(b"copied-wsi-capability", 0).unwrap();
         vfs.write(copied, b"copied bytes").unwrap();
-        let auth = vfs.wayland_auth_snapshot();
+        let auth = vfs.wayland_auth();
         for candidate in [fd, foreign, copied] {
             let context = trames_vulkan::Context::new(trames_vulkan::Backend::new());
             let control = Arc::new(Control::new(100));
@@ -3044,18 +3182,12 @@ mod tests {
             ));
             let done = epoch.drain().pop().unwrap();
             if candidate == fd {
-                // The uninitialized virtual WSI rejects features after accepting
-                // the genuine connection. No Vulkan loader/driver is needed.
                 assert_eq!(done.cpu.x(0), (-8i64) as u64);
-                assert_eq!((done.gpu.calls, done.instructions), (1, 6));
             } else {
-                assert_eq!((done.gpu.calls, done.instructions), (0, 3));
-                assert_eq!(done.cpu.pc, 0x100c);
-                assert!(matches!(
-                    done.outcome,
-                    Some(SliceOutcome::NativeCall { .. })
-                ));
+                assert_eq!(done.cpu.x(0), (-1_000_000_000i64) as u64);
             }
+            assert_eq!((done.gpu.calls, done.instructions), (1, 6));
+            assert_eq!(done.native.checkpoint_retries, 0);
             memory.commit_parallel().unwrap();
             assert_eq!(memory.read_array::<32>(0x3000).unwrap(), [0xa5; 32]);
         }

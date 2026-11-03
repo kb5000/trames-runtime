@@ -61,13 +61,16 @@ impl Wait {
 }
 impl Backend {
     pub(super) fn observe_fence(&self, fence: &Object) {
+        self.observe_raw_fence(fence.raw);
+    }
+    pub(super) fn observe_raw_fence(&self, fence: u64) {
         #[cfg(trames_moltenvk)]
         {
             let data = Box::into_raw(Box::new(Arc::downgrade(&self.completion)));
             // SAFETY: only validated retained native fence handles reach here.
             // MoltenVK consumes the weak capability, calls it after its mutex
             // releases, and destroys it once even if the fence never signals.
-            unsafe { trames_mvk_observe_fence(fence.raw, notify, data.cast(), dispose) };
+            unsafe { trames_mvk_observe_fence(fence, notify, data.cast(), dispose) };
         }
         #[cfg(not(trames_moltenvk))]
         let _ = fence;
@@ -152,5 +155,150 @@ impl Backend {
             self.coherent_download(m)?;
         }
         result.map(Some)
+    }
+}
+
+pub(super) struct Teardown {
+    pub operation: u64,
+    pub target: u64,
+    pub abandoned: bool,
+}
+impl Backend {
+    fn validate_teardown(&self, operation: u64, target: u64) -> Result<()> {
+        if operation == 2 {
+            if target != self.instance_id {
+                return invalid();
+            }
+        } else {
+            if self.instance.is_none() {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED.into());
+            }
+            self.device(target)?;
+        }
+        Ok(())
+    }
+    pub(super) fn teardown_ready(&self) -> bool {
+        self.compiles.values().all(|c| c.task.completed())
+            && (!available()
+                || self
+                    .submissions
+                    .iter()
+                    .all(|s| !matches!(Self::fence_ready(&s.fence), Ok(false)))
+                    && self.wayland.idle())
+    }
+    pub(super) fn start_teardown(&mut self, operation: u64, target: u64) -> Result<Invocation> {
+        self.validate_teardown(operation, target)?;
+        if self.teardown_ready() {
+            self.finish_teardown(operation, target)?;
+            return Ok(Invocation::Complete(0));
+        }
+        let id = self.id();
+        self.teardowns.insert(
+            id,
+            Teardown {
+                operation,
+                target,
+                abandoned: false,
+            },
+        );
+        Ok(Invocation::Pending(id))
+    }
+    pub(super) fn poll_teardown(&mut self, job: u64) -> Result<Option<u64>> {
+        self.collect();
+        if !self.teardown_ready() {
+            return Ok(None);
+        }
+        let Some(job) = self.teardowns.remove(&job) else {
+            return Err(vk::Result::ERROR_DEVICE_LOST.into());
+        };
+        self.finish_teardown(job.operation, job.target)?;
+        Ok(Some(0))
+    }
+    pub(super) fn finish_teardown(&mut self, operation: u64, target: u64) -> Result<()> {
+        self.validate_teardown(operation, target)?;
+        // Keep the original final native idle/destruction algorithm. Pending
+        // compilation and observed GPU submissions have already released the
+        // execution slot; races with later calls retain original device safety.
+        self.clear_device();
+        if operation == 2 {
+            self.wsi.surfaces.clear();
+            self.wayland.surfaces.clear();
+            self.instance = None;
+            self.wsi_enabled = false;
+            self.instance_id = 0;
+            self.physical_id = 0;
+            self.capabilities = Default::default();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    struct Wake(mpsc::Sender<()>);
+    impl trames_shared::IoWake for Wake {
+        fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+            let _ = self.0.send(());
+        }
+    }
+    #[test]
+    fn device_teardown_defers_for_native_compilation_and_uses_the_accepted_target() {
+        let mut backend = Backend::new();
+        let (release, gate) = mpsc::channel();
+        let completion = Some(backend.completion.clone());
+        let task = crate::task::Task::spawn_notifying(completion, move || {
+            gate.recv().unwrap();
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })
+        .unwrap();
+        backend.compiles.insert(
+            37,
+            Compile {
+                task,
+                dependencies: Vec::new(),
+                bind_point: vk::PipelineBindPoint::COMPUTE,
+                creation_flags: 0,
+                subpass: 0,
+                vertex_inputs: Vec::new(),
+                static_states: 0,
+                output: 0,
+                abandoned: false,
+            },
+        );
+        let context = crate::Context::new(backend);
+        let mut memory = Memory::default();
+        memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        let Invocation::Pending(job) = context.invoke(&mut memory, 2, 0x1000, 128, None).0.unwrap()
+        else {
+            panic!("native compile must not join on this caller")
+        };
+        assert_eq!(context.poll(&mut memory, job).unwrap(), None);
+        let (send, receive) = mpsc::channel();
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Wake(send));
+        let signal = trames_shared::IoSignal::new(1, Arc::downgrade(&target));
+        let _subscription = context
+            .try_lock()
+            .unwrap()
+            .subscribe_compile(job, &signal)
+            .unwrap();
+        // Native work on another context remains runnable. The record can change
+        // while waiting; destruction still targets the original accepted ID.
+        let other = crate::Context::new(Backend::new());
+        memory.write_array(0x1000, 0x2000u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            other.invoke(&mut memory, 79, 0x1000, 128, None).0,
+            Ok(Invocation::Complete(0))
+        );
+        release.send(()).unwrap();
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(context.poll(&mut memory, job).unwrap(), Some(0));
+        assert!(!context.try_lock().unwrap().is_compile(37));
+        assert_eq!(
+            context.poll(&mut memory, job).unwrap(),
+            Some(vk::Result::ERROR_DEVICE_LOST.as_raw() as i64 as u64)
+        );
     }
 }

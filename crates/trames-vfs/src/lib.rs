@@ -38,7 +38,7 @@ mod disk_io;
 pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob, DiskSync, DiskSyncJob};
 mod direct_io;
 mod native_images;
-pub use direct_io::NativeEvent;
+pub use direct_io::{NativeEvent, NativeEvents};
 mod file_data;
 mod file_io;
 use direct_io::PipeResource;
@@ -73,7 +73,7 @@ pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
 pub use ipc::{
     LocalConnection, LocalDatagram, LocalOperation, LocalReceived, LocalResource, LocalRights,
-    LocalSocket, SharedRights, WaylandAuth,
+    LocalSocket, SharedRights, WaylandAuth, WaylandGrant,
 };
 pub use locks::{RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER};
 mod linux_namespace;

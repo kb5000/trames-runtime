@@ -15,6 +15,7 @@ pub(super) struct Authority {
     pub video: trames_video::Context,
     pub images: Option<Arc<dyn trames_graphics::ImageFds>>,
     pub auth: WaylandAuth,
+    pub events: Option<trames_vfs::NativeEvents>,
 }
 impl From<Context> for Authority {
     fn from(context: Context) -> Self {
@@ -23,6 +24,7 @@ impl From<Context> for Authority {
             video: Default::default(),
             images: None,
             auth: Default::default(),
+            events: None,
         }
     }
 }
@@ -149,15 +151,9 @@ impl Pending {
                         Ok(fd) => fd,
                         Err(e) => return Attempt::Complete(Err(Error::Memory(e))),
                     };
-                    let Some(authenticated) = u32::try_from(fd)
+                    u32::try_from(fd)
                         .ok()
-                        .and_then(|fd| authority.auth.resolve(fd))
-                    else {
-                        // The owner may need to pump a newly transferred right.
-                        // No backend or guest output effects have happened.
-                        return Attempt::Checkpoint;
-                    };
-                    Some(authenticated)
+                        .and_then(|fd| authority.auth.resolve(fd).ok())
                 } else {
                     None
                 };
@@ -166,7 +162,7 @@ impl Pending {
                 self.call.operation,
                 self.call.args[1],
                 self.call.args[2],
-                authenticated,
+                authenticated.as_ref().map(|grant| grant.connection()),
                 authority.images.as_ref(),
             );
             stats.record(self.call.pc, self.call.operation, &value, transfers);

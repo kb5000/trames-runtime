@@ -569,32 +569,15 @@ impl<C: Cpu> Kernel<C> {
             }
             self.native
                 .authorize_stateful(&p.memory, pc, module, function)?;
-            let notify = if a[0] == trames_audio::OPEN && a[2] == 128 {
-                let fd = p
-                    .memory
-                    .read_u64(a[1])
-                    .map_err(trames_accel::native::Error::Memory)?;
-                match u32::try_from(fd)
-                    .ok()
-                    .and_then(|fd| p.linux.vfs.native_event(fd).ok())
-                {
-                    Some(event) => {
-                        Some(std::sync::Arc::new(move || event.notify()) as trames_audio::Notify)
-                    }
-                    None => {
-                        return Ok(Some(trames_accel::native::Return {
-                            value: (-22i64) as u64,
-                            fallback: false,
-                        }))
-                    }
-                }
-            } else {
-                None
-            };
-            let value = self
-                .audio_context(p)
-                .invoke(&mut p.memory, a[0], a[1], a[2], notify)
-                .map_err(trames_accel::native::Error::Memory)?;
+            let value = crate::devices::audio(
+                &self.audio_context(p),
+                Some(&p.linux.vfs.native_events()),
+                &mut p.memory,
+                a[0],
+                a[1],
+                a[2],
+            )
+            .map_err(trames_accel::native::Error::Memory)?;
             return Ok(Some(trames_accel::native::Return {
                 value,
                 fallback: false,
@@ -606,51 +589,17 @@ impl<C: Cpu> Kernel<C> {
             }
             self.native
                 .authorize_stateful(&p.memory, pc, module, function)?;
-            if matches!(
+            let images = p.linux.vfs.image_fds();
+            let value = crate::devices::video(
+                &self.video_context(p),
+                Some(&p.linux.vfs.native_events()),
+                Some(&images),
+                &mut p.memory,
                 a[0],
-                trames_video::EXPORT_FRAME | trames_video::ALLOCATE_IMAGE
-            ) {
-                let files = p.linux.vfs.image_fds();
-                let value = crate::video::image_call(
-                    &self.video_context(p),
-                    &*files,
-                    &mut p.memory,
-                    a[0],
-                    a[1],
-                    a[2],
-                )
-                .map_err(trames_accel::native::Error::Memory)?;
-                return Ok(Some(trames_accel::native::Return {
-                    value,
-                    fallback: false,
-                }));
-            }
-            let notify = if a[0] == trames_video::CREATE_SURFACE && a[2] == 128 {
-                let fd = p
-                    .memory
-                    .read_u64(a[1])
-                    .map_err(trames_accel::native::Error::Memory)?;
-                match u32::try_from(fd)
-                    .ok()
-                    .and_then(|fd| p.linux.vfs.native_event(fd).ok())
-                {
-                    Some(event) => {
-                        Some(std::sync::Arc::new(move || event.notify()) as trames_video::Notify)
-                    }
-                    None => {
-                        return Ok(Some(trames_accel::native::Return {
-                            value: (-22i64) as u64,
-                            fallback: false,
-                        }))
-                    }
-                }
-            } else {
-                None
-            };
-            let value = self
-                .video_context(p)
-                .invoke(&mut p.memory, a[0], a[1], a[2], notify)
-                .map_err(trames_accel::native::Error::Memory)?;
+                a[1],
+                a[2],
+            )
+            .map_err(trames_accel::native::Error::Memory)?;
             return Ok(Some(trames_accel::native::Return {
                 value,
                 fallback: false,
@@ -688,7 +637,7 @@ impl<C: Cpu> Kernel<C> {
             a[0],
             a[1],
             a[2],
-            authenticated,
+            authenticated.as_ref().map(|grant| grant.connection()),
             images.as_ref(),
         );
         self.gpu_transfers.merge(transfers);
@@ -4212,10 +4161,15 @@ impl<C: Cpu> Kernel<C> {
                 context: self.gpu_context(p),
                 video: self.video_context(p),
                 images: Some(p.linux.vfs.image_fds()),
-                auth: p.linux.vfs.wayland_auth_snapshot(),
+                auth: p.linux.vfs.wayland_auth(),
+                events: Some(p.linux.vfs.native_events()),
             });
-            let audio = accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE)
-                .then(|| self.audio_context(p));
+            let audio = accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE).then(|| {
+                crate::devices::Audio {
+                    context: self.audio_context(p),
+                    events: p.linux.vfs.native_events(),
+                }
+            });
             let p = self.processes.get_mut(&id).expect("cohort process");
             let waiting = if let State::Futex { wait, deadline } = &p.state {
                 Some(crate::run_queue::WaitState::Futex {
@@ -5154,10 +5108,12 @@ impl<C: Cpu> Kernel<C> {
         }
         if sockets.is_empty()
             && native_fds.is_empty()
-            && self
-                .processes
-                .values()
-                .any(|p| p.linux.vfs.has_native_event_sources())
+            && self.processes.values().any(|p| {
+                p.linux.vfs.has_native_event_sources()
+                    || p.byte_wait
+                        .as_ref()
+                        .is_some_and(|wait| wait.notification_external())
+            })
         {
             // Native completion retains an unpark token, including when it
             // arrives after the last ready check but before this park.
