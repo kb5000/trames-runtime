@@ -8,6 +8,7 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 pub(super) struct FsHandle {
     pub shared: Arc<SharedCell<Filesystem>>,
     pub quota: Arc<file_accounting::FileQuota>,
+    pub namespace: Arc<std::sync::Mutex<()>>,
     #[cfg(all(feature = "hostfs", unix))]
     pub host: Option<Arc<hostfs::HostFs>>,
     overlay: Option<Arc<overlay::Overlay>>,
@@ -33,6 +34,7 @@ impl FsHandle {
             host: None,
             shared: Arc::new(SharedCell::new(data)),
             quota,
+            namespace: Arc::default(),
             overlay: None,
         }
     }
@@ -47,6 +49,7 @@ impl FsHandle {
             host: None,
             shared: Arc::new(SharedCell::new(data)),
             quota,
+            namespace: Arc::default(),
             overlay: Some(overlay),
         }
     }

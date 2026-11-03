@@ -42,6 +42,7 @@ impl Drop for PtyEnd {
             self.pair.notify();
             if let Some(mount) = self.pair.mount.as_ref().filter(|m| m.devpts.is_some()) {
                 let key = format!("/{}", self.pair.number).into_bytes();
+                let _namespace = mount.fs.namespace.lock().unwrap();
                 let mut fs = mount.fs.borrow_mut();
                 if fs
                     .paths
@@ -283,6 +284,7 @@ impl Devpts {
         Ok(out)
     }
     fn allocate_slave(&self, id: u32, credentials: &Credentials) -> Result<(u32, NodeRef)> {
+        let _namespace = self.fs.namespace.lock().unwrap();
         let mut fs = self.fs.borrow_mut();
         let number = (0..self.max)
             .find(|number| !fs.paths.contains_key(format!("/{number}").as_bytes()))

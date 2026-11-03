@@ -34,9 +34,8 @@ pub use uts::uts_call;
 mod timer;
 pub use syslog::syslog;
 mod uring;
-pub use timer::timerfd_control;
-mod xattr;
 pub use state::Linux;
+pub use timer::timerfd_control;
 
 pub fn fill_entropy(bytes: &mut [u8]) -> Result<(), trames_vfs::Errno> {
     getrandom::fill(bytes).map_err(|_| trames_vfs::Errno(5))

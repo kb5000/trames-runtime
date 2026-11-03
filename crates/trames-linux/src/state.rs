@@ -974,6 +974,9 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
+            5..=17 | 33..=38 | 43 | 44 | 49..=55 | 88 | 276 | 452 => {
+                crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
+            }
             92 => match a[0] as u32 {
                 // Only the native AArch64 Linux execution domain exists.
                 // Query and reselect it; other personality modes stay unsupported.
@@ -992,16 +995,10 @@ impl Linux {
                 }),
             427 => self.uring_register(a, memory),
             280 => self.bpf_syscall(a, memory),
-            5..=16 => self.xattr_syscall(number, a, memory),
-            51 => {
-                let path = Self::path(memory, a[0])?;
-                self.vfs.chroot(&path)?;
-                Ok(0)
-            }
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
             }
-            71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 | 452 => {
+            71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
                 self.file_syscall(number, a, memory, io)
             }
             279 => {
@@ -1057,38 +1054,6 @@ impl Linux {
             198..=212 | 242 => self.network_syscall(number, a, memory),
             269 => self.send_messages(a, memory),
             65 => self.readv(a, memory, io),
-            37 => {
-                if a[4] & !0x400 != 0 {
-                    return Err(Errno(22));
-                }
-                let old = Self::path(memory, a[1])?;
-                let new = Self::path(memory, a[3])?;
-                self.vfs.link_at(a[0] as i32, &old, a[2] as i32, &new)?;
-                Ok(0)
-            }
-            38 | 276 => {
-                let old = Self::path(memory, a[1])?;
-                let new = Self::path(memory, a[3])?;
-                self.vfs.rename_at(
-                    a[0] as i32,
-                    &old,
-                    a[2] as i32,
-                    &new,
-                    if number == 276 { a[4] as u32 } else { 0 },
-                )?;
-                Ok(0)
-            }
-            43 | 44 => {
-                let stat = if number == 43 {
-                    let path = Self::path(memory, a[0])?;
-                    self.vfs.statfs_at(&path)?
-                } else {
-                    self.vfs.statfs_fd(a[0] as u32)?
-                };
-                Self::check(memory, a[1], 120, Access::Write)?;
-                memory.write(a[1], &stat).map_err(|_| Errno(14))?;
-                Ok(0)
-            }
             45 => {
                 let path = Self::path(memory, a[0])?;
                 self.vfs.truncate_at(&path, a[1])?;
@@ -1102,38 +1067,6 @@ impl Linux {
                 self.vfs.allocate_fd(a[0] as u32, a[1], a[2], a[3])?;
                 Ok(0)
             }
-            52 => {
-                self.vfs.chmod_fd(a[0] as u32, a[1] as u32)?;
-                Ok(0)
-            }
-            53 => {
-                let path = Self::path(memory, a[1])?;
-                self.vfs.chmod_at(a[0] as i32, &path, a[2] as u32)?;
-                Ok(0)
-            }
-            54 => {
-                if a[4] & !0x1100 != 0 {
-                    return Err(Errno(22));
-                }
-                let path = Self::path(memory, a[1])?;
-                if path.is_empty() && a[4] & 0x1000 != 0 {
-                    self.vfs
-                        .chown_fd_at(a[0] as u32, a[2] as u32, a[3] as u32)?;
-                } else {
-                    self.vfs.chown_at(
-                        a[0] as i32,
-                        &path,
-                        a[2] as u32,
-                        a[3] as u32,
-                        a[4] & 0x100 != 0,
-                    )?;
-                }
-                Ok(0)
-            }
-            55 => {
-                self.vfs.chown_fd(a[0] as u32, a[1] as u32, a[2] as u32)?;
-                Ok(0)
-            }
             67 | 68 => self.positioned(a, memory, number == 68),
             82 | 83 => {
                 self.vfs.sync_fd(a[0] as u32, number == 83)?;
@@ -1143,41 +1076,8 @@ impl Linux {
                 self.vfs.sync()?;
                 Ok(0)
             }
-            88 => {
-                if a[3] & !0x100 != 0 {
-                    return Err(Errno(22));
-                }
-                let path = if a[1] == 0 {
-                    None
-                } else {
-                    Some(Self::path(memory, a[1])?)
-                };
-                let times = if a[2] == 0 {
-                    None
-                } else {
-                    Self::check(memory, a[2], 32, Access::Read)?;
-                    Some(std::array::from_fn(|i| {
-                        std::array::from_fn(|j| {
-                            memory
-                                .read_u64(a[2] + (i * 16 + j * 8) as u64)
-                                .expect("validated timespec") as i64
-                        })
-                    }))
-                };
-                self.vfs
-                    .set_times_flags(a[0] as i32, path.as_deref(), times, a[3] as u32)?;
-                Ok(0)
-            }
             23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),
             24 => Ok(self.vfs.dup3(a[0] as u32, a[1] as u32, a[2] as u32)? as u64),
-            35 => {
-                if a[2] & !0x200 != 0 {
-                    return Err(Errno(22));
-                }
-                let path = Self::path(memory, a[1])?;
-                self.vfs.unlink_at(a[0] as i32, &path, a[2] != 0)?;
-                Ok(0)
-            }
             63 => self.read(a, memory, io),
             64 => self.write(a, memory, io),
             66 => self.writev(a, memory, io),
@@ -1190,16 +1090,6 @@ impl Linux {
             }
             57 => {
                 self.vfs.close(a[0] as u32)?;
-                Ok(0)
-            }
-            33 => {
-                let path = Self::path(memory, a[1])?;
-                self.vfs.mknod_at(a[0] as i32, &path, a[2] as u32, a[3])?;
-                Ok(0)
-            }
-            34 => {
-                let path = Self::path(memory, a[1])?;
-                self.vfs.mkdir_at(a[0] as i32, &path, a[2] as u32)?;
                 Ok(0)
             }
             62 => self.fd_query(62, a, memory),
@@ -1216,26 +1106,6 @@ impl Linux {
                 Self::finish_stat(a, memory, stat)
             }
             80 => self.fd_query(80, a, memory),
-            17 => {
-                let mut bytes = self.vfs.cwd()?;
-                let len = bytes.len() + 1;
-                if a[1] < len as u64 {
-                    return Err(Errno(34));
-                }
-                Self::check(memory, a[0], len, Access::Write)?;
-                bytes.push(0);
-                memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
-                Ok(len as u64)
-            }
-            50 => {
-                self.vfs.chdir_fd(a[0] as u32)?;
-                Ok(0)
-            }
-            49 => {
-                let path = Self::path(memory, a[0])?;
-                self.vfs.chdir(&path)?;
-                Ok(0)
-            }
             25 if matches!(a[1], 1 | 3) => self.fd_query(25, a, memory),
             25 => {
                 let flags = self.vfs.flags(a[0] as u32)?;
@@ -1332,12 +1202,6 @@ impl Linux {
                     flags & 0x200 != 0,
                     flags & 0x100 != 0,
                 )?;
-                Ok(0)
-            }
-            36 => {
-                let target = Self::path(memory, a[0])?;
-                let path = Self::path(memory, a[2])?;
-                self.vfs.symlink_at(&target, a[1] as i32, &path)?;
                 Ok(0)
             }
             78 => {

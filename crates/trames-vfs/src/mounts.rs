@@ -769,7 +769,7 @@ impl Vfs {
         self.register_mounts(&mounts)?;
         // CLONE_NEWNS/unshare also detaches fs_struct. Keep the VFS API correct
         // when called directly with a shared context, not only through Kernel.
-        if Rc::strong_count(&self.context.paths) > 1 {
+        if self.context.paths.is_shared() {
             self.unshare_context();
         }
         {

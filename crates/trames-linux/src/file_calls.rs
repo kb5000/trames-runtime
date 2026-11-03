@@ -86,27 +86,6 @@ impl Linux {
                 self.vfs.sync_filesystem_fd(a[0] as u32)?;
                 Ok(0)
             }
-            452 => {
-                if a[3] & !0x1100 != 0 {
-                    return Err(Errno(22));
-                }
-                let path = if a[1] == 0 && a[3] & 0x1000 != 0 {
-                    Vec::new()
-                } else {
-                    Self::path(memory, a[1])?
-                };
-                if path.is_empty() && a[3] & 0x1000 != 0 {
-                    if a[0] as i32 == -100 {
-                        self.vfs.chmod_at(-100, b".", a[2] as u32)?;
-                    } else {
-                        self.vfs.chmod_fd_at(a[0] as u32, a[2] as u32)?;
-                    }
-                } else {
-                    self.vfs
-                        .chmod_at_flags(a[0] as i32, &path, a[2] as u32, a[3] & 0x100 != 0)?;
-                }
-                Ok(0)
-            }
             437 => {
                 let (flags, mode, resolve) = Self::decode_open_how(memory, a[2], a[3])?;
                 let path = Self::path(memory, a[1])?;

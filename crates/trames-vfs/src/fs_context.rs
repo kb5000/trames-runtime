@@ -32,20 +32,181 @@ pub(super) struct Paths {
     pub cwd_mount: Option<Rc<Mount>>,
     pub root_mount: Option<Rc<Mount>>,
 }
+// Canonical fs_struct path resources contain no owner Rc. A control view may
+// project mount topology locally, but cwd/root and their detached traversal pins
+// belong to the one original shared fs_struct.
+#[derive(Default)]
+struct SharedPaths {
+    #[cfg(all(feature = "hostfs", unix))]
+    host_cwd: Option<Arc<hostfs::OpenFile>>,
+    cwd_node: Option<NodeRef>,
+    root_node: Option<NodeRef>,
+    cwd_mount: Option<Arc<mounts::MountData>>,
+    root_mount: Option<Arc<mounts::MountData>>,
+    _cwd_pin: Option<mounts::DirectoryPin>,
+    _root_pin: Option<mounts::DirectoryPin>,
+}
+impl SharedPaths {
+    fn from_paths(paths: &Paths) -> Self {
+        let cwd_mount = paths.cwd_mount.as_ref().map(|m| m.shared.clone());
+        let root_mount = paths.root_mount.as_ref().map(|m| m.shared.clone());
+        Self {
+            #[cfg(all(feature = "hostfs", unix))]
+            host_cwd: paths.host_cwd.clone(),
+            cwd_node: paths.cwd_node.clone(),
+            root_node: paths.root_node.clone(),
+            _cwd_pin: cwd_mount.clone().map(mounts::DirectoryPin::new),
+            _root_pin: root_mount.clone().map(mounts::DirectoryPin::new),
+            cwd_mount,
+            root_mount,
+        }
+    }
+}
+#[derive(Default)]
+pub(super) struct PathStore {
+    shared: Arc<SharedCell<SharedPaths>>,
+    // Only this control view owns these Rc projections. Keep current mounts
+    // alive for owner-only weak namespace snapshots, without retaining every
+    // directory the process has ever visited.
+    projections: RefCell<Vec<Rc<Mount>>>,
+    pub(super) registry: Rc<RefCell<Vec<Weak<Mount>>>>,
+}
+impl PathStore {
+    fn project(&self, state: &SharedPaths) -> Paths {
+        // Most reads keep the same mount resources, even when cwd's inode has
+        // changed. Reuse this view's projections instead of rebuilding a mount
+        // graph or scanning its registry on every pathname lookup.
+        {
+            let cached = self.projections.borrow();
+            let lookup = |mount: &Option<Arc<mounts::MountData>>| match mount {
+                None => Some(None),
+                Some(mount) => cached
+                    .iter()
+                    .find(|m| Arc::ptr_eq(&m.shared, mount))
+                    .cloned()
+                    .map(Some),
+            };
+            if let (Some(cwd_mount), Some(root_mount)) =
+                (lookup(&state.cwd_mount), lookup(&state.root_mount))
+            {
+                return Paths {
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_cwd: state.host_cwd.clone(),
+                    cwd_node: state.cwd_node.clone(),
+                    root_node: state.root_node.clone(),
+                    cwd_mount,
+                    root_mount,
+                };
+            }
+        }
+        let mut cache = BTreeMap::new();
+        // Actual owner mounts retain their original namespace controls and
+        // mutable topology; a query's registry contains only fresh projections.
+        for mount in self.registry.borrow().iter().filter_map(Weak::upgrade) {
+            cache.insert(Arc::as_ptr(&mount.shared) as usize, mount);
+        }
+        for mount in self.projections.borrow().iter() {
+            cache
+                .entry(Arc::as_ptr(&mount.shared) as usize)
+                .or_insert_with(|| mount.clone());
+        }
+        let mut project =
+            |mount: &Arc<mounts::MountData>| Mount::query_projection(mount.clone(), &mut cache);
+        let paths = Paths {
+            #[cfg(all(feature = "hostfs", unix))]
+            host_cwd: state.host_cwd.clone(),
+            cwd_node: state.cwd_node.clone(),
+            root_node: state.root_node.clone(),
+            cwd_mount: state.cwd_mount.as_ref().map(&mut project),
+            root_mount: state.root_mount.as_ref().map(&mut project),
+        };
+        self.remember(&paths);
+        paths
+    }
+    fn remember(&self, paths: &Paths) {
+        *self.projections.borrow_mut() = paths
+            .cwd_mount
+            .iter()
+            .chain(paths.root_mount.iter())
+            .cloned()
+            .collect();
+    }
+    pub fn borrow(&self) -> Paths {
+        self.project(&self.shared.borrow())
+    }
+    pub fn borrow_mut(&self) -> PathsWrite<'_> {
+        let state = self.shared.borrow_mut();
+        let paths = self.project(&state);
+        PathsWrite {
+            store: self,
+            state,
+            paths,
+        }
+    }
+    fn shared(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            projections: RefCell::default(),
+            registry: self.registry.clone(),
+        }
+    }
+    fn fork(&self) -> Self {
+        let paths = self.borrow();
+        let result = Self {
+            shared: Arc::new(SharedCell::new(SharedPaths::from_paths(&paths))),
+            projections: RefCell::default(),
+            registry: self.registry.clone(),
+        };
+        result.remember(&paths);
+        result
+    }
+    pub fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.shared) > 1
+    }
+}
+pub(super) struct PathsWrite<'a> {
+    store: &'a PathStore,
+    state: std::sync::RwLockWriteGuard<'a, SharedPaths>,
+    paths: Paths,
+}
+impl std::ops::Deref for PathsWrite<'_> {
+    type Target = Paths;
+    fn deref(&self) -> &Paths {
+        &self.paths
+    }
+}
+impl std::ops::DerefMut for PathsWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Paths {
+        &mut self.paths
+    }
+}
+impl Drop for PathsWrite<'_> {
+    fn drop(&mut self) {
+        *self.state = SharedPaths::from_paths(&self.paths);
+        self.store.remember(&self.paths);
+    }
+}
 #[derive(Default)]
 pub(super) struct FsContext {
-    // Path/mount operations still join. This is deliberately not Send, and is
-    // separate from the umask capability shared with workers.
-    pub paths: Rc<RefCell<Paths>>,
+    pub paths: PathStore,
     mask: Umask,
 }
 impl FsContext {
     pub(super) fn share_mask(&mut self, other: &Self) {
         self.mask = other.mask.clone();
     }
+    /// Original fs_struct resources; local mount projections are always fresh.
+    pub(super) fn share_paths(&mut self, other: &Self) {
+        self.paths = PathStore {
+            shared: other.paths.shared.clone(),
+            projections: RefCell::default(),
+            registry: self.paths.registry.clone(),
+        };
+        self.mask = other.mask.clone();
+    }
     pub(super) fn shared(&self) -> Self {
         Self {
-            paths: self.paths.clone(),
+            paths: self.paths.shared(),
             mask: self.mask.clone(),
         }
     }
@@ -53,14 +214,14 @@ impl FsContext {
 impl Clone for FsContext {
     fn clone(&self) -> Self {
         Self {
-            paths: Rc::new(RefCell::new(self.paths.borrow().clone())),
+            paths: self.paths.fork(),
             mask: self.mask.fork(),
         }
     }
 }
 impl Vfs {
     pub fn shares_context_with(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.context.paths, &other.context.paths)
+        Arc::ptr_eq(&self.context.paths.shared, &other.context.paths.shared)
     }
     pub fn unshare_context(&mut self) {
         self.context = self.context.clone();
@@ -82,6 +243,9 @@ mod tests {
 
     #[test]
     fn shared_paths_and_mask_are_live_while_fork_copies_the_context() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<SharedPaths>();
+        send_sync::<SharedCell<SharedPaths>>();
         let mut parent = Vfs::default();
         parent.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
         parent.mkdir_at(AT_FDCWD, b"/b", 0o755).unwrap();

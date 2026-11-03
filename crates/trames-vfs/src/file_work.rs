@@ -146,6 +146,9 @@ pub enum FileOutcome {
     /// A genuine mapping-layout boundary, with original input retained. There
     /// have been no output effects; a copy retains its accepted input bytes.
     Layout(FileWork),
+    /// A namespace call met an original owner-only task/proc/mount resource,
+    /// before effects. Its copied operands and accepted shared FDs survive.
+    Owner(FileWork),
 }
 pub struct FileWork {
     paths: Box<PathQueries>,
@@ -156,6 +159,7 @@ pub struct FileWork {
     input_active: Option<FileActive>,
     open: Option<Box<PreparedOpen>>,
     sync_targets: Option<Vec<storage::FilesystemSync>>,
+    namespace: Option<Box<namespace_work::NamespaceWork>>,
 }
 struct FileActive(Arc<Inode>);
 impl Drop for FileActive {
@@ -182,6 +186,24 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
+    pub(super) fn namespace(paths: PathQueries, namespace: namespace_work::NamespaceWork) -> Self {
+        Self {
+            namespace: Some(Box::new(namespace)),
+            ..Self::sync_all(paths)
+        }
+    }
+    pub fn run_owner(self, vfs: &mut Vfs) -> FileReply {
+        let result = self
+            .namespace
+            .as_ref()
+            .expect("retained namespace owner call")
+            .run_owner(&self.paths, vfs);
+        FileReply {
+            result,
+            file_size_signal: false,
+            scratch: None,
+        }
+    }
     pub fn sync_all(paths: PathQueries) -> Self {
         Self {
             paths: Box::new(paths),
@@ -192,9 +214,13 @@ impl FileWork {
             input_active: None,
             open: None,
             sync_targets: None,
+            namespace: None,
         }
     }
     pub fn host_work(&self) -> bool {
+        if let Some(namespace) = &self.namespace {
+            return namespace.host_work();
+        }
         self.target
             .as_ref()
             .is_none_or(|target| target.host_work(&self.command))
@@ -209,6 +235,7 @@ impl FileWork {
             input_active: None,
             open: None,
             sync_targets: None,
+            namespace: None,
         }
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
@@ -221,10 +248,12 @@ impl FileWork {
             input_active: None,
             open: None,
             sync_targets: None,
+            namespace: None,
         }
     }
     pub fn queued(mut self) -> Self {
-        if self.sync_targets.is_none()
+        if self.namespace.is_none()
+            && self.sync_targets.is_none()
             && matches!(
                 self.command,
                 FileCommand::SyncAll | FileCommand::SyncFilesystem
@@ -312,6 +341,16 @@ impl FileWork {
         self
     }
     pub fn run(mut self) -> FileOutcome {
+        if let Some(namespace) = &self.namespace {
+            return match namespace.run(&self.paths) {
+                Some(result) => FileOutcome::Complete(FileReply {
+                    result,
+                    file_size_signal: false,
+                    scratch: None,
+                }),
+                None => FileOutcome::Owner(self),
+            };
+        }
         let reply = if let Some(targets) = &self.sync_targets {
             Some((
                 targets

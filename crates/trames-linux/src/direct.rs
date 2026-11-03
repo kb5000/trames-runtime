@@ -13,6 +13,7 @@ use trames_vfs::{IoSignal, IoSubscription, IoWake};
 pub(crate) mod file;
 mod ip_message;
 mod local_message;
+pub(crate) mod namespace;
 #[cfg(test)]
 mod netlink;
 mod socket_wait;
@@ -364,7 +365,9 @@ impl DirectSyscalls {
         self
     }
     pub fn supports_path_query(&self, number: u32) -> bool {
-        matches!(number, 27 | 48 | 56 | 61 | 62 | 78..=80 | 291 | 437 | 439) && self.paths.is_some()
+        (namespace::supported(number)
+            || matches!(number, 27 | 48 | 56 | 61 | 62 | 78..=80 | 291 | 437 | 439))
+            && self.paths.is_some()
     }
     pub fn invoke_path(
         &self,
@@ -372,6 +375,9 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if namespace::supported(number) {
+            return self.invoke_namespace(number, a, memory);
+        }
         let paths = self.paths.as_ref()?;
         if self.file_prepared(number, a) {
             return None;

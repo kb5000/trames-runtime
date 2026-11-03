@@ -137,6 +137,11 @@ impl Vfs {
             return Err(Errno(7));
         }
         let (node, fs) = self.xattr_node(fd, path, follow, true)?;
+        // This original filesystem-wide attribute budget and its checkpoint
+        // must commit/roll back together. No ordinary byte/metadata read uses
+        // this namespace transaction guard.
+        let _namespace = fs.namespace.lock().unwrap();
+        let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         self.xattr_allowed(&n, name, true)?;

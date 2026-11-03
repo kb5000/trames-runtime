@@ -2001,3 +2001,33 @@ file-to-pipe/socket transfers, structural VM/task topology and unfinished contex
 cancellation remain separate boundaries. This common implementation is shared by
 Mac HVF and the iPad interpreter. No new resource thread, polling bus, global
 algorithm lock, ordinary guest memory fence or unsafe block is introduced here.
+
+## Namespace, metadata and canonical fs_struct (2026-11-03)
+
+Directory create/remove, link/symlink/rename, chmod/chown/times/xattrs, cwd/chdir/
+fchdir/chroot and statfs use one imported namespace ABI on the caller, worker and
+joined compatibility entry. Canonical cwd/root and detached traversal pins are
+original shared fs_struct resources; each control island retains only its private
+Rc mount projections. CLONE_FS shares the original resource; fork/unshare copies
+it. The canonical state is compile-time checked Send+Sync, without widening the
+existing sealed PathQueries Send boundary.
+
+Short worker calls borrow their current island, and joined memory-only calls use
+their original VFS. Only native or retained work builds a fresh private island.
+Inputs and actual dirfd/OFD identities are accepted once; queued work owns no guest
+pointers. The old joined namespace/xattr ABI duplication is removed. Actual flat
+filesystem namespace transactions protect create/remove/link/rename and their
+checkpoint/rollback, including PTY creation/final-close. Original inode metadata
+transactions protect their multi-field changes; normal byte operations do not
+acquire these namespace/metadata transaction locks.
+
+Disk-backed namespace work uses the existing bounded pool and direct source
+completion. An owner-only proc/task/mount projection defers before effects and
+keeps copied inputs plus accepted shared FDs in FileOutcome::Owner. This is distinct
+from a mapped-file layout checkpoint. Existing persistence, permission, error-order,
+notification and supported-operation semantics remain. No namespace io_uring SQE
+extension, new service thread or production unsafe block is added by this batch.
+
+The [consolidated coordination/fallback audit](coordination-boundaries.md) is the
+current architecture inventory. Structural mount/task/VM and owner control paths
+remain; further coordinator-removal implementation is on hold after this batch.

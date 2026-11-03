@@ -17,6 +17,7 @@ fn value(work: FileWork) -> Result<FileValue> {
             reply.result
         }
         FileOutcome::Layout(_) => panic!("unexpected mapping-layout boundary"),
+        FileOutcome::Owner(_) => panic!("unexpected owner-only resource"),
     }
 }
 fn count(work: FileWork) -> Result<u64> {

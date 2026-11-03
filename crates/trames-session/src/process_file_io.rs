@@ -47,6 +47,11 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         match p.file_checkpoint.take().unwrap().take() {
+            trames_linux::FileBoundary::Owner { work, output } => {
+                let reply = work.run_owner(&mut p.linux.vfs);
+                p.file_entry = None;
+                output.apply(reply.result, &mut p.memory).map(Some)
+            }
             trames_linux::FileBoundary::Signal { value } => {
                 Self::queue_one(pid, p, 25, pid);
                 p.file_entry = None;

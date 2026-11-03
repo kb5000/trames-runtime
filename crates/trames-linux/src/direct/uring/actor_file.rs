@@ -54,6 +54,7 @@ impl FileIo {
         actor: &UringActor,
     ) -> Result<(i32, bool)> {
         match outcome {
+            FileOutcome::Owner(_) => unreachable!("io_uring data work has no namespace command"),
             FileOutcome::Layout(work) => {
                 actor.layouts.lock().unwrap().push(UringFileLayout {
                     work,

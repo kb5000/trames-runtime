@@ -72,10 +72,19 @@ pub enum FileOutput {
     Scalar(u64),
     Vectors(Vec<(u64, usize)>),
     Stat(u64),
-    CopyOffsets { from: u64, to: u64 },
+    Buffer {
+        address: u64,
+        capacity: u64,
+        query_size: bool,
+        zero: bool,
+    },
+    CopyOffsets {
+        from: u64,
+        to: u64,
+    },
 }
 impl FileOutput {
-    fn apply(
+    pub fn apply(
         &self,
         result: Result<trames_vfs::FileValue, Errno>,
         memory: &mut impl CpuMemory,
@@ -108,6 +117,21 @@ impl FileOutput {
                         memory.write(*address, &bytes).map_err(|_| Errno(14))?
                     }
                     Self::Vectors(parts) => Linux::scatter(memory, parts, &bytes)?,
+                    Self::Buffer {
+                        address,
+                        capacity,
+                        query_size,
+                        zero,
+                    } => {
+                        if !(*query_size && *capacity == 0) {
+                            if *capacity < bytes.len() as u64 {
+                                return Err(Errno(34));
+                            }
+                            Linux::check(memory, *address, bytes.len(), Access::Write)?;
+                            memory.write(*address, &bytes).map_err(|_| Errno(14))?;
+                        }
+                        return Ok(if *zero { 0 } else { bytes.len() as u64 });
+                    }
                     _ => unreachable!("accepted read output"),
                 }
                 Ok(bytes.len() as u64)
@@ -143,6 +167,10 @@ impl FilePending {
     }
 }
 pub enum FileBoundary {
+    Owner {
+        work: trames_vfs::FileWork,
+        output: FileOutput,
+    },
     Layout {
         work: trames_vfs::FileWork,
         output: FileOutput,
@@ -181,6 +209,10 @@ pub(super) struct PreparedFileCall {
     action: PreparedAction,
 }
 enum PreparedAction {
+    Owner {
+        work: trames_vfs::FileWork,
+        output: FileOutput,
+    },
     Host {
         work: trames_vfs::FileWork,
         output: FileOutput,
@@ -196,7 +228,8 @@ enum PreparedAction {
 }
 impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
-        matches!(number, 45..=47 | 56 | 62..=71 | 80..=83 | 267 | 285..=287 | 437)
+        namespace::supported(number)
+            || matches!(number, 45..=47 | 56 | 62..=71 | 80..=83 | 267 | 285..=287 | 437)
     }
     pub fn start_file_call(
         &self,
@@ -208,6 +241,12 @@ impl DirectSyscalls {
     ) -> Option<IoAttempt> {
         if !Self::file_call(number) {
             return None;
+        }
+        if namespace::supported(number) {
+            if let Some(value) = self.invoke_namespace(number, args, memory) {
+                return Some(IoAttempt::Complete(value));
+            }
+            return self.start_prepared_file(number, args, memory, pid, target);
         }
         if number == 45 {
             if self.file_prepared(number, args) {
@@ -243,7 +282,16 @@ impl DirectSyscalls {
         work: trames_vfs::FileWork,
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        let output = FileOutput::None;
+        self.prepare_filesystem_work(number, args, work, FileOutput::None, memory)
+    }
+    pub(super) fn prepare_filesystem_work(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        work: trames_vfs::FileWork,
+        output: FileOutput,
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
         let action = if work.host_work() {
             PreparedAction::Host { work, output }
         } else {
@@ -253,6 +301,7 @@ impl DirectSyscalls {
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
+                trames_vfs::FileOutcome::Owner(work) => PreparedAction::Owner { work, output },
             }
         };
         *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
@@ -284,6 +333,7 @@ impl DirectSyscalls {
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
+                trames_vfs::FileOutcome::Owner(work) => PreparedAction::Owner { work, output },
             }
         };
         *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
@@ -335,6 +385,9 @@ impl DirectSyscalls {
                 let value = self.finish_file_reply(reply, output, memory);
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
             }
+            PreparedAction::Owner { work, output } => {
+                IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner { work, output }))
+            }
             PreparedAction::Host { work, output } => {
                 self.submit_file_work(work, output, number, args, memory, pid, target)
             }
@@ -382,6 +435,22 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
+        if namespace::supported(number) {
+            let (call, output) = match namespace::import(number, args, memory) {
+                Ok(call) => call,
+                Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            };
+            if !vfs.namespace_host_work() {
+                // All instruction views are joined here. Use the original
+                // caller VFS directly, as before worker admission existed.
+                return Some(IoAttempt::Complete(output.apply(call.execute(vfs), memory)));
+            }
+            let work = vfs.path_queries().namespace_work(call);
+            if let Some(value) = self.prepare_filesystem_work(number, args, work, output, memory) {
+                return Some(IoAttempt::Complete(value));
+            }
+            return self.start_prepared_file(number, args, memory, pid, target);
+        }
         if number == 45 {
             let path = match Linux::path(memory, args[0]) {
                 Ok(path) => path,
@@ -512,6 +581,12 @@ impl DirectSyscalls {
                 } else {
                     IoAttempt::Complete(value)
                 }
+            }
+            Some(trames_vfs::FileOutcome::Owner(work)) => {
+                IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner {
+                    work,
+                    output: pending.output,
+                }))
             }
             Some(trames_vfs::FileOutcome::Layout(work)) => {
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {

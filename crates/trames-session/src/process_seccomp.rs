@@ -943,6 +943,78 @@ mod tests {
         }
     }
     #[test]
+    fn namespace_mutations_stay_on_workers_with_one_filter_decision() {
+        for slots in [1, 2] {
+            for decision in [ALLOW, 0x5007b] {
+                let mut p = super::super::tests::process();
+                p.memory.write(0x1234, b"/worker-namespace\0").unwrap();
+                let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
+                let mut code = Vec::new();
+                for (number, flags) in [(34, 0o700), (35, 0x200)] {
+                    code.extend([
+                        0x92800c60,
+                        mov(1, 0x1234),
+                        mov(2, flags),
+                        mov(8, number),
+                        0xd4000001,
+                    ]);
+                }
+                code.push(0x14000000 | ((-(code.len() as i32) as u32) & 0x03ffffff));
+                for (index, word) in code.into_iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu = Cpu::new(0x4000, 0);
+                p.affinity = (1 << slots) - 1;
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                ));
+                let mut peer = p.fork();
+                peer.parent = 1;
+                let mut kernel = super::super::tests::kernel();
+                kernel.cpu_count = 2;
+                kernel.workers = crate::workers::Pool::new(2);
+                kernel.per_cpu = vec![Duration::ZERO; 2];
+                kernel.processes.insert(1, p);
+                kernel.processes.insert(2, peer);
+                assert!(kernel
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                    .unwrap());
+                assert!(kernel.syscalls > 0);
+                assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+                assert_eq!(kernel.service_requests, 0);
+                if decision == ALLOW {
+                    assert!(
+                        kernel.syscalls > 100,
+                        "slots={slots} calls={}",
+                        kernel.syscalls
+                    );
+                    assert_eq!(
+                        kernel.worker_file_syscalls, kernel.syscalls,
+                        "slots={slots}"
+                    );
+                } else {
+                    assert_eq!(kernel.worker_file_syscalls, 0);
+                    assert_eq!(
+                        kernel.processes[&1]
+                            .linux
+                            .vfs
+                            .stat_at(AT_FDCWD, b"/worker-namespace"),
+                        Err(Errno(2))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn filtered_path_queries_complete_or_defer_with_one_entry_decision() {
         for (path, decision, direct) in [
             (b"/file\0".as_slice(), ALLOW, true),

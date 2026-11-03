@@ -8,8 +8,10 @@ use super::*;
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
     pub(super) devices: Arc<cgroup::DeviceAccess>,
+    pub(super) namespace_io: bool,
     pub(super) retained: Option<(u32, SharedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
+    pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
     deferred: Rc<Cell<bool>>,
     pub(super) file_layout_exclusive: bool,
     pub(super) capture_open: bool,
@@ -22,8 +24,10 @@ impl Authority {
         Self {
             files: vfs.shared_files(),
             devices: vfs.device_access(),
+            namespace_io: true,
             retained: None,
             peer: None,
+            accepted: None,
             deferred: Rc::new(Cell::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
@@ -35,8 +39,10 @@ impl Authority {
         Self {
             files: source.files.clone(),
             devices: source.devices.clone(),
+            namespace_io: source.namespace_io,
             retained: None,
             peer: None,
+            accepted: None,
             deferred: Rc::new(Cell::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
@@ -71,7 +77,13 @@ impl Authority {
                 });
             }
         }
-        let Some(file) = self.files.query_lookup(fd) else {
+        let lookup = self
+            .accepted
+            .as_ref()
+            .and_then(|files| files.get(&fd))
+            .cloned()
+            .unwrap_or_else(|| self.files.query_lookup(fd));
+        let Some(file) = lookup else {
             return self.defer();
         };
         let file = file?;
@@ -113,7 +125,9 @@ pub struct PathQueries {
     pub(super) view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
-// afresh, including mounts, fs context, pseudo state, dummy FD table and namespaces.
+// afresh, including mount projections, pseudo state, dummy FD table and namespaces.
+// Canonical cwd/root resources cross only through their original Arc fs_struct;
+// its PathsStore always constructs fresh private Rc mount projections.
 // Source resources cross only as their existing Send+Sync Arc capabilities,
 // including the actual pseudo inode cache (never runtime/task control state).
 // Query-local clones never escape a method. Send moves the entire private island
@@ -133,18 +147,7 @@ impl Vfs {
         let mut mounts = BTreeMap::new();
         let mut project =
             |mount: &Rc<Mount>| Mount::query_projection(mount.shared.clone(), &mut mounts);
-        let paths = self.context.paths.borrow();
-        {
-            let mut own = view.context.paths.borrow_mut();
-            own.cwd_node = paths.cwd_node.clone();
-            own.root_node = paths.root_node.clone();
-            own.cwd_mount = paths.cwd_mount.as_ref().map(&mut project);
-            own.root_mount = paths.root_mount.as_ref().map(&mut project);
-            #[cfg(all(feature = "hostfs", unix))]
-            {
-                own.host_cwd = paths.host_cwd.clone();
-            }
-        }
+        view.context.share_paths(&self.context);
         if let Some(namespace) = &self.mounts {
             let table = namespace.0.borrow();
             view.mounts = Some(MountNamespace(Rc::new(RefCell::new(mounts::Table {
@@ -184,6 +187,8 @@ impl Vfs {
                 .map_or_else(|| self.shared_files(), |q| q.files.clone()),
             retained: None,
             peer: None,
+            accepted: None,
+            namespace_io: self.namespace_host_work(),
             devices: self
                 .query
                 .as_ref()

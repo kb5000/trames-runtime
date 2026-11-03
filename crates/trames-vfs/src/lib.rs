@@ -42,9 +42,11 @@ pub use direct_io::{NativeEvent, NativeEvents};
 mod file_accounting;
 mod file_data;
 mod file_work;
+mod namespace_work;
 pub use file_work::{
     FileCommand, FileCopy, FileOutcome, FileReply, FileTarget, FileValue, FileWork,
 };
+pub use namespace_work::{NamespaceAttempt, NamespaceCall};
 mod file_io;
 use direct_io::PipeResource;
 pub use file_io::{DirectFile, DirectFiles, FileAccess, FileEpoch, PreparedFile};
@@ -309,6 +311,7 @@ type NodeRef = Arc<Inode>;
 struct Inode {
     regular_file: bool,
     active_file_work: std::sync::atomic::AtomicUsize,
+    metadata: std::sync::Mutex<()>,
     // Immutable device behavior belongs to inode identity, not its pathname.
     simple_device: Option<simple_device::Kind>,
     #[cfg(all(feature = "hostfs", unix))]
@@ -334,6 +337,7 @@ impl Inode {
         Self {
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             active_file_work: std::sync::atomic::AtomicUsize::new(0),
+            metadata: std::sync::Mutex::new(()),
             simple_device: simple_device::Kind::content(&node.content),
             #[cfg(all(feature = "hostfs", unix))]
             mount_target: std::sync::atomic::AtomicBool::new(false),
@@ -746,13 +750,18 @@ impl Vfs {
         let pid_ns = PidNamespace::default();
         let root_network = Arc::new(linux_namespace::RootNetwork::default());
         let network = root_network.network.borrow().clone();
+        let mount_registry: Rc<RefCell<Vec<Weak<Mount>>>> = Rc::default();
+        // Only this owner/control view uses this Rc registry. Query islands
+        // construct a fresh one before sharing canonical fs_struct resources.
+        let mut context = FsContext::default();
+        context.paths.registry = mount_registry.clone();
         Self {
             query: None,
             network,
             native_services: Arc::default(),
             fs,
             fds: DescriptorTable::default(),
-            context: FsContext::default(),
+            context,
             uts: UtsNamespace::default(),
             root_network,
             path_bindings: ipc::PathBindings::default(),
@@ -762,7 +771,7 @@ impl Vfs {
             pid_ns: pid_ns.clone(),
             pid_children: pid_ns,
             mounts: None,
-            mount_registry: Rc::default(),
+            mount_registry,
             mount_resources: Rc::default(),
             detached_mounts: Rc::default(),
             credentials: Credentials::default(),
@@ -1198,6 +1207,7 @@ impl Vfs {
         exclusive: bool,
     ) -> Result<()> {
         let filesystem = path.filesystem(self);
+        let _namespace = filesystem.namespace.lock().unwrap();
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
             let node = host.create(&filesystem, &path.key, &content, mode)?;
@@ -1213,13 +1223,15 @@ impl Vfs {
         let parent = if path == b"/" {
             None
         } else {
-            path.iter().rposition(|b| *b == b'/').and_then(|i| {
-                self.node(&ResolvedPath {
-                    key: path[..i.max(1)].to_vec(),
-                    mount: path.mount.clone(),
-                })
-                .ok()
-            })
+            let i = path.iter().rposition(|b| *b == b'/').ok_or(Errno(2))?;
+            let parent = self.node(&ResolvedPath {
+                key: path[..i.max(1)].to_vec(),
+                mount: path.mount.clone(),
+            })?;
+            if !matches!(parent.borrow().content, Content::Directory) {
+                return Err(Errno(20));
+            }
+            Some(parent)
         };
         let inherited = parent.as_ref().and_then(|p| {
             let p = p.borrow();
@@ -1661,7 +1673,7 @@ impl Vfs {
             return Err(Errno(17));
         }
         self.check_parent_write(&dest)?;
-        self.insert(dest, Content::Symlink(target.to_vec()), 0o120777)
+        self.insert_entry(dest, Content::Symlink(target.to_vec()), 0o120777, true)
     }
     pub fn readlink_at(&self, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
         // readlinkat has implicit AT_EMPTY_PATH support for an O_PATH handle
@@ -1790,6 +1802,7 @@ impl Vfs {
             return Err(Errno(18));
         }
         let filesystem = dest.filesystem(self);
+        let _namespace = filesystem.namespace.lock().unwrap();
         #[cfg(all(feature = "hostfs", unix))]
         let host_source = source.key.clone();
         let source = self.node(source)?;
@@ -1863,10 +1876,11 @@ impl Vfs {
             return self.cgroup_mkdir(&p, mode);
         }
         self.check_parent_write(&p)?;
-        self.insert(
+        self.insert_entry(
             p,
             Content::Directory,
             0o40000 | (mode & 0o7777 & !self.umask()),
+            true,
         )
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
@@ -1894,10 +1908,12 @@ impl Vfs {
             _ => Content::File(self.empty_data_at(&p)?),
         };
         let type_ = if type_ == 0 { 0o100000 } else { type_ };
-        self.insert(p, content, type_ | (mode & 0o7777 & !self.umask()))
+        self.insert_entry(p, content, type_ | (mode & 0o7777 & !self.umask()), true)
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
         let p = self.resolve_final(dirfd, path, false)?;
+        let filesystem = p.filesystem(self);
+        let _namespace = filesystem.namespace.lock().unwrap();
         if self.is_mount_root(&p) {
             return Err(Errno(16));
         }

@@ -29,6 +29,7 @@ impl Vfs {
             return Err(Errno(18));
         }
         let filesystem = source.filesystem(self);
+        let _namespace = filesystem.namespace.lock().unwrap();
         let src = self.node(&source)?;
         self.check_parent_write(&source)?;
         self.check_parent_write(&dest)?;
@@ -149,6 +150,7 @@ impl Vfs {
         Ok(())
     }
     fn chmod_node(&self, node: NodeRef, mode: u32, persistent: bool) -> Result<()> {
+        let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {
@@ -269,6 +271,7 @@ impl Vfs {
                 .clone()
                 .ok_or(Errno(22))?,
         };
+        let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         if values.iter().all(Option::is_none) {
             return Ok(());

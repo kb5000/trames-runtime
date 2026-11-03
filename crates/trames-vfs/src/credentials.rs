@@ -288,6 +288,7 @@ impl Vfs {
         self.credentials.allows_node(node, bits)
     }
     fn chown_node(&self, node: NodeRef, uid: u32, gid: u32, persistent: bool) -> Result<()> {
+        let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;

@@ -248,3 +248,48 @@ fn pathname_truncate_retains_the_resolved_file_and_imported_path_through_native_
     drop((direct, v));
     std::fs::remove_dir_all(directory).unwrap();
 }
+#[test]
+fn namespace_call_retains_original_path_and_dirfd_across_native_wait_and_reuse() {
+    let (path, mut v) = disk();
+    v.mkdir_at(-100, b"/old", 0o755).unwrap();
+    v.mkdir_at(-100, b"/other", 0o755).unwrap();
+    let fd = v.open_at(-100, b"/old", 0, 0).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+    memory.write(0x10000, b"child\0").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let direct = DirectSyscalls::default()
+        .with_paths(v.path_queries())
+        .with_file_executor(Arc::new(Queue(send)));
+    let target = t();
+    let args = [fd as u64, 0x10000, 0o700, 0, 0, 0];
+    let Some(IoAttempt::Blocked(wait)) =
+        direct.start_file_call(34, args, &mut memory, 1, &Arc::downgrade(&target))
+    else {
+        panic!("persistent namespace work must release the execution slot")
+    };
+    let pending = wait.file_pending().unwrap();
+    drop((wait, direct));
+    memory.write(0x10000, b"other\0").unwrap();
+    v.close(fd).unwrap();
+    assert_eq!(v.open_at(-100, b"/other", 0, 0).unwrap(), fd);
+    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    std::thread::spawn(move || result.complete(work.run()))
+        .join()
+        .unwrap();
+    assert!(matches!(
+        DirectSyscalls::default().start_retained_file(
+            pending,
+            34,
+            args,
+            &mut memory,
+            1,
+            &Arc::downgrade(&target)
+        ),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert!(v.stat_at(-100, b"/old/child").is_ok());
+    assert_eq!(v.stat_at(-100, b"/other/other"), Err(Errno(2)));
+    drop(v);
+    std::fs::remove_dir_all(path).unwrap();
+}
