@@ -154,8 +154,6 @@ pub(super) struct Done<C: Cpu> {
 pub(super) enum Event<C: Cpu> {
     Done(Box<Done<C>>),
     Service(Box<Request<C>>),
-    DiskRead(usize, Result<Vec<u8>, trames_vfs::Errno>),
-    DiskSync(usize, Result<(), trames_vfs::Errno>),
     EpochStopped(usize),
     VmReady,
     Idle,
@@ -317,41 +315,21 @@ struct DiskWorker {
     send: mpsc::Sender<DiskJob>,
     join: thread::JoinHandle<()>,
 }
-enum DiskJob {
-    Read(usize, trames_vfs::DiskReadJob, Vec<u8>),
-    Sync(usize, trames_vfs::DiskSyncJob),
-    UringSync(trames_vfs::DiskSyncJob, Arc<trames_linux::UringDiskResult>),
-}
+struct DiskJob(trames_vfs::FileWork, Arc<trames_linux::FileResult>);
 impl DiskJob {
-    fn run<C: Cpu>(self, cache: &mut trames_vfs::DiskReadCache) -> Option<Event<C>> {
-        Some(match self {
-            Self::Read(id, job, bytes) => Event::DiskRead(
-                id,
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    job.run_cached(cache, bytes)
-                }))
-                .unwrap_or(Err(trames_vfs::Errno(5))),
-            ),
-            Self::Sync(id, job) => Event::DiskSync(
-                id,
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
-                    .unwrap_or(Err(trames_vfs::Errno(5))),
-            ),
-            Self::UringSync(job, result) => {
-                result.complete(
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
-                        .unwrap_or(Err(trames_vfs::Errno(5))),
-                );
-                return None;
-            }
-        })
+    fn run(self) {
+        let Self(job, result) = self;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
+            Ok(reply) => result.complete(reply),
+            Err(_) => result.fail(5),
+        }
     }
 }
 struct DiskPool<C: Cpu> {
     workers: Mutex<Vec<DiskWorker>>,
     next: AtomicUsize,
     limit: usize,
-    send: mpsc::Sender<Event<C>>,
+    marker: std::marker::PhantomData<fn() -> C>,
     closed: AtomicBool,
 }
 impl<C: Cpu> DiskPool<C> {
@@ -359,9 +337,7 @@ impl<C: Cpu> DiskPool<C> {
         let mut workers = self.workers.lock().unwrap();
         if self.closed.load(Ordering::Relaxed) {
             drop(workers);
-            if let DiskJob::UringSync(_, result) = job {
-                result.complete(Err(trames_vfs::Errno(5)));
-            }
+            job.1.fail(5);
             return;
         }
         // The existing lazy pool keeps at most two host workers. Ordinary
@@ -369,32 +345,11 @@ impl<C: Cpu> DiskPool<C> {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.limit;
         if index >= workers.len() {
             let (send, receive) = mpsc::channel::<DiskJob>();
-            let done = self.send.clone();
             if let Ok(join) = thread::Builder::new()
                 .name("trames-disk".into())
                 .spawn(move || {
-                    let mut cache = trames_vfs::DiskReadCache::default();
-                    loop {
-                        let work = match receive.recv_timeout(Duration::from_millis(250)) {
-                            Ok(work) => work,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                // Open host descriptors can retain deleted data
-                                // blocks even after their Weak object expires.
-                                // Release idle handles, then sleep without a
-                                // recurring idle timer until the next request.
-                                cache = trames_vfs::DiskReadCache::default();
-                                match receive.recv() {
-                                    Ok(work) => work,
-                                    Err(_) => break,
-                                }
-                            }
-                        };
-                        if let Some(event) = work.run::<C>(&mut cache) {
-                            if done.send(event).is_err() {
-                                break;
-                            }
-                        }
+                    while let Ok(work) = receive.recv() {
+                        work.run();
                     }
                 })
             {
@@ -412,10 +367,9 @@ impl<C: Cpu> DiskPool<C> {
             job
         };
         // Thread resource failure preserves one execution and one completion.
-        if let Some(event) = job.run::<C>(&mut trames_vfs::DiskReadCache::default()) {
-            let _ = self.send.send(event);
-        }
+        job.run();
     }
+
     fn shutdown(&self) {
         let workers = {
             let mut workers = self.workers.lock().unwrap();
@@ -428,9 +382,10 @@ impl<C: Cpu> DiskPool<C> {
         }
     }
 }
-impl<C: Cpu> trames_linux::UringDiskExecutor for DiskPool<C> {
-    fn submit(&self, job: trames_vfs::DiskSyncJob, result: Arc<trames_linux::UringDiskResult>) {
-        self.submit(DiskJob::UringSync(job, result));
+impl<C: Cpu> trames_linux::FileExecutor for DiskPool<C> {
+    fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<trames_linux::FileResult>) {
+        result.begin();
+        self.submit(DiskJob(job.queued(), result));
     }
 }
 pub(super) struct Pool<C: Cpu> {
@@ -443,7 +398,6 @@ pub(super) struct Pool<C: Cpu> {
     active_native: Arc<AtomicUsize>,
     profile_native_overlap: bool,
     disk: Arc<DiskPool<C>>,
-    disk_buffers: Vec<Vec<u8>>,
 }
 impl<C: Cpu> Pool<C> {
     pub fn events(&self) -> mpsc::Sender<Event<C>> {
@@ -461,7 +415,7 @@ impl<C: Cpu> Pool<C> {
                 workers: Mutex::new(Vec::new()),
                 next: AtomicUsize::new(0),
                 limit: count.clamp(1, 2),
-                send: send.clone(),
+                marker: std::marker::PhantomData,
                 closed: AtomicBool::new(false),
             }),
             send,
@@ -471,7 +425,6 @@ impl<C: Cpu> Pool<C> {
             peak_native: Arc::new(AtomicUsize::new(0)),
             active_native: Arc::new(AtomicUsize::new(0)),
             profile_native_overlap,
-            disk_buffers: Vec::new(),
         }
     }
     pub fn ensure(&mut self, index: usize) -> std::io::Result<()> {
@@ -596,7 +549,9 @@ impl<C: Cpu> Pool<C> {
                                     let call = job.retry.take().unwrap();
                                     let tcp_handoff=call.tcp_liveness.is_some();
                                     let _tcp_liveness=call.tcp_liveness;
-                                    if let Some(uring) = call.uring {
+                                    if let Some(file) = call.file {
+                                        snapshot.direct.start_retained_file(file,call.number,call.args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(uring) = call.uring {
                                         snapshot.direct.start_retained_uring(uring, call.args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
                                     } else if let Some(socket) = call.retained_socket {
                                         snapshot.direct.start_retained_socket(socket,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
@@ -627,7 +582,15 @@ impl<C: Cpu> Pool<C> {
                                         parked_io = Some(pending);
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
-                                    trames_linux::IoAttempt::ByteCheckpoint(file) => {
+                                    trames_linux::IoAttempt::FileCheckpoint(file) => {
+    let saved = saved_call.as_ref().expect("retained byte call");
+    let call = crate::run_queue::IoCall::from_file_checkpoint(file, saved.number, saved.args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break SliceOutcome::Syscall {instructions:0};
+},
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
     let saved = saved_call.as_ref().expect("retained byte call");
     let call = crate::run_queue::IoCall::from_byte(file, saved.number, saved.args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
@@ -720,7 +683,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 work.cpu.clear_exclusive();
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
-                                        && (snapshot.direct.supports_creation(work.cpu.x(8) as u32)
+                                        && (trames_linux::DirectSyscalls::file_call(work.cpu.x(8) as u32)
+                                            || snapshot.direct.supports_creation(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_socket_control(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_local_message(work.cpu.x(8) as u32, work.cpu.x(0) as u32)
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
@@ -734,6 +698,61 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     let args = std::array::from_fn(|i| work.cpu.x(i));
                                     let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if entry.allowed() {
+                                        if let Some(epoch) = &epoch {
+                                        if snapshot.direct.supports_call(number, args) {
+                                            let attempt = snapshot.direct.start(number, args,
+                                                work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None)
+                                                .expect("retained I/O");
+                                            if let Some(began) = began { syscall_time += began.elapsed(); }
+                                            match attempt {
+                                                trames_linux::IoAttempt::Complete(result) => {
+                                                    work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    syscalls += 1;
+                                                    continue;
+                                                }
+                                                trames_linux::IoAttempt::Blocked(pending) => {
+                                                    parked_io = Some(pending);
+                                                    break SliceOutcome::Yield { instructions: 0 };
+                                                }
+                                                trames_linux::IoAttempt::FileCheckpoint(file) => {
+    let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break result;
+},
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
+    let call = crate::run_queue::IoCall::from_byte(file, number, args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break result;
+},
+trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                        work.cpu.set_x(8,socket.number as u64);
+                                        job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
+                                                trames_linux::IoAttempt::Checkpoint => { job.seccomp_entry = Some(entry); break result; },
+                                            }
+                                        }
+                                        if let Some(attempt) = snapshot.direct.start_file_call(number, args,
+                                            work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target) {
+                                            if let Some(began) = began { syscall_time += began.elapsed(); }
+                                            match attempt {
+                                                trames_linux::IoAttempt::Complete(value) => {
+                                                    work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    syscalls += 1; continue;
+                                                }
+                                                trames_linux::IoAttempt::Blocked(pending) => {
+                                                    parked_io = Some(pending); break SliceOutcome::Yield { instructions: 0 };
+                                                }
+                                                trames_linux::IoAttempt::FileCheckpoint(file) => {
+                                                    job.retry = Some(crate::run_queue::IoCall::from_file_checkpoint(file, number, args));
+                                                    job.seccomp_entry = Some(entry); break result;
+                                                }
+                                                _ => unreachable!("typed file entry"),
+                                            }
+                                        }
+                                        }
                                         if let Some(value)=snapshot.direct.invoke_epoll_control(number,args,work.memory.as_deref().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
@@ -745,7 +764,14 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                                 match attempt {
                                                     trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
-                                                    trames_linux::IoAttempt::ByteCheckpoint(file) => {
+                                                    trames_linux::IoAttempt::FileCheckpoint(file) => {
+    let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break result;
+},
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
     let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
@@ -766,7 +792,12 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                     match attempt {
                                                         trames_linux::IoAttempt::Complete(value) => { work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
                                                         trames_linux::IoAttempt::Blocked(pending) => { parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
-                                                        trames_linux::IoAttempt::ByteCheckpoint(file) => {
+                                                        trames_linux::IoAttempt::FileCheckpoint(file) => {
+                                                            let call=crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
+                                                            for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+                                                            work.cpu.set_x(8,call.number as u64);job.retry=Some(call);break result;
+                                                        },
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                             let call=crate::run_queue::IoCall::from_byte(file, number, args);
                                                             for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                                             work.cpu.set_x(8,call.number as u64);job.retry=Some(call);break result;
@@ -862,12 +893,20 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                     if let Some(epoch) = &epoch {
                                         let number = work.cpu.x(8) as u32;
                                         let args = std::array::from_fn(|i| work.cpu.x(i));
+
                                         if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                 trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
-                                                trames_linux::IoAttempt::ByteCheckpoint(file) => {
+                                                trames_linux::IoAttempt::FileCheckpoint(file) => {
+    let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break result;
+},
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
     let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
@@ -895,7 +934,14 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                     parked_io = Some(pending);
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
-                                                trames_linux::IoAttempt::ByteCheckpoint(file) => {
+                                                trames_linux::IoAttempt::FileCheckpoint(file) => {
+    let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
+    for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
+    work.cpu.set_x(8,call.number as u64);
+    job.retry=Some(call);
+    break result;
+},
+trames_linux::IoAttempt::ByteCheckpoint(file) => {
     let call = crate::run_queue::IoCall::from_byte(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
     work.cpu.set_x(8,call.number as u64);
@@ -908,6 +954,25 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                 trames_linux::IoAttempt::Checkpoint => break result,
                                             }
                                         }
+                                        if let Some(attempt) = snapshot.direct.start_file_call(number, args,
+                                            work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target) {
+                                            if let Some(began) = began { syscall_time += began.elapsed(); }
+                                            match attempt {
+                                                trames_linux::IoAttempt::Complete(value) => {
+                                                    work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    syscalls += 1; continue;
+                                                }
+                                                trames_linux::IoAttempt::Blocked(pending) => {
+                                                    parked_io = Some(pending); break SliceOutcome::Yield { instructions: 0 };
+                                                }
+                                                trames_linux::IoAttempt::FileCheckpoint(file) => {
+                                                    job.retry = Some(crate::run_queue::IoCall::from_file_checkpoint(file, number, args));
+                                                    break result;
+                                                }
+                                                _ => unreachable!("typed file entry"),
+                                            }
+                                        }
+
                                     }
                                     if let Some(value) = snapshot
                                         .invoke(&work.cpu, work.memory.as_deref_mut().expect("worker view"))
@@ -1220,25 +1285,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
         worker.epoch = Some(epoch.clone());
         worker.send.send(Command::<C>::Epoch(epoch)).map_err(|_| ())
     }
-    pub fn disk_read(&mut self, id: usize, job: trames_vfs::DiskReadJob) {
-        let bytes = self.disk_buffers.pop().unwrap_or_default();
-        self.disk_job(DiskJob::Read(id, job, bytes));
-    }
-    pub fn disk_sync(&mut self, id: usize, job: trames_vfs::DiskSyncJob) {
-        self.disk_job(DiskJob::Sync(id, job));
-    }
-    pub fn uring_disk(&self) -> Arc<dyn trames_linux::UringDiskExecutor> {
+    pub fn file_executor(&self) -> Arc<dyn trames_linux::FileExecutor> {
         self.disk.clone()
-    }
-    fn disk_job(&mut self, job: DiskJob) {
-        self.disk.submit(job);
-    }
-    pub fn recycle_disk_buffer(&mut self, bytes: Vec<u8>) {
-        // Keep initialized lengths so equal-size reads need no repeated zeroing.
-        // A short read truncates before scatter; no stale tail reaches guest.
-        if self.disk_buffers.len() < 2 {
-            self.disk_buffers.push(bytes);
-        }
     }
     fn received(&mut self, event: Event<C>) -> Event<C> {
         if let Event::<C>::EpochStopped(slot) = &event {
@@ -1268,11 +1316,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
             match self.received(event) {
                 Event::<C>::Done(done) => return Ok(*done),
                 Event::<C>::Service(request) => request.respond(None),
-                Event::<C>::DiskRead(_, _)
-                | Event::<C>::DiskSync(_, _)
-                | Event::<C>::EpochStopped(_)
-                | Event::<C>::VmReady
-                | Event::<C>::Idle => return Err(()),
+                Event::<C>::EpochStopped(_) | Event::<C>::VmReady | Event::<C>::Idle => {
+                    return Err(())
+                }
             }
         }
     }
@@ -1283,13 +1329,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
             match self.event_timeout(deadline.saturating_duration_since(Instant::now()))? {
                 Some(Event::<C>::Done(done)) => return Ok(Some(*done)),
                 Some(Event::<C>::Service(request)) => request.respond(None),
-                Some(
-                    Event::<C>::DiskRead(_, _)
-                    | Event::<C>::DiskSync(_, _)
-                    | Event::<C>::EpochStopped(_)
-                    | Event::<C>::VmReady
-                    | Event::<C>::Idle,
-                ) => return Err(()),
+                Some(Event::<C>::EpochStopped(_) | Event::<C>::VmReady | Event::<C>::Idle) => {
+                    return Err(())
+                }
                 None => return Ok(None),
             }
         }
@@ -1312,12 +1354,7 @@ impl<C: Cpu> Drop for Pool<C> {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
-                Ok(Some(
-                    Event::<C>::DiskRead(_, _)
-                    | Event::<C>::DiskSync(_, _)
-                    | Event::<C>::VmReady
-                    | Event::<C>::Idle,
-                )) => {}
+                Ok(Some(Event::<C>::VmReady | Event::<C>::Idle)) => {}
                 Ok(None) => {
                     for worker in self.workers.iter_mut().flatten() {
                         if worker.join.is_finished() {
@@ -1403,6 +1440,8 @@ mod tests {
             None,
         );
         job.retry = Some(crate::run_queue::IoCall {
+            file: None,
+            file_checkpoint: None,
             uring: None,
             number: 212,
             args,
@@ -1517,7 +1556,7 @@ mod tests {
             processor: 1,
             profile: true,
             streams: Default::default(),
-            files: Default::default(),
+
             fd_flags: Default::default(),
             umask: Default::default(),
             actions: Default::default(),

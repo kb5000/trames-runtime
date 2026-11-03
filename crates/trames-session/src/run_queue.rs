@@ -66,9 +66,31 @@ pub(super) struct IoCall {
     pub tcp_liveness: Option<trames_net::TcpLease>,
     pub retained_poll: Option<trames_linux::RetainedPoll>,
     pub uring: Option<trames_linux::UringEnter>,
+    pub file: Option<trames_linux::FilePending>,
+    pub file_checkpoint: Option<trames_linux::FileCheckpoint>,
     pub deadline: Option<Instant>,
 }
 impl IoCall {
+    pub fn from_file_checkpoint(
+        file: trames_linux::FileCheckpoint,
+        number: u32,
+        args: [u64; 6],
+    ) -> Self {
+        Self {
+            number,
+            args,
+            flock: None,
+            retained_byte: None,
+            retained_socket: None,
+            tcp_liveness: None,
+            retained_poll: None,
+            uring: None,
+            file: None,
+            file_checkpoint: Some(file),
+            deadline: None,
+        }
+    }
+
     pub fn from_byte(file: trames_linux::RetainedByte, number: u32, args: [u64; 6]) -> Self {
         let (number, args) = file.local_message_entry().unwrap_or((number, args));
         Self {
@@ -81,6 +103,8 @@ impl IoCall {
             tcp_liveness: None,
             retained_poll: None,
             uring: None,
+            file: None,
+            file_checkpoint: None,
         }
     }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
@@ -94,6 +118,8 @@ impl IoCall {
             tcp_liveness: None,
             retained_poll: None,
             uring: None,
+            file: None,
+            file_checkpoint: None,
         }
     }
 }
@@ -108,6 +134,8 @@ impl From<&trames_linux::PendingIo> for IoCall {
             tcp_liveness: io.tcp_liveness(),
             retained_poll: io.retained_poll.clone(),
             uring: io.uring_enter(),
+            file: io.file_pending(),
+            file_checkpoint: None,
             deadline: io.deadline,
         }
     }

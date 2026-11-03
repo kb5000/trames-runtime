@@ -131,7 +131,7 @@ pub(super) struct DiskBacking {
     pub(super) inode: u64,
     // Open descriptions own strong leases; closed cached inodes own no FDs.
     pub(super) files: std::sync::Mutex<[std::sync::Weak<File>; 2]>,
-    pub(super) charge: std::sync::OnceLock<AtomicU64>,
+    pub(super) charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
 }
 impl DiskObject {
     // Guest inode lifetime is independent of host descriptor lifetime. A store
@@ -171,25 +171,16 @@ impl DiskBacking {
     // update this store-local scalar; ordinary reads and overwrites do not.
     pub(super) fn register_size(&self, length: u64) {
         if let Some(store) = &self._store {
-            self.charge.get_or_init(|| {
-                store.used.fetch_add(length, Ordering::Relaxed);
-                AtomicU64::new(length)
-            });
+            self.charge
+                .get_or_init(|| file_accounting::FileCharge::register(store.used.clone(), length));
         }
     }
     pub(super) fn update_size(&self, length: u64) {
-        if let (Some(store), Some(charge)) = (&self._store, self.charge.get()) {
-            if charge.load(Ordering::Relaxed) == length {
-                return;
-            }
-            let old = charge.swap(length, Ordering::Relaxed);
-            if length > old {
-                store.used.fetch_add(length - old, Ordering::Relaxed);
-            } else if old > length {
-                store.used.fetch_sub(old - length, Ordering::Relaxed);
-            }
+        if let Some(charge) = self.charge.get() {
+            charge.publish(length);
         }
     }
+
     pub(super) fn open(&self, write: bool) -> Result<File> {
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &self.host {
@@ -211,9 +202,6 @@ impl DiskBacking {
 }
 impl Drop for DiskBacking {
     fn drop(&mut self) {
-        if let (Some(store), Some(charge)) = (&self._store, self.charge.get_mut()) {
-            store.used.fetch_sub(*charge.get_mut(), Ordering::Relaxed);
-        }
         #[cfg(all(feature = "hostfs", unix))]
         if self.host.is_some() {
             return;
@@ -224,6 +212,33 @@ impl Drop for DiskBacking {
     }
 }
 impl FileData {
+    pub(super) fn mapped_work(&self) -> bool {
+        matches!(self, Self::Mapped(data) if data.has_live_pages())
+    }
+    pub(super) fn layout_change(&self, length: u64) -> bool {
+        length != self.len() && self.mapped_work()
+    }
+    pub(super) fn metadata(&self) -> Option<file_data::FileMeta> {
+        match self {
+            Self::Plain(data) => data.metadata(),
+            Self::Mapped(data) => data.metadata(),
+            _ => None,
+        }
+    }
+    pub(super) fn activate_metadata(&self, mode: u32, times: [Timestamp; 3]) {
+        match self {
+            Self::Plain(data) => data.activate(mode, times),
+            Self::Mapped(data) => data.activate_metadata(mode, times),
+            _ => (),
+        }
+    }
+    pub(super) fn patch_metadata(&self, before: file_data::FileMeta, after: file_data::FileMeta) {
+        match self {
+            Self::Plain(data) => data.patch_metadata(before, after),
+            Self::Mapped(data) => data.patch_metadata(before, after),
+            _ => (),
+        }
+    }
     pub(super) fn register_storage(&self) {
         match self {
             Self::Plain(data) => data.register_storage(),
@@ -231,6 +246,13 @@ impl FileData {
             // Lower data is already charged to its source store; copy-up
             // registers its new private object when the inode changes source.
             _ => (),
+        }
+    }
+    pub(super) fn bind_quota(&self, quota: &Arc<file_accounting::FileQuota>) -> Result<()> {
+        match self {
+            Self::Plain(data) => data.bind_quota(quota),
+            Self::Mapped(data) => data.bind_quota(quota),
+            _ => Ok(()), // SharedFile has its original reservation account; Lower retains its own provider.
         }
     }
     pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<File>>> {
@@ -363,6 +385,27 @@ impl FileData {
             }
         }
     }
+    pub(super) fn write_transfer(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+        append: bool,
+        limit: u64,
+        signal: impl FnOnce(),
+    ) -> Result<(usize, u64)> {
+        if let Self::Plain(data) = self {
+            return data.write_limited(offset, bytes, append, limit, signal);
+        }
+        let position = if append { self.len() } else { offset };
+        #[cfg(all(feature = "hostfs", unix))]
+        if append {
+            if let Some(result) = self.append_host(bytes) {
+                return result;
+            }
+        }
+        self.write_at(position, bytes)
+            .map(|n| (n, position + n as u64))
+    }
     pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
         match self {
             Self::Plain(data) => data.write_at(offset, bytes),
@@ -402,7 +445,7 @@ pub(super) struct DiskStore {
     _lock: File,
     checkpoint: std::sync::Mutex<()>,
     initializing: std::sync::atomic::AtomicBool,
-    used: AtomicU64,
+    pub(super) used: Arc<AtomicU64>,
 }
 fn regular(path: &Path) -> Result<()> {
     if !fs::symlink_metadata(path)
@@ -465,7 +508,7 @@ impl DiskStore {
             _lock: lock,
             checkpoint: std::sync::Mutex::new(()),
             initializing: std::sync::atomic::AtomicBool::new(false),
-            used: AtomicU64::new(0),
+            used: Arc::new(AtomicU64::new(0)),
         }))
     }
     fn object_path(&self, inode: u64) -> PathBuf {
@@ -973,7 +1016,7 @@ impl Vfs {
             false
         };
         if identical {
-            if old.borrow().mode != 0o100755 {
+            if old.borrow().file_metadata().mode != 0o100755 {
                 self.chmod_at(AT_FDCWD, &canonical, 0o755)?;
             }
             return Ok(());
@@ -1020,7 +1063,7 @@ impl Vfs {
                 *n = new.clone();
             }
         }
-        fs.inodes.push(Arc::downgrade(&new));
+        fs.track_inode(&new)?;
         old.borrow_mut().links = 0;
         if let Err(e) = fs.checkpoint() {
             for n in fs.paths.values_mut() {
@@ -1090,9 +1133,10 @@ impl Vfs {
         options: DiskOptions,
         owner_lock: Option<&Path>,
     ) -> Result<Self> {
-        let disk = DiskStore::open(path, owner_lock)?;
-        let manifest = disk.root.join("manifest");
         let mut v = Vfs::default();
+        let mut disk = DiskStore::open(path, owner_lock)?;
+        Arc::get_mut(&mut disk).expect("unpublished store").used = v.fs.quota.used.clone();
+        let manifest = disk.root.join("manifest");
         if manifest.try_exists().map_err(host_errno)? {
             regular(&manifest)?;
             let mut bytes = Vec::new();
@@ -1110,6 +1154,7 @@ impl Vfs {
             let mut fs = v.fs.borrow_mut();
             fs.disk = Some(disk);
             fs.limits = StorageLimits::disk();
+            fs.quota.configure(fs.limits.file_bytes, fs.volume);
         }
         v.context.paths.borrow_mut().cwd_node = Some(v.node(b"/")?);
         v.initialize_mounts()?;
@@ -1144,6 +1189,7 @@ impl Vfs {
             fs.limits = old;
             return Err(e);
         }
+        fs.quota.configure(fs.limits.file_bytes, fs.volume);
         Ok(())
     }
     pub fn set_volume_space(&mut self, space: VolumeSpace) -> Result<()> {
@@ -1154,27 +1200,18 @@ impl Vfs {
         if used > space.total_bytes {
             return Err(Errno(28));
         }
-        self.fs.borrow_mut().volume = Some((space, used));
+        let mut fs = self.fs.borrow_mut();
+        fs.volume = Some((space, used));
+        fs.quota.configure(fs.limits.file_bytes, fs.volume);
         Ok(())
     }
     pub fn capacity(&self) -> StorageCapacity {
         Self::filesystem_capacity(&self.fs.borrow())
     }
-    pub(super) fn filesystem_used_bytes(fs: &Filesystem) -> u64 {
-        if let Some(disk) = &fs.disk {
-            return disk.used.load(Ordering::Relaxed);
-        }
-        fs.inodes
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .map(|n| {
-                let node = n.borrow();
-                match &node.content {
-                    Content::File(b) if node.seals.is_none() => b.len(),
-                    _ => 0,
-                }
-            })
-            .sum()
+    pub(super) fn filesystem_used_bytes(
+        fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
+    ) -> u64 {
+        fs.quota.used.load(Ordering::Relaxed)
     }
     pub(super) fn filesystem_bytes(
         fs: &FsBorrow<'_, impl std::ops::Deref<Target = Filesystem>>,
@@ -1239,14 +1276,16 @@ impl Vfs {
         if let Some(overlay) = &fs.overlay {
             return overlay.empty_data();
         }
-        if let Some(d) = &fs.disk {
+        let data = if let Some(d) = &fs.disk {
             let next = fs.next_inode.checked_add(1).ok_or(Errno(28))?;
             let data = d.create(fs.next_inode)?;
             fs.next_inode = next;
-            Ok(data)
+            data
         } else {
-            Ok(FileData::memory(Vec::new()))
-        }
+            FileData::memory(Vec::new())
+        };
+        data.bind_quota(fs.quota)?;
+        Ok(data)
     }
     pub fn checkpoint(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
@@ -1264,21 +1303,55 @@ impl Vfs {
     }
     /// Flush every live file, then the namespace and its directory entry.
     pub fn sync(&self) -> Result<()> {
-        let fs = self.fs.borrow();
-        for node in fs.inodes.iter().filter_map(std::sync::Weak::upgrade) {
-            if let Content::File(data) = &node.borrow().content {
-                data.sync(false)?;
-            }
+        let mut filesystems = BTreeMap::new();
+        filesystems.insert(self.fs.identity(), self.fs.clone());
+        for mount in self
+            .mount_resources
+            .borrow()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            filesystems
+                .entry(mount.fs.identity())
+                .or_insert_with(|| mount.fs.clone());
         }
-        fs.checkpoint()?;
-        if let Some(disk) = &fs.disk {
-            disk.sync_directory()?;
+        for filesystem in filesystems.into_values() {
+            Self::sync_filesystem(&filesystem)?;
         }
         Ok(())
     }
+    fn sync_filesystem(filesystem: &FsHandle) -> Result<()> {
+        FilesystemSync::new(filesystem.clone()).run()
+    }
+    pub(super) fn sync_targets(&self, all: bool) -> Vec<FilesystemSync> {
+        let mut filesystems = BTreeMap::new();
+        filesystems.insert(self.fs.identity(), self.fs.clone());
+        if all {
+            for mount in self
+                .mount_resources
+                .borrow()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+            {
+                filesystems
+                    .entry(mount.fs.identity())
+                    .or_insert_with(|| mount.fs.clone());
+            }
+        }
+        filesystems.into_values().map(FilesystemSync::new).collect()
+    }
+    pub fn sync_filesystem_fd(&self, fd: u32) -> Result<()> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        let filesystem = open.mount.as_ref().map_or(&self.fs, |m| &m.fs).clone();
+        drop(open);
+        Self::sync_filesystem(&filesystem)
+    }
     pub fn sync_fd(&self, fd: u32, data_only: bool) -> Result<()> {
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
+        self.sync_description(&self.descriptor(fd)?, data_only)
+    }
+    pub(super) fn sync_description(&self, descriptor: &Descriptor, data_only: bool) -> Result<()> {
+        let o = descriptor.open.borrow();
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(file) = &o.host_file {
             return if data_only {
@@ -1327,7 +1400,6 @@ impl Vfs {
                 break;
             }
             let end = total.checked_add(n as u64).ok_or(Errno(27))?;
-            self.check_growth(0, end)?;
             let mut at = 0;
             while at < n {
                 let written = data.write_at(total + at as u64, &buffer[at..n])?;
@@ -1378,7 +1450,7 @@ impl Vfs {
             {
                 let mut staged = staged.borrow_mut();
                 let old = old.borrow();
-                staged.mode = old.mode;
+                staged.mode = old.file_metadata().mode;
                 staged.uid = old.uid;
                 staged.gid = old.gid;
                 staged.xattrs = old.xattrs.clone();
@@ -1447,5 +1519,58 @@ impl Vfs {
             bytes.extend(part);
         }
         Ok(bytes)
+    }
+}
+
+/// The files accepted by one filesystem sync. Native work keeps this snapshot,
+/// so a later open does not join its byte locks or durability transaction.
+pub(super) struct FilesystemSync {
+    filesystem: FsHandle,
+    nodes: Vec<NodeRef>,
+    active: bool,
+}
+impl FilesystemSync {
+    fn new(filesystem: FsHandle) -> Self {
+        let nodes = filesystem
+            .borrow()
+            .inodes
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|node| node.regular_file)
+            .collect();
+        Self {
+            filesystem,
+            nodes,
+            active: false,
+        }
+    }
+    pub(super) fn queued(mut self) -> Self {
+        for node in &self.nodes {
+            node.active_file_work.fetch_add(1, Ordering::Relaxed);
+        }
+        self.active = true;
+        self
+    }
+    pub(super) fn run(&self) -> Result<()> {
+        for node in &self.nodes {
+            if let Content::File(data) = &node.borrow().content {
+                data.sync(false)?;
+            }
+        }
+        let fs = self.filesystem.borrow();
+        fs.checkpoint()?;
+        if let Some(disk) = &fs.disk {
+            disk.sync_directory()?;
+        }
+        Ok(())
+    }
+}
+impl Drop for FilesystemSync {
+    fn drop(&mut self) {
+        if self.active {
+            for node in &self.nodes {
+                node.active_file_work.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 }

@@ -327,6 +327,8 @@ pub struct UringRequest {
     pub source: Option<std::sync::Weak<dyn UringSource>>,
     pub file: Option<UringFile>,
     pub buffer: Option<Arc<trames_memory::PinnedBuffer>>,
+    pub selection: Option<UringSelection>,
+    pub selected_identity: Option<u64>,
     pub error: Option<Errno>,
     pub dependency: Option<(u64, bool)>,
     pub deadline: Option<Instant>,
@@ -341,6 +343,13 @@ pub struct UringRequest {
     pub shots: u64,
     pub poll_ready: u16,
     pub poll_epoch: [u64; 2],
+}
+#[derive(Clone)]
+pub struct UringSelection {
+    pub buffer: UringProvidedBuffer,
+    pub group: u16,
+    pub identity: u64,
+    pub lease: Arc<dyn UringExecutionLease>,
 }
 #[derive(Clone, Copy)]
 pub struct UringProvidedBuffer {

@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 pub const MEMFD_BYTES: u64 = 128 * 1024 * 1024;
+#[derive(Clone, Copy)]
+pub(super) enum FileResize {
+    Truncate(u64),
+    Allocate {
+        mode: u64,
+        offset: u64,
+        length: u64,
+        end: u64,
+    },
+}
 impl Vfs {
     /// Apply the host-managed session policy to the existing resource budget,
     /// including files already retained by FD transfers or native mappings.
@@ -21,51 +31,131 @@ impl Vfs {
             .checked_add(length)
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(Errno(27))?;
-        let (old, shared) = {
-            let o_descriptor = self.descriptor(fd)?;
-            let o = o_descriptor.open.borrow();
-            if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 0 {
+        {
+            let descriptor = self.descriptor(fd)?;
+            let open = descriptor.open.borrow();
+            if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 0 {
                 return Err(Errno(9));
             }
-            if o.pipe.is_some() {
+            if open.pipe.is_some() {
                 return Err(Errno(29));
             }
-            let n = o.node.as_ref().ok_or(Errno(19))?.borrow();
-            let Content::File(data) = &n.content else {
+            let node = open.node.as_ref().ok_or(Errno(19))?.borrow();
+            if !matches!(node.content, Content::File(_)) {
                 return Err(Errno(19));
-            };
-            (data.len(), data.shared_file())
-        };
+            }
+        }
         if mode > 1 {
             return Err(Errno(95));
         }
-        self.fd_writable(fd)?;
-        if let Some(file) = shared {
-            let n = self
-                .descriptor(fd)?
-                .open
-                .borrow()
-                .node
-                .clone()
-                .ok_or(Errno(19))?;
-            if n.borrow()
-                .seals
-                .is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old)
-            {
-                return Err(Errno(1));
-            }
-            if mode == 0 && end > self.file_size_limit {
-                return Err(Errno(27));
-            }
-            file.reserve_range(
-                usize::try_from(offset).map_err(|_| Errno(27))?,
-                usize::try_from(length).map_err(|_| Errno(27))?,
-            )
-            .map_err(storage::host_errno)?;
-        } else if mode != 0 {
-            return Err(Errno(95));
+        self.resize_fd(
+            fd,
+            FileResize::Allocate {
+                mode,
+                offset,
+                length,
+                end,
+            },
+        )
+    }
+    pub(super) fn resize_fd(&mut self, fd: u32, request: FileResize) -> Result<()> {
+        if matches!(request, FileResize::Truncate(_)) && self.flags(fd)? & O_PATH != 0 {
+            return Err(Errno(9));
         }
-        self.truncate_fd(fd, if mode == 0 { old.max(end) } else { old })
+        self.fd_writable(fd)?;
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        let node = open.node.clone().ok_or(Errno(22))?;
+        let anonymous = node.borrow().seals.is_some();
+        let available = if anonymous {
+            self.memfd_available()
+        } else {
+            self.fd_available_bytes(fd)?
+        };
+        if open.flags.get() & 3 == 0 {
+            return Err(Errno(22));
+        }
+        self.pseudo_immutable(&node)?;
+        let mut n = node.borrow_mut();
+        let seals = n.seals;
+        let Content::File(data) = &mut n.content else {
+            return Err(Errno(22));
+        };
+        let old = data.len();
+        let length = match request {
+            FileResize::Truncate(length) => length,
+            FileResize::Allocate { mode, end, .. } => {
+                if let Some(_file) = data.shared_file() {
+                    if seals.is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old) {
+                        return Err(Errno(1));
+                    }
+                    if mode == 0 && end > self.file_size_limit {
+                        return Err(Errno(27));
+                    }
+                } else if mode != 0 {
+                    return Err(Errno(95));
+                }
+                if mode == 0 {
+                    old.max(end)
+                } else {
+                    old
+                }
+            }
+        };
+        if length > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        if seals.is_some_and(|s| s & 2 != 0 && length < old || s & 4 != 0 && length > old) {
+            return Err(Errno(1));
+        }
+        if length > old && length > self.file_size_limit {
+            self.file_size_signal.set(true);
+            return Err(Errno(27));
+        }
+        if let Some(query) = &self.query {
+            if !query.file_layout_exclusive && data.layout_change(length) {
+                return query.defer();
+            }
+        }
+        // This is the original inode's resize ownership. No mapped publisher
+        // can appear between layout admission, reserve_range and final EOF.
+        if let FileResize::Allocate { offset, length, .. } = request {
+            if let Some(file) = data.shared_file() {
+                file.reserve_range(
+                    usize::try_from(offset).map_err(|_| Errno(27))?,
+                    usize::try_from(length).map_err(|_| Errno(27))?,
+                )
+                .map_err(storage::host_errno)?;
+            }
+        }
+        if data.growth_charge(length) > available {
+            return Err(Errno(28));
+        }
+        data.truncate(length)?;
+        let meta = n.file_metadata();
+        if !self.credentials.has_cap(capabilities::FSETID) {
+            n.mode = meta.mode & !0o4000;
+            if n.mode & 0o10 != 0 {
+                n.mode &= !0o2000;
+            }
+        }
+        n.times[1] = storage::Timestamp::now();
+        n.times[2] = n.times[1];
+        let linked = n.links != 0;
+        drop(n);
+        if linked {
+            open.mount
+                .as_ref()
+                .map_or(&self.fs, |m| &m.fs)
+                .borrow()
+                .checkpoint()?;
+        }
+        inotify::notify(
+            &node,
+            inotify::MODIFY,
+            open.notification.as_ref().and_then(|c| c.link.as_ref()),
+        );
+        Ok(())
     }
     pub fn memfd_create(&mut self, name: &[u8], flags: u32) -> Result<u32> {
         let (fd, open) = self.memfd_description(name, flags)?;
@@ -121,7 +211,7 @@ impl Vfs {
             xattrs: BTreeMap::new(),
             seals: Some(if flags & 2 != 0 { 0 } else { 1 }),
         }));
-        fs.inodes.push(Arc::downgrade(&node));
+        fs.track_inode(&node)?;
         drop(fs);
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);

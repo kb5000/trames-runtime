@@ -893,7 +893,7 @@ impl Importer {
             xattrs: BTreeMap::new(),
             seals: Some(15),
         }));
-        fs.inodes.push(Arc::downgrade(&node));
+        fs.track_inode(&node)?;
         drop(fs);
         Ok(Arc::new(SharedOpenDescription {
             socket: None,

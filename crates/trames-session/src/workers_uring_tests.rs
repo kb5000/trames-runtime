@@ -13,7 +13,7 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
         processor: 0,
         profile: false,
         streams: Default::default(),
-        files: Default::default(),
+
         fd_flags: Default::default(),
         umask: Default::default(),
         actions: Default::default(),

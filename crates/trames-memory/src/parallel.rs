@@ -2069,6 +2069,28 @@ impl Registry {
     }
 }
 impl Memory {
+    /// Cold filesystem-layout ownership only. This walks mapped provider
+    /// metadata, never guest bytes or an ordinary CPU/data path.
+    pub fn uses_backing_domains(&self, domains: &std::collections::BTreeSet<u64>) -> bool {
+        if domains.is_empty() {
+            return false;
+        }
+        if let Some(shared) = &self.shared {
+            return shared.borrow().uses_backing_domains(domains);
+        }
+        self.frames.iter().flatten().any(|page| {
+            page.backing.as_ref().is_some_and(|backing| {
+                backing
+                    .object
+                    .parallel_change_domain()
+                    .is_some_and(|(id, _)| domains.contains(&id))
+                    || backing
+                        .object
+                        .parallel_metadata_domain()
+                        .is_some_and(|(id, _)| domains.contains(&id))
+            })
+        })
+    }
     pub fn prepare_hardware(&mut self) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().prepare_hardware();

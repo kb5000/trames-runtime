@@ -25,11 +25,12 @@ impl Credentials {
         } else {
             0
         };
-        (node.mode >> shift) & bits == bits
+        let mode = node.file_metadata().mode;
+        (mode >> shift) & bits == bits
             || c.has_cap(capabilities::DAC_OVERRIDE)
                 && (bits & 1 == 0
                     || matches!(node.content, Content::Directory)
-                    || node.mode & 0o111 != 0)
+                    || mode & 0o111 != 0)
             || c.has_cap(capabilities::DAC_READ_SEARCH)
                 && bits & 2 == 0
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
@@ -201,11 +202,14 @@ impl Vfs {
             .mount
             .as_ref()
             .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0);
-        if !nosuid && !self.credentials.caps.no_new_privs && n.mode & 0o4000 != 0 {
+        if !nosuid && !self.credentials.caps.no_new_privs && n.file_metadata().mode & 0o4000 != 0 {
             self.credentials.euid = n.uid;
             self.credentials.fsuid = n.uid;
         }
-        if !nosuid && !self.credentials.caps.no_new_privs && n.mode & 0o2010 == 0o2010 {
+        if !nosuid
+            && !self.credentials.caps.no_new_privs
+            && n.file_metadata().mode & 0o2010 == 0o2010
+        {
             self.credentials.egid = n.gid;
             self.credentials.fsgid = n.gid;
         }

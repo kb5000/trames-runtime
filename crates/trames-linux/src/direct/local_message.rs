@@ -380,6 +380,7 @@ impl DirectSyscalls {
             socket_subscriptions: Vec::new(),
             uring: None,
             poll_uring: None,
+            file: None,
             target: target.clone(),
         })
     }

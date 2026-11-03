@@ -339,8 +339,8 @@ fn owner_accepted_drain_gains_source_context_and_real_fallback_stops_readmission
     assert!(opened >= 0 && l.vfs.stat_at(-100, b"/tmp/owner-to-source").is_ok());
     assert!(!l.uring_requires_owner());
 
-    // Structural O_TRUNC genuinely needs the filesystem owner, rather than
-    // an unbounded sequence of empty worker cohorts before guest retirement.
+    // An ordinary truncate-open is a source file operation. Only an actual
+    // live mapping layout would request scoped mm ownership.
     open[1] = 0;
     open[28..32].copy_from_slice(&0x202u32.to_le_bytes());
     open[32..40].copy_from_slice(&3u64.to_le_bytes());
@@ -349,11 +349,6 @@ fn owner_accepted_drain_gains_source_context_and_real_fallback_stops_readmission
         enter(&d, fd, 1, 0, &mut m, &t),
         IoAttempt::Complete(Ok(1))
     ));
-    let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-    assert!(!background.progress(&mut m));
-    assert!(l.uring_requires_owner());
-    assert!(!l.worker_uring_pending());
-    assert!(l.progress_uring(&mut m, 7));
     assert!(!l.uring_requires_owner());
     let (tag, opened) = cq(&mut m, &r);
     assert_eq!(tag, 3);
@@ -408,9 +403,9 @@ fn retained_enter_survives_cohort_stop_close_reuse_and_unmapped_queue() {
 
 #[test]
 fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finishes() {
-    struct Queue(std::sync::mpsc::Sender<(trames_vfs::DiskSyncJob, Arc<UringDiskResult>)>);
-    impl UringDiskExecutor for Queue {
-        fn submit(&self, job: trames_vfs::DiskSyncJob, result: Arc<UringDiskResult>) {
+    struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
+    impl FileExecutor for Queue {
+        fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
             assert!(self.0.send((job, result)).is_ok());
         }
     }
@@ -453,7 +448,7 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
         let caps = files.capture(&l.vfs, true);
         let (send, receive) = std::sync::mpsc::channel();
         let mut epoch = UringEpoch::default();
-        let d = direct(&l, &m, &mut epoch, &caps).with_uring_disk(Arc::new(Queue(send)));
+        let d = direct(&l, &m, &mut epoch, &caps).with_file_executor(Arc::new(Queue(send)));
         let t = target();
         add(&mut m, &r, sqe(3, file, 99));
         assert!(matches!(
@@ -461,7 +456,7 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
             IoAttempt::Complete(Ok(1))
         ));
         let (job, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(result.result().is_none());
+        assert!(!result.ready());
         l.vfs.close(fd).unwrap();
         l.vfs.close(file).unwrap();
         drop(d);
@@ -473,7 +468,13 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
             "queued host work lost its original OFD"
         );
         result.complete(job.run());
-        assert_eq!(result.result(), Some(Ok(())));
+        assert!(matches!(
+            result.take(),
+            Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+                result: Ok(trames_vfs::FileValue::Count(0)),
+                ..
+            }))
+        ));
         drop(result);
         assert!(
             close.upgrade().is_none(),
@@ -533,4 +534,82 @@ fn owner_only_registered_files_keep_original_read_and_close_semantics() {
         .unwrap();
     assert!(epoch.finish().is_empty());
     files.finish();
+}
+
+#[test]
+fn queued_file_read_reserves_its_selected_buffer_and_copies_out_on_the_source() {
+    struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
+    impl FileExecutor for Queue {
+        fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
+            result.begin();
+            assert!(self.0.send((work.queued(), result)).is_ok());
+        }
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "trames-selected-file-{}-{}",
+        std::process::id(),
+        trames_memory::new_backing_identity()
+    ));
+    let mut l = Linux::new(0x100000);
+    l.vfs = Vfs::open_disk(&directory, Default::default()).unwrap();
+    l.vfs
+        .import_file(b"/data", b"abcdefghijklmnop".to_vec())
+        .unwrap();
+    let file = l.vfs.open_at(-100, b"/data", 2, 0).unwrap();
+    let (fd, r) = l.vfs.uring_create(8, 16).unwrap();
+    let mut m = Memory::default();
+    m.map(0x1000, 4 * trames_memory::PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    for (address, offset, len) in [
+        (0x10000, 0, r.ring_bytes),
+        (0x20000, 0x10000000, r.sqe_bytes),
+    ] {
+        m.map_backed(
+            address,
+            l.vfs.mapping_pages(fd, offset, len, true, true).unwrap(),
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+    }
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let (send, receive) = std::sync::mpsc::channel();
+    let d = direct(&l, &m, &mut epoch, &caps).with_file_executor(Arc::new(Queue(send)));
+    let t = target();
+    let mut provide = scalar(31, 1, 0x3000, 16, 900);
+    provide[8..16].copy_from_slice(&7u64.to_le_bytes());
+    provide[40..42].copy_from_slice(&3u16.to_le_bytes());
+    assert_eq!(submit(&d, &mut m, fd, &r, provide, &t), 0);
+    for tag in [901, 902] {
+        let mut read = scalar(22, file, 0, 16, tag);
+        read[1] = 32;
+        read[40..42].copy_from_slice(&3u16.to_le_bytes());
+        add(&mut m, &r, read);
+    }
+    assert!(matches!(
+        enter(&d, fd, 2, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(2))
+    ));
+    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(receive.try_recv().is_err());
+    assert_eq!(m.read_array::<16>(0x3000).unwrap(), [0; 16]);
+    std::thread::spawn(move || result.complete(work.run()))
+        .join()
+        .unwrap();
+    assert!(matches!(
+        enter(&d, fd, 0, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert_eq!(cq(&mut m, &r), (901, 16));
+    assert_eq!(cq(&mut m, &r), (902, -105));
+    assert_eq!(m.read_array::<16>(0x3000).unwrap(), *b"abcdefghijklmnop");
+    assert!(r.state.lock().unwrap().busy_groups.is_empty());
+    drop((d, m, r));
+    assert!(epoch.finish().is_empty());
+    files.finish();
+    drop(l);
+    std::fs::remove_dir_all(directory).unwrap();
 }

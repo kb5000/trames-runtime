@@ -58,7 +58,7 @@ impl PollRingOps for Ring {
         if changed {
             self.notify_completion(event);
         }
-        true
+        !actor.has_file_layouts()
     }
 }
 impl UringSnapshot {

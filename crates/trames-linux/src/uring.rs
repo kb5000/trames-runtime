@@ -52,6 +52,9 @@ impl Linux {
         self.uring_actor.get_or_init(Arc::default).track(ring);
     }
 
+    pub fn set_file_executor(&mut self, executor: Arc<dyn crate::FileExecutor>) {
+        self.file_executor = Some(executor);
+    }
     pub fn set_uring_clock(&mut self, started: Instant) {
         self.uring_clock = started;
     }
@@ -124,6 +127,15 @@ impl Linux {
         if a[2] > ring.cq_entries as u64 {
             return Err(Errno(22));
         }
+        let execution = self.file_executor.as_ref().map(|disk| {
+            let paths = self.vfs.path_queries();
+            Arc::new(crate::direct::uring::actor::Execution::new(
+                &paths,
+                &self.vfs.descriptor_factory(),
+                &Default::default(),
+                Some(disk.clone()),
+            ))
+        });
         let submitted = if let Some(n) = saved {
             n
         } else {
@@ -199,7 +211,12 @@ impl Linux {
                     None
                 };
                 let actor = self.uring_actor.get_or_init(Arc::default).clone();
-                request.source = Some(Arc::downgrade(&(actor as Arc<dyn trames_vfs::UringSource>)));
+                request.source = Some(Arc::downgrade(
+                    &(actor.clone() as Arc<dyn trames_vfs::UringSource>),
+                ));
+                if let Some(context) = &execution {
+                    actor.accept(&ring, &mut request, context.clone());
+                }
                 state.insert(request);
             }
             if consumed == 0 && count != 0 {
@@ -676,6 +693,8 @@ pub(crate) fn import_request(
         source: None,
         file: None,
         buffer: None,
+        selection: None,
+        selected_identity: None,
         error: None,
         dependency,
         deadline: None,

@@ -9,17 +9,61 @@ pub(super) struct Authority {
     pub(super) files: SharedFiles,
     pub(super) devices: Arc<cgroup::DeviceAccess>,
     pub(super) retained: Option<(u32, SharedFd)>,
+    pub(super) peer: Option<(u32, SharedFd)>,
     deferred: Rc<Cell<bool>>,
+    pub(super) file_layout_exclusive: bool,
+    pub(super) capture_open: bool,
+    pub(super) open_work: Rc<RefCell<Option<file_work::PreparedOpen>>>,
     // Keep the private weak mount registry alive, including detached mounts.
     _mounts: Vec<Rc<Mount>>,
 }
 impl Authority {
+    pub(super) fn file_root(vfs: &Vfs) -> Self {
+        Self {
+            files: vfs.shared_files(),
+            devices: vfs.device_access(),
+            retained: None,
+            peer: None,
+            deferred: Rc::new(Cell::new(false)),
+            file_layout_exclusive: false,
+            capture_open: false,
+            open_work: Default::default(),
+            _mounts: Vec::new(),
+        }
+    }
+    pub(super) fn file_projection(source: &Self) -> Self {
+        Self {
+            files: source.files.clone(),
+            devices: source.devices.clone(),
+            retained: None,
+            peer: None,
+            deferred: Rc::new(Cell::new(false)),
+            file_layout_exclusive: false,
+            capture_open: false,
+            open_work: Default::default(),
+            _mounts: Vec::new(),
+        }
+    }
+    pub(super) fn clear_deferred(&self) {
+        self.deferred.set(false);
+    }
+    pub(super) fn take_deferred(&self) -> bool {
+        self.deferred.replace(false)
+    }
     pub(super) fn defer<T>(&self) -> Result<T> {
         self.deferred.set(true);
         Err(Errno(95)) // internal only; PathQueries returns None, not this errno
     }
     pub(super) fn descriptor(&self, fd: u32) -> Result<Descriptor> {
         if let Some((alias, file)) = &self.retained {
+            if *alias == fd {
+                return Ok(Descriptor {
+                    open: OpenHandle::Shared(file.open.clone()),
+                    cloexec: false.into(),
+                });
+            }
+        }
+        if let Some((alias, file)) = &self.peer {
             if *alias == fd {
                 return Ok(Descriptor {
                     open: OpenHandle::Shared(file.open.clone()),
@@ -66,7 +110,7 @@ fn host_mount(_: &Mount) -> bool {
 /// One exclusively owned control island, movable with a retained execution job.
 /// No &Vfs, Rc or mutable control handle can escape this type's sealed API.
 pub struct PathQueries {
-    view: RefCell<Vfs>,
+    pub(super) view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
 // afresh, including mounts, fs context, pseudo state, dummy FD table and namespaces.
@@ -121,6 +165,8 @@ impl Vfs {
         view.credentials = self.credentials.clone();
         view.file_size_limit = self.file_size_limit;
         view.context.share_mask(&self.context);
+        view.lock_owner = self.lock_owner;
+        *view.mount_resources.borrow_mut() = self.mount_resources.borrow().clone();
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
         view.ptys = self.ptys.clone();
@@ -137,11 +183,15 @@ impl Vfs {
                 .as_ref()
                 .map_or_else(|| self.shared_files(), |q| q.files.clone()),
             retained: None,
+            peer: None,
             devices: self
                 .query
                 .as_ref()
                 .map_or_else(|| self.device_access(), |q| q.devices.clone()),
             deferred: Rc::new(Cell::new(false)),
+            file_layout_exclusive: false,
+            capture_open: false,
+            open_work: Default::default(),
             _mounts: mounts.into_values().collect(),
         });
         PathQueries {
@@ -155,57 +205,6 @@ impl PathQueries {
     pub fn retain_context(&self) -> Self {
         self.view.borrow().path_queries()
     }
-    pub fn uring_file_control(
-        &self,
-        file: &UringFile,
-        opcode: u8,
-        flags: u32,
-        offset: u64,
-        address: u64,
-        length: u32,
-    ) -> Option<Result<()>> {
-        file.shared_file()?;
-        self.uring_query(|view| {
-            view.with_uring_fd(file, |view, fd| {
-                let descriptor = view.descriptor(fd)?;
-                let open = descriptor.open.borrow();
-                let filesystem = open.mount.as_ref().map_or(&view.fs, |m| &m.fs);
-                if filesystem.has_overlay()
-                    || filesystem.borrow().disk.is_some()
-                    || open.node.as_ref().is_some_and(|n| {
-                        matches!(&n.borrow().content, Content::File(data)
-                    if !matches!(data, storage::FileData::Plain(p) if p.disk_source().is_none()))
-                    })
-                {
-                    return view.query.as_ref().unwrap().defer();
-                }
-                #[cfg(all(feature = "hostfs", unix))]
-                if open.host_file.is_some() {
-                    return view.query.as_ref().unwrap().defer();
-                }
-                drop(open);
-                match opcode {
-                    3 => view.sync_fd(fd, flags & 1 != 0),
-                    17 => view.allocate_fd(fd, length as u64, offset, address),
-                    55 => view.truncate_fd(fd, offset),
-                    _ => unreachable!("sealed io_uring file operation"),
-                }
-            })
-        })
-    }
-    pub fn uring_disk_sync(
-        &self,
-        file: &UringFile,
-        data_only: bool,
-    ) -> Option<Result<Option<DiskSyncJob>>> {
-        file.shared_file()?;
-        self.uring_query(|view| {
-            view.with_uring_fd(file, |view, fd| {
-                view.prepare_disk_sync(fd, data_only)
-                    .map(|prepared| prepared.map(|(_, job)| job))
-            })
-        })
-    }
     #[allow(clippy::too_many_arguments)] // Original openat2 operands and source Files authority.
     pub fn uring_open(
         &self,
@@ -217,9 +216,6 @@ impl PathQueries {
         policy: u64,
         files: &DirectFiles,
     ) -> Option<Result<u32>> {
-        if flags & O_PATH == 0 && flags & 0x200 != 0 {
-            return None;
-        }
         if file.is_some_and(|f| f.shared_file().is_none()) {
             return None;
         }
@@ -350,9 +346,6 @@ impl PathQueries {
         files: &DirectFiles,
     ) -> Option<Result<u32>> {
         // Truncation can change mapped backing lifetimes and remains joined.
-        if flags & O_PATH == 0 && flags & 0x200 != 0 {
-            return None;
-        }
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
         deferred.set(false);
@@ -461,12 +454,13 @@ mod tests {
             owner.stat_fd(fd).unwrap()[16..20],
             0o100600u32.to_le_bytes()
         );
-        assert!(writer
-            .get(fd)
-            .unwrap()
-            .write(b"hello", None, &mut Default::default())
-            .is_none());
-        owner.write(fd, b".....").unwrap();
+        assert_eq!(
+            writer
+                .get(fd)
+                .unwrap()
+                .write(b"hello", None, &mut Default::default()),
+            Some(Ok(5))
+        );
         writer
             .get(fd)
             .expect("new file has direct authority")
@@ -528,6 +522,11 @@ mod tests {
         assert!(query
             .open_at_resolve(AT_FDCWD, b"/file", 2 | 0x200, 0, 0, &files)
             .is_none());
+        drop(
+            query
+                .take_open_work()
+                .expect("accepted truncate reservation"),
+        );
         assert!(query
             .open_at_resolve(AT_FDCWD, b"/proc/self/status", 0, 0, 0, &files)
             .is_none());

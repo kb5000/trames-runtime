@@ -7,6 +7,7 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 #[derive(Clone)]
 pub(super) struct FsHandle {
     pub shared: Arc<SharedCell<Filesystem>>,
+    pub quota: Arc<file_accounting::FileQuota>,
     #[cfg(all(feature = "hostfs", unix))]
     pub host: Option<Arc<hostfs::HostFs>>,
     overlay: Option<Arc<overlay::Overlay>>,
@@ -14,21 +15,38 @@ pub(super) struct FsHandle {
 pub(super) struct FsBorrow<'a, G> {
     guard: G,
     pub overlay: &'a Option<Arc<overlay::Overlay>>,
+    pub quota: &'a Arc<file_accounting::FileQuota>,
 }
 impl FsHandle {
     pub fn new(data: Filesystem) -> Self {
+        let used = data
+            .disk
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicU64::new(0)), |d| d.used.clone());
+        let quota = file_accounting::FileQuota::new(used, data.limits.file_bytes, data.volume);
+        for node in data.inodes.iter().filter_map(std::sync::Weak::upgrade) {
+            node.bind_quota(&quota)
+                .expect("validated initial filesystem");
+        }
         Self {
             #[cfg(all(feature = "hostfs", unix))]
             host: None,
             shared: Arc::new(SharedCell::new(data)),
+            quota,
             overlay: None,
         }
     }
     pub fn with_overlay(data: Filesystem, overlay: Arc<overlay::Overlay>) -> Self {
+        let quota = overlay.file_quota();
+        for node in data.inodes.iter().filter_map(std::sync::Weak::upgrade) {
+            node.bind_quota(&quota)
+                .expect("validated initial filesystem");
+        }
         Self {
             #[cfg(all(feature = "hostfs", unix))]
             host: None,
             shared: Arc::new(SharedCell::new(data)),
+            quota,
             overlay: Some(overlay),
         }
     }
@@ -36,12 +54,14 @@ impl FsHandle {
         FsBorrow {
             guard: self.shared.borrow(),
             overlay: &self.overlay,
+            quota: &self.quota,
         }
     }
     pub fn borrow_mut(&self) -> FsBorrow<'_, RwLockWriteGuard<'_, Filesystem>> {
         FsBorrow {
             guard: self.shared.borrow_mut(),
             overlay: &self.overlay,
+            quota: &self.quota,
         }
     }
     pub fn same_data(&self, other: &Self) -> bool {
@@ -63,6 +83,13 @@ impl<G: Deref<Target = Filesystem>> Deref for FsBorrow<'_, G> {
 impl<G: DerefMut<Target = Filesystem>> DerefMut for FsBorrow<'_, G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
+    }
+}
+impl<G: DerefMut<Target = Filesystem>> FsBorrow<'_, G> {
+    pub fn track_inode(&mut self, node: &NodeRef) -> Result<()> {
+        node.bind_quota(self.quota)?;
+        self.inodes.push(Arc::downgrade(node));
+        Ok(())
     }
 }
 impl<G: Deref<Target = Filesystem>> FsBorrow<'_, G> {

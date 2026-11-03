@@ -1960,3 +1960,44 @@ required. Disk/mapped/overlay allocation and truncation, O_TRUNC open, backing
 write growth/append, owner-only task/mount/proc resources and lifecycle/VM topology
 remain explicit compatibility checkpoints. Common code is shared by Mac/iPad;
 HVF only supplies CPU/MMU execution.
+
+## Regular-file data, EOF and durability subsystem (2026-11-03)
+
+Regular-file scalar/vector/positioned I/O, append/growth, seek/stat, truncate,
+fallocate, fsync/fdatasync/syncfs/sync, O_TRUNC and file-to-file transfers now use
+one accepted FileWork contract. Normal calls and io_uring retain the original full
+OFD, copied inputs and output description once. Short data calls execute on their
+source worker using the original descriptor algorithms; they allocate no temporary
+Files table. Large or blocking work uses the existing bounded disk pool and sends
+readiness directly to its source. Source tasks retain completion/checkpoint state
+across cohort stops, FD reuse and signals; guest pointers never enter native jobs.
+There is no Session disk request/reply service, recycled owner buffer protocol or
+ring-specific disk executor. Pure VFS legacy disk helpers remain compatibility APIs.
+
+The original byte/position locks protect actual shared resources. Private quota
+uses one original shared atomic account and transactional per-file EOF charges;
+failed or partial growth reconciles its reservation. Host-directory bytes stay
+outside the private-store quota. Canonical file mode/times live on the same data
+object, including owner writes and checkpoint/stat readers. FileEpoch no longer
+scans or copies metadata back at each cohort. Algorithms retain their existing
+permissions, seals, RLIMIT_FSIZE, append, notification and durability semantics.
+
+A mapped backing layout change identifies affected original mm instruction views.
+Only those views quiesce before the accepted job runs on the same disk pool;
+completion releases their pause counts. Ordinary data and unrelated CPUs do not
+require a global stop. Writable hardware-backed resident pages participate in
+writeback; unmaterialized pages are not falsely marked dirty. Queued filesystem
+sync captures its original files and marks actual in-flight resources, without
+including later-created files in that accepted byte-lock operation.
+
+O_TRUNC reserves an unpublished numeric slot and retains the resolved inode;
+only successful truncate publishes the FD. Pathname truncate captures the original
+OFD without publishing a temporary guest FD. Copy retains accepted input bytes and
+offsets across an output-layout checkpoint. io_uring provided-buffer selection
+retains its original group generation and pin until completion/cancellation.
+
+Namespace/directory mutations, owner-only task/proc/mount controls, cross-resource
+file-to-pipe/socket transfers, structural VM/task topology and unfinished context
+cancellation remain separate boundaries. This common implementation is shared by
+Mac HVF and the iPad interpreter. No new resource thread, polling bus, global
+algorithm lock, ordinary guest memory fence or unsafe block is introduced here.

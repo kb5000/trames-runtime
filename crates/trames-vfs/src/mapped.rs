@@ -351,8 +351,20 @@ impl MappedData {
             writers: Arc::default(),
         }
     }
+    pub(super) fn metadata(&self) -> Option<file_data::FileMeta> {
+        self.data.borrow().metadata()
+    }
+    pub(super) fn activate_metadata(&self, mode: u32, times: [storage::Timestamp; 3]) {
+        self.data.borrow().activate_metadata(mode, times);
+    }
+    pub(super) fn patch_metadata(&self, before: file_data::FileMeta, after: file_data::FileMeta) {
+        self.data.borrow().patch_metadata(before, after);
+    }
     pub(super) fn logical_size(&self) -> trames_shared::LogicalSize {
         self.data.borrow().logical_size()
+    }
+    pub(super) fn bind_quota(&self, quota: &Arc<file_accounting::FileQuota>) -> Result<()> {
+        self.data.borrow().bind_quota(quota)
     }
     pub(super) fn register_storage(&self) {
         self.data.borrow().register_storage();
@@ -556,18 +568,30 @@ impl MappedData {
         page.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
+    pub(super) fn layout_domains(&self) -> [u64; 2] {
+        [self.state.identity, self.state.metadata_identity]
+    }
+    pub(super) fn has_live_pages(&self) -> bool {
+        self.pages.borrow().values().any(|p| p.strong_count() != 0)
+    }
     pub(super) fn has_writers(&self) -> bool {
         self.writers.active()
     }
     pub(super) fn sync(&self, data_only: bool) -> Result<()> {
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
+                if self.has_writers() && !page.deferred() {
+                    page.dirty.store(true, Ordering::Relaxed);
+                }
                 self.flush(base, &page)?;
             }
         }
         self.data.borrow().sync(data_only)
     }
     pub(super) fn truncate(&self, length: u64) -> Result<()> {
+        if length == self.len() {
+            return Ok(());
+        }
         self.sync(false)?;
         self.data.borrow_mut().truncate(length)?;
         // The length has changed even if a later page reload fails. Publish

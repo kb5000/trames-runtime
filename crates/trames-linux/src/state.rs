@@ -22,6 +22,7 @@ const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 
 pub struct Linux {
     pub(crate) batch_pipe_signal: bool,
+    pub(crate) file_executor: Option<std::sync::Arc<dyn crate::FileExecutor>>,
     pub(crate) uring_clock: std::time::Instant,
     pub(crate) uring_actor: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::UringActor>>>,
     pub vfs: Vfs,
@@ -59,6 +60,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: self.uring_clock,
+            file_executor: self.file_executor.clone(),
             uring_actor: Default::default(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
             trace: self.trace,
@@ -103,6 +105,7 @@ impl Linux {
         Self {
             batch_pipe_signal: false,
             uring_clock: std::time::Instant::now(),
+            file_executor: None,
             uring_actor: Default::default(),
             vfs: Vfs::default(),
             trace: false,
@@ -499,6 +502,34 @@ impl Linux {
         records: bool,
         mut write: impl FnMut(&[u8]) -> Result<u64>,
     ) -> Result<u64> {
+        let vectors = Self::writev_parameters(a, memory, bytes)?;
+        if !records {
+            return write(bytes);
+        }
+        let mut position = 0;
+        let mut total = 0;
+        for (_, count) in vectors {
+            if count == 0 {
+                continue;
+            }
+            let written = match write(&bytes[position..position + count]) {
+                Ok(written) => written,
+                Err(error) if total == 0 => return Err(error),
+                Err(_) => break,
+            };
+            total += written;
+            if written < count as u64 {
+                break;
+            }
+            position += count;
+        }
+        Ok(total)
+    }
+    pub(crate) fn writev_parameters(
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        bytes: &mut Vec<u8>,
+    ) -> Result<Vec<(u64, usize)>> {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
@@ -526,27 +557,7 @@ impl Linux {
                 .map_err(|_| Errno(14))?;
             position += count;
         }
-        if !records {
-            return write(bytes);
-        }
-        let mut position = 0;
-        let mut total = 0;
-        for (_, count) in vectors {
-            if count == 0 {
-                continue;
-            }
-            let written = match write(&bytes[position..position + count]) {
-                Ok(written) => written,
-                Err(error) if total == 0 => return Err(error),
-                Err(_) => break,
-            };
-            total += written;
-            if written < count as u64 {
-                break;
-            }
-            position += count;
-        }
-        Ok(total)
+        Ok(vectors)
     }
     pub fn positioned_vector(
         &mut self,

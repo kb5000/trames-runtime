@@ -420,7 +420,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -624,7 +624,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: p.linux.vfs.stream_descriptors(),
-                files: p.linux.vfs.file_descriptors(),
+
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -693,7 +693,7 @@ mod tests {
                     processor: 0,
                     profile: false,
                     streams: Default::default(),
-                    files: Default::default(),
+
                     fd_flags: Default::default(),
                     umask: Default::default(),
                     actions: p.signals.actions.shared(),
@@ -800,7 +800,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: p.linux.vfs.stream_descriptors(),
-                files: p.linux.vfs.file_descriptors(),
+
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -1259,7 +1259,7 @@ mod tests {
             processor: 0,
             profile: false,
             streams: Default::default(),
-            files: Default::default(),
+
             fd_flags: Default::default(),
             umask: Default::default(),
             actions: Default::default(),
@@ -1511,7 +1511,7 @@ mod tests {
                     processor: 0,
                     profile: false,
                     streams: p.linux.vfs.stream_descriptors(),
-                    files: p.linux.vfs.file_descriptors(),
+
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),
                     actions: p.signals.actions.shared(),
@@ -1547,7 +1547,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -1592,7 +1592,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -1630,7 +1630,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -1670,7 +1670,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: Default::default(),
                 actions: Default::default(),
@@ -1718,7 +1718,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: Default::default(),
                 actions: Default::default(),
@@ -1768,7 +1768,7 @@ mod tests {
                 processor: 0,
                 profile: false,
                 streams: Default::default(),
-                files: Default::default(),
+
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
                 actions: p.signals.actions.shared(),
@@ -1813,7 +1813,7 @@ mod tests {
                     processor: 0,
                     profile: false,
                     streams: p.linux.vfs.stream_descriptors(),
-                    files: p.linux.vfs.file_descriptors(),
+
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),
                     actions: p.signals.actions.shared(),

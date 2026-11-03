@@ -691,7 +691,7 @@ impl HostFs {
         let mut fs = filesystem.borrow_mut();
         fs.paths.insert(key.to_vec(), node.clone());
         let collect = if created {
-            fs.inodes.push(Arc::downgrade(&node));
+            fs.track_inode(&node)?;
             fs.next_inode = fs.next_inode.wrapping_add(1);
             fs.next_inode.is_multiple_of(1024)
         } else {

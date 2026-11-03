@@ -10,6 +10,13 @@ impl<T> SharedCell<T> {
     pub fn borrow(&self) -> RwLockReadGuard<'_, T> {
         self.0.read().unwrap()
     }
+    pub fn try_borrow(&self) -> Option<RwLockReadGuard<'_, T>> {
+        match self.0.try_read() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(error) => panic!("{error}"),
+        }
+    }
     pub fn borrow_mut(&self) -> RwLockWriteGuard<'_, T> {
         self.0.write().unwrap()
     }

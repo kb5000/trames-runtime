@@ -122,7 +122,8 @@ impl RingWaitOps for Ring {
     fn waitable(&self, state: &State, r: &Request) -> bool {
         state.eligible(r)
             && !self.backpressured(state, r)
-            && !(r.selected()
+            && !(r.selection.is_none()
+                && r.selected()
                 && state
                     .provided
                     .get(&r.sqe.buffer_group())

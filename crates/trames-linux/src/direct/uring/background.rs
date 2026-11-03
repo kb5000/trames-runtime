@@ -88,7 +88,7 @@ impl DirectSyscalls {
             self.paths.as_ref(),
             self.resources.as_ref(),
             &self.files,
-            self.uring_disk.as_ref(),
+            self.file_executor.as_ref(),
         );
         if let Some(context) = self.urings.context.get() {
             for ring in actor.rings() {

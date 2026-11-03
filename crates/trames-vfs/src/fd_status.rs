@@ -267,13 +267,14 @@ mod tests {
         let file = files.get(fd).unwrap();
         let mut cache = DiskReadCache::default();
         flags.fcntl(fd, 4, 0x400).unwrap();
-        assert_eq!(file.write(b"X", None, &mut cache), None);
-        assert_eq!(file.seek(0, 1), Some(Ok(0)));
+        assert_eq!(file.write(b"X", None, &mut cache), Some(Ok(1)));
+        assert_eq!(file.seek(0, 1), Some(Ok(5)));
         assert_eq!(
             file.read(4, Some(0), &mut cache),
             Some(Ok(b"abcd".to_vec()))
         );
         flags.fcntl(fd, 4, 0).unwrap();
+        assert_eq!(file.seek(0, 0), Some(Ok(0)));
         assert_eq!(file.write(b"X", None, &mut cache), Some(Ok(1)));
         epoch.finish();
         v.seek(fd, 0, 0).unwrap();

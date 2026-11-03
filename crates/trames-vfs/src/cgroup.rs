@@ -149,7 +149,8 @@ impl Cgroups {
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        fs.inodes.push(Arc::downgrade(&node));
+        fs.track_inode(&node)
+            .expect("non-file inode has no byte charge");
         fs.paths.insert(path, node);
         inode
     }

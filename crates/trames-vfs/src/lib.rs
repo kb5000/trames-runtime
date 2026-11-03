@@ -39,10 +39,15 @@ pub use disk_io::{DiskRead, DiskReadCache, DiskReadJob, DiskSync, DiskSyncJob};
 mod direct_io;
 mod native_images;
 pub use direct_io::{NativeEvent, NativeEvents};
+mod file_accounting;
 mod file_data;
+mod file_work;
+pub use file_work::{
+    FileCommand, FileCopy, FileOutcome, FileReply, FileTarget, FileValue, FileWork,
+};
 mod file_io;
 use direct_io::PipeResource;
-pub use file_io::{DirectFile, DirectFiles, FileEpoch, PreparedFile};
+pub use file_io::{DirectFile, DirectFiles, FileAccess, FileEpoch, PreparedFile};
 mod readiness;
 mod timer_io;
 pub use direct_io::{DirectFd, DirectFds, DirectPoll};
@@ -55,8 +60,8 @@ mod uring;
 pub use uring::{
     RetainedFd, Uring, UringBufferGroup, UringBufferSource, UringExecutionLease, UringFile,
     UringFileView, UringObject, UringProvidedBuffer, UringRequest, UringResource, UringRetirement,
-    UringRunning, UringSource, UringSqe, UringState, URING_CQES, URING_MAX_ENTRIES, URING_OPS,
-    URING_SQ_ARRAY,
+    UringRunning, UringSelection, UringSource, UringSqe, UringState, URING_CQES, URING_MAX_ENTRIES,
+    URING_OPS, URING_SQ_ARRAY,
 };
 mod executable;
 pub use executable::ExecutableFile;
@@ -302,6 +307,8 @@ enum Content {
 }
 type NodeRef = Arc<Inode>;
 struct Inode {
+    regular_file: bool,
+    active_file_work: std::sync::atomic::AtomicUsize,
     // Immutable device behavior belongs to inode identity, not its pathname.
     simple_device: Option<simple_device::Kind>,
     #[cfg(all(feature = "hostfs", unix))]
@@ -311,6 +318,7 @@ struct Inode {
     identity: u64,
     state: SharedCell<Node>,
     length: std::sync::OnceLock<trames_shared::LogicalSize>,
+    quota: std::sync::OnceLock<Arc<file_accounting::FileQuota>>,
 }
 impl Inode {
     fn new(mut node: Node) -> Self {
@@ -319,8 +327,13 @@ impl Inode {
                 data.register_storage();
             }
         }
+        if let Content::File(data) = &node.content {
+            data.activate_metadata(node.mode, node.times);
+        }
         node.identity = trames_memory::new_backing_identity();
         Self {
+            regular_file: !node.volatile && matches!(node.content, Content::File(_)),
+            active_file_work: std::sync::atomic::AtomicUsize::new(0),
             simple_device: simple_device::Kind::content(&node.content),
             #[cfg(all(feature = "hostfs", unix))]
             mount_target: std::sync::atomic::AtomicBool::new(false),
@@ -329,15 +342,38 @@ impl Inode {
             identity: node.identity,
             state: SharedCell::new(node),
             length: std::sync::OnceLock::new(),
+            quota: std::sync::OnceLock::new(),
         }
+    }
+    fn bind_quota(&self, quota: &Arc<file_accounting::FileQuota>) -> Result<()> {
+        let quota = self.quota.get_or_init(|| quota.clone());
+        let node = self.borrow();
+        if node.seals.is_none() && !node.volatile {
+            if let Content::File(data) = &node.content {
+                data.bind_quota(quota)?;
+            }
+        }
+        Ok(())
     }
     fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Node> {
         self.state.borrow()
     }
+    fn try_borrow(&self) -> Option<std::sync::RwLockReadGuard<'_, Node>> {
+        self.state.try_borrow()
+    }
     fn borrow_mut(&self) -> InodeWrite<'_> {
+        let mut state_guard = self.state.borrow_mut();
+        let canonical = state_guard.file_metadata();
+        state_guard.mode = canonical.mode;
+        state_guard.times = canonical.times;
+        let before = file_data::FileMeta {
+            mode: state_guard.mode,
+            times: state_guard.times,
+        };
         InodeWrite {
             owner_cell: self,
-            state_guard: self.state.borrow_mut(),
+            state_guard,
+            before,
         }
     }
     fn length_for(&self, node: &Node) -> trames_shared::LogicalSize {
@@ -361,6 +397,7 @@ impl Inode {
     }
 }
 struct InodeWrite<'a> {
+    before: file_data::FileMeta,
     owner_cell: &'a Inode,
     state_guard: std::sync::RwLockWriteGuard<'a, Node>,
 }
@@ -377,9 +414,24 @@ impl std::ops::DerefMut for InodeWrite<'_> {
 }
 impl Drop for InodeWrite<'_> {
     fn drop(&mut self) {
+        if let Content::File(data) = &self.state_guard.content {
+            let after = file_data::FileMeta {
+                mode: self.state_guard.mode,
+                times: self.state_guard.times,
+            };
+            data.activate_metadata(after.mode, after.times);
+            data.patch_metadata(self.before, after);
+        }
         if self.state_guard.seals.is_none() {
             if let Content::File(data) = &self.state_guard.content {
                 data.register_storage();
+                if !self.state_guard.volatile {
+                    if let Some(quota) = self.owner_cell.quota.get() {
+                        // Already-published storage either retains its original charge or
+                        // was admitted by filesystem_empty_data before replacement.
+                        data.bind_quota(quota).expect("admitted inode storage");
+                    }
+                }
             }
         }
         if let Some(size) = self.owner_cell.length.get() {
@@ -416,7 +468,7 @@ struct Node {
 thread_local! {static PATH_SEARCHES: Cell<usize> = const { Cell::new(0) };}
 impl Node {
     fn file_metadata(&self) -> file_data::FileMeta {
-        if let Content::File(storage::FileData::Plain(data)) = &self.content {
+        if let Content::File(data) = &self.content {
             if let Some(meta) = data.metadata() {
                 return meta;
             }
@@ -957,10 +1009,7 @@ impl Vfs {
             return None;
         }
         let node = if write { o.node.clone() } else { o.data_node() }?;
-        let regular = {
-            let n = node.borrow();
-            !n.volatile && matches!(&n.content, Content::File(data) if data.shared_file().is_none())
-        };
+        let regular = node.regular_file;
         regular.then_some(node)
     }
     /// Coordinator-only check against the retained inode, never a path lookup.
@@ -1228,7 +1277,7 @@ impl Vfs {
             xattrs: BTreeMap::new(),
             seals: None,
         }));
-        fs.inodes.push(Arc::downgrade(&node));
+        fs.track_inode(&node)?;
         fs.paths.insert(path.key.clone(), node.clone());
         if let Err(e) = fs.checkpoint() {
             fs.paths.remove(&path.key);
@@ -1660,7 +1709,7 @@ impl Vfs {
         executable: bool,
     ) -> Result<()> {
         let (current, parents) = self.import_plan(path)?;
-        self.check_growth(0, data.len())?;
+        // Staged bytes already own their original quota reservation.
         for parent in parents {
             self.insert(parent, Content::Directory, 0o40755)?;
         }
@@ -2058,10 +2107,7 @@ impl Vfs {
                         && node.simple_device.is_none()
                         && (n.volatile
                             || n.seals.is_some()
-                            || !matches!(
-                                n.content,
-                                Content::File(storage::FileData::Plain(_)) | Content::Directory
-                            ))
+                            || !matches!(n.content, Content::File(_) | Content::Directory))
                     {
                         return query.defer();
                     }
@@ -2176,22 +2222,24 @@ impl Vfs {
                 .transpose()?
                 .flatten(),
         };
-        if flags & 0x200 != 0
-            && !Self::cgroup_mount(&p)
-            && oom.is_none()
-            && network_control.is_none()
-        {
-            let mut n = node.borrow_mut();
-            if let Content::File(b) = &mut n.content {
-                b.truncate(0)?;
-                n.times[1] = storage::Timestamp::now();
-                n.times[2] = n.times[1];
+        if self.query.is_none() {
+            if flags & 0x200 != 0
+                && !Self::cgroup_mount(&p)
+                && oom.is_none()
+                && network_control.is_none()
+            {
+                let mut n = node.borrow_mut();
+                if let Content::File(b) = &mut n.content {
+                    b.truncate(0)?;
+                    n.times[1] = storage::Timestamp::now();
+                    n.times[2] = n.times[1];
+                }
             }
-        }
-        if flags & 0x200 != 0 {
-            self.checkpoint()?;
-            if matches!(node.borrow().content, Content::File(_)) {
-                inotify::notify(&node, inotify::MODIFY, None);
+            if flags & 0x200 != 0 {
+                self.checkpoint()?;
+                if matches!(node.borrow().content, Content::File(_)) {
+                    inotify::notify(&node, inotify::MODIFY, None);
+                }
             }
         }
         if flags & O_PATH == 0
@@ -2321,6 +2369,28 @@ impl Vfs {
             }),
             cloexec: (flags & O_CLOEXEC != 0).into(),
         };
+        if let Some(query) = &self.query {
+            if flags & 0x200 != 0 || query.capture_open {
+                let OpenHandle::Shared(shared) = &descriptor.open else {
+                    return query.defer();
+                };
+                let file = SharedFd::new(shared.clone());
+                let target = if query.capture_open {
+                    Some(file.filesystem_target())
+                } else {
+                    file.file_target()
+                };
+                if let Some(target) = target {
+                    *query.open_work.borrow_mut() = Some(file_work::PreparedOpen {
+                        reservation,
+                        target,
+                        cloexec: descriptor.cloexec,
+                        publication: publication.cloned(),
+                    });
+                    return query.defer();
+                }
+            }
+        }
         if let Some(files) = publication {
             files.publish_open(self, &descriptor.open.borrow());
         }
@@ -2588,8 +2658,11 @@ impl Vfs {
     }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
-        let o_descriptor = self.descriptor(fd)?;
-        let mut o = o_descriptor.open.borrow_mut();
+        let descriptor = self.descriptor(fd)?;
+        self.read_description(&descriptor, count)
+    }
+    fn read_description(&mut self, descriptor: &Descriptor, count: usize) -> Result<Vec<u8>> {
+        let mut o = descriptor.open.borrow_mut();
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_read(kind, count);
         }
@@ -2727,11 +2800,21 @@ impl Vfs {
         self.file_size_signal.replace(false)
     }
     fn file_write(&mut self, fd: u32, bytes: &[u8], offset: Option<u64>) -> Result<usize> {
-        self.fd_writable(fd)?;
-        let available = self.fd_available_bytes(fd)?;
+        let descriptor = self.descriptor(fd)?;
+        self.file_write_description(&descriptor, bytes, offset)
+    }
+    fn file_write_description(
+        &mut self,
+        descriptor: &Descriptor,
+        bytes: &[u8],
+        offset: Option<u64>,
+    ) -> Result<usize> {
+        let mut o = descriptor.open.borrow_mut();
+        if let Some(mount) = &o.mount {
+            mount.writable()?;
+        }
+        let available = self.description_available_bytes(&o);
         let memfd_available = self.memfd_available();
-        let o_descriptor = self.descriptor(fd)?;
-        let mut o = o_descriptor.open.borrow_mut();
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
         }
@@ -2758,6 +2841,47 @@ impl Vfs {
         }
         let node = o.node.clone().ok_or(Errno(29))?;
         self.pseudo_immutable(&node)?;
+        {
+            let n = node.borrow();
+            if n.seals.is_none() {
+                if let Content::File(storage::FileData::Plain(data)) = &n.content {
+                    let bytes = &bytes[..bytes.len().min(storage::MAX_TRANSFER)];
+                    if bytes.is_empty() {
+                        return Ok(0);
+                    }
+                    let mut position = o.file_position.lock().unwrap();
+                    let at = offset.unwrap_or(position.value);
+                    let append = o.flags.get() & 0x400 != 0;
+                    let result =
+                        data.write_limited(at, bytes, append, self.file_size_limit, || {
+                            self.file_size_signal.set(true)
+                        });
+                    if let Ok((_, end)) = result {
+                        if offset.is_none() {
+                            position.value = end;
+                        }
+                    }
+                    drop(position);
+                    if result.as_ref().is_ok_and(|(n, _)| *n != 0) {
+                        data.modified(!self.credentials.has_cap(capabilities::FSETID));
+                    }
+                    let synchronous = o.flags.get() & 0x1000 != 0;
+                    drop(n);
+                    if result.as_ref().is_ok_and(|(n, _)| *n != 0) {
+                        inotify::notify(
+                            &node,
+                            inotify::MODIFY,
+                            o.notification.as_ref().and_then(|c| c.link.as_ref()),
+                        );
+                    }
+                    drop(o);
+                    if result.is_ok() && synchronous {
+                        self.sync_description(descriptor, false)?;
+                    }
+                    return result.map(|(n, _)| n);
+                }
+            }
+        }
         let mut n = node.borrow_mut();
         let seals = n.seals;
         let count = bytes.len().min(storage::MAX_TRANSFER);
@@ -2780,42 +2904,46 @@ impl Vfs {
                 } else {
                     offset.unwrap_or(file_position.value)
                 };
-                if position >= self.file_size_limit {
-                    self.file_size_signal.set(true);
-                    return Err(Errno(27));
-                }
-                let bytes = &bytes[..bytes
-                    .len()
-                    .min(usize::try_from(self.file_size_limit - position).unwrap_or(usize::MAX))];
-                let end = position
-                    .checked_add(bytes.len() as u64)
-                    .filter(|&n| n <= i64::MAX as u64)
-                    .ok_or(Errno(27))?;
-                if seals.is_some_and(|s| s & 8 != 0 || s & 4 != 0 && end > b.len()) {
-                    return Err(Errno(1));
-                }
-                let available = if seals.is_some() {
-                    memfd_available
+                let plain = seals.is_none() && matches!(b, storage::FileData::Plain(_));
+                let bytes = if plain {
+                    bytes
                 } else {
-                    available
+                    if position >= self.file_size_limit {
+                        self.file_size_signal.set(true);
+                        return Err(Errno(27));
+                    }
+                    let bytes = &bytes[..bytes.len().min(
+                        usize::try_from(self.file_size_limit - position).unwrap_or(usize::MAX),
+                    )];
+                    let end = position
+                        .checked_add(bytes.len() as u64)
+                        .filter(|&n| n <= i64::MAX as u64)
+                        .ok_or(Errno(27))?;
+                    if seals.is_some_and(|s| s & 8 != 0 || s & 4 != 0 && end > b.len()) {
+                        return Err(Errno(1));
+                    }
+                    let available = if seals.is_some() {
+                        memfd_available
+                    } else {
+                        available
+                    };
+                    if let Some(query) = &self.query {
+                        if !query.file_layout_exclusive && end > b.len() && b.layout_change(end) {
+                            return query.defer();
+                        }
+                    }
+                    if b.growth_charge(end) > available {
+                        return Err(Errno(28));
+                    }
+                    bytes
                 };
-                if b.growth_charge(end) > available {
-                    return Err(Errno(28));
-                }
-                #[cfg(all(feature = "hostfs", unix))]
-                let native_append = if o.flags.get() & 0x400 != 0 {
-                    b.append_host(bytes).transpose()?
-                } else {
-                    None
-                };
-                #[cfg(not(all(feature = "hostfs", unix)))]
-                let native_append: Option<(usize, u64)> = None;
-                let (written, end) = if let Some((written, end)) = native_append {
-                    (written, end)
-                } else {
-                    let written = b.write_at(position, bytes)?;
-                    (written, position + written as u64)
-                };
+                let (written, end) = b.write_transfer(
+                    position,
+                    bytes,
+                    o.flags.get() & 0x400 != 0,
+                    self.file_size_limit,
+                    || self.file_size_signal.set(true),
+                )?;
                 if offset.is_none() {
                     file_position.value = end;
                 }
@@ -2829,10 +2957,7 @@ impl Vfs {
             } else {
                 None
             };
-            if let Some(meta) = shared {
-                n.mode = meta.mode;
-                n.times = meta.times;
-            } else {
+            if shared.is_none() {
                 if clear_setid && matches!(n.content, Content::File(_)) {
                     n.mode &= !0o4000;
                     if n.mode & 0o10 != 0 {
@@ -2856,7 +2981,7 @@ impl Vfs {
         }
         drop(o);
         if result.is_ok() && synchronous {
-            self.sync_fd(fd, false)?;
+            self.sync_description(descriptor, false)?;
         }
         result
     }
@@ -2865,8 +2990,16 @@ impl Vfs {
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
+        let descriptor = self.descriptor(fd)?;
+        self.pread_description(&descriptor, count, offset)
+    }
+    fn pread_description(
+        &self,
+        descriptor: &Descriptor,
+        count: usize,
+        offset: u64,
+    ) -> Result<Vec<u8>> {
+        let o = descriptor.open.borrow();
         if o.bridge.is_some() || o.kernel_log.is_some() {
             return Err(Errno(29));
         }
@@ -2919,73 +3052,7 @@ impl Vfs {
         self.file_write(fd, bytes, Some(offset))
     }
     pub fn truncate_fd(&mut self, fd: u32, length: u64) -> Result<()> {
-        if self.flags(fd)? & O_PATH != 0 {
-            return Err(Errno(9));
-        }
-        self.fd_writable(fd)?;
-        let anonymous = self
-            .descriptor(fd)?
-            .open
-            .borrow()
-            .node
-            .as_ref()
-            .is_some_and(|node| node.borrow().seals.is_some());
-        let available = if anonymous {
-            self.memfd_available()
-        } else {
-            self.fd_available_bytes(fd)?
-        };
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
-        if o.flags.get() & 3 == 0 {
-            return Err(Errno(22));
-        }
-        let node = o.node.clone().ok_or(Errno(22))?;
-        self.pseudo_immutable(&node)?;
-        let mut n = node.borrow_mut();
-        let seals = n.seals;
-        let Content::File(b) = &mut n.content else {
-            return Err(Errno(22));
-        };
-        if length > i64::MAX as u64 {
-            return Err(Errno(22));
-        }
-        if seals.is_some_and(|s| s & 2 != 0 && length < b.len() || s & 4 != 0 && length > b.len()) {
-            return Err(Errno(1));
-        }
-        if length > b.len() && length > self.file_size_limit {
-            self.file_size_signal.set(true);
-            return Err(Errno(27));
-        }
-        if b.growth_charge(length) > available {
-            return Err(Errno(28));
-        }
-        b.truncate(length)?;
-        if !self.credentials.has_cap(capabilities::FSETID) {
-            n.mode &= !0o4000;
-            if n.mode & 0o10 != 0 {
-                n.mode &= !0o2000;
-            }
-        }
-        n.times[1] = storage::Timestamp::now();
-        n.times[2] = n.times[1];
-        let linked = n.links != 0;
-        drop(n);
-        if linked {
-            // Persist the owning filesystem only. A named tmpfs buffer cannot
-            // require serializing the unrelated persistent root namespace.
-            o.mount
-                .as_ref()
-                .map_or(&self.fs, |mount| &mount.fs)
-                .borrow()
-                .checkpoint()?;
-        }
-        inotify::notify(
-            &node,
-            inotify::MODIFY,
-            o.notification.as_ref().and_then(|c| c.link.as_ref()),
-        );
-        Ok(())
+        self.resize_fd(fd, memfd::FileResize::Truncate(length))
     }
     pub fn truncate_at(&mut self, path: &[u8], length: u64) -> Result<()> {
         let fd = self.open_at(AT_FDCWD, path, 1, 0)?;
@@ -3791,3 +3858,6 @@ mod permission_tests {
 
 #[cfg(test)]
 mod shared_control_tests;
+
+#[cfg(test)]
+mod file_work_tests;

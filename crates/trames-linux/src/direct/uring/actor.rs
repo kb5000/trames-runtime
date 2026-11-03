@@ -2,21 +2,24 @@
 //! Source-task execution ownership. Rings contain weak cleanup tokens, never
 //! a task, Files root or path island. No resource service thread is involved.
 use super::*;
+#[path = "actor_file.rs"]
+mod file;
+pub use file::UringFileLayout;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
 };
 type Key = (usize, u64);
-pub(super) struct Execution {
+pub(crate) struct Execution {
     paths: Mutex<trames_vfs::PathQueries>,
     factory: trames_vfs::DescriptorFactory,
     files: trames_vfs::DirectFiles,
-    disk: Option<Arc<dyn UringDiskExecutor>>,
+    disk: Option<Arc<dyn FileExecutor>>,
 }
 struct Accepted {
     context: Arc<Execution>,
     socket: Option<socket_wait::RetainedSocket>,
-    sync: Option<Arc<UringDiskResult>>,
+    file: Option<file::FileIo>,
 }
 #[derive(Default)]
 pub struct UringActor {
@@ -25,6 +28,8 @@ pub struct UringActor {
     owner_required: AtomicBool,
     revision: AtomicU64,
     accepted: Mutex<BTreeMap<Key, Accepted>>,
+    layouts: Mutex<Vec<file::UringFileLayout>>,
+    file_signals: Mutex<Vec<(u64, u32)>>,
 }
 impl trames_vfs::UringSource for UringActor {}
 struct Lease {
@@ -41,11 +46,11 @@ impl Drop for Lease {
     }
 }
 impl Execution {
-    pub(super) fn new(
+    pub(crate) fn new(
         paths: &trames_vfs::PathQueries,
         factory: &trames_vfs::DescriptorFactory,
         files: &trames_vfs::DirectFiles,
-        disk: Option<Arc<dyn UringDiskExecutor>>,
+        disk: Option<Arc<dyn FileExecutor>>,
     ) -> Self {
         Self {
             paths: Mutex::new(paths.retain_context()),
@@ -59,50 +64,13 @@ impl Execution {
         call: &mut Accepted,
         request: &mut Request,
         memory: &mut impl CpuMemory,
+        actor: &UringActor,
+        ring: &Uring,
     ) -> Option<Result<(i32, bool)>> {
         let s = &request.sqe;
         Some(match s.opcode() {
-            // Backing layout/writeback commits retain the existing filesystem
-            // boundary. No request/cursor/fixed-table state moves back to it.
-            3 | 17 | 55 => {
-                if s.opcode() == 3 {
-                    if s.op_flags() & !1 != 0 {
-                        return Some(Err(Errno(22)));
-                    }
-                    if let Some(sync) = &call.sync {
-                        return Some(sync.result().unwrap_or(Err(Errno(11))).map(|()| (0, true)));
-                    }
-                    let prepared = self
-                        .paths
-                        .lock()
-                        .unwrap()
-                        .uring_disk_sync(request.file.as_ref()?, s.op_flags() & 1 != 0)?;
-                    match prepared {
-                        Err(e) => return Some(Err(e)),
-                        Ok(Some(job)) => {
-                            let disk = self.disk.as_ref()?;
-                            let result = Arc::new(UringDiskResult::with_file(
-                                request.file.as_ref()?.clone(),
-                            ));
-                            call.sync = Some(result.clone());
-                            disk.submit(job, result);
-                            return Some(Err(Errno(11)));
-                        }
-                        Ok(None) => {}
-                    }
-                }
-                self.paths
-                    .lock()
-                    .unwrap()
-                    .uring_file_control(
-                        request.file.as_ref()?,
-                        s.opcode(),
-                        s.op_flags(),
-                        s.offset(),
-                        s.address(),
-                        s.length(),
-                    )?
-                    .map(|()| (0, true))
+            1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55 => {
+                return file::execute(self, call, request, memory, actor, ring);
             }
             6 => {
                 if s.length() & !9 != 0
@@ -134,19 +102,7 @@ impl Execution {
                 if s.opcode() == 28 && s.op_flags() != 0 {
                     return Some(Err(Errno(22)));
                 }
-                self.paths
-                    .lock()
-                    .unwrap()
-                    .uring_open(
-                        request.file.as_ref(),
-                        s.fd(),
-                        request.path.as_deref()?,
-                        flags,
-                        mode,
-                        policy,
-                        &self.files,
-                    )?
-                    .map(|fd| (fd as i32, true))
+                return file::open(self, call, request, memory, actor, flags, mode, policy);
             }
             19 => {
                 if s.op_flags() != 0 || s.length() != 0 {
@@ -233,6 +189,9 @@ impl Execution {
     }
 }
 impl UringActor {
+    pub fn take_file_signals(&self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut *self.file_signals.lock().unwrap())
+    }
     pub(crate) fn require_owner(&self) {
         self.owner_required.store(true, Ordering::Relaxed);
     }
@@ -246,12 +205,13 @@ impl UringActor {
         self.active.store(active, Ordering::Relaxed);
     }
     pub(crate) fn pending_disk(&self) -> bool {
-        self.accepted.lock().unwrap().values().any(|call| {
-            call.sync
-                .as_ref()
-                .is_some_and(|result| result.result().is_none())
-        })
+        self.accepted
+            .lock()
+            .unwrap()
+            .values()
+            .any(|call| call.file.as_ref().is_some_and(|file| !file.result.ready()))
     }
+
     pub(crate) fn event_wait(&self, owner: u64, task: u32) -> bool {
         if self.pending_disk() {
             return true;
@@ -288,19 +248,23 @@ impl UringActor {
             .unwrap()
             .insert(Arc::as_ptr(ring) as usize, Arc::downgrade(ring));
     }
-    pub(super) fn accept(
+    pub(crate) fn accept(
         self: &Arc<Self>,
         ring: &Arc<Uring>,
         request: &mut Request,
         context: Arc<Execution>,
     ) {
         let key = (Arc::as_ptr(ring) as usize, request.sequence);
+        self.rings
+            .lock()
+            .unwrap()
+            .insert(key.0, Arc::downgrade(ring));
         self.accepted.lock().unwrap().insert(
             key,
             Accepted {
                 context,
                 socket: None,
-                sync: None,
+                file: None,
             },
         );
         request.execution = Some(Arc::new(Lease {
@@ -319,24 +283,29 @@ impl UringActor {
         let mut call = self.accepted.lock().unwrap().remove(&key)?;
         let before = (
             call.socket.as_ref().map(|s| s.uring_wait_kind()),
-            call.sync.is_some(),
+            call.file.is_some(),
         );
+        let original = request;
         let mut selected_view;
         let request = if let Some(buffer) = selected {
-            selected_view = request.clone();
-            let length = if request.sqe.opcode() == 27 && request.sqe.length() == 0 {
+            selected_view = original.clone();
+            let length = if original.sqe.opcode() == 27 && original.sqe.length() == 0 {
                 buffer.length
             } else {
-                buffer.length.min(request.sqe.length())
+                buffer.length.min(original.sqe.length())
             };
             selected_view.sqe.0[16..24].copy_from_slice(&buffer.address.to_le_bytes());
             selected_view.sqe.0[24..28].copy_from_slice(&length.to_le_bytes());
             selected_view.requested = length as u64;
             &mut selected_view
         } else {
-            request
+            &mut *original
         };
-        let result = call.context.clone().run(&mut call, request, memory);
+        let result = call
+            .context
+            .clone()
+            .run(&mut call, request, memory, self, ring);
+        let selection = request.selection.clone();
         if request.sqe.multishot()
             && matches!(request.sqe.opcode(), 26 | 27)
             && matches!(result, Some(Ok(_)))
@@ -346,8 +315,9 @@ impl UringActor {
         let changed = before
             != (
                 call.socket.as_ref().map(|s| s.uring_wait_kind()),
-                call.sync.is_some(),
+                call.file.is_some(),
             );
+        original.selection = selection;
         self.accepted.lock().unwrap().insert(key, call);
         if changed {
             ring.readiness.notify_locked();
@@ -360,13 +330,16 @@ impl UringActor {
         sequence: u64,
         signal: &Arc<IoSignal>,
     ) -> Option<trames_vfs::IoSubscription> {
-        let (socket, sync) = {
+        let (socket, file) = {
             let accepted = self.accepted.lock().unwrap();
             let call = accepted.get(&(ring as *const Uring as usize, sequence))?;
-            (call.socket.clone(), call.sync.clone())
+            (
+                call.socket.clone(),
+                call.file.as_ref().map(|f| f.result.clone()),
+            )
         };
-        if let Some(sync) = sync {
-            return Some(sync.subscribe(signal));
+        if let Some(file) = file {
+            return Some(file.subscribe(signal));
         }
         socket?.uring_subscribe(signal)
     }

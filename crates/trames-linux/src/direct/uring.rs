@@ -9,12 +9,10 @@ use trames_vfs::{
     UringRunning as Running, UringSqe, UringState as State, Vfs,
 };
 type Result<T> = std::result::Result<T, Errno>;
-mod actor;
+pub(crate) mod actor;
 mod background;
-mod disk;
-pub use actor::UringActor;
+pub use actor::{UringActor, UringFileLayout};
 pub use background::UringBackground;
-pub use disk::{UringDiskExecutor, UringDiskResult};
 
 trait ResourceOps: Sized {
     fn capture(file: &UringFile) -> Option<Self>;
@@ -110,6 +108,19 @@ impl RequestOps for Request {
             } else {
                 Err(Errno(22))
             });
+        }
+        // An accepted file actor owns its imported input through native waits.
+        // Never retry a second byte operation through the stateless fast helper.
+        if self.execution.is_some()
+            && self
+                .file
+                .as_ref()
+                .and_then(|f| f.shared_file())
+                .and_then(|f| f.file_target())
+                .is_some()
+            && matches!(s.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+        {
+            return None;
         }
         let resource = self.resource.as_ref()?;
         if s.opcode() == 6 {
@@ -475,7 +486,8 @@ impl RingOps for Ring {
                 {
                     continue;
                 }
-                if (r.selected() || matches!(r.sqe.opcode(), 31 | 32))
+                if r.selection.is_none()
+                    && (r.selected() || matches!(r.sqe.opcode(), 31 | 32))
                     && state
                         .provided
                         .get(&r.sqe.buffer_group())
@@ -536,12 +548,16 @@ impl RingOps for Ring {
             let mut selected = None;
             let mut group_lease = None;
             let mut selected_error = None;
-            if r.selected() {
+            if let Some(lease) = &r.selection {
+                selected = Some(lease.buffer);
+                group_lease = Some((lease.group, lease.identity));
+            } else if r.selected() {
                 match crate::uring::buffers::peek(&r.sqe, r.owner, &state.provided) {
                     Ok(buffer) => {
                         selected = Some(buffer);
                         let key = state.provided[&r.sqe.buffer_group()].identity;
                         state.busy_groups.insert(key);
+                        r.selected_identity = Some(key);
                         group_lease = Some((r.sqe.buffer_group(), key));
                     }
                     Err(e) => selected_error = Some(e),
@@ -577,6 +593,9 @@ impl RingOps for Ring {
                     })
                     .or_else(|| execute(&mut r, memory, selected))
             };
+            if let (Some(selection), Some(buffer)) = (&mut r.selection, selected) {
+                selection.buffer = buffer;
+            }
             if result.is_some() {
                 r.started = true;
             }
@@ -610,7 +629,8 @@ impl RingOps for Ring {
             } else {
                 0
             };
-            let retired_group = if let Some((_, key)) = group_lease {
+            let keep_group = r.selection.is_some() && matches!(result, Some(Err(Errno(11))));
+            let retired_group = if let Some((_, key)) = group_lease.filter(|_| !keep_group) {
                 state.busy_groups.remove(&key);
                 notify |= state.contended_groups.remove(&key);
                 state.retired_groups.remove(&key)
@@ -674,7 +694,7 @@ impl UringSnapshot {
         paths: Option<&trames_vfs::PathQueries>,
         factory: Option<&trames_vfs::DescriptorFactory>,
         files: &trames_vfs::DirectFiles,
-        disk: Option<&Arc<dyn UringDiskExecutor>>,
+        disk: Option<&Arc<dyn FileExecutor>>,
     ) {
         if self.context.get().is_none() {
             if let (Some(paths), Some(factory)) = (paths, factory) {
@@ -916,6 +936,8 @@ impl UringSnapshot {
                             }
                             r.resource = self.accepted_resource(&bound);
                             if r.resource.is_none()
+                                && !(self.context.get().is_some()
+                                    && bound.shared_file().and_then(|f| f.file_target()).is_some())
                                 && matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
                             {
                                 r.file = Some(bound);
@@ -938,14 +960,22 @@ impl UringSnapshot {
                     rejected_requests.push(r);
                     break;
                 }
-                let context = matches!(
-                    r.sqe.opcode(),
-                    3 | 13 | 16 | 17 | 18 | 19 | 21 | 28 | 34 | 45 | 55 | 56 | 57
-                ) || r.sqe.opcode() == 6
-                    && !matches!(
-                        r.resource.as_ref().map(|f| &f.object),
-                        Some(Object::Byte(_))
+                let context = matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+                    && (self.context.get().is_some() || r.resource.is_none())
+                    && r.file
+                        .as_ref()
+                        .and_then(|f| f.shared_file())
+                        .and_then(|f| f.file_target())
+                        .is_some()
+                    || matches!(
+                        r.sqe.opcode(),
+                        3 | 13 | 16 | 17 | 18 | 19 | 21 | 28 | 34 | 45 | 55 | 56 | 57
                     )
+                    || r.sqe.opcode() == 6
+                        && !matches!(
+                            r.resource.as_ref().map(|f| &f.object),
+                            Some(Object::Byte(_))
+                        )
                     || matches!(r.sqe.opcode(), 26 | 27)
                         && (r.resource.is_none()
                             || matches!(
@@ -1053,6 +1083,7 @@ impl UringSnapshot {
                 socket_subscriptions: Vec::new(),
                 host_subscription: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
                 uring: Some(Box::new(Wait {
                     ring,
@@ -1170,7 +1201,7 @@ impl DirectSyscalls {
             self.paths.as_ref(),
             self.resources.as_ref(),
             &self.files,
-            self.uring_disk.as_ref(),
+            self.file_executor.as_ref(),
         );
         call.ring
             .state
@@ -1677,7 +1708,7 @@ mod tests {
         assert!(epoch.finish().is_empty());
     }
     #[test]
-    fn local_uring_regular_files_preserve_offsets_and_defer_growth_once() {
+    fn local_uring_regular_files_preserve_offsets_and_grow_without_handoff() {
         let (mut l, mut m, fd, r) = setup(8);
         l.vfs.import_file(b"/data", b"abcdefgh".to_vec()).unwrap();
         let file = l.vfs.open_at(trames_vfs::AT_FDCWD, b"/data", 2, 0).unwrap();
@@ -1702,21 +1733,12 @@ mod tests {
         request[0] = 23;
         request[8..16].copy_from_slice(&8u64.to_le_bytes());
         add(&mut m, &r, request);
-        assert!(matches!(
-            start(&s, fd, 1, 1, &mut m, &t),
-            IoAttempt::Checkpoint
-        ));
+        complete(start(&s, fd, 1, 1, &mut m, &t), 1);
+        assert_eq!(cq(&mut m, &r), (52, 1));
+        assert_eq!(l.vfs.seek(file, 0, 1), Ok(1));
         drop(s);
         assert!(epoch.finish().is_empty());
-        assert_eq!(r.state.lock().unwrap().waits[&7].0, 1);
         files.finish();
-        assert_eq!(l.vfs.seek(file, 0, 1), Ok(1));
-        assert_eq!(l.vfs.pread(file, 100, 0).unwrap(), b"abcdefgh");
-        assert_eq!(
-            l.uring_enter_ring(r.clone(), [fd as u64, 1, 1, 1, 0, 0], &mut m, Some(1), 7),
-            Ok((1, true))
-        );
-        assert_eq!(cq(&mut m, &r), (52, 1));
         assert_eq!(l.vfs.pread(file, 10, 0).unwrap(), b"abcdefgha");
     }
     #[test]

@@ -824,15 +824,16 @@ impl Vfs {
     pub(super) fn fd_available_bytes(&self, fd: u32) -> Result<u64> {
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
+        Ok(self.description_available_bytes(&open))
+    }
+    pub(super) fn description_available_bytes(&self, open: &OpenDescription) -> u64 {
         #[cfg(all(feature = "hostfs", unix))]
         if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
             // Native volume/quota admission belongs to the actual write. Never
             // scan cached host inodes or charge them to the private store.
-            return Ok(u64::MAX);
+            return u64::MAX;
         }
-        let bytes =
-            Self::filesystem_bytes(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow()).2;
-        Ok(bytes)
+        Self::filesystem_bytes(&open.mount.as_ref().map_or(&self.fs, |m| &m.fs).borrow()).2
     }
     pub fn mapping_executable(&self, fd: u32) -> Result<bool> {
         if self.uring(fd).is_ok() {
@@ -2260,7 +2261,7 @@ mod boundary_tests {
         assert_eq!(mount.flags.get() & MS_RELATIME, 0);
         v.seek(fd, 0, 0).unwrap();
         v.read(fd, 1).unwrap();
-        assert!(node.borrow().times[0].seconds < future.seconds);
+        assert!(node.borrow().file_metadata().times[0].seconds < future.seconds);
     }
     #[test]
     fn empty_mqueue_mounts_share_identity_without_creatable_regular_files() {
@@ -2296,13 +2297,14 @@ pub(super) fn accessed(node: &mut Node, mount: Option<&MountData>) {
         return;
     }
     if let Content::File(storage::FileData::Plain(data)) = &node.content {
-        if let Some(meta) = data.accessed(
-            false,
-            mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0),
-        ) {
-            node.mode = meta.mode;
-            node.times = meta.times;
-            return;
+        if data
+            .accessed(
+                false,
+                mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0),
+            )
+            .is_some()
+        {
+            return; // The original shared file metadata is canonical already.
         }
     }
     let now = storage::Timestamp::now();

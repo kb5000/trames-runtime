@@ -418,6 +418,7 @@ impl DirectSyscalls {
             host_subscription: None,
             uring: None,
             poll_uring: None,
+            file: None,
             target: target.clone(),
         }
     }

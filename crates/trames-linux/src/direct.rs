@@ -10,16 +10,17 @@ use std::{
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
+pub(crate) mod file;
 mod ip_message;
 mod local_message;
 #[cfg(test)]
 mod netlink;
 mod socket_wait;
+pub use file::{FileBoundary, FileCheckpoint, FileExecutor, FileOutput, FilePending, FileResult};
 pub(crate) mod uring;
 pub use socket_wait::RetainedSocket;
 pub use uring::{
-    UringActor, UringBackground, UringDiskExecutor, UringDiskResult, UringEnter, UringEpoch,
-    UringSnapshot,
+    UringActor, UringBackground, UringEnter, UringEpoch, UringFileLayout, UringSnapshot,
 };
 
 fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
@@ -49,6 +50,7 @@ pub struct PendingIo {
     uring: Option<Box<uring::Wait>>,
     poll_uring: Option<Box<uring::PollWait>>,
     target: Weak<dyn IoWake>,
+    file: Option<FilePending>,
 }
 /// Authority accepted for one byte syscall. The complete OFD lease, rather
 /// than its numeric table slot or a copied pipe counter, owns the endpoint.
@@ -97,7 +99,13 @@ impl PendingIo {
             .iter()
             .any(|s| s.notification_external())
     }
+    pub fn file_pending(&self) -> Option<FilePending> {
+        self.file.clone()
+    }
     pub fn external_wait(&self) -> bool {
+        if self.file.is_some() {
+            return true;
+        }
         self.retained_socket
             .as_ref()
             .is_some_and(RetainedSocket::external_wait)
@@ -122,6 +130,7 @@ pub enum IoAttempt {
     Checkpoint,
     SocketCheckpoint(RetainedSocket),
     ByteCheckpoint(RetainedByte),
+    FileCheckpoint(FileCheckpoint),
 }
 /// Shared epoll ABI for both joined and worker-local implementations.
 pub fn epoll_parameters(
@@ -171,9 +180,10 @@ pub fn epoll_scatter(
 #[derive(Default)]
 pub struct DirectSyscalls {
     paths: Option<trames_vfs::PathQueries>,
+    file_prepared: RefCell<Option<file::PreparedFileCall>>,
     resources: Option<trames_vfs::DescriptorFactory>,
     urings: UringSnapshot,
-    uring_disk: Option<Arc<dyn UringDiskExecutor>>,
+    file_executor: Option<Arc<dyn FileExecutor>>,
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
     terminal: Option<trames_vfs::TerminalAccess>,
@@ -197,9 +207,10 @@ impl DirectSyscalls {
         let membership = descriptors.shared_files();
         Self {
             paths: None,
+            file_prepared: Default::default(),
             resources: None,
             urings: Default::default(),
-            uring_disk: None,
+            file_executor: None,
             descriptors,
             network: Default::default(),
             terminal: None,
@@ -362,6 +373,9 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
         let paths = self.paths.as_ref()?;
+        if self.file_prepared(number, a) {
+            return None;
+        }
         let result = if matches!(number, 56 | 437) {
             let parameters = (|| {
                 let (flags, mode, policy) = if number == 437 {
@@ -372,9 +386,26 @@ impl DirectSyscalls {
                 Ok((Linux::path(memory, a[1])?, flags, mode, policy))
             })();
             match parameters {
-                Ok((path, flags, mode, policy)) => paths
-                    .open_at_resolve(a[0] as i32, &path, flags, mode, policy, &self.files)?
-                    .map(u64::from),
+                Ok((path, flags, mode, policy)) => {
+                    match paths.open_at_resolve(
+                        a[0] as i32,
+                        &path,
+                        flags,
+                        mode,
+                        policy,
+                        &self.files,
+                    ) {
+                        Some(result) => result.map(u64::from),
+                        None => {
+                            return self.prepare_open_work(
+                                number,
+                                a,
+                                paths.take_open_work()?,
+                                memory,
+                            )
+                        }
+                    }
+                }
                 Err(e) => Err(e),
             }
         } else {
@@ -447,8 +478,8 @@ impl DirectSyscalls {
         self.network = network;
         self
     }
-    pub fn with_uring_disk(mut self, disk: Arc<dyn UringDiskExecutor>) -> Self {
-        self.uring_disk = Some(disk);
+    pub fn with_file_executor(mut self, disk: Arc<dyn FileExecutor>) -> Self {
+        self.file_executor = Some(disk);
         self
     }
     pub fn with_urings(mut self, snapshot: UringSnapshot) -> Self {
@@ -485,8 +516,8 @@ impl DirectSyscalls {
         self.urings.clock = Some(started);
         self
     }
-    /// File deferral is before effects and uses the ordinary owner service.
-    /// It is distinct from byte-resource blocking/pipe signal handling.
+    /// File operations use their original resource authority. Blocking native
+    /// work and genuine mapping-layout changes retain the accepted operation.
     pub fn invoke_file(
         &self,
         number: u32,
@@ -526,74 +557,7 @@ impl DirectSyscalls {
             self.record_fd_control();
             return Some(result);
         }
-        if !matches!(number, 62..=70 | 80) {
-            return None;
-        }
-        let file = match self.files.get(a[0] as u32) {
-            Some(file) => file,
-            None if number == 62 => return self.invoke_path(number, a, memory),
-            None => return None,
-        };
-        let deferred = Cell::new(false);
-        let read = |count, offset| {
-            file.read(count, offset, &mut self.disk_cache.borrow_mut())
-                .unwrap_or_else(|| {
-                    deferred.set(true);
-                    Err(Errno(11))
-                })
-        };
-        let write = |bytes: &[u8], offset| {
-            file.write(bytes, offset, &mut self.disk_cache.borrow_mut())
-                .unwrap_or_else(|| {
-                    deferred.set(true);
-                    Err(Errno(11))
-                })
-                .map(|n| n as u64)
-        };
-        let result = match number {
-            62 => file.seek(a[1] as i64, a[2] as u32)?,
-            63 => Linux::read_transport(a, memory, |count| read(count, None)),
-            64 => Linux::write_transport(a, memory, &mut self.scratch.borrow_mut(), |bytes| {
-                write(bytes, None)
-            }),
-            65 => Linux::readv_transport_mode(a, memory, false, |count| read(count, None)),
-            66 => Linux::writev_transport_mode(
-                a,
-                memory,
-                &mut self.scratch.borrow_mut(),
-                false,
-                |bytes| write(bytes, None),
-            ),
-            67 => Linux::read_transport(a, memory, |count| read(count, Some(a[3]))),
-            68 => Linux::write_transport(a, memory, &mut self.scratch.borrow_mut(), |bytes| {
-                write(bytes, Some(a[3]))
-            }),
-            69 | 70 => (|| {
-                let (parts, total) = Linux::positioned_vector_parts(memory, a, number == 70)?;
-                if number == 70 {
-                    let mut scratch = self.scratch.borrow_mut();
-                    Linux::gather_parts(memory, &parts, total, &mut scratch)?;
-                    write(&scratch, Some(a[3]))
-                } else {
-                    let bytes = read(total, Some(a[3]))?;
-                    Linux::scatter(memory, &parts, &bytes)?;
-                    Ok(bytes.len() as u64)
-                }
-            })(),
-            80 => (|| {
-                let stat = file.stat()?;
-                Linux::check(memory, a[1], 128, Access::Write)?;
-                memory.write(a[1], &stat).map_err(|_| Errno(14))?;
-                Ok(0)
-            })(),
-            _ => unreachable!(),
-        };
-        if deferred.get() {
-            return None;
-        }
-        self.completed.set(self.completed.get() + 1);
-        self.file_completed.set(self.file_completed.get() + 1);
-        Some(result)
+        self.invoke_file_io(number, a, memory)
     }
     pub fn supports(&self, number: u32, fd: u32) -> bool {
         // Classify the ABI before resolving an FD. Creation, pathname, clock
@@ -667,6 +631,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if self.file_prepared(number, args) {
+            return true;
+        }
         if number == 116 {
             return self.kernel_log.is_some();
         }
@@ -800,6 +767,7 @@ impl DirectSyscalls {
                 host_subscription: Some(subscription),
                 uring: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
             },
             memory,
@@ -1027,6 +995,9 @@ impl DirectSyscalls {
                 return Some(self.start_tcp(fd, number, args, memory, pid, target, saved_deadline));
             }
         }
+        if let Some(attempt) = self.start_prepared_file(number, args, memory, pid, target) {
+            return Some(attempt);
+        }
         if let Some(file) = self.retain_byte(number, args) {
             return Some(match file {
                 Ok(file) => self.start_retained_byte(file, number, args, memory, pid, target),
@@ -1060,7 +1031,7 @@ impl DirectSyscalls {
                 self.paths.as_ref(),
                 self.resources.as_ref(),
                 &self.files,
-                self.uring_disk.as_ref(),
+                self.file_executor.as_ref(),
             );
             let attempt = self.urings.start(args, memory, pid, target)?;
             return Some(attempt);
@@ -1194,6 +1165,7 @@ impl DirectSyscalls {
                 host_subscription,
                 uring: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
             },
             memory,
@@ -1245,6 +1217,7 @@ impl DirectSyscalls {
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
             },
             memory,
@@ -1344,6 +1317,7 @@ impl DirectSyscalls {
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
             },
             memory,
@@ -1384,6 +1358,7 @@ impl DirectSyscalls {
                 host_subscription: None,
                 uring: None,
                 poll_uring: None,
+                file: None,
                 target: target.clone(),
             },
             memory,
@@ -1420,6 +1395,17 @@ impl DirectSyscalls {
     ) -> IoAttempt {
         if pending.retained_socket.is_some() {
             return self.resume_socket(pending, memory);
+        }
+        if let Some(file) = pending.file.take() {
+            return self.resume_file(
+                file,
+                pending.number,
+                pending.args,
+                pending.signal,
+                pending._subscriptions,
+                memory,
+                &pending.target,
+            );
         }
         if pending.uring.is_some() {
             return self.urings.resume(pending, memory);
@@ -2781,7 +2767,7 @@ mod tests {
         }
     }
     #[test]
-    fn file_preflight_and_growth_deferral_never_consume_a_partial_vector() {
+    fn file_preflight_and_source_growth_never_consume_a_partial_vector() {
         let mut vfs = Vfs::default();
         vfs.import_file(b"/data", b"abcd".to_vec()).unwrap();
         let fd = vfs.open_at(trames_vfs::AT_FDCWD, b"/data", 2, 0).unwrap();
@@ -2801,11 +2787,10 @@ mod tests {
         assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"abcd");
         assert_eq!(
             direct.invoke_file(64, [fd as u64, 0x1100, 8, 0, 0, 0], &mut m),
-            None
+            Some(Ok(8))
         );
-        assert_eq!(vfs.seek(fd, 0, 1).unwrap(), 0);
-        assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"abcd");
-        assert_eq!(vfs.write(fd, b"12345678").unwrap(), 8);
+        assert_eq!(vfs.seek(fd, 0, 1).unwrap(), 8);
+        assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"12345678");
         vfs.seek(fd, 0, 0).unwrap();
         assert_eq!(
             direct.invoke_file(63, [fd as u64, 0x1100, 8, 0, 0, 0], &mut m),

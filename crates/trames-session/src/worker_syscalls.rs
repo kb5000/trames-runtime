@@ -18,7 +18,6 @@ pub(super) struct Snapshot {
     pub processor: u32,
     pub profile: bool,
     pub streams: trames_vfs::FdMask,
-    pub files: trames_vfs::FdMask,
     pub fd_flags: trames_vfs::FdFlags,
     pub umask: trames_vfs::Umask,
     pub actions: crate::signal_actions::Actions,
@@ -51,17 +50,7 @@ pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
         62 | 80 => true,
         63..=66 => {
             let fd = cpu.x(0) as u32;
-            fd < trames_vfs::MAX_FDS
-                && ((snapshot.streams[fd as usize / 64] | snapshot.files[fd as usize / 64])
-                    & (1 << (fd % 64))
-                    != 0
-                    || snapshot.direct.published_file(fd))
-        }
-        67..=70 | 82 | 83 => {
-            let fd = cpu.x(0) as u32;
-            fd < trames_vfs::MAX_FDS
-                && (snapshot.files[fd as usize / 64] & (1 << (fd % 64)) != 0
-                    || snapshot.direct.published_file(fd))
+            fd < trames_vfs::MAX_FDS && snapshot.streams[fd as usize / 64] & (1 << (fd % 64)) != 0
         }
         _ => false,
     }
@@ -571,7 +560,7 @@ mod tests {
             processor: 0,
             profile: false,
             streams: Default::default(),
-            files: Default::default(),
+
             fd_flags: Default::default(),
             umask: Default::default(),
             actions: Default::default(),
@@ -692,7 +681,7 @@ mod tests {
             processor: 0,
             profile: false,
             streams: Default::default(),
-            files: Default::default(),
+
             fd_flags: Default::default(),
             umask: Default::default(),
             actions: Default::default(),
@@ -743,7 +732,7 @@ mod tests {
             processor: 0,
             profile: false,
             streams: vfs.stream_descriptors(),
-            files: vfs.file_descriptors(),
+
             fd_flags: vfs.fd_flags_snapshot(),
             umask: vfs.umask_capability(),
             actions: Default::default(),
@@ -838,7 +827,7 @@ mod tests {
             processor: 0,
             profile: false,
             streams: vfs.stream_descriptors(),
-            files: vfs.file_descriptors(),
+
             fd_flags: vfs.fd_flags_snapshot(),
             umask: vfs.umask_capability(),
             actions: Default::default(),
@@ -897,7 +886,7 @@ mod tests {
             processor: 3,
             profile: false,
             streams: Default::default(),
-            files: Default::default(),
+
             fd_flags: Default::default(),
             umask: Default::default(),
             actions: Default::default(),

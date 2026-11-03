@@ -82,11 +82,12 @@ struct Metadata {
 }
 impl Metadata {
     fn of(node: &Node) -> Self {
+        let metadata = node.file_metadata();
         Self {
-            mode: node.mode,
+            mode: metadata.mode,
             uid: node.uid,
             gid: node.gid,
-            times: [node.times[1], node.times[2]],
+            times: [metadata.times[1], metadata.times[2]],
             attrs: node.xattrs.clone(),
         }
     }
@@ -175,6 +176,14 @@ impl Overlay {
     pub(super) fn capacity(&self) -> StorageCapacity {
         let layer = self.upper.as_ref().unwrap_or(&self.lowers[0]);
         Vfs::filesystem_capacity(&layer.fs.borrow())
+    }
+    pub(super) fn file_quota(&self) -> Arc<file_accounting::FileQuota> {
+        self.upper
+            .as_ref()
+            .unwrap_or(&self.lowers[0])
+            .fs
+            .quota
+            .clone()
     }
     pub(super) fn capacity_bytes(&self) -> (u64, u64, u64) {
         let layer = self.upper.as_ref().unwrap_or(&self.lowers[0]);
@@ -407,7 +416,7 @@ impl Overlay {
             .collect();
         for (id, (n, _)) in &all {
             if n.borrow().links != 0 && known.insert(*id) {
-                backing.inodes.push(Arc::downgrade(n));
+                backing.track_inode(n)?;
             }
         }
         backing.inodes.retain(|n| n.strong_count() != 0);
@@ -683,13 +692,13 @@ impl Vfs {
                     path_hint: SharedCell::default(),
                     device: n.device,
                     content,
-                    mode: n.mode,
+                    mode: n.file_metadata().mode,
                     uid: n.uid,
                     gid: n.gid,
                     volatile: false,
                     inode,
                     links: 0,
-                    times: n.times,
+                    times: n.file_metadata().times,
                     xattrs: n
                         .xattrs
                         .iter()

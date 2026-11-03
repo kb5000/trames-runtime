@@ -83,8 +83,7 @@ impl Linux {
                 Ok(0) // Kernel prefetch/eviction advice is optional, not a data operation.
             }
             267 => {
-                self.vfs.fd_kind(a[0] as u32)?;
-                self.vfs.sync()?;
+                self.vfs.sync_filesystem_fd(a[0] as u32)?;
                 Ok(0)
             }
             452 => {

@@ -69,18 +69,20 @@ pub struct DirectFiles(
 );
 #[derive(Clone)]
 struct PublishedFiles {
-    epoch: Arc<Mutex<PublishedEpoch>>,
+    epoch: Arc<PublishedEpoch>,
     clear_setid: bool,
     unlimited: bool,
 }
 // Weak epoch identity prevents a later checkpoint from reusing stale admission.
 pub(super) struct PublishedFile {
-    epoch: std::sync::Weak<Mutex<PublishedEpoch>>,
+    epoch: std::sync::Weak<PublishedEpoch>,
     prepared: PreparedFile,
 }
 #[derive(Default)]
-struct PublishedEpoch {
-    nodes: BTreeMap<usize, (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>)>,
+struct PublishedEpoch;
+pub enum FileAccess {
+    Fast(DirectFile),
+    Full(FileTarget),
 }
 impl DirectFiles {
     pub fn published(&self, fd: u32) -> bool {
@@ -90,22 +92,40 @@ impl DirectFiles {
             .is_some_and(|r| r.is_ok_and(|f| f.open.file_authority.get().is_some()))
     }
     pub(super) fn publish_open(&self, vfs: &Vfs, open: &OpenDescription) {
-        let publication = self.3.as_ref().expect("worker file publication authority");
-        if let Some((prepared, node, data)) =
-            FileEpoch::prepare_open(vfs, open, publication.unlimited)
-        {
-            // Resource preparation is outside this registration-only lock.
-            let mut epoch = publication.epoch.lock().unwrap();
-            epoch.nodes.insert(
-                Arc::as_ptr(&node) as usize,
-                (Arc::downgrade(&node), Arc::downgrade(&data)),
-            );
-            drop(epoch);
+        let Some(publication) = self.3.as_ref() else {
+            return;
+        };
+        if let Some((prepared, _, _)) = FileEpoch::prepare_open(vfs, open, publication.unlimited) {
             let _ = open.file_authority.set(PublishedFile {
                 epoch: Arc::downgrade(&publication.epoch),
                 prepared,
             });
         }
+    }
+    pub fn resolve(&self, fd: u32) -> Option<FileAccess> {
+        if let Some(result) = self.2.as_ref().and_then(|files| files.lookup(fd)) {
+            let file = result.ok()?;
+            if let Some(prepared) = self.1.get(&file.identity()) {
+                return prepared.accept(Some(file)).map(FileAccess::Fast);
+            }
+            if let Some(publication) = &self.3 {
+                if let Some(published) = file.open.file_authority.get() {
+                    if published.epoch.as_ptr() == Arc::as_ptr(&publication.epoch) {
+                        if let Some(mut fast) = published.prepared.accept(Some(file.clone())) {
+                            fast.clear_setid = publication.clear_setid;
+                            fast.unlimited = publication.unlimited;
+                            return Some(FileAccess::Fast(fast));
+                        }
+                    }
+                }
+            }
+            return file.file_target().map(FileAccess::Full);
+        }
+        self.0
+            .get(fd as usize)?
+            .as_ref()?
+            .accept(None)
+            .map(FileAccess::Fast)
     }
     pub fn get(&self, fd: u32) -> Option<DirectFile> {
         if let Some(result) = self.2.as_ref().and_then(|files| files.lookup(fd)) {
@@ -144,7 +164,7 @@ impl DirectFiles {
 }
 #[derive(Default)]
 pub struct FileEpoch {
-    published: Arc<Mutex<PublishedEpoch>>,
+    published: Arc<PublishedEpoch>,
     prepared: BTreeMap<(usize, bool, bool), PreparedFile>,
     captures: BTreeMap<(usize, u64, bool, bool, u64), DirectFiles>,
 }
@@ -244,11 +264,7 @@ impl FileEpoch {
         if let Some(prepared) = self.prepared.get(&prepared_key) {
             return Some(prepared.clone());
         }
-        let (prepared, node, data) = Self::prepare_open(vfs, o, unlimited)?;
-        self.published.lock().unwrap().nodes.insert(
-            Arc::as_ptr(&node) as usize,
-            (Arc::downgrade(&node), Arc::downgrade(&data)),
-        );
+        let (prepared, _, _) = Self::prepare_open(vfs, o, unlimited)?;
         self.prepared.insert(prepared_key, prepared.clone());
         Some(prepared)
     }
@@ -263,7 +279,7 @@ impl FileEpoch {
         }
         let node = Vfs::ordinary_file(o, false)?;
         let flock = o.flock_capability();
-        let n = node.borrow();
+        let n = node.try_borrow()?;
         let Content::File(storage::FileData::Plain(data)) = &n.content else {
             return None;
         };
@@ -302,23 +318,22 @@ impl FileEpoch {
         }));
         Some((prepared, node.clone(), data))
     }
-    /// All workers/requests must have returned first. This touches only the
-    /// captured inodes, never scans the filesystem or adds a compute fast-path lock.
-    pub fn finish(self) {
-        let nodes = std::mem::take(&mut self.published.lock().unwrap().nodes);
-        for (_, (node, data)) in nodes {
-            if let (Some(node), Some(data)) = (node.upgrade(), data.upgrade()) {
-                let Some(meta) = data.finish_metadata() else {
-                    continue;
-                };
-                let mut node = node.borrow_mut();
-                node.mode = meta.mode;
-                node.times = meta.times;
-            }
-        }
-    }
+    /// Compatibility lifetime boundary only. Canonical file metadata is already
+    /// visible on its original resource; no inode scan or copyback is required.
+    pub fn finish(self) {}
 }
 impl DirectFile {
+    fn try_position(&self) -> Option<std::sync::MutexGuard<'_, FilePosition>> {
+        match self.position.try_lock() {
+            Ok(position) => Some(position),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    pub fn target(&self) -> Option<FileTarget> {
+        self.file.clone().map(FileTarget)
+    }
+
     pub fn shared_file(&self) -> Option<SharedFd> {
         self.file.clone()
     }
@@ -351,7 +366,7 @@ impl DirectFile {
         let base = match whence {
             0 => 0,
             1 => {
-                let position = self.position.lock().unwrap();
+                let position = self.try_position()?;
                 if position.pending != 0 {
                     return None;
                 }
@@ -409,7 +424,7 @@ impl DirectFile {
         let result = if let Some(offset) = offset {
             self.data.epoch_read_at(offset, count, cache)?
         } else {
-            let mut position = self.position.lock().unwrap();
+            let mut position = self.try_position()?;
             if position.pending != 0 {
                 return None;
             }
@@ -454,23 +469,23 @@ impl DirectFile {
         if !self.unlimited || self.prepared.0.flags & 0x1000 != 0 {
             return None;
         }
-        // Append growth/quotas/manifest retain the original owner path. No
-        // partial vector or append transfer is performed before deferring.
-        if self.prepared.0.status.get() & 0x400 != 0 {
-            return None;
-        }
+        let append = self.prepared.0.status.get() & 0x400 != 0;
         let result = if let Some(offset) = offset {
-            self.data.write_in_place(offset, bytes, cache)?
+            self.data
+                .write_local(offset, bytes, append, cache)?
+                .map(|(n, _)| n)
         } else {
-            let mut position = self.position.lock().unwrap();
+            let mut position = self.try_position()?;
             if position.pending != 0 {
                 return None;
             }
-            let result = self.data.write_in_place(position.value, bytes, cache)?;
-            if let Ok(n) = result {
-                position.value += n as u64;
+            let result = self
+                .data
+                .write_local(position.value, bytes, append, cache)?;
+            if let Ok((_, end)) = result {
+                position.value = end;
             }
-            result
+            result.map(|(n, _)| n)
         };
         if result.is_ok_and(|n| n != 0) {
             self.data.modified(self.clear_setid);
@@ -482,7 +497,7 @@ impl DirectFile {
         if self.prepared.0.flags & O_PATH != 0 {
             return Some(Err(Errno(9)));
         }
-        let mut position = self.position.lock().unwrap();
+        let mut position = self.try_position()?;
         if position.pending != 0 {
             return None;
         }
@@ -775,10 +790,27 @@ mod tests {
                 b.get(duplicate).unwrap(),
             ] {
                 let seen = &seen;
+                let paths = parent.path_queries();
                 scope.spawn(move || {
                     let mut cache = DiskReadCache::default();
                     loop {
-                        let bytes = file.read(8, None, &mut cache).unwrap().unwrap();
+                        let bytes = match file.read(8, None, &mut cache) {
+                            Some(result) => result.unwrap(),
+                            None => match FileWork::run_inline(
+                                &paths,
+                                file.target().unwrap(),
+                                FileCommand::Read {
+                                    count: 8,
+                                    offset: None,
+                                },
+                            ) {
+                                FileOutcome::Complete(FileReply {
+                                    result: Ok(FileValue::Bytes(bytes)),
+                                    ..
+                                }) => bytes,
+                                _ => panic!("original OFD read transaction"),
+                            },
+                        };
                         if bytes.is_empty() {
                             break;
                         }
@@ -868,26 +900,35 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
-    fn growth_append_finite_limit_and_synchronous_writes_defer_without_effects() {
-        let (mut vfs, fd) = memory_file(b"abcdefgh".to_vec());
+    fn growth_and_append_execute_on_source_while_finite_and_sync_policy_use_full_file_calls() {
+        let (vfs, fd) = memory_file(b"abcdefgh".to_vec());
         let mut epoch = FileEpoch::default();
         let files = epoch.capture(&vfs, true);
         let file = files.get(fd).unwrap();
         let mut cache = DiskReadCache::default();
         assert_eq!(file.seek(7, 0), Some(Ok(7)));
-        assert_eq!(file.write(b"XY", None, &mut cache), None);
-        assert_eq!(vfs.seek(fd, 0, 1).unwrap(), 7);
-        assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"abcdefgh");
+        assert_eq!(file.write(b"XY", None, &mut cache), Some(Ok(2)));
+        assert_eq!(file.seek(0, 1), Some(Ok(9)));
+        assert_eq!(vfs.pread(fd, 16, 0).unwrap(), b"abcdefgXY");
         epoch.finish();
         for (flags, unlimited) in [(0x400, true), (0x1000, true), (0, false)] {
+            let (mut vfs, fd) = memory_file(b"abcdefgh".to_vec());
             let other = vfs.open_at(AT_FDCWD, b"/data", 2 | flags, 0).unwrap();
             let mut epoch = FileEpoch::default();
             let files = epoch.capture(&vfs, unlimited);
+            let expected = if flags == 0x400 { Some(Ok(1)) } else { None };
             assert_eq!(
                 files.get(other).unwrap().write(b"X", Some(0), &mut cache),
-                None
+                expected
             );
-            assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"abcdefgh");
+            assert_eq!(
+                vfs.pread(fd, 16, 0).unwrap(),
+                if flags == 0x400 {
+                    b"abcdefghX".as_slice()
+                } else {
+                    b"abcdefgh".as_slice()
+                }
+            );
             epoch.finish();
         }
     }
@@ -910,7 +951,7 @@ mod tests {
                         assert_eq!(file.read(1, Some(99), &mut cache), Some(Ok(Vec::new())));
                         assert_eq!(file.read(0, None, &mut cache), Some(Ok(Vec::new())));
                         assert_eq!(file.write(b"", None, &mut cache), Some(Ok(0)));
-                        assert_eq!(file.write(b"grow", Some(99), &mut cache), None);
+                        assert_eq!(file.write(b"grow", Some(99), &mut cache), Some(Ok(4)));
                     })
                     .join()
                     .unwrap();
@@ -930,7 +971,7 @@ mod tests {
         }
     }
     #[test]
-    fn asynchronous_reads_block_conflicting_worker_writes_and_offset_changes() {
+    fn retained_native_reads_share_data_but_keep_the_original_offset_transaction() {
         let path = std::env::temp_dir().join(format!(
             "trames-direct-lease-{}-{}",
             std::process::id(),
@@ -946,8 +987,8 @@ mod tests {
         let (read, job) = vfs.prepare_disk_read(fd, 16384, None).unwrap().unwrap();
         assert_eq!(file.seek(0, 1), None);
         assert_eq!(file.read(1, None, &mut cache), None);
-        assert_eq!(file.write(b"X", Some(0), &mut cache), None);
-        assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), [42]);
+        assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Ok(1)));
+        assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), b"X");
         assert_eq!(read.finish(job.run()).unwrap().len(), 16384);
         assert_eq!(file.seek(0, 1), Some(Ok(16384)));
         assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Ok(1)));

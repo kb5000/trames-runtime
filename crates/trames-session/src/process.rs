@@ -32,6 +32,8 @@ mod pid_namespace;
 #[path = "process_signals.rs"]
 mod signals;
 use trames_kernel::signal::AltStack;
+#[path = "process_file_io.rs"]
+mod file_io;
 #[path = "process_scheduling.rs"]
 mod scheduling;
 #[path = "process_seccomp.rs"]
@@ -42,7 +44,6 @@ mod service;
 mod vm;
 #[cfg(all(test, trames_interpreter_conformance))]
 use crate::signal_actions::Action;
-use service::DiskEpoch;
 
 use trames_kernel::signal::{Info, Signals};
 #[derive(Clone)]
@@ -93,6 +94,10 @@ pub(crate) struct Process<C: Cpu> {
     socket_deadline: Option<Instant>,
     poll_mask: Option<u64>,
     uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
+    retained_file: Option<trames_linux::FilePending>,
+    file_checkpoint: Option<trames_linux::FileCheckpoint>,
+    file_entry: Option<(u64, u32, [u64; 6])>,
+    file_pauses: u32,
     flock_wait: Option<(trames_vfs::FlockRequest, Option<trames_vfs::RetainedFd>)>,
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
@@ -146,6 +151,9 @@ impl<C: Cpu> Process<C> {
     /// Original accepted calls can rearm their actual event source. New calls
     /// still use Snapshot::admit and evaluate policy only at their SVC entry.
     fn worker_event_wait(&self, id: u32) -> bool {
+        if self.retained_file.is_some() {
+            return true;
+        }
         if self.retained_socket.is_some()
             || self
                 .byte_wait
@@ -186,6 +194,12 @@ impl<C: Cpu> Process<C> {
     fn worker_io_candidate(&self, id: u32) -> bool {
         if !matches!(self.state, State::Blocked(..)) {
             return false;
+        }
+        if self.file_checkpoint.is_some() {
+            return false;
+        }
+        if self.retained_file.is_some() {
+            return !self.linux.trace;
         }
         if let Some(poll) = &self.retained_poll {
             return !self.linux.trace
@@ -327,7 +341,8 @@ impl<C: Cpu> Process<C> {
     }
 
     fn frozen(&self, pid: u32) -> bool {
-        self.linux.vfs.cgroup_frozen(pid) && self.pending_bits() & (1 << 8) == 0
+        self.file_pauses != 0
+            || self.linux.vfs.cgroup_frozen(pid) && self.pending_bits() & (1 << 8) == 0
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork(&self) -> Box<Self> {
@@ -370,6 +385,10 @@ impl<C: Cpu> Process<C> {
             socket_deadline: None,
             poll_mask: None,
             uring_wait: None,
+            retained_file: None,
+            file_checkpoint: None,
+            file_entry: None,
+            file_pauses: 0,
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
@@ -405,12 +424,15 @@ struct ProcMaps {
 // Joined shared resources notify through guest execution or a worker. Timers
 // also resume at the accepted wait's deadline. Host-backed resources retain
 // their host event path.
-struct JoinedByteWake;
+struct JoinedByteWake(std::thread::Thread);
 impl trames_vfs::IoWake for JoinedByteWake {
-    fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {}
+    fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+        self.0.unpark();
+    }
 }
 pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
+    file_layouts: Vec<file_io::FileLayout>,
     memory_limits: super::MemoryLimits,
     cpu_count: usize,
     task_limit: usize,
@@ -1100,6 +1122,9 @@ impl<C: Cpu> Kernel<C> {
         p.flock_wait = None;
         p.record_wait = None;
         p.byte_wait = None;
+        p.retained_file = None;
+        p.file_checkpoint = None;
+        p.file_entry = None;
         p.retained_socket = None;
         p.retained_byte = None;
         p.retained_message_owner = None;
@@ -1488,8 +1513,14 @@ impl<C: Cpu> Kernel<C> {
         if stopped && sig != 9 && sig != 18 {
             return Ok(false);
         }
-        let info = p.take_signal(sig, shared);
         let action = p.signals.actions.get(sig as usize);
+        // Submitted regular-file work is not restarted from a guest pointer.
+        // Caught signals wait for its accepted result/copyout, like ordinary
+        // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
+        if action.handler > 1 && p.file_entry.is_some() && matches!(p.state, State::Blocked(..)) {
+            return Ok(false);
+        }
+        let info = p.take_signal(sig, shared);
         // Timer-generated signals also reach this queue without queue_one.
         // Namespace init ignores default dispositions, except forced ancestor
         // KILL/STOP and synchronous faults, which must still make progress.
@@ -1541,6 +1572,9 @@ impl<C: Cpu> Kernel<C> {
                 p.flock_wait = None;
                 p.record_wait = None;
                 p.byte_wait = None;
+                p.retained_file = None;
+                p.file_checkpoint = None;
+                p.file_entry = None;
                 p.retained_socket = None;
                 p.retained_byte = None;
                 p.retained_message_owner = None;
@@ -1778,6 +1812,9 @@ impl<C: Cpu> Kernel<C> {
             p.flock_wait = None;
             p.record_wait = None;
             p.byte_wait = None;
+            p.retained_file = None;
+            p.file_checkpoint = None;
+            p.file_entry = None;
             p.retained_socket = None;
             p.retained_byte = None;
             p.retained_message_owner = None;
@@ -1930,6 +1967,7 @@ impl<C: Cpu> Kernel<C> {
             }
             426 => {
                 p.linux.set_uring_clock(self.started);
+                p.linux.set_file_executor(self.workers.file_executor());
                 let (saved, ring, deadline) = match p.uring_wait.take() {
                     Some((submitted, ring, deadline)) => (Some(submitted), ring, deadline),
                     None => (
@@ -2887,7 +2925,51 @@ impl<C: Cpu> Kernel<C> {
             .cloned();
         let was_local = local.is_some();
         let batch_signal_source = local.clone();
-        let byte = if let Some(file) = local {
+        let accepted_file = p.file_entry == Some((p.cpu.pc(), number, a));
+        let file_boundary = accepted_file && p.file_checkpoint.is_some();
+        let retained_file = if accepted_file {
+            p.retained_file.take().or_else(|| {
+                p.byte_wait
+                    .as_ref()
+                    .and_then(trames_linux::PendingIo::file_pending)
+            })
+        } else {
+            None
+        };
+        let owned_file = if !accepted_file {
+            trames_linux::DirectSyscalls::default()
+                .with_file_executor(self.workers.file_executor())
+                .start_owned_file(
+                    &mut p.linux.vfs,
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                )
+        } else {
+            None
+        };
+        if owned_file.is_some() {
+            p.file_entry = Some((p.cpu.pc(), number, a));
+        }
+        let byte = if file_boundary {
+            Some(trames_linux::IoAttempt::FileCheckpoint(
+                p.file_checkpoint.take().unwrap(),
+            ))
+        } else if let Some(file) = retained_file {
+            p.byte_wait = None;
+            Some(trames_linux::DirectSyscalls::default().start_retained_file(
+                file,
+                number,
+                a,
+                &mut p.memory,
+                pid,
+                &Arc::downgrade(&self.byte_target),
+            ))
+        } else if owned_file.is_some() {
+            owned_file
+        } else if let Some(file) = local {
             p.byte_wait = None;
             p.retained_byte = None;
             Some(
@@ -3014,6 +3096,11 @@ impl<C: Cpu> Kernel<C> {
                 p.byte_wait = Some(wait);
                 Ok(None)
             }
+            Some(trames_linux::IoAttempt::FileCheckpoint(checkpoint)) => {
+                p.file_checkpoint = Some(checkpoint);
+                p.file_entry = Some((p.cpu.pc(), number, a));
+                self.start_file_checkpoint(pid, p, number, a)
+            }
             Some(trames_linux::IoAttempt::ByteCheckpoint(file)) => {
                 // Job-control/input signals require task authority. Retain the
                 // accepted endpoint across this handoff and any signal wait.
@@ -3081,6 +3168,9 @@ impl<C: Cpu> Kernel<C> {
             }
         };
         if raw.is_some() {
+            p.file_entry = None;
+            p.retained_file = None;
+            p.file_checkpoint = None;
             p.tcp_liveness = None;
             p.retained_byte = None;
         }
@@ -3959,6 +4049,7 @@ impl<C: Cpu> Kernel<C> {
             // Interactive transports can wake retained I/O while every CPU is
             // parked. The solo-CPU admission branch below remains unchanged.
             if (self.terminal.is_some()
+                || self.processes.values().any(|p| p.retained_file.is_some())
                 || self
                     .processes
                     .get(&1)
@@ -4246,7 +4337,7 @@ impl<C: Cpu> Kernel<C> {
                     processor: p.last_cpu as u32,
                     profile: self.profile_syscalls,
                     streams: p.linux.vfs.stream_descriptors(),
-                    files: p.linux.vfs.file_descriptors(),
+
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),
                     actions: p.signals.actions.shared(),
@@ -4261,7 +4352,7 @@ impl<C: Cpu> Kernel<C> {
                         .with_membership(p.linux.vfs.shared_files())
                         .with_paths(p.linux.vfs.path_queries())
                         .with_resources(p.linux.vfs.descriptor_factory())
-                        .with_uring_disk(self.workers.uring_disk())
+                        .with_file_executor(self.workers.file_executor())
                         .with_kernel_log(p.linux.vfs.kernel_log_capability())
                         .with_urings(
                             uring_epoch
@@ -4323,10 +4414,16 @@ impl<C: Cpu> Kernel<C> {
                     .as_ref()
                     .and_then(|wait| wait.retained_socket.clone())
                     .or_else(|| p.retained_socket.take());
+                let retained_file = previous
+                    .as_ref()
+                    .and_then(trames_linux::PendingIo::file_pending)
+                    .or_else(|| p.retained_file.take());
                 let retained_byte = previous
                     .and_then(|wait| wait.retained_byte)
                     .or_else(|| p.retained_byte.take());
                 job.retry = Some(crate::run_queue::IoCall {
+                    file: retained_file,
+                    file_checkpoint: p.file_checkpoint.take(),
                     uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {
                         trames_linux::UringEnter {
                             submitted,
@@ -4367,7 +4464,6 @@ impl<C: Cpu> Kernel<C> {
         self.parallel_dispatch_time += began.elapsed();
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
-        let mut disk = DiskEpoch::<C>::default();
         let mut checkpoint_error = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -4429,19 +4525,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Some(crate::workers::Event::<C>::Service(request)) => {
                     self.service_requests += 1;
-                    if !self.epoch_request(request, &mut disk, io) {
-                        break;
-                    }
-                }
-                Some(crate::workers::Event::<C>::DiskRead(id, result)) => {
-                    self.finish_disk_read(id, result, &mut disk);
-                    if !self.resume_disk_waiters(&mut disk, io) {
-                        break;
-                    }
-                }
-                Some(crate::workers::Event::<C>::DiskSync(id, result)) => {
-                    self.finish_disk_sync(id, result, &mut disk);
-                    if !self.resume_disk_waiters(&mut disk, io) {
+                    if !self.epoch_request(request, io) {
                         break;
                     }
                 }
@@ -4450,13 +4534,9 @@ impl<C: Cpu> Kernel<C> {
         }
         epoch.stop();
         let began = Instant::now();
-        // Submitted disk I/O must finish/commit exactly once before
-        // mapping, process or FD mutation. Do not wait in Pool::complete while
-        // its caller is parked awaiting a disk completion on this same channel.
-        for request in disk.waiting.drain(..) {
-            request.respond(None);
-        }
-        while stopped < chosen.len() || disk.in_flight != 0 || epoch.pending_services() != 0 {
+        // Native file work owns its resources and publishes directly to its
+        // accepted source. Joining CPU Views never waits for unrelated disk I/O.
+        while stopped < chosen.len() || epoch.pending_services() != 0 {
             match self
                 .workers
                 .event_timeout(Duration::from_secs(1))
@@ -4466,12 +4546,6 @@ impl<C: Cpu> Kernel<C> {
                 Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
                 Some(crate::workers::Event::<C>::VmReady | crate::workers::Event::<C>::Idle) => {}
                 Some(crate::workers::Event::<C>::Service(request)) => request.respond(None),
-                Some(crate::workers::Event::<C>::DiskRead(id, result)) => {
-                    self.finish_disk_read(id, result, &mut disk);
-                }
-                Some(crate::workers::Event::<C>::DiskSync(id, result)) => {
-                    self.finish_disk_sync(id, result, &mut disk);
-                }
                 None => {}
             }
         }
@@ -4531,6 +4605,16 @@ impl<C: Cpu> Kernel<C> {
                 .and_then(|call| call.retained_socket.clone());
             p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
             p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
+            p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
+            p.file_checkpoint = done
+                .io
+                .as_ref()
+                .and_then(|call| call.file_checkpoint.clone());
+            p.file_entry = done
+                .io
+                .as_ref()
+                .filter(|call| call.file.is_some() || call.file_checkpoint.is_some())
+                .map(|call| (p.cpu.pc(), call.number, call.args));
             p.state = if let Some(compile) = done.gpu_pending {
                 State::Gpu {
                     retired: true,
@@ -4801,6 +4885,7 @@ impl<C: Cpu> Kernel<C> {
                 self.load_sample = Instant::now();
             }
             self.control(io)?;
+            self.poll_file_layouts();
             for backend in self.gpu.borrow_mut().values_mut() {
                 backend.reap_abandoned();
             }
@@ -4958,7 +5043,8 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if !progress {
-                let external = self.processes.values().any(|p| {
+                let external = !self.file_layouts.is_empty() || self.processes.values().any(|p| {
+                    p.retained_file.is_some() || p.file_checkpoint.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
                         || matches!(p.state, State::Gpu { .. })
@@ -5202,6 +5288,10 @@ pub(super) fn run<C: Cpu>(
         socket_deadline: None,
         poll_mask: None,
         uring_wait: None,
+        retained_file: None,
+        file_checkpoint: None,
+        file_entry: None,
+        file_pauses: 0,
         flock_wait: None,
         record_wait: None,
         byte_wait: None,
@@ -5233,7 +5323,8 @@ pub(super) fn run<C: Cpu>(
     };
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
-        byte_target: Arc::new(JoinedByteWake),
+        byte_target: Arc::new(JoinedByteWake(std::thread::current())),
+        file_layouts: Vec::new(),
         memory_limits: runtime.memory_limits,
         cpu_count: count,
         task_limit: root.linux.task_limit.max(1),
@@ -5711,6 +5802,8 @@ mod tests {
         p.linux.vfs.flock(b, 6).unwrap();
         let (request, file) = p.linux.vfs.retain_flock(a, 2).unwrap();
         let call = crate::run_queue::IoCall {
+            file: None,
+            file_checkpoint: None,
             uring: None,
             number: 32,
             args: [a as u64, 2, 0, 0, 0, 0],
@@ -6263,6 +6356,8 @@ mod tests {
         let b = p.linux.vfs.open_at(-100, b"/lock", 2, 0).unwrap();
         let (shared, _) = p.linux.vfs.retain_flock(a, 1).unwrap();
         let mut call = crate::run_queue::IoCall {
+            file: None,
+            file_checkpoint: None,
             uring: None,
             number: 32,
             args: [a as u64, 1, 0, 0, 0, 0],
@@ -6521,6 +6616,10 @@ mod tests {
             socket_deadline: None,
             poll_mask: None,
             uring_wait: None,
+            retained_file: None,
+            file_checkpoint: None,
+            file_entry: None,
+            file_pauses: 0,
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
@@ -6712,7 +6811,8 @@ mod tests {
     }
     pub(super) fn kernel() -> Kernel {
         Kernel {
-            byte_target: Arc::new(JoinedByteWake),
+            byte_target: Arc::new(JoinedByteWake(std::thread::current())),
+            file_layouts: Vec::new(),
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
             task_limit: trames_vfs::MAX_TASKS,

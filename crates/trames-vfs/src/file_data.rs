@@ -18,6 +18,7 @@ pub(super) struct PlainFile {
     host: Option<Arc<hostfs::HostFile>>,
     bytes: RwLock<Bytes>,
     length: AtomicU64,
+    charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
     logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
     backing: Option<Arc<storage::DiskBacking>>,
     pending: AtomicUsize,
@@ -49,16 +50,42 @@ impl PlainFile {
             None => Ok(None),
         }
     }
+    pub(super) fn bind_quota(&self, quota: &Arc<file_accounting::FileQuota>) -> Result<()> {
+        #[cfg(all(feature = "hostfs", unix))]
+        if self.host.is_some() {
+            return Ok(());
+        }
+        if let Some(charge) = self.charge.get() {
+            charge.bind(quota);
+            return Ok(());
+        }
+        // The original data lock excludes another first publisher; no double
+        // provisional charge or cached admission error can escape a failed bind.
+        let _data = self.bytes.write().unwrap();
+        if self.charge.get().is_none() {
+            let charge = if let Some(backing) = self.backing.as_ref().filter(|b| b._store.is_some())
+            {
+                backing.register_size(self.length.load(Ordering::Relaxed));
+                backing.charge.get().unwrap().clone()
+            } else {
+                file_accounting::FileCharge::admit(quota, self.length.load(Ordering::Relaxed))?
+            };
+            charge.bind(quota);
+            let _ = self.charge.set(charge);
+        }
+        Ok(())
+    }
     pub(super) fn register_storage(&self) {
-        let Some(backing) = self
-            .backing
-            .as_ref()
-            .filter(|b| b._store.is_some() && b.charge.get().is_none())
-        else {
+        let Some(backing) = self.backing.as_ref().filter(|b| b._store.is_some()) else {
             return;
         };
-        let _bytes = self.bytes.read().unwrap();
+        if let Some(charge) = backing.charge.get() {
+            let _ = self.charge.set(charge.clone());
+            return;
+        }
+        let _data = self.bytes.read().unwrap();
         backing.register_size(self.length.load(Ordering::Relaxed));
+        let _ = self.charge.set(backing.charge.get().unwrap().clone());
     }
     #[cfg(all(feature = "hostfs", unix))]
     pub(super) fn append_host(&self, bytes: &[u8]) -> Option<Result<(usize, u64)>> {
@@ -88,6 +115,7 @@ impl PlainFile {
             host: backing.as_ref().and_then(|b| b.host.clone()),
             bytes: RwLock::new(bytes),
             length: AtomicU64::new(length),
+            charge: std::sync::OnceLock::new(),
             logical_size: std::sync::OnceLock::new(),
             backing,
             pending: AtomicUsize::new(0),
@@ -106,8 +134,18 @@ impl PlainFile {
     pub fn metadata(&self) -> Option<FileMeta> {
         *self.meta.lock().unwrap()
     }
-    pub fn finish_metadata(&self) -> Option<FileMeta> {
-        self.meta.lock().unwrap().take()
+    pub(super) fn patch_metadata(&self, before: FileMeta, after: FileMeta) {
+        let mut meta = self.meta.lock().unwrap();
+        if let Some(meta) = meta.as_mut() {
+            if before.mode != after.mode {
+                meta.mode = after.mode;
+            }
+            for i in 0..3 {
+                if before.times[i] != after.times[i] {
+                    meta.times[i] = after.times[i];
+                }
+            }
+        }
     }
     pub fn accessed(&self, readonly: bool, relatime: bool) -> Option<FileMeta> {
         let mut meta = self.meta.lock().unwrap();
@@ -164,6 +202,9 @@ impl PlainFile {
     }
     fn publish_length(&self, length: u64) {
         self.length.store(length, Ordering::Relaxed);
+        if let Some(charge) = self.charge.get() {
+            charge.publish(length);
+        }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &self.host {
             host.publish_length(length);
@@ -225,48 +266,132 @@ impl PlainFile {
         count: usize,
         cache: &mut DiskReadCache,
     ) -> Option<Result<Vec<u8>>> {
-        let data = self.bytes.read().unwrap();
+        let data = match self.bytes.try_read() {
+            Ok(data) => data,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(error) => panic!("{error}"),
+        };
         if self.mapped.load(Ordering::Relaxed) {
             return None;
         }
         Some(data.read_at(offset, count, Some(cache)))
     }
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize> {
-        let mut data = self.bytes.write().unwrap();
-        let result = data.write_at(offset, bytes, None);
-        self.publish_length(data.len());
-        result
+        self.write_transfer(offset, bytes, false, None)
+            .map(|(n, _)| n)
     }
-    /// None is strictly before effects: growth, host blocking bulk writes and
-    /// outstanding reads continue through the existing service/limit path.
-    pub fn write_in_place(
+    pub(super) fn write_transfer(
         &self,
         offset: u64,
         bytes: &[u8],
-        cache: &mut DiskReadCache,
-    ) -> Option<Result<usize>> {
+        append: bool,
+        cache: Option<&mut DiskReadCache>,
+    ) -> Result<(usize, u64)> {
         let mut data = self.bytes.write().unwrap();
-        if self.mapped.load(Ordering::Relaxed) || self.pending.load(Ordering::Acquire) != 0 {
-            return None;
+        self.transfer(&mut data, offset, bytes, append, cache, u64::MAX, || ())
+    }
+    pub(super) fn write_limited(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        append: bool,
+        limit: u64,
+        signal: impl FnOnce(),
+    ) -> Result<(usize, u64)> {
+        let mut data = self.bytes.write().unwrap();
+        self.transfer(&mut data, offset, bytes, append, None, limit, signal)
+    }
+    #[allow(clippy::too_many_arguments)] // One original byte transaction plus cache and guest limit/signal policy.
+    fn transfer(
+        &self,
+        data: &mut Bytes,
+        offset: u64,
+        bytes: &[u8],
+        append: bool,
+        cache: Option<&mut DiskReadCache>,
+        limit: u64,
+        signal: impl FnOnce(),
+    ) -> Result<(usize, u64)> {
+        let position = if append { data.len() } else { offset };
+        if position >= limit {
+            signal();
+            return Err(Errno(27));
         }
-        let end = match offset.checked_add(bytes.len() as u64) {
-            Some(end) => end,
-            None => return Some(Err(Errno(27))),
+        let bytes = &bytes[..bytes
+            .len()
+            .min(usize::try_from(limit - position).unwrap_or(usize::MAX))];
+        let end = position
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= i64::MAX as u64)
+            .ok_or(Errno(27))?;
+        let growth = self
+            .charge
+            .get()
+            .map(|c| c.grow(end))
+            .transpose()?
+            .flatten();
+        #[cfg(all(feature = "hostfs", unix))]
+        let result = if let Some(host) = self.host.as_ref().filter(|_| append) {
+            host.append(bytes)
+        } else {
+            data.write_at(position, bytes, cache)
+                .map(|n| (n, position + n as u64))
         };
-        if end > data.len() || matches!(&*data, Bytes::Disk(_)) && bytes.len() >= 16 * 1024 {
+        #[cfg(not(all(feature = "hostfs", unix)))]
+        let result = data
+            .write_at(position, bytes, cache)
+            .map(|n| (n, position + n as u64));
+        if let Some(growth) = growth {
+            growth.commit(data.len());
+        }
+        self.publish_length(data.len());
+        result
+    }
+    /// None is before effects. Busy native data or long host transfers are
+    /// handed to the existing file executor; RAM and cached short writes stay
+    /// on their original calling CPU. Growth/append use the same data algorithm.
+    pub fn write_local(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        append: bool,
+        cache: &mut DiskReadCache,
+    ) -> Option<Result<(usize, u64)>> {
+        let mut data = match self.bytes.try_write() {
+            Ok(data) => data,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(error) => panic!("{error}"),
+        };
+        if self.mapped.load(Ordering::Relaxed)
+            || matches!(&*data, Bytes::Disk(_)) && bytes.len() >= 16 * 1024
+        {
             return None;
         }
-        Some(data.write_at(offset, bytes, Some(cache)))
+        Some(self.transfer(
+            &mut data,
+            offset,
+            bytes,
+            append,
+            Some(cache),
+            u64::MAX,
+            || (),
+        ))
     }
     pub fn register_read(self: &Arc<Self>) -> ReadLease {
-        // Registration excludes an in-progress in-place writer. The lease
-        // outlives this guard and blocks future worker writes before effects.
+        // Register after an in-progress writer releases the original byte
+        // lock. The lease tracks this read; later byte access uses that lock.
         let _data = self.bytes.read().unwrap();
         self.pending.fetch_add(1, Ordering::Acquire);
         ReadLease { data: self.clone() }
     }
     pub fn truncate(&self, length: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
+        let growth = self
+            .charge
+            .get()
+            .map(|c| c.grow(length))
+            .transpose()?
+            .flatten();
         match &mut *data {
             Bytes::Memory(b) => {
                 let n = usize::try_from(length).map_err(|_| Errno(27))?;
@@ -279,6 +404,9 @@ impl PlainFile {
                 d.open(true)?.set_len(length).map_err(storage::host_errno)?;
                 d.length = length;
             }
+        }
+        if let Some(growth) = growth {
+            growth.commit(length);
         }
         self.publish_length(length);
         Ok(())
