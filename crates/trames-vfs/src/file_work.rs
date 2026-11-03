@@ -189,6 +189,14 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
+    /// Owned staging only, not file size or a guest mapping quota.
+    pub fn buffered_bytes(&self) -> usize {
+        match &self.command {
+            FileCommand::Read { count, .. } => *count,
+            FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => bytes.len(),
+            _ => 0,
+        }
+    }
     pub(super) fn namespace(paths: PathQueries, namespace: namespace_work::NamespaceWork) -> Self {
         Self {
             namespace: Some(Box::new(namespace)),

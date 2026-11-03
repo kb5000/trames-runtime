@@ -228,8 +228,12 @@ impl DirectSyscalls {
             return Ok(None);
         }
         let mut requests = VecDeque::new();
+        let mut staged_bytes = 0;
         let mut error = Errno(11);
-        for i in 0..a[1] {
+        // Linux permits a submitted prefix. Bound both request metadata and
+        // owned copies before dispatch instead of staging an arbitrary nr *
+        // MAX_WRITE batch in host RAM. No guest mapping quota is introduced.
+        for i in 0..a[1].min(64) {
             let address = match a[2]
                 .checked_add(i * 8)
                 .and_then(|p| memory.read_array(p).ok())
@@ -257,6 +261,12 @@ impl DirectSyscalls {
             }
             match self.import_aio(address, memory) {
                 Ok((request, work)) => {
+                    let bytes = work.buffered_bytes();
+                    if bytes > crate::MAX_WRITE - staged_bytes {
+                        context.state.lock().unwrap().active.remove(&address);
+                        break;
+                    }
+                    staged_bytes += bytes;
                     if let Some(executor) = &self.file_executor {
                         executor.submit_file(work, request.result.clone());
                     } else {
@@ -634,6 +644,93 @@ mod tests {
             Ok(0)
         );
         assert!(aio.context(context).is_err());
+    }
+    #[test]
+    fn large_submit_uses_a_bounded_staged_prefix() {
+        let mut v = trames_vfs::Vfs::default();
+        v.import_file(b"/data", vec![0; 512 * 1024]).unwrap();
+        let fd = v.open_at(trames_vfs::AT_FDCWD, b"/data", 0, 0).unwrap();
+        let aio = Aio::default();
+        let mut memory = Memory::default();
+        memory.map(0x1000, 0x83000, Permissions::RW).unwrap();
+        aio.install(&mut memory).unwrap();
+        let disk = Arc::new(Disk::default());
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_aio(aio, v.native_events())
+            .with_paths(v.path_queries())
+            .with_file_executor(disk.clone());
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        let target = Arc::downgrade(&wake);
+        assert_eq!(
+            value(
+                direct
+                    .start(0, [8, 0x1000, 0, 0, 0, 0], &mut memory, 1, &target, None)
+                    .unwrap()
+            ),
+            Ok(0)
+        );
+        let context = u64::from_le_bytes(memory.read_array(0x1000).unwrap());
+        for i in 0..3 {
+            let mut cb = [0; 64];
+            cb[20..24].copy_from_slice(&fd.to_le_bytes());
+            cb[24..32].copy_from_slice(&0x3000u64.to_le_bytes());
+            cb[32..40].copy_from_slice(&(512u64 * 1024).to_le_bytes());
+            memory.write_array(0x1800 + i * 64, cb).unwrap();
+            memory
+                .write_array(0x1400 + i * 8, (0x1800 + i * 64).to_le_bytes())
+                .unwrap();
+        }
+        let wait = match direct
+            .start(
+                2,
+                [context, 3, 0x1400, 0, 0, 0],
+                &mut memory,
+                1,
+                &target,
+                None,
+            )
+            .unwrap()
+        {
+            IoAttempt::Blocked(p) => p,
+            _ => panic!("disk batch must park"),
+        };
+        assert_eq!(disk.0.lock().unwrap().len(), 2);
+        disk.complete();
+        assert_eq!(value(direct.resume(wait, &mut memory)), Ok(2));
+        assert_eq!(
+            value(
+                direct
+                    .start(
+                        4,
+                        [context, 2, 2, 0x2000, 0, 0],
+                        &mut memory,
+                        1,
+                        &target,
+                        None
+                    )
+                    .unwrap()
+            ),
+            Ok(2)
+        );
+        memory
+            .write_array(0x1400, (0x1800u64 + 2 * 64).to_le_bytes())
+            .unwrap();
+        let wait = match direct
+            .start(
+                2,
+                [context, 1, 0x1400, 0, 0, 0],
+                &mut memory,
+                1,
+                &target,
+                None,
+            )
+            .unwrap()
+        {
+            IoAttempt::Blocked(p) => p,
+            _ => panic!("remaining request must park"),
+        };
+        disk.complete();
+        assert_eq!(value(direct.resume(wait, &mut memory)), Ok(1));
     }
     #[test]
     fn parked_getevents_retains_destroyed_context_across_numeric_reuse() {
