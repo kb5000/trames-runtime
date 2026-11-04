@@ -159,7 +159,7 @@ impl From<&Credentials> for Identity {
     }
 }
 struct Target {
-    presence: Weak<()>,
+    presence: crate::task::Visibility,
     limits: Weak<Limits>,
     identity: Identity,
 }
@@ -167,15 +167,12 @@ struct Target {
 pub struct Directory(RwLock<BTreeMap<u32, Target>>);
 impl Directory {
     pub fn prune(&self) {
-        self.0
-            .write()
-            .unwrap()
-            .retain(|_, t| t.presence.strong_count() != 0);
+        self.0.write().unwrap().retain(|_, t| t.presence.present());
     }
     pub fn publish(
         &self,
         pid: u32,
-        presence: &Arc<()>,
+        presence: &Arc<crate::task::Presence>,
         limits: &Arc<Limits>,
         credentials: &Credentials,
     ) {
@@ -184,7 +181,7 @@ impl Directory {
         entries.insert(
             pid,
             Target {
-                presence: Arc::downgrade(presence),
+                presence: presence.visibility(),
                 limits: Arc::downgrade(limits),
                 identity: credentials.into(),
             },
@@ -230,7 +227,7 @@ impl Authority {
             let entries = self.directory.0.read().unwrap();
             let target = entries
                 .get(&pid)
-                .filter(|t| t.presence.strong_count() != 0)
+                .filter(|t| t.presence.present())
                 .ok_or(Errno(3))?;
             if !privileged
                 && !(target
@@ -325,7 +322,7 @@ mod tests {
         let directory = Arc::new(Directory::default());
         let own = Limits::new(&v);
         let old = Limits::new(&v);
-        let life = Arc::new(());
+        let life = Arc::new(crate::task::Presence::default());
         directory.publish(42, &life, &old, &Credentials::default());
         let a = Authority {
             directory: directory.clone(),
@@ -340,7 +337,7 @@ mod tests {
         drop(life);
         assert_eq!(a.call(261, [42, 7, 0, 0x1000, 0, 0], &mut m), Err(Errno(3)));
         let replacement = Limits::new(&v);
-        let life = Arc::new(());
+        let life = Arc::new(crate::task::Presence::default());
         directory.publish(42, &life, &replacement, &Credentials::default());
         pair(&mut m, (8, 16));
         assert_eq!(a.call(261, [42, 7, 0x1000, 0, 0, 0], &mut m), Ok(0));

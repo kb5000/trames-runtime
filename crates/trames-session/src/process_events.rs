@@ -2,8 +2,6 @@
 //! Cooperative futex waits, signal waits and POSIX timers; all addresses are guest addresses.
 use super::*;
 
-pub(super) use trames_kernel::signal::write_siginfo;
-
 impl<C: Cpu> Kernel<C> {
     pub(super) fn timerfd(
         &self,

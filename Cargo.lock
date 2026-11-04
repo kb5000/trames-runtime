@@ -738,6 +738,7 @@ version = "1.3.0"
 dependencies = [
  "trames-execution",
  "trames-memory",
+ "trames-shared",
  "trames-vfs",
 ]
 

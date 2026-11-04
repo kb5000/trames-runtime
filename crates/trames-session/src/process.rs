@@ -89,7 +89,8 @@ pub(crate) struct Process<C: Cpu> {
     session: u32,
     state: State,
     signals: Signals,
-    wait_event: Option<i32>,
+    wait_event: Arc<trames_kernel::children::Child>,
+    children: Arc<trames_kernel::children::Children>,
     poll_deadline: Option<Instant>,
     socket_deadline: Option<Instant>,
     uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
@@ -395,7 +396,8 @@ impl<C: Cpu> Process<C> {
             session: self.session,
             state: State::Ready,
             signals: self.signals.fork(shared_actions),
-            wait_event: None,
+            wait_event: Default::default(),
+            children: Default::default(),
             poll_deadline: None,
             socket_deadline: None,
             uring_wait: None,
@@ -447,6 +449,7 @@ pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
     file_layouts: Vec<file_io::FileLayout>,
     limit_directory: Arc<trames_kernel::limits::Directory>,
+    children_dirty: Cell<bool>,
     memory_limits: super::MemoryLimits,
     cpu_count: usize,
     task_limit: usize,
@@ -588,6 +591,7 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
 }
 impl<C: Cpu> Kernel<C> {
     fn publish_task(&self, id: u32, p: &Process<C>) {
+        self.children_dirty.set(true);
         self.limit_directory
             .publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
         if matches!(p.state, State::Zombie(_)) {
@@ -611,6 +615,7 @@ impl<C: Cpu> Kernel<C> {
         if let Some((id, p)) = current {
             self.publish_task(id, p);
         }
+        self.publish_children(current.map(|(_, p)| p));
     }
     fn native_call(
         &mut self,
@@ -905,6 +910,7 @@ impl<C: Cpu> Kernel<C> {
         Ok(())
     }
     fn spawn_host(&mut self, request: trames_linux::HostSpawn) -> Result<u32, Errno> {
+        self.reap_waited();
         if self.processes.len() >= self.task_limit || request.argv.is_empty() {
             return Err(Errno(11));
         }
@@ -1192,6 +1198,7 @@ impl<C: Cpu> Kernel<C> {
         let mut processes: Vec<_> = self
             .processes
             .iter()
+            .filter(|(_, other)| other.signals.presence.present())
             .map(|(&id, other)| {
                 self.process_info(
                     id,
@@ -1277,6 +1284,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.release_descriptors();
     }
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        self.children_dirty.set(true);
         p.signals.io.exit();
         p.linux.cancel_uring(&mut p.memory, pid);
         p.uring_wait = None;
@@ -1332,7 +1340,7 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Zombie(status);
         self.close_exit_files(p);
         p.signals.io.inbox.clear();
-        p.wait_event = None;
+        p.wait_event.clear();
         if !self
             .processes
             .values()
@@ -1437,7 +1445,7 @@ impl<C: Cpu> Kernel<C> {
         p.signals.clear_opposing(sig);
         if sig == 18 && matches!(p.state, State::Stopped) {
             p.state = p.stopped_state.take().map_or(State::Ready, |s| *s);
-            p.wait_event = Some(0xffff);
+            p.wait_event.continued();
         }
         // Unblocked default dispositions are ignored by namespace init. Blocked
         // signals remain available to signalfd/sigwait. Ancestor KILL/STOP and
@@ -1736,8 +1744,9 @@ impl<C: Cpu> Kernel<C> {
             }) {
                 other.stopped_state = Some(Box::new(other.state.clone()));
                 other.state = State::Stopped;
+                other.wait_event.stopped(sig);
             }
-            p.wait_event = Some(((sig as i32) << 8) | 0x7f);
+            p.wait_event.stopped(sig);
             self.notify(p.parent, p.tgid, p.linux.vfs.credentials.uid, sig as i32, 5);
             return Ok(true);
         }
@@ -2052,73 +2061,57 @@ impl<C: Cpu> Kernel<C> {
         }
         Err(Errno(40))
     }
-    fn wait(&mut self, _pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        // __WALL includes all waitable clone children. Non-thread guest clones
-        // currently all use SIGCHLD, so this preserves the ordinary selection.
-        if a[2] & !(11 | 0x40000000) != 0 {
-            return Err(Errno(22));
+    fn reap_waited(&mut self) {
+        self.processes
+            .retain(|id, p| *id != p.tgid || p.signals.presence.present());
+    }
+    // Structural owner boundaries update the original relationships. Worker
+    // waits never scan Process, clone these records or ask the owner to retry.
+    fn publish_children(&self, current: Option<&Process<C>>) {
+        if !self.children_dirty.replace(false) {
+            return;
         }
-        if a[1] != 0 {
-            Linux::check(&p.memory, a[1], 4, Access::Write)?;
-        }
-        if a[3] != 0 {
-            Linux::check(&p.memory, a[3], 144, Access::Write)?;
-        }
-        let target = a[0] as i32;
-        let matching: Vec<u32> = self
-            .processes
-            .iter()
-            .filter(|(id, c)| {
-                c.parent == p.tgid
-                    && **id == c.tgid
-                    && (target == -1
-                        || (target == 0 && c.group == p.group)
-                        || (target < -1
-                            && p.linux.vfs.visible_pid(c.group) == target.unsigned_abs())
-                        || (target > 0 && p.linux.vfs.visible_pid(**id) == target as u32))
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        if matching.is_empty() {
-            return Err(Errno(10));
-        }
-        for child in matching {
-            let c = &self.processes[&child];
-            let status = match c.state {
-                State::Zombie(s)
-                    if !self
-                        .processes
-                        .values()
-                        .any(|t| t.tgid == c.tgid && !matches!(t.state, State::Zombie(_))) =>
-                {
-                    Some(s)
+        let tasks = || {
+            self.processes
+                .iter()
+                .map(|(&id, p)| (id, p.as_ref()))
+                .chain(current.map(|p| {
+                    (
+                        if self.processes.contains_key(&p.tgid) {
+                            u32::MAX
+                        } else {
+                            p.tgid
+                        },
+                        p,
+                    )
+                }))
+        };
+        let parents: BTreeMap<_, _> = tasks().map(|(_, p)| (p.tgid, &p.children)).collect();
+        for (id, p) in tasks().filter(|(id, p)| *id == p.tgid) {
+            p.wait_event.bind_presence(&p.signals.presence);
+            p.wait_event.attach(
+                parents.get(&p.parent).copied(),
+                id,
+                p.group,
+                p.linux.vfs.credentials.uid,
+            );
+            if let State::Zombie(status) = p.state {
+                if !tasks().any(|(_, t)| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_))) {
+                    p.wait_event.exited(status);
                 }
-                State::Stopped if a[2] & 2 != 0 => c.wait_event,
-                _ if a[2] & 8 != 0 && c.wait_event == Some(0xffff) => Some(0xffff),
-                _ => None,
-            };
-            if let Some(status) = status {
-                if a[1] != 0 {
-                    p.memory
-                        .write(a[1], &status.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                if a[3] != 0 {
-                    p.memory.write(a[3], &[0; 144]).map_err(|_| Errno(14))?;
-                }
-                if matches!(c.state, State::Zombie(_)) {
-                    self.processes.remove(&child);
-                } else {
-                    self.processes.get_mut(&child).expect("child").wait_event = None;
-                }
-                return Ok(Some(p.linux.vfs.visible_pid(child) as u64));
             }
         }
-        if a[2] & 1 != 0 {
-            Ok(Some(0))
-        } else {
-            Ok(None)
+    }
+    fn wait(&mut self, _pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
+        self.publish_children(Some(p));
+        let request = trames_kernel::children::Wait::prepare(260, a)?;
+        let result = p
+            .children
+            .wait(request, p.linux.vfs.pid_namespace(), p.group, &mut p.memory);
+        if p.children.take_reaped() {
+            self.reap_waited();
         }
+        result
     }
     fn syscall(
         &mut self,
@@ -2128,6 +2121,9 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
+        if matches!(number, 93 | 94 | 142..=159 | 167 | 220 | 221 | 281) {
+            self.children_dirty.set(true);
+        }
         match number {
             25 | 29
                 if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
@@ -2464,6 +2460,7 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(p.linux.vfs.visible_pid(pid) as u64))
             }
             220 => {
+                self.reap_waited();
                 const ALLOWED: u64 = 0xff
                     | 0xf00
                     | 0x4000
@@ -2571,6 +2568,8 @@ impl<C: Cpu> Kernel<C> {
                 }
                 child.tgid = if threaded { p.tgid } else { id };
                 if threaded {
+                    child.children = p.children.clone();
+                    child.wait_event = p.wait_event.clone();
                     child.oom = Arc::new(p.oom.thread());
                     child.signals.io.share_process(&p.signals.io);
                     child.subreaper = p.subreaper;
@@ -4321,7 +4320,10 @@ impl<C: Cpu> Kernel<C> {
         self.processes.iter().any(|(&other, p)| {
             other != id
                 && !p.frozen(other)
-                && (matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
+                && (matches!(p.state, State::Blocked(95 | 260, _))
+                    && !p.linux.trace
+                    && first.parent == p.tgid
+                    || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
                     || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
                         && !p.linux.trace
                     || p.worker_io_candidate(other)
@@ -4350,6 +4352,7 @@ impl<C: Cpu> Kernel<C> {
         limit: u64,
         persistent: bool,
     ) -> Result<bool, RuntimeError> {
+        self.reap_waited();
         if self
             .processes
             .get(&1)
@@ -4402,7 +4405,10 @@ impl<C: Cpu> Kernel<C> {
                 }
                 // call/control/deliver publish resource changes immediately.
                 match p.state.clone() {
-                    State::Blocked(..) if p.worker_io_candidate(id) => {
+                    State::Blocked(..)
+                        if p.worker_io_candidate(id)
+                            || !p.linux.trace && matches!(p.state, State::Blocked(95 | 260, _)) =>
+                    {
                         // The worker owns the retry; do not perform byte I/O in
                         // the coordinator before preparing its execution View.
                     }
@@ -4446,7 +4452,10 @@ impl<C: Cpu> Kernel<C> {
                 || (matches!(p.state, State::Sleep(..))
                     && !p.linux.trace
                     && vms.contains(&p.vm_id))
-                || (matches!(p.state, State::Sigwait { .. } | State::Suspend(_)) && !p.linux.trace)
+                || (matches!(
+                    p.state,
+                    State::Sigwait { .. } | State::Suspend(_) | State::Blocked(95 | 260, _)
+                ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
         }));
@@ -4546,6 +4555,13 @@ impl<C: Cpu> Kernel<C> {
                         mask: p.signals.mask,
                     }),
                 ))
+            } else if let State::Blocked(number @ (95 | 260), args) = p.state {
+                Some(crate::run_queue::WaitState::Child(
+                    crate::run_queue::ChildWait::new(trames_kernel::children::Wait {
+                        number,
+                        args,
+                    }),
+                ))
             } else if !matches!(p.state, State::Ready)
                 && !p.worker_io_candidate(id)
                 && !p.worker_gpu_candidate()
@@ -4573,6 +4589,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    children: p.children.clone(),
                     limits: Some(limits),
                     timers: Some(self.timers.clone()),
                     saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
@@ -4933,6 +4950,9 @@ impl<C: Cpu> Kernel<C> {
                             p.signals.wait_mask.take().expect("suspend restore mask"),
                         ),
                     },
+                    crate::run_queue::WaitState::Child(wait) => {
+                        State::Blocked(wait.request.number, wait.request.args)
+                    }
                     crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
                 })
             };
@@ -5564,7 +5584,8 @@ pub(super) fn run<C: Cpu>(
         session: 1,
         state: State::Ready,
         signals: Signals::default(),
-        wait_event: None,
+        wait_event: Default::default(),
+        children: Default::default(),
         poll_deadline: None,
         socket_deadline: None,
         uring_wait: None,
@@ -5603,6 +5624,7 @@ pub(super) fn run<C: Cpu>(
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         file_layouts: Vec::new(),
         limit_directory: Default::default(),
+        children_dirty: Cell::new(true),
         memory_limits: runtime.memory_limits,
         cpu_count: count,
         task_limit: root.linux.task_limit.max(1),
@@ -7001,7 +7023,8 @@ mod tests {
             session: 1,
             state: State::Ready,
             signals: Signals::default(),
-            wait_event: None,
+            wait_event: Default::default(),
+            children: Default::default(),
             poll_deadline: None,
             socket_deadline: None,
             uring_wait: None,
@@ -7201,6 +7224,7 @@ mod tests {
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             file_layouts: Vec::new(),
             limit_directory: Default::default(),
+            children_dirty: Cell::new(true),
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
             task_limit: trames_vfs::MAX_TASKS,
@@ -8649,7 +8673,7 @@ mod tests {
         assert_eq!(k.thread_signal(3, &mut caller, 2, Some(1), 18), Ok(0));
         assert!(matches!(k.processes[&1].state, State::Ready));
         assert!(matches!(k.processes[&2].state, State::Ready));
-        assert_eq!(k.processes[&1].wait_event, Some(0xffff));
+        assert_eq!(k.processes[&1].wait_event.pending(), Some(0xffff));
     }
     #[test]
     fn process_signals_are_single_delivery_and_thread_signals_check_identity_and_permissions() {

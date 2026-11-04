@@ -22,6 +22,7 @@ pub(super) enum WaitState {
     /// A lifecycle-owned wait; ring maintenance must not retire its syscall.
     OwnerEvent,
     Signal(Arc<SignalWait>),
+    Child(Arc<ChildWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -30,6 +31,28 @@ pub(super) enum WaitState {
         deadline: Instant,
         remaining: u64,
     },
+}
+pub(super) struct ChildWait {
+    pub request: trames_kernel::children::Wait,
+    subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
+}
+impl ChildWait {
+    pub fn new(request: trames_kernel::children::Wait) -> Arc<Self> {
+        Arc::new(Self {
+            request,
+            subscriptions: Mutex::default(),
+        })
+    }
+    pub fn bind(
+        &self,
+        family: &trames_kernel::children::Children,
+        task: &trames_kernel::signal::IoTask,
+        signal: &Arc<trames_vfs::IoSignal>,
+    ) {
+        let mut subscriptions = task.subscribe(signal);
+        subscriptions.push(family.subscribe(signal));
+        *self.subscriptions.lock().unwrap() = subscriptions;
+    }
 }
 pub(super) struct SignalWait {
     pub request: trames_kernel::signal::SignalWait,
@@ -51,7 +74,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
-            Self::OwnerEvent => None,
+            Self::OwnerEvent | Self::Child(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
@@ -281,6 +304,14 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if let Some(WaitState::Child(wait)) = &self.waiting {
+            if self.work.syscalls.as_ref().is_some_and(|s| {
+                s.children
+                    .ready(wait.request, &s.io_routes.namespace, s.io_signals.group())
+            }) {
+                return true;
+            }
+        }
         if let Some(WaitState::Signal(wait)) = &self.waiting {
             if self
                 .work
@@ -567,6 +598,22 @@ impl<C: Cpu> Epoch<C> {
         self.notify(&mut q);
     }
     /// Only before launch: every View is prepared/admitted before any CPU runs.
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn wait_child_parked(&self, pid: u32) {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut q = self.queues.lock().unwrap();
+        while !q
+            .parked
+            .get(&pid)
+            .is_some_and(|j| matches!(j.waiting, Some(WaitState::Child(_))))
+        {
+            assert!(!self.control.stopped(), "cohort stopped before child wait");
+            let left = until.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "child wait did not park");
+            q = self.changed.wait_timeout(q, left).unwrap().0;
+        }
+    }
+    /// Only before launch: every View is prepared/admitted before any CPU runs.
     pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
         let pid = job.work.pid;
         if let Some(snapshot) = &mut job.work.syscalls {
@@ -574,6 +621,9 @@ impl<C: Cpu> Epoch<C> {
             snapshot.io_signals.set_wake(&signal);
             if let Some(WaitState::Signal(wait)) = &job.waiting {
                 wait.bind(&snapshot.io_signals, &signal);
+            }
+            if let Some(WaitState::Child(wait)) = &job.waiting {
+                wait.bind(&snapshot.children, &snapshot.io_signals, &signal);
             }
             snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);

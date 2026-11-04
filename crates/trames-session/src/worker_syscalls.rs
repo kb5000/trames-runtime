@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub children: Arc<trames_kernel::children::Children>,
     pub limits: Option<trames_kernel::limits::Authority>,
     pub timers: Option<Arc<trames_kernel::timers::Timers>>,
 
@@ -259,6 +260,18 @@ pub(super) fn futex_queue(
 }
 
 impl Snapshot {
+    pub fn begin_child_wait(
+        &self,
+        request: trames_kernel::children::Wait,
+    ) -> crate::run_queue::WaitState {
+        let wait = crate::run_queue::ChildWait::new(request);
+        wait.bind(
+            &self.children,
+            &self.io_signals,
+            self.io_wake.as_ref().expect("child wait wake"),
+        );
+        crate::run_queue::WaitState::Child(wait)
+    }
     pub fn begin_signal_wait(
         &self,
         request: trames_kernel::signal::SignalWait,
@@ -455,7 +468,7 @@ impl Snapshot {
     }
     pub fn task_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
-            && (matches!(cpu.x(8) as u32, 132..=137)
+            && (matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
                 || self.signal_send(cpu)
                 || self.limit_call(cpu.x(8) as u32)))
         .then(|| {
@@ -484,7 +497,7 @@ impl Snapshot {
             return true;
         }
         if trames_kernel::timers::timer_call(cpu.x(8) as u32)
-            || matches!(cpu.x(8) as u32, 132..=137)
+            || matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
             || self.signal_send(cpu)
             || self.limit_call(cpu.x(8) as u32)
         {
@@ -814,6 +827,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 
@@ -942,6 +956,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 
@@ -1000,6 +1015,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 
@@ -1102,6 +1118,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 
@@ -1168,6 +1185,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 

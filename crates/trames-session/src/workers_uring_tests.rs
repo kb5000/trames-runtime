@@ -6,6 +6,7 @@ use trames_cpu::Cpu;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
+        children: Default::default(),
         limits: None,
         timers: None,
 
@@ -31,7 +32,7 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
 }
 #[test]
 fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_slot() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         let mut linux = trames_linux::Linux::new(0x100000);
         let [reader, writer] = linux.vfs.pipe(0).unwrap();
         let (fd, ring) = linux.vfs.uring_create(4, 8).unwrap();
@@ -105,6 +106,9 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
         cpu.set_x(0, 0x7788);
         let futexes = crate::futex::Futexes::default();
         let deadline = Instant::now() + Duration::from_secs(3600);
+        let source_snapshot = snapshot(direct);
+        let child = Arc::new(trames_kernel::children::Child::default());
+        child.attach(Some(&source_snapshot.children), 42, 1, 0);
         let waiting = match mode {
             0 => crate::run_queue::WaitState::Sleep {
                 deadline,
@@ -116,7 +120,10 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
                     .unwrap(),
                 deadline: None,
             },
-            _ => crate::run_queue::WaitState::OwnerEvent,
+            2 => crate::run_queue::WaitState::OwnerEvent,
+            _ => crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(
+                trames_kernel::children::Wait::prepare(95, [0, 0, 0, 4, 0, 0]).unwrap(),
+            )),
         };
         epoch.add(crate::run_queue::Job::new(
             Work {
@@ -126,7 +133,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
                 cpu,
                 memory: Some(Box::new(source)),
                 control: control.clone(),
-                syscalls: Some(snapshot(direct)),
+                syscalls: Some(source_snapshot),
             },
             1,
             0,

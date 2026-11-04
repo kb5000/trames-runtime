@@ -4,7 +4,7 @@ use super::*;
 
 impl Signals {
     pub fn publish_policy(&self, namespace: &PidNamespace, can_kill: bool) {
-        let _ = self.io.presence.set(Arc::downgrade(&self.presence));
+        let _ = self.io.presence.set(self.presence.visibility());
         *self.io.policy.write().unwrap() = Some(Policy {
             actions: self.actions.shared(),
             namespace: namespace.clone(),

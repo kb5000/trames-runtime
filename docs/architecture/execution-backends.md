@@ -2328,3 +2328,21 @@ Solo/self limit queries borrow the actual process object directly, including
 an explicit self TID in prlimit64. They do not refresh the task directory or
 clone a namespace/credential context. Cross-task owner queries resolve the PID
 once and use the same decoder and authority check as source calls.
+
+### Original child wait ownership (2026-11-05)
+
+`trames-kernel::children` supplies parent families and original child-group
+wait events to both the serial kernel and retained execution workers. Threads
+share the process family and child event; fork copies neither parent's children
+nor pending child events. Wait syscalls import scalar operands once, subscribe
+before checking, relinquish their CPU slot while blocked and consume original
+events under the parent object lock. No guest memory copyout or callback spans
+that lock. Task `Presence` separates PID visibility from deferred projection
+destruction; reaping hides the PID from shared signal and limit directories
+immediately. Directory handles retain only a relaxed atomic visibility bit. Dropping the
+original task lifetime owner or consuming its exit retires that bit; a pending
+I/O handle cannot extend PID visibility. This common implementation applies to HVF and the iPad interpreter.
+
+This change does not yet move task exit, group-stop acknowledgement, reparenting
+or final resource destruction onto workers; those connected lifecycle
+prerequisites remain documented in `coordination-boundaries.md`.

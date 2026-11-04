@@ -135,101 +135,14 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     pub(super) fn waitid(&mut self, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        let options = a[3];
-        if options & !(1 | 2 | 4 | 8 | 0x01000000 | 0x40000000) != 0 || options & 14 == 0 {
-            return Err(Errno(22));
+        self.publish_children(Some(p));
+        let request = trames_kernel::children::Wait::prepare(95, a)?;
+        let result = p
+            .children
+            .wait(request, p.linux.vfs.pid_namespace(), p.group, &mut p.memory);
+        if p.children.take_reaped() {
+            self.reap_waited();
         }
-        if a[0] > 2 || a[0] != 0 && a[1] > i32::MAX as u64 || a[0] == 1 && a[1] == 0 {
-            return Err(Errno(22));
-        }
-        if a[2] != 0 {
-            Linux::check(&p.memory, a[2], 128, Access::Write)?;
-        }
-        if a[4] != 0 {
-            Linux::check(&p.memory, a[4], 144, Access::Write)?;
-        }
-        let mut found = false;
-        let mut ready = None;
-        for (&id, child) in &self.processes {
-            if child.parent != p.tgid || id != child.tgid {
-                continue;
-            }
-            let local = p.linux.vfs.visible_pid(id);
-            if a[0] == 1 && local != a[1] as u32
-                || a[0] == 2
-                    && (if a[1] == 0 {
-                        child.group != p.group
-                    } else {
-                        p.linux.vfs.visible_pid(child.group) != a[1] as u32
-                    })
-            {
-                continue;
-            }
-            found = true;
-            let result = match child.state {
-                State::Zombie(s)
-                    if options & 4 != 0
-                        && !self
-                            .processes
-                            .values()
-                            .any(|t| t.tgid == id && !matches!(t.state, State::Zombie(_))) =>
-                {
-                    Some((s, if s & 127 == 0 { 1 } else { 2 }))
-                }
-                State::Stopped if options & 2 != 0 => child.wait_event.map(|s| (s, 5)),
-                _ if options & 8 != 0 && child.wait_event == Some(0xffff) => Some((0xffff, 6)),
-                _ => None,
-            };
-            if let Some((status, code)) = result {
-                ready = Some((id, local, status, code, child.linux.vfs.credentials.uid));
-                break;
-            }
-        }
-        if !found {
-            return Err(Errno(10));
-        }
-        if let Some((id, local, status, code, uid)) = ready {
-            if a[2] != 0 {
-                let mut out = [0; 128];
-                events::write_siginfo(
-                    &mut out,
-                    17,
-                    Info {
-                        sender: local,
-                        uid,
-                        status: match code {
-                            1 | 5 => status >> 8,
-                            6 => 18,
-                            _ => status & 127,
-                        },
-                        code,
-                        timer: None,
-                        fault: None,
-                        poll: None,
-                    },
-                );
-                out[20..24].copy_from_slice(&uid.to_le_bytes());
-                p.memory.write(a[2], &out).map_err(|_| Errno(14))?;
-            }
-            if a[4] != 0 {
-                p.memory.write(a[4], &[0; 144]).map_err(|_| Errno(14))?;
-            }
-            if options & 0x01000000 == 0 {
-                if code == 1 || code == 2 {
-                    self.processes.remove(&id);
-                } else {
-                    self.processes.get_mut(&id).expect("wait child").wait_event = None;
-                }
-            }
-            return Ok(Some(0));
-        }
-        if options & 1 != 0 {
-            if a[2] != 0 {
-                p.memory.write(a[2], &[0; 128]).map_err(|_| Errno(14))?;
-            }
-            Ok(Some(0))
-        } else {
-            Ok(None)
-        }
+        result
     }
 }

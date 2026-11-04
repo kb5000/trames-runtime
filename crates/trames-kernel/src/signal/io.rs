@@ -165,7 +165,7 @@ pub struct IoTask {
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
     live: AtomicBool,
-    presence: std::sync::OnceLock<Weak<()>>,
+    presence: std::sync::OnceLock<crate::task::Visibility>,
     policy: RwLock<Option<Policy>>,
     pid: AtomicU32,
     tgid: AtomicU32,
@@ -197,7 +197,7 @@ impl IoTask {
     fn identifies(&self, kind: u32, id: u32) -> bool {
         self.presence.get().map_or_else(
             || self.live.load(Ordering::Relaxed),
-            |p| p.strong_count() != 0,
+            crate::task::Visibility::present,
         ) && match kind {
             0 => self.pid.load(Ordering::Relaxed) == id,
             1 => self.tgid() == id,
@@ -206,6 +206,9 @@ impl IoTask {
     }
     pub fn tgid(&self) -> u32 {
         self.tgid.load(Ordering::Relaxed)
+    }
+    pub fn group(&self) -> u32 {
+        self.group.load(Ordering::Relaxed)
     }
     fn belongs(&self, kind: u32, id: u32) -> bool {
         self.live.load(Ordering::Relaxed) && self.identifies(kind, id)

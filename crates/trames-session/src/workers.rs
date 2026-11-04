@@ -502,6 +502,13 @@ impl<C: Cpu> Pool<C> {
                                         continue;
                                     }
                                 }
+                                if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
+                                    if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
+                                        work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                        job.waiting = None;
+                                        continue;
+                                    }
+                                }
                                 if let Some((sig, shared)) = snapshot.next_io_signal() {
                                     let action = snapshot.actions.get(sig as usize);
                                     let disposition = trames_kernel::signal::disposition(sig, action);
@@ -523,15 +530,20 @@ impl<C: Cpu> Pool<C> {
                                                 if let crate::run_queue::WaitState::Futex { wait, .. } = &waiting {
                                                     wait.cancel();
                                                 }
-                                                if let crate::run_queue::WaitState::Sleep { deadline, remaining } = waiting {
-                                                    if remaining != 0 {
+                                                if let crate::run_queue::WaitState::Sleep { deadline, remaining } = &waiting {
+                                                    if *remaining != 0 {
                                                         let ns = deadline.saturating_duration_since(Instant::now()).as_nanos();
                                                         let memory = work.memory.as_deref_mut().expect("signal View");
-                                                        let _ = memory.write_array(remaining, ((ns / 1_000_000_000) as u64).to_le_bytes());
-                                                        let _ = memory.write_array(remaining + 8, ((ns % 1_000_000_000) as u64).to_le_bytes());
+                                                        let _ = memory.write_array(*remaining, ((ns / 1_000_000_000) as u64).to_le_bytes());
+                                                        let _ = memory.write_array(*remaining + 8, ((ns % 1_000_000_000) as u64).to_le_bytes());
                                                     }
                                                 }
-                                                work.cpu.set_x(0, 0u64.wrapping_sub(4));
+                                                if let crate::run_queue::WaitState::Child(wait) = &waiting {
+                                                    if action.flags & 0x10000000 != 0 {
+                                                        for (i, value) in wait.request.args.iter().enumerate() { work.cpu.set_x(i, *value); }
+                                                        work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
+                                                    } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
+                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
                                             }
                                             let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
                                             if let Some(pending) = pending {
@@ -968,7 +980,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     break result;
                                 }
                                 if let Some(snapshot)=&work.syscalls {
-                                    if matches!(work.cpu.x(8) as u32, 132..=137) || snapshot.signal_send(&work.cpu) || snapshot.limit_call(work.cpu.x(8) as u32) {
+                                    if matches!(work.cpu.x(8) as u32, 132..=137) || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260) || snapshot.signal_send(&work.cpu) || snapshot.limit_call(work.cpu.x(8) as u32) {
                                         if let Some(entry)=snapshot.task_entry(&work.cpu) {
                                             if !entry.allowed() {
                                                 if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
@@ -977,6 +989,21 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         }
                                         let began=snapshot.profile.then(Instant::now);
                                         let number=work.cpu.x(8) as u32;
+                                        if matches!(number,95|260) {
+                                            let request=match trames_kernel::children::Wait::prepare(number,std::array::from_fn(|i|work.cpu.x(i))) {
+                                                Ok(request)=>request, Err(e)=>{work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}
+                                            };
+                                            // Subscribe before checking: an exit between checking and
+                                            // parking cannot strand the accepted source wait.
+                                            let waiting=snapshot.begin_child_wait(request);
+                                            let attempt=snapshot.children.wait(request,&snapshot.io_routes.namespace,snapshot.io_signals.group(),work.memory.as_deref_mut().expect("child wait View"));
+                                            if let Some(value)=attempt.transpose() {
+                                                work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;
+                                            }
+                                            parked=Some(waiting);
+                                            if let Some(began)=began{syscall_time+=began.elapsed();}
+                                            syscalls+=1;break SliceOutcome::Yield{instructions:0};
+                                        }
                                         if matches!(number,133|137) {
                                             let attempt=trames_kernel::signal::SignalWait::prepare(number,std::array::from_fn(|i|work.cpu.x(i)),work.memory.as_deref().expect("signal wait View"));
                                             let request=match attempt {Ok(r)=>r,Err(e)=>{work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}};
@@ -1718,6 +1745,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            children: Default::default(),
             limits: None,
             timers: None,
 
@@ -1739,6 +1767,145 @@ mod tests {
             program_break: Default::default(),
             uts: None,
             direct: Default::default(),
+        }
+    }
+
+    #[test]
+    fn child_waits_and_signal_restarts_share_one_slot_without_owner_requests() {
+        for (number, caught, restart, adopted) in [
+            (260, false, false, false),
+            (95, false, false, true),
+            (260, true, false, false),
+            (260, true, true, false),
+            (95, true, true, false),
+        ] {
+            let mut memory = Memory::default();
+            for (address, length) in [
+                (0x1000, PAGE_SIZE),
+                (0x2000, PAGE_SIZE),
+                (0x8000, 3 * PAGE_SIZE),
+            ] {
+                memory.map(address, length, Permissions::RW).unwrap();
+            }
+            for (pc, words) in [
+                (
+                    0x1000,
+                    vec![0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001],
+                ),
+                (0x1100, vec![0xf90002a0u32, 0xd2801168, 0xd4000001]),
+            ] {
+                for (i, word) in words.into_iter().enumerate() {
+                    memory
+                        .write_array(pc + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+            }
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let signals = trames_kernel::signal::Signals::default();
+            signals.actions.set(
+                10,
+                trames_kernel::signal::Action {
+                    handler: 0x1100,
+                    flags: if restart { 0x10000000 } else { 0 },
+                    ..Default::default()
+                },
+            );
+            signals.begin_io();
+            let mut snapshot = syscall_snapshot();
+            snapshot.io_signals = signals.io.clone();
+            snapshot.actions = signals.actions.shared();
+            let child = Arc::new(trames_kernel::children::Child::default());
+            child.attach(Some(&snapshot.children), 42, 1, 1234);
+            let args = if number == 260 {
+                [u32::MAX as u64, 0x2100, 0, 0x2200, 0, 0]
+            } else {
+                [0, 0, 0x2100, 4, 0x2200, 0]
+            };
+            let request = trames_kernel::children::Wait::prepare(number, args).unwrap();
+            let mut cpu = Cpu::new(if adopted { 0x1004 } else { 0x1000 }, 0xb000);
+            cpu.set_x(8, number as u64);
+            cpu.set_x(21, 0x2000);
+            for (i, value) in args.into_iter().enumerate() {
+                cpu.set_x(i, value);
+            }
+            let control = Arc::new(Control::new(u64::MAX));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            epoch.add(crate::run_queue::Job::new(
+                Work {
+                    pid: 1,
+                    cpu,
+                    memory: Some(Box::new(
+                        memory.parallel_view(&mut Default::default()).unwrap(),
+                    )),
+                    control: control.clone(),
+                    syscalls: Some(snapshot),
+                    gpu: None,
+                    audio: None,
+                },
+                1,
+                0,
+                adopted.then(|| {
+                    crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(request))
+                }),
+            ));
+            epoch.add(crate::run_queue::Job::new(
+                work(2, &[0x14000000], 0, control),
+                1,
+                0,
+                None,
+            ));
+            let mut pool = Pool::new(1);
+            pool.ensure(0).unwrap();
+            pool.launch(0, epoch.clone()).unwrap();
+            epoch.wait_child_parked(1);
+            let baseline = epoch.progress.load(Ordering::Relaxed);
+            let until = Instant::now() + Duration::from_secs(2);
+            while epoch.progress.load(Ordering::Relaxed) == baseline {
+                assert!(Instant::now() < until, "peer did not use the released slot");
+                std::thread::yield_now();
+            }
+            assert!(!epoch.control.stopped());
+            if caught {
+                signals
+                    .io
+                    .inbox
+                    .enqueue(10, trames_kernel::signal::Info::default())
+                    .unwrap();
+                if restart {
+                    epoch.wait_child_parked(1);
+                }
+            }
+            if !caught || restart {
+                child.exited(23 << 8);
+            }
+            let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
+            if !matches!(event, Some(Event::EpochStopped(0))) {
+                epoch.stop();
+                panic!("child wait completion missing: number={number} caught={caught} restart={restart} adopted={adopted} event={}", match event {None=>"none",Some(Event::Service(_))=>"service",Some(Event::Done(_))=>"done",Some(Event::Idle)=>"idle",Some(Event::VmReady)=>"vm",Some(Event::EpochStopped(_))=>"other worker"});
+            }
+            let done = epoch.drain();
+            let caller = done.iter().find(|d| d.pid == 1).unwrap();
+            assert_eq!(
+                caller.cpu.x(19),
+                if caught && !restart {
+                    0u64.wrapping_sub(4)
+                } else if number == 260 {
+                    42
+                } else {
+                    0
+                }
+            );
+            assert_eq!(caller.serviced_syscalls, 0);
+            assert_eq!(child.reaped(), !caught || restart);
+            assert!(
+                done.iter().find(|d| d.pid == 2).unwrap().instructions > 0,
+                "peer uses the released slot"
+            );
+            memory.commit_parallel().unwrap();
+            assert_eq!(
+                memory.read_u64(0x2000).unwrap(),
+                if caught { 10 } else { 0 }
+            );
         }
     }
 

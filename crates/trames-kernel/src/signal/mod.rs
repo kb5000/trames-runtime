@@ -27,7 +27,7 @@ pub const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
 
 #[derive(Default)]
 pub struct Signals {
-    pub presence: std::sync::Arc<()>,
+    pub presence: std::sync::Arc<crate::task::Presence>,
     pub reader: std::sync::OnceLock<std::sync::Arc<TaskReader>>,
     pub io: std::sync::Arc<IoTask>,
     pub io_directory: std::sync::Arc<IoDirectory>,

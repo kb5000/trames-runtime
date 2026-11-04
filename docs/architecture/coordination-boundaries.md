@@ -220,3 +220,38 @@ acceptance verifies its admitted workflows, not the frequency of every remaining
 boundary in Firefox or a complete server workload. No whole-application trace or
 claim that all these owner paths were exercised is made here. The 2026-11-04 transfer, event-wait, timer and signal migrations update this inventory; the remaining owner
 boundaries are still reachable.
+
+### Shared child waits and lifecycle publication (2026-11-05)
+
+The parent process now owns an original shared `Children` object. CLONE_THREAD
+shares it; a fork starts a new family. Each child group owns one original
+wait-event object, also shared by its threads. Birth, credentials, process-group
+changes, reparenting and completed group exit publish structural metadata at
+actual custody boundaries. Ordinary owner waits do not rebuild the process
+directory after every query, and worker waits never access that directory.
+
+Supported wait4/waitid selection, WNOHANG, WNOWAIT, stopped/continued events,
+namespace PID translation and result formatting use this same object from the
+owner and source workers. A blocked accepted wait subscribes to both its parent
+family and original task/process signal queues before checking readiness. It
+returns the execution slot, resumes on existing executors and preserves caught
+signal EINTR/SA_RESTART behavior without a service request. Sibling waiters
+consume an event once under the parent's object lock. Guest copyout and wake
+callbacks run after releasing resource locks.
+
+A consumed exit retires shared PID presence immediately, so kill(0), prlimit and
+proc observations cannot expose a reaped child while its owner projection is
+awaiting collection. Task visibility handles and original child objects prevent retained
+completion handles from keeping a PID visible or retargeting its replacement.
+Native ARM Linux oracle checks also corrected pre-existing ABI differences:
+WNOHANG without a result does not preflight output pointers; a copyout EFAULT
+after consumption does not restore the event; waitid copies rusage before
+siginfo while wait4 copies status first. WNOWAIT still preserves the event.
+
+**This is the wait/event foundation of the lifecycle migration.** Default
+STOP/CONT/termination delivery, live task exit/group-exit cleanup, clear_tid,
+parent-death/reparenting policy, namespace-init teardown and CPU/Memory/VFS
+projection collection still run at their existing lifecycle boundaries.
+`Epoch::finish` still stops its cohort. Exit events become waitable only after
+the current cleanup has finished and all group members have exited. None of
+these remaining dependencies is relabelled as a worker fast path or hidden RPC.
