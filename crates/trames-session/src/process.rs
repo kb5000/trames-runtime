@@ -111,6 +111,7 @@ pub(crate) struct Process<C: Cpu> {
     pending_open: Option<u32>,
     stopped_state: Option<Box<State>>,
     auto_reap: bool,
+    host_status: Option<Arc<std::sync::atomic::AtomicI32>>,
     tgid: u32,
     started: Instant,
     cpu_time: Duration,
@@ -406,6 +407,7 @@ impl<C: Cpu> Process<C> {
             pending_open: None,
             stopped_state: None,
             auto_reap: false,
+            host_status: None,
             tgid: self.tgid,
             started: Instant::now(),
             cpu_time: Duration::ZERO,
@@ -871,11 +873,109 @@ impl<C: Cpu> Kernel<C> {
                 if let Some(signal @ 1..=64) = io.root_signal() {
                     Self::queue_one(1, root, signal, 0);
                 }
-                Ok(())
             }
-            Ok(false) => Err(RuntimeError::Cancelled),
-            Err(_) => Err(RuntimeError::Arguments("host session control failed")),
+            Ok(false) => return Err(RuntimeError::Cancelled),
+            Err(_) => return Err(RuntimeError::Arguments("host session control failed")),
         }
+        while let Some(request) = io.host_spawn() {
+            let status = request.status.clone();
+            let published_pid = request.pid.clone();
+            match self.spawn_host(request) {
+                Ok(pid) => published_pid.store(pid, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => status.store(-(e.0 as i32), std::sync::atomic::Ordering::Relaxed),
+            }
+        }
+        while let Some((group, signal @ 1..=64)) = io.host_signal() {
+            for (&pid, task) in &mut self.processes {
+                if task.group == group && !matches!(task.state, State::Zombie(_)) {
+                    Self::queue_one(pid, task, signal, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn spawn_host(&mut self, request: trames_linux::HostSpawn) -> Result<u32, Errno> {
+        if self.processes.len() >= self.task_limit || request.argv.is_empty() {
+            return Err(Errno(11));
+        }
+        let id = self.next_pid;
+        self.next_pid = id
+            .checked_add(1)
+            .filter(|v| *v < i32::MAX as u32)
+            .ok_or(Errno(11))?;
+        let root = self.processes.get(&1).ok_or(Errno(3))?;
+        root.linux.vfs.cgroup_can_fork(1)?;
+        let mut child = root.fork_state(Memory::default(), false, false, false);
+        child
+            .memory
+            .inherit_total_limit(&root.memory)
+            .map_err(|_| Errno(12))?;
+        child.linux.vfs = request.vfs;
+        child.linux.vfs.activate_child_pid(id)?;
+        child.linux.vfs.set_process_context(id);
+        child.linux.fork_tid(0);
+        child.parent = 1;
+        child.parent_thread = 1;
+        child.tgid = id;
+        child.session = id;
+        child.group = id;
+        child.signals = Signals::default();
+        child.signals.io_directory = root.signals.io_directory.clone();
+        child.linux.vfs.set_controlling_terminal(None)?;
+        if let Some(end) = child.linux.vfs.pty(0)?.filter(|end| !end.master) {
+            let mut tty = end.pair.terminal.borrow_mut();
+            tty.session = id;
+            tty.foreground = id;
+            child
+                .linux
+                .vfs
+                .set_controlling_terminal(Some(end.pair.id))?;
+        }
+        let program = &request.argv[0];
+        let path = if program.contains(&b'/') {
+            program.clone()
+        } else {
+            let search = request
+                .environment
+                .iter()
+                .find_map(|e| e.strip_prefix(b"PATH="))
+                .unwrap_or(b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+            let mut denied = false;
+            let mut found = None;
+            for dir in search.split(|b| *b == b':') {
+                let mut path = dir.to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(program);
+                match child.linux.vfs.executable_file_at(AT_FDCWD, &path, 0) {
+                    Ok(_) => {
+                        found = Some(path);
+                        break;
+                    }
+                    Err(e) if e.0 == 13 => denied = true,
+                    Err(e) if e.0 == 2 || e.0 == 20 => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            found.ok_or(Errno(if denied { 13 } else { 2 }))?
+        };
+        Self::exec_strings(
+            &mut child,
+            AT_FDCWD,
+            path,
+            request.argv,
+            request.environment,
+            0,
+            self.memory_limits.per_process,
+            self.started,
+        )?;
+        child.host_status = Some(request.status);
+        child.vm_id = self.resource_id();
+        child.linux.vfs.cgroup_fork(1, id, id);
+        self.processes.insert(id, child);
+        self.publish_io_tasks(None);
+        Ok(id)
     }
     fn process_maps(&self, p: &Process<C>) -> Vec<u8> {
         // Mapping edits (including PROT_NONE reservations) advance the code
@@ -1223,6 +1323,9 @@ impl<C: Cpu> Kernel<C> {
             .values()
             .any(|t| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_)))
         {
+            if let Some(completion) = &p.host_status {
+                completion.store(status, std::sync::atomic::Ordering::Relaxed);
+            }
             self.reap_namespace_children(pid, p.linux.vfs.pid_namespace(), p.parent);
             self.timers.retain(|_, t| t.tgid != p.tgid);
             self.notify(
@@ -1251,6 +1354,9 @@ impl<C: Cpu> Kernel<C> {
         self.timers.retain(|_, t| t.tgid != tgid);
         if let Some(leader) = self.processes.get(&tgid) {
             if let State::Zombie(status) = leader.state {
+                if let Some(completion) = &leader.host_status {
+                    completion.store(status, std::sync::atomic::Ordering::Relaxed);
+                }
                 let parent = leader.parent;
                 let uid = leader.linux.vfs.credentials.uid;
                 let namespace = leader.linux.vfs.pid_namespace().clone();
@@ -1739,7 +1845,22 @@ impl<C: Cpu> Kernel<C> {
         budget: usize,
         clock_origin: Instant,
     ) -> Result<(), Errno> {
-        let mut path = Linux::path(&p.memory, a[0])?;
+        let path = Linux::path(&p.memory, a[0])?;
+        let argv = strings(&p.memory, a[1])?;
+        let envp = strings(&p.memory, a[2])?;
+        Self::exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn exec_strings(
+        p: &mut Process<C>,
+        dirfd: i32,
+        mut path: Vec<u8>,
+        mut argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+        flags: u32,
+        budget: usize,
+        clock_origin: Instant,
+    ) -> Result<(), Errno> {
         if path.is_empty() && flags & 0x1000 == 0 {
             return Err(Errno(2));
         }
@@ -1759,8 +1880,6 @@ impl<C: Cpu> Kernel<C> {
         };
         let mut file = p.linux.vfs.executable_file_at(dirfd, &path, flags)?;
         let inaccessible = via_fd && p.linux.vfs.flags(dirfd as u32)? & trames_vfs::O_CLOEXEC != 0;
-        let mut argv = strings(&p.memory, a[1])?;
-        let envp = strings(&p.memory, a[2])?;
         if argv.is_empty() {
             argv.push(Vec::new());
         }
@@ -5442,6 +5561,7 @@ pub(super) fn run<C: Cpu>(
         pending_open: None,
         stopped_state: None,
         auto_reap: false,
+        host_status: None,
         tgid: 1,
         started: Instant::now(),
         cpu_time: Duration::ZERO,
@@ -5782,6 +5902,107 @@ mod tests {
         k.control(&mut Control(Some(65))).unwrap();
     }
 
+    #[test]
+    fn host_spawn_loads_literal_argv_and_reports_group_completion() {
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        let mut k = kernel();
+        let mut root = process();
+        let mut image = vec![0u8; 140];
+        image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, value) in [(16, 2u16), (18, 183), (52, 64), (54, 56), (56, 1)] {
+            image[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at, value) in [(20, 1u32), (64, 1), (68, 5)] {
+            image[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at, value) in [
+            (24, 0x400080u64),
+            (32, 64),
+            (80, 0x400000),
+            (96, 140),
+            (104, 140),
+            (112, 4096),
+        ] {
+            image[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at, value) in [(128, 0xd2800540u32), (132, 0xd2800ba8), (136, 0xd4000001)] {
+            image[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        root.linux
+            .vfs
+            .import_executable(b"/program", image)
+            .unwrap();
+        let vfs = root.linux.vfs.clone();
+        let status = Arc::new(AtomicI32::new(trames_linux::HOST_RUNNING));
+        let published = Arc::new(AtomicU32::new(0));
+        k.processes.insert(1, root);
+        let id = k
+            .spawn_host(trames_linux::HostSpawn {
+                argv: vec![b"program".to_vec(), b"a b;$(literal)".to_vec()],
+                environment: vec![b"PATH=/".to_vec(), b"X=literal value".to_vec()],
+                vfs,
+                status: status.clone(),
+                pid: published,
+            })
+            .unwrap();
+        let mut child = k.processes.remove(&id).unwrap();
+        assert_eq!(child.cpu.pc, 0x400080);
+        assert_eq!(child.group, id);
+        assert_eq!(child.session, id);
+        assert!(child
+            .linux
+            .environment
+            .iter()
+            .any(|s| s == b"X=literal value"));
+        assert_eq!(status.load(Ordering::Relaxed), trames_linux::HOST_RUNNING);
+        let memory = child.memory.share();
+        let mut thread = child.fork_state(memory, true, true, true);
+        thread.tgid = id;
+        k.processes.insert(id + 1, thread);
+        k.exit_one(id, &mut child, 42 << 8);
+        assert_eq!(status.load(Ordering::Relaxed), trames_linux::HOST_RUNNING);
+        k.processes.insert(id, child);
+        let mut thread = k.processes.remove(&(id + 1)).unwrap();
+        k.exit_one(id + 1, &mut thread, 0);
+        assert_eq!(status.load(Ordering::Relaxed), 42 << 8);
+        assert!(k.processes.contains_key(&1));
+    }
+    #[test]
+    fn host_command_signal_is_scoped_to_its_process_group() {
+        struct Control;
+        impl GuestOutput for Control {
+            fn host_signal(&mut self) -> Option<(u32, u32)> {
+                None
+            }
+            fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+        }
+        struct Signal(bool);
+        impl GuestOutput for Signal {
+            fn host_signal(&mut self) -> Option<(u32, u32)> {
+                if std::mem::take(&mut self.0) {
+                    Some((2, 2))
+                } else {
+                    None
+                }
+            }
+            fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+        }
+        let mut k = kernel();
+        let root = process();
+        let mut child = root.fork();
+        child.group = 2;
+        child.tgid = 2;
+        k.processes.insert(1, root);
+        k.processes.insert(2, child);
+        k.control(&mut Signal(true)).unwrap();
+        assert_eq!(k.processes[&2].next_signal(u64::MAX).map(|s| s.0), Some(2));
+        assert!(k.processes[&1].next_signal(u64::MAX).is_none());
+        k.control(&mut Control).unwrap();
+    }
     #[test]
     fn host_control_publishes_partial_context_and_fd_changes_before_error() {
         struct Control(u32);
@@ -6773,6 +6994,7 @@ mod tests {
             pending_open: None,
             stopped_state: None,
             auto_reap: false,
+            host_status: None,
             tgid: 1,
             started: Instant::now(),
             cpu_time: Duration::ZERO,

@@ -68,6 +68,18 @@ pub struct HostMemoryInfo {
     pub available: usize,
 }
 
+/// A host-authorized process launch, consumed only at the existing lifecycle
+/// boundary. Stdio contains independent descriptors into shared byte resources.
+/// Completion is a Linux wait status (or negative errno on launch failure).
+pub struct HostSpawn {
+    pub argv: Vec<Vec<u8>>,
+    pub environment: Vec<Vec<u8>>,
+    pub vfs: trames_vfs::Vfs,
+    pub status: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    pub pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+pub const HOST_RUNNING: i32 = i32::MIN;
+
 pub trait GuestOutput {
     /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
     /// Queried only for memory/proc metadata, never on CPU/native byte access.
@@ -88,6 +100,13 @@ pub trait GuestOutput {
     }
     /// One host-authorized Linux signal for guest PID 1, consumed only after
     /// the stopped control hook. Terminal events still target foreground jobs.
+    fn host_spawn(&mut self) -> Option<HostSpawn> {
+        None
+    }
+    /// An explicitly authorized signal to one host-launched process group.
+    fn host_signal(&mut self) -> Option<(u32, u32)> {
+        None
+    }
     fn root_signal(&mut self) -> Option<u32> {
         None
     }
