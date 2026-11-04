@@ -60,7 +60,8 @@ impl Limits {
             _ => {}
         }
     }
-    fn call(
+    /// Decode an already authorized target. Callers keep guest identity checks outside.
+    pub fn call(
         &self,
         number: u32,
         a: [u64; 6],
@@ -211,6 +212,16 @@ impl Authority {
         } else {
             self.pid
         };
+        self.call_resolved(pid, number, a, memory)
+    }
+    /// The trusted owner has already resolved this global target in its namespace.
+    pub fn call_resolved(
+        &self,
+        pid: u32,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
         let privileged = self.credentials.has_cap(capabilities::SYS_RESOURCE);
         if pid == self.pid {
             return self.limits.call(number, a, memory, self.fixed, privileged);

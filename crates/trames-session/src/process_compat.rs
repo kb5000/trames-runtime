@@ -98,6 +98,17 @@ impl<C: Cpu> Kernel<C> {
             Err(Errno(3))
         }
     }
+    fn fixed_limits(&self) -> trames_kernel::limits::Fixed {
+        trames_kernel::limits::Fixed {
+            address_space: if self.memory_limits.is_host_managed() {
+                u64::MAX
+            } else {
+                self.memory_limits.per_process as u64
+            },
+            stack: super::super::STACK_SIZE,
+            tasks: self.task_limit as u64,
+        }
+    }
     pub(super) fn limit_authority(
         &self,
         pid: u32,
@@ -109,15 +120,7 @@ impl<C: Cpu> Kernel<C> {
             namespace: p.linux.vfs.pid_namespace().clone(),
             pid,
             credentials: p.linux.vfs.credentials.clone(),
-            fixed: trames_kernel::limits::Fixed {
-                address_space: if self.memory_limits.is_host_managed() {
-                    u64::MAX
-                } else {
-                    self.memory_limits.per_process as u64
-                },
-                stack: super::super::STACK_SIZE,
-                tasks: self.task_limit as u64,
-            },
+            fixed: self.fixed_limits(),
         }
     }
     pub(super) fn rlimit(
@@ -127,12 +130,25 @@ impl<C: Cpu> Kernel<C> {
         number: u32,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
-        if number == 261 && a[0] as u32 != 0 {
-            // Structural lifecycle and credentials still change at custody
-            // boundaries. Refresh the joined caller's target directory once.
-            self.publish_io_tasks(Some((pid, p)));
+        let target = if number == 261 && a[0] as u32 != 0 {
+            p.linux.vfs.global_pid(a[0] as u32)?
+        } else {
+            pid
+        };
+        if target == pid {
+            // Solo execution borrows its actual limit object. No directory
+            // refresh, authority cloning or second namespace translation.
+            return p.limits.call(
+                number,
+                a,
+                &mut p.memory,
+                self.fixed_limits(),
+                p.linux.vfs.credentials.has_cap(capabilities::SYS_RESOURCE),
+            );
         }
-        self.limit_authority(pid, p).call(number, a, &mut p.memory)
+        self.publish_io_tasks(Some((pid, p)));
+        self.limit_authority(pid, p)
+            .call_resolved(target, number, a, &mut p.memory)
     }
 }
 

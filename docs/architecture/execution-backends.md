@@ -2322,3 +2322,9 @@ binds its replacement VFS to the inherited original process limits. Explicit FD
 table unshare/exec keeps the same process soft-limit atomic while detaching table
 membership; a fork still copies the process limit. These are structural ownership
 updates, not repeated file-I/O or guest-instruction policy checks.
+
+
+Solo/self limit queries borrow the actual process object directly, including
+an explicit self TID in prlimit64. They do not refresh the task directory or
+clone a namespace/credential context. Cross-task owner queries resolve the PID
+once and use the same decoder and authority check as source calls.
