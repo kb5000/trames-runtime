@@ -415,6 +415,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -624,6 +625,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -660,6 +662,142 @@ mod tests {
                 assert!(p.linux.vfs.flags(fd).is_ok());
             }
             assert_eq!(snapshot.direct.fd_control_completed(), 0);
+        }
+    }
+    #[test]
+    fn timer_controls_apply_entry_policy_once_before_inputs() {
+        for number in [102, 103, 107, 108, 109, 110, 111] {
+            for decision in [ALLOW, 0x5007b] {
+                let mut p = super::super::tests::process();
+                for (i, word) in [0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001]
+                    .into_iter()
+                    .enumerate()
+                {
+                    p.memory
+                        .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.memory.write_array(0x8000, 3600u64.to_le_bytes()).unwrap();
+                p.memory
+                    .write_array(0x8200, 0x8220u64.to_le_bytes())
+                    .unwrap();
+                p.memory.write_array(0x8208, 8u64.to_le_bytes()).unwrap();
+                p.memory
+                    .write_array(0x8220, (1u64 << 11).to_le_bytes())
+                    .unwrap();
+                p.signals.io_directory.publish(&p.signals.io, 1, 1, 1, 0, 0);
+                let timers = Arc::new(trames_kernel::timers::Timers::default());
+                timers
+                    .call(
+                        107,
+                        [1, 0, 0x8300, 0, 0, 0],
+                        &mut p.memory,
+                        Instant::now(),
+                        1,
+                        &p.signals.io_directory,
+                        p.linux.vfs.pid_namespace(),
+                    )
+                    .unwrap();
+                let id = p.memory.read_u64(0x8300).unwrap();
+                p.memory.write_array(0x8000, [0u8; 32]).unwrap();
+                let output = if decision == ALLOW { 0x8000 } else { u64::MAX };
+                let args = match number {
+                    102 => [0, output, 0, 0, 0, 0],
+                    103 => [0, output, 0, 0, 0, 0],
+                    107 => [1, 0, output, 0, 0, 0],
+                    108 => [id, output, 0, 0, 0, 0],
+                    109 | 111 => [id, 0, 0, 0, 0, 0],
+                    110 => [id, 0, output, 0, 0, 0],
+                    _ => unreachable!(),
+                };
+                p.cpu = Cpu::new(0x4000, 0);
+                p.cpu.set_x(8, number);
+                put_args(&mut p.cpu, args);
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                ));
+                let snapshot = crate::worker_syscalls::Snapshot {
+                    timers: Some(timers),
+                    owner_pending: 0,
+                    saved_wait_mask: Default::default(),
+                    io_signals: p.signals.io.clone(),
+                    io_routes: trames_kernel::signal::IoRoutes {
+                        directory: p.signals.io_directory.clone(),
+                        ..Default::default()
+                    },
+                    io_wake: None,
+                    seccomp: p.seccomp.clone(),
+                    identities: [0; 7],
+                    started: Instant::now(),
+                    processor: 0,
+                    profile: false,
+                    streams: Default::default(),
+                    fd_flags: Default::default(),
+                    umask: Default::default(),
+                    actions: p.signals.actions.shared(),
+                    program_break: p.linux.program_break(),
+                    uts: None,
+                    futex: Default::default(),
+                    direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors()),
+                };
+                let task = snapshot.io_signals.clone();
+                let control = Arc::new(crate::workers::Control::new(1000));
+                let epoch = crate::run_queue::Epoch::new(control.clone());
+                epoch.add(crate::run_queue::Job::new(
+                    crate::workers::Work {
+                        pid: 1,
+                        cpu: std::mem::take(&mut p.cpu),
+                        memory: Some(Box::new(
+                            p.memory.parallel_view(&mut Default::default()).unwrap(),
+                        )),
+                        control,
+                        syscalls: Some(snapshot),
+                        gpu: None,
+                        audio: None,
+                    },
+                    1,
+                    0,
+                    None,
+                ));
+                let mut pool = crate::workers::Pool::new(1);
+                pool.ensure(0).unwrap();
+                pool.launch(0, epoch.clone()).unwrap();
+                assert!(matches!(
+                    pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                    Some(crate::workers::Event::EpochStopped(0))
+                ));
+                let done = epoch.drain().pop().unwrap();
+                p.memory.commit_parallel().unwrap();
+                p.cpu = done.cpu;
+                assert_eq!(p.seccomp.evaluations(), 1);
+                if decision == ALLOW {
+                    assert_eq!(p.cpu.x(19), 0);
+                    assert_eq!(done.io_waits, 0);
+                    assert_eq!(done.serviced_syscalls, 0);
+                    assert_eq!(task.context.lock().unwrap().wait_mask, None);
+                    assert_eq!(task.mask(), 0);
+                } else {
+                    p.seccomp_entry = done.seccomp_entry;
+                    assert!(p.seccomp_entry.is_some());
+                    super::super::tests::kernel().call(
+                        1,
+                        &mut p,
+                        number as u32,
+                        args,
+                        &mut trames_linux::CapturedOutput::default(),
+                    );
+                    assert_eq!(p.cpu.x(0), error(Errno(123)));
+                    assert_eq!(p.seccomp.evaluations(), 1);
+                    assert_eq!(task.mask(), 0);
+                }
+            }
         }
     }
     #[test]
@@ -712,6 +850,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    timers: None,
                     owner_pending: 0,
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
@@ -823,6 +962,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    timers: None,
                     owner_pending: 0,
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
@@ -935,6 +1075,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -1471,6 +1612,7 @@ mod tests {
             .wait((0, 7, 0x1000), 3, 1, || Ok::<_, ()>(()))
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -1728,6 +1870,7 @@ mod tests {
                         .unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    timers: None,
                     owner_pending: 0,
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
@@ -1769,6 +1912,7 @@ mod tests {
             ));
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -1819,6 +1963,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -1862,6 +2007,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -1907,6 +2053,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -1960,6 +2107,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -2015,6 +2163,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                timers: None,
                 owner_pending: 0,
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
@@ -2065,6 +2214,7 @@ mod tests {
                 ));
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    timers: None,
                     owner_pending: 0,
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),

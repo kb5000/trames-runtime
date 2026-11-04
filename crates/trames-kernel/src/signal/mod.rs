@@ -13,7 +13,7 @@ pub use actions::{Action, Actions};
 pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
-pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask};
+pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
 pub use pending::Pending;
 use std::{cell::RefCell, rc::Rc};
 use trames_memory::{Access, CpuMemory};

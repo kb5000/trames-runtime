@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub timers: Option<Arc<trames_kernel::timers::Timers>>,
     pub owner_pending: u64,
     pub saved_wait_mask: std::cell::Cell<Option<u64>>,
     pub io_signals: Arc<trames_kernel::signal::IoTask>,
@@ -416,6 +417,18 @@ impl Snapshot {
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
         cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4)
     }
+    pub fn timer_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
+        (self.seccomp.mode() != 0
+            && self.timers.is_some()
+            && trames_kernel::timers::timer_call(cpu.x(8) as u32))
+        .then(|| {
+            self.seccomp.entry_decision(
+                cpu.x(8) as u32,
+                cpu.pc(),
+                std::array::from_fn(|i| cpu.x(i)),
+            )
+        })
+    }
     pub fn event_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0 && trames_linux::event_wait(cpu.x(8) as u32)).then(|| {
             self.seccomp.entry_decision(
@@ -431,6 +444,9 @@ impl Snapshot {
         }
         if self.seccomp.mode() == 0 {
             return true;
+        }
+        if trames_kernel::timers::timer_call(cpu.x(8) as u32) {
+            return false;
         }
         // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
@@ -577,6 +593,15 @@ impl Snapshot {
                 self.direct.record_fd_control();
                 result
             }
+            number @ (102 | 103 | 107..=111) => self.timers.as_ref()?.call(
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+                self.started,
+                self.io_signals.tgid(),
+                &self.io_routes.directory,
+                &self.io_routes.namespace,
+            ),
             134 => self
                 .actions
                 .query(std::array::from_fn(|i| cpu.x(i)), memory)?,
@@ -721,6 +746,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -847,6 +873,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -903,6 +930,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -1003,6 +1031,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -1067,6 +1096,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),

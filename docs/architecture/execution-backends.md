@@ -2156,3 +2156,53 @@ arriving FASYNC signals, handler/sigreturn masks and read-only timeout copyout.
 Source-worker regressions assert zero service requests for masked EINTR/sigreturn,
 original epoll identity after close/reuse, and once-only seccomp evaluation across
 parking. This does not claim every signal source or owner FD has been migrated.
+
+
+## Shared POSIX and real interval timers (2026-11-04)
+
+timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer use one
+shared execution-independent Timer ABI on Mac HVF and the iPad interpreter.
+A read-shared timer namespace retains original timer objects; each timer protects
+its own armed state, period, overrun and deletion. Create/delete transactions
+protect the ID namespace. A separate short deadline-index transaction changes
+only the deadline set and its atomic next-expiry hint. No registry write lock
+spans ordinary timer queries or another timer's algorithm. Existing metadata and
+signal-queue bounds are not a guest resident-memory charge.
+
+The current cohort binds this registry to its existing execution queue. Only an
+actual earlier deadline wakes an idle executor; unchanged/disarmed updates do not
+notify. CPU dispatch tests the cached expiry hint, while an idle executor sleeps
+until the next actual resource/timer deadline. An existing executor removes a
+bounded due batch, releases the queue/index locks, and delivers on original
+signal mailboxes. Rearming and deletion serialize on the original timer before
+committing their deadline changes. Sub-microsecond periods do not spin inside
+maintenance. No timer/reactor/resource service thread or polling bus is created,
+and a timer expiry alone no longer requests a whole-cohort join.
+
+SIGEV_NONE needs no asynchronous observation: it retains its absolute origin and
+period, computes current periodic phase on a query and reports zero overrun.
+It installs neither a signal target nor a host/execution deadline. Ordinary
+short joined timer calls also keep their CPU quantum; they do not rescan every
+blocked process after each query. Real signal/control work and normal bounded
+execution polls remain.
+
+A process-directed target retains its original process inbox and group
+incarnation; a thread-directed target weakly names the original task. Later PID
+reuse cannot redirect a notification. Standard signals coalesce and queued timer
+records accumulate overruns under the original inbox mutex. Source workers use
+the same caught-signal frame, temporary-mask restoration and sigreturn as I/O
+signals. Default stop/termination still requests task lifecycle handling. Legacy
+owner signalfd/sigwait waiters can consume the same shared pending timer records;
+those owner waits have not been migrated by this batch. libc SIGEV_THREAD uses
+its existing helper-thread/SIGEV_THREAD_ID ABI, without a new host timer thread.
+
+Entry seccomp is evaluated once before timer ABI effects. ALLOW executes locally;
+non-ALLOW carries its exact decision to the original owner policy action. The
+common ABI preserves copied input/old-output aliasing, fault-without-mutation,
+clock origins, original ownership and timer retirement. Native Linux comparison
+also corrects two prior discrepancies: POSIX timer_settime ignores non-ABSTIME
+flag bits, and exec removes POSIX timers while preserving ITIMER_REAL. Fork starts
+with no inherited timers; final process exit removes its remaining timers.
+CPU-clock POSIX timers and ITIMER_VIRTUAL/PROF keep their previous explicit
+unsupported behavior. No new ordinary-memory fence, unsafe block or global
+algorithm lock is added.

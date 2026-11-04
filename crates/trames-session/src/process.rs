@@ -511,8 +511,7 @@ pub(crate) struct Kernel<C: Cpu> {
     load: [f64; 3],
     load_sample: Instant,
     next_resource: u64,
-    timers: BTreeMap<i32, events::Timer>,
-    next_timer: i32,
+    timers: Arc<trames_kernel::timers::Timers>,
     native: trames_accel::native::Registry,
     gpu: RefCell<BTreeMap<u64, trames_vulkan::Context>>,
     video: RefCell<BTreeMap<u64, trames_video::Context>>,
@@ -1322,7 +1321,7 @@ impl<C: Cpu> Kernel<C> {
                 completion.store(status, std::sync::atomic::Ordering::Relaxed);
             }
             self.reap_namespace_children(pid, p.linux.vfs.pid_namespace(), p.parent);
-            self.timers.retain(|_, t| t.tgid != p.tgid);
+            self.timers.clear_process(p.tgid, false);
             self.notify(
                 p.parent,
                 pid,
@@ -1346,7 +1345,7 @@ impl<C: Cpu> Kernel<C> {
         {
             return;
         }
-        self.timers.retain(|_, t| t.tgid != tgid);
+        self.timers.clear_process(tgid, false);
         if let Some(leader) = self.processes.get(&tgid) {
             if let State::Zombie(status) = leader.state {
                 if let Some(completion) = &leader.host_status {
@@ -2626,7 +2625,7 @@ impl<C: Cpu> Kernel<C> {
                         t.linux.vfs.release_descriptors();
                     }
                 }
-                self.timers.retain(|_, t| t.tgid != p.tgid);
+                self.timers.clear_process(p.tgid, true);
                 self.wake_vfork(pid);
                 if pid != p.tgid {
                     p.linux.vfs.cgroup_exec_rekey(pid, p.tgid);
@@ -4140,12 +4139,13 @@ impl<C: Cpu> Kernel<C> {
                 let a = args(&p.cpu);
                 let return_pc = p.cpu.pc();
                 self.call(id, p, number, a, io);
-                // Pure queries have no scheduling/FD/mapping effects. Keep the
-                // serial quantum just as workers keep theirs, rather than scan
+                // Queries and shared timer controls have no task/FD/mapping
+                // publication effects. Keep the serial quantum just as workers keep theirs, rather than scan
                 // every blocked task after each TimeStamp/getpid query. The
                 // normal time/instruction/return bounds still poll control and
                 // timers; a delivered/pending signal must return to the kernel.
-                immediate_return = matches!(number, 113 | 114 | 168 | 172..=178)
+                immediate_return = (matches!(number, 113 | 114 | 168 | 172..=178)
+                    || trames_kernel::timers::timer_call(number))
                     && matches!(p.state, State::Ready)
                     && p.cpu.pc() == return_pc
                     && p.pending_bits() & (!p.signals.mask | UNBLOCKABLE) == 0;
@@ -4464,6 +4464,7 @@ impl<C: Cpu> Kernel<C> {
             self.workers.events(),
             persistent,
         );
+        epoch.bind_timers(self.timers.clone());
         self.publish_io_tasks(None);
         let mut file_epoch = trames_vfs::FileEpoch::default();
         let mut uring_epoch = trames_linux::UringEpoch::default();
@@ -4529,6 +4530,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    timers: Some(self.timers.clone()),
                     owner_pending: p.signals.pending.bits()
                         | p.signals.shared_pending.borrow().bits(),
                     saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
@@ -4998,11 +5000,6 @@ impl<C: Cpu> Kernel<C> {
         if self.terminal.is_some() {
             timeout = Duration::from_millis(2);
         }
-        for timer in self.timers.values() {
-            if let Some(deadline) = timer.deadline {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
-            }
-        }
         let worker_vms: std::collections::BTreeSet<_> = self
             .processes
             .iter()
@@ -5294,7 +5291,7 @@ impl<C: Cpu> Kernel<C> {
                         || p.byte_wait.as_ref().is_some_and(|wait|wait.external_wait())
                         || !p.linux.uring_native_wait_fds().is_empty()
                         || p.flock_wait.as_ref().is_some_and(|(r,_)| r.native_wait_fd().is_some())
-                }) || self.terminal.is_some() || self.timers.values().any(|t| t.deadline.is_some());
+                }) || self.terminal.is_some() || self.timers.next_deadline().is_some();
                 if !external {
                     return Err(RuntimeError::Deadlock);
                 }
@@ -5314,10 +5311,8 @@ impl<C: Cpu> Kernel<C> {
         if let Some(root) = self.processes.get(&1) {
             native_fds.extend(root.linux.vfs.native_service_event_fd());
         }
-        for timer in self.timers.values() {
-            if let Some(d) = timer.deadline {
-                timeout = timeout.min(d.saturating_duration_since(now));
-            }
+        if let Some(d) = self.timers.next_deadline() {
+            timeout = timeout.min(d.saturating_duration_since(now));
         }
         for (&id, p) in &self.processes {
             if p.frozen(id) {
@@ -5627,8 +5622,7 @@ pub(super) fn run<C: Cpu>(
         load: [0.0; 3],
         load_sample: Instant::now(),
         next_resource: 2,
-        timers: BTreeMap::new(),
-        next_timer: 1,
+        timers: Default::default(),
         native: trames_accel::native::Registry::default(),
         gpu: RefCell::new(BTreeMap::new()),
         video: RefCell::new(BTreeMap::new()),
@@ -7219,8 +7213,7 @@ mod tests {
             load: [0.0; 3],
             load_sample: Instant::now(),
             next_resource: 2,
-            timers: BTreeMap::new(),
-            next_timer: 1,
+            timers: Default::default(),
             native: trames_accel::native::Registry::default(),
             gpu: RefCell::new(BTreeMap::new()),
             video: RefCell::new(BTreeMap::new()),

@@ -958,6 +958,13 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     break result;
                                 }
                                 if let Some(snapshot)=&work.syscalls {
+                                    if let Some(entry)=snapshot.timer_entry(&work.cpu) {
+                                        if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
+                                        let began=snapshot.profile.then(Instant::now);
+                                        let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("timer View")).expect("shared timer authority");
+                                        if let Some(began)=began{syscall_time+=began.elapsed();}
+                                        work.cpu.set_x(0,value);syscalls+=1;continue;
+                                    }
                                     if let Some(entry)=snapshot.event_entry(&work.cpu) {
                                         if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
                                         if let Some(epoch)=&epoch {
@@ -1678,6 +1685,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            timers: None,
             owner_pending: 0,
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
@@ -1764,6 +1772,127 @@ mod tests {
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
     }
 
+    #[test]
+    fn posix_timer_api_expiry_and_signal_return_use_the_only_worker_slot() {
+        let mut memory = Memory::default();
+        for (a, n) in [
+            (0x1000, PAGE_SIZE),
+            (0x2000, PAGE_SIZE),
+            (0x8000, 3 * PAGE_SIZE),
+        ] {
+            memory.map(a, n, Permissions::RW).unwrap();
+        }
+        let mov = |r: u32, v: u32| 0xd2800000 | (v << 5) | r;
+        let svc = 0xd4000001;
+        let code = [
+            mov(0, 1),
+            mov(1, 0x2200),
+            mov(2, 0x2300),
+            mov(8, 107),
+            svc,
+            0xaa0003f3,
+            0xb9400300,
+            mov(1, 0),
+            mov(2, 0x2100),
+            mov(3, 0),
+            mov(8, 110),
+            svc,
+            0xaa0003f4,
+            mov(0, 0),
+            mov(1, 0),
+            mov(2, 0x2400),
+            mov(3, 0),
+            mov(8, 73),
+            svc,
+            0xaa0003f6,
+            0xb9400300,
+            mov(8, 111),
+            svc,
+            0xaa0003f7,
+            mov(8, 93),
+            svc,
+        ];
+        for (a, code) in [
+            (0x1000, code.to_vec()),
+            (0x1100, vec![0xf90002a0, mov(8, 139), svc]),
+        ] {
+            for (i, word) in code.into_iter().enumerate() {
+                memory
+                    .write_array(a + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+        }
+        for (a, v) in [
+            (0x2118, 10_000_000u64),
+            (0x2200, 42),
+            (0x2208, 10),
+            (0x2400, 3600),
+        ] {
+            memory.write_array(a, v.to_le_bytes()).unwrap();
+        }
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let timers = Arc::new(trames_kernel::timers::Timers::default());
+        let mut snapshot = syscall_snapshot();
+        snapshot.timers = Some(timers.clone());
+        snapshot
+            .io_routes
+            .directory
+            .publish(&snapshot.io_signals, 1, 1, 1, 0, 0);
+        snapshot.actions.set(
+            10,
+            trames_kernel::signal::Action {
+                handler: 0x1100,
+                flags: 0x10000000,
+                ..Default::default()
+            },
+        );
+        let task = snapshot.io_signals.clone();
+        let mut cpu = Cpu::new(0x1000, 0xb000);
+        cpu.set_x(21, 0x2000);
+        cpu.set_x(24, 0x2300);
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::new(control.clone());
+        epoch.bind_timers(timers.clone());
+        epoch.add(crate::run_queue::Job::new(
+            Work {
+                pid: 1,
+                cpu,
+                memory: Some(Box::new(
+                    memory.parallel_view(&mut Default::default()).unwrap(),
+                )),
+                control,
+                syscalls: Some(snapshot),
+                gpu: None,
+                audio: None,
+            },
+            1,
+            0,
+            None,
+        ));
+        let mut pool = Pool::new(1);
+        pool.ensure(0).unwrap();
+        pool.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            pool.event_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Event::EpochStopped(0))
+        ));
+        let done = epoch.drain().pop().unwrap();
+        assert_eq!(
+            (
+                done.cpu.x(19),
+                done.cpu.x(20),
+                done.cpu.x(22),
+                done.cpu.x(23)
+            ),
+            (0, 0, 0u64.wrapping_sub(4), 0)
+        );
+        assert_eq!(done.serviced_syscalls, 0);
+        assert_eq!(done.syscalls, 5);
+        assert!(timers.next_deadline().is_none());
+        assert_eq!(task.context.lock().unwrap().frames, 0);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_u64(0x2000).unwrap(), 10);
+    }
     #[test]
     fn masked_event_wait_signal_and_sigreturn_need_no_owner_service() {
         for number in [22, 72, 73, 441] {

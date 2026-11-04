@@ -375,6 +375,7 @@ pub(super) struct Epoch<C: Cpu> {
     slot_changed: [Condvar; 32],
     host_events: OnceLock<Option<Arc<trames_vfs::HostEvents>>>,
     pub io_target: Weak<dyn trames_vfs::IoWake>,
+    timers: OnceLock<Arc<trames_kernel::timers::Timers>>,
     deadline_origin: Instant,
     next_deadline: AtomicU64,
     ready_slots: AtomicU64,
@@ -404,6 +405,7 @@ impl<C: Cpu> Epoch<C> {
             slot_changed: std::array::from_fn(|_| Condvar::new()),
             host_events: OnceLock::new(),
             io_target: me.clone(),
+            timers: OnceLock::new(),
             deadline_origin: Instant::now(),
             next_deadline: AtomicU64::new(u64::MAX),
             ready_slots: AtomicU64::new(0),
@@ -420,6 +422,11 @@ impl<C: Cpu> Epoch<C> {
         persistent: bool,
     ) -> Arc<Self> {
         Self::configured(control, Some(events), persistent)
+    }
+    pub fn bind_timers(self: &Arc<Self>, timers: Arc<trames_kernel::timers::Timers>) {
+        assert!(self.timers.set(timers.clone()).is_ok());
+        let target: Arc<dyn trames_kernel::timers::TimerWake> = self.clone();
+        timers.bind(Arc::downgrade(&target));
     }
     fn deadline_ticks(&self, deadline: Instant) -> u64 {
         deadline
@@ -478,7 +485,8 @@ impl<C: Cpu> Epoch<C> {
     /// With no deadline, CPU/native execution does not query the host clock.
     pub fn deadline_due(&self) -> bool {
         let next = self.next_deadline.load(Ordering::Relaxed);
-        next != u64::MAX && self.deadline_ticks(Instant::now()) >= next
+        (next != u64::MAX && self.deadline_ticks(Instant::now()) >= next)
+            || self.timers.get().is_some_and(|t| t.due())
     }
     fn refresh_ready(&self, q: &Queues<C>) {
         let slots = q.ready.iter().fold(0, |mask, job| {
@@ -658,6 +666,13 @@ impl<C: Cpu> Epoch<C> {
             if self.control.stopped() {
                 return None;
             }
+            if let Some(timers) = self.timers.get().filter(|t| t.due()) {
+                // Signal callbacks may acquire this queue. Timer maintenance
+                // runs on this existing executor, always outside its mutex.
+                drop(q);
+                timers.tick();
+                q = self.queues.lock().unwrap();
+            }
             let now = Instant::now();
             let expired: Vec<_> = q
                 .parked
@@ -682,7 +697,12 @@ impl<C: Cpu> Epoch<C> {
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             }
-            let deadline = q.parked.values().filter_map(|j| j.wake_deadline()).min();
+            let deadline = q
+                .parked
+                .values()
+                .filter_map(|j| j.wake_deadline())
+                .chain(self.timers.get().and_then(|t| t.next_deadline()))
+                .min();
             self.next_deadline.store(
                 deadline.map_or(u64::MAX, |d| self.deadline_ticks(d)),
                 Ordering::Relaxed,
@@ -1039,6 +1059,15 @@ impl<C: Cpu> Epoch<C> {
                 .map(|(job, outcome)| job.finish(outcome, self.progress.load(Ordering::Relaxed))),
         );
         done
+    }
+}
+
+impl<C: Cpu> trames_kernel::timers::TimerWake for Epoch<C> {
+    fn timers_changed(&self) {
+        let mut q = self.queues.lock().unwrap();
+        if !self.control.stopped() {
+            self.notify(&mut q);
+        }
     }
 }
 

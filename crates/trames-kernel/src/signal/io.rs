@@ -17,6 +17,24 @@ pub struct Inbox {
     bits: AtomicU64,
 }
 impl Inbox {
+    fn timer(&self, sig: u32, info: Info) -> i32 {
+        let mut pending = self.pending.lock().unwrap();
+        let overrun = if let Some((id, extra, _)) = info.timer {
+            if let Some(previous) = pending.timer_mut(sig, id) {
+                let (_, overrun, _) = previous.timer.as_mut().unwrap();
+                *overrun = overrun.saturating_add(extra).saturating_add(1);
+                *overrun
+            } else {
+                let _ = pending.enqueue(sig, info);
+                extra
+            }
+        } else {
+            let _ = pending.enqueue(sig, info);
+            0
+        };
+        self.bits.store(pending.bits(), Ordering::Relaxed);
+        overrun
+    }
     pub fn bits(&self) -> u64 {
         self.bits.load(Ordering::Relaxed)
     }
@@ -82,6 +100,9 @@ impl Default for IoTask {
     }
 }
 impl IoTask {
+    pub fn tgid(&self) -> u32 {
+        self.tgid.load(Ordering::Relaxed)
+    }
     fn belongs(&self, kind: u32, id: u32) -> bool {
         self.live.load(Ordering::Relaxed)
             && match kind {
@@ -163,7 +184,65 @@ pub struct IoDirectory {
 struct Group {
     members: RwLock<Vec<Weak<IoTask>>>,
 }
+/// An accepted timer target retains its original process inbox/group incarnation,
+/// or a weak reference to the original thread. PID reuse cannot redirect it.
+pub struct TimerTarget {
+    group: Arc<Group>,
+    id: u32,
+    thread: Option<Weak<IoTask>>,
+    process: Arc<Inbox>,
+}
+impl TimerTarget {
+    pub fn signal(&self, sig: u32, info: Info) -> i32 {
+        if let Some(thread) = &self.thread {
+            let Some(task) = thread.upgrade().filter(|t| t.belongs(0, self.id)) else {
+                return 0;
+            };
+            let overrun = task.inbox.timer(sig, info);
+            task.wake();
+            overrun
+        } else {
+            let overrun = self.process.timer(sig, info);
+            if let Some(task) = self
+                .group
+                .members
+                .read()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|t| t.belongs(1, self.id) && t.ready())
+            {
+                task.wake();
+            }
+            overrun
+        }
+    }
+}
 impl IoDirectory {
+    pub fn timer_target(&self, tgid: u32, thread: Option<u32>) -> Result<TimerTarget, Errno> {
+        let key = thread.map_or((1, tgid), |tid| (0, tid));
+        let group = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or(Errno(22))?;
+        let task = group
+            .members
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|t| t.belongs(key.0, key.1) && t.tgid() == tgid)
+            .ok_or(Errno(22))?;
+        Ok(TimerTarget {
+            group,
+            id: key.1,
+            thread: thread.map(|_| Arc::downgrade(&task)),
+            process: task.process().clone(),
+        })
+    }
     pub fn publish(
         &self,
         task: &Arc<IoTask>,

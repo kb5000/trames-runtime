@@ -218,13 +218,6 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         let now = Instant::now();
-        if self
-            .timers
-            .values()
-            .any(|timer| timer.deadline.is_some_and(|d| d <= now))
-        {
-            return Ok(true);
-        }
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
         Ok(self.processes.iter().any(|(&pid, p)| {
             if members.contains(&pid) || p.frozen(pid) {
