@@ -81,8 +81,8 @@ impl<C: Cpu> Kernel<C> {
                 let write = matches!(request.number, 64 | 66 | 68 | 70);
                 let admitted = match p.linux.vfs.epoch_io(a[0] as u32, write) {
                     Some(trames_vfs::EpochIo::Stream) => matches!(request.number, 63..=66),
-                    // RLIMIT_FSIZE can queue SIGXFSZ. Keep its complete existing
-                    // signal path joined; no effects before this decision.
+                    // Ordinary files, including FSIZE and its signal, use the
+                    // retained FileWork path instead of this legacy FD service.
                     Some(trames_vfs::EpochIo::File) => false,
                     None => false,
                 };

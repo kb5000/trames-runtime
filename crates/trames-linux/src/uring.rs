@@ -143,6 +143,7 @@ impl Linux {
                 &self.vfs.descriptor_factory(),
                 &Default::default(),
                 Some(disk.clone()),
+                self.vfs.task_signal(),
             ))
         });
         let submitted = if let Some(n) = saved {

@@ -311,7 +311,9 @@ impl DirectSyscalls {
             PreparedAction::Host { work, output }
         } else {
             match work.run() {
-                trames_vfs::FileOutcome::Complete(reply) if !reply.file_size_signal => {
+                trames_vfs::FileOutcome::Complete(reply)
+                    if !reply.file_size_signal || self.task_signal.is_some() =>
+                {
                     return Some(self.finish_file_reply(reply, output, memory));
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
@@ -344,7 +346,9 @@ impl DirectSyscalls {
             }
         } else {
             match trames_vfs::FileWork::run_inline(paths, target, command) {
-                trames_vfs::FileOutcome::Complete(reply) if !reply.file_size_signal => {
+                trames_vfs::FileOutcome::Complete(reply)
+                    if !reply.file_size_signal || self.task_signal.is_some() =>
+                {
                     return Some(self.finish_file_reply(reply, output, memory));
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
@@ -360,12 +364,31 @@ impl DirectSyscalls {
         });
         None
     }
+    fn complete_file_attempt(
+        &self,
+        reply: trames_vfs::FileReply,
+        output: FileOutput,
+        memory: &mut impl CpuMemory,
+    ) -> IoAttempt {
+        let owner_signal = reply.file_size_signal && self.task_signal.is_none();
+        let value = self.finish_file_reply(reply, output, memory);
+        if owner_signal {
+            IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
+        } else {
+            IoAttempt::Complete(value)
+        }
+    }
     fn finish_file_reply(
         &self,
         mut reply: trames_vfs::FileReply,
         output: FileOutput,
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
+        if reply.file_size_signal {
+            if let Some(task) = &self.task_signal {
+                task.raise(25);
+            }
+        }
         if let Some(bytes) = reply.scratch.take() {
             *self.scratch.borrow_mut() = bytes;
         }
@@ -406,8 +429,7 @@ impl DirectSyscalls {
                 }))
             }
             PreparedAction::Reply { reply, output } => {
-                let value = self.finish_file_reply(reply, output, memory);
-                IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
+                self.complete_file_attempt(reply, output, memory)
             }
             PreparedAction::Owner { work, output } => {
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner { work, output }))
@@ -573,15 +595,7 @@ impl DirectSyscalls {
         } else {
             match trames_vfs::FileWork::run_owned(vfs, file, command) {
                 trames_vfs::FileOutcome::Complete(reply) => {
-                    let signal = reply.file_size_signal;
-                    let value = self.finish_file_reply(reply, output, memory);
-                    if signal {
-                        IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal {
-                            value,
-                        }))
-                    } else {
-                        IoAttempt::Complete(value)
-                    }
+                    self.complete_file_attempt(reply, output, memory)
                 }
                 trames_vfs::FileOutcome::Waiting(work) => {
                     self.submit_file_work(work, output, number, args, memory, pid, target)
@@ -627,13 +641,7 @@ impl DirectSyscalls {
                 self.park_transfer(pending, work, number, args, signal, memory, target)
             }
             Some(trames_vfs::FileOutcome::Complete(reply)) => {
-                let signal = reply.file_size_signal;
-                let value = self.finish_file_reply(reply, pending.output, memory);
-                if signal {
-                    IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
-                } else {
-                    IoAttempt::Complete(value)
-                }
+                self.complete_file_attempt(reply, pending.output, memory)
             }
             Some(trames_vfs::FileOutcome::Owner(work)) => {
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner {

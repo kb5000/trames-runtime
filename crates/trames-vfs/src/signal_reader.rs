@@ -4,6 +4,10 @@
 use crate::{IoSignal, IoSubscription};
 use std::sync::Arc;
 pub trait SignalReader: Send + Sync {
+    /// Original reading/submitting task, retained by accepted asynchronous work.
+    fn task_signal(&self) -> Option<Arc<dyn crate::TaskSignal>> {
+        None
+    }
     fn poll(&self, mask: u64) -> (u16, [u64; 2]);
     fn take(&self, mask: u64) -> Option<[u8; 128]>;
     fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription>;

@@ -53,7 +53,7 @@ impl<C: Cpu> Kernel<C> {
                 output.apply(reply.result, &mut p.memory).map(Some)
             }
             trames_linux::FileBoundary::Signal { value } => {
-                Self::queue_one(pid, p, 25, pid);
+                trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
                 p.file_entry = None;
                 value.map(Some)
             }
@@ -97,7 +97,7 @@ impl<C: Cpu> Kernel<C> {
                     .get_mut(&task)
                     .filter(|p| p.memory.instruction_identity().0 == owner)
                 {
-                    Self::queue_one(task, process, 25, task);
+                    trames_vfs::TaskSignal::raise(&*process.signals.io, 25);
                 }
             }
             for layout in actor.take_file_layouts() {

@@ -3453,7 +3453,7 @@ impl<C: Cpu> Kernel<C> {
             Self::queue_one(pid, p, 13, pid);
         }
         if p.linux.vfs.take_file_size_signal() {
-            Self::queue_one(pid, p, 25, pid);
+            trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
         }
         for target in p.linux.vfs.take_cgroup_kills() {
             if target == pid {

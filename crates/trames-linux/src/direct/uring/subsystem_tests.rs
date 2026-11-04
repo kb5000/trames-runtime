@@ -613,3 +613,93 @@ fn queued_file_read_reserves_its_selected_buffer_and_copies_out_on_the_source() 
     drop(l);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_pumps() {
+    #[derive(Default)]
+    struct Signals(std::sync::atomic::AtomicUsize);
+    impl trames_vfs::TaskSignal for Signals {
+        fn raise(&self, sig: u32) {
+            assert_eq!(sig, 25);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
+    impl FileExecutor for Queue {
+        fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
+            result.begin();
+            assert!(self.0.send((work.queued(), result)).is_ok());
+        }
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "trames-limit-source-{}",
+        trames_memory::new_backing_identity()
+    ));
+    let mut l = Linux::new(0x100000);
+    l.vfs = Vfs::open_disk(&directory, Default::default()).unwrap();
+    l.vfs.import_file(b"/limited", Vec::new()).unwrap();
+    let file = l.vfs.open_at(-100, b"/limited", 2, 0).unwrap();
+    let (fd, r) = l.vfs.uring_create(8, 16).unwrap();
+    let mut m = Memory::default();
+    m.map(0x1000, 4 * trames_memory::PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    for (address, offset, len) in [
+        (0x10000, 0, r.ring_bytes),
+        (0x20000, 0x10000000, r.sqe_bytes),
+    ] {
+        m.map_backed(
+            address,
+            l.vfs.mapping_pages(fd, offset, len, true, true).unwrap(),
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+    }
+    m.write_array(0x1200, file.to_le_bytes()).unwrap();
+    l.uring_register([fd as u64, 2, 0x1200, 1, 0, 0], &mut m)
+        .unwrap();
+    l.vfs.close(file).unwrap();
+    m.write(0x3000, b"x").unwrap();
+    l.vfs.file_size_limit_handle().set(1);
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let retained = files.capture_uring(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let a = Arc::new(Signals::default());
+    let b = Arc::new(Signals::default());
+    let (send, receive) = std::sync::mpsc::channel();
+    let d = direct(&l, &m, &mut epoch, &caps)
+        .with_task_signal(a.clone())
+        .with_file_executor(Arc::new(Queue(send)))
+        .with_urings(
+            epoch
+                .capture_all(&l.vfs, m.instruction_identity().0, 7, &caps, &retained)
+                .with_actor(l.uring_actor_root()),
+        );
+    let t = target();
+    let mut write = scalar(23, 0, 0x3000, 1, 77);
+    write[1] = 1;
+    write[8..16].copy_from_slice(&1u64.to_le_bytes());
+    add(&mut m, &r, write);
+    assert!(matches!(
+        enter(&d, fd, 1, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(1))
+    ));
+    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    l.vfs.file_size_limit_handle().set(0);
+    result.complete(work.run());
+    let pump = direct(&l, &m, &mut epoch, &caps).with_task_signal(b.clone());
+    assert!(matches!(
+        enter(&pump, fd, 0, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert_eq!(cq(&mut m, &r), (77, -27));
+    assert_eq!(a.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(d.urings.actor().take_file_signals().is_empty());
+    assert!(!d.urings.actor().owner_required());
+    drop((d, pump, l));
+    files.finish();
+    std::fs::remove_dir_all(directory).unwrap();
+}

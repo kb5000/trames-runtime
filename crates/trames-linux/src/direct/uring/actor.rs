@@ -15,6 +15,7 @@ pub(crate) struct Execution {
     factory: trames_vfs::DescriptorFactory,
     files: trames_vfs::DirectFiles,
     disk: Option<Arc<dyn FileExecutor>>,
+    signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
 }
 struct Accepted {
     context: Arc<Execution>,
@@ -51,12 +52,14 @@ impl Execution {
         factory: &trames_vfs::DescriptorFactory,
         files: &trames_vfs::DirectFiles,
         disk: Option<Arc<dyn FileExecutor>>,
+        signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
     ) -> Self {
         Self {
             paths: Mutex::new(paths.retain_context()),
             factory: factory.clone(),
             files: files.clone(),
             disk,
+            signal,
         }
     }
     fn run(

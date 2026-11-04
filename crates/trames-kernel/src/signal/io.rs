@@ -270,14 +270,34 @@ struct Policy {
 }
 impl trames_vfs::TaskSignal for IoTask {
     fn raise(&self, signal: u32) {
-        let _ = self.inbox.enqueue(
-            signal,
+        if !self.live.load(Ordering::Relaxed) {
+            return;
+        }
+        let info = if signal == 25 {
+            // Linux FSIZE uses send_sig(..., current, 0): SI_USER, tgid/ruid.
+            Info {
+                code: 0,
+                sender: self.tgid(),
+                uid: self.uid.load(Ordering::Relaxed),
+                ..Info::default()
+            }
+        } else {
             Info {
                 code: 128,
                 ..Info::default()
-            },
-        );
-        self.wake();
+            }
+        };
+        let enqueue = || self.inbox.enqueue_quiet(signal, info).unwrap_or(false);
+        let policy = self.policy.read().unwrap();
+        let changed = policy.as_ref().map_or_else(enqueue, |p| {
+            p.actions
+                .with_action(signal, |action| !ignored(signal, action) && enqueue())
+        });
+        drop(policy);
+        if changed {
+            self.inbox.changed();
+            self.wake();
+        }
     }
 }
 #[derive(Default)]
@@ -589,6 +609,25 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_size_resource_signal_preserves_origin_ignores_discard_and_retired_targets() {
+        let signals = Signals::default();
+        let directory = IoDirectory::default();
+        directory.publish(&signals.io, 42, 40, 40, 1000, 1000);
+        signals.publish_policy(&PidNamespace::default(), false);
+        signals.actions.set_handler(25, 0x4000);
+        trames_vfs::TaskSignal::raise(&*signals.io, 25);
+        let info = signals.io.inbox.take(25).unwrap();
+        assert_eq!((info.code, info.sender, info.uid), (0, 40, 1000));
+        signals.actions.set_handler(25, 1);
+        trames_vfs::TaskSignal::raise(&*signals.io, 25);
+        assert!(signals.io.inbox.is_empty());
+        signals.actions.set_handler(25, 0x4000);
+        signals.io.exit();
+        trames_vfs::TaskSignal::raise(&*signals.io, 25);
+        assert!(signals.io.inbox.is_empty());
+    }
+
     #[test]
     fn pending_timer_overrun_does_not_create_another_signalfd_readiness_edge() {
         let inbox = Inbox::default();

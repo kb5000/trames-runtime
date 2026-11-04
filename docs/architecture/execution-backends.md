@@ -2303,3 +2303,14 @@ Worker tests count one BPF decision per completed call and no owner returns for
 both successful queries and ERRNO denials. Separate timing/path-counter runs
 compare the unchanged old stable binary, the shared production interpreter,
 Mac HVF and the same static ARM64 ELF on native ARM Linux.
+
+
+Resource-limit error completion also stays on the source. Inline and queued
+file work enqueue SIGXFSZ through the original shared task capability. io_uring
+keeps this capability in its accepted execution context across close, fixed-file
+reuse, custody handoff and pumping by another context. Legacy buffered AIO's
+io_submit completion already uses its submitting task. Signal callbacks run
+after resource/disposition locks are released; ignored signals and retired tasks
+do not acquire pending records. Native ARM Linux acceptance checks SI_USER,
+tgid/real UID, short-write and EFBIG behavior. Default termination/stop still
+requires the actual task lifecycle boundary; caught/ignored error signals do not.

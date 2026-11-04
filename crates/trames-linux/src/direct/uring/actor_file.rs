@@ -52,6 +52,7 @@ impl FileIo {
         request: &Request,
         memory: &mut impl CpuMemory,
         actor: &UringActor,
+        signal: Option<&Arc<dyn trames_vfs::TaskSignal>>,
     ) -> Result<(i32, bool)> {
         match outcome {
             FileOutcome::Waiting(_) => unreachable!("io_uring has no stream transfer command"),
@@ -68,12 +69,16 @@ impl FileIo {
             }
             FileOutcome::Complete(reply) => {
                 if reply.file_size_signal {
-                    actor
-                        .file_signals
-                        .lock()
-                        .unwrap()
-                        .push((request.owner, request.task));
-                    actor.require_owner();
+                    if let Some(task) = signal {
+                        task.raise(25);
+                    } else {
+                        actor
+                            .file_signals
+                            .lock()
+                            .unwrap()
+                            .push((request.owner, request.task));
+                        actor.require_owner();
+                    }
                 }
                 let n = match reply.result? {
                     FileValue::Count(n) => n,
@@ -173,7 +178,7 @@ pub(super) fn execute(
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &call.file {
         return Some(match io.result.take() {
-            Some(outcome) => io.finish(outcome, request, memory, actor),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
         });
     }
@@ -235,13 +240,19 @@ pub(super) fn execute(
     }
     if queued || matches!(outcome, Some(FileOutcome::Layout(_))) {
         let result = match outcome {
-            Some(outcome) => io.finish(outcome, request, memory, actor),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
         };
         call.file = Some(io);
         Some(result)
     } else {
-        Some(io.finish(outcome.unwrap(), request, memory, actor))
+        Some(io.finish(
+            outcome.unwrap(),
+            request,
+            memory,
+            actor,
+            execution.signal.as_ref(),
+        ))
     }
 }
 
@@ -258,7 +269,7 @@ pub(super) fn open(
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &call.file {
         return Some(match io.result.take() {
-            Some(outcome) => io.finish(outcome, request, memory, actor),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
         });
     }
@@ -290,7 +301,7 @@ pub(super) fn open(
     }
     let outcome = work.run();
     let layout = matches!(outcome, FileOutcome::Layout(_));
-    let result = io.finish(outcome, request, memory, actor);
+    let result = io.finish(outcome, request, memory, actor, execution.signal.as_ref());
     if layout {
         call.file = Some(io);
     }

@@ -1116,6 +1116,7 @@ impl DirectSyscalls {
                 self.resources.as_ref(),
                 &self.files,
                 self.file_executor.as_ref(),
+                self.task_signal.as_ref(),
             );
             let attempt = self.urings.start(args, memory, pid, target)?;
             return Some(attempt);

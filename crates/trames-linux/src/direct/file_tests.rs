@@ -334,3 +334,64 @@ fn stream_wait_rearms_original_fds_and_copies_offsets_only_on_commit() {
     assert_eq!(memory.read_u64(0x10000).unwrap(), 4);
     assert_eq!(v.read(read, 3).unwrap(), b"ayl");
 }
+
+#[derive(Default)]
+struct FileSignal(std::sync::atomic::AtomicUsize);
+impl trames_vfs::TaskSignal for FileSignal {
+    fn raise(&self, signal: u32) {
+        assert_eq!(signal, 25);
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+#[test]
+fn size_failure_notifies_the_source_without_inline_or_native_owner_checkpoint() {
+    for native in [false, true] {
+        let (directory, mut v) = if native {
+            let (p, v) = disk();
+            (Some(p), v)
+        } else {
+            (None, trames_vfs::Vfs::default())
+        };
+        v.import_file(b"/limited", Vec::new()).unwrap();
+        let fd = v.open_at(-100, b"/limited", 2, 0).unwrap();
+        v.set_file_size_limit(0);
+        let mut epoch = trames_vfs::FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let signal = Arc::new(FileSignal::default());
+        let (send, receive) = std::sync::mpsc::channel();
+        let direct = DirectSyscalls::default()
+            .with_files(files)
+            .with_membership(v.shared_files())
+            .with_paths(v.path_queries())
+            .with_task_signal(signal.clone())
+            .with_file_executor(Arc::new(Queue(send)));
+        let mut m = Memory::default();
+        m.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write(0x10000, b"x").unwrap();
+        let args = [fd as u64, 0x10000, 1, 0, 0, 0];
+        let wake = t();
+        let result = direct
+            .start_file_call(64, args, &mut m, 1, &Arc::downgrade(&wake))
+            .unwrap();
+        let result = if native {
+            let IoAttempt::Blocked(wait) = result else {
+                panic!("native operation should park only its source")
+            };
+            let pending = wait.file_pending().unwrap();
+            drop(wait);
+            let (work, completion) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            completion.complete(work.run());
+            direct.start_retained_file(pending, 64, args, &mut m, 1, &Arc::downgrade(&wake))
+        } else {
+            result
+        };
+        assert!(matches!(result, IoAttempt::Complete(Err(Errno(27)))));
+        assert_eq!(signal.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(v.pread(fd, 8, 0).unwrap(), b"");
+        drop((direct, v));
+        epoch.finish();
+        if let Some(p) = directory {
+            std::fs::remove_dir_all(p).unwrap();
+        }
+    }
+}

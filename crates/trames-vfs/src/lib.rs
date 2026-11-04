@@ -687,6 +687,9 @@ impl Clone for Vfs {
     }
 }
 impl Vfs {
+    pub fn task_signal(&self) -> Option<Arc<dyn TaskSignal>> {
+        self.signal_reader.borrow().as_ref()?.task_signal()
+    }
     pub fn bind_signal_reader(&self, reader: Arc<dyn SignalReader>) {
         let mut current = self.signal_reader.borrow_mut();
         if current.as_ref().is_none_or(|r| !Arc::ptr_eq(r, &reader)) {
