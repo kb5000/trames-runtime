@@ -2877,7 +2877,7 @@ impl<C: Cpu> Kernel<C> {
             31 => self.ioprio_get(pid, p, a[0], a[1]).map(Some),
             132 => Self::sigaltstack(p, a[0], a[1]).map(Some),
             283 => Self::membarrier(p, a[0], a[1]).map(Some),
-            163 | 164 | 261 => self.rlimit(p, number, a).map(Some),
+            163 | 164 | 261 => self.rlimit(pid, p, number, a).map(Some),
             124 => Ok(Some(0)),
             203 if matches!(p.state, State::Blocked(203, _))
                 && p.linux.vfs.local_socket(a[0] as u32)?.is_none() =>
@@ -8862,7 +8862,7 @@ mod boundary_tests {
             ),
             Err(Errno(11))
         );
-        k.rlimit(&mut p, 163, [6, 0x1000, 0, 0, 0, 0]).unwrap();
+        k.rlimit(1, &mut p, 163, [6, 0x1000, 0, 0, 0, 0]).unwrap();
         assert_eq!(read_u64(&p.memory, 0x1000).unwrap(), 300);
         k.refresh_proc(1, &mut p, None);
         let fd = p

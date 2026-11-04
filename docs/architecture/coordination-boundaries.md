@@ -98,6 +98,24 @@ adds no coordinator/service thread, polling or ordinary I/O check. Regression
 tests retain more than 128 live mounts across independent namespaces, verify
 retirement and preserve atomic per-namespace limit failure/recovery.
 
+### Cross-process resource-limit compatibility (2026-11-04)
+
+`prlimit64` resolves the target PID/TID in the caller's PID namespace instead of
+rejecting every non-self target. It uses caller credentials and memory for
+permission checks and copyin/copyout, then updates the target's existing
+process-owned limit objects. Thread-group members share those objects and the
+FD allocator's atomic soft limit; a fork takes independent copies. Cross-process
+access requires matching real caller UID/GID against all target real/effective/
+saved IDs, or the caller's CAP_SYS_RESOURCE. Hard-limit raises use the caller's
+capability, not the target's. No host process limit is changed.
+
+This is a compatibility correction at the existing joined policy-mutation
+boundary. It does not claim worker-local resource-limit syscalls or introduce
+a new message, coordinator/service thread, global lock, or file-I/O check.
+The original caller-memory preflight and alias-safe new/old argument behavior
+remain. A future source-worker migration must move process-limit authority and
+all enforcement consumers together, rather than publish a stale snapshot.
+
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
