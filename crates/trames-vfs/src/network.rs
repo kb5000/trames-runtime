@@ -380,9 +380,15 @@ mod tests {
         replacement.listen(4).unwrap();
         assert_ne!(replacement.local_addr().unwrap(), address);
         let _peer = std::net::TcpStream::connect(address).unwrap();
-        let (accepted, _) = v
-            .accept_socket_output(&original, O_NONBLOCK, |_| Ok(()))
-            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (accepted, _) = loop {
+            match v.accept_socket_output(&original, O_NONBLOCK, |_| Ok(())) {
+                Err(Errno(11)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+                result => break result.unwrap(),
+            }
+        };
         assert_eq!(
             v.socket_fd(accepted).unwrap().local_addr().unwrap(),
             address

@@ -251,7 +251,7 @@ impl Linux {
             a[3] & 1 == 0 || a[2] == 0 || ring.cq_ready() >= a[2] as u32,
         ))
     }
-    fn complete_request(
+    pub(crate) fn complete_request(
         state: &mut UringState,
         request: &UringRequest,
         result: i32,
@@ -322,25 +322,7 @@ impl Linux {
     }
     pub fn cancel_uring(&mut self, memory: &mut Memory, task: u32) {
         let owner = memory.instruction_identity().0;
-        for ring in self.uring_rings() {
-            let mut retired = Vec::new();
-            let mut state = ring.state.lock().unwrap();
-            let mut pending = std::mem::take(&mut state.pending);
-            while let Some(request) = pending.pop_front() {
-                if request.owner == owner && request.task == task {
-                    Self::complete_request(&mut state, &request, -125, false);
-                    retired.push(request);
-                } else {
-                    state.pending.push_back(request);
-                }
-            }
-            state.waits.remove(&task);
-            let count = ring.flush(&mut state).unwrap_or(0);
-            let event = ring.completion_event(&state, count);
-            drop(state);
-            drop(retired);
-            ring.notify_completion(event);
-        }
+        crate::UringActor::cancel_task_rings(self.uring_rings(), owner, task);
         self.vfs.reap_uring_files();
     }
     pub fn uring_deadline(&self) -> Option<Instant> {
@@ -1069,6 +1051,35 @@ pub(crate) mod tests {
         assert_eq!(cq(&mut m, &r), (1, -125));
         enter(&mut l, &mut m, fd, 1);
         assert_eq!(cq(&mut m, &r), (2, 0));
+    }
+    #[test]
+    fn source_exit_cancellation_keeps_peer_requests_and_original_closed_ring() {
+        let (mut l, mut m, fd, r) = setup(4);
+        let [read, write] = l.vfs.pipe(0).unwrap();
+        for (task, data, address) in [(7, 1, 0x2000u64), (8, 2, 0x2001u64)] {
+            let mut s = sqe(22, read, data);
+            s[16..24].copy_from_slice(&address.to_le_bytes());
+            put(&mut s, 24, 1);
+            add(&mut m, &r, s);
+            l.uring_enter([fd as u64, 1, 0, 0, 0, 0], &mut m, None, task)
+                .unwrap();
+        }
+        let owner = trames_memory::CpuMemory::instruction_identity(&m).0;
+        let actor = l.uring_actor_root().get().unwrap().clone();
+        l.vfs.close(fd).unwrap();
+        let replacement = l.vfs.eventfd(3, 0).unwrap();
+        assert_eq!(replacement, fd);
+        std::thread::spawn(move || actor.cancel_task(owner, 7))
+            .join()
+            .unwrap();
+        assert_eq!(cq(&mut m, &r), (1, -125));
+        assert_eq!(r.state.lock().unwrap().pending.len(), 1);
+        l.vfs.write(write, b"x").unwrap();
+        assert!(l.progress_uring(&mut m, 8));
+        assert_eq!(cq(&mut m, &r), (2, 1));
+        assert_eq!(m.read_array::<1>(0x2000).unwrap(), [0]);
+        assert_eq!(m.read_array::<1>(0x2001).unwrap(), *b"x");
+        assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
     }
     #[test]
     fn pending_buffers_are_never_used_in_another_task_or_address_space() {

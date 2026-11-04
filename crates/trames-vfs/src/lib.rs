@@ -38,6 +38,7 @@ mod simple_device;
 use shared_cell::SharedCell;
 mod flock;
 use fd_table::{Descriptor, DescriptorTable};
+pub use fd_table::{FileTableOwner, FileTableRetirement};
 pub use fd_table::{SharedFd, SharedFiles};
 pub use flock::FlockRequest;
 mod directory;
@@ -93,7 +94,9 @@ pub use ipc::{
     LocalConnection, LocalDatagram, LocalOperation, LocalReceived, LocalResource, LocalRights,
     LocalSocket, SharedRights, WaylandAuth, WaylandGrant,
 };
-pub use locks::{RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER};
+pub use locks::{
+    ProcessRecordLocks, RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER,
+};
 mod linux_namespace;
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
@@ -2459,7 +2462,7 @@ impl Vfs {
         if let Some(files) = publication {
             files.publish_open(self, &descriptor.open.borrow());
         }
-        Ok(reservation.publish(descriptor, self.query.is_none().then_some(&self.fds)))
+        reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
         if let Some(result) = self.fds.membership().close(fd, self.lock_owner) {
@@ -2521,16 +2524,20 @@ impl Vfs {
     /// Detach a task's view while another task retains the shared file table.
     /// No descriptor has actually closed, so POSIX process locks stay held.
     pub fn detach_file_table(&mut self) {
-        self.fds = DescriptorTable::default();
+        let mut empty = DescriptorTable::default();
+        empty.share_limit(&self.fds);
+        self.fds = empty;
     }
     /// exit/exec drops this task's table reference. Only the final reference
     /// closes entries; no process-table scan or separate files_id is needed.
     pub fn release_descriptors(&mut self) {
-        if self.fds.last_owner() {
-            self.close_all();
-        } else {
-            self.detach_file_table();
-        }
+        self.fds.retire(self.lock_owner);
+        self.detach_file_table();
+        self.reap_local_rights();
+        self.reap_detached_mounts();
+    }
+    pub fn file_table_owner(&self) -> FileTableOwner {
+        self.fds.task_owner()
     }
     pub fn close_exec(&mut self) {
         let closed: Vec<_> = self
@@ -2729,8 +2736,12 @@ impl Vfs {
             o.position += data.len() as u64;
             return Ok(data);
         }
-        if let Some(data) = self.cgroup_read(&o, o.position, count)? {
-            o.position += data.len() as u64;
+        if let Some(events::SharedControl::Cgroup(file)) = &o.control {
+            let mut position = o.file_position.lock().unwrap();
+            let data = file
+                .cgroup_read(&self.cgroup_access(), position.value, count)?
+                .ok_or(Errno(19))?;
+            position.value += data.len() as u64;
             return Ok(data);
         }
         if let Some(log) = &o.kernel_log {
@@ -2770,16 +2781,10 @@ impl Vfs {
         let n = node.borrow();
         let result = match &n.content {
             Content::File(b) => {
-                if n.volatile {
-                    let out = b.read_at(o.position, count)?;
-                    o.position += out.len() as u64;
-                    Ok(out)
-                } else {
-                    let mut position = o.file_position.lock().unwrap();
-                    let out = b.read_at(position.value, count)?;
-                    position.value += out.len() as u64;
-                    Ok(out)
-                }
+                let mut position = o.file_position.lock().unwrap();
+                let out = b.read_at(position.value, count)?;
+                position.value += out.len() as u64;
+                Ok(out)
             }
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
@@ -2893,10 +2898,17 @@ impl Vfs {
             // proc oom_score_adj_write ignores and does not advance f_pos.
             return Ok(count);
         }
-        if let Some(count) = self.cgroup_write(&o, bytes)? {
-            if offset.is_none() {
-                o.position = o.position.saturating_add(count as u64);
+        if let Some(events::SharedControl::Cgroup(file)) = &o.control {
+            if offset.is_some() {
+                return file
+                    .cgroup_write(&self.cgroup_access(), bytes)?
+                    .ok_or(Errno(19));
             }
+            let mut position = o.file_position.lock().unwrap();
+            let count = file
+                .cgroup_write(&self.cgroup_access(), bytes)?
+                .ok_or(Errno(19))?;
+            position.value = position.value.saturating_add(count as u64);
             return Ok(count);
         }
         let node = o.node.clone().ok_or(Errno(29))?;
@@ -3163,8 +3175,7 @@ impl Vfs {
             }
         };
         let mut file_position = o.file_position.lock().unwrap();
-        let regular = matches!(n.content, Content::Directory)
-            || matches!(n.content, Content::File(_)) && !n.volatile;
+        let regular = o.oom.is_none() && o.network_control.is_none() && o.mount_file.is_none();
         let base = match whence {
             0 => 0,
             1 => {

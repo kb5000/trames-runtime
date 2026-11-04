@@ -242,6 +242,6 @@ impl DescriptorFactory {
             accepted,
             flags,
         );
-        Ok((reserved.publish(descriptor, None), name))
+        Ok((reserved.publish(descriptor, None)?, name))
     }
 }

@@ -153,27 +153,13 @@ impl OpenDescription {
             || self.oom.is_some()
             || self.network_control.is_some()
             || self.mount_file.is_some()
-            || self.bridge.is_some()
-            || self.kernel_log.is_some()
         {
             return false;
         }
-        self.mount
-            .as_ref()
-            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
-            || self.pty.is_some()
-            || self.local.is_some()
-            || self.namespace_resource.is_some()
-            || self.socket.is_some()
-            || self.control.is_some()
-            || self.pipe.is_some()
-            || self.node.as_ref().is_some_and(|node| {
-                if node.simple_device.is_some() {
-                    return true;
-                }
-                let node = node.borrow();
-                !node.volatile && matches!(node.content, Content::File(_) | Content::Directory)
-            })
+        // Lifetime sharing does not grant byte/path authority. Volatile proc
+        // nodes and other complete descriptions can close/dup on an executor;
+        // their body still uses its existing admission and refresh algorithm.
+        true
     }
 }
 impl OpenHandle {

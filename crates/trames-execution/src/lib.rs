@@ -2,6 +2,25 @@
 //! Architectural state at kernel/executor boundaries; no decoder or host VM.
 #![no_std]
 
+/// Original per-thread user addresses at the kernel/executor boundary. A
+/// snapshot retains this object; it never copies mutable exit registration.
+#[derive(Default)]
+pub struct ThreadAddresses(core::sync::atomic::AtomicU64);
+impl ThreadAddresses {
+    pub fn new(clear_tid: u64) -> Self {
+        Self(core::sync::atomic::AtomicU64::new(clear_tid))
+    }
+    pub fn clear_tid(&self) -> u64 {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_clear_tid(&self, address: u64) {
+        self.0.store(address, core::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn take_clear_tid(&self) -> u64 {
+        self.0.swap(0, core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// The Linux syscall ABI needs registers, not an interpreter or its caches.
 /// Calls are statically dispatched and add no work to ordinary guest accesses.
 pub trait Registers {
@@ -166,6 +185,13 @@ pub struct ExecutionExit {
     pub instructions: InstructionCount,
 }
 
+/// Thread-safe request to stop the owning executor's next/active CPU entry.
+/// It carries no guest register or memory authority. A retained handle must
+/// become inert before its CPU is destroyed or its identifier can be reused.
+pub trait ExecutionInterrupt: Send + Sync {
+    fn request_exit(&self);
+}
+
 #[cfg(test)]
 mod sme_tests {
     use super::*;
@@ -207,11 +233,4 @@ mod sme_tests {
         assert_eq!(c.set(64, &[64]), Some(64));
         assert_eq!(c.on_exec, None);
     }
-}
-
-/// Thread-safe request to stop the owning executor's next/active CPU entry.
-/// It carries no guest register or memory authority. A retained handle must
-/// become inert before its CPU is destroyed or its identifier can be reused.
-pub trait ExecutionInterrupt: Send + Sync {
-    fn request_exit(&self);
 }

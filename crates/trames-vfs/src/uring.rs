@@ -760,7 +760,7 @@ impl Vfs {
             cloexec: true.into(),
         };
         output()?;
-        let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds));
+        let fd = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
         Ok((fd, ring))
     }
     pub fn uring(&self, fd: u32) -> Result<Arc<Uring>> {

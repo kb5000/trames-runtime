@@ -185,7 +185,7 @@ pub(super) struct PreparedOpen {
     pub(super) publication: Option<DirectFiles>,
 }
 impl PreparedOpen {
-    fn publish(self, paths: &PathQueries) -> u32 {
+    fn publish(self, paths: &PathQueries) -> Result<u32> {
         let descriptor = Descriptor {
             open: OpenHandle::Shared(self.target.0.open),
             cloexec: self.cloexec,
@@ -435,7 +435,9 @@ impl FileWork {
                 }
                 if result.is_ok() {
                     if let Some(open) = self.open.take() {
-                        result = Ok(FileValue::Count(open.publish(&self.paths) as u64));
+                        result = open
+                            .publish(&self.paths)
+                            .map(|fd| FileValue::Count(fd as u64));
                     }
                 }
                 let scratch = match &mut self.command {

@@ -192,6 +192,33 @@ impl Execution {
     }
 }
 impl UringActor {
+    /// Cancel the original submitter's requests without a VFS/Memory owner.
+    /// Accepted native jobs retain their own staging; CQ and endpoint callbacks
+    /// run only after the original ring lock has been released.
+    pub fn cancel_task(&self, owner: u64, task: u32) {
+        Self::cancel_task_rings(self.rings(), owner, task);
+    }
+    pub(crate) fn cancel_task_rings(rings: Vec<Arc<Uring>>, owner: u64, task: u32) {
+        for ring in rings {
+            let mut retired = Vec::new();
+            let mut state = ring.state.lock().unwrap();
+            let mut pending = std::mem::take(&mut state.pending);
+            while let Some(request) = pending.pop_front() {
+                if request.owner == owner && request.task == task {
+                    Linux::complete_request(&mut state, &request, -125, false);
+                    retired.push(request);
+                } else {
+                    state.pending.push_back(request);
+                }
+            }
+            state.waits.remove(&task);
+            let count = ring.flush(&mut state).unwrap_or(0);
+            let event = ring.completion_event(&state, count);
+            drop(state);
+            drop(retired);
+            ring.notify_completion(event);
+        }
+    }
     pub fn take_file_signals(&self) -> Vec<(u64, u32)> {
         std::mem::take(&mut *self.file_signals.lock().unwrap())
     }

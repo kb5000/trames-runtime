@@ -1219,19 +1219,26 @@ mod tests {
 
     #[test]
     fn filtered_fd_workers_complete_shared_operations_and_preserve_deferred_decisions() {
-        for (number, owner, decision) in [
-            (23, false, ALLOW),
-            (24, false, ALLOW),
-            (25, false, ALLOW),
-            (57, false, ALLOW),
-            (23, true, ALLOW),
-            (57, true, ALLOW),
-            (23, false, 0x5007b),
-            (57, false, 0x5007b),
+        for (number, kind, decision) in [
+            (23, 0, ALLOW),
+            (24, 0, ALLOW),
+            (25, 0, ALLOW),
+            (57, 0, ALLOW),
+            (23, 1, ALLOW),
+            (57, 1, ALLOW),
+            (23, 2, ALLOW),
+            (57, 2, ALLOW),
+            (23, 0, 0x5007b),
+            (57, 0, 0x5007b),
         ] {
             let mut p = super::super::tests::process();
             let [shared, _] = p.linux.vfs.pipe(0).unwrap();
-            let fd = if owner { 0 } else { shared };
+            let owner = kind == 2;
+            let fd = match kind {
+                0 => shared,
+                1 => 0,
+                _ => p.linux.vfs.epoll_create(0).unwrap(),
+            };
             let args = match number {
                 24 => [fd as u64, 200, 0, 0, 0, 0],
                 25 => [fd as u64, 1030, 160, 0, 0, 0],
@@ -1838,60 +1845,72 @@ mod tests {
 
     #[test]
     fn allowed_filtered_identity_calls_continue_on_workers_without_peer_checkpoints() {
-        let mut p = super::super::tests::process();
-        for (index, word) in [0xd2801588u32, 0xd4000001, 0x17ffffff]
-            .into_iter()
-            .enumerate()
-        {
-            p.memory
-                .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
-                .unwrap();
-        }
-        p.memory
-            .protect(
-                0x4000,
-                trames_memory::PAGE_SIZE,
-                trames_memory::Permissions::RX,
-            )
-            .unwrap();
-        p.cpu = Cpu::new(0x4000, 0);
-        p.affinity = 15;
-        p.seccomp
-            .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
-        let mut kernel = super::super::tests::kernel();
-        kernel.cpu_count = 4;
-        kernel.workers = crate::workers::Pool::new(4);
-        kernel.per_cpu = vec![Duration::ZERO; 4];
-        for id in 2..=4 {
-            let mut peer = p.fork();
-            peer.parent = 1;
-            kernel.processes.insert(id, peer);
-        }
-        kernel.processes.insert(1, p);
-        // Host scheduling and instrumentation can end a round after just one
-        // syscall per task. Assert guest progress, not a host-time throughput.
-        for _ in 0..128 {
-            assert!(kernel
-                .parallel_round(&mut trames_linux::CapturedOutput::default(), 100_000)
-                .unwrap());
-            assert_eq!(
-                kernel.syscalls, kernel.worker_syscalls,
-                "identity queries must not checkpoint"
-            );
-            if kernel.worker_syscalls > 100 {
-                break;
+        for (number, decision) in [(172u32, ALLOW), (96, ALLOW), (96, 0x5007b)] {
+            let mut p = super::super::tests::process();
+            for (index, word) in [0xd2800008u32 | (number << 5), 0xd4000001, 0x17ffffff]
+                .into_iter()
+                .enumerate()
+            {
+                p.memory
+                    .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                    .unwrap();
             }
-        }
-        assert!(
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu = Cpu::new(0x4000, 0);
+            p.affinity = 15;
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+            ));
+            let mut kernel = super::super::tests::kernel();
+            kernel.cpu_count = 4;
+            kernel.workers = crate::workers::Pool::new(4);
+            kernel.per_cpu = vec![Duration::ZERO; 4];
+            for id in 2..=4 {
+                let mut peer = p.fork();
+                peer.parent = 1;
+                kernel.processes.insert(id, peer);
+            }
+            kernel.processes.insert(1, p);
+            // Host scheduling and instrumentation can end a round after just one
+            // syscall per task. Assert guest progress, not a host-time throughput.
+            for _ in 0..128 {
+                assert!(kernel
+                    .parallel_round(&mut trames_linux::CapturedOutput::default(), 100_000)
+                    .unwrap());
+                assert_eq!(
+                    kernel.syscalls, kernel.worker_syscalls,
+                    "identity queries must not checkpoint"
+                );
+                if kernel.worker_syscalls > 100 {
+                    break;
+                }
+            }
+            assert!(
             kernel.worker_syscalls > 100,
             "allowed calls must stay on their workers: worker={} owner={} instructions={} tasks={:?}",
             kernel.worker_syscalls, kernel.syscalls, kernel.instructions,
             kernel.processes.iter().map(|(id,p)| (*id,p.cpu.pc,p.cpu.x(8),p.cpu.x(0))).collect::<Vec<_>>()
         );
-        assert_eq!(
-            kernel.syscalls, kernel.worker_syscalls,
-            "identity queries must not checkpoint"
-        );
+            assert_eq!(
+                kernel.syscalls, kernel.worker_syscalls,
+                "identity queries must not checkpoint"
+            );
+            if number == 96 {
+                assert_eq!(
+                    kernel
+                        .processes
+                        .values()
+                        .any(|p| p.linux.clear_tid_address() != 0),
+                    decision == ALLOW
+                );
+            }
+        }
     }
     #[test]
     fn worker_filter_snapshots_keep_pc_arguments_and_immutable_installation_order() {

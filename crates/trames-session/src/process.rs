@@ -641,6 +641,9 @@ impl<C: Cpu> Kernel<C> {
             return;
         }
         p.bind_signals();
+        p.signals
+            .io
+            .bind_thread_addresses(p.linux.thread_addresses());
         p.signals.io.set_session(p.session);
         if p.signals.io.cgroup().is_none() {
             if let Some(task) = p.linux.vfs.cgroup_task(id) {
@@ -2129,6 +2132,7 @@ impl<C: Cpu> Kernel<C> {
             runtime.linux.task_limit = p.linux.task_limit;
             runtime.linux.set_uring_clock(clock_origin);
             runtime.linux.set_boot_clock(p.linux.boot_clock());
+            runtime.linux.inherit_exec_addresses(&p.linux);
             p.linux = runtime.linux;
             runtime.cpu.inherit_exec(&p.cpu);
             p.cpu = runtime.cpu;

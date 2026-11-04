@@ -250,6 +250,17 @@ pub struct RecordLockContext {
     pub owner: u32,
     visible: Option<BTreeMap<u32, u32>>,
 }
+/// Original process-owned lock domain; does not retain any file or task.
+#[derive(Clone)]
+pub struct ProcessRecordLocks {
+    registry: Arc<Registry>,
+    owner: u32,
+}
+impl ProcessRecordLocks {
+    pub fn release(&self) {
+        self.registry.release(self.owner);
+    }
+}
 impl RecordLockContext {
     pub fn visible_pid(&self, owner: u32) -> u32 {
         self.visible
@@ -258,6 +269,12 @@ impl RecordLockContext {
     }
 }
 impl Vfs {
+    pub fn process_record_locks(&self, owner: u32) -> ProcessRecordLocks {
+        ProcessRecordLocks {
+            registry: self.record_locks.clone(),
+            owner,
+        }
+    }
     pub fn record_lock_context(&self, owner: u32) -> RecordLockContext {
         RecordLockContext {
             owner,
@@ -273,7 +290,7 @@ impl Vfs {
         self.lock_owner = owner;
     }
     pub fn release_process_locks(&self) {
-        self.record_locks.release(self.lock_owner);
+        self.process_record_locks(self.lock_owner).release();
     }
     pub(super) fn release_record_locks(&self, descriptor: &Descriptor) {
         descriptor
@@ -347,6 +364,27 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_process_lock_domain_releases_on_a_source_executor_with_live_files() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(AT_FDCWD, b"/locks", 0x42, 0o600).unwrap();
+        let requested = v.normalize_lock(fd, 1, 0, 0, 8).unwrap();
+        v.record_lock_set(fd, requested).unwrap();
+        let mut peer = v.clone_with_files(true);
+        peer.set_lock_owner(2);
+        let other = peer.normalize_lock(fd, 1, 0, 0, 8).unwrap();
+        assert_eq!(
+            peer.record_lock_conflict(fd, other).unwrap(),
+            Some(requested)
+        );
+        let locks = v.process_record_locks(1);
+        std::thread::spawn(move || locks.release()).join().unwrap();
+        assert_eq!(peer.record_lock_conflict(fd, other).unwrap(), None);
+        assert!(v.flags(fd).is_ok() && peer.flags(fd).is_ok());
+        peer.record_lock_set(fd, other).unwrap();
+        v.process_record_locks(1).release();
+        assert_eq!(v.record_lock_conflict(fd, requested).unwrap(), Some(other));
+    }
     #[test]
     fn ofd_ranges_share_dup_fork_and_retained_lifetime_but_conflict_with_posix() {
         let mut v = Vfs::default();

@@ -40,7 +40,7 @@ pub struct Linux {
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
     heap: crate::heap::Heap,
-    clear_child_tid: u64,
+    thread_addresses: std::sync::Arc<trames_execution::ThreadAddresses>,
 }
 impl Clone for Linux {
     fn clone(&self) -> Self {
@@ -85,7 +85,9 @@ impl Linux {
             } else {
                 self.heap.clone()
             },
-            clear_child_tid: self.clear_child_tid,
+            thread_addresses: std::sync::Arc::new(trames_execution::ThreadAddresses::new(
+                self.clear_tid_address(),
+            )),
         }
     }
 }
@@ -99,14 +101,22 @@ impl Linux {
         self.heap.break_capability()
     }
     pub fn clear_tid_address(&self) -> u64 {
-        self.clear_child_tid
+        self.thread_addresses.clear_tid()
+    }
+    pub fn thread_addresses(&self) -> &std::sync::Arc<trames_execution::ThreadAddresses> {
+        &self.thread_addresses
+    }
+    pub fn inherit_exec_addresses(&mut self, old: &Self) {
+        self.thread_addresses = old.thread_addresses.clone();
+        self.thread_addresses.set_clear_tid(0);
     }
     pub fn fork_tid(&mut self, address: u64) {
-        self.clear_child_tid = address;
+        self.thread_addresses.set_clear_tid(address);
     }
     pub fn exit_tid(&mut self, memory: &mut Memory) {
-        if self.clear_child_tid != 0 {
-            let _ = memory.write(self.clear_child_tid, &[0; 4]);
+        let address = self.thread_addresses.take_clear_tid();
+        if address != 0 {
+            let _ = memory.write(address, &[0; 4]);
         }
     }
     pub fn new(brk_base: u64) -> Self {
@@ -128,7 +138,7 @@ impl Linux {
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
             heap: crate::heap::Heap::new(brk_base),
-            clear_child_tid: 0,
+            thread_addresses: Default::default(),
         }
     }
     pub fn path(memory: &impl CpuMemory, address: u64) -> Result<Vec<u8>> {
@@ -927,9 +937,7 @@ impl Linux {
         let number = cpu.x(8) as u32 as u64;
         let a = std::array::from_fn(|index| cpu.x(index));
         if number == 93 || number == 94 {
-            if self.clear_child_tid != 0 {
-                let _ = memory.write(self.clear_child_tid, &[0; 4]);
-            }
+            self.exit_tid(memory);
             if self.trace {
                 eprintln!("trames syscall {number}: exit {}", a[0] as u8);
             }
@@ -1228,11 +1236,9 @@ impl Linux {
                 Ok(count as u64)
             }
             96 => {
-                if a[0] != 0 {
-                    Self::check(memory, a[0], 4, Access::Write)?;
-                }
-                self.clear_child_tid = a[0];
-                Ok(1)
+                // Linux records this address without touching user memory.
+                self.thread_addresses.set_clear_tid(a[0]);
+                Ok(self.vfs.visible_pid(self.vfs.process_context()) as u64)
             }
             98 => {
                 if !a[0].is_multiple_of(4) {
@@ -1538,6 +1544,38 @@ impl Linux {
 mod tests {
     use super::*;
     use trames_vfs::O_NONBLOCK;
+    #[test]
+    fn thread_exit_registration_accepts_unmapped_addresses_and_keeps_original_task_identity() {
+        let mut l = Linux::new(0);
+        let mut m = Memory::default();
+        let mut output = CapturedOutput::default();
+        assert_eq!(
+            l.syscall(96, [0x9000, 0, 0, 0, 0, 0], &mut m, &mut output),
+            Ok(1)
+        );
+        assert_eq!(l.clear_tid_address(), 0x9000);
+        m.map(0x9000, PAGE_SIZE, Permissions::RW).unwrap();
+        m.write_array(0x9000, 42u32.to_le_bytes()).unwrap();
+        let original = l.thread_addresses().clone();
+        let mut child = l.clone_with_files(true);
+        child.fork_tid(0x9004);
+        assert!(!std::sync::Arc::ptr_eq(
+            l.thread_addresses(),
+            child.thread_addresses()
+        ));
+        l.exit_tid(&mut m);
+        assert_eq!(m.read_array::<4>(0x9000).unwrap(), [0; 4]);
+        assert_eq!(original.clear_tid(), 0);
+        assert_eq!(child.clear_tid_address(), 0x9004);
+        l.fork_tid(0xdead0000);
+        l.exit_tid(&mut m);
+        assert_eq!(original.clear_tid(), 0);
+        l.fork_tid(0x9000);
+        let mut image = Linux::new(0);
+        image.inherit_exec_addresses(&l);
+        assert!(std::sync::Arc::ptr_eq(image.thread_addresses(), &original));
+        assert_eq!(original.clear_tid(), 0);
+    }
     #[test]
     fn first_touch_output_quota_failure_does_not_consume_file_input() {
         let mut l = Linux::new(0);

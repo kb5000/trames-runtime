@@ -511,7 +511,9 @@ impl DirectFd {
         matches!(self.resource, ByteResource::NetlinkPoll(_))
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        let resource = if let Some(local) = &open.local {
+        let resource = if let Some(log) = &open.kernel_log {
+            ByteResource::Kmsg(log.clone())
+        } else if let Some(local) = &open.local {
             match local.direct().or_else(|| local.direct_message()) {
                 Some((data, side)) => ByteResource::Unix { data, side },
                 None if local.addressed_datagram() => {
@@ -1383,7 +1385,6 @@ impl DirectFd {
         }
         match &self.resource {
             ByteResource::Cgroup(file, Some(caller)) => {
-                let count = file.cgroup_write(caller, bytes)?.ok_or(Errno(19))?;
                 let mut position = self
                     ._file
                     .as_ref()
@@ -1392,6 +1393,7 @@ impl DirectFd {
                     .file_position
                     .lock()
                     .unwrap();
+                let count = file.cgroup_write(caller, bytes)?.ok_or(Errno(19))?;
                 position.value = position.value.saturating_add(count as u64);
                 Ok(count)
             }

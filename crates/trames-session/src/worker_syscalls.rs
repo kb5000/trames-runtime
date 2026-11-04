@@ -482,6 +482,7 @@ impl Snapshot {
         (self.seccomp.mode() != 0
             && (matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
                 || self.signal_send(cpu)
+                || self.thread_call(cpu.x(8) as u32)
                 || self.limit_call(cpu.x(8) as u32)))
         .then(|| {
             self.seccomp.entry_decision(
@@ -493,6 +494,9 @@ impl Snapshot {
     }
     pub fn limit_call(&self, number: u32) -> bool {
         self.limits.is_some() && matches!(number, 163 | 164 | 261)
+    }
+    pub fn thread_call(&self, number: u32) -> bool {
+        number == 96 && self.io_signals.thread_addresses().is_some()
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131)
@@ -507,6 +511,7 @@ impl Snapshot {
         if trames_kernel::timers::timer_call(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
             || self.signal_send(cpu)
+            || self.thread_call(cpu.x(8) as u32)
             || self.limit_call(cpu.x(8) as u32)
         {
             return false;
@@ -577,6 +582,10 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            96 => {
+                self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
+                Ok(self.identities[6])
+            }
             number @ 129..=131 => {
                 self.io_routes
                     .send(&self.io_signals, number, std::array::from_fn(|i| cpu.x(i)))?

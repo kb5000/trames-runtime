@@ -241,6 +241,10 @@ pub struct DirectSyscalls {
     completed: Cell<u64>,
 }
 impl DirectSyscalls {
+    /// The original task's ring roots remain usable after FD close/reuse.
+    pub fn cancel_task_uring(&self, owner: u64, task: u32) {
+        self.urings.cancel_task(owner, task);
+    }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
         self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
         if let Some(descriptors) = self.urings.descriptors.take() {

@@ -65,7 +65,7 @@ impl DescriptorFactory {
         let reserved = self.files.reserve()?;
         let core = self.new_local(kind & 0xf)?;
         let descriptor = Vfs::local_description(self.open_id(), self.owner, core, kind);
-        Ok(reserved.publish(descriptor, None))
+        reserved.publish(descriptor, None)
     }
     pub fn local_pair_with_output(
         &self,
@@ -86,7 +86,7 @@ impl DescriptorFactory {
             [a, b].map(|socket| Vfs::local_description(self.open_id(), self.owner, socket, kind));
         let fds = reserved.numbers();
         output(fds)?;
-        Ok(reserved.publish(descriptors))
+        reserved.publish(descriptors)
     }
     /// TIOCGPTPEER accepts the original full master OFD; no pathname relookup.
     pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
@@ -111,7 +111,7 @@ impl DescriptorFactory {
             self.devices.check(node.mode, device.rdev(), 6)?;
         }
         let descriptor = pty::peer_descriptor(end, flags, self.open_id(), self.owner);
-        Ok(reservation.publish(descriptor, None))
+        reservation.publish(descriptor, None)
     }
     /// Signals belong to the reading task, while the mask belongs to this OFD.
     /// None defers an owner-only type before any mask or membership effects.
@@ -127,7 +127,7 @@ impl DescriptorFactory {
                     flags,
                     events::Anonymous::Signal(Arc::new(events::SignalMask::new(mask))),
                 );
-                Ok(reserved.publish(descriptor, None))
+                reserved.publish(descriptor, None)
             })());
         }
         Some(self.files.lookup(fd as u32)?.and_then(|file| {
@@ -186,7 +186,7 @@ impl DescriptorFactory {
             .socket(family, kind & 0xf, protocol)
             .map_err(|e| Errno(e.0))?;
         let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, kind);
-        Ok(reserved.publish(descriptor, None))
+        reserved.publish(descriptor, None)
     }
     /// None leaves an excluded owner object untouched; missing/invalid shared
     /// entries preserve the ordinary EBADF/ENOTSOCK result.
@@ -267,13 +267,13 @@ impl DescriptorFactory {
             let open = descriptor.open.borrow();
             *open.tcp_publication.lock().unwrap() = Vfs::direct_tcp_shared(&open.shared);
         }
-        let fd = reserved.publish(descriptor, None);
+        let fd = reserved.publish(descriptor, None)?;
         Ok((fd, address))
     }
     fn anonymous(&self, flags: u32, resource: events::Anonymous) -> Result<u32> {
         let reservation = self.files.reserve()?;
         let descriptor = events::anonymous_descriptor(self.open_id(), flags, resource);
-        Ok(reservation.publish(descriptor, None))
+        reservation.publish(descriptor, None)
     }
     pub fn eventfd(&self, initial: u32, flags: u32) -> Result<u32> {
         if flags & !(O_CLOEXEC | O_NONBLOCK | 1) != 0 {
@@ -380,7 +380,7 @@ impl DescriptorFactory {
             },
         );
         output(reservation.numbers())?;
-        Ok(reservation.publish(descriptions))
+        reservation.publish(descriptions)
     }
 }
 
@@ -410,7 +410,8 @@ mod tests {
                 .shared_files()
                 .reserve()
                 .unwrap()
-                .publish(descriptor, None);
+                .publish(descriptor, None)
+                .unwrap();
             let nsfd = if bound {
                 root.set_runtime_info(
                     1,

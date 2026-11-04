@@ -168,6 +168,7 @@ pub struct IoTask {
     process: std::sync::OnceLock<Arc<Inbox>>,
     lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
     cgroup: std::sync::OnceLock<trames_vfs::CgroupTask>,
+    thread_addresses: std::sync::OnceLock<Arc<trames_execution::ThreadAddresses>>,
     session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
@@ -188,6 +189,7 @@ impl Default for IoTask {
             process: Default::default(),
             lifecycle: Default::default(),
             cgroup: Default::default(),
+            thread_addresses: Default::default(),
             session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
@@ -235,6 +237,12 @@ impl IoTask {
     }
     pub fn cgroup(&self) -> Option<&trames_vfs::CgroupTask> {
         self.cgroup.get()
+    }
+    pub fn thread_addresses(&self) -> Option<&Arc<trames_execution::ThreadAddresses>> {
+        self.thread_addresses.get()
+    }
+    pub fn bind_thread_addresses(&self, addresses: &Arc<trames_execution::ThreadAddresses>) {
+        self.thread_addresses.get_or_init(|| addresses.clone());
     }
     pub fn bind_cgroup(self: &Arc<Self>, task: trames_vfs::CgroupTask) {
         if self.cgroup.set(task).is_ok() {

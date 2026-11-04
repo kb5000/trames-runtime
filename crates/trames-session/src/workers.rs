@@ -1010,7 +1010,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     break result;
                                 }
                                 if let Some(snapshot)=&work.syscalls {
-                                    if matches!(work.cpu.x(8) as u32, 132..=137) || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260) || snapshot.signal_send(&work.cpu) || snapshot.limit_call(work.cpu.x(8) as u32) {
+                                    if matches!(work.cpu.x(8) as u32, 132..=137) || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260) || snapshot.signal_send(&work.cpu) || snapshot.thread_call(work.cpu.x(8) as u32) || snapshot.limit_call(work.cpu.x(8) as u32) {
                                         if let Some(entry)=snapshot.task_entry(&work.cpu) {
                                             if !entry.allowed() {
                                                 if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
@@ -2006,6 +2006,52 @@ mod tests {
         assert_eq!(signal_task.context.lock().unwrap().frames, 0);
         memory.commit_parallel().unwrap();
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
+    }
+
+    #[test]
+    fn thread_exit_address_registration_uses_original_task_state_without_owner_requests() {
+        for slots in [1, 4] {
+            let linux = trames_linux::Linux::new(0);
+            let addresses = linux.thread_addresses().clone();
+            let control = Arc::new(Control::new(100000));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            let mut caller = work(
+                1,
+                &[
+                    0xd2800c08, 0xd4000001, 0xaa0003f3, 0xd2800000, 0xd2800ba8, 0xd4000001,
+                ],
+                0x9000,
+                control,
+            );
+            let snapshot = syscall_snapshot();
+            snapshot.io_signals.bind_thread_addresses(&addresses);
+            caller.syscalls = Some(snapshot);
+            epoch.add(crate::run_queue::Job::new(
+                caller,
+                (1 << slots) - 1,
+                0,
+                None,
+            ));
+            let mut pool = Pool::new(slots);
+            for slot in 0..slots {
+                pool.ensure(slot).unwrap();
+                pool.launch(slot, epoch.clone()).unwrap();
+            }
+            for _ in 0..slots {
+                let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
+                if !matches!(event, Some(Event::EpochStopped(_))) {
+                    epoch.stop();
+                    panic!("thread registration requested an owner");
+                }
+            }
+            let result = epoch.drain().pop().unwrap();
+            assert_eq!(result.cpu.x(8), 93);
+            assert_eq!(result.cpu.x(19), 22);
+            assert_eq!(result.syscalls, 1);
+            assert_eq!(result.serviced_syscalls, 0);
+            assert_eq!(addresses.clear_tid(), 0x9000);
+            assert_eq!(linux.clear_tid_address(), 0x9000);
+        }
     }
 
     #[test]

@@ -707,6 +707,16 @@ pub struct UringSnapshot {
     context: std::sync::OnceLock<Arc<actor::Execution>>,
 }
 impl UringSnapshot {
+    pub(super) fn cancel_task(&self, owner: u64, task: u32) {
+        let actor = self
+            .actor
+            .as_ref()
+            .and_then(|root| root.get())
+            .or_else(|| self.local_actor.get());
+        if let Some(actor) = actor {
+            actor.cancel_task(owner, task);
+        }
+    }
     pub(super) fn ensure_context(
         &self,
         paths: Option<&trames_vfs::PathQueries>,

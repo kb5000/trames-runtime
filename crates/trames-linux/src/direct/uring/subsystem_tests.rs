@@ -488,6 +488,7 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
 #[test]
 fn owner_only_registered_files_keep_original_read_and_close_semantics() {
     let (mut l, mut m, fd, r) = setup(8);
+    let oom = Arc::new(trames_vfs::OomTask::default());
     l.vfs.set_runtime_info(
         1,
         trames_vfs::RuntimeInfo {
@@ -495,12 +496,16 @@ fn owner_only_registered_files_keep_original_read_and_close_semantics() {
                 pid: 1,
                 tgid: 1,
                 command: b"trames".to_vec(),
+                oom: Arc::downgrade(&oom),
                 ..Default::default()
             }],
             ..Default::default()
         },
     );
-    let file = l.vfs.open_at(-100, b"/proc/self/status", 0, 0).unwrap();
+    let file = l
+        .vfs
+        .open_at(-100, b"/proc/self/oom_score_adj", 0, 0)
+        .unwrap();
     assert!(l.vfs.shared_files().lookup(file).is_none());
     m.write_array(0x1200, file.to_le_bytes()).unwrap();
     l.uring_register([fd as u64, 2, 0x1200, 1, 0, 0], &mut m)
@@ -532,6 +537,47 @@ fn owner_only_registered_files_keep_original_read_and_close_semantics() {
     ));
     l.uring_register([fd as u64, 3, 0, 0, 0, 0], &mut m)
         .unwrap();
+    assert!(epoch.finish().is_empty());
+    files.finish();
+}
+
+#[test]
+fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
+    let (mut l, mut m, fd, r) = setup(8);
+    l.vfs.set_runtime_info(1, Default::default());
+    let file = l.vfs.open_at(-100, b"/proc/version", 0, 0).unwrap();
+    assert!(l.vfs.shared_files().lookup(file).unwrap().is_ok());
+    m.write_array(0x1200, file.to_le_bytes()).unwrap();
+    l.uring_register([fd as u64, 2, 0x1200, 1, 0, 0], &mut m)
+        .unwrap();
+    l.vfs.close(file).unwrap();
+    let replacement = l.vfs.eventfd(3, 0).unwrap();
+    assert_eq!(replacement, file);
+    let mut files = trames_vfs::FileEpoch::default();
+    assert!(files.capture_uring(&l.vfs, true).is_empty());
+    let mut epoch = UringEpoch::default();
+    let d = direct(&l, &m, &mut epoch, &Default::default());
+    let mut read = scalar(22, 0, 0x2200, 512, 77);
+    read[1] = 1;
+    add(&mut m, &r, read);
+    assert!(matches!(
+        enter(&d, fd, 1, 1, &mut m, &target()),
+        IoAttempt::Checkpoint
+    ));
+    assert_eq!(r.load_queue(0), 0);
+    assert_eq!(
+        l.uring_enter([fd as u64, 1, 1, 1, 0, 0], &mut m, None, 7),
+        Ok((1, true))
+    );
+    let completion = cq(&mut m, &r);
+    assert_eq!(completion.0, 77);
+    assert!(completion.1 > 0);
+    assert_eq!(&m.read_array::<5>(0x2200).unwrap(), b"Linux");
+    assert!(matches!(
+        d.urings.register([fd as u64, 3, 0, 0, 0, 0], &mut m, 7),
+        Some(IoAttempt::Complete(Ok(0)))
+    ));
+    assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
     assert!(epoch.finish().is_empty());
     files.finish();
 }

@@ -946,14 +946,6 @@ impl Vfs {
             _ => Ok(None),
         }
     }
-    pub(super) fn cgroup_write(&self, o: &OpenDescription, bytes: &[u8]) -> Result<Option<usize>> {
-        match &o.control {
-            Some(events::SharedControl::Cgroup(file)) => {
-                file.cgroup_write(&self.cgroup_access(), bytes)
-            }
-            _ => Ok(None),
-        }
-    }
 }
 impl CgroupFile {
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
@@ -1274,6 +1266,36 @@ impl CgroupFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_and_source_control_io_use_one_original_file_position() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/x", 0o755).unwrap();
+        v.cgroup_fork(1, 2, 2);
+        let fd = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.procs", 2, 0)
+            .unwrap();
+        v.write(fd, b"2").unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let direct = v.direct_descriptors().get(alias).unwrap();
+        assert_eq!(v.seek(fd, 0, 1), Ok(1));
+        v.seek(fd, 0, 0).unwrap();
+        assert_eq!(v.read(fd, 1).unwrap(), b"2");
+        assert_eq!(direct.read(1).unwrap(), b"\n");
+        assert_eq!(v.read(alias, 1).unwrap(), b"");
+        direct.byte_seek(0, 0).unwrap();
+        assert_eq!(v.read(alias, 8).unwrap(), b"2\n");
+        let freeze = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.freeze", 2, 0)
+            .unwrap();
+        v.write(freeze, b"1").unwrap();
+        let source = v.direct_descriptors().get(freeze).unwrap();
+        source.write(b"0").unwrap();
+        assert_eq!(v.seek(freeze, 0, 1), Ok(2));
+        assert_eq!(source.byte_seek(0, 1), Ok(2));
+        source.byte_seek(0, 0).unwrap();
+        assert_eq!(v.read(freeze, 8).unwrap(), b"0\n");
+        assert_eq!(source.read(1).unwrap(), b"");
+    }
     fn setup() -> Vfs {
         let mut v = Vfs::default();
         v.set_runtime_info(1, RuntimeInfo::default());

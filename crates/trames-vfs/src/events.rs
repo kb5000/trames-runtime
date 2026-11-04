@@ -283,7 +283,7 @@ impl Vfs {
     pub(super) fn anonymous(&mut self, flags: u32, anonymous: Anonymous) -> Result<u32> {
         let reservation = self.shared_files().reserve()?;
         let descriptor = anonymous_descriptor(self.open_id(), flags, anonymous);
-        Ok(reservation.publish(descriptor, Some(&self.fds)))
+        reservation.publish(descriptor, Some(&self.fds))
     }
     pub fn eventfd(&mut self, initial: u32, flags: u32) -> Result<u32> {
         self.descriptor_factory().eventfd(initial, flags)

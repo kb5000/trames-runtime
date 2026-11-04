@@ -2,7 +2,10 @@
 //! One membership object per Linux files_struct, with stable lookup leases.
 use super::open_handle::OpenView;
 use super::*;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize},
+    Mutex,
+};
 
 #[derive(Clone)]
 pub(super) enum SlotOpen {
@@ -48,11 +51,21 @@ impl Slot {
         }
     }
 }
-#[derive(Default)]
 pub(super) struct Membership {
     pub(super) entries: Mutex<MembershipEntries>,
     pub(super) local_ownership: Arc<ipc::ownership::Ownership>,
     revision: AtomicU64,
+    owners: AtomicUsize,
+}
+impl Default for Membership {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            local_ownership: Arc::default(),
+            revision: AtomicU64::new(0),
+            owners: AtomicUsize::new(1),
+        }
+    }
 }
 #[derive(Default)]
 pub(super) struct MembershipEntries {
@@ -105,6 +118,87 @@ impl Default for SharedFiles {
         )
     }
 }
+
+/// One actual Linux task's reference to files_struct. Cloning this capability
+/// retains that same reference, not another task or another table owner.
+#[derive(Clone)]
+pub struct FileTableOwner(Arc<TaskFiles>);
+struct TaskFiles {
+    membership: Arc<Membership>,
+    active: AtomicBool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTableRetirement {
+    pub last_owner: bool,
+    /// Original excluded control projections still need their existing owner
+    /// destructor. Shared OFDs have already closed on the retiring executor.
+    pub owner_controls: usize,
+}
+impl FileTableOwner {
+    fn initial(files: &SharedFiles) -> Self {
+        Self(Arc::new(TaskFiles {
+            membership: files.0.clone(),
+            active: AtomicBool::new(true),
+        }))
+    }
+    fn shared(files: &SharedFiles) -> Self {
+        let active = files
+            .0
+            .owners
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count != 0).then(|| count + 1)
+            })
+            .is_ok();
+        Self(Arc::new(TaskFiles {
+            membership: files.0.clone(),
+            active: AtomicBool::new(active),
+        }))
+    }
+    pub fn retire(&self, lock_owner: u32) -> Option<FileTableRetirement> {
+        self.retire_inner(Some(lock_owner))
+    }
+    fn retire_inner(&self, lock_owner: Option<u32>) -> Option<FileTableRetirement> {
+        if !self.0.active.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        let files = &self.0.membership;
+        if files.owners.fetch_sub(1, Ordering::Relaxed) != 1 {
+            return Some(FileTableRetirement {
+                last_owner: false,
+                owner_controls: 0,
+            });
+        }
+        let removed = {
+            let mut entries = files.entries.lock().unwrap();
+            let removed = std::mem::take(&mut entries.slots);
+            for fd in removed.keys() {
+                entries.free.release(*fd);
+            }
+            if !removed.is_empty() {
+                files.revision.fetch_add(1, Ordering::Relaxed);
+            }
+            removed
+        };
+        let mut owner_controls = 0;
+        // Last-close can wake another executor or enter a native callback.
+        // Neither an owner projection nor the membership mutex is borrowed.
+        for slot in removed.values() {
+            match &slot.open {
+                SlotOpen::Shared(open) => {
+                    if let Some(owner) = lock_owner {
+                        open.release_record_locks(owner);
+                    }
+                }
+                SlotOpen::Owner(..) => owner_controls += 1,
+            }
+        }
+        drop(removed);
+        Some(FileTableRetirement {
+            last_owner: true,
+            owner_controls,
+        })
+    }
+}
 /// An unpublished numeric slot. Rollback releases only this reservation.
 pub(super) struct ReservedFd {
     files: SharedFiles,
@@ -116,8 +210,11 @@ impl ReservedFd {
         mut self,
         descriptor: Descriptor,
         owner: Option<&DescriptorTable>,
-    ) -> u32 {
+    ) -> Result<u32> {
         let mut entries = self.files.0.entries.lock().unwrap();
+        if self.files.closed() {
+            return Err(Errno(9));
+        }
         assert!(entries.reserved.remove(&self.fd));
         if let Some(owner) = owner {
             assert!(owner.install(self.fd, descriptor, &mut entries).is_none());
@@ -137,7 +234,7 @@ impl ReservedFd {
             self.files.changed(&mut entries);
         }
         self.pending = false;
-        self.fd
+        Ok(self.fd)
     }
 }
 impl Drop for ReservedFd {
@@ -158,8 +255,11 @@ impl ReservedPair {
     pub(super) fn numbers(&self) -> [u32; 2] {
         self.fds
     }
-    pub(super) fn publish(mut self, descriptions: [Descriptor; 2]) -> [u32; 2] {
+    pub(super) fn publish(mut self, descriptions: [Descriptor; 2]) -> Result<[u32; 2]> {
         let mut entries = self.files.0.entries.lock().unwrap();
+        if self.files.closed() {
+            return Err(Errno(9));
+        }
         for (fd, descriptor) in self.fds.into_iter().zip(descriptions) {
             let OpenHandle::Shared(open) = descriptor.open else {
                 unreachable!("pipe descriptions are shared")
@@ -177,7 +277,7 @@ impl ReservedPair {
         }
         self.files.changed(&mut entries);
         self.pending = false;
-        self.fds
+        Ok(self.fds)
     }
 }
 impl Drop for ReservedPair {
@@ -198,6 +298,9 @@ pub(super) enum PollOpen {
     Epoll(Arc<SharedOpenDescription>),
 }
 impl SharedFiles {
+    fn closed(&self) -> bool {
+        self.0.owners.load(Ordering::Relaxed) == 0
+    }
     pub(super) fn control_open(&self, fd: u32) -> Option<Arc<SharedOpenDescription>> {
         let entries = self.0.entries.lock().unwrap();
         let open = match &entries.get(&fd)?.open {
@@ -265,6 +368,9 @@ impl SharedFiles {
     }
     pub(super) fn reserve_pair(&self) -> Result<ReservedPair> {
         let mut entries = self.0.entries.lock().unwrap();
+        if self.closed() {
+            return Err(Errno(9));
+        }
         let free = entries.free.first(2);
         let fds: [u32; 2] = free.try_into().map_err(|_| Errno(24))?;
         if fds[1] >= self.descriptor_limit() {
@@ -282,6 +388,9 @@ impl SharedFiles {
     }
     pub(super) fn reserve(&self) -> Result<ReservedFd> {
         let mut entries = self.0.entries.lock().unwrap();
+        if self.closed() {
+            return Err(Errno(9));
+        }
         let fd = entries
             .available(0)
             .filter(|&fd| fd < self.descriptor_limit())
@@ -665,8 +774,17 @@ impl Descriptor {
 }
 /// CLONE_FILES retains this exact table; fork copies membership/CLOEXEC only.
 /// The owner index retains only excluded controls, never shared endpoint OFDs.
-#[derive(Default)]
-pub(super) struct DescriptorTable(Rc<RefCell<TableState>>, SharedFiles);
+pub(super) struct DescriptorTable(Rc<RefCell<TableState>>, SharedFiles, FileTableOwner);
+impl Default for DescriptorTable {
+    fn default() -> Self {
+        let files = SharedFiles::default();
+        Self(
+            Rc::default(),
+            files.clone(),
+            FileTableOwner::initial(&files),
+        )
+    }
+}
 #[derive(Default)]
 struct TableState {
     // Only SlotOpen::Owner entries have a descriptor in this index.
@@ -738,13 +856,34 @@ impl DescriptorTable {
         self.1.clone()
     }
     pub(super) fn shared(&self) -> Self {
-        Self(self.0.clone(), self.1.copy_limit())
+        let files = self.1.copy_limit();
+        Self(
+            self.0.clone(),
+            files.clone(),
+            FileTableOwner::shared(&files),
+        )
     }
     pub(super) fn shares_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.1 .0, &other.1 .0)
     }
-    pub(super) fn last_owner(&self) -> bool {
-        Rc::strong_count(&self.0) == 1
+    pub(super) fn task_owner(&self) -> FileTableOwner {
+        self.2.clone()
+    }
+    pub(super) fn retire(&self, lock_owner: u32) {
+        self.2.retire(lock_owner);
+        self.retire_owner_controls(Some(lock_owner));
+    }
+    fn retire_owner_controls(&self, lock_owner: Option<u32>) {
+        if self.1 .0.owners.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let removed = std::mem::take(&mut self.0.borrow_mut().entries);
+        if let Some(owner) = lock_owner {
+            for descriptor in removed.values() {
+                descriptor.open.borrow().release_record_locks(owner);
+            }
+        }
+        drop(removed);
     }
     fn descriptor(&self, fd: u32, slot: &Slot) -> Descriptor {
         let open = match &slot.open {
@@ -904,11 +1043,8 @@ impl DescriptorTable {
 }
 impl Drop for DescriptorTable {
     fn drop(&mut self) {
-        if self.last_owner() {
-            // Retaining an execution map is not another Linux table owner.
-            // Already accepted operations retain their own original OFD.
-            drop(self.drain());
-        }
+        self.2.retire_inner(None);
+        self.retire_owner_controls(None);
     }
 }
 impl TableState {
@@ -951,6 +1087,19 @@ impl Clone for DescriptorTable {
         // Resource identities are unchanged by fork. Reuse prepared owner
         // capabilities/masks, but bind live lookups to each new membership.
         // Per-descriptor metadata also gets a new ownership domain.
+        let files = SharedFiles(
+            Arc::new(Membership {
+                local_ownership: self.1 .0.local_ownership.clone(),
+                entries: Mutex::new(MembershipEntries {
+                    slots: entries,
+                    free,
+                    reserved: Default::default(),
+                }),
+                revision: AtomicU64::new(0),
+                owners: AtomicUsize::new(1),
+            }),
+            Arc::new(std::sync::atomic::AtomicU32::new(self.1.descriptor_limit())),
+        );
         Self(
             Rc::new(RefCell::new(TableState {
                 entries: owners,
@@ -958,18 +1107,8 @@ impl Clone for DescriptorTable {
                 identity: self.identity(),
                 metadata: Rc::default(),
             })),
-            SharedFiles(
-                Arc::new(Membership {
-                    local_ownership: self.1 .0.local_ownership.clone(),
-                    entries: Mutex::new(MembershipEntries {
-                        slots: entries,
-                        free,
-                        reserved: Default::default(),
-                    }),
-                    revision: AtomicU64::new(0),
-                }),
-                Arc::new(std::sync::atomic::AtomicU32::new(self.1.descriptor_limit())),
-            ),
+            files.clone(),
+            FileTableOwner::initial(&files),
         )
     }
 }
@@ -977,6 +1116,190 @@ impl Clone for DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_task_retires_real_membership_before_owner_projection_collection() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
+        let mut peer = v.clone_with_files(true);
+        let files = v.shared_files();
+        let accepted = files
+            .lookup(reader)
+            .unwrap()
+            .unwrap()
+            .direct_byte()
+            .unwrap();
+        let first = v.file_table_owner();
+        let repeated = first.clone();
+        let last = peer.file_table_owner();
+        let result = std::thread::spawn(move || first.retire(1))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!result.last_owner);
+        assert!(files.lookup(writer).unwrap().is_ok());
+        assert_eq!(
+            repeated.retire(1),
+            None,
+            "a capability clone is not a second Linux owner"
+        );
+        let result = std::thread::spawn(move || last.retire(1))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            FileTableRetirement {
+                last_owner: true,
+                owner_controls: 0
+            }
+        );
+        assert!(matches!(files.lookup(writer), Some(Err(Errno(9)))));
+        assert_eq!(
+            accepted.read(1).unwrap(),
+            b"",
+            "writer is closed while both owner projections still exist"
+        );
+        v.release_descriptors();
+        peer.release_descriptors();
+        assert_eq!(accepted.read(1).unwrap(), b"");
+        assert!(
+            v.eventfd(0, 0).is_ok(),
+            "the detached VFS can start a fresh table"
+        );
+    }
+    #[test]
+    fn volatile_file_lifetime_and_offset_are_shared_without_granting_worker_byte_authority() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let fd = v.open_at(AT_FDCWD, b"/proc/version", 0, 0).unwrap();
+        let full = v.pread(fd, 128, 0).unwrap();
+        assert!(full.len() > 4);
+        let alias = v.dup(fd, 0, false).unwrap();
+        let files = v.shared_files();
+        let identity = Arc::downgrade(&files.lookup(fd).unwrap().unwrap().open);
+        assert_eq!(v.read(fd, 1).unwrap(), &full[..1]);
+        assert_eq!(v.read(alias, 3).unwrap(), &full[1..4]);
+        assert_eq!(v.seek(fd, 0, 1), Ok(4));
+        assert!(
+            files.lookup(fd).unwrap().unwrap().direct_byte().is_none(),
+            "dynamic contents retain their real admission boundary"
+        );
+        let task = v.file_table_owner();
+        let result = std::thread::spawn(move || task.retire(1))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.owner_controls, 0);
+        assert!(identity.upgrade().is_none());
+        assert_eq!(v.flags(alias), Err(Errno(9)));
+    }
+    #[test]
+    fn concurrent_task_retirements_have_one_final_close_and_preserve_accepted_operations() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
+        let peers: Vec<_> = (0..31).map(|_| v.clone_with_files(true)).collect();
+        let read = v
+            .shared_files()
+            .lookup(reader)
+            .unwrap()
+            .unwrap()
+            .direct_byte()
+            .unwrap();
+        let write = v
+            .shared_files()
+            .lookup(writer)
+            .unwrap()
+            .unwrap()
+            .direct_byte()
+            .unwrap();
+        let owners: Vec<_> = std::iter::once(v.file_table_owner())
+            .chain(peers.iter().map(Vfs::file_table_owner))
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(owners.len()));
+        let last = std::thread::scope(|scope| {
+            let workers: Vec<_> = owners
+                .into_iter()
+                .map(|owner| {
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        owner.retire(1).unwrap().last_owner
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(last, 1);
+        assert!(matches!(
+            v.shared_files().lookup(writer),
+            Some(Err(Errno(9)))
+        ));
+        assert_eq!(write.write(b"x"), Ok(1));
+        assert_eq!(read.read(1).unwrap(), b"x");
+        assert_eq!(read.read(1), Err(Errno(11)));
+        drop(write);
+        assert_eq!(read.read(1).unwrap(), b"");
+        drop(peers);
+        assert_eq!(read.read(1).unwrap(), b"");
+    }
+    #[test]
+    fn late_factory_and_reserved_publication_cannot_resurrect_a_retired_table() {
+        let v = Vfs::default();
+        let files = v.shared_files();
+        let factory = v.descriptor_factory();
+        let reserved = files.reserve().unwrap();
+        let pair = files.reserve_pair().unwrap();
+        let descriptor = events::anonymous_descriptor(
+            900,
+            0,
+            events::Anonymous::Event(Arc::new(direct_io::EventCounter::new(0, false))),
+        );
+        let other = descriptor.clone();
+        let owner = v.file_table_owner();
+        std::thread::spawn(move || owner.retire(1)).join().unwrap();
+        assert_eq!(factory.eventfd(0, 0), Err(Errno(9)));
+        assert!(matches!(files.reserve(), Err(Errno(9))));
+        assert!(matches!(files.reserve_pair(), Err(Errno(9))));
+        assert_eq!(reserved.publish(descriptor, None), Err(Errno(9)));
+        assert_eq!(pair.publish([other.clone(), other]), Err(Errno(9)));
+        assert!(files.0.entries.lock().unwrap().reserved.is_empty());
+        assert!(files.0.entries.lock().unwrap().slots.is_empty());
+        let mut closed_view = v.clone_with_files(true);
+        assert_eq!(
+            closed_view.eventfd(0, 0),
+            Err(Errno(9)),
+            "cloning a retired view cannot revive membership"
+        );
+    }
+    #[test]
+    fn excluded_control_retirement_keeps_an_explicit_owner_destructor_boundary() {
+        let mut v = Vfs::default();
+        let epoll = v.epoll_create(0).unwrap();
+        let open = Arc::downgrade(&v.descriptor(epoll).unwrap().open.borrow().shared);
+        let owner = v.file_table_owner();
+        let result = std::thread::spawn(move || owner.retire(1))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            FileTableRetirement {
+                last_owner: true,
+                owner_controls: 1
+            }
+        );
+        assert!(open.upgrade().is_some());
+        assert_eq!(
+            v.flags(epoll),
+            Err(Errno(9)),
+            "numeric membership has retired"
+        );
+        v.release_descriptors();
+        assert!(open.upgrade().is_none());
+    }
     #[test]
     fn unpublished_reservations_are_invisible_and_dup_collision_matches_linux() {
         let mut owner = Vfs::default();
