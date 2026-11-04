@@ -296,7 +296,7 @@ mod tests {
             .epoll_ctl(epoll, 1, event, 0xc0000001, 42)
             .unwrap();
         owner.state = State::Blocked(22, [epoll as u64, 0x1000, 1, u64::MAX, 0x2000, 8]);
-        owner.poll_mask = Some(0);
+        owner.signals.wait_mask = Some(0);
         owner.signals.mask = 1 << 11;
         kernel.processes.insert(1, owner);
         let mut output = trames_linux::CapturedOutput::default();
@@ -327,7 +327,7 @@ mod tests {
         owner.poll_deadline = None;
         Kernel::<Cpu>::queue_one(1, owner, 10, 0);
         assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
-        assert_eq!(kernel.processes[&1].poll_mask, Some(0));
+        assert_eq!(kernel.processes[&1].signals.wait_mask, Some(0));
         assert_eq!(kernel.processes[&1].signals.mask, 1 << 11);
     }
 

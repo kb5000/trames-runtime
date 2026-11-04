@@ -525,10 +525,14 @@ impl<C: Cpu> Pool<C> {
                                             }
                                             let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
                                             if let Some(pending) = pending {
+                                                syscalls += 1;
+                                                let interrupted=if let Some(wait)=&pending.retained_poll {
+                                                    wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
+                                                }else{Err(trames_vfs::Errno(4))};
                                                 if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
+                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
                                             }
                                             if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, info, action).is_err() {
                                                 let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
@@ -623,11 +627,13 @@ impl<C: Cpu> Pool<C> {
                                 if let Some(began) = began { syscall_time += began.elapsed(); }
                                 match result {
                                     trames_linux::IoAttempt::Complete(result) => {
+                                        if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_wait_mask(); }
                                         work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         syscalls += 1;
                                         continue;
                                     }
                                     trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}
                                         parked_io = Some(pending);
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
@@ -653,6 +659,12 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         job.retry=Some(crate::run_queue::IoCall::from_socket(socket));
                                         break SliceOutcome::Syscall {instructions:0};
                                     }
+                                    trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
                                     trames_linux::IoAttempt::Checkpoint => {
                                         // An owner-blocked call can leave -EAGAIN
                                         // in x0. The joined path needs the original
@@ -760,11 +772,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(result) => {
+                                                    if trames_linux::event_wait(number) { snapshot.finish_wait_mask(); }
                                                     work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1;
                                                     continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}
                                                     parked_io = Some(pending);
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
@@ -785,6 +799,12 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
 trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                         work.cpu.set_x(8,socket.number as u64);
                                         job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
+                                                trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
                                                 trames_linux::IoAttempt::Checkpoint => { job.seccomp_entry = Some(entry); break result; },
                                             }
                                         }
@@ -797,6 +817,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                     syscalls += 1; continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}
                                                     parked_io = Some(pending); break SliceOutcome::Yield { instructions: 0 };
                                                 }
                                                 trames_linux::IoAttempt::FileCheckpoint(file) => {
@@ -817,7 +838,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                 if let Some(began)=began {syscall_time+=began.elapsed();}
                                                 match attempt {
                                                     trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
-                                                    trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
+                                                    trames_linux::IoAttempt::Blocked(pending)=>{
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                     trames_linux::IoAttempt::FileCheckpoint(file) => {
     let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
@@ -835,7 +857,13 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
 trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                         work.cpu.set_x(8,socket.number as u64);
                                         job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
-                                                    trames_linux::IoAttempt::Checkpoint=>{job.seccomp_entry=Some(entry);break result;}
+                                                    trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
+                                                    trames_linux::IoAttempt::Checkpoint =>{job.seccomp_entry=Some(entry);break result;}
                                                 }
                                             }
                                         }
@@ -845,7 +873,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                     if let Some(began) = began { syscall_time += began.elapsed(); }
                                                     match attempt {
                                                         trames_linux::IoAttempt::Complete(value) => { work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
-                                                        trames_linux::IoAttempt::Blocked(pending) => { parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
+                                                        trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();} parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
                                                         trames_linux::IoAttempt::FileCheckpoint(file) => {
                                                             let call=crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
                                                             for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
@@ -856,6 +885,12 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                             for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                                             work.cpu.set_x(8,call.number as u64);job.retry=Some(call);break result;
                                                         }
+                                                        trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
                                                         trames_linux::IoAttempt::Checkpoint => { job.seccomp_entry=Some(entry);break result; }
                                                         trames_linux::IoAttempt::SocketCheckpoint(_) => unreachable!("Unix message start"),
                                                     }
@@ -922,6 +957,30 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     vm_checkpoint = true;
                                     break result;
                                 }
+                                if let Some(snapshot)=&work.syscalls {
+                                    if let Some(entry)=snapshot.event_entry(&work.cpu) {
+                                        if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
+                                        if let Some(epoch)=&epoch {
+                                            let number=work.cpu.x(8) as u32;
+                                            let args=std::array::from_fn(|i|work.cpu.x(i));
+                                            let began=snapshot.profile.then(Instant::now);
+                                            if let Some(attempt)=snapshot.direct.start(number,args,work.memory.as_deref_mut().expect("wait View"),work.pid,&epoch.io_target,None) {
+                                                if let Some(began)=began{syscall_time+=began.elapsed();}
+                                                match attempt {
+                                                    trames_linux::IoAttempt::Complete(value)=>{snapshot.finish_wait_mask();work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                    trames_linux::IoAttempt::Blocked(pending)=>{
+                                                        if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)){work.control.stop();}
+                                                        parked_io=Some(pending);break SliceOutcome::Yield{instructions:0};
+                                                    }
+                                                    trames_linux::IoAttempt::WaitCheckpoint(wait)=>{job.retry=Some(crate::run_queue::IoCall::from_wait(wait));break result;}
+                                                    trames_linux::IoAttempt::Checkpoint=>{job.seccomp_entry=Some(entry);break result;}
+                                                    _=>unreachable!("typed event wait"),
+                                                }
+                                            }
+                                        }
+                                        job.seccomp_entry=Some(entry);break result;
+                                    }
+                                }
                                 if let Some(snapshot) = work
                                     .syscalls
                                     .as_ref()
@@ -952,7 +1011,8 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
-                                                trames_linux::IoAttempt::Blocked(pending)=>{parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
+                                                trames_linux::IoAttempt::Blocked(pending)=>{
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                 trames_linux::IoAttempt::FileCheckpoint(file) => {
     let call = crate::run_queue::IoCall::from_file_checkpoint(file, number, args);
     for (i,value) in call.args.iter().enumerate() {work.cpu.set_x(i,*value);}
@@ -970,7 +1030,13 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
 trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                         work.cpu.set_x(8,socket.number as u64);
                                         job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
-                                                trames_linux::IoAttempt::Checkpoint=>break result,
+                                                trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
+                                                trames_linux::IoAttempt::Checkpoint =>break result,
                                             }
                                         }
                                         if snapshot.direct.supports_call(number, args) {
@@ -985,6 +1051,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                     continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}
                                                     parked_io = Some(pending);
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
@@ -1005,6 +1072,12 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
 trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.args.iter().enumerate() {work.cpu.set_x(i,*value);}
                                         work.cpu.set_x(8,socket.number as u64);
                                         job.retry=Some(crate::run_queue::IoCall::from_socket(socket));break result;}
+                                                trames_linux::IoAttempt::WaitCheckpoint(wait) => {
+ let call=crate::run_queue::IoCall::from_wait(wait);
+ for(i,value) in call.args.iter().enumerate(){work.cpu.set_x(i,*value);}
+ work.cpu.set_x(8,call.number as u64);job.retry=Some(call);
+ break SliceOutcome::Syscall{instructions:0};
+},
                                                 trames_linux::IoAttempt::Checkpoint => break result,
                                             }
                                         }
@@ -1017,6 +1090,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                     syscalls += 1; continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
+ if pending.retained_poll.as_ref().is_some_and(|w|snapshot.begin_wait_mask(w)) {work.control.stop();}
                                                     parked_io = Some(pending); break SliceOutcome::Yield { instructions: 0 };
                                                 }
                                                 trames_linux::IoAttempt::FileCheckpoint(file) => {
@@ -1604,6 +1678,8 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,
@@ -1688,6 +1764,105 @@ mod tests {
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
     }
 
+    #[test]
+    fn masked_event_wait_signal_and_sigreturn_need_no_owner_service() {
+        for number in [22, 72, 73, 441] {
+            let mut v = trames_vfs::Vfs::default();
+            let epoll = v.epoll_create(0).unwrap();
+            let mut memory = Memory::default();
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.map(0x8000, 3 * PAGE_SIZE, Permissions::RW).unwrap();
+            for (address, words) in [
+                (
+                    0x1000,
+                    vec![0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001],
+                ),
+                (0x1100, vec![0xf90002a0u32, 0xd2801168, 0xd4000001]),
+            ] {
+                for (i, word) in words.into_iter().enumerate() {
+                    memory
+                        .write_array(address + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+            }
+            memory.write_array(0x2100, 3600u64.to_le_bytes()).unwrap();
+            memory.write_array(0x2200, 0x2210u64.to_le_bytes()).unwrap();
+            memory.write_array(0x2208, 8u64.to_le_bytes()).unwrap();
+            memory
+                .write_array(0x2210, (1u64 << 11).to_le_bytes())
+                .unwrap();
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let mut snapshot = syscall_snapshot();
+            snapshot.direct = trames_linux::DirectSyscalls::new(v.direct_descriptors());
+            snapshot.io_signals.context.lock().unwrap().mask = 1 << 9;
+            snapshot.io_signals.publish_mask(1 << 9);
+            snapshot.actions.set(
+                10,
+                trames_kernel::signal::Action {
+                    handler: 0x1100,
+                    flags: 0x10000000,
+                    ..Default::default()
+                },
+            );
+            snapshot
+                .io_signals
+                .inbox
+                .enqueue(10, Default::default())
+                .unwrap();
+            let task = snapshot.io_signals.clone();
+            let mut cpu = Cpu::new(0x1000, 0xb000);
+            cpu.set_x(8, number as u64);
+            cpu.set_x(21, 0x2000);
+            let args = match number {
+                72 => [0, 0, 0, 0, 0x2100, 0x2200],
+                73 => [0, 0, 0x2100, 0x2210, 8, 0],
+                22 => [epoll as u64, 0x2300, 1, 3600000, 0x2210, 8],
+                _ => [epoll as u64, 0x2300, 1, 0x2100, 0x2210, 8],
+            };
+            for (i, a) in args.iter().enumerate() {
+                cpu.set_x(i, *a);
+            }
+            let control = Arc::new(Control::new(100));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            epoch.add(crate::run_queue::Job::new(
+                Work {
+                    pid: 1,
+                    cpu,
+                    memory: Some(Box::new(
+                        memory.parallel_view(&mut Default::default()).unwrap(),
+                    )),
+                    control,
+                    syscalls: Some(snapshot),
+                    gpu: None,
+                    audio: None,
+                },
+                1,
+                0,
+                None,
+            ));
+            let mut pool = Pool::new(1);
+            pool.ensure(0).unwrap();
+            pool.launch(0, epoch.clone()).unwrap();
+            assert!(
+                matches!(
+                    pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                    Some(Event::EpochStopped(0))
+                ),
+                "wait {number} did not retire"
+            );
+            let done = epoch.drain().pop().unwrap();
+            assert_eq!(done.cpu.x(19), 0u64.wrapping_sub(4));
+            assert_eq!(done.syscalls, 2, "interrupted wait plus sigreturn");
+            assert_eq!(done.serviced_syscalls, 0);
+            let state = *task.context.lock().unwrap();
+            assert_eq!(state.mask, 1 << 9);
+            assert_eq!(state.wait_mask, None);
+            assert_eq!(state.frames, 0);
+            memory.commit_parallel().unwrap();
+            assert_eq!(memory.read_u64(0x2000).unwrap(), 10);
+        }
+    }
     #[test]
     fn aio_releases_the_only_slot_and_retains_its_batch_across_cohort_handoff() {
         struct Disk(Mutex<Option<(trames_vfs::FileWork, Arc<trames_linux::FileResult>)>>);

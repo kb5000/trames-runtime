@@ -27,6 +27,7 @@ pub struct Signals {
     pub io_directory: std::sync::Arc<IoDirectory>,
     pub actions: Actions,
     pub mask: u64,
+    pub wait_mask: Option<u64>,
     pub pending: Pending,
     pub shared_pending: Rc<RefCell<Pending>>,
     pub frames: u32,
@@ -45,6 +46,7 @@ impl Signals {
                 self.actions.clone()
             },
             mask: self.mask,
+            wait_mask: None,
             pending: Pending::default(),
             shared_pending: Rc::new(RefCell::new(Pending::default())),
             frames: self.frames,

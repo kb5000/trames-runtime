@@ -46,7 +46,7 @@ pub struct PendingIo {
     // keep their original owner restart path, rather than exporting this lease.
     native_tcp: Option<trames_vfs::DirectTcpFd>,
     resource_deadline: Option<Instant>,
-    pub retained_poll: Option<crate::poll::RetainedPoll>,
+    pub retained_poll: Option<Arc<crate::RetainedWait>>,
     epoll_revision: Option<u64>,
     _subscriptions: Vec<IoSubscription>,
     host_subscription: Option<trames_vfs::HostSubscription>,
@@ -145,6 +145,7 @@ impl PendingIo {
 // existing boxed task/job; boxing this variant would add a separate wait allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum IoAttempt {
+    WaitCheckpoint(Arc<crate::RetainedWait>),
     Complete(Result<u64, Errno>),
     Blocked(PendingIo),
     Checkpoint,
@@ -175,7 +176,7 @@ pub fn epoll_parameters(
         Ok((ms >= 0).then(|| Duration::from_millis(ms as u64)))
     }
 }
-fn epoll_buffer(memory: &impl CpuMemory, a: [u64; 6]) -> Result<(), Errno> {
+pub(crate) fn epoll_buffer(memory: &impl CpuMemory, a: [u64; 6]) -> Result<(), Errno> {
     if a[2] == 0 || a[2] > (crate::MAX_WRITE / 16) as u64 {
         return Err(Errno(22));
     }
@@ -694,11 +695,10 @@ impl DirectSyscalls {
         if number == 427 {
             return self.urings.supports_register(args);
         }
-        if number == 73 {
-            return args[3] == 0;
+        if matches!(number, 72 | 73) {
+            return true;
         }
         self.supports(number, args[0] as u32)
-            && (!matches!(number, 22 | 441) || args[4] == 0)
             && (number != 29
                 || args[1] as u32 == 0x541b
                 || self
@@ -989,7 +989,7 @@ impl DirectSyscalls {
         if matches!(number, 32 | 116) {
             return IoAttempt::Complete(result);
         }
-        if matches!(number, 22 | 73 | 441) {
+        if crate::event_wait(number) {
             self.poll_completed.set(self.poll_completed.get() + 1);
             return IoAttempt::Complete(result);
         }
@@ -1015,7 +1015,17 @@ impl DirectSyscalls {
         }
         IoAttempt::Complete(result)
     }
-    fn complete_pending(&self, pending: &PendingIo, result: Result<u64, Errno>) -> IoAttempt {
+    fn complete_pending(
+        &self,
+        pending: &PendingIo,
+        result: Result<u64, Errno>,
+        memory: &mut impl CpuMemory,
+    ) -> IoAttempt {
+        let result = if let Some(wait) = &pending.retained_poll {
+            wait.finish(memory, result)
+        } else {
+            result
+        };
         if pending.native_tcp.is_some() {
             self.complete_tcp(result)
         } else if let Some(file) = &pending.retained_byte {
@@ -1092,56 +1102,22 @@ impl DirectSyscalls {
         if !self.supports_call(number, args) {
             return None;
         }
-        let mut poll = None;
-        let deadline = if number == 73 {
-            let deadline = match poll_deadline(memory, args[2], saved_deadline) {
-                Ok(deadline) => deadline,
-                Err(error) => return Some(self.complete(number, args, Err(error))),
-            };
-            let prepared = match crate::poll::Poll::prepare(&self.descriptors, memory, args) {
-                Some(Ok(poll)) => poll,
-                Some(Err(error)) => return Some(self.complete(number, args, Err(error))),
-                None => return Some(IoAttempt::Checkpoint),
-            };
-            if !self.urings.poll_pump(&prepared.poll_resources(), memory) {
-                return Some(IoAttempt::Checkpoint);
-            }
-            match prepared.check(memory, deadline) {
-                Err(Errno(11)) => {}
-                result => return Some(self.complete(number, args, result)),
-            }
-            poll = Some(prepared.retain());
-            deadline
-        } else if matches!(number, 22 | 441) {
-            match epoll_parameters(memory, number, args).and_then(|timeout| {
-                if saved_deadline.is_some() {
-                    Ok(saved_deadline)
-                } else {
-                    timeout
-                        .map(|d| Instant::now().checked_add(d).ok_or(Errno(22)))
-                        .transpose()
-                }
-            }) {
-                Ok(deadline) => {
-                    if !self.urings.poll_pump(
-                        &self
-                            .descriptors
-                            .get(args[0] as u32)
-                            .unwrap()
-                            .poll_resources(),
-                        memory,
-                    ) {
-                        return Some(IoAttempt::Checkpoint);
-                    }
-                    match self.epoll_once(args, deadline, memory) {
-                        Err(Errno(11)) => {}
-                        result => return Some(self.complete(number, args, result)),
-                    }
-                    deadline
-                }
-                Err(error) => return Some(self.complete(number, args, Err(error))),
-            }
-        } else {
+        if crate::event_wait(number) {
+            return Some(
+                match crate::RetainedWait::prepare_worker(
+                    &self.descriptors,
+                    memory,
+                    number,
+                    args,
+                    saved_deadline,
+                ) {
+                    Some(Ok(wait)) => self.start_event_wait(wait, memory, pid, target),
+                    Some(Err(error)) => self.complete(number, args, Err(error)),
+                    None => IoAttempt::Checkpoint,
+                },
+            );
+        }
+        let deadline = {
             let Some(result) = self.transfer(number, args, memory) else {
                 return Some(IoAttempt::Checkpoint);
             };
@@ -1161,13 +1137,6 @@ impl DirectSyscalls {
                 })
             }
         };
-        let epoll_revision = matches!(number, 22 | 441)
-            .then(|| {
-                self.descriptors
-                    .get(args[0] as u32)
-                    .and_then(|fd| fd.epoll_revision())
-            })
-            .flatten();
         let signal = IoSignal::new(pid, target.clone());
         let mut host_subscription = None;
         let subscriptions = if number == 116 {
@@ -1192,8 +1161,6 @@ impl DirectSyscalls {
             };
             host_subscription = Some(subscription);
             Vec::new()
-        } else if let Some(poll) = &poll {
-            poll.subscribe(&signal)
         } else {
             self.descriptors
                 .get(args[0] as u32)
@@ -1207,8 +1174,8 @@ impl DirectSyscalls {
                 args,
                 deadline,
                 signal,
-                epoll_revision,
-                retained_poll: poll,
+                epoll_revision: None,
+                retained_poll: None,
                 resource_deadline: None,
                 flock: None,
                 retained_socket: None,
@@ -1241,27 +1208,52 @@ impl DirectSyscalls {
     }
     pub fn start_retained_poll(
         &self,
-        poll: crate::poll::RetainedPoll,
+        poll: Arc<crate::RetainedWait>,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
         pid: u32,
         target: &Weak<dyn IoWake>,
         deadline: Option<Instant>,
     ) -> IoAttempt {
+        let _ = (args, deadline); // Original accepted ABI/deadline belongs to poll.
         let Some(poll) = poll.rearm(&self.descriptors) else {
-            return IoAttempt::Checkpoint;
+            return IoAttempt::WaitCheckpoint(poll);
         };
+        self.start_event_wait(poll, memory, pid, target)
+    }
+    fn start_event_wait<
+        W: std::borrow::Borrow<crate::RetainedWait> + Into<Arc<crate::RetainedWait>>,
+    >(
+        &self,
+        accepted: W,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let wait = accepted.borrow();
+        if !self.urings.poll_pump(&wait.poll_resources(), memory) {
+            return IoAttempt::WaitCheckpoint(accepted.into());
+        }
+        match wait.check(memory) {
+            Err(Errno(11)) => {}
+            result => {
+                let result = wait.finish(memory, result);
+                return self.complete(wait.number, wait.args, result);
+            }
+        }
         let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = poll.subscribe(&signal);
+        let subscriptions = wait.subscribe(&signal);
+        let revision = wait.epoll_revision();
+        let wait = accepted.into();
         self.resume(
             PendingIo {
                 aio: None,
-                number: 73,
-                args,
-                deadline,
+                number: wait.number,
+                args: wait.args,
+                deadline: wait.deadline,
                 signal,
-                epoll_revision: None,
-                retained_poll: Some(poll),
+                retained_poll: Some(wait),
+                epoll_revision: revision,
                 retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
@@ -1476,13 +1468,10 @@ impl DirectSyscalls {
             return self.urings.resume(pending, memory);
         }
         pending.signal.reset();
-        if matches!(pending.number, 22 | 441) {
-            let Some(fd) = self.descriptors.get(pending.args[0] as u32) else {
-                return IoAttempt::Checkpoint;
-            };
-            let revision = fd.epoll_revision();
+        if let Some(wait) = &pending.retained_poll {
+            let revision = wait.epoll_revision();
             if pending.epoll_revision != revision {
-                pending._subscriptions = fd.subscribe(&pending.signal);
+                pending._subscriptions = wait.subscribe(&pending.signal);
                 pending.poll_uring = None;
                 pending.epoll_revision = revision;
             }
@@ -1519,7 +1508,10 @@ impl DirectSyscalls {
         }
         if let Some(wait) = &mut pending.poll_uring {
             if !wait.refresh(&pending.signal, memory) {
-                return IoAttempt::Checkpoint;
+                return pending
+                    .retained_poll
+                    .clone()
+                    .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint);
             }
         }
         if pending
@@ -1527,7 +1519,10 @@ impl DirectSyscalls {
             .as_ref()
             .is_some_and(|s| s.rearm().is_err())
         {
-            return IoAttempt::Checkpoint;
+            return pending
+                .retained_poll
+                .clone()
+                .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint);
         }
         let result = if let Some(fd) = &pending.native_tcp {
             self.transfer_tcp(fd, pending.number, pending.args, memory)
@@ -1541,7 +1536,7 @@ impl DirectSyscalls {
             };
             result
         } else if let Some(poll) = &pending.retained_poll {
-            poll.check(memory, pending.deadline)
+            poll.check(memory)
         } else if matches!(pending.number, 22 | 441) {
             epoll_buffer(memory, pending.args)
                 .and_then(|()| self.epoll_once(pending.args, pending.deadline, memory))
@@ -1566,7 +1561,7 @@ impl DirectSyscalls {
                     || pending.external_wait()
                         && pending.deadline.is_some_and(|d| Instant::now() >= d)
                 {
-                    return self.complete_pending(&pending, Err(Errno(11)));
+                    return self.complete_pending(&pending, Err(Errno(11)), memory);
                 }
                 let resource_deadline = if pending.native_tcp.is_some() {
                     None
@@ -1593,7 +1588,7 @@ impl DirectSyscalls {
             Err(Errno(32)) if checkpoint_pipe && signals_pipe(pending.number, pending.args) => {
                 IoAttempt::Checkpoint
             }
-            result => self.complete_pending(&pending, result),
+            result => self.complete_pending(&pending, result, memory),
         }
     }
     /// Legacy single-assignment entry. None means no effects and the caller must
@@ -2492,7 +2487,7 @@ mod tests {
             direct.invoke(73, [0x1ffc, 1, 0, 0, 0, 0], &mut m),
             Some(Err(Errno(14)))
         );
-        assert!(!direct.supports_call(73, [0, 0, 0, 0x1200, 8, 0]));
+        assert!(direct.supports_call(73, [0, 0, 0, 0x1200, 8, 0]));
         assert_eq!(
             direct.invoke(73, [0, 0, 0x1200, 0, 0, 0], &mut m),
             Some(Ok(0))
@@ -2585,6 +2580,37 @@ mod tests {
         assert_eq!(v.read(replacement, 3).unwrap(), b"new");
     }
 
+    #[test]
+    fn epoll_wait_retains_original_epoll_after_close_reuse_and_new_epoch() {
+        let mut v = Vfs::default();
+        let event = v.eventfd(0, 0).unwrap();
+        let ep = v.epoll_create(0).unwrap();
+        v.epoll_ctl(ep, 1, event, 1, 42).unwrap();
+        let mut m = memory();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let direct = DirectSyscalls::new(v.direct_descriptors());
+        let args = [ep as u64, 0x1100, 1, u64::MAX, 0, 0];
+        let wait = pending(
+            direct
+                .start(22, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap(),
+        );
+        v.close(ep).unwrap();
+        let replacement = v.epoll_create(0).unwrap();
+        assert_eq!(replacement, ep);
+        let ready = v.eventfd(1, 0).unwrap();
+        v.epoll_ctl(replacement, 1, ready, 1, 999).unwrap();
+        assert!(!wait.signal.ready());
+        v.write(event, &1u64.to_le_bytes()).unwrap();
+        assert!(wait.signal.ready());
+        let fresh = DirectSyscalls::new(v.direct_descriptors());
+        assert_eq!(complete(fresh.resume(wait, &mut m)), Ok(1));
+        assert_eq!(m.read_u64(0x1108).unwrap(), 42);
+        assert_eq!(
+            v.epoll_wait(replacement, 1, |_, _| Ok(None)).unwrap(),
+            vec![(1, 999)]
+        );
+    }
     #[test]
     fn eventless_regular_file_poll_retains_the_complete_accepted_ofd_until_cancel() {
         let mut v = Vfs::default();
@@ -3395,7 +3421,7 @@ mod tests {
         assert_eq!(direct.completed(), 2);
     }
     #[test]
-    fn epoll_deadline_preflight_event_layout_and_no_temporary_mask_admission() {
+    fn epoll_deadline_preflight_event_layout_and_mask_validation() {
         let mut vfs = Vfs::default();
         let event = vfs.eventfd(0, 0).unwrap();
         let ep = vfs.epoll_create(0).unwrap();
@@ -3416,9 +3442,12 @@ mod tests {
         vfs.write(event, &1u64.to_le_bytes()).unwrap();
         assert!(wait.signal.ready());
         // Failed output validation must not consume ONESHOT.
-        let mut bad = wait;
-        bad.args[1] = 0x1ffc;
+        let bad = wait;
+        // Invalidate the actual accepted destination, rather than rewriting
+        // checkpoint metadata (which must no longer retarget the syscall).
+        m.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
         assert_eq!(complete(direct.resume(bad, &mut m)), Err(Errno(14)));
+        m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         assert_eq!(
             complete(
                 direct
@@ -3442,9 +3471,14 @@ mod tests {
             Ok(0)
         );
         args[4] = 0x1000;
-        assert!(direct
-            .start(22, args, &mut m, 1, &Arc::downgrade(&target), None)
-            .is_none());
+        assert_eq!(
+            complete(
+                direct
+                    .start(22, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap()
+            ),
+            Err(Errno(22))
+        );
         args[4] = 0;
         m.write_array(0x1000, 0u64.to_le_bytes()).unwrap();
         m.write_array(0x1008, 1_000_000_000u64.to_le_bytes())

@@ -18,13 +18,6 @@ impl Source {
         vfs.open_description_identity(fd)
             .map_or(Self::Invalid, Self::Owner)
     }
-    fn joined(vfs: &Vfs, fds: &DirectFds, fd: u32) -> Self {
-        if let Some(resource) = fds.get(fd).filter(|fd| !fd.is_epoll()) {
-            Self::Direct(resource)
-        } else {
-            Self::owner(vfs, fd)
-        }
-    }
 }
 #[derive(Clone)]
 struct Entry {
@@ -64,20 +57,21 @@ impl Entry {
         })
     }
 }
+#[derive(Clone)]
 pub(crate) struct Poll {
     entries: Vec<Entry>,
 }
 /// The imported poll array and its accepted shared OFDs survive a checkpoint.
-/// Cloning checkpoint metadata does not clone every descriptor or re-import
-/// guest buffers. Owner-only controls are rebound at their joined boundary.
+/// Parking shares the enclosing RetainedWait; ready calls need no extra Arc
+/// allocation around this poll array. Owner controls rebind at their boundary.
 #[derive(Clone)]
-pub struct RetainedPoll(Arc<Poll>);
+pub struct RetainedPoll(Poll);
 struct SelectSet {
     address: u64,
     events: u16,
     entries: Vec<Entry>,
 }
-/// pselect stays owner-side, with the same accepted shared/OFD identities.
+/// Original pselect sets and OFDs, shared by worker and owner execution.
 #[derive(Clone)]
 pub struct RetainedSelect {
     sets: Arc<[SelectSet]>,
@@ -130,7 +124,7 @@ impl Poll {
         Some(Ok(Self { entries }))
     }
     pub(crate) fn retain(self) -> RetainedPoll {
-        RetainedPoll(Arc::new(self))
+        RetainedPoll(self)
     }
     fn ready(
         &self,
@@ -186,6 +180,13 @@ impl Poll {
     }
 }
 impl RetainedPoll {
+    pub(crate) fn fully_retained(&self) -> bool {
+        self.0.entries.iter().all(|entry| match &entry.source {
+            Source::Ignored | Source::Invalid => true,
+            Source::Direct(fd) => fd.retains_ofd(),
+            Source::Owner(_) => false,
+        })
+    }
     pub fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
         self.0
             .entries
@@ -208,6 +209,13 @@ impl RetainedPoll {
         Poll::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args)
             .expect("joined poll has an owner fallback")
             .map(Poll::retain)
+    }
+    pub(crate) fn ready(
+        &self,
+        joined: bool,
+        owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+    ) -> Result<Vec<(u64, u16)>, Errno> {
+        self.0.ready(joined, owner)
     }
     pub fn ready_joined(
         &self,
@@ -238,11 +246,7 @@ impl RetainedPoll {
         fds.shares_with(self.0.direct())
     }
     pub(crate) fn rearm(&self, fds: &DirectFds) -> Option<Self> {
-        if self.0.entries.iter().all(|entry| match &entry.source {
-            Source::Ignored | Source::Invalid => true,
-            Source::Direct(fd) => fd.retains_ofd(),
-            Source::Owner(_) => false,
-        }) {
+        if self.fully_retained() {
             return Some(self.clone());
         }
         let entries = self
@@ -293,6 +297,9 @@ impl RetainedPoll {
     }
 }
 impl RetainedSelect {
+    pub(crate) fn same_capture(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.sets, &other.sets)
+    }
     pub fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
         self.sets
             .iter()
@@ -311,41 +318,175 @@ impl RetainedSelect {
         memory: &impl CpuMemory,
         args: [u64; 6],
     ) -> Result<Self, Errno> {
+        Self::prepare_inner(&vfs.direct_descriptors(), Some(vfs), memory, args)
+            .expect("joined select has owner controls")
+    }
+    pub(crate) fn prepare_worker(
+        fds: &DirectFds,
+        memory: &impl CpuMemory,
+        args: [u64; 6],
+    ) -> Option<Result<Self, Errno>> {
+        Self::prepare_inner(fds, None, memory, args)
+    }
+    fn prepare_inner(
+        fds: &DirectFds,
+        owner: Option<&Vfs>,
+        memory: &impl CpuMemory,
+        args: [u64; 6],
+    ) -> Option<Result<Self, Errno>> {
         if args[0] > 256 {
-            return Err(Errno(22));
+            return Some(Err(Errno(22)));
         }
         let size = args[0].div_ceil(64) as usize * 8;
-        let fds = vfs.direct_descriptors();
         let mut sets = Vec::new();
         for (index, events) in [(1, 1), (2, 4), (3, 2)] {
             if args[index] == 0 {
                 continue;
             }
-            Linux::check(memory, args[index], size, Access::Write)?;
+            if let Err(e) = Linux::check(memory, args[index], size, Access::Write) {
+                return Some(Err(e));
+            }
             let mut bits = vec![0; size];
-            memory.read(args[index], &mut bits).map_err(|_| Errno(14))?;
-            let entries = (0..args[0] as u32)
-                .filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0)
-                .map(|fd| Entry {
+            if memory.read(args[index], &mut bits).is_err() {
+                return Some(Err(Errno(14)));
+            }
+            let mut entries = Vec::new();
+            for fd in
+                (0..args[0] as u32).filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0)
+            {
+                let source = if let Some(resource) = fds.get(fd).filter(|fd| !fd.is_epoll()) {
+                    Source::Direct(resource)
+                } else if let Some(vfs) = owner {
+                    Source::owner(vfs, fd)
+                } else if fds
+                    .shared_files()
+                    .is_some_and(|files| files.lookup(fd).is_some_and(|f| f.is_err()))
+                {
+                    Source::Invalid
+                } else {
+                    return None;
+                };
+                entries.push(Entry {
                     address: 0,
                     fd,
                     events,
-                    source: Source::joined(vfs, &fds, fd),
-                })
-                .collect();
+                    source,
+                });
+            }
             sets.push(SelectSet {
                 address: args[index],
                 events,
                 entries,
             });
         }
-        Ok(Self {
+        Some(Ok(Self {
             sets: sets.into(),
             size,
+        }))
+    }
+    fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.sets.iter().flat_map(|s| &s.entries)
+    }
+    fn direct(&self) -> impl Iterator<Item = &DirectFd> {
+        self.entries().filter_map(|e| {
+            if let Source::Direct(fd) = &e.source {
+                Some(fd)
+            } else {
+                None
+            }
+        })
+    }
+    pub(crate) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {
+        self.direct().flat_map(|fd| fd.subscribe(signal)).collect()
+    }
+    pub(crate) fn poll_resources(&self) -> Vec<Arc<dyn trames_vfs::DirectPoll>> {
+        self.direct().flat_map(|fd| fd.poll_resources()).collect()
+    }
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.entries()
+            .filter(|e| e.events & 1 != 0)
+            .filter_map(|e| {
+                if let Source::Direct(fd) = &e.source {
+                    fd.next_deadline()
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+    pub(crate) fn supports_worker(&self) -> bool {
+        self.entries().all(|e| {
+            matches!(
+                &e.source,
+                Source::Direct(_) | Source::Invalid | Source::Ignored
+            )
+        })
+    }
+    pub(crate) fn owner_controls(&self) -> Vec<(u32, OfdIdentity)> {
+        self.entries()
+            .filter_map(|e| {
+                if let Source::Owner(id) = &e.source {
+                    Some((e.fd, id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    pub(crate) fn shares_resources(&self, fds: &DirectFds) -> bool {
+        fds.shares_with(self.direct())
+    }
+    pub(crate) fn rearm(&self, fds: &DirectFds) -> Option<Self> {
+        if self.entries().all(|e| {
+            matches!(&e.source,Source::Direct(fd) if fd.retains_ofd())
+                || matches!(e.source, Source::Invalid | Source::Ignored)
+        }) {
+            return Some(self.clone());
+        }
+        let sets = self
+            .sets
+            .iter()
+            .map(|s| {
+                let entries = s
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(|mut e| {
+                        let id = match &e.source {
+                            Source::Owner(id) => Some(id.clone()),
+                            Source::Direct(fd) if !fd.retains_ofd() => Some(fd.ofd_identity()),
+                            _ => None,
+                        };
+                        if let Some(id) = id {
+                            e.source = Source::Direct(
+                                fds.get(e.fd)
+                                    .filter(|fd| !fd.is_epoll() && fd.ofd_identity() == id)?,
+                            );
+                        }
+                        Some(e)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(SelectSet {
+                    address: s.address,
+                    events: s.events,
+                    entries,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            sets: sets.into(),
+            size: self.size,
         })
     }
     pub fn ready_joined(
         &self,
+        owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
+    ) -> Result<(u64, PollOutput), Errno> {
+        self.ready(true, owner)
+    }
+    pub(crate) fn ready(
+        &self,
+        joined: bool,
         mut owner: impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
     ) -> Result<(u64, PollOutput), Errno> {
         let mut count = 0;
@@ -353,7 +494,7 @@ impl RetainedSelect {
         for set in self.sets.iter() {
             let mut result = vec![0; self.size];
             for entry in &set.entries {
-                let ready = entry.ready(true, &mut owner)?;
+                let ready = entry.ready(joined, &mut owner)?;
                 if ready & 32 != 0 {
                     return Err(Errno(9));
                 }

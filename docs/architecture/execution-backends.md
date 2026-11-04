@@ -2107,3 +2107,52 @@ against file/directory stat concurrently. They release forced locks before failu
 or use receive deadlines, so the old cycle fails rather than hanging the suite.
 The original unmodified Docker repro is run separately against an APFS clone of
 the frozen Debian environment, without changing its project data or credentials.
+
+
+## Retained event-wait subsystem (2026-11-04)
+
+Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2 share one accepted
+RetainedWait contract on Mac HVF and the iPad interpreter. Entry imports the
+original descriptor sets/OFDs or epoll object, absolute deadline, output locations
+and optional temporary signal mask once. Parking, readiness rearming and cohort
+handoff keep this contract: numeric FD close/reuse, guest input edits or a later
+FD epoch do not retarget the accepted wait. Epoll interest revision changes
+refresh subscriptions on that same epoll object. Owner/mixed poll/select imports
+retain the original owner-control identity before their existing joined path.
+
+A ready call uses a stack wait wrapper. Only actual parking/checkpoint allocates
+its shared retained wrapper; unchanged rearm clones that Arc rather than every
+captured descriptor. Shared epoll results scatter their original records directly
+on both joined and worker paths. Ordinary readiness executes on the source worker;
+a blocked task returns its execution slot and subscribes to original resources,
+host events and deadlines. Existing io_uring pumps remain source-owned. A source
+pump that cannot run returns a typed WaitCheckpoint with the accepted wait rather
+than silently re-importing guest input on the owner.
+
+Only a truly blocked masked wait publishes the temporary mask. The previous mask
+lives in shared per-task signal context across handoff. Caught I/O signals enter
+the ARM64 frame on that task's worker: the handler runs with the temporary mask
+plus its action/current-signal mask, while ucontext records the pre-wait mask.
+Sigreturn restores that original mask. Event waits report EINTR even under
+SA_RESTART; ordinary completion restores the old mask without constructing a
+signal frame. Actual legacy owner-queue signal delivery still uses task control.
+An actual mask unblock synchronizes with the existing private/process inbox
+mutexes, closing the enqueue/unmask lost-wake window; unchanged or blocking-only
+masks do not acquire these locks. No new global lock or ordinary-memory fence is
+used. Default signal termination/stop remains a lifecycle effect.
+
+Raw pselect6/ppoll timeout copyout follows native Linux: remaining time updates on
+readiness, timeout and EINTR are best effort. A final write fault does not replace
+the syscall result. epoll_pwait2 does not modify its timeout. Entry seccomp is
+judged once before wait-input effects; ALLOW can execute/park locally and a
+non-ALLOW or resource fallback preserves the exact original decision. Tracing,
+excluded owner/dynamic resources and unsupported source pumps retain explicit
+boundaries. No new coordinator, reactor or resource service thread, polling bus,
+per-call algorithm lock or unsafe block is introduced.
+
+Concentrated acceptance compares all four families against the same static ARM64
+ELF on native Linux, Mac HVF and the production interpreter, including queued and
+arriving FASYNC signals, handler/sigreturn masks and read-only timeout copyout.
+Source-worker regressions assert zero service requests for masked EINTR/sigreturn,
+original epoll identity after close/reuse, and once-only seccomp evaluation across
+parking. This does not claim every signal source or owner FD has been migrated.

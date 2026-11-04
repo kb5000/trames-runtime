@@ -65,13 +65,29 @@ pub(super) struct IoCall {
     pub retained_byte: Option<trames_linux::RetainedByte>,
     pub retained_socket: Option<trames_linux::RetainedSocket>,
     pub tcp_liveness: Option<trames_net::TcpLease>,
-    pub retained_poll: Option<trames_linux::RetainedPoll>,
+    pub retained_poll: Option<Arc<trames_linux::RetainedWait>>,
     pub uring: Option<trames_linux::UringEnter>,
     pub file: Option<trames_linux::FilePending>,
     pub file_checkpoint: Option<trames_linux::FileCheckpoint>,
     pub deadline: Option<Instant>,
 }
 impl IoCall {
+    pub fn from_wait(wait: Arc<trames_linux::RetainedWait>) -> Self {
+        Self {
+            number: wait.number,
+            args: wait.args,
+            deadline: wait.deadline,
+            retained_poll: Some(wait),
+            retained_byte: None,
+            retained_socket: None,
+            flock: None,
+            tcp_liveness: None,
+            uring: None,
+            file: None,
+            file_checkpoint: None,
+            aio: None,
+        }
+    }
     pub fn from_file_checkpoint(
         file: trames_linux::FileCheckpoint,
         number: u32,
@@ -507,13 +523,11 @@ impl<C: Cpu> Epoch<C> {
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
         let deadline = Instant::now();
-        q.parked
-            .get_mut(&pid)
-            .unwrap()
-            .io
-            .as_mut()
-            .unwrap()
-            .deadline = Some(deadline);
+        let io = q.parked.get_mut(&pid).unwrap().io.as_mut().unwrap();
+        io.deadline = Some(deadline);
+        if let Some(wait) = io.retained_poll.as_mut() {
+            Arc::make_mut(wait).deadline = Some(deadline);
+        }
         self.publish_deadline(Some(deadline));
         self.notify(&mut q);
     }

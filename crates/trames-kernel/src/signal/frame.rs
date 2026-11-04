@@ -43,7 +43,8 @@ impl Signals {
         sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
     ) -> Result<(), Errno> {
         let mut frame = self.frame_state();
-        frame.enter_sme(state, memory, sig, info, action, sme)?;
+        frame.enter_sme_restoring(state, memory, sig, info, action, sme, self.wait_mask)?;
+        self.wait_mask = None;
         self.commit_frame(frame);
         Ok(())
     }
@@ -91,6 +92,19 @@ impl FrameState {
         action: Action,
         sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
     ) -> Result<(), Errno> {
+        self.enter_sme_restoring(state, memory, sig, info, action, sme, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn enter_sme_restoring(
+        &mut self,
+        state: &mut Aarch64State,
+        memory: &mut impl CpuMemory,
+        sig: u32,
+        info: Info,
+        action: Action,
+        sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
+        restore_mask: Option<u64>,
+    ) -> Result<(), Errno> {
         let records = sme.map(|(config, registers, sme2)| {
             sme_records(config, registers, sme2, state.tpidr2_el0)
         });
@@ -125,7 +139,7 @@ impl FrameState {
         frame[144..152].copy_from_slice(&old_alt.sp.to_le_bytes());
         frame[152..156].copy_from_slice(&old_alt.reported_flags(state.sp).to_le_bytes());
         frame[160..168].copy_from_slice(&old_alt.size.to_le_bytes());
-        frame[168..176].copy_from_slice(&self.mask.to_le_bytes());
+        frame[168..176].copy_from_slice(&restore_mask.unwrap_or(self.mask).to_le_bytes());
         frame[304..312].copy_from_slice(&info.fault.unwrap_or(0).to_le_bytes());
         for r in 0..31 {
             frame[312 + r * 8..320 + r * 8].copy_from_slice(&state.x(r).to_le_bytes());

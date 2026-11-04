@@ -11,6 +11,8 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub owner_pending: u64,
+    pub saved_wait_mask: std::cell::Cell<Option<u64>>,
     pub io_signals: Arc<trames_kernel::signal::IoTask>,
     pub io_routes: trames_kernel::signal::IoRoutes,
     pub io_wake: Option<Arc<trames_vfs::IoSignal>>,
@@ -255,6 +257,32 @@ pub(super) fn futex_queue(
 }
 
 impl Snapshot {
+    /// Only a blocked accepted event wait changes task mask state. The calling
+    /// task owns this Snapshot; its Cell avoids locks for unmasked completions.
+    pub fn begin_wait_mask(&self, wait: &trames_linux::RetainedWait) -> bool {
+        if let Some(mask) = wait.mask {
+            let mask = mask & !trames_kernel::signal::UNBLOCKABLE;
+            if self.saved_wait_mask.get().is_none() {
+                let mut context = self.io_signals.context.lock().unwrap();
+                self.saved_wait_mask.set(Some(context.mask));
+                context.wait_mask = self.saved_wait_mask.get();
+                context.mask = mask;
+                self.io_signals.publish_mask(mask);
+            }
+            // Legacy signal queues still belong to task control. A real
+            // newly-unmasked signal uses that boundary, preserving this wait.
+            return self.owner_pending & !mask != 0;
+        }
+        false
+    }
+    pub fn finish_wait_mask(&self) {
+        if let Some(mask) = self.saved_wait_mask.take() {
+            let mut context = self.io_signals.context.lock().unwrap();
+            context.mask = mask;
+            context.wait_mask = None;
+            self.io_signals.publish_mask(mask);
+        }
+    }
     pub fn next_io_signal(&self) -> Option<(u32, bool)> {
         self.io_signals.next(!self.io_signals.mask())
     }
@@ -271,6 +299,7 @@ impl Snapshot {
         self.io_signals.publish_mask(frame.mask);
         *self.io_signals.context.lock().unwrap() = trames_kernel::signal::IoContext {
             mask: frame.mask,
+            wait_mask: self.saved_wait_mask.get(),
             frames: frame.frames,
             alt_stack: frame.alt_stack,
         };
@@ -288,7 +317,16 @@ impl Snapshot {
         let sme = cpu
             .sme_config()
             .map(|c| (c, cpu.sme_state(), C::features().hwcap2 & (1 << 37) != 0));
-        frame.enter_sme(&mut state, memory, sig, info, action, sme)?;
+        frame.enter_sme_restoring(
+            &mut state,
+            memory,
+            sig,
+            info,
+            action,
+            sme,
+            self.saved_wait_mask.get(),
+        )?;
+        self.saved_wait_mask.take();
         let has_sme = sme.is_some();
         cpu.restore_architectural_state(&state);
         if has_sme {
@@ -378,6 +416,15 @@ impl Snapshot {
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
         cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4)
     }
+    pub fn event_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
+        (self.seccomp.mode() != 0 && trames_linux::event_wait(cpu.x(8) as u32)).then(|| {
+            self.seccomp.entry_decision(
+                cpu.x(8) as u32,
+                cpu.pc(),
+                std::array::from_fn(|i| cpu.x(i)),
+            )
+        })
+    }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if cpu.x(8) as u32 == 25 && cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
             return false;
@@ -387,7 +434,8 @@ impl Snapshot {
         }
         // Filtered membership/sleep entries use the dedicated worker path, which
         // carries their exact decision through an owner-resource fallback.
-        if self.direct.supports_creation(cpu.x(8) as u32)
+        if trames_linux::event_wait(cpu.x(8) as u32)
+            || self.direct.supports_creation(cpu.x(8) as u32)
             || self.direct.supports_socket_control(cpu.x(8) as u32)
             || self.direct.supports_path_query(cpu.x(8) as u32)
             || self.direct.supports_epoll_control(cpu.x(8) as u32)
@@ -673,6 +721,8 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,
@@ -797,6 +847,8 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,
@@ -851,6 +903,8 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,
@@ -949,6 +1003,8 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,
@@ -1011,6 +1067,8 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            owner_pending: 0,
+            saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
             io_wake: None,

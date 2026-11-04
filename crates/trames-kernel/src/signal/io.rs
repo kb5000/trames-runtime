@@ -47,6 +47,7 @@ impl Inbox {
 #[derive(Clone, Copy, Default)]
 pub struct IoContext {
     pub mask: u64,
+    pub wait_mask: Option<u64>,
     pub frames: u32,
     pub alt_stack: AltStack,
 }
@@ -112,7 +113,18 @@ impl IoTask {
         self.live.store(false, Ordering::Relaxed);
     }
     pub fn publish_mask(&self, mask: u64) {
-        self.mask.store(mask, Ordering::Relaxed);
+        let old = self.mask.load(Ordering::Relaxed);
+        if old & !mask != 0 {
+            // An unblock must observe prior enqueues, or a later producer must
+            // observe this mask before selecting a wake target. Use the actual
+            // task/process queue locks; ordinary reads and blocking-only mask
+            // changes need no extra barrier or resource/global serialization.
+            let _private = self.inbox.pending.lock().unwrap();
+            let _process = self.process().pending.lock().unwrap();
+            self.mask.store(mask, Ordering::Relaxed);
+        } else {
+            self.mask.store(mask, Ordering::Relaxed);
+        }
     }
     pub fn mask(&self) -> u64 {
         self.mask.load(Ordering::Relaxed)
@@ -345,6 +357,7 @@ impl Signals {
     pub fn begin_io(&self) {
         *self.io.context.lock().unwrap() = IoContext {
             mask: self.mask,
+            wait_mask: self.wait_mask,
             frames: self.frames,
             alt_stack: self.alt_stack,
         };
@@ -353,6 +366,7 @@ impl Signals {
     pub fn finish_io(&mut self) {
         let state = *self.io.context.lock().unwrap();
         self.mask = state.mask;
+        self.wait_mask = state.wait_mask;
         self.frames = state.frames;
         self.alt_stack = state.alt_stack;
     }

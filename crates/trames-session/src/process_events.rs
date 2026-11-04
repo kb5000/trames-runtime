@@ -53,12 +53,21 @@ impl<C: Cpu> Kernel<C> {
         .map(Some)
     }
     pub(super) fn epoll(
-        &self,
+        &mut self,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
+        if p.retained_poll.is_some()
+            || p.linux
+                .vfs
+                .direct_descriptors()
+                .get(a[0] as u32)
+                .is_some_and(|fd| fd.is_epoll())
+        {
+            return self.poll(p, number, a, io);
+        }
         let timeout = trames_linux::epoll_parameters(&p.memory, number, a)?;
         let mask = if a[4] == 0 {
             None
@@ -100,15 +109,15 @@ impl<C: Cpu> Kernel<C> {
         }
         if !ready.is_empty() || p.poll_deadline.is_some_and(|d| Instant::now() >= d) {
             trames_linux::epoll_scatter(&mut p.memory, a[1], &ready)?;
-            if let Some(mask) = p.poll_mask.take() {
+            if let Some(mask) = p.signals.wait_mask.take() {
                 p.signals.mask = mask;
             }
             p.poll_deadline = None;
             Ok(Some(ready.len() as u64))
         } else {
             if let Some(mask) = mask {
-                if p.poll_mask.is_none() {
-                    p.poll_mask = Some(p.signals.mask);
+                if p.signals.wait_mask.is_none() {
+                    p.signals.wait_mask = Some(p.signals.mask);
                 }
                 p.signals.mask = mask;
             }

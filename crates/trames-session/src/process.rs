@@ -92,7 +92,6 @@ pub(crate) struct Process<C: Cpu> {
     wait_event: Option<i32>,
     poll_deadline: Option<Instant>,
     socket_deadline: Option<Instant>,
-    poll_mask: Option<u64>,
     uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
     retained_file: Option<trames_linux::FilePending>,
     retained_aio: Option<trames_linux::RetainedAio>,
@@ -106,8 +105,7 @@ pub(crate) struct Process<C: Cpu> {
     retained_message_owner: Option<trames_vfs::RetainedFd>,
     retained_socket: Option<trames_linux::RetainedSocket>,
     tcp_liveness: Option<trames_net::TcpLease>,
-    retained_poll: Option<trames_linux::RetainedPoll>,
-    retained_select: Option<trames_linux::RetainedSelect>,
+    retained_poll: Option<Arc<trames_linux::RetainedWait>>,
     pending_open: Option<u32>,
     stopped_state: Option<Box<State>>,
     auto_reap: bool,
@@ -204,9 +202,9 @@ impl<C: Cpu> Process<C> {
             return !self.linux.trace;
         }
         if let Some(poll) = &self.retained_poll {
-            return !self.linux.trace
-                && self.seccomp.mode() == 0
-                && poll.supports_worker(&self.linux.vfs);
+            // This original wait has already passed its entry policy. A
+            // cohort handoff must not turn an admitted wait into a new SVC.
+            return !self.linux.trace && poll.supports_worker(&self.linux.vfs);
         }
         if self.retained_socket.is_some()
             || self
@@ -388,7 +386,6 @@ impl<C: Cpu> Process<C> {
             wait_event: None,
             poll_deadline: None,
             socket_deadline: None,
-            poll_mask: None,
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
@@ -403,7 +400,6 @@ impl<C: Cpu> Process<C> {
             retained_message_owner: None,
             tcp_liveness: None,
             retained_poll: None,
-            retained_select: None,
             pending_open: None,
             stopped_state: None,
             auto_reap: false,
@@ -1278,7 +1274,6 @@ impl<C: Cpu> Kernel<C> {
         p.retained_message_owner = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
-        p.retained_select = None;
         self.parent_thread_exited(pid, p, None);
         p.linux.vfs.cgroup_exit(pid);
         let state = if matches!(p.state, State::Stopped) {
@@ -1738,9 +1733,11 @@ impl<C: Cpu> Kernel<C> {
                 if let Some(fd) = p.pending_open.take() {
                     p.linux.vfs.cancel_fifo_open(fd);
                 }
-                if let Some(mask) = p.poll_mask.take() {
-                    p.signals.mask = mask;
+                if let Some(wait) = p.retained_poll.as_ref() {
+                    let _ = wait.finish(&mut p.memory, Err(Errno(4)));
                 }
+                // Signal entry uses the temporary handler mask but records
+                // the pre-wait mask in ucontext for sigreturn.
                 p.poll_deadline = None;
                 p.uring_wait = None;
                 p.flock_wait = None;
@@ -1755,7 +1752,6 @@ impl<C: Cpu> Kernel<C> {
                 p.retained_message_owner = None;
                 p.tcp_liveness = None;
                 p.retained_poll = None;
-                p.retained_select = None;
                 let timed_socket = p.socket_deadline.take().is_some();
                 if !timed_socket
                     && action.flags & 0x10000000 != 0
@@ -2010,7 +2006,6 @@ impl<C: Cpu> Kernel<C> {
             p.retained_message_owner = None;
             p.tcp_liveness = None;
             p.retained_poll = None;
-            p.retained_select = None;
             p.linux.vfs.unshare_descriptors();
             p.linux.vfs.close_exec();
             let credentials = execute_vfs.credentials.clone();
@@ -3364,6 +3359,10 @@ impl<C: Cpu> Kernel<C> {
             Some(trames_linux::IoAttempt::SocketCheckpoint(_)) => {
                 unreachable!("owner socket retry")
             }
+            Some(trames_linux::IoAttempt::WaitCheckpoint(wait)) => {
+                p.retained_poll = Some(wait);
+                self.poll(p, number, a, io)
+            }
             Some(trames_linux::IoAttempt::Checkpoint) => {
                 unreachable!("joined shared byte call")
             }
@@ -3400,8 +3399,7 @@ impl<C: Cpu> Kernel<C> {
                     // into a later read, poll, or runnable CPU epoch.
                     p.poll_deadline = None;
                     p.retained_poll = None;
-                    p.retained_select = None;
-                    if let Some(mask) = p.poll_mask.take() {
+                    if let Some(mask) = p.signals.wait_mask.take() {
                         p.signals.mask = mask;
                     }
                 }
@@ -3481,7 +3479,7 @@ impl<C: Cpu> Kernel<C> {
                 .as_ref()
                 .is_some_and(|poll| poll.waits_for_stdin(&p.linux.vfs)),
             State::Blocked(72, _) => p
-                .retained_select
+                .retained_poll
                 .as_ref()
                 .is_some_and(|select| select.waits_for_stdin(&p.linux.vfs)),
             State::Blocked(22 | 441, a) => p
@@ -3526,100 +3524,53 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
-        let timeout = if number == 73 { a[2] } else { a[4] };
-        let mut expired = false;
-        if timeout != 0 && p.retained_poll.is_none() && p.retained_select.is_none() {
-            let sec = read_u64(&p.memory, timeout)?;
-            let ns = read_u64(&p.memory, timeout + 8)?;
-            if sec > i64::MAX as u64 || ns >= 1_000_000_000 {
-                return Err(Errno(22));
-            }
-            if p.poll_deadline.is_none() {
-                p.poll_deadline = Some(
-                    Instant::now()
-                        .checked_add(Duration::new(sec, ns as u32))
-                        .ok_or(Errno(22))?,
-                );
-            }
-        }
-        expired |= p.poll_deadline.is_some_and(|d| Instant::now() >= d);
-        let mask = if p.retained_poll.is_some() || p.retained_select.is_some() {
-            None
-        } else if number == 73 {
-            if a[3] != 0 {
-                if a[4] != 8 {
-                    return Err(Errno(22));
-                }
-                Some(read_u64(&p.memory, a[3])?)
-            } else {
-                None
-            }
-        } else if a[5] != 0 {
-            let ptr = read_u64(&p.memory, a[5])?;
-            let len = read_u64(&p.memory, a[5] + 8)?;
-            if ptr != 0 {
-                if len != 8 {
-                    return Err(Errno(22));
-                }
-                Some(read_u64(&p.memory, ptr)?)
-            } else {
-                None
-            }
+        let retained = p.retained_poll.take();
+        let fresh = if retained.is_none() {
+            Some(
+                trames_linux::RetainedWait::prepare_joined(
+                    &p.linux.vfs,
+                    &p.memory,
+                    number,
+                    a,
+                    p.poll_deadline,
+                )
+                .expect("owner event resource admitted")?,
+            )
         } else {
             None
         };
-        let mut count = 0;
-        let mut outputs = Vec::new();
-        if number == 73 {
-            let poll = match p.retained_poll.take() {
-                Some(poll) => poll,
-                None => trames_linux::RetainedPoll::prepare_joined(&p.linux.vfs, &p.memory, a)?,
-            };
-            let rows = poll.ready_joined(|fd, original, events| {
+        let wait = retained.as_deref().or(fresh.as_ref()).unwrap();
+        let result = if matches!(wait.number, 22 | 441) {
+            // A shared epoll already owns every admitted interest. Scatter its
+            // original event records directly, just as on a worker, rather
+            // than allocating a second byte vector for joined short waits.
+            wait.check(&mut p.memory)
+        } else {
+            wait.output(true, |fd, original, events| {
                 if !p.linux.vfs.matches_open_description(fd, original) {
                     return Ok(32);
                 }
                 self.readiness(p, fd, events, io)
-            })?;
-            for (address, ready) in rows {
-                if ready != 0 {
-                    count += 1;
-                }
-                outputs.push((address, ready.to_le_bytes().to_vec()));
-            }
-            p.retained_poll = Some(poll);
-        } else {
-            let select = match p.retained_select.take() {
-                Some(select) => select,
-                None => trames_linux::RetainedSelect::prepare_joined(&p.linux.vfs, &p.memory, a)?,
-            };
-            (count, outputs) = select.ready_joined(|fd, original, events| {
-                if !p.linux.vfs.matches_open_description(fd, original) {
-                    return Ok(32);
-                }
-                self.readiness(p, fd, events, io)
-            })?;
-            p.retained_select = Some(select);
-        }
-        if count != 0 || expired {
-            for (ptr, bytes) in outputs {
-                p.memory.write(ptr, &bytes).map_err(|_| Errno(14))?;
-            }
-            if let Some(old) = p.poll_mask.take() {
-                p.signals.mask = old;
-            }
-            p.poll_deadline = None;
-            p.retained_poll = None;
-            p.retained_select = None;
-            Ok(Some(count))
-        } else {
-            if let Some(mask) = mask {
-                if p.poll_mask.is_none() {
-                    p.poll_mask = Some(p.signals.mask);
+            })
+            .and_then(|(count, outputs)| wait.copy_output(&mut p.memory, count, outputs))
+        };
+        if result == Err(Errno(11)) {
+            if let Some(mask) = wait.mask {
+                if p.signals.wait_mask.is_none() {
+                    p.signals.wait_mask = Some(p.signals.mask);
                 }
                 p.signals.mask = mask & !UNBLOCKABLE;
             }
+            p.poll_deadline = wait.deadline;
+            p.retained_poll = retained.or_else(|| fresh.map(Arc::new));
             Ok(None)
+        } else {
+            let result = wait.finish(&mut p.memory, result);
+            if let Some(mask) = p.signals.wait_mask.take() {
+                p.signals.mask = mask;
+            }
+            p.poll_deadline = None;
+            result.map(Some)
         }
     }
     fn terminal_signal(
@@ -4578,6 +4529,9 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    owner_pending: p.signals.pending.bits()
+                        | p.signals.shared_pending.borrow().bits(),
+                    saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
                     seccomp: p.seccomp.clone(),
                     identities: [
                         p.linux.vfs.visible_pid(p.tgid) as u64,
@@ -5377,11 +5331,10 @@ impl<C: Cpu> Kernel<C> {
             if let Some(wait) = &p.retained_poll {
                 native_fds.extend(wait.native_wait_fds(&p.linux.vfs));
             }
-            if let Some(wait) = &p.retained_select {
-                native_fds.extend(wait.native_wait_fds(&p.linux.vfs));
-            }
-            if let State::Blocked(22 | 441, args) = p.state {
-                native_fds.extend(p.linux.vfs.native_wait_fds_for(args[0] as u32));
+            if p.retained_poll.is_none() {
+                if let State::Blocked(22 | 441, args) = p.state {
+                    native_fds.extend(p.linux.vfs.native_wait_fds_for(args[0] as u32));
+                }
             }
             native_fds.extend(p.linux.uring_native_wait_fds());
             if let Some((request, _)) = &p.flock_wait {
@@ -5560,7 +5513,6 @@ pub(super) fn run<C: Cpu>(
         wait_event: None,
         poll_deadline: None,
         socket_deadline: None,
-        poll_mask: None,
         uring_wait: None,
         retained_file: None,
         retained_aio: None,
@@ -5575,7 +5527,6 @@ pub(super) fn run<C: Cpu>(
         retained_message_owner: None,
         tcp_liveness: None,
         retained_poll: None,
-        retained_select: None,
         pending_open: None,
         stopped_state: None,
         auto_reap: false,
@@ -6266,6 +6217,7 @@ mod tests {
         assert!(matches!(p.state, State::Blocked(73, _)));
         assert_eq!(p.poll_deadline, deadline);
         p.poll_deadline = Some(Instant::now());
+        Arc::make_mut(p.retained_poll.as_mut().unwrap()).deadline = p.poll_deadline;
         k.call(1, &mut p, 73, args, &mut io);
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), 0);
@@ -6293,8 +6245,8 @@ mod tests {
         let mut io = trames_linux::CapturedOutput::default();
         k.call(1, &mut p, 72, args, &mut io);
         assert!(matches!(p.state, State::Blocked(72, _)));
-        assert!(p.retained_select.is_some());
-        assert!(!p.worker_io_candidate(1));
+        assert!(p.retained_poll.is_some());
+        assert!(p.worker_io_candidate(1));
         let deadline = p.poll_deadline;
         p.linux.vfs.close(reader).unwrap();
         let [replacement, new_writer] = p.linux.vfs.pipe(0).unwrap();
@@ -6315,7 +6267,7 @@ mod tests {
             p.memory.read_array::<8>(0x1000).unwrap(),
             (1u64 << reader).to_le_bytes()
         );
-        assert!(p.retained_select.is_none() && p.poll_deadline.is_none());
+        assert!(p.retained_poll.is_none() && p.poll_deadline.is_none());
         assert_eq!(p.linux.vfs.write(writer, b"x"), Err(Errno(32)));
         assert_eq!(p.linux.vfs.read(replacement, 3).unwrap(), b"new");
     }
@@ -6993,7 +6945,6 @@ mod tests {
             wait_event: None,
             poll_deadline: None,
             socket_deadline: None,
-            poll_mask: None,
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
@@ -7008,7 +6959,6 @@ mod tests {
             retained_message_owner: None,
             tcp_liveness: None,
             retained_poll: None,
-            retained_select: None,
             pending_open: None,
             stopped_state: None,
             auto_reap: false,
@@ -8344,7 +8294,7 @@ mod tests {
         let mut p = process();
         let mut k = kernel();
         p.poll_deadline = Some(Instant::now());
-        p.poll_mask = Some(0x200);
+        p.signals.wait_mask = Some(0x200);
         p.signals.mask = 0x400;
         let a = [999, 0x4800, 1, u64::MAX, 0, 8];
         p.state = State::Blocked(22, a);
@@ -8358,7 +8308,7 @@ mod tests {
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), error(Errno(9)));
         assert!(p.poll_deadline.is_none());
-        assert!(p.poll_mask.is_none());
+        assert!(p.signals.wait_mask.is_none());
         assert_eq!(p.signals.mask, 0x200);
     }
     #[test]
