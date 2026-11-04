@@ -255,3 +255,10 @@ projection collection still run at their existing lifecycle boundaries.
 `Epoch::finish` still stops its cohort. Exit events become waitable only after
 the current cleanup has finished and all group members have exited. None of
 these remaining dependencies is relabelled as a worker fast path or hidden RPC.
+
+Cross-cohort adoption keeps child waits disjoint from generic I/O retry
+transport. A previously blocked wait4/waitid owns its accepted `ChildWait`
+request; importing a second `IoCall` for the same syscall would replay it as
+unsupported I/O after the child event completed. The real Kernel adoption test
+covers both APIs. Existing owner-event resource envelopes remain an explicit
+compatibility boundary; they are not erased by this lifecycle change.

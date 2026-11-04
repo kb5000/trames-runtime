@@ -4524,6 +4524,7 @@ impl<C: Cpu> Kernel<C> {
             let limits = self.limit_authority(id, &self.processes[&id]);
             let p = self.processes.get_mut(&id).expect("cohort process");
             p.signals.begin_io();
+            let source_io = p.worker_io_candidate(id);
             let waiting = if let State::Futex { wait, deadline } = &p.state {
                 Some(crate::run_queue::WaitState::Futex {
                     wait: wait.clone(),
@@ -4562,10 +4563,7 @@ impl<C: Cpu> Kernel<C> {
                         args,
                     }),
                 ))
-            } else if !matches!(p.state, State::Ready)
-                && !p.worker_io_candidate(id)
-                && !p.worker_gpu_candidate()
-            {
+            } else if !matches!(p.state, State::Ready) && !source_io && !p.worker_gpu_candidate() {
                 Some(crate::run_queue::WaitState::OwnerEvent)
             } else {
                 None
@@ -4684,7 +4682,18 @@ impl<C: Cpu> Kernel<C> {
                         + self.instructions.saturating_sub(instructions),
                 }));
             }
-            if let State::Blocked(number, args) = p.state {
+            let io_retry = match p.state {
+                State::Blocked(number, args)
+                    if !matches!(job.waiting, Some(crate::run_queue::WaitState::Child(_))) =>
+                {
+                    Some((number, args))
+                }
+                _ => None,
+            };
+            if let Some((number, args)) = io_retry {
+                // A child wait owns its accepted request, not a second I/O
+                // retry. Existing owner-event compatibility state still uses
+                // its legacy envelope until that resource is migrated.
                 // Re-arm against the new epoch target. The owner's notification
                 // target cannot schedule a parked worker in this cohort.
                 let previous = p.byte_wait.take();
@@ -7002,6 +7011,62 @@ mod tests {
             vec![(1, 0), (3, 1)]
         );
         assert_eq!(assign_cpus([(1, 3), (2, 3)], 2), vec![(1, 0), (2, 1)]);
+    }
+    #[test]
+    fn owner_adopted_child_wait_cannot_be_replayed_as_an_io_retry() {
+        use trames_engine::Cpu as _;
+        for number in [95, 260] {
+            let mut parent = process();
+            parent.affinity = 3;
+            parent.state = State::Blocked(
+                number,
+                if number == 260 {
+                    [42, 0x1000, 0, 0, 0, 0]
+                } else {
+                    [1, 42, 0x1000, 4, 0, 0]
+                },
+            );
+            parent.cpu.set_x(8, number as u64);
+            parent.cpu.set_x(19, u64::MAX);
+            for (i, word) in [0xaa0003f3u32, 0x14000000].into_iter().enumerate() {
+                parent
+                    .memory
+                    .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            parent
+                .memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                .unwrap();
+            let mut peer = parent.fork();
+            peer.tgid = 2;
+            peer.parent = 1;
+            peer.cpu.set_pc(0x4004);
+            let mut child = parent.fork();
+            child.tgid = 42;
+            child.parent = 1;
+            child.state = State::Zombie(23 << 8);
+            let mut kernel = kernel();
+            kernel.cpu_count = 2;
+            kernel.workers = crate::workers::Pool::new(2);
+            kernel.per_cpu = vec![Duration::ZERO; 2];
+            kernel.processes.insert(1, parent);
+            kernel.processes.insert(2, peer);
+            kernel.processes.insert(42, child);
+            let expected = if number == 260 { 42 } else { 0 };
+            for _ in 0..8 {
+                let limit = kernel.instructions + 100_000;
+                assert!(kernel
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+                    .unwrap());
+                if kernel.processes[&1].cpu.x(19) == expected {
+                    break;
+                }
+            }
+            assert_eq!(kernel.processes[&1].cpu.x(19), expected);
+            assert_eq!(kernel.service_requests, 0);
+            assert!(!kernel.cohort_return_syscalls.contains_key(&number));
+        }
     }
     pub(super) fn process() -> Box<Process> {
         let mut memory = Memory::default();
