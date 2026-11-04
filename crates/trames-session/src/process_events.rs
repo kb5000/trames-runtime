@@ -4,14 +4,6 @@ use super::*;
 
 pub(super) use trames_kernel::signal::write_siginfo;
 
-fn timespec(m: &Memory, address: u64) -> Result<Duration, Errno> {
-    let sec = read_u64(m, address)?;
-    let ns = read_u64(m, address.checked_add(8).ok_or(Errno(14))?)?;
-    if sec > i64::MAX as u64 || ns >= 1_000_000_000 {
-        return Err(Errno(22));
-    }
-    Ok(Duration::new(sec, ns as u32))
-}
 impl<C: Cpu> Kernel<C> {
     pub(super) fn timerfd(
         &self,
@@ -172,22 +164,15 @@ impl<C: Cpu> Kernel<C> {
                 info,
                 deadline,
             } => {
-                if let Some((sig, shared)) = p.next_signal(mask) {
-                    let value = p.take_signal(sig, shared);
-                    if info != 0 {
-                        let mut bytes = [0; 128];
-                        write_siginfo(&mut bytes, sig, value);
-                        if p.memory.write(info, &bytes).is_err() {
-                            p.cpu.set_x(0, error(Errno(14)));
-                            p.state = State::Ready;
-                            return true;
-                        }
-                    }
-                    p.cpu.set_x(0, sig as u64);
-                    p.state = State::Ready;
-                    true
-                } else if deadline.is_some_and(|d| Instant::now() >= d) {
-                    p.cpu.set_x(0, error(Errno(11)));
+                let wait = trames_kernel::signal::SignalWait::Timed {
+                    mask,
+                    info,
+                    deadline,
+                };
+                if let Some(value) =
+                    wait.check(&p.signals.io, &mut p.memory, p.linux.vfs.pid_namespace())
+                {
+                    p.cpu.set_x(0, value.unwrap_or_else(error));
                     p.state = State::Ready;
                     true
                 } else {
@@ -231,25 +216,17 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             137 => {
-                if a[3] != 8 {
-                    return Err(Errno(22));
-                }
-                let mask = read_u64(&p.memory, a[0])? & !UNBLOCKABLE;
-                if a[1] != 0 {
-                    Linux::check(&p.memory, a[1], 128, Access::Write)?;
-                }
-                let deadline = if a[2] == 0 {
-                    None
-                } else {
-                    Some(
-                        Instant::now()
-                            .checked_add(timespec(&p.memory, a[2])?)
-                            .ok_or(Errno(22))?,
-                    )
+                let trames_kernel::signal::SignalWait::Timed {
+                    mask,
+                    info,
+                    deadline,
+                } = trames_kernel::signal::SignalWait::prepare(number, a, &p.memory)?
+                else {
+                    unreachable!()
                 };
                 p.state = State::Sigwait {
                     mask,
-                    info: a[1],
+                    info,
                     deadline,
                 };
                 self.resume_event(p);

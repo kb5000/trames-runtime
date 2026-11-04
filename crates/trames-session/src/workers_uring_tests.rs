@@ -7,7 +7,7 @@ use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
         timers: None,
-        owner_pending: 0,
+
         saved_wait_mask: Default::default(),
         io_signals: Default::default(),
         io_routes: Default::default(),

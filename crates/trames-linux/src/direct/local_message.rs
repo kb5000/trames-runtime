@@ -189,7 +189,7 @@ impl DirectSyscalls {
         if number == 269 {
             return Some(Batch::new(args).map(|batch| RetainedByte {
                 fd: fd.clone(),
-                message: Some(Arc::new(AcceptedMessage {
+                operation: ByteOperation::Message(Arc::new(AcceptedMessage {
                     transfer: Transfer::Batch(Box::new(batch)),
                     factory: factory.clone(),
                     identity,
@@ -216,7 +216,7 @@ impl DirectSyscalls {
             crate::network::unix::prepare_transfer(number, args, memory, &io)?.map(|prepared| {
                 RetainedByte {
                     fd: fd.clone(),
-                    message: Some(Arc::new(AcceptedMessage {
+                    operation: ByteOperation::Message(Arc::new(AcceptedMessage {
                         transfer: Transfer::Single { prepared, datagram },
                         factory: factory.clone(),
                         identity,
@@ -282,7 +282,10 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if let Some(accepted) = &file.message {
+        if let ByteOperation::Signal(read) = &file.operation {
+            return Some(read.check(&file.fd, memory));
+        }
+        if let Some(accepted) = file.message() {
             let Transfer::Single { prepared, datagram } = &accepted.transfer else {
                 let Transfer::Batch(batch) = &accepted.transfer else {
                     unreachable!()
@@ -316,7 +319,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let accepted = file.message.clone().expect("accepted local message");
+        let accepted = file.message().cloned().expect("accepted local message");
         let number = accepted.number;
         let args = accepted.args;
         let socket = owner.local_socket(vfs).expect("original local OFD");
@@ -411,14 +414,14 @@ impl DirectSyscalls {
 }
 impl RetainedByte {
     pub(super) fn datagram_target(&self) -> Option<&trames_vfs::LocalDatagram> {
-        match &self.message.as_ref()?.transfer {
+        match &self.message()?.transfer {
             Transfer::Single { datagram, .. } => datagram.as_ref()?.target.get(),
             Transfer::Batch(_) => None,
         }
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
         let mut subscriptions = self.fd.subscribe(signal);
-        if let Some(Transfer::Batch(batch)) = self.message.as_ref().map(|m| &m.transfer) {
+        if let Some(Transfer::Batch(batch)) = self.message().map(|m| &m.transfer) {
             subscriptions.extend(batch.subscribe(signal));
         }
         if let Some(target) = self.datagram_target() {
@@ -427,13 +430,13 @@ impl RetainedByte {
         subscriptions
     }
     pub(super) fn batch_shares_resources(&self, fds: &DirectFds) -> bool {
-        matches!(self.message.as_ref().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.shares_resources(fds))
+        matches!(self.message().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.shares_resources(fds))
     }
     pub fn batch_pipe_signal(&self) -> bool {
-        matches!(self.message.as_ref().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.pipe_signal())
+        matches!(self.message().map(|m| &m.transfer), Some(Transfer::Batch(batch)) if batch.pipe_signal())
     }
     pub fn local_message_entry(&self) -> Option<(u32, [u64; 6])> {
-        self.message.as_ref().map(|m| (m.number, m.args))
+        self.message().map(|m| (m.number, m.args))
     }
 }
 

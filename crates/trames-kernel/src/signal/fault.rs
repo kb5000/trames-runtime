@@ -40,8 +40,8 @@ impl Signals {
         if self.actions.get(signal as usize).handler <= 1 || self.mask & (1 << (signal - 1)) != 0 {
             return false;
         }
-        self.pending.discard(signal);
-        let _ = self.pending.enqueue(
+        self.io.inbox.discard(signal);
+        let _ = self.io.inbox.enqueue(
             signal,
             Info {
                 code,
@@ -55,7 +55,7 @@ impl Signals {
         if self.pending_bits() & (1 << 8) != 0 {
             return self.next_signal(1 << 8);
         }
-        if let Some((&sig, _)) = self.pending.iter().find(|(_, info)| info.fault.is_some()) {
+        if let Some(sig) = self.io.inbox.first_fault() {
             return Some((sig, false));
         }
         let mut allowed = !self.mask | UNBLOCKABLE;

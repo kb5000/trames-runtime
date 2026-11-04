@@ -21,6 +21,7 @@ pub(super) use domains::{Checkpoint, Domain};
 pub(super) enum WaitState {
     /// A lifecycle-owned wait; ring maintenance must not retire its syscall.
     OwnerEvent,
+    Signal(Arc<SignalWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -30,12 +31,28 @@ pub(super) enum WaitState {
         remaining: u64,
     },
 }
+pub(super) struct SignalWait {
+    pub request: trames_kernel::signal::SignalWait,
+    subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
+}
+impl SignalWait {
+    pub fn new(request: trames_kernel::signal::SignalWait) -> Arc<Self> {
+        Arc::new(Self {
+            request,
+            subscriptions: Mutex::default(),
+        })
+    }
+    pub fn bind(&self, task: &trames_kernel::signal::IoTask, signal: &Arc<trames_vfs::IoSignal>) {
+        *self.subscriptions.lock().unwrap() = task.subscribe(signal);
+    }
+}
 impl WaitState {
     fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
             Self::OwnerEvent => None,
+            Self::Signal(wait) => wait.request.deadline(),
         }
     }
     fn woken(&self) -> bool {
@@ -264,6 +281,16 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if let Some(WaitState::Signal(wait)) = &self.waiting {
+            if self
+                .work
+                .syscalls
+                .as_ref()
+                .is_some_and(|s| wait.request.ready(&s.io_signals))
+            {
+                return true;
+            }
+        }
         self.work.syscalls.as_ref().is_some_and(|s| {
             s.next_io_signal().is_some_and(|(sig, _)| {
                 s.actions.get(sig as usize).handler <= 1
@@ -545,6 +572,9 @@ impl<C: Cpu> Epoch<C> {
         if let Some(snapshot) = &mut job.work.syscalls {
             let signal = trames_vfs::IoSignal::new(pid, self.io_target.clone());
             snapshot.io_signals.set_wake(&signal);
+            if let Some(WaitState::Signal(wait)) = &job.waiting {
+                wait.bind(&snapshot.io_signals, &signal);
+            }
             snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
@@ -688,6 +718,7 @@ impl<C: Cpu> Epoch<C> {
                     .as_ref()
                     .and_then(WaitState::deadline)
                     .is_some_and(|d| d <= now)
+                    && !matches!(job.waiting, Some(WaitState::Signal(_)))
                 {
                     let waiting = job.waiting.take().unwrap();
                     job.work.cpu.set_x(0, waiting.expire());
@@ -867,6 +898,7 @@ impl<C: Cpu> Epoch<C> {
                 .as_ref()
                 .and_then(WaitState::deadline)
                 .is_some_and(|d| d <= Instant::now())
+                && !matches!(job.waiting, Some(WaitState::Signal(_)))
             {
                 let waiting = job.waiting.take().unwrap();
                 job.work.cpu.set_x(0, waiting.expire());

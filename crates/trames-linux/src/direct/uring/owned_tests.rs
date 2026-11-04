@@ -43,6 +43,85 @@ fn register_files(l: &mut Linux, m: &mut Memory, fd: u32, files: &[i32]) {
     l.uring_register([fd as u64, 2, 0x1200, files.len() as u64, 0, 0], m)
         .unwrap();
 }
+#[derive(Default)]
+struct SignalQueue {
+    queue: std::sync::Mutex<std::collections::VecDeque<[u8; 128]>>,
+    ready: Arc<trames_vfs::Readiness>,
+}
+impl trames_vfs::SignalReader for SignalQueue {
+    fn poll(&self, mask: u64) -> (u16, [u64; 2]) {
+        (
+            u16::from(mask & (1 << 9) != 0 && !self.queue.lock().unwrap().is_empty()),
+            [0; 2],
+        )
+    }
+    fn take(&self, mask: u64) -> Option<[u8; 128]> {
+        if mask & (1 << 9) == 0 {
+            None
+        } else {
+            self.queue.lock().unwrap().pop_front()
+        }
+    }
+    fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+        vec![self.ready.subscribe(signal)]
+    }
+}
+#[test]
+fn signalfd_uring_read_vector_fixed_and_poll_keep_submitter_and_original_ofd() {
+    for op in [22, 1, 4, 6] {
+        let (mut l, mut m, fd, r) = setup(8);
+        let queue = Arc::new(SignalQueue::default());
+        l.vfs.bind_signal_reader(queue.clone());
+        let signal = l.vfs.signalfd(-1, 1 << 9, 0).unwrap();
+        register_files(&mut l, &mut m, fd, &[signal as i32]);
+        let mut pin = None;
+        let mut entry = if op == 1 {
+            m.write_array(0x2000, 0x3000u64.to_le_bytes()).unwrap();
+            m.write_array(0x2008, 128u64.to_le_bytes()).unwrap();
+            data(op, 0, 0x2000, 1, 9, 1)
+        } else if op == 6 {
+            let mut e = sqe(6, 0, 9);
+            e[1] = 1;
+            e[28..32].copy_from_slice(&1u32.to_le_bytes());
+            e
+        } else {
+            data(op, 0, 0x3000, 128, 9, 1)
+        };
+        if op == 4 {
+            register_buffers(&mut l, &mut m, fd, 0x3000, 128);
+            pin = Some(r.state.lock().unwrap().buffers.as_ref().unwrap()[0].clone());
+            entry[40..42].copy_from_slice(&0u16.to_le_bytes());
+        }
+        l.vfs.close(signal).unwrap();
+        assert_eq!(l.vfs.eventfd(1, 0).unwrap(), signal);
+        add(&mut m, &r, entry);
+        let mut epoch = UringEpoch::default();
+        let snapshot = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
+        let IoAttempt::Blocked(wait) = start(&snapshot, fd, 1, 1, &mut m) else {
+            panic!("signalfd operation {op} must park")
+        };
+        assert!(!wait.signal.ready());
+        if op == 4 {
+            m.unmap(0x3000, PAGE_SIZE).unwrap();
+            m.map(0x3000, PAGE_SIZE, Permissions::RW).unwrap();
+            m.write_array(0x3000, 55u32.to_le_bytes()).unwrap();
+        }
+        let mut record = [0; 128];
+        record[..4].copy_from_slice(&10u32.to_le_bytes());
+        queue.queue.lock().unwrap().push_back(record);
+        queue.ready.notify_atomic();
+        assert!(wait.signal.ready());
+        complete(snapshot.resume(wait, &mut m), 1);
+        assert_eq!(cq(&mut m, &r), (9, if op == 6 { 1 } else { 128 }));
+        if let Some(pin) = pin {
+            assert_eq!(&pin.read(0, 4).unwrap(), &10u32.to_le_bytes());
+            assert_eq!(m.read_array::<4>(0x3000).unwrap(), 55u32.to_le_bytes());
+        } else if op != 6 {
+            assert_eq!(m.read_array::<4>(0x3000).unwrap(), 10u32.to_le_bytes());
+        }
+        assert!(epoch.finish().is_empty());
+    }
+}
 #[test]
 fn numeric_shared_uring_caches_do_not_retain_closed_files_or_pipe_endpoints() {
     let (mut l, m, fd, _r) = setup(8);

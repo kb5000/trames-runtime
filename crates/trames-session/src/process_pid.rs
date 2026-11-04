@@ -20,7 +20,7 @@ impl<C: Cpu> Kernel<C> {
             }
             let sig = child.pdeath_signal;
             if sig != 0 && Self::prepare_signal(child, sig, parent.tgid) {
-                let _ = child.signals.shared_pending.borrow_mut().enqueue(
+                let _ = child.signals.io.process().enqueue(
                     sig,
                     Info {
                         sender: parent.tgid,

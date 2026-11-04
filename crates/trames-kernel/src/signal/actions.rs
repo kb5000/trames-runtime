@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared Linux sighand table. Pending queues and mutation side effects remain
-//! with the task owner; query-only rt_sigaction can execute on a worker.
+//! Shared Linux sighand table. Disposition updates serialize only with sends
+//! and queue-discard effects on this original task group's resources.
 use super::UNBLOCKABLE;
 use std::sync::{Arc, Mutex};
 use trames_memory::{Access, CpuMemory};
@@ -56,10 +56,17 @@ impl Actions {
         }
         Self(Arc::new(Mutex::new(table)))
     }
-    /// Same ABI and preflight order for the task owner and query-only workers.
-    /// Mutation callers additionally clear ignored pending signals in their
-    /// thread group; do not admit mutating calls without those shared queues.
+    /// Same ABI and preflight order for the task owner and executing workers.
+    /// Mutation callers clear ignored pending signals in their thread group.
     pub fn call(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<Option<Action>, Errno> {
+        self.call_with(a, memory, |_| {})
+    }
+    pub fn call_with(
+        &self,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        changed: impl FnOnce(Action),
+    ) -> Result<Option<Action>, Errno> {
         let signal = a[0] as u32;
         if signal == 0 || signal > 64 || signal == 9 || signal == 19 || a[3] != 8 {
             return Err(Errno(22));
@@ -92,6 +99,7 @@ impl Actions {
             // fault-without-mutation contract and keep old/new one transaction.
             Self::export(table[signal as usize], a[2], memory)?;
             table[signal as usize] = action;
+            changed(action);
         } else if a[2] != 0 {
             // Query-only workers never keep the table lock across guest bytes.
             Self::export(self.get(signal as usize), a[2], memory)?;
@@ -117,6 +125,10 @@ impl Actions {
             return None;
         }
         Some(self.call(a, memory).map(|_| 0))
+    }
+    pub fn with_action<R>(&self, sig: u32, body: impl FnOnce(Action) -> R) -> R {
+        let table = self.0.lock().unwrap();
+        body(table[sig as usize])
     }
     pub fn set_handler(&self, signal: usize, handler: u64) {
         self.0.lock().unwrap()[signal].handler = handler;

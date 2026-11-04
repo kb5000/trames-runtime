@@ -6,7 +6,7 @@ use trames_vfs::Errno;
 
 #[test]
 fn fork_and_exec_preserve_task_ownership_without_copying_pending_signals() {
-    let mut parent = Signals {
+    let parent = Signals {
         mask: 1 << 11,
         frames: 2,
         alt_stack: AltStack {
@@ -18,12 +18,8 @@ fn fork_and_exec_preserve_task_ownership_without_copying_pending_signals() {
     };
     parent.actions.set_handler(10, 0x4000);
     parent.actions.set_handler(12, 1);
-    parent.pending.enqueue(10, Info::default()).unwrap();
-    parent
-        .shared_pending
-        .borrow_mut()
-        .enqueue(12, Info::default())
-        .unwrap();
+    parent.io.inbox.enqueue(10, Info::default()).unwrap();
+    parent.io.process().enqueue(12, Info::default()).unwrap();
     let mut fork = parent.fork(false);
     let shared = parent.fork(true);
     parent.actions.set_handler(10, 0x5000);

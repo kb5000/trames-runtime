@@ -18,6 +18,26 @@ pub(crate) fn resource_rw(
         vec![(s.address(), (s.length() as usize).min(MAX_WRITE))]
     };
     let count: usize = parts.iter().map(|p| p.1).sum();
+    if let Some(file) = request.file.as_ref().filter(|f| f.is_signalfd()) {
+        let fd = vfs
+            .direct_descriptors()
+            .byte_file(file.shared_file().unwrap())
+            .ok_or(Errno(95))?;
+        if !matches!(s.offset(), 0 | u64::MAX) {
+            return Err(Errno(29));
+        }
+        if write {
+            return Err(Errno(22));
+        }
+        return crate::direct::signal_read::SignalRead::uring(
+            &fd,
+            &parts,
+            memory,
+            s.opcode() == 1,
+            request.buffer.as_deref(),
+        )
+        .map(|n| (n as i32, n == request.requested));
+    }
     for &(address, len) in &parts {
         if len != 0 && request.buffer.is_none() {
             Linux::check(
@@ -210,7 +230,14 @@ pub(crate) fn owner(
                 return Err(Errno(22));
             }
             let file = request.file.as_ref().unwrap();
-            let (events, epoch) = file.with_retained(vfs, |f| f.readiness(s.op_flags() as u16));
+            let (events, epoch) = if file.is_signalfd() {
+                vfs.direct_descriptors()
+                    .byte_file(file.shared_file().unwrap())
+                    .and_then(|f| f.poll_state(s.op_flags() as u16))
+                    .ok_or(Errno(95))?
+            } else {
+                file.with_retained(vfs, |f| f.readiness(s.op_flags() as u16))
+            };
             let fresh = !s.multishot()
                 || s.length() & 8 != 0
                 || events & !request.poll_ready != 0

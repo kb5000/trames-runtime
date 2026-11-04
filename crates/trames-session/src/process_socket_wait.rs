@@ -1,7 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use trames_cpu::Cpu as Interpreter;
+use trames_linux::CapturedOutput;
 use trames_memory::{Permissions, PAGE_SIZE};
+
+#[test]
+fn joined_sigsuspend_preserves_temporary_handler_mask_and_restores_original_mask() {
+    let mut p = super::tests::process();
+    let mut k = super::tests::kernel();
+    let original = (1 << 9) | (1 << 11);
+    let temporary = 1u64 << 14;
+    p.signals.mask = original;
+    p.signals.actions.set_handler(10, 0x4000);
+    p.memory
+        .write_array(0x1000, temporary.to_le_bytes())
+        .unwrap();
+    k.call(
+        1,
+        &mut p,
+        133,
+        [0x1000, 8, 0, 0, 0, 0],
+        &mut CapturedOutput::default(),
+    );
+    assert!(matches!(p.state,State::Suspend(old) if old==original));
+    Kernel::queue_one(1, &mut p, 10, 1);
+    assert!(k.deliver(1, &mut p).unwrap());
+    assert_eq!(p.signals.mask, temporary | (1 << 9));
+    Kernel::sigreturn(&mut p).unwrap();
+    assert_eq!(p.signals.mask, original);
+    assert_eq!(p.cpu.x(0), error(Errno(4)));
+}
 
 #[test]
 fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services() {
@@ -869,7 +897,7 @@ fn native_message_epipe_hands_only_saved_task_effects_to_owner() {
             );
             assert_eq!(k.processes[&1].seccomp.evaluations(), 3);
             assert_eq!(
-                k.processes[&1].signals.pending.contains_key(&13),
+                k.processes[&1].signals.io.inbox.contains_key(&13),
                 !no_signal
             );
             if no_signal {
@@ -1588,7 +1616,7 @@ fn joined_pty_wait_and_signal_handoff_keep_accepted_endpoints_after_fd_reuse() {
     p.retained_byte = Some(accepted);
     k.call(1, &mut p, 64, write, &mut output);
     assert_eq!(p.cpu.x(0), 1);
-    assert!(p.signals.pending.contains_key(&2));
+    assert!(p.signals.io.inbox.contains_key(&2));
     assert!(p.retained_byte.is_none());
     assert!(!pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
 }
@@ -1812,7 +1840,7 @@ fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decisio
 #[test]
 fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creator() {
     let mut p = super::tests::process();
-    let k = super::tests::kernel();
+    let mut k = super::tests::kernel();
     let fd = p
         .linux
         .vfs
@@ -1828,19 +1856,22 @@ fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creato
         fault: None,
         poll: None,
     };
-    p.signals.pending.enqueue(10, info(31)).unwrap();
-    peer.signals.pending.enqueue(12, info(41)).unwrap();
+    p.signals.io.inbox.enqueue(10, info(31)).unwrap();
+    peer.signals.io.inbox.enqueue(12, info(41)).unwrap();
     let args = [fd as u64, 0x1800, 128, 0, 0, 0];
-    assert_eq!(k.read_signalfd(&mut peer, 63, args), Ok(Some(128)));
+    k.call(2, &mut peer, 63, args, &mut CapturedOutput::default());
+    assert_eq!(peer.cpu.x(0), 128);
     assert_eq!(
         u32::from_le_bytes(peer.memory.read_array(0x1800).unwrap()),
         12
     );
-    assert!(p.signals.pending.contains_key(&10));
-    assert!(peer.signals.pending.is_empty());
-    assert_eq!(k.read_signalfd(&mut p, 63, args), Ok(Some(128)));
+    assert!(p.signals.io.inbox.contains_key(&10));
+    assert!(peer.signals.io.inbox.is_empty());
+    k.call(1, &mut p, 63, args, &mut CapturedOutput::default());
+    assert_eq!(p.cpu.x(0), 128);
     assert_eq!(u32::from_le_bytes(p.memory.read_array(0x1800).unwrap()), 10);
-    assert_eq!(k.read_signalfd(&mut peer, 63, args), Err(Errno(11)));
+    k.call(2, &mut peer, 63, args, &mut CapturedOutput::default());
+    assert_eq!(peer.cpu.x(0), error(Errno(11)));
 }
 
 #[test]
@@ -2696,7 +2727,7 @@ fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filt
         assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 1);
         assert_eq!(k.processes[&1].seccomp.evaluations(), 3);
         assert_eq!(
-            k.processes[&1].signals.pending.contains_key(&13),
+            k.processes[&1].signals.io.inbox.contains_key(&13),
             !no_signal
         );
         let p = k.processes.get_mut(&1).unwrap();

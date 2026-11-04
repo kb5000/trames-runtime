@@ -12,7 +12,7 @@ use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
     pub timers: Option<Arc<trames_kernel::timers::Timers>>,
-    pub owner_pending: u64,
+
     pub saved_wait_mask: std::cell::Cell<Option<u64>>,
     pub io_signals: Arc<trames_kernel::signal::IoTask>,
     pub io_routes: trames_kernel::signal::IoRoutes,
@@ -258,9 +258,27 @@ pub(super) fn futex_queue(
 }
 
 impl Snapshot {
+    pub fn begin_signal_wait(
+        &self,
+        request: trames_kernel::signal::SignalWait,
+    ) -> crate::run_queue::WaitState {
+        if let trames_kernel::signal::SignalWait::Suspend { mask } = request {
+            let mut context = self.io_signals.context.lock().unwrap();
+            self.saved_wait_mask.set(Some(context.mask));
+            context.wait_mask = self.saved_wait_mask.get();
+            context.mask = mask;
+            self.io_signals.publish_mask(mask);
+        }
+        let wait = crate::run_queue::SignalWait::new(request);
+        wait.bind(
+            &self.io_signals,
+            self.io_wake.as_ref().expect("task wait wake"),
+        );
+        crate::run_queue::WaitState::Signal(wait)
+    }
     /// Only a blocked accepted event wait changes task mask state. The calling
     /// task owns this Snapshot; its Cell avoids locks for unmasked completions.
-    pub fn begin_wait_mask(&self, wait: &trames_linux::RetainedWait) -> bool {
+    pub fn begin_wait_mask(&self, wait: &trames_linux::RetainedWait) {
         if let Some(mask) = wait.mask {
             let mask = mask & !trames_kernel::signal::UNBLOCKABLE;
             if self.saved_wait_mask.get().is_none() {
@@ -270,11 +288,7 @@ impl Snapshot {
                 context.mask = mask;
                 self.io_signals.publish_mask(mask);
             }
-            // Legacy signal queues still belong to task control. A real
-            // newly-unmasked signal uses that boundary, preserving this wait.
-            return self.owner_pending & !mask != 0;
         }
-        false
     }
     pub fn finish_wait_mask(&self) {
         if let Some(mask) = self.saved_wait_mask.take() {
@@ -438,6 +452,24 @@ impl Snapshot {
             )
         })
     }
+    pub fn signal_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
+        (self.seccomp.mode() != 0
+            && (matches!(cpu.x(8) as u32, 132..=137) || self.signal_send(cpu)))
+        .then(|| {
+            self.seccomp.entry_decision(
+                cpu.x(8) as u32,
+                cpu.pc(),
+                std::array::from_fn(|i| cpu.x(i)),
+            )
+        })
+    }
+    pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
+        matches!(cpu.x(8) as u32, 129..=131)
+            && !matches!(
+                cpu.x(if cpu.x(8) as u32 == 131 { 2 } else { 1 }) as u32,
+                18..=22
+            )
+    }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if cpu.x(8) as u32 == 25 && cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
             return false;
@@ -445,7 +477,10 @@ impl Snapshot {
         if self.seccomp.mode() == 0 {
             return true;
         }
-        if trames_kernel::timers::timer_call(cpu.x(8) as u32) {
+        if trames_kernel::timers::timer_call(cpu.x(8) as u32)
+            || matches!(cpu.x(8) as u32, 132..=137)
+            || self.signal_send(cpu)
+        {
             return false;
         }
         // Filtered membership/sleep entries use the dedicated worker path, which
@@ -469,7 +504,6 @@ impl Snapshot {
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
-            && !(cpu.x(8) as u32 == 134 && cpu.x(1) == 0)
             && !(cpu.x(8) as u32 == 214 && cpu.x(0) == 0)
             && !(cpu.x(8) as u32 == 436 && cpu.x(2) as u32 == 4)
             && !self
@@ -515,6 +549,10 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            number @ 129..=131 => {
+                self.io_routes
+                    .send(&self.io_signals, number, std::array::from_fn(|i| cpu.x(i)))?
+            }
             25 if matches!(cpu.x(1), 8..=11 | 15 | 16) => {
                 self.direct.record_fd_control();
                 self.fd_flags.async_control(
@@ -602,9 +640,27 @@ impl Snapshot {
                 &self.io_routes.directory,
                 &self.io_routes.namespace,
             ),
+            132 => {
+                self.io_signals
+                    .alt_stack_call(cpu.sp(), std::array::from_fn(|i| cpu.x(i)), memory)
+            }
             134 => self
                 .actions
-                .query(std::array::from_fn(|i| cpu.x(i)), memory)?,
+                .call_with(std::array::from_fn(|i| cpu.x(i)), memory, |action| {
+                    let sig = cpu.x(0) as u32;
+                    if trames_kernel::signal::ignored(sig, action) {
+                        self.io_routes
+                            .directory
+                            .discard_process(self.io_signals.tgid(), sig);
+                    }
+                })
+                .map(|_| 0),
+            135 => self
+                .io_signals
+                .mask_call(std::array::from_fn(|i| cpu.x(i)), memory),
+            136 => self
+                .io_signals
+                .pending_call(std::array::from_fn(|i| cpu.x(i)), memory),
             number @ 160..=162 => trames_linux::uts_call(
                 self.uts.as_ref()?,
                 number,
@@ -747,7 +803,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -874,7 +930,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -931,7 +987,7 @@ mod tests {
             .unwrap();
         let mut snapshot = Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -1032,7 +1088,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -1097,7 +1153,7 @@ mod tests {
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),

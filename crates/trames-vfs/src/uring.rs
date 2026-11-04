@@ -94,7 +94,7 @@ impl RetainedFd {
             || o.anonymous.is_some()
     }
     pub fn poll(&self, events: u16) -> u16 {
-        Vfs::poll_open(&self.0.open.borrow(), events, 0)
+        Vfs::poll_open(&self.0.open.borrow(), events, 0, None)
     }
     pub fn datagram(&self) -> bool {
         let open = self.0.open.borrow();
@@ -107,7 +107,10 @@ impl RetainedFd {
     }
     pub fn readiness(&self, events: u16) -> (u16, [u64; 2]) {
         let open = self.0.open.borrow();
-        (Vfs::poll_open(&open, events, 0), Vfs::poll_epoch(&open))
+        (
+            Vfs::poll_open(&open, events, 0, None),
+            Vfs::poll_epoch(&open),
+        )
     }
     pub fn socket(&self) -> Option<Arc<NetSocket>> {
         self.0.open.borrow().socket.clone()
@@ -138,6 +141,13 @@ impl UringFile {
             self.file.open.control,
             Some(events::SharedControl::Event(_))
         )
+    }
+    pub fn is_signalfd(&self) -> bool {
+        self.owner.is_none()
+            && matches!(
+                self.file.open.control,
+                Some(events::SharedControl::Signal(_))
+            )
     }
     pub fn identity(&self) -> usize {
         self.file.identity()
@@ -215,9 +225,7 @@ impl RetainedFd {
         if open.anonymous.as_ref().is_some_and(|a| {
             matches!(
                 a,
-                events::Anonymous::Uring(_)
-                    | events::Anonymous::Signal(_)
-                    | events::Anonymous::Epoll { .. }
+                events::Anonymous::Uring(_) | events::Anonymous::Epoll { .. }
             )
         }) || matches!(
             open.kind,

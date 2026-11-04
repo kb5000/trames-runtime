@@ -2206,3 +2206,39 @@ with no inherited timers; final process exit removes its remaining timers.
 CPU-clock POSIX timers and ITIMER_VIRTUAL/PROF keep their previous explicit
 unsupported behavior. No new ordinary-memory fence, unsafe block or global
 algorithm lock is added.
+
+
+## Shared signal queues, controls and reader-scoped waits (2026-11-04)
+
+This supersedes the signal-reader limitations in the earlier descriptor, event
+wait and timer sections. Signals has no duplicate Rc pending queues: owner
+producers, guest senders, timers and FASYNC use the original task/process inboxes.
+An immutable reader capability binds the current task and PID namespace at
+execution admission, not signalfd creation. Scalar/vector reads dequeue one
+whole record before each copyout; partial success, faults, coalescing, realtime
+FIFO and namespace translation retain the Linux ABI. Accepted blocking plans
+keep the original OFD and copied iovecs across close/reuse and source handoff.
+
+poll/epoll and their nested owner observations carry the current reader context.
+The live epoll index stores an OFD weak identity, not a creator queue. Queue and
+OFD-mask subscriptions wake the existing execution queue. io_uring reads,
+readv, fixed buffers/files and poll retain their submitting task and original
+OFD; a pinned-buffer read targets the original pin even after VA remapping.
+The joined adapter reuses the same record-copy algorithm.
+
+sigaltstack, rt_sigaction, rt_sigprocmask and rt_sigpending execute on their source
+worker. Disposition mutation/discard synchronizes with enqueue on the original
+sighand table; notification never runs under sighand/pending locks. Query-only
+owner calls avoid unnecessary context transfer and publication. Caught delivery,
+rt_sigreturn, sigsuspend temporary-mask restoration and rt_sigtimedwait use shared
+task context. Accepted waits copy their set/deadline once, dequeue before handler
+delivery and copyout, and preserve their state through cohort collection.
+
+Ordinary kill/tkill/tgkill routes use published original task/group incarnations,
+PID namespaces and credentials. A separate weak presence token distinguishes a
+zombie from a reaped task even when a retained reader keeps its inbox alive.
+Source ALLOW/ERRNO and unsupported TRACE/USER_NOTIF decisions are applied once;
+TRAP/KILL and tracing keep the real task-policy boundary. STOP/CONT group state,
+default termination, parent wait/SIGCHLD, exit resource cleanup and reaping still
+require the lifecycle migration described in coordination-boundaries.md. They
+are not hidden behind the new source entry path or counted as removed here.

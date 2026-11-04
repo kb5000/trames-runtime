@@ -10,39 +10,60 @@ use std::{
     },
 };
 use trames_vfs::{AsyncOwner, AsyncOwners, IoSignal, PidNamespace};
+#[path = "io_guest.rs"]
+mod guest;
 
 #[derive(Default)]
 pub struct Inbox {
     pending: Mutex<Pending>,
     bits: AtomicU64,
+    epoch: AtomicU64,
+    readiness: Arc<trames_vfs::Readiness>,
 }
 impl Inbox {
     fn timer(&self, sig: u32, info: Info) -> i32 {
         let mut pending = self.pending.lock().unwrap();
+        let mut queued = false;
         let overrun = if let Some((id, extra, _)) = info.timer {
             if let Some(previous) = pending.timer_mut(sig, id) {
                 let (_, overrun, _) = previous.timer.as_mut().unwrap();
                 *overrun = overrun.saturating_add(extra).saturating_add(1);
                 *overrun
             } else {
-                let _ = pending.enqueue(sig, info);
+                let fresh = sig >= 32 || !pending.contains_key(&sig);
+                queued = pending.enqueue(sig, info).is_ok() && fresh;
                 extra
             }
         } else {
-            let _ = pending.enqueue(sig, info);
+            let fresh = sig >= 32 || !pending.contains_key(&sig);
+            queued = pending.enqueue(sig, info).is_ok() && fresh;
             0
         };
         self.bits.store(pending.bits(), Ordering::Relaxed);
+        drop(pending);
+        if queued {
+            self.changed();
+        }
         overrun
     }
     pub fn bits(&self) -> u64 {
         self.bits.load(Ordering::Relaxed)
     }
     pub fn enqueue(&self, sig: u32, info: Info) -> Result<(), Errno> {
+        if self.enqueue_quiet(sig, info)? {
+            self.changed();
+        }
+        Ok(())
+    }
+    fn enqueue_quiet(&self, sig: u32, info: Info) -> Result<bool, Errno> {
         let mut pending = self.pending.lock().unwrap();
+        if sig < 32 && pending.contains_key(&sig) {
+            return Ok(false);
+        }
         pending.enqueue(sig, info)?;
         self.bits.store(pending.bits(), Ordering::Relaxed);
-        Ok(())
+        drop(pending);
+        Ok(true)
     }
     pub fn next(&self, mask: u64) -> Option<u32> {
         if self.bits() & mask == 0 {
@@ -54,12 +75,81 @@ impl Inbox {
         let mut pending = self.pending.lock().unwrap();
         let result = pending.remove(&sig);
         self.bits.store(pending.bits(), Ordering::Relaxed);
+        drop(pending);
+        if result.is_some() {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
     pub fn discard(&self, sig: u32) {
         let mut pending = self.pending.lock().unwrap();
+        if !pending.contains_key(&sig) {
+            return;
+        }
         pending.discard(sig);
         self.bits.store(pending.bits(), Ordering::Relaxed);
+        drop(pending);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+    fn changed(&self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.readiness.notify_atomic();
+    }
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> trames_vfs::IoSubscription {
+        self.readiness.subscribe(signal)
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+    pub fn contains_key(&self, sig: &u32) -> bool {
+        self.bits() & (1u64 << (*sig - 1)) != 0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bits() == 0
+    }
+    pub fn peek(&self, sig: u32) -> Option<Info> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(&s, info)| (s == sig).then_some(*info))
+    }
+    pub fn first_fault(&self) -> Option<u32> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(&sig, info)| info.fault.is_some().then_some(sig))
+    }
+    pub fn senders(&self) -> Vec<u32> {
+        self.pending
+            .lock()
+            .unwrap()
+            .values()
+            .map(|i| i.sender)
+            .collect()
+    }
+    pub fn clear(&self) {
+        let mut p = self.pending.lock().unwrap();
+        if p.is_empty() {
+            return;
+        }
+        p.clear();
+        self.bits.store(0, Ordering::Relaxed);
+        drop(p);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dequeue(&self, mask: u64) -> Option<(u32, Info)> {
+        if self.bits() & mask == 0 {
+            return None;
+        }
+        let mut p = self.pending.lock().unwrap();
+        let sig = p.next(mask)?;
+        let info = p.remove(&sig).unwrap();
+        self.bits.store(p.bits(), Ordering::Relaxed);
+        drop(p);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        Some((sig, info))
     }
 }
 #[derive(Clone, Copy, Default)]
@@ -75,6 +165,8 @@ pub struct IoTask {
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
     live: AtomicBool,
+    presence: std::sync::OnceLock<Weak<()>>,
+    policy: RwLock<Option<Policy>>,
     pid: AtomicU32,
     tgid: AtomicU32,
     group: AtomicU32,
@@ -90,6 +182,8 @@ impl Default for IoTask {
             context: Default::default(),
             mask: AtomicU64::new(0),
             live: AtomicBool::new(true),
+            presence: Default::default(),
+            policy: RwLock::default(),
             pid: AtomicU32::new(0),
             tgid: AtomicU32::new(0),
             group: AtomicU32::new(0),
@@ -100,16 +194,21 @@ impl Default for IoTask {
     }
 }
 impl IoTask {
+    fn identifies(&self, kind: u32, id: u32) -> bool {
+        self.presence.get().map_or_else(
+            || self.live.load(Ordering::Relaxed),
+            |p| p.strong_count() != 0,
+        ) && match kind {
+            0 => self.pid.load(Ordering::Relaxed) == id,
+            1 => self.tgid() == id,
+            _ => self.group.load(Ordering::Relaxed) == id,
+        }
+    }
     pub fn tgid(&self) -> u32 {
         self.tgid.load(Ordering::Relaxed)
     }
     fn belongs(&self, kind: u32, id: u32) -> bool {
-        self.live.load(Ordering::Relaxed)
-            && match kind {
-                0 => self.pid.load(Ordering::Relaxed) == id,
-                1 => self.tgid.load(Ordering::Relaxed) == id,
-                _ => self.group.load(Ordering::Relaxed) == id,
-            }
+        self.live.load(Ordering::Relaxed) && self.identifies(kind, id)
     }
     pub fn process(&self) -> &Arc<Inbox> {
         self.process.get_or_init(Arc::default)
@@ -163,6 +262,11 @@ impl IoTask {
             self.inbox.take(sig)
         }
     }
+}
+struct Policy {
+    actions: Actions,
+    namespace: PidNamespace,
+    can_kill: bool,
 }
 impl trames_vfs::TaskSignal for IoTask {
     fn raise(&self, signal: u32) {
@@ -219,6 +323,37 @@ impl TimerTarget {
     }
 }
 impl IoDirectory {
+    fn tasks(&self, kind: u32, id: u32) -> Vec<Arc<IoTask>> {
+        let group = self.groups.lock().unwrap().get(&(kind, id)).cloned();
+        group.map_or_else(Vec::new, |g| {
+            g.members
+                .read()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|t| t.identifies(kind, id))
+                .collect()
+        })
+    }
+    pub fn discard_process(&self, tgid: u32, sig: u32) -> bool {
+        let group = self.groups.lock().unwrap().get(&(1, tgid)).cloned();
+        let Some(group) = group else { return false };
+        let tasks: Vec<_> = group
+            .members
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|t| t.belongs(1, tgid))
+            .collect();
+        for task in &tasks {
+            task.inbox.discard(sig);
+        }
+        if let Some(task) = tasks.first() {
+            task.process().discard(sig);
+        }
+        !tasks.is_empty()
+    }
     pub fn timer_target(&self, tgid: u32, thread: Option<u32>) -> Result<TimerTarget, Errno> {
         let key = thread.map_or((1, tgid), |tid| (0, tid));
         let group = self
@@ -270,7 +405,7 @@ impl IoDirectory {
                     .read()
                     .unwrap()
                     .iter()
-                    .all(|t| t.upgrade().is_none_or(|t| !t.belongs(key.0, key.1)))
+                    .all(|t| t.upgrade().is_none_or(|t| !t.identifies(key.0, key.1)))
             }) {
                 groups.remove(&key);
             }
@@ -280,7 +415,7 @@ impl IoDirectory {
                 })
             });
             let mut members = group.members.write().unwrap();
-            members.retain(|t| t.upgrade().is_some_and(|t| t.belongs(key.0, key.1)));
+            members.retain(|t| t.upgrade().is_some_and(|t| t.identifies(key.0, key.1)));
             if !members.iter().any(|t| t.ptr_eq(&Arc::downgrade(task))) {
                 members.push(Arc::downgrade(task));
             }
@@ -291,7 +426,7 @@ impl IoDirectory {
                     .read()
                     .unwrap()
                     .iter()
-                    .any(|t| t.upgrade().is_some_and(|t| t.belongs(key.0, key.1)))
+                    .any(|t| t.upgrade().is_some_and(|t| t.identifies(key.0, key.1)))
             });
         }
     }
@@ -454,6 +589,21 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_timer_overrun_does_not_create_another_signalfd_readiness_edge() {
+        let inbox = Inbox::default();
+        let info = Info {
+            timer: Some((7, 0, 123)),
+            ..Default::default()
+        };
+        assert_eq!(inbox.timer(35, info), 0);
+        let epoch = inbox.epoch();
+        assert_eq!(inbox.timer(35, info), 1);
+        assert_eq!(inbox.epoch(), epoch);
+        assert_eq!(inbox.take(35).unwrap().timer, Some((7, 1, 123)));
+        assert_eq!(inbox.timer(35, info), 0);
+        assert!(inbox.epoch() > epoch);
+    }
     #[test]
     fn process_pending_is_shared_and_old_pid_owners_do_not_retarget_reused_ids() {
         let directory = Arc::new(IoDirectory::default());

@@ -3,33 +3,37 @@
 //! state only at delivery/return boundaries; ordinary execution is untouched.
 mod actions;
 mod alt_stack;
+mod control;
 mod fault;
 mod frame;
 pub use frame::FrameState;
 mod info;
 mod io;
 mod pending;
+mod reader;
+mod wait;
 pub use actions::{Action, Actions};
 pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
 pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
 pub use pending::Pending;
-use std::{cell::RefCell, rc::Rc};
+pub use reader::TaskReader;
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
+pub use wait::SignalWait;
 
 pub const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
 
 #[derive(Default)]
 pub struct Signals {
+    pub presence: std::sync::Arc<()>,
+    pub reader: std::sync::OnceLock<std::sync::Arc<TaskReader>>,
     pub io: std::sync::Arc<IoTask>,
     pub io_directory: std::sync::Arc<IoDirectory>,
     pub actions: Actions,
     pub mask: u64,
     pub wait_mask: Option<u64>,
-    pub pending: Pending,
-    pub shared_pending: Rc<RefCell<Pending>>,
     pub frames: u32,
     pub alt_stack: AltStack,
 }
@@ -38,6 +42,8 @@ impl Signals {
     /// CLONE_THREAD additionally adopts the existing process pending queue.
     pub fn fork(&self, shared_actions: bool) -> Self {
         Self {
+            presence: Default::default(),
+            reader: Default::default(),
             io: Default::default(),
             io_directory: self.io_directory.clone(),
             actions: if shared_actions {
@@ -47,8 +53,6 @@ impl Signals {
             },
             mask: self.mask,
             wait_mask: None,
-            pending: Pending::default(),
-            shared_pending: Rc::new(RefCell::new(Pending::default())),
             frames: self.frames,
             alt_stack: self.alt_stack,
         }
@@ -59,48 +63,20 @@ impl Signals {
         self.alt_stack = AltStack::default();
     }
     pub fn pending_bits(&self) -> u64 {
-        self.pending.bits()
-            | self.shared_pending.borrow().bits()
-            | self.io.inbox.bits()
-            | self.io.process().bits()
+        self.io.inbox.bits() | self.io.process().bits()
     }
-    /// Linux selects a task's private queue before its process queue.
     pub fn next_signal(&self, mask: u64) -> Option<(u32, bool)> {
-        self.pending
-            .next(mask)
-            .or_else(|| self.io.inbox.next(mask))
-            .map(|sig| (sig, false))
-            .or_else(|| {
-                self.shared_pending
-                    .borrow()
-                    .next(mask)
-                    .or_else(|| self.io.process().next(mask))
-                    .map(|sig| (sig, true))
-            })
+        self.io.next(mask)
     }
-    pub fn take_signal(&mut self, sig: u32, shared: bool) -> Info {
-        if shared {
-            self.shared_pending
-                .borrow_mut()
-                .remove(&sig)
-                .or_else(|| self.io.process().take(sig))
-        } else {
-            self.pending
-                .remove(&sig)
-                .or_else(|| self.io.inbox.take(sig))
-        }
-        .expect("selected pending signal")
+    pub fn take_signal(&self, sig: u32, shared: bool) -> Info {
+        self.io.take(sig, shared).expect("selected pending signal")
     }
     pub fn signal_senders(&self) -> Vec<u32> {
-        self.pending
-            .values()
-            .chain(self.shared_pending.borrow().values())
-            .map(|i| i.sender)
-            .collect()
+        let mut senders = self.io.inbox.senders();
+        senders.extend(self.io.process().senders());
+        senders
     }
-    pub fn discard(&mut self, sig: u32) {
-        self.pending.discard(sig);
-        self.shared_pending.borrow_mut().discard(sig);
+    pub fn discard(&self, sig: u32) {
         self.io.inbox.discard(sig);
         self.io.process().discard(sig);
     }
@@ -120,49 +96,29 @@ impl Signals {
                 || self.actions.get(sig as usize).handler != 1
                 || self.mask & (1 << (sig - 1)) != 0)
     }
-    /// rt_sigaction mutation plus task/process queue effects. The task-group
-    /// owner must also discard the signal in the other threads' private queues.
+    /// rt_sigaction mutation and task/process queue effects share sighand.
     pub fn action_call(
         &mut self,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<Option<Action>, Errno> {
-        let action = self.actions.call(a, memory)?;
-        if action.is_some_and(|x| ignored(a[0] as u32, x)) {
-            self.discard(a[0] as u32);
-        }
-        Ok(action)
+        self.actions.call_with(a, memory, |action| {
+            if ignored(a[0] as u32, action)
+                && !self
+                    .io_directory
+                    .discard_process(self.io.tgid(), a[0] as u32)
+            {
+                self.discard(a[0] as u32);
+            }
+        })
     }
     pub fn mask_call(&mut self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        if a[3] != 8 {
-            return Err(Errno(22));
-        }
-        if a[2] != 0 {
-            memory
-                .check(a[2], 8, Access::Write)
-                .map_err(|_| Errno(14))?;
-        }
-        let new = if a[1] != 0 {
-            let bits = u64::from_le_bytes(memory.read_array(a[1]).map_err(|_| Errno(14))?);
-            Some(
-                match a[0] {
-                    0 => self.mask | bits,
-                    1 => self.mask & !bits,
-                    2 => bits,
-                    _ => return Err(Errno(22)),
-                } & !UNBLOCKABLE,
-            )
-        } else {
-            None
-        };
-        if a[2] != 0 {
-            memory
-                .write_array(a[2], self.mask.to_le_bytes())
-                .map_err(|_| Errno(14))?;
-        }
-        if let Some(mask) = new {
+        if let Some(mask) = control::update_mask(self.mask, a, memory)? {
             self.mask = mask;
+            self.io.publish_mask(mask);
         }
+        // Context custody is transferred only at begin_io/finish_io. An owner
+        // query needs neither a context mutex nor a redundant mask publication.
         Ok(0)
     }
 }

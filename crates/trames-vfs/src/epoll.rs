@@ -133,9 +133,9 @@ impl LiveEpoll {
         self.changed.notify_atomic();
         Ok(())
     }
-    pub(super) fn ready(&self) -> bool {
+    pub(super) fn ready_with(&self, reader: Option<&Arc<dyn SignalReader>>) -> bool {
         self.snapshot().iter().any(|(_, state, target)| {
-            let Some(fd) = target.resolve() else {
+            let Some(fd) = target.resolve_with(reader) else {
                 return false;
             };
             let state = state.lock().unwrap();
@@ -143,21 +143,26 @@ impl LiveEpoll {
             state.armed && ready != 0 && state.ready(ready, epoch)
         })
     }
-    pub(super) fn epoch(&self) -> u64 {
+    pub(super) fn epoch_with(&self, reader: Option<&Arc<dyn SignalReader>>) -> u64 {
         self.snapshot()
             .iter()
-            .filter_map(|w| w.2.resolve())
+            .filter_map(|w| w.2.resolve_with(reader))
             .map(|fd| fd.peek_poll(0).1)
             .fold(self.revision(), |n, e| {
                 n.wrapping_add(e[0]).wrapping_add(e[1])
             })
     }
-    pub(super) fn wait(&self, max: usize, frozen: &[DirectWatch]) -> Result<Vec<(u32, u64)>> {
+    pub(super) fn wait_with(
+        &self,
+        max: usize,
+        frozen: &[DirectWatch],
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> Result<Vec<(u32, u64)>> {
         let mut cursor = self.cursor.lock().unwrap();
         let shared = self.snapshot();
         let mut result = Vec::new();
         for (key, state, target) in ordered(&shared, frozen, *cursor) {
-            let Some(fd) = target.resolve() else {
+            let Some(fd) = target.resolve_with(reader) else {
                 continue;
             };
             let mut state = state.lock().unwrap();

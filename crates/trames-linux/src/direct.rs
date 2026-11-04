@@ -18,6 +18,7 @@ mod local_message;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod netlink;
+pub(crate) mod signal_read;
 mod socket_wait;
 pub use file::{FileBoundary, FileCheckpoint, FileExecutor, FileOutput, FilePending, FileResult};
 pub(crate) mod uring;
@@ -61,9 +62,22 @@ pub struct PendingIo {
 #[derive(Clone)]
 pub struct RetainedByte {
     fd: trames_vfs::DirectFd,
-    message: Option<Arc<local_message::AcceptedMessage>>,
+    operation: ByteOperation,
+}
+#[derive(Clone)]
+enum ByteOperation {
+    Plain,
+    Message(Arc<local_message::AcceptedMessage>),
+    Signal(Arc<signal_read::SignalRead>),
 }
 impl RetainedByte {
+    fn message(&self) -> Option<&Arc<local_message::AcceptedMessage>> {
+        if let ByteOperation::Message(m) = &self.operation {
+            Some(m)
+        } else {
+            None
+        }
+    }
     pub fn is_unix(&self) -> bool {
         self.fd.is_unix()
     }
@@ -71,10 +85,10 @@ impl RetainedByte {
         self.fd.retained_pty()
     }
     pub fn local_owner_identity(&self) -> Option<trames_vfs::OfdIdentity> {
-        self.message.as_ref().map(|_| self.fd.ofd_identity())
+        self.message().map(|_| self.fd.ofd_identity())
     }
     pub fn local_owner(&self) -> Option<trames_vfs::RetainedFd> {
-        self.message.as_ref()?;
+        self.message()?;
         Some(self.fd.shared_file()?.retained())
     }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
@@ -227,6 +241,13 @@ pub struct DirectSyscalls {
     completed: Cell<u64>,
 }
 impl DirectSyscalls {
+    pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
+        self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
+        if let Some(descriptors) = self.urings.descriptors.take() {
+            self.urings.descriptors = Some(descriptors.with_signal_reader(Some(reader)));
+        }
+        self
+    }
     pub fn with_task_signal(mut self, task: Arc<dyn trames_vfs::TaskSignal>) -> Self {
         self.task_signal = Some(task);
         self
@@ -1200,11 +1221,18 @@ impl DirectSyscalls {
             Ok(file) => file,
             Err(error) => return Some(Err(error)),
         };
-        let fd = file.direct_byte()?;
+        let fd = self
+            .descriptors
+            .get(args[0] as u32)
+            .filter(|fd| fd.is_signalfd())
+            .or_else(|| file.direct_byte())?;
         if matches!(number, 67..=70) && !fd.is_simple_device() {
             return None;
         }
-        Some(Ok(RetainedByte { fd, message: None }))
+        Some(Ok(RetainedByte {
+            fd,
+            operation: ByteOperation::Plain,
+        }))
     }
     pub fn start_retained_poll(
         &self,
@@ -1286,7 +1314,7 @@ impl DirectSyscalls {
             .or_else(|| self.retain_byte(number, args))?;
         Some(match retained {
             Ok(file)
-                if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message.is_none() =>
+                if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message().is_none() =>
             {
                 IoAttempt::ByteCheckpoint(file)
             }
@@ -1303,7 +1331,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message.is_none() {
+        if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message().is_none() {
             return match self.prepare_packet_byte(&file, number, args, memory) {
                 Some(Ok(prepared)) => {
                     self.start_byte(prepared, number, args, memory, pid, target, true)
@@ -1325,11 +1353,31 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         checkpoint_pipe: bool,
     ) -> IoAttempt {
-        match self.transfer_retained(&file, number, args, memory) {
+        let mut file = file;
+        let result = if matches!(number, 63 | 65)
+            && file.fd.is_signalfd()
+            && matches!(file.operation, ByteOperation::Plain)
+        {
+            if let Err(e) = file.fd.check_read_access() {
+                return self.complete_byte(&file, Err(e));
+            }
+            let read = match signal_read::SignalRead::prepare(number, args, memory) {
+                Ok(r) => r,
+                Err(e) => return self.complete_byte(&file, Err(e)),
+            };
+            let result = read.check(&file.fd, memory);
+            if result == Err(Errno(11)) && !file.fd.nonblocking() {
+                file.operation = ByteOperation::Signal(Arc::new(read));
+            }
+            Some(result)
+        } else {
+            self.transfer_retained(&file, number, args, memory)
+        };
+        match result {
             Some(Err(Errno(11)))
                 if !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
             Some(Err(Errno(32))) if checkpoint_pipe && signals_pipe(number, args) => {
-                return if file.message.is_some() {
+                return if file.message().is_some() {
                     IoAttempt::ByteCheckpoint(file)
                 } else {
                     IoAttempt::Checkpoint
@@ -1337,7 +1385,7 @@ impl DirectSyscalls {
             }
             Some(result) => return self.complete_byte(&file, result),
             None => {
-                return if file.message.is_some() || file.fd.is_pty() || file.fd.is_unix() {
+                return if file.message().is_some() || file.fd.is_pty() || file.fd.is_unix() {
                     IoAttempt::ByteCheckpoint(file)
                 } else {
                     IoAttempt::Checkpoint

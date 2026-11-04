@@ -58,6 +58,8 @@ mod readiness;
 mod timer_io;
 pub use direct_io::{DirectFd, DirectFds, DirectPoll};
 pub use readiness::{IoSignal, IoSubscription, IoWake};
+mod signal_reader;
+pub use signal_reader::SignalReader;
 pub use timer_io::TimerFd;
 pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness};
 mod epoll;
@@ -639,6 +641,7 @@ impl ProcRefresh {
 }
 
 pub struct Vfs {
+    signal_reader: RefCell<Option<Arc<dyn SignalReader>>>,
     query: Option<path_queries::Authority>,
     network: trames_net::Network,
     native_services: Arc<SharedCell<Option<Arc<ipc::NativeServices>>>>,
@@ -682,6 +685,12 @@ impl Clone for Vfs {
     }
 }
 impl Vfs {
+    pub fn bind_signal_reader(&self, reader: Arc<dyn SignalReader>) {
+        let mut current = self.signal_reader.borrow_mut();
+        if current.as_ref().is_none_or(|r| !Arc::ptr_eq(r, &reader)) {
+            *current = Some(reader);
+        }
+    }
     pub fn descriptor_limit(&self) -> u32 {
         self.fds.limit()
     }
@@ -701,6 +710,7 @@ impl Vfs {
     }
     pub fn clone_with_resources(&self, shared_files: bool, shared_fs: bool) -> Self {
         Self {
+            signal_reader: RefCell::new(self.signal_reader.borrow().clone()),
             query: self.query.clone(),
             network: self.network.clone(),
             native_services: self.native_services.clone(),
@@ -760,6 +770,7 @@ impl Vfs {
         let mut context = FsContext::default();
         context.paths.registry = mount_registry.clone();
         Self {
+            signal_reader: RefCell::new(None),
             query: None,
             network,
             native_services: Arc::default(),
@@ -930,7 +941,7 @@ impl Vfs {
                     if *direct_revision == revision {
                         return (
                             snapshot.clone(),
-                            DirectFds(direct.clone(), Some(self.shared_files())),
+                            DirectFds(direct.clone(), Some(self.shared_files()), None),
                         );
                     }
                 }
@@ -956,7 +967,7 @@ impl Vfs {
         }
         let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
         *cached = Some((revision, snapshot.clone()));
-        let direct = DirectFds(direct.into(), Some(self.shared_files()));
+        let direct = DirectFds(direct.into(), Some(self.shared_files()), None);
         *identity.direct.borrow_mut() = Some((revision, direct.0.clone()));
         (snapshot, direct)
     }
@@ -1091,15 +1102,25 @@ impl Vfs {
             return 32;
         };
         let open = d.open.borrow();
-        Self::poll_open(&open, events, pending)
+        Self::poll_open(&open, events, pending, self.signal_reader.borrow().as_ref())
     }
-    fn peek_poll_open(o: &OpenDescription, events: u16, pending: u64) -> u16 {
+    fn peek_poll_open(
+        o: &OpenDescription,
+        events: u16,
+        pending: u64,
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> u16 {
         o.mount_file.as_ref().map_or_else(
-            || Self::poll_open(o, events, pending),
+            || Self::poll_open(o, events, pending, reader),
             |file| file.watch.peek(events).0,
         )
     }
-    fn poll_open(o: &OpenDescription, events: u16, pending: u64) -> u16 {
+    fn poll_open(
+        o: &OpenDescription,
+        events: u16,
+        pending: u64,
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> u16 {
         if let Some(file) = &o.mount_file {
             return file.watch.poll(events).0;
         }
@@ -1116,7 +1137,7 @@ impl Vfs {
             return local.poll(events);
         }
         if let Some(anonymous) = &o.anonymous {
-            return anonymous.poll(events, pending);
+            return anonymous.poll(events, pending, reader);
         }
         if let Some(bridge) = &o.bridge {
             return bridge.poll(events);

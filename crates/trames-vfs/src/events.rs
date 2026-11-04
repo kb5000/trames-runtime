@@ -20,17 +20,27 @@ pub(super) enum Anonymous {
 
 /// Shared control portions of the original anonymous resources. Epoll keeps
 /// owner-only targets in Anonymous; its admitted live index contains no Rc.
-pub(super) struct SignalMask(AtomicU64);
+pub(super) struct SignalMask {
+    mask: AtomicU64,
+    pub(super) revision: AtomicU64,
+    pub(super) changed: Arc<Readiness>,
+}
 impl SignalMask {
     pub(super) fn new(mask: u64) -> Self {
-        Self(AtomicU64::new(mask & !((1 << 8) | (1 << 18))))
+        Self {
+            mask: AtomicU64::new(mask & !((1 << 8) | (1 << 18))),
+            revision: AtomicU64::new(0),
+            changed: Arc::default(),
+        }
     }
     pub(super) fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.mask.load(Ordering::Relaxed)
     }
     pub(super) fn set(&self, mask: u64) {
-        self.0
+        self.mask
             .store(mask & !((1 << 8) | (1 << 18)), Ordering::Relaxed);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_atomic();
     }
 }
 pub(super) enum SharedControl {
@@ -128,7 +138,12 @@ impl Anonymous {
             Self::Epoll { .. } => b"anon_inode:[eventpoll]",
         }
     }
-    pub(super) fn poll(&self, events: u16, pending: u64) -> u16 {
+    pub(super) fn poll(
+        &self,
+        events: u16,
+        pending: u64,
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> u16 {
         match self {
             Self::Uring(ring) => {
                 if ring.cq_ready() != 0 {
@@ -157,14 +172,15 @@ impl Anonymous {
             Self::Epoll {
                 watches, shared, ..
             } => {
-                if shared.ready()
+                if shared.ready_with(reader)
                     || watches.values().any(|w| {
                         let state = w.state.lock().unwrap();
                         state.armed
                             && w.open.upgrade().is_some_and(|o| {
                                 let o = o.borrow();
-                                let ready = Vfs::peek_poll_open(&o, state.events as u16, pending);
-                                ready != 0 && state.ready(ready, Vfs::poll_epoch(&o))
+                                let ready =
+                                    Vfs::peek_poll_open(&o, state.events as u16, pending, reader);
+                                ready != 0 && state.ready(ready, Vfs::poll_epoch_with(&o, reader))
                             })
                     })
                 {
@@ -435,8 +451,10 @@ impl Vfs {
         if !watches.contains_key(&key) {
             let t = target.borrow();
             let nested = matches!(t.anonymous, Some(Anonymous::Epoll { .. }));
+            let unbound_signal = matches!(t.anonymous, Some(Anonymous::Signal(_)))
+                && self.signal_reader.borrow().is_none();
             drop(t);
-            if !nested {
+            if !nested && !unbound_signal {
                 if let Some(resource) = direct_io::WatchResource::capture(&target.downgrade(), None)
                 {
                     return shared
@@ -494,6 +512,9 @@ impl Vfs {
         })
     }
     pub(super) fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
+        Self::poll_epoch_with(o, None)
+    }
+    fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
         if let Some(file) = &o.mount_file {
             return file.watch.poll(0).1;
         }
@@ -528,8 +549,8 @@ impl Vfs {
             let generation = watches
                 .values()
                 .filter_map(|watch| watch.open.upgrade())
-                .map(|open| Self::poll_epoch(&open.borrow()))
-                .fold(shared.epoch(), |sum, epoch| {
+                .map(|open| Self::poll_epoch_with(&open.borrow(), reader))
+                .fold(shared.epoch_with(reader), |sum, epoch| {
                     sum.wrapping_add(epoch[0]).wrapping_add(epoch[1])
                 });
             return [generation, 0];
@@ -570,7 +591,7 @@ impl Vfs {
         else {
             return Err(Errno(22));
         };
-        if shared.ready() {
+        if shared.ready_with(self.signal_reader.borrow().as_ref()) {
             return Ok(true);
         }
         for watch in watches.values() {
@@ -590,8 +611,13 @@ impl Vfs {
             };
             let (ready, epoch) = special.unwrap_or_else(|| {
                 (
-                    Self::peek_poll_open(&target, requested, pending),
-                    Self::poll_epoch(&target),
+                    Self::peek_poll_open(
+                        &target,
+                        requested,
+                        pending,
+                        self.signal_reader.borrow().as_ref(),
+                    ),
+                    Self::poll_epoch_with(&target, self.signal_reader.borrow().as_ref()),
                 )
             });
             if ready != 0 && state.ready(ready, epoch) {
@@ -620,7 +646,7 @@ impl Vfs {
         watches.retain(|_, w| w.open.strong_count() != 0);
         shared.set_owner_count(watches.len());
         if watches.is_empty() {
-            return shared.wait(max, &[]);
+            return shared.wait_with(max, &[], self.signal_reader.borrow().as_ref());
         }
         let mut cursor = cursor.lock().unwrap();
         let live = shared.snapshot();
@@ -636,7 +662,7 @@ impl Vfs {
             let Some(watch) = watches.get(&key) else {
                 let at = live.binary_search_by_key(&key, |w| w.0).unwrap();
                 let (_, state, target) = &live[at];
-                let Some(fd) = target.resolve() else {
+                let Some(fd) = target.resolve_with(self.signal_reader.borrow().as_ref()) else {
                     continue;
                 };
                 let mut state = state.lock().unwrap();
@@ -670,8 +696,13 @@ impl Vfs {
             };
             let (ready, epoch) = override_ready.unwrap_or_else(|| {
                 (
-                    Self::peek_poll_open(&o, requested, pending),
-                    Self::poll_epoch(&o),
+                    Self::peek_poll_open(
+                        &o,
+                        requested,
+                        pending,
+                        self.signal_reader.borrow().as_ref(),
+                    ),
+                    Self::poll_epoch_with(&o, self.signal_reader.borrow().as_ref()),
                 )
             });
             if let Some(event) = state.observe(ready, epoch) {

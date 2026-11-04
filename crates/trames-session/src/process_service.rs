@@ -175,7 +175,7 @@ mod tests {
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -522,7 +522,7 @@ mod tests {
                     assert!(matches!(p.state, State::Blocked(63, _)));
                 } else {
                     assert_eq!(p.cpu.x(0), error(Errno(32)));
-                    assert!(p.signals.pending.contains_key(&13));
+                    assert!(p.signals.io.inbox.contains_key(&13));
                 }
             }
         }
@@ -605,7 +605,7 @@ mod tests {
                     assert!(matches!(p.state, State::Blocked(63, _)));
                 } else {
                     assert_eq!(p.cpu.x(0), error(Errno(32)));
-                    assert!(p.signals.pending.contains_key(&13));
+                    assert!(p.signals.io.inbox.contains_key(&13));
                 }
             }
         }

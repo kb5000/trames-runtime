@@ -125,6 +125,15 @@ pub(crate) struct Process<C: Cpu> {
     seccomp_entry: Option<seccomp::EntryDecision>,
 }
 impl<C: Cpu> Process<C> {
+    fn bind_signals(&self) {
+        self.signals.publish_policy(
+            self.linux.vfs.pid_namespace(),
+            self.linux.vfs.credentials.has_cap(capabilities::KILL),
+        );
+        self.linux
+            .vfs
+            .bind_signal_reader(self.signals.reader(self.linux.vfs.pid_namespace()));
+    }
     fn shares_wait_resources(&self, fds: &trames_vfs::DirectFds) -> bool {
         self.retained_socket
             .as_ref()
@@ -349,11 +358,15 @@ impl<C: Cpu> Process<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork(&self) -> Box<Self> {
-        self.fork_state(self.memory.clone(), false, false, false)
+        let child = self.fork_state(self.memory.clone(), false, false, false);
+        child.bind_signals();
+        child
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork_with_memory(&self, memory: Memory) -> Box<Self> {
-        self.fork_state(memory, true, true, true)
+        let child = self.fork_state(memory, true, true, true);
+        child.bind_signals();
+        child
     }
     fn fork_state(
         &self,
@@ -581,6 +594,7 @@ impl<C: Cpu> Kernel<C> {
             if matches!(p.state, State::Zombie(_)) {
                 return;
             }
+            p.bind_signals();
             p.signals.io_directory.publish(
                 &p.signals.io,
                 id,
@@ -907,6 +921,7 @@ impl<C: Cpu> Kernel<C> {
             .map_err(|_| Errno(12))?;
         child.linux.vfs = request.vfs;
         child.linux.vfs.activate_child_pid(id)?;
+        child.bind_signals();
         child.linux.vfs.set_process_context(id);
         child.linux.fork_tid(0);
         child.parent = 1;
@@ -1107,8 +1122,8 @@ impl<C: Cpu> Kernel<C> {
                 self.memory_limits.per_process as u64
             }),
             oom: Arc::downgrade(&p.oom),
-            pending: p.signals.pending.bits(),
-            shared_pending: p.signals.shared_pending.borrow().bits(),
+            pending: p.signals.io.inbox.bits(),
+            shared_pending: p.signals.io.process().bits(),
             blocked: p.signals.mask,
             ignored,
             caught,
@@ -1221,7 +1236,7 @@ impl<C: Cpu> Kernel<C> {
             if action.handler == 1 || (matches!(code, 5 | 6) && action.flags & 1 != 0) {
                 return;
             }
-            let _ = p.signals.shared_pending.borrow_mut().enqueue(
+            let _ = p.signals.io.process().enqueue(
                 17,
                 Info {
                     sender: child,
@@ -1260,6 +1275,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.release_descriptors();
     }
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        p.signals.io.exit();
         p.linux.cancel_uring(&mut p.memory, pid);
         p.uring_wait = None;
         p.flock_wait = None;
@@ -1310,7 +1326,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.state = State::Zombie(status);
         self.close_exit_files(p);
-        p.signals.pending.clear();
+        p.signals.io.inbox.clear();
         p.wait_event = None;
         if !self
             .processes
@@ -1433,7 +1449,7 @@ impl<C: Cpu> Kernel<C> {
     }
     fn queue_one(_pid: u32, p: &mut Process<C>, sig: u32, sender: u32) {
         if Self::prepare_signal(p, sig, sender) {
-            let _ = p.signals.pending.enqueue(
+            let _ = p.signals.io.inbox.enqueue(
                 sig,
                 Info {
                     sender,
@@ -1514,7 +1530,7 @@ impl<C: Cpu> Kernel<C> {
             self.processes.get_mut(&tid).ok_or(Errno(3))?
         };
         if Self::prepare_signal(target, sig, sender) {
-            target.signals.pending.enqueue(
+            target.signals.io.inbox.enqueue(
                 sig,
                 Info {
                     sender,
@@ -1592,7 +1608,7 @@ impl<C: Cpu> Kernel<C> {
                 && Self::prepare_signal(other, sig, sender)
                 && !queued.contains(&other.tgid)
             {
-                other.signals.shared_pending.borrow_mut().enqueue(
+                other.signals.io.process().enqueue(
                     sig,
                     Info {
                         sender,
@@ -1792,7 +1808,7 @@ impl<C: Cpu> Kernel<C> {
                 p.cpu.set_x(0, error(Errno(4)));
             }
             State::Suspend(old) => {
-                p.signals.mask = old;
+                p.signals.wait_mask = Some(old);
                 p.cpu.set_x(0, error(Errno(4)));
             }
             State::Futex { .. } | State::Sigwait { .. } => {
@@ -2528,6 +2544,7 @@ impl<C: Cpu> Kernel<C> {
                     child.linux.vfs.unshare_cgroup()?;
                 }
                 child.linux.vfs.activate_child_pid(id)?;
+                child.bind_signals();
                 let parent_tid = p.linux.vfs.visible_pid(id);
                 let child_tid = child.linux.vfs.visible_pid(id);
                 // PID namespace init inherits its parent's PGID/SID/tty, as
@@ -2546,7 +2563,6 @@ impl<C: Cpu> Kernel<C> {
                 child.tgid = if threaded { p.tgid } else { id };
                 if threaded {
                     child.oom = Arc::new(p.oom.thread());
-                    child.signals.shared_pending = p.signals.shared_pending.clone();
                     child.signals.io.share_process(&p.signals.io);
                     child.subreaper = p.subreaper;
                     child.file_size_limit = p.file_size_limit.clone();
@@ -2698,30 +2714,22 @@ impl<C: Cpu> Kernel<C> {
             74 => self.signalfd(p, a),
             85..=87 => self.timerfd(p, number, a),
             134 => {
-                let sig = a[0] as u32;
-                if let Some(action) = p.signals.action_call(a, &mut p.memory)? {
-                    if trames_kernel::signal::ignored(sig, action) {
-                        for other in self.processes.values_mut().filter(|o| o.tgid == p.tgid) {
-                            other.signals.pending.discard(sig);
-                        }
-                    }
-                }
+                self.publish_io_tasks(Some((pid, p)));
+                p.signals.action_call(a, &mut p.memory)?;
                 Ok(Some(0))
             }
             135 => p.signals.mask_call(a, &mut p.memory).map(Some),
-            136 => {
-                if a[1] != 8 {
-                    return Err(Errno(22));
-                }
-                let bits = p.pending_bits() & p.signals.mask;
-                write_u64(&mut p.memory, a[0], bits)?;
-                Ok(Some(0))
-            }
+            136 => p
+                .signals
+                .io
+                .pending_call_mask(p.signals.mask, a, &mut p.memory)
+                .map(Some),
             133 => {
-                if a[1] != 8 {
-                    return Err(Errno(22));
-                }
-                let mask = read_u64(&p.memory, a[0])? & !UNBLOCKABLE;
+                let trames_kernel::signal::SignalWait::Suspend { mask } =
+                    trames_kernel::signal::SignalWait::prepare(number, a, &p.memory)?
+                else {
+                    unreachable!()
+                };
                 let old = p.signals.mask;
                 p.signals.mask = mask;
                 p.state = State::Suspend(old);
@@ -2913,9 +2921,6 @@ impl<C: Cpu> Kernel<C> {
                     }
                     Err(e) => Err(e),
                 }
-            }
-            63 | 65 if p.linux.vfs.signalfd_mask(a[0] as u32)?.is_some() => {
-                self.read_signalfd(p, number, a)
             }
             63 | 64 | 65 | 66 | 29
                 if (number != 29 || a[1] as u32 != 0x5421)
@@ -3269,7 +3274,7 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 )
         } else if matches!(number, 63..=66) {
-            let direct = trames_linux::DirectSyscalls::default()
+            let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
                 .with_membership(p.linux.vfs.shared_files())
                 .with_terminal(trames_vfs::TerminalAccess {
                     session: p.session,
@@ -4300,6 +4305,8 @@ impl<C: Cpu> Kernel<C> {
             other != id
                 && !p.frozen(other)
                 && (matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
+                    || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
+                        && !p.linux.trace
                     || p.worker_io_candidate(other)
                         && (p
                             .flock_wait
@@ -4422,6 +4429,7 @@ impl<C: Cpu> Kernel<C> {
                 || (matches!(p.state, State::Sleep(..))
                     && !p.linux.trace
                     && vms.contains(&p.vm_id))
+                || (matches!(p.state, State::Sigwait { .. } | State::Suspend(_)) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
         }));
@@ -4499,6 +4507,27 @@ impl<C: Cpu> Kernel<C> {
                     deadline,
                     remaining,
                 })
+            } else if let State::Sigwait {
+                mask,
+                info,
+                deadline,
+            } = p.state
+            {
+                Some(crate::run_queue::WaitState::Signal(
+                    crate::run_queue::SignalWait::new(trames_kernel::signal::SignalWait::Timed {
+                        mask,
+                        info,
+                        deadline,
+                    }),
+                ))
+            } else if let State::Suspend(old) = p.state {
+                p.signals.wait_mask = Some(old);
+                p.signals.begin_io();
+                Some(crate::run_queue::WaitState::Signal(
+                    crate::run_queue::SignalWait::new(trames_kernel::signal::SignalWait::Suspend {
+                        mask: p.signals.mask,
+                    }),
+                ))
             } else if !matches!(p.state, State::Ready)
                 && !p.worker_io_candidate(id)
                 && !p.worker_gpu_candidate()
@@ -4531,8 +4560,6 @@ impl<C: Cpu> Kernel<C> {
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
                     timers: Some(self.timers.clone()),
-                    owner_pending: p.signals.pending.bits()
-                        | p.signals.shared_pending.borrow().bits(),
                     saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
                     seccomp: p.seccomp.clone(),
                     identities: [
@@ -4597,7 +4624,8 @@ impl<C: Cpu> Kernel<C> {
                                 || p.signals.actions.get(22).handler == 1,
                         })
                         .with_files(direct_files)
-                        .with_lock_context(p.linux.vfs.record_lock_context(p.tgid)),
+                        .with_lock_context(p.linux.vfs.record_lock_context(p.tgid))
+                        .with_signal_reader(p.signals.reader(p.linux.vfs.pid_namespace())),
                     futex: crate::futex::Authority::new(self.futexes.clone(), p.vm_id),
                 }),
             };
@@ -4876,6 +4904,20 @@ impl<C: Cpu> Kernel<C> {
                         deadline,
                         remaining,
                     } => State::Sleep(deadline, remaining),
+                    crate::run_queue::WaitState::Signal(wait) => match wait.request {
+                        trames_kernel::signal::SignalWait::Timed {
+                            mask,
+                            info,
+                            deadline,
+                        } => State::Sigwait {
+                            mask,
+                            info,
+                            deadline,
+                        },
+                        trames_kernel::signal::SignalWait::Suspend { .. } => State::Suspend(
+                            p.signals.wait_mask.take().expect("suspend restore mask"),
+                        ),
+                    },
                     crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
                 })
             };
@@ -5543,6 +5585,7 @@ pub(super) fn run<C: Cpu>(
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
     };
+    root.bind_signals();
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
@@ -6302,7 +6345,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_ppoll_keeps_shared_ofd_and_rejects_reused_owner_control_identity() {
+    fn mixed_ppoll_keeps_shared_pipe_and_signalfd_ofds_after_close_reuse() {
         let mut k = kernel();
         let mut p = process();
         let [reader, writer] = p.linux.vfs.pipe(0).unwrap();
@@ -6319,7 +6362,7 @@ mod tests {
         let args = [0x1000, 2, 0, 0, 0, 0];
         k.call(1, &mut p, 73, args, &mut io);
         assert!(matches!(p.state, State::Blocked(73, _)));
-        assert!(!p.worker_io_candidate(1));
+        assert!(p.worker_io_candidate(1));
         p.linux.vfs.close(reader).unwrap();
         let [replacement, new_writer] = p.linux.vfs.pipe(0).unwrap();
         assert_eq!(replacement, reader);
@@ -6328,15 +6371,18 @@ mod tests {
         assert_eq!(replacement_signal, signal);
         p.linux.vfs.write(new_writer, b"new").unwrap();
         k.call(1, &mut p, 73, args, &mut io);
+        assert!(matches!(p.state, State::Blocked(73, _)));
+        p.linux.vfs.write(writer, b"x").unwrap();
+        k.call(1, &mut p, 73, args, &mut io);
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), 1);
         assert_eq!(
             p.memory.read_array::<2>(0x1006).unwrap(),
-            0u16.to_le_bytes()
+            1u16.to_le_bytes()
         );
         assert_eq!(
             p.memory.read_array::<2>(0x100e).unwrap(),
-            32u16.to_le_bytes()
+            0u16.to_le_bytes()
         );
         assert!(p.retained_poll.is_none());
         assert_eq!(p.linux.vfs.write(writer, b"x"), Err(Errno(32)));
@@ -6921,7 +6967,7 @@ mod tests {
     pub(super) fn process() -> Box<Process> {
         let mut memory = Memory::default();
         memory.map(0x1000, 8 * PAGE_SIZE, Permissions::RW).unwrap();
-        Box::new(Process {
+        let process = Box::new(Process {
             cpu: Cpu::new(0x4000, 0x9000),
             affinity: 1,
             last_cpu: 0,
@@ -6973,7 +7019,9 @@ mod tests {
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,
-        })
+        });
+        process.bind_signals();
+        process
     }
     #[test]
     #[ignore = "manual fixed-cohort preparation benchmark; not Firefox acceptance"]
@@ -7089,9 +7137,9 @@ mod tests {
         k.processes.insert(3, root_command);
         k.processes.insert(4, another_session);
         k.terminal_signal(1, &mut sender, 9, 3, 2);
-        assert!(k.processes[&3].signals.pending.contains_key(&2));
-        assert!(!k.processes[&4].signals.pending.contains_key(&2));
-        assert!(!sender.signals.pending.contains_key(&2));
+        assert!(k.processes[&3].signals.io.inbox.contains_key(&2));
+        assert!(!k.processes[&4].signals.io.inbox.contains_key(&2));
+        assert!(!sender.signals.io.inbox.contains_key(&2));
     }
     #[test]
     fn host_pty_keyboard_and_resize_signals_are_scoped_to_the_foreground_session() {
@@ -7120,11 +7168,11 @@ mod tests {
         k.processes.insert(4, other);
         k.processes.insert(5, background);
         k.pump_guest_ptys();
-        assert!(k.processes[&3].signals.pending.contains_key(&2));
-        assert!(k.processes[&3].signals.pending.contains_key(&28));
+        assert!(k.processes[&3].signals.io.inbox.contains_key(&2));
+        assert!(k.processes[&3].signals.io.inbox.contains_key(&28));
         for id in [1, 4, 5] {
-            assert!(!k.processes[&id].signals.pending.contains_key(&2));
-            assert!(!k.processes[&id].signals.pending.contains_key(&28));
+            assert!(!k.processes[&id].signals.io.inbox.contains_key(&2));
+            assert!(!k.processes[&id].signals.io.inbox.contains_key(&28));
         }
         assert_eq!(
             pair.host_signals.load(std::sync::atomic::Ordering::Relaxed),
@@ -8197,7 +8245,7 @@ mod tests {
         p.signals.actions.set_handler(10, 0x5000);
         Kernel::queue_one(1, &mut p, 10, 1);
         assert!(!k.deliver(1, &mut p).unwrap());
-        assert!(p.signals.pending.contains_key(&10));
+        assert!(p.signals.io.inbox.contains_key(&10));
         Kernel::queue_one(1, &mut p, 19, 1);
         assert!(k.deliver(1, &mut p).unwrap());
         assert!(matches!(p.state, State::Stopped));
@@ -8570,7 +8618,7 @@ mod tests {
         let mut k = kernel();
         let leader = process();
         let mut thread = leader.fork();
-        thread.signals.shared_pending = leader.signals.shared_pending.clone();
+        thread.signals.io.share_process(&leader.signals.io);
         k.processes.insert(1, leader);
         Kernel::queue_one(2, &mut thread, 19, 1);
         assert!(k.deliver(2, &mut thread).unwrap());
@@ -8592,11 +8640,11 @@ mod tests {
         thread.tgid = 1;
         k.processes.insert(2, thread);
         assert_eq!(k.signal(1, &mut p, 0, 10), Ok(0));
-        assert!(p.signals.shared_pending.borrow().contains_key(&10));
-        assert!(k.processes[&2].signals.pending.is_empty());
+        assert!(p.signals.io.process().contains_key(&10));
+        assert!(k.processes[&2].signals.io.inbox.is_empty());
         assert_eq!(k.thread_signal(1, &mut p, 2, Some(3), 10), Err(Errno(3)));
         assert_eq!(k.thread_signal(1, &mut p, 2, Some(1), 10), Ok(0));
-        assert_eq!(k.processes[&2].signals.pending[&10].code, -6);
+        assert_eq!(k.processes[&2].signals.io.inbox.peek(10).unwrap().code, -6);
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 0);
         assert_eq!(k.thread_signal(1, &mut p, 2, None, 0), Err(Errno(1)));
         assert_eq!(k.thread_signal(1, &mut p, 2, None, 18), Ok(0));
@@ -9005,8 +9053,8 @@ mod boundary_tests {
             })))
             .unwrap());
         assert_eq!(&k.terminal.as_ref().unwrap().window[..4], &[40, 0, 120, 0]);
-        assert!(k.processes[&1].signals.pending.contains_key(&28));
-        assert!(!k.processes[&2].signals.pending.contains_key(&28));
+        assert!(k.processes[&1].signals.io.inbox.contains_key(&28));
+        assert!(!k.processes[&2].signals.io.inbox.contains_key(&28));
     }
 }
 

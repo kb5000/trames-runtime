@@ -40,6 +40,14 @@ impl EntryDecision {
     pub(crate) fn allowed(&self) -> bool {
         self.value & 0xffff_0000 == ALLOW
     }
+    /// These decisions have no task lifecycle or signal-delivery effects.
+    pub(crate) fn completed(&self) -> Option<u64> {
+        match self.value & 0xffff_0000 {
+            0x0005_0000 => Some(0u64.wrapping_sub((self.value & 0xffff).min(4095) as u64)),
+            0x7ff0_0000 | 0x7fc0_0000 => Some(0u64.wrapping_sub(38)),
+            _ => None,
+        }
+    }
     fn value_for(self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
         (self.number == number
             && self.pc == pc
@@ -369,8 +377,8 @@ impl<C: Cpu> Kernel<C> {
                 // The syscall number lives in x8 and siginfo; replacing x0
                 // would corrupt the arguments inspected by a SIGSYS broker.
                 p.state = State::Ready;
-                p.signals.pending.discard(31);
-                let _ = p.signals.pending.enqueue(
+                p.signals.io.inbox.discard(31);
+                let _ = p.signals.io.inbox.enqueue(
                     31,
                     Info {
                         sender: decision & 0xffff,
@@ -416,7 +424,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -626,7 +634,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -725,7 +733,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     timers: Some(timers),
-                    owner_pending: 0,
+
                     saved_wait_mask: Default::default(),
                     io_signals: p.signals.io.clone(),
                     io_routes: trames_kernel::signal::IoRoutes {
@@ -851,7 +859,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     timers: None,
-                    owner_pending: 0,
+
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
                     io_routes: Default::default(),
@@ -963,7 +971,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     timers: None,
-                    owner_pending: 0,
+
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
                     io_routes: Default::default(),
@@ -1076,7 +1084,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -1613,7 +1621,7 @@ mod tests {
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
             timers: None,
-            owner_pending: 0,
+
             saved_wait_mask: Default::default(),
             io_signals: Default::default(),
             io_routes: Default::default(),
@@ -1871,7 +1879,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     timers: None,
-                    owner_pending: 0,
+
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
                     io_routes: Default::default(),
@@ -1913,7 +1921,7 @@ mod tests {
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -1964,7 +1972,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -1997,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_sigaction_queries_obey_seccomp_and_mutations_defer_without_effects() {
+    fn worker_sigaction_queries_and_mutations_use_one_exact_entry_decision() {
         for allowed in [false, true] {
             let mut p = super::super::tests::process();
             p.signals.actions.set_handler(10, 0x5000);
@@ -2008,7 +2016,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -2028,7 +2036,8 @@ mod tests {
                 direct: Default::default(),
                 futex: Default::default(),
             };
-            assert_eq!(snapshot.admit(&p.cpu), allowed);
+            assert!(!snapshot.admit(&p.cpu));
+            assert_eq!(snapshot.signal_entry(&p.cpu).unwrap().allowed(), allowed);
             if allowed {
                 assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
             }
@@ -2038,8 +2047,15 @@ mod tests {
             );
             p.cpu.set_x(1, 0x1100);
             assert!(!snapshot.admit(&p.cpu));
-            assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), None);
-            assert_eq!(p.signals.actions.get(10).handler, 0x5000);
+            assert_eq!(snapshot.signal_entry(&p.cpu).unwrap().allowed(), allowed);
+            if allowed {
+                assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
+            }
+            assert_eq!(
+                p.signals.actions.get(10).handler,
+                if allowed { 0 } else { 0x5000 }
+            );
+            assert_eq!(p.seccomp.evaluations(), 2);
         }
     }
     #[test]
@@ -2054,7 +2070,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -2108,7 +2124,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -2164,7 +2180,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 timers: None,
-                owner_pending: 0,
+
                 saved_wait_mask: Default::default(),
                 io_signals: Default::default(),
                 io_routes: Default::default(),
@@ -2215,7 +2231,7 @@ mod tests {
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
                     timers: None,
-                    owner_pending: 0,
+
                     saved_wait_mask: Default::default(),
                     io_signals: Default::default(),
                     io_routes: Default::default(),

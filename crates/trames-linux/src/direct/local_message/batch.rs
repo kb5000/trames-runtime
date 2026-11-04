@@ -106,7 +106,7 @@ impl Batch {
                 let sent = if let Some(item) = &state.active {
                     if let Some((vfs, socket)) = owner.as_mut() {
                         let Transfer::Single { prepared, datagram } =
-                            &item.message.as_ref().expect("accepted item").transfer
+                            &item.message().expect("accepted item").transfer
                         else {
                             unreachable!()
                         };

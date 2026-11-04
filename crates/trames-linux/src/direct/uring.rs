@@ -178,6 +178,24 @@ impl RequestOps for Request {
             }
         };
         let count = parts.iter().map(|p| p.1).sum();
+        if let Object::Byte(fd) = &resource.object {
+            if fd.is_signalfd() {
+                return Some(if network {
+                    Err(Errno(88))
+                } else if write {
+                    Err(Errno(22))
+                } else {
+                    signal_read::SignalRead::uring(
+                        fd,
+                        parts,
+                        memory,
+                        s.opcode() == 1,
+                        self.buffer.as_deref(),
+                    )
+                    .map(|n| n as i32)
+                });
+            }
+        }
         let checked = parts
             .iter()
             .filter(|p| p.1 != 0 && self.buffer.is_none())
@@ -753,8 +771,15 @@ impl UringSnapshot {
         }
     }
     fn accepted_resource(&self, file: &UringFile) -> Option<Resource> {
-        file.shared_file()?;
-        Resource::capture(file)
+        let shared = file.shared_file()?;
+        self.descriptors
+            .as_ref()
+            .and_then(|fds| fds.byte_file(shared))
+            .map(|f| Resource {
+                object: Object::Byte(f),
+                identity: file.identity(),
+            })
+            .or_else(|| Resource::capture(file))
             .or_else(|| {
                 self.files
                     .retain(&file.retained())
@@ -1316,7 +1341,7 @@ impl UringEpoch {
                     && (r.resource.is_some()
                         || r.file
                             .as_ref()
-                            .is_none_or(|f| Resource::capture(f).is_some()))
+                            .is_none_or(|f| f.is_signalfd() || Resource::capture(f).is_some()))
         })
     }
     pub fn adopt_wait(
