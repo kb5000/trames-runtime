@@ -144,6 +144,24 @@ mod tests {
     use super::super::tests::{kernel, process};
     use super::*;
     #[test]
+    fn joined_credential_change_publishes_the_resource_signal_origin() {
+        let mut k = kernel();
+        let mut p = process();
+        p.signals.actions.set_handler(25, 0x5000);
+        k.publish_io_tasks(Some((1, &p)));
+        k.call(
+            1,
+            &mut p,
+            146,
+            [1000, 0, 0, 0, 0, 0],
+            &mut trames_linux::CapturedOutput::default(),
+        );
+        assert_eq!(p.linux.vfs.credentials.uid, 1000);
+        trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
+        let info = p.signals.io.inbox.take(25).unwrap();
+        assert_eq!((info.code, info.sender, info.uid), (0, 1, 1000));
+    }
+    #[test]
     fn guest_poweroff_checks_authority_magic_and_stops_the_whole_root_group() {
         let mut k = kernel();
         let mut p = process();

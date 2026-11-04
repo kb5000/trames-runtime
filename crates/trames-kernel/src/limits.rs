@@ -296,6 +296,7 @@ mod tests {
         let limits = Limits::new(&v);
         let mut thread = v.clone_with_files(false);
         limits.bind(&mut thread);
+        thread.unshare_descriptors();
         let fork = v.clone_with_files(true);
         let child = limits.fork(&fork);
         limits.set(1, (9, 18));

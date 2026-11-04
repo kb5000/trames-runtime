@@ -915,7 +915,10 @@ impl Vfs {
     /// Detach table metadata, retaining the same open descriptions. Structural
     /// clone/unshare/exec still execute at a joined lifecycle boundary.
     pub fn unshare_descriptors(&mut self) {
+        // FD membership changes, but this process keeps the same live rlimit.
+        let limit = self.descriptor_limit_handle();
         self.fds = self.fds.clone();
+        self.fds.bind_limit(limit.0);
     }
     /// Immutable descriptor kinds for one CPU epoch. Cached per shared table
     /// version, so dispatch does not scan all descriptors on every syscall.

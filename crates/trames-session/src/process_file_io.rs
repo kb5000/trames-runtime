@@ -11,7 +11,7 @@ pub(super) struct FileLayout {
 impl<C: Cpu> Kernel<C> {
     pub(super) fn start_file_checkpoint(
         &mut self,
-        pid: u32,
+        _pid: u32,
         p: &mut Process<C>,
         _number: u32,
         _args: [u64; 6],

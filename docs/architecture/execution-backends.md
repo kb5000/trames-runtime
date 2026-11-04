@@ -2314,3 +2314,11 @@ after resource/disposition locks are released; ignored signals and retired tasks
 do not acquire pending records. Native ARM Linux acceptance checks SI_USER,
 tgid/real UID, short-write and EFBIG behavior. Default termination/stop still
 requires the actual task lifecycle boundary; caught/ignored error signals do not.
+
+
+Task identity publication happens on actual clone and credential custody changes,
+including solo execution before any parallel epoch exists. Host-authorized exec
+binds its replacement VFS to the inherited original process limits. Explicit FD
+table unshare/exec keeps the same process soft-limit atomic while detaching table
+membership; a fork still copies the process limit. These are structural ownership
+updates, not repeated file-I/O or guest-instruction policy checks.

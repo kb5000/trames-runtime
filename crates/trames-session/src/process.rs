@@ -587,28 +587,29 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
     Err(Errno(7))
 }
 impl<C: Cpu> Kernel<C> {
+    fn publish_task(&self, id: u32, p: &Process<C>) {
+        self.limit_directory
+            .publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
+        if matches!(p.state, State::Zombie(_)) {
+            return;
+        }
+        p.bind_signals();
+        p.signals.io_directory.publish(
+            &p.signals.io,
+            id,
+            p.tgid,
+            p.group,
+            p.linux.vfs.credentials.uid,
+            p.linux.vfs.credentials.suid,
+        );
+    }
     fn publish_io_tasks(&self, current: Option<(u32, &Process<C>)>) {
         self.limit_directory.prune();
-        fn publish<C: Cpu>(directory: &trames_kernel::limits::Directory, id: u32, p: &Process<C>) {
-            directory.publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
-            if matches!(p.state, State::Zombie(_)) {
-                return;
-            }
-            p.bind_signals();
-            p.signals.io_directory.publish(
-                &p.signals.io,
-                id,
-                p.tgid,
-                p.group,
-                p.linux.vfs.credentials.uid,
-                p.linux.vfs.credentials.suid,
-            );
-        }
         for (&id, p) in &self.processes {
-            publish(&self.limit_directory, id, p);
+            self.publish_task(id, p);
         }
         if let Some((id, p)) = current {
-            publish(&self.limit_directory, id, p);
+            self.publish_task(id, p);
         }
     }
     fn native_call(
@@ -920,6 +921,7 @@ impl<C: Cpu> Kernel<C> {
             .inherit_total_limit(&root.memory)
             .map_err(|_| Errno(12))?;
         child.linux.vfs = request.vfs;
+        child.limits.bind(&mut child.linux.vfs);
         child.linux.vfs.activate_child_pid(id)?;
         child.bind_signals();
         child.linux.vfs.set_process_context(id);
@@ -2607,6 +2609,7 @@ impl<C: Cpu> Kernel<C> {
                         .map_err(|_| Errno(14))?;
                 }
                 child.linux.vfs.cgroup_fork(pid, id, child.tgid);
+                self.publish_task(id, &child);
                 self.processes.insert(id, child);
                 if a[0] & 0x4000 != 0 {
                     p.state = State::Vfork(id);
@@ -3137,7 +3140,11 @@ impl<C: Cpu> Kernel<C> {
         let was_blocked = matches!(p.state, State::Blocked(..));
         p.cpu.set_x(8, number as u64);
         put_args(&mut p.cpu, a);
-        let ids = |c: &trames_vfs::Credentials| [c.euid, c.egid, c.fsuid, c.fsgid];
+        let ids = |c: &trames_vfs::Credentials| {
+            [
+                c.euid, c.egid, c.fsuid, c.fsgid, c.uid, c.gid, c.suid, c.sgid,
+            ]
+        };
         let before_ids = ids(&p.linux.vfs.credentials);
         let socket = p
             .byte_wait
@@ -3384,8 +3391,12 @@ impl<C: Cpu> Kernel<C> {
         if was_local && !matches!(result, Ok(None)) {
             p.retained_message_owner = None;
         }
-        if ids(&p.linux.vfs.credentials) != before_ids {
-            p.pdeath_signal = 0;
+        let after_ids = ids(&p.linux.vfs.credentials);
+        if after_ids != before_ids {
+            if after_ids[..4] != before_ids[..4] {
+                p.pdeath_signal = 0;
+            }
+            self.publish_task(pid, p);
         }
         let raw = match result {
             Ok(Some(raw)) => {
@@ -5954,6 +5965,10 @@ mod tests {
             })
             .unwrap();
         let mut child = k.processes.remove(&id).unwrap();
+        child.limits.set(7, (8, 16));
+        child.limits.set(1, (3, u64::MAX));
+        assert_eq!(child.linux.vfs.descriptor_limit(), 8);
+        assert_eq!(child.linux.vfs.file_size_limit_handle().get(), 3);
         assert_eq!(child.cpu.pc, 0x400080);
         assert_eq!(child.group, id);
         assert_eq!(child.session, id);
