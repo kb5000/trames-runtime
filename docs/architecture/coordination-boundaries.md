@@ -262,3 +262,9 @@ request; importing a second `IoCall` for the same syscall would replay it as
 unsupported I/O after the child event completed. The real Kernel adoption test
 covers both APIs. Existing owner-event resource envelopes remain an explicit
 compatibility boundary; they are not erased by this lifecycle change.
+
+Completed owner projections are collected after worker Views return and before
+processing the next returned owner syscall. This makes an immediate getpgid (and
+other owner PID queries) observe the same reaping as signal/limit directories;
+collection is not deferred to the next cohort's admission. The adoption test
+follows each successful source wait with an owner getpgid and requires ESRCH.

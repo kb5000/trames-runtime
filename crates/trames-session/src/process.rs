@@ -4352,7 +4352,6 @@ impl<C: Cpu> Kernel<C> {
         limit: u64,
         persistent: bool,
     ) -> Result<bool, RuntimeError> {
-        self.reap_waited();
         if self
             .processes
             .get(&1)
@@ -5046,6 +5045,9 @@ impl<C: Cpu> Kernel<C> {
         // Successful worker wakes are already committed. Publish readiness
         // before any returned syscall (requeue/exit/signal) can change tasks.
         self.resume_futex_ready();
+        // Source waits already retired PID visibility. Drop their completed
+        // owner projections before any returned PID query can inspect them.
+        self.reap_waited();
         outcomes.sort_by_key(|v| v.0);
         for (id, _) in &outcomes {
             if let State::Gpu {
@@ -7028,7 +7030,16 @@ mod tests {
             );
             parent.cpu.set_x(8, number as u64);
             parent.cpu.set_x(19, u64::MAX);
-            for (i, word) in [0xaa0003f3u32, 0x14000000].into_iter().enumerate() {
+            for (i, word) in [
+                0xaa0003f3u32,
+                0xd2800540,
+                0xd2801368,
+                0xd4000001,
+                0x14000000,
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 parent
                     .memory
                     .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
@@ -7041,7 +7052,7 @@ mod tests {
             let mut peer = parent.fork();
             peer.tgid = 2;
             peer.parent = 1;
-            peer.cpu.set_pc(0x4004);
+            peer.cpu.set_pc(0x4010);
             let mut child = parent.fork();
             child.tgid = 42;
             child.parent = 1;
@@ -7059,11 +7070,19 @@ mod tests {
                 assert!(kernel
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
                     .unwrap());
-                if kernel.processes[&1].cpu.x(19) == expected {
+                if kernel.processes[&1].cpu.x(19) == expected
+                    && kernel.processes[&1].cpu.x(0) == 0u64.wrapping_sub(3)
+                {
                     break;
                 }
             }
             assert_eq!(kernel.processes[&1].cpu.x(19), expected);
+            assert_eq!(
+                kernel.processes[&1].cpu.x(0),
+                0u64.wrapping_sub(3),
+                "owner getpgid must see reaping immediately"
+            );
+            assert!(!kernel.processes.contains_key(&42));
             assert_eq!(kernel.service_requests, 0);
             assert!(!kernel.cohort_return_syscalls.contains_key(&number));
         }
