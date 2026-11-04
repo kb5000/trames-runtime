@@ -85,6 +85,19 @@ success would leave a hidden whole-cohort fallback. Structural fork/exec and
 security-policy mutation are also still explicit boundaries. No all-lifecycle
 or all-signal-policy owner-independence claim is made by this batch.
 
+### Concurrent mount namespace resource tracking (2026-11-04)
+
+The shared mount-resource list is a weak identity/retirement index across all
+namespaces. It is not the namespace mount table. Its former aggregate 128-entry
+check could make unshare(CLONE_NEWNS) fail with ENOSPC when unrelated containers
+were active. Stock runc's nsexec stage 1 then exited before forwarding the init
+PID; its parent reported a PID-pipe EOF. The index now grows with actual live
+resources and prunes retired weak entries. Existing per-namespace mount-table
+bounds and structural namespace authority remain unchanged. This correction
+adds no coordinator/service thread, polling or ordinary I/O check. Regression
+tests retain more than 128 live mounts across independent namespaces, verify
+retirement and preserve atomic per-namespace limit failure/recovery.
+
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |

@@ -817,7 +817,7 @@ mod tests {
         let completed = finish.recv_timeout(Duration::from_secs(1));
         drop(writer); // Even the old broken implementation can finish cleanup.
         reader.join().unwrap();
-        assert_eq!(completed.unwrap(), true);
+        assert!(completed.unwrap());
     }
     #[test]
     fn copy_up_does_not_pin_inode_while_waiting_for_upper_namespace() {

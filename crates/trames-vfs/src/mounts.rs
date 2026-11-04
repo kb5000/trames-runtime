@@ -1973,9 +1973,9 @@ impl Vfs {
         self.reap_detached_mounts();
         let mut resources = self.mount_resources.borrow_mut();
         resources.retain(|m| m.strong_count() != 0);
-        if resources.len() + mounts.len() > MAX_MOUNTS {
-            return Err(Errno(28));
-        }
+        // This is a weak lookup/retirement index shared by every namespace,
+        // not a mount table. Applying the per-namespace bound here couples
+        // unrelated containers and can make unshare fail before init starts.
         let mut registry = self.mount_registry.borrow_mut();
         registry.retain(|m| m.strong_count() != 0);
         resources.extend(mounts.iter().map(|m| Arc::downgrade(&m.identity)));
@@ -2110,25 +2110,55 @@ mod boundary_tests {
         }
     }
     #[test]
-    fn namespace_limit_failure_is_atomic_and_recoverable() {
-        let mut v = vfs();
-        let mut keep = Vec::new();
-        loop {
-            let id = v.mounts.as_ref().unwrap().id();
-            let cwd = v.cwd().unwrap();
-            let before = v.clone();
-            match v.unshare_mounts() {
-                Ok(()) => keep.push(before),
-                Err(e) => {
-                    assert_eq!(e, Errno(28));
-                    assert_eq!(v.mounts.as_ref().unwrap().id(), id);
-                    assert_eq!(v.cwd().unwrap(), cwd);
-                    break;
-                }
-            }
+    fn sibling_namespaces_do_not_share_the_mount_table_quota() {
+        let mut parent = vfs();
+        parent.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
+        let initial = parent
+            .mount_resources
+            .borrow()
+            .iter()
+            .filter(|w| w.strong_count() != 0)
+            .count();
+        let mut siblings = Vec::new();
+        for _ in 0..MAX_MOUNTS + 16 {
+            let mut child = parent.clone();
+            child.unshare_mounts().unwrap();
+            child.mount(None, b"/b", Some(b"tmpfs"), 0, None).unwrap();
+            siblings.push(child);
         }
-        drop(keep);
-        v.unshare_mounts().unwrap();
+        assert!(parent.mount_resources.borrow().len() > MAX_MOUNTS);
+        for child in &siblings {
+            assert_eq!(
+                child.mounts.as_ref().unwrap().0.borrow().mounts.len(),
+                initial + 1
+            );
+        }
+        drop(siblings);
+        parent.register_mounts(&[]).unwrap();
+        assert_eq!(parent.mount_resources.borrow().len(), initial);
+    }
+    #[test]
+    fn per_namespace_mount_limit_failure_is_atomic_and_recoverable() {
+        let mut v = vfs();
+        while v.mounts.as_ref().unwrap().0.borrow().mounts.len() < MAX_MOUNTS {
+            v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
+        }
+        let id = v.mounts.as_ref().unwrap().id();
+        let cwd = v.cwd().unwrap();
+        assert_eq!(
+            v.mount(None, b"/a", Some(b"tmpfs"), 0, None),
+            Err(Errno(28))
+        );
+        assert_eq!(v.mounts.as_ref().unwrap().id(), id);
+        assert_eq!(v.cwd().unwrap(), cwd);
+        let mut child = v.clone();
+        child.unshare_mounts().unwrap();
+        assert_eq!(
+            child.mounts.as_ref().unwrap().0.borrow().mounts.len(),
+            MAX_MOUNTS
+        );
+        v.umount(b"/a", 0).unwrap();
+        v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
     }
     #[test]
     fn tmpfs_directory_links_and_hardlink_outside_bind_do_not_confuse_paths() {
