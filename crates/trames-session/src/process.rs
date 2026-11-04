@@ -2714,7 +2714,9 @@ impl<C: Cpu> Kernel<C> {
             74 => self.signalfd(p, a),
             85..=87 => self.timerfd(p, number, a),
             134 => {
-                self.publish_io_tasks(Some((pid, p)));
+                if a[1] != 0 {
+                    self.publish_io_tasks(Some((pid, p)));
+                }
                 p.signals.action_call(a, &mut p.memory)?;
                 Ok(Some(0))
             }
