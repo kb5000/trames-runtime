@@ -396,6 +396,7 @@ mod tests {
     fn finish(work: FileWork) -> Result<FileValue> {
         match work.run() {
             FileOutcome::Complete(reply) => reply.result,
+            FileOutcome::Waiting(_) => panic!("unexpected stream wait"),
             FileOutcome::Owner(_) => panic!("ordinary namespace reached owner"),
             FileOutcome::Layout(_) => panic!("namespace unexpectedly changed mapped backing"),
         }

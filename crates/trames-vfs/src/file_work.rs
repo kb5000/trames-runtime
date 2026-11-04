@@ -26,6 +26,7 @@ impl FileTarget {
             return true;
         }
         match command {
+            FileCommand::Transfer(transfer) => transfer.borrow().host_work_owned(),
             FileCommand::Read { count, .. } if *count < 16 * 1024 => false,
             FileCommand::Write { bytes, .. }
                 if bytes.len() < 16 * 1024 && self.0.open.flags.get() & 0x1000 == 0 =>
@@ -46,6 +47,9 @@ impl FileTarget {
         }
     }
     pub fn host_work(&self, operation: &FileCommand) -> bool {
+        if let FileCommand::Transfer(transfer) = operation {
+            return transfer.borrow().host_work();
+        }
         if matches!(
             operation,
             FileCommand::Sync { .. }
@@ -68,6 +72,7 @@ impl FileTarget {
         let persistent = data.disk_source().is_some();
         match operation {
             FileCommand::Copy { .. } => true,
+            FileCommand::Transfer(transfer) => transfer.borrow().host_work(),
             FileCommand::Seek { .. } => persistent,
             FileCommand::Stat => false,
             FileCommand::Read { .. } => persistent,
@@ -124,6 +129,7 @@ pub enum FileCommand {
         whence: u32,
     },
     Stat,
+    Transfer(RefCell<StreamTransfer>),
     Copy {
         input: FileTarget,
         transfer: RefCell<FileCopy>,
@@ -146,6 +152,8 @@ pub struct FileReply {
 }
 pub enum FileOutcome {
     Complete(FileReply),
+    /// No bytes committed: the source task parks on the accepted endpoint.
+    Waiting(FileWork),
     /// A genuine mapping-layout boundary, with original input retained. There
     /// have been no output effects; a copy retains its accepted input bytes.
     Layout(FileWork),
@@ -189,6 +197,28 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
+    pub fn transfer_waiting(&self) -> bool {
+        matches!(&self.command,FileCommand::Transfer(t) if t.borrow().waits())
+    }
+    pub fn transfer_ready(&self) -> bool {
+        match &self.command {
+            FileCommand::Transfer(t) => t.borrow().ready(),
+            _ => true,
+        }
+    }
+    pub fn transfer_wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        match &self.command {
+            FileCommand::Transfer(t) => t.borrow().wait_sources(signal),
+            _ => unreachable!("transfer wait"),
+        }
+    }
+    pub fn transfer_native_fds(&self) -> Vec<HostFd> {
+        match &self.command {
+            FileCommand::Transfer(t) => t.borrow().native_wait_fds(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Owned staging only, not file size or a guest mapping quota.
     pub fn buffered_bytes(&self) -> usize {
         match &self.command {
@@ -281,7 +311,12 @@ impl FileWork {
             );
         }
         if self.input_active.is_none() {
-            if let FileCommand::Copy { input, .. } = &self.command {
+            let input = match &self.command {
+                FileCommand::Copy { input, .. } => Some(input.clone()),
+                FileCommand::Transfer(t) => t.borrow().input.file_target(),
+                _ => None,
+            };
+            if let Some(input) = input {
                 if let Some(node) = input.0.open.node.as_ref() {
                     node.active_file_work.fetch_add(1, Ordering::Relaxed);
                     self.input_active = Some(FileActive(node.clone()));
@@ -304,6 +339,11 @@ impl FileWork {
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
     pub fn run_owned(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
         let result = command.execute_target(vfs, &target);
+        if result.as_ref().is_err_and(|e| e.0 == 11)
+            && matches!(&command,FileCommand::Transfer(t) if t.borrow().waits())
+        {
+            return FileOutcome::Waiting(Self::from_vfs(vfs, target, command));
+        }
         let signal = vfs.take_file_size_signal();
         let scratch = match &mut command {
             FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => {
@@ -324,6 +364,11 @@ impl FileWork {
     ) -> FileOutcome {
         match paths.file_command(&target, &command, false) {
             Some((result, signal)) => {
+                if result.as_ref().is_err_and(|e| e.0 == 11)
+                    && matches!(&command,FileCommand::Transfer(t) if t.borrow().waits())
+                {
+                    return FileOutcome::Waiting(Self::new(paths, target, command));
+                }
                 let scratch = match &mut command {
                     FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => {
                         Some(std::mem::take(bytes))
@@ -385,6 +430,9 @@ impl FileWork {
         };
         match reply {
             Some((mut result, signal)) => {
+                if result.as_ref().is_err_and(|e| e.0 == 11) && self.transfer_waiting() {
+                    return FileOutcome::Waiting(self);
+                }
                 if result.is_ok() {
                     if let Some(open) = self.open.take() {
                         result = Ok(FileValue::Count(open.publish(&self.paths) as u64));
@@ -508,6 +556,7 @@ impl FileCommand {
             cloexec: false.into(),
         };
         match self {
+            Self::Transfer(transfer) => transfer.borrow_mut().execute(v),
             Self::Read {
                 count,
                 offset: None,
@@ -548,6 +597,7 @@ impl FileCommand {
     }
     fn execute(&self, v: &mut Vfs, fd: u32) -> Result<FileValue> {
         match self {
+            FileCommand::Transfer(transfer) => transfer.borrow_mut().execute(v),
             FileCommand::Copy { input, transfer } => v.with_file_peer(input, |v, input| {
                 transfer.borrow_mut().execute(v, input, fd)
             }),
@@ -631,6 +681,9 @@ impl FileCopy {
     }
     fn execute(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
         if self.stage.is_none() {
+            if !self.range && v.flags(output)? & 0x400 != 0 {
+                return Err(Errno(22));
+            }
             let source = v.stat_fd(input)?;
             v.fd_kind(output)?;
             let from = match self.from? {

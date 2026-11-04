@@ -689,8 +689,21 @@ mod tests {
         v.close(accepted).unwrap();
         v.close(fd).unwrap();
     }
+    // Debug smoltcp packet stacks exceed Linux libtest's default 2 MiB.
+    // Only these virtual-handshake fixtures need a larger harness stack.
+    fn packet_stack(case: fn()) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(case)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
     #[test]
     fn virtual_connect_timeout_survives_handoff_without_rereading_peer_or_fd() {
+        packet_stack(virtual_connect_timeout_survives_handoff_without_rereading_peer_or_fd_case);
+    }
+    fn virtual_connect_timeout_survives_handoff_without_rereading_peer_or_fd_case() {
         let fabric = trames_net::Fabric::new().unwrap();
         let mut v = Vfs::default();
         v.configure_virtual_network(&fabric, 2, trames_net::NetworkMode::Outbound)
@@ -749,6 +762,11 @@ mod tests {
     }
     #[test]
     fn connect_checkpoint_resumes_original_handshake_after_peer_bytes_and_fd_change() {
+        packet_stack(
+            connect_checkpoint_resumes_original_handshake_after_peer_bytes_and_fd_change_case,
+        );
+    }
+    fn connect_checkpoint_resumes_original_handshake_after_peer_bytes_and_fd_change_case() {
         struct NoEvents;
         impl IoWake for NoEvents {
             fn wake_io(&self, _: &Arc<IoSignal>) {}

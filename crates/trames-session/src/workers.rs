@@ -508,8 +508,8 @@ impl<C: Cpu> Pool<C> {
                                         // Caught I/O signals below never stop the other CPUs.
                                         work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
                                     }
-                                    let uninterruptible = job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some() || io.number == 2)
-                                        || job.retry.as_ref().is_some_and(|call| call.file.is_some() || call.number == 2);
+                                    let uninterruptible = job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                        || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
                                             if let Some(waiting) = job.waiting.take() {
@@ -525,7 +525,7 @@ impl<C: Cpu> Pool<C> {
                                             }
                                             let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
                                             if let Some(pending) = pending {
-                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 32 | 63..=66 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
                                                 } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }

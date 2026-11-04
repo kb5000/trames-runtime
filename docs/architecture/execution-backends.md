@@ -2030,4 +2030,45 @@ extension, new service thread or production unsafe block is added by this batch.
 
 The [consolidated coordination/fallback audit](coordination-boundaries.md) is the
 current architecture inventory. Structural mount/task/VM and owner control paths
-remain; further coordinator-removal implementation is on hold after this batch.
+remain. The following transfer migration updates the mixed-I/O boundary.
+
+
+## Cross-resource stream transfer (2026-11-04)
+
+The normal sendfile/splice contract covers regular-file/pipe, pipe/pipe,
+file/Unix-stream or TCP, pipe/Unix-stream or TCP, and stream/pipe pairs. One ABI
+import captures both original OFDs and offset values before queueing. The same
+StreamTransfer algorithm serves worker and joined execution. Closing/reusing a
+numeric FD, changing guest inputs or handing the task to another cohort cannot
+retarget accepted resources. Unsupported owner/dynamic resources defer before
+effects; tee/vmsplice are not introduced by this migration.
+
+Pipe prefix and capacity reservations belong to the original pipe mutex and are
+also respected by ordinary reads, writes, polling and native relay. No pipe mutex
+spans disk I/O or a parked task. A blocked sink releases an uncommitted pipe prefix;
+a destination pipe reserves capacity before a stream source consumes bytes.
+Cancellation/drop returns reservations and publishes original readiness. Memory
+and socket byte operations execute on the source worker. Disk/native file work
+uses the existing bounded pool and copied staging, never borrowed guest pointers.
+
+A resource wait retains its operation and subscribes to the original endpoint's
+readiness, native event source and deadline. It gives up its execution slot and
+can be interrupted/restarted by the existing signal ABI. In-flight disk work
+retains its existing accepted-result/copyout policy. A true mapped-file output
+layout change retains staged input through the existing affected-domain boundary;
+it is distinct from ordinary backpressure and from owner-only compatibility work.
+
+Immediately completing joined calls use the original VFS, with no retained file
+island/result/subscription allocation. The existing below-16-KiB short native
+read/write policy also applies to these joined transfers, unless an original
+inode already has queued work or output requires synchronous I/O. Bulk and worker
+native I/O stay on the original disk pool. Its completion notifies the existing
+source target; the joined scheduler parks on that notification rather than polling
+with a fixed sleep. Resumption retains access to the same executor.
+
+EOF, short results, EAGAIN, offset/error ordering, append rejection, SIGPIPE,
+caught-signal cancellation and SA_RESTART are covered against native Linux. Original
+file position/byte synchronization and the existing bounded transfer staging are
+retained. No new coordinator/resource thread, message bus, ordinary-memory fence,
+unsafe block, CPU quota or global transfer lock is added. This is common Mac/iPad
+code; no whole-application or entirely coordinator-free claim follows from it.

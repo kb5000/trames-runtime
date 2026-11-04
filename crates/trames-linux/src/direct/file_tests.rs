@@ -51,6 +51,10 @@ fn imported_write_survives_epoch_drop_input_changes_fd_reuse_and_native_completi
     else {
         panic!("native write should release its CPU slot");
     };
+    assert!(
+        wait.notification_external(),
+        "disk completion must wake joined execution"
+    );
     let pending = wait.file_pending().unwrap();
     drop(wait);
     drop((direct, old_target));
@@ -292,4 +296,41 @@ fn namespace_call_retains_original_path_and_dirfd_across_native_wait_and_reuse()
     assert_eq!(v.stat_at(-100, b"/other/other"), Err(Errno(2)));
     drop(v);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn stream_wait_rearms_original_fds_and_copies_offsets_only_on_commit() {
+    let mut v = trames_vfs::Vfs::default();
+    v.import_file(b"/input", b"payload".to_vec()).unwrap();
+    let source = v.open_at(-100, b"/input", 0, 0).unwrap();
+    let [read, write] = v.pipe(0).unwrap();
+    v.write(write, &vec![1; 65536]).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+    memory.write_array(0x10000, 1u64.to_le_bytes()).unwrap();
+    let direct = DirectSyscalls::default()
+        .with_membership(v.shared_files())
+        .with_paths(v.path_queries());
+    let target = t();
+    let args = [write as u64, source as u64, 0x10000, 3, 0, 0];
+    let Some(IoAttempt::Blocked(wait)) =
+        direct.start_file_call(71, args, &mut memory, 1, &Arc::downgrade(&target))
+    else {
+        panic!("full destination")
+    };
+    let pending = wait.file_pending().unwrap();
+    assert!(pending.interruptible());
+    assert_eq!(memory.read_u64(0x10000).unwrap(), 1);
+    v.close(source).unwrap();
+    v.import_file(b"/other", b"wrong".to_vec()).unwrap();
+    assert_eq!(v.open_at(-100, b"/other", 0, 0).unwrap(), source);
+    drop((wait, direct));
+    v.read(read, 65536).unwrap();
+    let direct = DirectSyscalls::default();
+    assert!(matches!(
+        direct.start_retained_file(pending, 71, args, &mut memory, 1, &Arc::downgrade(&target)),
+        IoAttempt::Complete(Ok(3))
+    ));
+    assert_eq!(memory.read_u64(0x10000).unwrap(), 4);
+    assert_eq!(v.read(read, 3).unwrap(), b"ayl");
 }

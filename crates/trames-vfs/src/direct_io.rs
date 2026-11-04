@@ -111,6 +111,8 @@ pub(super) struct PipeData {
     pub read_epoch: u64,
     pub write_epoch: u64,
     pub io_epoch: [u64; 2],
+    pub read_reserved: bool,
+    pub write_reserved: usize,
 }
 impl PipeData {
     pub(super) fn new() -> Self {
@@ -121,14 +123,22 @@ impl PipeData {
             read_epoch: 0,
             write_epoch: 0,
             io_epoch: [0; 2],
+            read_reserved: false,
+            write_reserved: 0,
         }
+    }
+    pub(super) fn write_room(&self) -> usize {
+        PIPE_CAPACITY - self.bytes.len() - self.write_reserved
+    }
+    pub(super) fn readable(&self) -> bool {
+        !self.read_reserved && !self.bytes.is_empty()
     }
     // The original pipe algorithms, shared by VFS and worker-local calls.
     pub(super) fn read(&mut self, count: usize) -> Result<Vec<u8>> {
         if count == 0 {
             return Ok(Vec::new());
         }
-        if self.bytes.is_empty() && self.writers != 0 {
+        if self.read_reserved || self.bytes.is_empty() && self.writers != 0 {
             return Err(Errno(11));
         }
         let n = count.min(self.bytes.len());
@@ -144,7 +154,7 @@ impl PipeData {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let room = PIPE_CAPACITY - self.bytes.len();
+        let room = self.write_room();
         if room == 0 || bytes.len() <= 4096 && room < bytes.len() {
             return Err(Errno(11));
         }
@@ -1001,7 +1011,7 @@ impl DirectFd {
             } => {
                 let data = data.lock().unwrap();
                 let ready = if *read {
-                    (if data.bytes.is_empty() { 0 } else { events & 1 })
+                    (if data.readable() { events & 1 } else { 0 })
                         | (if data.writers == 0 && data.write_epoch != *initial_write_epoch {
                             16
                         } else {
@@ -1009,7 +1019,7 @@ impl DirectFd {
                         })
                 } else if data.readers == 0 {
                     8
-                } else if PIPE_CAPACITY - data.bytes.len() >= 4096 {
+                } else if data.write_room() >= 4096 {
                     events & 4
                 } else {
                     0

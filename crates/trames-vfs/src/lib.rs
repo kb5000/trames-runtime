@@ -19,8 +19,10 @@ mod fd_status;
 pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
+mod stream_transfer;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
+pub use stream_transfer::{StreamTransfer, TransferWait};
 mod descriptor_factory;
 mod fd_allocator;
 mod fd_table;
@@ -1127,7 +1129,7 @@ impl Vfs {
             let p = end.data.lock().unwrap();
             ready = 0;
             if end.read {
-                if !p.bytes.is_empty() {
+                if p.readable() {
                     ready |= events & 1;
                 }
                 if p.writers == 0 && p.write_epoch != end.initial_write_epoch {
@@ -1137,7 +1139,7 @@ impl Vfs {
             if end.write {
                 if p.readers == 0 {
                     ready |= 8;
-                } else if PIPE_CAPACITY - p.bytes.len() >= 4096 {
+                } else if p.write_room() >= 4096 {
                     ready |= events & 4;
                 }
             }
@@ -2578,6 +2580,17 @@ impl Vfs {
         from: Option<u64>,
         to: Option<u64>,
     ) -> Result<usize> {
+        let files = self.shared_files();
+        if let (Some(Ok(source)), Some(Ok(dest))) = (files.lookup(input), files.lookup(output)) {
+            if StreamTransfer::admitted(&source, &dest) {
+                let mut transfer =
+                    StreamTransfer::new(source, dest, Ok(from), Ok(to), count as u64, true, 0);
+                return match transfer.execute(self)? {
+                    FileValue::Transfer { count, .. } => Ok(count as usize),
+                    _ => unreachable!(),
+                };
+            }
+        }
         let source = self.descriptor(input)?.open.clone();
         let dest = self.descriptor(output)?.open.clone();
         if OpenHandle::ptr_eq(&source, &dest) {
@@ -2630,66 +2643,32 @@ impl Vfs {
             return Ok(0);
         }
         if let Some((pipe, _)) = source_pipe {
-            let bytes = {
-                let p = pipe.data.lock().unwrap();
-                if p.bytes.is_empty() && p.writers != 0 {
-                    return Err(Errno(11));
-                }
-                p.bytes
-                    .iter()
-                    .take(count.min(PIPE_CAPACITY))
-                    .copied()
-                    .collect::<Vec<_>>()
-            };
+            let (read, bytes) =
+                stream_transfer::ReadLease::take(pipe.data.clone(), count.min(PIPE_CAPACITY))?;
             if bytes.is_empty() {
                 return Ok(0);
             }
             let n = if let Some((target, _)) = &dest_pipe {
-                let mut p = target.data.lock().unwrap();
-                if p.readers == 0 {
-                    return Err(Errno(32));
-                }
-                let n = bytes.len().min(PIPE_CAPACITY - p.bytes.len());
-                if n == 0 {
-                    return Err(Errno(11));
-                }
-                p.bytes.extend(&bytes[..n]);
-                p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
-                n
+                let mut write =
+                    stream_transfer::WriteLease::take(target.data.clone(), bytes.len())?;
+                let n = write.count;
+                write.commit(&bytes[..n])?
             } else if let Some(offset) = to {
                 self.pwrite(output, &bytes, offset)?
             } else {
                 self.write(output, &bytes)?
             };
-            let mut p = pipe.data.lock().unwrap();
-            p.bytes.drain(..n);
-            if n != 0 {
-                p.io_epoch[1] = p.io_epoch[1].wrapping_add(1);
-            }
+            read.commit(n);
             return Ok(n);
         }
         let (pipe, _) = dest_pipe.unwrap();
-        let room = {
-            let p = pipe.data.lock().unwrap();
-            if p.readers == 0 {
-                return Err(Errno(32));
-            }
-            PIPE_CAPACITY - p.bytes.len()
-        };
-        if room == 0 {
-            return Err(Errno(11));
-        }
+        let mut write = stream_transfer::WriteLease::take(pipe.data.clone(), count)?;
         let bytes = if let Some(offset) = from {
-            self.pread(input, count.min(room), offset)?
+            self.pread(input, write.count, offset)?
         } else {
-            self.read(input, count.min(room))?
+            self.read(input, write.count)?
         };
-        let mut p = pipe.data.lock().unwrap();
-        p.bytes.extend(&bytes);
-        if !bytes.is_empty() {
-            p.io_epoch[0] = p.io_epoch[0].wrapping_add(1);
-        }
-        Ok(bytes.len())
+        write.commit(&bytes)
     }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
@@ -2783,8 +2762,11 @@ impl Vfs {
         result
     }
     pub fn write(&mut self, fd: u32, bytes: &[u8]) -> Result<usize> {
-        let o_descriptor = self.descriptor(fd)?;
-        let mut o = o_descriptor.open.borrow_mut();
+        let descriptor = self.descriptor(fd)?;
+        self.write_description(&descriptor, bytes)
+    }
+    fn write_description(&mut self, descriptor: &Descriptor, bytes: &[u8]) -> Result<usize> {
+        let mut o = descriptor.open.borrow_mut();
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_write::<false>(kind, bytes);
         }
@@ -2824,7 +2806,7 @@ impl Vfs {
             return end.data.lock().unwrap().write(bytes);
         }
         drop(o);
-        self.file_write(fd, bytes, None)
+        self.file_write_description(descriptor, bytes, None)
     }
     /// Per-task RLIMIT_FSIZE; disk quota remains a separate ENOSPC constraint.
     pub fn set_file_size_limit(&mut self, limit: u64) {

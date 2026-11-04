@@ -94,26 +94,42 @@ impl PendingIo {
             .map(|fd| fd.tcp.retain().expect("accepted TCP transport"))
     }
     pub fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
-        self.retained_byte
+        let mut fds = self
+            .retained_byte
             .as_ref()
-            .map_or_else(Vec::new, |file| file.fd.native_wait_fds())
+            .map_or_else(Vec::new, |file| file.fd.native_wait_fds());
+        if let Some(file) = &self.file {
+            fds.extend(file.native_wait_fds());
+        }
+        fds
     }
     pub fn notification_external(&self) -> bool {
-        self._subscriptions
-            .iter()
-            .any(|s| s.notification_external())
+        // Native file jobs notify the existing source target directly. Joined
+        // execution must park on that notification, rather than sleep/poll.
+        self.file.as_ref().is_some_and(|p| !p.interruptible())
+            || self
+                ._subscriptions
+                .iter()
+                .any(|s| s.notification_external())
     }
     pub fn file_pending(&self) -> Option<FilePending> {
         self.file.clone()
     }
     pub fn external_wait(&self) -> bool {
-        if self.file.is_some() || DirectSyscalls::aio_call(self.number) {
+        if self.file.as_ref().is_some_and(|p| !p.interruptible())
+            || DirectSyscalls::aio_call(self.number)
+        {
             return true;
         }
         self.retained_socket
             .as_ref()
             .is_some_and(RetainedSocket::external_wait)
             || self.host_subscription.is_some()
+            || !self.socket_subscriptions.is_empty()
+            || self
+                .file
+                .as_ref()
+                .is_some_and(|file| !file.native_wait_fds().is_empty())
             || self._subscriptions.iter().any(|s| s.external())
             || self.uring.as_ref().is_some_and(|w| w.external())
             || self.poll_uring.as_ref().is_some_and(|w| w.external())

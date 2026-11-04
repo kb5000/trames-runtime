@@ -399,6 +399,9 @@ impl DirectSyscalls {
                         continue;
                     };
                     let result = match outcome {
+                        trames_vfs::FileOutcome::Waiting(_) => {
+                            unreachable!("AIO has no stream transfer command")
+                        }
                         trames_vfs::FileOutcome::Complete(reply) => {
                             if reply.file_size_signal {
                                 if let Some(task) = &self.task_signal {

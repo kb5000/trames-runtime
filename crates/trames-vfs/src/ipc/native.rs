@@ -124,6 +124,9 @@ impl PipeRelay {
     fn pump(&mut self) -> bool {
         let mut pipe = self.guest.data.lock().unwrap();
         if self.to_native {
+            if pipe.read_reserved {
+                return true;
+            }
             if pipe.bytes.is_empty() {
                 return pipe.writers != 0;
             }
@@ -141,7 +144,7 @@ impl PipeRelay {
             if pipe.readers == 0 {
                 return false;
             }
-            let room = (PIPE_CAPACITY - pipe.bytes.len()).min(16384);
+            let room = pipe.write_room().min(16384);
             if room == 0 {
                 return true;
             }
@@ -702,7 +705,7 @@ impl Connection {
             let needed = if relay.to_native {
                 !pipe.bytes.is_empty()
             } else {
-                pipe.bytes.len() < PIPE_CAPACITY
+                pipe.write_room() != 0
             };
             drop(pipe);
             relay.interest.update(

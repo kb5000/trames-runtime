@@ -152,8 +152,22 @@ pub struct FilePending {
     pub result: Arc<FileResult>,
     pub output: FileOutput,
     _target: Option<trames_vfs::FileTarget>,
+    waiting: Option<Arc<Mutex<Option<trames_vfs::FileWork>>>>,
 }
 impl FilePending {
+    pub fn interruptible(&self) -> bool {
+        self.waiting
+            .as_ref()
+            .is_some_and(|w| w.lock().unwrap().is_some())
+    }
+    pub(super) fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
+        self.waiting.as_ref().map_or_else(Vec::new, |w| {
+            w.lock()
+                .unwrap()
+                .as_ref()
+                .map_or_else(Vec::new, trames_vfs::FileWork::transfer_native_fds)
+        })
+    }
     pub fn new(
         result: Arc<FileResult>,
         output: FileOutput,
@@ -163,6 +177,7 @@ impl FilePending {
             result,
             output,
             _target: target.into(),
+            waiting: None,
         }
     }
 }
@@ -229,7 +244,7 @@ enum PreparedAction {
 impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
-            || matches!(number, 45..=47 | 56 | 62..=71 | 80..=83 | 267 | 285..=287 | 437)
+            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 267 | 285..=287 | 437)
     }
     pub fn start_file_call(
         &self,
@@ -302,6 +317,7 @@ impl DirectSyscalls {
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
                 trames_vfs::FileOutcome::Owner(work) => PreparedAction::Owner { work, output },
+                trames_vfs::FileOutcome::Waiting(work) => PreparedAction::Host { work, output },
             }
         };
         *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
@@ -334,6 +350,7 @@ impl DirectSyscalls {
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
                 trames_vfs::FileOutcome::Owner(work) => PreparedAction::Owner { work, output },
+                trames_vfs::FileOutcome::Waiting(work) => PreparedAction::Host { work, output },
             }
         };
         *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
@@ -354,7 +371,14 @@ impl DirectSyscalls {
         }
         self.completed.set(self.completed.get() + 1);
         self.file_completed.set(self.file_completed.get() + 1);
-        output.apply(reply.result, memory)
+        let transfer = matches!(output, FileOutput::CopyOffsets { .. });
+        let result = output.apply(reply.result, memory);
+        if transfer && result == Err(Errno(32)) {
+            if let Some(task) = &self.task_signal {
+                task.raise(13);
+            }
+        }
+        result
     }
     pub(super) fn file_prepared(&self, number: u32, args: [u64; 6]) -> bool {
         self.file_prepared
@@ -404,17 +428,23 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
-        let Some(executor) = &self.file_executor else {
-            return IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
-                work,
-                output,
-            }));
-        };
         let result = Arc::new(FileResult::default());
         let original = work.target().cloned();
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = vec![result.subscribe(&signal)];
-        executor.submit_file(work, result.clone());
+        if work.transfer_waiting() {
+            result.complete(trames_vfs::FileOutcome::Waiting(work));
+        } else if work.host_work() {
+            let Some(executor) = &self.file_executor else {
+                return IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
+                    work,
+                    output,
+                }));
+            };
+            executor.submit_file(work, result.clone());
+        } else {
+            result.complete(work.run());
+        }
         self.resume_file(
             FilePending::new(result, output, original),
             number,
@@ -470,21 +500,6 @@ impl DirectSyscalls {
                 target,
             ));
         }
-        if matches!(number, 71 | 285) {
-            let (file, command, output) = copy_import(&vfs.shared_files(), number, args, memory)?;
-            return Some(match command {
-                Ok(command) => self.submit_file_work(
-                    trames_vfs::FileWork::from_vfs(vfs, file, command),
-                    output,
-                    number,
-                    args,
-                    memory,
-                    pid,
-                    target,
-                ),
-                Err(error) => IoAttempt::Complete(Err(error)),
-            });
-        }
         if number == 81 {
             return Some(self.submit_file_work(
                 trames_vfs::FileWork::sync_all(vfs.path_queries()),
@@ -521,18 +536,29 @@ impl DirectSyscalls {
                 }
             }
         }
-        if !matches!(number, 46 | 47 | 62..=70 | 80 | 82 | 83 | 267 | 286 | 287) {
-            return None;
-        }
-        let original = vfs.shared_files().lookup(args[0] as u32)?.ok()?;
-        let file = if matches!(number, 82 | 83 | 267) {
-            original.filesystem_target()
+        let (file, command, output) = if matches!(number, 71 | 76 | 285) {
+            let (file, command, output) = copy_import(&vfs.shared_files(), number, args, memory)?;
+            let command = match command {
+                Ok(command) => command,
+                Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            };
+            (file, command, output)
         } else {
-            original.file_target()?
-        };
-        let (command, output) = match import(number, args, memory, &mut self.scratch.borrow_mut()) {
-            Ok(call) => call,
-            Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            if !matches!(number, 46 | 47 | 62..=70 | 80 | 82 | 83 | 267 | 286 | 287) {
+                return None;
+            }
+            let original = vfs.shared_files().lookup(args[0] as u32)?.ok()?;
+            let file = if matches!(number, 82 | 83 | 267) {
+                original.filesystem_target()
+            } else {
+                original.file_target()?
+            };
+            let (command, output) =
+                match import(number, args, memory, &mut self.scratch.borrow_mut()) {
+                    Ok(call) => call,
+                    Err(error) => return Some(IoAttempt::Complete(Err(error))),
+                };
+            (file, command, output)
         };
         Some(if file.host_work_owned(&command) {
             self.submit_file_work(
@@ -557,6 +583,9 @@ impl DirectSyscalls {
                         IoAttempt::Complete(value)
                     }
                 }
+                trames_vfs::FileOutcome::Waiting(work) => {
+                    self.submit_file_work(work, output, number, args, memory, pid, target)
+                }
                 _ => unreachable!("joined caller layout ownership"),
             }
         })
@@ -572,7 +601,31 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        let waiting = pending
+            .waiting
+            .as_ref()
+            .and_then(|w| w.lock().unwrap().take());
+        if let Some(work) = waiting {
+            if !work.transfer_ready() {
+                return self.park_transfer(pending, work, number, args, signal, memory, target);
+            }
+            pending.result.begin();
+            if work.host_work() {
+                let Some(executor) = &self.file_executor else {
+                    return IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
+                        work,
+                        output: pending.output,
+                    }));
+                };
+                executor.submit_file(work, pending.result.clone());
+            } else {
+                pending.result.complete(work.run());
+            }
+        }
         match pending.result.take() {
+            Some(trames_vfs::FileOutcome::Waiting(work)) => {
+                self.park_transfer(pending, work, number, args, signal, memory, target)
+            }
             Some(trames_vfs::FileOutcome::Complete(reply)) => {
                 let signal = reply.file_size_signal;
                 let value = self.finish_file_reply(reply, pending.output, memory);
@@ -616,6 +669,65 @@ impl DirectSyscalls {
                 target: target.clone(),
             }),
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn park_transfer(
+        &self,
+        mut pending: FilePending,
+        work: trames_vfs::FileWork,
+        number: u32,
+        args: [u64; 6],
+        signal: Arc<IoSignal>,
+        memory: &mut impl CpuMemory,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let _ = memory;
+        signal.reset();
+        let wait = match work.transfer_wait_sources(&signal) {
+            Ok(wait) => wait,
+            Err(_) => return self.complete(number, args, Err(Errno(5))),
+        };
+        let mut subscriptions = vec![pending.result.subscribe(&signal)];
+        subscriptions.extend(wait.subscriptions);
+        let mut native = Vec::new();
+        if let Some(events) = target.upgrade().and_then(|t| t.host_events()) {
+            for (fd, write) in wait.native {
+                match events.subscribe(fd, write, &signal) {
+                    Ok(s) => native.push(s),
+                    Err(_) => return self.complete(number, args, Err(Errno(5))),
+                }
+            }
+        }
+        if work.transfer_ready() {
+            signal.notify();
+        }
+        pending.result.begin();
+        *pending
+            .waiting
+            .get_or_insert_with(Arc::default)
+            .lock()
+            .unwrap() = Some(work);
+        IoAttempt::Blocked(PendingIo {
+            aio: None,
+            number,
+            args,
+            deadline: None,
+            signal,
+            flock: None,
+            retained_byte: None,
+            retained_socket: None,
+            native_tcp: None,
+            resource_deadline: wait.deadline,
+            retained_poll: None,
+            epoll_revision: None,
+            _subscriptions: subscriptions,
+            host_subscription: None,
+            socket_subscriptions: native,
+            uring: None,
+            poll_uring: None,
+            file: Some(pending),
+            target: target.clone(),
+        })
     }
     pub fn start_retained_file(
         &self,
@@ -725,7 +837,7 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
-        if matches!(number, 71 | 285) {
+        if matches!(number, 71 | 76 | 285) {
             if self.file_prepared(number, a) {
                 return None;
             }
@@ -827,13 +939,18 @@ fn copy_import(
     FileOutput,
 )> {
     let range = number == 285;
-    let (input, output, from, to, count) = if range {
-        (a[0], a[2], a[1], a[3], a[4])
+    let splice = number == 76;
+    let (input, output, from, to, count, flags) = if splice {
+        (a[0], a[2], a[1], a[3], a[4], a[5] as u32)
+    } else if range {
+        (a[0], a[2], a[1], a[3], a[4], 0)
     } else {
-        (a[1], a[0], a[2], 0, a[3])
+        (a[1], a[0], a[2], 0, a[3], 0)
     };
-    let input = files.lookup(input as u32)?.ok()?.file_target()?;
-    let output = files.lookup(output as u32)?.ok()?.file_target()?;
+    // Resolve each original OFD once. A concurrent close/reuse must not retarget
+    // a pair already accepted while deciding between file and stream work.
+    let input = files.lookup(input as u32)?.ok()?;
+    let output = files.lookup(output as u32)?.ok()?;
     let offset = |pointer| -> Result<Option<u64>, Errno> {
         if pointer == 0 {
             return Ok(None);
@@ -842,10 +959,32 @@ fn copy_import(
         Linux::check(memory, pointer, 8, Access::Write)?;
         let value = memory.read_u64(pointer).map_err(|_| Errno(14))?;
         if value > i64::MAX as u64 {
-            return Err(Errno(22));
+            Err(Errno(22))
+        } else {
+            Ok(Some(value))
         }
-        Ok(Some(value))
     };
+    if (splice || !range && (input.file_target().is_none() || output.file_target().is_none()))
+        && trames_vfs::StreamTransfer::admitted(&input, &output)
+    {
+        let target = output.filesystem_target();
+        let command =
+            trames_vfs::FileCommand::Transfer(RefCell::new(trames_vfs::StreamTransfer::new(
+                input,
+                output,
+                offset(from),
+                offset(to),
+                count,
+                splice,
+                flags,
+            )));
+        return Some((target, Ok(command), FileOutput::CopyOffsets { from, to }));
+    }
+    if splice {
+        return None;
+    }
+    let input = input.file_target()?;
+    let output = output.file_target()?;
     let command = if range && a[5] != 0 {
         Err(Errno(22))
     } else {

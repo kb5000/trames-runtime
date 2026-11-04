@@ -1677,7 +1677,19 @@ impl<C: Cpu> Kernel<C> {
         // Caught signals wait for its accepted result/copyout, like ordinary
         // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
         if action.handler > 1
-            && (p.file_entry.is_some() || matches!(p.state, State::Blocked(2, _)))
+            && (p.file_entry.is_some()
+                && !p
+                    .retained_file
+                    .as_ref()
+                    .map(trames_linux::FilePending::interruptible)
+                    .or_else(|| {
+                        p.byte_wait
+                            .as_ref()
+                            .and_then(trames_linux::PendingIo::file_pending)
+                            .map(|f| f.interruptible())
+                    })
+                    .unwrap_or(false)
+                || matches!(p.state, State::Blocked(2, _)))
             && matches!(p.state, State::Blocked(..))
         {
             return Ok(false);
@@ -1755,6 +1767,8 @@ impl<C: Cpu> Kernel<C> {
                             | 64
                             | 65
                             | 66
+                            | 71
+                            | 76
                             | 95
                             | 260
                             | 202
@@ -3169,14 +3183,18 @@ impl<C: Cpu> Kernel<C> {
             ))
         } else if let Some(file) = retained_file {
             p.byte_wait = None;
-            Some(trames_linux::DirectSyscalls::default().start_retained_file(
-                file,
-                number,
-                a,
-                &mut p.memory,
-                pid,
-                &Arc::downgrade(&self.byte_target),
-            ))
+            Some(
+                trames_linux::DirectSyscalls::default()
+                    .with_file_executor(self.workers.file_executor())
+                    .start_retained_file(
+                        file,
+                        number,
+                        a,
+                        &mut p.memory,
+                        pid,
+                        &Arc::downgrade(&self.byte_target),
+                    ),
+            )
         } else if owned_file.is_some() {
             owned_file
         } else if let Some(file) = local {
@@ -8442,6 +8460,9 @@ mod tests {
         k.call(1, &mut p, 76, a, &mut io);
         assert!(matches!(p.state, State::Blocked(76, _)));
         p.linux.vfs.set_status_flags(w2, 1 | O_NONBLOCK).unwrap();
+        // F_SETFL is metadata, not a pipe readiness edge. An existing
+        // blocked operation observes its live flags on the next source retry.
+        p.byte_wait.as_ref().unwrap().signal.notify();
         k.call(1, &mut p, 76, a, &mut io);
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), error(Errno(11)));
@@ -8450,6 +8471,29 @@ mod tests {
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), 3);
         assert_eq!(p.linux.vfs.read(r, 3), Err(Errno(11)));
+    }
+    #[test]
+    fn caught_signal_cancels_resource_transfer_wait_without_deferring_as_disk_io() {
+        let mut k = kernel();
+        let mut p = process();
+        let mut io = trames_linux::CapturedOutput::default();
+        let [r, _w] = p.linux.vfs.pipe(0).unwrap();
+        let [_r2, w2] = p.linux.vfs.pipe(0).unwrap();
+        p.signals.actions.set_handler(10, 0x5000);
+        k.call(1, &mut p, 76, [r as u64, 0, w2 as u64, 0, 3, 0], &mut io);
+        assert!(matches!(p.state, State::Blocked(76, _)));
+        assert!(p
+            .byte_wait
+            .as_ref()
+            .unwrap()
+            .file_pending()
+            .unwrap()
+            .interruptible());
+        Kernel::queue_one(1, &mut p, 10, 1);
+        assert_eq!(k.deliver(1, &mut p), Ok(true));
+        assert_eq!(p.cpu.pc, 0x5000);
+        assert!(p.file_entry.is_none());
+        assert!(p.byte_wait.is_none());
     }
     #[test]
     fn close_range_unshare_detaches_only_callers_shared_table() {

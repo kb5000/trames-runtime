@@ -17,6 +17,7 @@ fn value(work: FileWork) -> Result<FileValue> {
             reply.result
         }
         FileOutcome::Layout(_) => panic!("unexpected mapping-layout boundary"),
+        FileOutcome::Waiting(_) => panic!("unexpected stream wait"),
         FileOutcome::Owner(_) => panic!("unexpected owner-only resource"),
     }
 }
