@@ -55,9 +55,15 @@ impl RetainedSocket {
                 },
             };
             let message = match &socket {
-                Control::Network(socket) if matches!(number, 206 | 207) => Some(Arc::new(
-                    ip_message::Message::new(number, args, memory, socket.address_size())?,
-                )),
+                Control::Network(socket) if matches!(number, 206 | 207) => {
+                    Some(Arc::new(ip_message::Message::new(
+                        number,
+                        args,
+                        memory,
+                        socket.address_size(),
+                        socket.is_stream(),
+                    )?))
+                }
                 _ => None,
             };
             Ok(Self {
@@ -365,9 +371,15 @@ impl DirectSyscalls {
                 Control::Unix { .. } => None,
             };
             let message = match &socket {
-                Control::Network(socket) if ip_message::number(number) => Some(Arc::new(
-                    ip_message::Message::new(number, args, memory, socket.address_size())?,
-                )),
+                Control::Network(socket) if ip_message::number(number) => {
+                    Some(Arc::new(ip_message::Message::new(
+                        number,
+                        args,
+                        memory,
+                        socket.address_size(),
+                        socket.is_stream(),
+                    )?))
+                }
                 _ => None,
             };
             Ok(RetainedSocket {

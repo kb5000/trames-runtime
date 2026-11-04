@@ -1301,6 +1301,9 @@ impl<C: Cpu> Kernel<C> {
                 backend.abandon(*job);
             }
         }
+        if let Some(State::Futex { wait, .. }) = state {
+            wait.cancel();
+        }
         // Release active/stopped wait registrations before clear_tid wakes.
         // A zombie must not stay eligible through a saved stopped State.
         p.stopped_state = None;
@@ -1811,7 +1814,11 @@ impl<C: Cpu> Kernel<C> {
                 p.signals.wait_mask = Some(old);
                 p.cpu.set_x(0, error(Errno(4)));
             }
-            State::Futex { .. } | State::Sigwait { .. } => {
+            State::Futex { wait, .. } => {
+                wait.cancel();
+                p.cpu.set_x(0, error(Errno(4)));
+            }
+            State::Sigwait { .. } => {
                 p.cpu.set_x(0, error(Errno(4)));
             }
             _ => {}
@@ -8019,10 +8026,12 @@ mod tests {
             k.event_call(1, &mut p, 98, [0x1000, 128, 0, 0, 0, 0]),
             Ok(None)
         );
+        let checkpoint = p.state.clone();
         p.signals.actions.set_handler(10, 0x5000);
         Kernel::queue_one(1, &mut p, 10, 1);
         assert!(k.deliver(1, &mut p).unwrap());
         assert_eq!(k.futexes.wake((0, 1, 0x1000), 1, u32::MAX), 0);
+        drop(checkpoint);
         let mut stopped = process();
         assert_eq!(
             k.event_call(2, &mut stopped, 98, [0x1000, 128, 0, 0, 0, 0]),
@@ -8031,9 +8040,11 @@ mod tests {
         Kernel::queue_one(2, &mut stopped, 19, 1);
         assert!(k.deliver(2, &mut stopped).unwrap());
         assert!(matches!(stopped.state, State::Stopped));
+        let checkpoint = stopped.stopped_state.clone();
         k.exit_one(2, &mut stopped, 9);
         assert!(stopped.stopped_state.is_none());
         assert_eq!(k.futexes.wake((0, 1, 0x1000), 1, u32::MAX), 0);
+        drop(checkpoint);
     }
     #[test]
     fn futex_requeue_retains_stopped_registration_and_deadline_until_continue() {

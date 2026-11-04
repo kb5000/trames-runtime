@@ -64,8 +64,9 @@ impl Default for Inner {
 #[derive(Clone, Default)]
 pub(super) struct Futexes(Arc<Inner>);
 
-/// Cloned task states retain the same synchronized registration; its final
-/// owner cancels/unlinks it. Queues retain Ticket, not Wait (no ownership cycle).
+/// Cloned task states retain the same synchronized registration. Interruption
+/// and exit cancel it explicitly; final-owner Drop is a cleanup backstop.
+/// Queues retain Ticket, not Wait (no ownership cycle).
 /// Wake notifies the scheduler only after releasing its futex bucket.
 pub(super) struct Wait {
     pub ticket: Arc<Ticket>,
@@ -78,9 +79,10 @@ impl Wait {
     pub fn timeout(&self) -> bool {
         self.ticket.claim(TIMED_OUT)
     }
-}
-impl Drop for Wait {
-    fn drop(&mut self) {
+    /// Retire the logical wait even while an owner checkpoint retains a clone.
+    /// Dropping just the executing worker's Arc must not leave a ticket that
+    /// can consume a later wake intended for the task's new wait.
+    pub fn cancel(&self) {
         self.ticket.claim(CANCELLED);
         if self.woken() {
             return; // wake already unlinked it under the bucket lock
@@ -102,6 +104,11 @@ impl Drop for Wait {
             }
             break;
         }
+    }
+}
+impl Drop for Wait {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -524,6 +531,38 @@ mod tests {
         assert_eq!(waits.iter().filter(|w| w.woken()).count() as u64, woke);
         drop(waits);
         empty(&table);
+    }
+    #[test]
+    fn interrupted_wait_cannot_steal_a_new_wake_while_owner_clone_is_retained() {
+        let table = Futexes::default();
+        let old = (0, 7, 0x1000);
+        for new in [old, (0, 7, 0x1104)] {
+            let interrupted = register(&table, old, 1, 1);
+            let owner_checkpoint = interrupted.clone();
+            if new != old {
+                assert_eq!(
+                    table
+                        .requeue(old, new, 0, 1, || Ok::<_, ()>(()))
+                        .unwrap()
+                        .total(),
+                    1
+                );
+            }
+            interrupted.cancel();
+            drop(interrupted);
+            let next_wait = register(&table, new, 1, 1);
+            assert_eq!(table.wake(new, 1, 1), 1);
+            assert!(next_wait.woken());
+            assert!(!owner_checkpoint.woken());
+            assert_eq!(
+                owner_checkpoint.ticket.state.load(Ordering::Relaxed),
+                CANCELLED
+            );
+            drop(owner_checkpoint);
+            assert_eq!(table.wake(new, 1, 1), 0);
+            drop(next_wait);
+            empty(&table);
+        }
     }
     #[test]
     fn cancellation_unlinks_the_last_registration_owner_without_stale_keys() {

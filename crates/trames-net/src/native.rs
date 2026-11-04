@@ -794,6 +794,11 @@ impl Socket {
         Ok(n)
     }
     pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
+        let bytes = if self.kind == 1 {
+            &bytes[..bytes.len().min(MAX_TRANSFER)]
+        } else {
+            bytes
+        };
         if let Some(peer) = address.or_else(|| self.peer_addr().ok()) {
             self.policy_check(false, peer, bytes, 24)?;
         }

@@ -520,6 +520,9 @@ impl<C: Cpu> Pool<C> {
                                     if !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
                                             if let Some(waiting) = job.waiting.take() {
+                                                if let crate::run_queue::WaitState::Futex { wait, .. } = &waiting {
+                                                    wait.cancel();
+                                                }
                                                 if let crate::run_queue::WaitState::Sleep { deadline, remaining } = waiting {
                                                     if remaining != 0 {
                                                         let ns = deadline.saturating_duration_since(Instant::now()).as_nanos();

@@ -136,19 +136,21 @@ impl Prepared {
         a: [u64; 6],
         memory: &impl CpuMemory,
         address_size: usize,
+        stream: bool,
     ) -> Result<Self> {
         let transfer = match number {
             206 => {
-                if a[2] > trames_net::MAX_TRANSFER as u64 {
+                if !stream && a[2] > trames_net::MAX_TRANSFER as u64 {
                     return Err(Errno(90));
                 }
-                Linux::check(memory, a[1], a[2] as usize, Access::Read)?;
+                let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
+                Linux::check(memory, a[1], count, Access::Read)?;
                 let peer = if a[4] == 0 {
                     None
                 } else {
                     Some(address(memory, a[4], a[5])?)
                 };
-                let mut bytes = vec![0; a[2] as usize];
+                let mut bytes = vec![0; count];
                 memory.read(a[1], &mut bytes).map_err(|_| Errno(14))?;
                 Transfer::Send {
                     bytes,
@@ -185,11 +187,12 @@ impl Prepared {
                 } else {
                     packet_control(memory, control, control_size)?
                 };
-                let vectors = Vectors::prepare(
+                let vectors = Vectors::prepare_prefix(
                     memory,
                     u64_at(memory, a[1] + 16)?,
                     u64_at(memory, a[1] + 24)?,
                     access,
+                    receive || stream,
                 )?;
                 if receive {
                     Transfer::Receive {

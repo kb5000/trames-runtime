@@ -25,6 +25,7 @@ fn socket_admission_lease_rolls_back_errors_and_releases_without_namespace_rc() 
         timeouts: _,
         operation: _,
         _reservation,
+        kind: _,
     } = Arc::try_unwrap(socket).ok().unwrap();
     drop((backend, namespace));
     assert_eq!(root.live_sockets(), 1);
@@ -38,6 +39,8 @@ fn full_namespace_does_not_consume_an_accepted_native_connection() {
     use std::time::{Duration, Instant};
     let root = Network::new(NetworkMode::Loopback);
     let server = root.socket(2, 1, 0).unwrap();
+    assert!(server.is_stream());
+    assert!(!root.socket(2, 2, 0).unwrap().is_stream());
     server.bind(addr("127.0.0.1", 0)).unwrap();
     server.listen(2).unwrap();
     let mut netlink: Vec<_> = (1..MAX_SOCKETS)
@@ -58,12 +61,38 @@ fn full_namespace_does_not_consume_an_accepted_native_connection() {
             Err(error) => panic!("{error:?}"),
         }
     };
+    assert!(accepted.is_stream());
     assert_eq!(root.live_sockets(), MAX_SOCKETS);
     drop(accepted);
     assert_eq!(root.live_sockets(), MAX_SOCKETS - 1);
     // A retry with no pending connection must return its reservation too.
     assert!(matches!(server.accept(), Err(NetError(11))));
     assert_eq!(root.live_sockets(), MAX_SOCKETS - 1);
+}
+#[test]
+fn large_native_tcp_send_is_a_short_byte_write_while_udp_stays_atomic() {
+    use std::io::Read;
+    let root = Network::new(NetworkMode::Loopback);
+    let server = root.socket(2, 1, 0).unwrap();
+    assert!(server.is_stream());
+    server.bind(addr("127.0.0.1", 0)).unwrap();
+    server.listen(1).unwrap();
+    let mut peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (accepted, _) = server.accept().unwrap();
+    assert!(accepted.is_stream());
+    let payload = vec![0x6b; MAX_TRANSFER * 3 + 17];
+    let sent = accepted.send(&payload, 0, None).unwrap();
+    assert!(sent > 0 && sent <= MAX_TRANSFER);
+    let mut got = vec![0; sent];
+    peer.read_exact(&mut got).unwrap();
+    assert_eq!(got, payload[..sent]);
+    let udp = root.socket(2, 2, 0).unwrap();
+    assert!(!udp.is_stream());
+    assert_eq!(
+        udp.send(&payload, 0, Some(server.local_addr().unwrap())),
+        Err(NetError(90))
+    );
 }
 #[test]
 fn root_wildcard_accepts_native_and_guest_and_guest_can_use_bridge_service() {

@@ -2242,3 +2242,34 @@ TRAP/KILL and tracing keep the real task-policy boundary. STOP/CONT group state,
 default termination, parent wait/SIGCHLD, exit resource cleanup and reaping still
 require the lifecycle migration described in coordination-boundaries.md. They
 are not hidden behind the new source entry path or counted as removed here.
+
+
+## Stream prefixes and logical futex retirement (2026-11-04)
+
+TCP is a byte stream. The existing 1 MiB transfer staging bound limits one
+accepted prefix, not the application's logical write size. `sendto`, `sendmsg`,
+`sendmmsg` and retained/uring socket operations prepare only that prefix for a
+stream; applications may retry the remaining bytes. Immutable socket type is
+retained across native/virtual endpoint transitions and accept, without a host
+query or new data-path lock. Datagram messages keep their atomic size bound and
+EMSGSIZE. A short batch send compares the result against the original vector
+length, stops the batch and never replays the accepted prefix. An unmapped suffix
+outside that prefix is not borrowed or copied.
+
+Futex registration lifetime is separate from Rust ownership lifetime. A source
+worker can interrupt a wait while an owner checkpoint still retains the same
+`Arc<Wait>`. Dropping only the worker's clone leaves the old ticket eligible:
+a later wake can select that stale ticket instead of the task's new wait. In Go,
+this can strand a GC safe-point handshake indefinitely. Caught-signal delivery
+on both worker and owner paths, and exit from active/stopped waits, explicitly
+cancel the logical registration. Final-owner Drop remains a cleanup backstop.
+Cancellation uses the original winner CAS and keyed bucket unlink, including
+requeue races; it adds no coordinator request, service thread, polling, global
+algorithm lock or ordinary-memory barrier. Wake/timeout/interruption still race
+according to the existing ticket protocol. No Go preemption workaround is used.
+
+Deterministic tests retain owner clones across interruption and stopped exit,
+then create a new wait on the same or requeued key and require its first wake to
+succeed. External acceptance uses stock Debian Go tools with normal async
+preemption, repeated Docker health/exec/stop/remove cycles and an unmodified
+Python `sendall` reproducer transferring 3,777,458 bytes.

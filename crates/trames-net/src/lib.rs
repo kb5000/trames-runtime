@@ -239,6 +239,7 @@ impl Network {
                 )?),
                 self.1.clone(),
                 reservation,
+                kind,
             ));
         }
         let backend = match &self.0 {
@@ -251,10 +252,12 @@ impl Network {
             )?),
             Backend::Virtual(n) => SocketBackend::Virtual(n.socket(family, kind, protocol)?),
         };
-        Ok(Socket::wrap(backend, self.1.clone(), reservation))
+        Ok(Socket::wrap(backend, self.1.clone(), reservation, kind))
     }
 }
 pub struct Socket {
+    // Immutable ABI type, retained across native/virtual endpoint transitions.
+    kind: u32,
     // Serializes endpoint/control transitions, while ordinary data operations
     // can run concurrently. Cached native byte capabilities bypass this gate.
     operation: parking_lot::RwLock<()>,
@@ -283,14 +286,19 @@ impl Socket {
         backend: SocketBackend,
         namespace: Arc<netlink::Namespace>,
         reservation: socket_quota::Reservation,
+        kind: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
+            kind: kind & 0xf,
             operation: parking_lot::RwLock::new(()),
             backend,
             namespace,
             timeouts: [Cell::new(None), Cell::new(None)],
             _reservation: reservation,
         })
+    }
+    pub fn is_stream(&self) -> bool {
+        self.kind == 1
     }
     /// Connected-native transport capability with the original live policy.
     /// Ordinary snapshots stay weak; accepted calls retain the actual socket.
@@ -633,7 +641,7 @@ impl Socket {
                 (SocketBackend::Virtual(s), peer)
             }
         };
-        let accepted = Self::wrap(backend, self.namespace.clone(), reservation);
+        let accepted = Self::wrap(backend, self.namespace.clone(), reservation, self.kind);
         for receive in [false, true] {
             accepted.set_io_timeout(receive, self.io_timeout(receive));
         }

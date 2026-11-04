@@ -43,11 +43,12 @@ impl Message {
         args: [u64; 6],
         memory: &impl CpuMemory,
         address_size: usize,
+        stream: bool,
     ) -> Result<Self, Errno> {
         let active = if number == 269 {
             None
         } else {
-            Some(Prepared::new(number, args, memory, address_size)?)
+            Some(Prepared::new(number, args, memory, address_size, stream)?)
         };
         Ok(Self {
             pipe: AtomicBool::new(false),
@@ -120,6 +121,7 @@ impl Message {
                         [a[0], header, flags as u64, 0, 0, 0],
                         memory,
                         socket.address_size(),
+                        socket.is_stream(),
                     )?);
                 }
                 if state.recheck {
@@ -477,11 +479,54 @@ mod tests {
         }
     }
     #[test]
+    fn large_stream_batch_keeps_original_length_and_retries_only_accepted_prefix() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let socket = v.socket_operation(fd).unwrap();
+        let mut m = memory();
+        let limit = trames_net::MAX_TRANSFER;
+        m.map(0x10000, limit as u64, Permissions::RW).unwrap();
+        m.write(0x10000, &vec![b'x'; limit]).unwrap();
+        // The suffix is deliberately unmapped. Only the accepted prefix is
+        // borrowed/copied, while batch short-write accounting keeps the total.
+        m.write_array(0x1300, 0x10000u64.to_le_bytes()).unwrap();
+        m.write_array(0x1308, (limit as u64 * 3).to_le_bytes())
+            .unwrap();
+        let a = [fd as u64, 0x1000, 2, 0, 0, 0];
+        let batch = Message::new(269, a, &m, 16, true).unwrap();
+        assert_eq!(
+            batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {
+                assert_eq!(bytes.len(), limit);
+                Err(Errno(11))
+            }),
+            Err(Errno(11))
+        );
+        m.write(0x10000, b"changed").unwrap();
+        m.write_array(0x1010, u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(
+            batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {
+                assert!(bytes.iter().all(|b| *b == b'x'));
+                Ok(bytes.len())
+            }),
+            Ok(1)
+        );
+        assert_eq!(
+            m.read_array::<4>(0x1038).unwrap(),
+            (limit as u32).to_le_bytes()
+        );
+        assert_eq!(m.read_array::<4>(0x1078).unwrap(), [0; 4]);
+        assert_eq!(
+            batch.progress_with(&socket, 269, a, &mut m, |_, _, _| panic!("terminal replay")),
+            Ok(1)
+        );
+    }
+    #[test]
     fn batch_retains_only_the_accepted_item_and_never_replays_terminal_effects() {
         let (_v, fd, socket) = socket();
         let mut m = memory();
         let args = [fd as u64, 0x1000, 2, 0, 0, 0];
-        let batch = Message::new(269, args, &m, 16).unwrap();
+        let batch = Message::new(269, args, &m, 16, false).unwrap();
         assert_eq!(
             batch.progress_with(&socket, 269, args, &mut m, |bytes, _, _| {
                 assert_eq!(bytes, b"abc");
@@ -516,7 +561,7 @@ mod tests {
             for flags in [0, 0x4000] {
                 let mut m = memory();
                 let a = [fd as u64, 0x1000, 2, flags, 0, 0];
-                let batch = Message::new(269, a, &m, 16).unwrap();
+                let batch = Message::new(269, a, &m, 16, false).unwrap();
                 let mut calls = 0;
                 assert_eq!(
                     batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {
@@ -540,7 +585,7 @@ mod tests {
         }
         let mut m = memory();
         let a = [fd as u64, 0x1000, 2, 0, 0, 0];
-        let batch = Message::new(269, a, &m, 16).unwrap();
+        let batch = Message::new(269, a, &m, 16, false).unwrap();
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| Ok(1)),
             Ok(1)
@@ -548,7 +593,7 @@ mod tests {
         assert_eq!(m.read_array::<4>(0x1038).unwrap(), 1u32.to_le_bytes());
         let mut m = memory();
         m.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
-        let batch = Message::new(269, a, &m, 16).unwrap();
+        let batch = Message::new(269, a, &m, 16, false).unwrap();
         let mut effects = 0;
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| {
@@ -564,7 +609,7 @@ mod tests {
         );
         let mut m = memory();
         m.write_array(0x1050, u64::MAX.to_le_bytes()).unwrap();
-        let batch = Message::new(269, a, &m, 16).unwrap();
+        let batch = Message::new(269, a, &m, 16, false).unwrap();
         let mut effects = 0;
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| {
@@ -578,7 +623,7 @@ mod tests {
             let a = [fd as u64, 0x1000, count, 0, 0, 0];
             let mut m = Memory::default();
             m.map(0x1000, PAGE_SIZE * 17, Permissions::RW).unwrap();
-            let batch = Message::new(269, a, &m, 16).unwrap();
+            let batch = Message::new(269, a, &m, 16, false).unwrap();
             let mut calls = 0;
             assert_eq!(
                 batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {

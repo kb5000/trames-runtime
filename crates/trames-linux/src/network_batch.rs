@@ -22,8 +22,8 @@ pub(crate) fn requested(memory: &impl CpuMemory, header: u64) -> Result<u64> {
         let length = word(memory, vectors, index * 16 + 8)?;
         total = total
             .checked_add(length)
-            .filter(|&n| n <= trames_net::MAX_TRANSFER as u64)
-            .ok_or(Errno(90))?;
+            .filter(|&n| n <= i64::MAX as u64)
+            .ok_or(Errno(22))?;
     }
     Ok(total)
 }
