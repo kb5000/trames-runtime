@@ -71,6 +71,9 @@ pub(super) struct MountIdentity {
     #[cfg(all(feature = "hostfs", unix))]
     has_children: std::sync::atomic::AtomicBool,
     pub id: u64,
+    // Immutable mount identity; stat must not acquire the filesystem or root
+    // inode lock while it already holds another inode guard.
+    pub device: u64,
     pub fs: FsHandle,
     pub root: NodeRef,
     pub root_key: Vec<u8>,
@@ -224,6 +227,10 @@ impl Mount {
             #[cfg(all(feature = "hostfs", unix))]
             has_children: std::sync::atomic::AtomicBool::new(false),
             id: init.id,
+            device: init
+                .fs
+                .overlay_device()
+                .unwrap_or_else(|| init.root.borrow().device),
             fs: init.fs,
             root: init.root,
             root_key: init.root_key,
@@ -311,11 +318,7 @@ impl Mount {
 }
 impl MountData {
     pub(super) fn device(&self) -> u64 {
-        self.fs
-            .borrow()
-            .overlay
-            .as_ref()
-            .map_or_else(|| self.root.borrow().device, |o| o.device)
+        self.identity.device
     }
     pub fn readonly(&self) -> bool {
         self.flags.get() & MS_RDONLY != 0

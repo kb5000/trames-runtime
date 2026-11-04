@@ -1780,23 +1780,12 @@ impl Vfs {
                 return Err(Errno(20));
             }
         }
-        let live = self
-            .fs
-            .borrow()
-            .inodes
-            .iter()
-            .filter(|n| n.strong_count() != 0)
-            .count();
+        let fs = self.fs.borrow();
+        let live = fs.inodes.iter().filter(|n| n.strong_count() != 0).count();
         if live
             .checked_add(parents.len() + 1)
-            .is_none_or(|n| n > self.fs.borrow().limits.nodes)
-            || self
-                .fs
-                .borrow()
-                .paths
-                .len()
-                .saturating_add(parents.len() + 1)
-                > self.fs.borrow().limits.nodes
+            .is_none_or(|n| n > fs.limits.nodes)
+            || fs.paths.len().saturating_add(parents.len() + 1) > fs.limits.nodes
         {
             return Err(Errno(28));
         }
@@ -1841,8 +1830,11 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
-        if filesystem.borrow().paths.len() >= filesystem.borrow().limits.nodes {
-            return Err(Errno(28));
+        {
+            let fs = filesystem.borrow();
+            if fs.paths.len() >= fs.limits.nodes {
+                return Err(Errno(28));
+            }
         }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
@@ -3169,49 +3161,7 @@ impl Vfs {
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         let metadata = node.file_metadata();
         out[16..20].copy_from_slice(&metadata.mode.to_le_bytes());
-        let mut links = node.links;
-        if links != 0 && matches!(node.content, Content::Directory) {
-            // Persistent links count path owners; stat counts . and children's .. too.
-            let fs = mount.map_or(&self.fs, |m| &m.fs).borrow();
-            let path = node.path_in(&fs.paths, b"/").or_else(|| {
-                self.pseudo
-                    .borrow()
-                    .nodes
-                    .borrow()
-                    .entries
-                    .iter()
-                    .find(|(_, n)| n.identity == node.identity)
-                    .map(|((_, p), _)| p.clone())
-            });
-            if let Some(path) = path {
-                let mut prefix = path.clone();
-                if prefix != b"/" {
-                    prefix.push(b'/');
-                }
-                let mut directories = std::collections::BTreeSet::new();
-                for (name, n) in directory::children(&fs.paths, &path) {
-                    if matches!(n.borrow().content, Content::Directory) {
-                        directories.insert(name.to_vec());
-                    }
-                }
-                let at = ResolvedPath {
-                    key: path.clone(),
-                    mount: self.mount_for_path(mount),
-                };
-                for name in self.mounted_pseudo_children(&at)? {
-                    let mut child = prefix.clone();
-                    child.extend_from_slice(&name);
-                    if self
-                        .node(&child)
-                        .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
-                    {
-                        directories.insert(name);
-                    }
-                }
-                links = 2 + directories.len() as u32;
-            }
-        }
-        out[20..24].copy_from_slice(&links.to_le_bytes());
+        out[20..24].copy_from_slice(&node.links.to_le_bytes());
         out[24..28].copy_from_slice(&node.uid.to_le_bytes());
         out[28..32].copy_from_slice(&node.gid.to_le_bytes());
         let rdev = if !matches!(node.mode & 0o170000, 0o20000 | 0o60000) {
@@ -3235,6 +3185,65 @@ impl Vfs {
         for (offset, t) in [72, 88, 104].into_iter().zip(metadata.times) {
             out[offset..offset + 8].copy_from_slice(&t.seconds.to_le_bytes());
             out[offset + 8..offset + 16].copy_from_slice(&(t.nanos as u64).to_le_bytes());
+        }
+        Ok(out)
+    }
+    fn stat_inode(&self, inode: &NodeRef, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
+        let (mut out, directory) = {
+            let node = inode.borrow();
+            (
+                self.stat_node(&node, mount)?,
+                node.links != 0 && matches!(node.content, Content::Directory),
+            )
+        };
+        if directory {
+            // Namespace/checkpoint writers use filesystem -> inode. In
+            // particular, never carry the above scalar inode guard into here.
+            let (path, mut directories) = {
+                let fs = mount.map_or(&self.fs, |m| &m.fs).borrow();
+                let path = inode.borrow().path_in(&fs.paths, b"/").or_else(|| {
+                    self.pseudo
+                        .borrow()
+                        .nodes
+                        .borrow()
+                        .entries
+                        .iter()
+                        .find(|(_, n)| n.identity == inode.identity)
+                        .map(|((_, p), _)| p.clone())
+                });
+                let mut directories = std::collections::BTreeSet::new();
+                if let Some(path) = &path {
+                    for (name, n) in directory::children(&fs.paths, path) {
+                        if matches!(n.borrow().content, Content::Directory) {
+                            directories.insert(name.to_vec());
+                        }
+                    }
+                }
+                (path, directories)
+            };
+            if let Some(path) = path {
+                let mut prefix = path.clone();
+                if prefix != b"/" {
+                    prefix.push(b'/');
+                }
+                let at = ResolvedPath {
+                    key: path,
+                    mount: self.mount_for_path(mount),
+                };
+                // These lookups can re-enter the filesystem. No namespace or
+                // inode guard remains, even if a writer is already queued.
+                for name in self.mounted_pseudo_children(&at)? {
+                    let mut child = prefix.clone();
+                    child.extend_from_slice(&name);
+                    if self
+                        .node(&child)
+                        .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
+                    {
+                        directories.insert(name);
+                    }
+                }
+                out[20..24].copy_from_slice(&(2 + directories.len() as u32).to_le_bytes());
+            }
         }
         Ok(out)
     }
@@ -3268,7 +3277,7 @@ impl Vfs {
         }
         let n = self.node(&p)?;
         let mount = p.mount.map(OpenMount::Owner);
-        let out = self.stat_node(&n.borrow(), mount.as_ref());
+        let out = self.stat_inode(&n, mount.as_ref());
         out.map(|stat| (stat, id))
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
@@ -3301,7 +3310,7 @@ impl Vfs {
             return Ok(stat);
         }
         if let Some(n) = o.metadata_node() {
-            let mut stat = self.stat_node(&n.borrow(), o.mount.as_ref())?;
+            let mut stat = self.stat_inode(&n, o.mount.as_ref())?;
             if let Some(source) = &o.read_node {
                 if let Content::File(data) = &source.borrow().content {
                     stat[48..56].copy_from_slice(&data.len().to_le_bytes());
@@ -3312,7 +3321,7 @@ impl Vfs {
         }
         if matches!(o.kind, FdKind::Terminal) {
             if let Ok(n) = self.node(b"/dev/pts/0") {
-                return self.stat_node(&n.borrow(), o.mount.as_ref());
+                return self.stat_inode(&n, o.mount.as_ref());
             }
         }
         self.stat_node(

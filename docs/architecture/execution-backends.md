@@ -2072,3 +2072,38 @@ file position/byte synchronization and the existing bounded transfer staging are
 retained. No new coordinator/resource thread, message bus, ordinary-memory fence,
 unsafe block, CPU quota or global transfer lock is added. This is common Mac/iPad
 code; no whole-application or entirely coordinator-free claim follows from it.
+
+
+## Overlay checkpoint and stat lock order (2026-11-04)
+
+A Docker useradd on an overlay-backed Debian container exposed a namespace/inode
+cycle: checkpoint held the overlay filesystem for rename and needed an inode
+write guard, while FileEpoch scalar stat held that inode read guard and queried
+the mount device through the filesystem. The owner stalled during cohort setup,
+so unrelated guest exec requests also stopped progressing.
+
+Device numbers now belong to immutable mount identity and require no filesystem
+or inode lock after mount construction. Scalar stat/capability formatting touches
+only its accepted inode fields. Directory stat releases scalar inode guards before
+namespace traversal, follows filesystem -> inode order for reverse lookup/children,
+and releases both before pseudo-child lookups can re-enter the namespace. Overlay
+copy-up follows upper filesystem -> merged inode too, dropping the filesystem
+before bulk copy/sync. Existing capacity checks use the byte-account snapshot
+without an unrelated inode-count scan. Layer device identity also avoids a root
+inode re-borrow under checkpoint. Two import/hard-link limit checks use one
+filesystem read guard rather than recursively taking read locks while a writer
+could be queued.
+
+The focused audit also checked chmod/times/xattr rollback, reverse-path lookup,
+host identity publication and filesystem-sync checkpoint handoff: their scoped
+inode guards are released before entering the filesystem, or their lookup order
+already follows filesystem -> inode. This is a scoped source audit, not a proof
+that every runtime lock graph is cycle-free. No global lock, service/coordinator
+thread, try-lock polling loop, new guest error or ordinary-memory fence is added.
+
+Bounded regressions force the namespace writer during FileEpoch preparation,
+contend copy-up against the upper namespace and inode, and run rename/checkpoint
+against file/directory stat concurrently. They release forced locks before failure
+or use receive deadlines, so the old cycle fails rather than hanging the suite.
+The original unmodified Docker repro is run separately against an APFS clone of
+the frozen Debian environment, without changing its project data or credentials.

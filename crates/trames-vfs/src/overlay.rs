@@ -206,6 +206,10 @@ impl Overlay {
             return Ok(());
         }
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
+        // Upper namespace/checkpoint takes filesystem -> inode too. Never
+        // wait for that filesystem while holding the merged inode write guard.
+        let fs = upper.fs.borrow();
+        let available = Vfs::filesystem_bytes(&fs).2;
         let mut n = node.borrow_mut();
         if let Content::File(storage::FileData::Lower(source)) = &n.content {
             let source = source.borrow();
@@ -213,8 +217,7 @@ impl Overlay {
                 return Err(Errno(5));
             };
             let length = if truncate { 0 } else { data.len() };
-            let fs = upper.fs.borrow();
-            if length > Vfs::filesystem_capacity(&fs).available_bytes {
+            if length > available {
                 return Err(Errno(28));
             }
             let mut copy = if let Some(disk) = &fs.disk {
@@ -476,9 +479,9 @@ impl Overlay {
 }
 impl Layer {
     fn fs_device(&self) -> u64 {
-        // Caller may hold the filesystem write guard; inode metadata has a
-        // separate lock and provides the retained storage device identity.
-        self.at.identity.root.borrow().device
+        // The caller may own the upper filesystem write guard. Layer identity
+        // retains its immutable device without acquiring any inode lock.
+        self.at.identity.device
     }
 }
 // Keep escaping until the final path split: lowerdir itself contains ':' while
@@ -786,6 +789,131 @@ mod tests {
             Some(b"lowerdir=/lower:/lower2,upperdir=/upper,workdir=/work,index=off"),
         )
         .unwrap();
+    }
+    #[test]
+    fn file_epoch_stat_needs_no_overlay_namespace_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (ready, receive) = mpsc::channel();
+        let (go, start) = mpsc::channel();
+        let (done, finish) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut v = Vfs::default();
+            dirs(&mut v);
+            mount(&mut v);
+            write(&mut v, b"/merged/file", b"data");
+            let fd = v.open_at(AT_FDCWD, b"/merged/file", 2, 0).unwrap();
+            let fs = v.mount_location(b"/merged", true).unwrap().filesystem(&v);
+            ready.send(fs).unwrap();
+            start.recv().unwrap();
+            let files = FileEpoch::default().capture(&v, true);
+            done.send(files.get(fd).is_some()).unwrap();
+        });
+        let fs = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Model rename/checkpoint already owning this namespace. The scalar
+        // stat in file-epoch admission must complete even while it is locked.
+        let writer = fs.borrow_mut();
+        go.send(()).unwrap();
+        let completed = finish.recv_timeout(Duration::from_secs(1));
+        drop(writer); // Even the old broken implementation can finish cleanup.
+        reader.join().unwrap();
+        assert_eq!(completed.unwrap(), true);
+    }
+    #[test]
+    fn copy_up_does_not_pin_inode_while_waiting_for_upper_namespace() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/file", b"lower");
+        mount(&mut v);
+        let fs = v.mount_location(b"/merged", true).unwrap().filesystem(&v);
+        let (overlay, node) = {
+            let fs = fs.borrow();
+            (
+                fs.overlay.as_ref().unwrap().clone(),
+                fs.paths[b"/file".as_slice()].clone(),
+            )
+        };
+        let writer = v.fs.borrow_mut();
+        let (begin, started) = mpsc::channel();
+        let copy_node = node.clone();
+        let copying = std::thread::spawn(move || {
+            begin.send(()).unwrap();
+            overlay.copy_up(&copy_node, false).unwrap();
+        });
+        started.recv().unwrap();
+        // Let copy-up reach the deliberately locked upper filesystem.
+        std::thread::sleep(Duration::from_millis(20));
+        let (ready, acquired) = mpsc::channel();
+        let metadata = std::thread::spawn(move || {
+            let inode = node.borrow_mut();
+            ready.send(()).unwrap();
+            drop(inode);
+        });
+        let completed = acquired.recv_timeout(Duration::from_secs(1));
+        drop(writer); // Release before asserting, including on the old path.
+        copying.join().unwrap();
+        metadata.join().unwrap();
+        completed.unwrap();
+    }
+    #[test]
+    fn overlay_rename_checkpoint_and_directory_stat_share_one_lock_order() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/file", b"lower");
+        mount(&mut v);
+        write(&mut v, b"/merged/file", b"upper");
+        let fd = v.open_at(AT_FDCWD, b"/merged/file", 0, 0).unwrap();
+        let dir = v.open_at(AT_FDCWD, b"/merged", O_DIRECTORY, 0).unwrap();
+        let query = v.path_queries();
+        let calls: Vec<_> = (0..64)
+            .map(|i| {
+                let (from, to) = if i % 2 == 0 {
+                    (b"/merged/file".to_vec(), b"/merged/next".to_vec())
+                } else {
+                    (b"/merged/next".to_vec(), b"/merged/file".to_vec())
+                };
+                v.path_queries().namespace_work(NamespaceCall::Rename {
+                    oldfd: AT_FDCWD,
+                    old: from,
+                    newfd: AT_FDCWD,
+                    new: to,
+                    flags: 0,
+                })
+            })
+            .collect();
+        let barrier = Arc::new(Barrier::new(2));
+        let (done, finish) = mpsc::channel();
+        let b = barrier.clone();
+        let sender = done.clone();
+        let writer = std::thread::spawn(move || {
+            b.wait();
+            for work in calls {
+                assert!(matches!(
+                    work.run(),
+                    FileOutcome::Complete(FileReply { result: Ok(_), .. })
+                ));
+            }
+            sender.send(()).unwrap();
+        });
+        let reader = std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..128 {
+                assert!(query.stat_fd(fd).unwrap().is_ok());
+                let stat = query.stat_fd(dir).unwrap().unwrap();
+                assert_eq!(u32::from_le_bytes(stat[20..24].try_into().unwrap()), 2);
+            }
+            done.send(()).unwrap();
+        });
+        // A failed lock-order regression must fail this test, not hang CI.
+        for _ in 0..2 {
+            finish.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
     #[test]
     fn pivot_root_overlay_layers_do_not_retain_parent_topology_cycle() {

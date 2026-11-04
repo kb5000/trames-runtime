@@ -73,6 +73,9 @@ impl FsHandle {
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }
+    pub fn overlay_device(&self) -> Option<u64> {
+        self.overlay.as_ref().map(|overlay| overlay.device)
+    }
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
     }
