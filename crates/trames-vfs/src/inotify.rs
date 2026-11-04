@@ -375,6 +375,12 @@ pub(super) fn move_link(
         }
     }
 }
+pub(super) fn notify_removed(node: &NodeRef) {
+    let source = node.borrow().notifications.source.get().cloned();
+    if let Some(source) = source {
+        source.destroy(true);
+    }
+}
 pub(super) fn notify(node: &NodeRef, mask: u32, at: Option<&Arc<Link>>) {
     let n = node.borrow();
     let mask = mask

@@ -340,7 +340,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        v.cgroup_fork(1, 1, 1);
         v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/a", 0o755).unwrap();
         v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/a/b", 0o755).unwrap();
         let parent = v.open_at(AT_FDCWD, b"/sys/fs/cgroup/a", O_PATH, 0).unwrap();
@@ -358,7 +357,10 @@ mod tests {
         let procs = v
             .open_at(AT_FDCWD, b"/sys/fs/cgroup/a/b/cgroup.procs", 1, 0)
             .unwrap();
+        let authority = v.device_access();
+        assert!(authority.check(0o20666, 0x103, 2).is_ok());
         v.write(procs, b"0").unwrap();
+        assert_eq!(authority.check(0o20666, 0x103, 2), Err(Errno(1)));
         assert_eq!(v.open_at(AT_FDCWD, b"/dev/null", 0, 0), Err(Errno(1)));
         let path = v.open_at(AT_FDCWD, b"/dev/null", O_PATH, 0).unwrap();
         let fds = v.fd_snapshot();
@@ -374,6 +376,7 @@ mod tests {
         v.bpf_attach_device(child, allow, 2, 0).unwrap(); // cannot override parent
         assert_eq!(v.open_at(AT_FDCWD, b"/dev/null", 0, 0), Err(Errno(1)));
         v.bpf_attach_device(parent, allow, 6, deny).unwrap();
+        assert!(authority.check(0o20666, 0x103, 2).is_ok());
         assert!(v.open_at(AT_FDCWD, b"/dev/null", 2, 0).is_ok());
         v.close(deny).unwrap();
         assert_eq!(v.bpf_get_fd(ids[0]), Err(Errno(2)));

@@ -106,6 +106,7 @@ impl<C: Cpu> Kernel<C> {
                     let remaining = lease_deadline.saturating_duration_since(Instant::now());
                     if !batch
                         || p.stopped()
+                        || p.frozen(pid)
                         || p.seccomp.mode() != 0
                         || remaining.is_zero()
                         || epoch.control.stopped()
@@ -146,6 +147,9 @@ impl<C: Cpu> Kernel<C> {
                 }
                 job.work.cpu = std::mem::take(&mut p.cpu);
                 control.finish(job.stop_hold());
+                if let Some(task) = p.signals.io.cgroup() {
+                    task.acknowledge();
+                }
                 self.processes.insert(pid, p);
             }
             let members: Vec<_> = checkpoint

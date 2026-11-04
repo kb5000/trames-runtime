@@ -160,6 +160,9 @@ impl<C: Cpu> Process<C> {
     fn publish_stop_hold(&self, id: u32) {
         self.signals.io.lifecycle().register(&self.signals.io, id);
         self.signals.io.lifecycle().hold(id, self.stop_held());
+        if let Some(task) = self.signals.io.cgroup() {
+            task.acknowledge();
+        }
     }
 
     fn bind_signals(&self) {
@@ -391,7 +394,10 @@ impl<C: Cpu> Process<C> {
 
     fn frozen(&self, pid: u32) -> bool {
         self.file_pauses != 0
-            || self.linux.vfs.cgroup_frozen(pid) && self.pending_bits() & (1 << 8) == 0
+            || self.signals.io.cgroup().map_or_else(
+                || self.linux.vfs.cgroup_frozen(pid),
+                trames_vfs::CgroupTask::frozen,
+            ) && self.pending_bits() & (1 << 8) == 0
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork(&self) -> Box<Self> {
@@ -636,6 +642,11 @@ impl<C: Cpu> Kernel<C> {
         }
         p.bind_signals();
         p.signals.io.set_session(p.session);
+        if p.signals.io.cgroup().is_none() {
+            if let Some(task) = p.linux.vfs.cgroup_task(id) {
+                p.signals.io.bind_cgroup(task);
+            }
+        }
         p.signals.io_directory.publish(
             &p.signals.io,
             id,
@@ -2681,6 +2692,7 @@ impl<C: Cpu> Kernel<C> {
                         .write(a[4], &child_tid.to_le_bytes())
                         .map_err(|_| Errno(14))?;
                 }
+                child.linux.vfs.set_process_context(id);
                 child.linux.vfs.cgroup_fork(pid, id, child.tgid);
                 self.publish_task(id, &child);
                 self.processes.insert(id, child);
@@ -5344,7 +5356,22 @@ impl<C: Cpu> Kernel<C> {
                     };
                     let quantum_started = Instant::now();
                     let mut immediate_returns = 0;
-                    while p.runnable() && quantum != 0 {
+                    let control = p
+                        .runnable()
+                        .then(|| p.signals.io.lifecycle().enter(&p.signals.io, id));
+                    if let Some(control) = &control {
+                        match C::execution_interrupt(&mut self.engine) {
+                            Ok(Some(interrupt)) => {
+                                control.bind_interrupt(interrupt);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.processes.insert(id, p);
+                                return Err(RuntimeError::Backend(error.to_string()));
+                            }
+                        }
+                    }
+                    while p.runnable() && !p.frozen(id) && quantum != 0 {
                         if self.instructions >= limit {
                             self.processes.insert(id, p);
                             return Err(RuntimeError::BudgetExceeded(limit));
@@ -5385,6 +5412,12 @@ impl<C: Cpu> Kernel<C> {
                         {
                             break;
                         }
+                    }
+                    if let Some(control) = control {
+                        control.finish(Some(p.stop_held()));
+                    }
+                    if let Some(task) = p.signals.io.cgroup() {
+                        task.acknowledge();
                     }
                 }
                 let actual_id = p.rekey.take().unwrap_or(id);

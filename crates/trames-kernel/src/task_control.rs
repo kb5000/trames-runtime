@@ -38,6 +38,7 @@ struct Member {
 pub struct Lease {
     group: Arc<Group>,
     pid: u32,
+    task: Weak<IoTask>,
     held: Option<bool>,
 }
 struct Publication {
@@ -102,6 +103,20 @@ impl State {
     }
 }
 impl Group {
+    pub fn interrupt_member(&self, pid: u32) {
+        let state = self.state.lock().unwrap();
+        if let Some(interrupt) = state.members.get(&pid).and_then(|m| m.interrupt.as_ref()) {
+            interrupt.request_exit();
+        }
+    }
+    pub fn quiescent(&self, pid: u32) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .members
+            .get(&pid)
+            .is_none_or(|m| !m.running && !m.held)
+    }
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
@@ -150,6 +165,7 @@ impl Group {
         Lease {
             group: self.clone(),
             pid,
+            task: Arc::downgrade(task),
             held: None,
         }
     }
@@ -280,10 +296,14 @@ impl Group {
     pub fn live_task(&self) -> Option<Arc<IoTask>> {
         self.state.lock().unwrap().tasks().into_iter().next()
     }
-    fn finish(&self, pid: u32, held: Option<bool>) {
+    fn finish(&self, pid: u32, task: &Weak<IoTask>, held: Option<bool>) {
         let notice = {
             let mut s = self.state.lock().unwrap();
-            if let Some(m) = s.members.get_mut(&pid) {
+            let member = match s.members.get_mut(&pid) {
+                Some(member) => Some(member),
+                None => s.members.values_mut().find(|m| m.task.ptr_eq(task)),
+            };
+            if let Some(m) = member {
                 m.running = false;
                 m.interrupt = None;
                 if let Some(held) = held {
@@ -309,7 +329,7 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.group.finish(self.pid, self.held);
+        self.group.finish(self.pid, &self.task, self.held);
     }
 }
 
@@ -404,9 +424,9 @@ mod tests {
     #[test]
     fn exec_rekeys_the_original_member_and_replaces_the_retired_leader() {
         let (a, b, child) = family();
+        let lease = b.lifecycle().enter(&b, 43);
         a.lifecycle().register(&b, 42);
         assert_eq!(a.lifecycle().state.lock().unwrap().members.len(), 1);
-        let lease = b.lifecycle().enter(&b, 42);
         b.lifecycle().consume_stop(19, || true);
         assert_eq!(child.pending(), None);
         drop(lease);

@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit after the shared signal queue/control/wait subsystem
-batch, 2026-11-04. Mac HVF and the iPad interpreter use the same userspace Linux
+This is the consolidated implementation audit through the shared cgroup resource
+batch, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
 below, 2026-11-04, use calling workers and shared resources from their first implementation.
@@ -91,8 +91,8 @@ chain is still open; forwarding an entry alone does not remove those dependencie
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid and STOP/CONT run on source workers. Structural child/task/VM ownership, exit cleanup and pending-context collection remain on the owner. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination still requires exit cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, owner cgroup/proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and owner Rc control graphs have not been migrated. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are now separate shared resources. Do not classify every network socket or netlink message as owner-only. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
-| Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted cgroup/nsfs/mqueue mounts, volatile owner descriptors, controlling-terminal acquisition and excluded open types | Before-effects defer. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes and the structural fork/exit entry still join. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted nsfs/mqueue mounts, volatile owner descriptors, controlling-terminal acquisition and excluded open types | Before-effects defer. Actual cgroup mounts are admitted through their original shared graph and OFDs. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles remaining owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, old epoll creation, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
 | POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination and lifecycle cleanup retain their actual boundary; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
@@ -250,3 +250,54 @@ The Linux signal-generation and group-stop behavior was checked against
 The paired product evidence includes native ARM Linux, the Mac HVF backend,
 the production interpreter and an iPad device-target compile. It does not claim
 physical-iPad execution or a whole-browser speedup.
+
+### Shared cgroup hierarchy, freezer and control events (2026-11-05)
+
+The original cgroup v2 hierarchy, TID incarnations, pids counters and device
+attachments are now shared resource state. Actual cgroup mounts participate in
+the ordinary source pathname/namespace algorithms. Their control OFDs retain
+the original inode and hierarchy, rather than an owner VFS or a copied file
+body. Read/write, vector and positioned I/O, seek, directory operations and
+poll/epoll use these resources from the owner and source workers. The caller's
+PID namespace and credentials bind each operation; passing an OFD does not
+pass its creator's administrative authority.
+
+Each IoTask retains its original membership capability. Moves update that
+member, so a previously retained device factory observes the current cgroup's
+policy. Member retirement validates original identity; a late handle cannot
+remove a replacement that reused its numeric TID. Hierarchical population and
+frozen counts update at birth, move, acknowledgement and retirement, instead
+of scanning every task for each pids.current/cgroup.events read. Hierarchy
+transactions use the actual resource lock. Ordinary executor freeze tests
+read the member's relaxed atomic flag without acquiring that hierarchy lock.
+
+Freeze interrupts only affected active CPUs using the existing group execution
+lease and backend interrupt. The normal owner CPU quantum also holds this
+lease, as does the existing VM batch. A request is distinct from completion:
+`cgroup.events:frozen=1` waits for execution and accepted uninterruptible work
+to relinquish each member. Ancestor freeze, nested local freeze, live migration,
+SIGKILL and thaw preserve original waits and their execution-slot ownership.
+No message bus, service thread, guest-memory barrier or shadow task registry
+is introduced. A non-leader exec can rekey a running lease; completion finds
+that same original member after the key changes.
+
+The actual control inode owns its event generation and readiness. Population,
+completed freeze and pids limit events notify existing epoll/inotify channels
+after resource locks are released. Poll does not acknowledge a change; reading
+the original OFD does. Initial and removed control files expose Linux kernfs
+ERR/PRI behavior. Deletion/recreation and controller removal keep old FD
+identity, wake its waiters and return ENODEV rather than redirecting a retained
+operation to a replacement control file. The implementation was compared with
+[Linux kernfs](https://github.com/torvalds/linux/blob/v6.18/fs/kernfs/file.c),
+[the freezer](https://github.com/torvalds/linux/blob/v6.18/kernel/cgroup/freezer.c)
+and the [cgroup v2 interface](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+
+This removes the cgroup resource dependency, not the remaining task-lifecycle
+entry. Structural fork admission and final exit still call the same hierarchy
+at their current joined boundaries. BPF control installation, cgroup
+namespace/mount topology, full exit cancellation and final Files/mm/native
+ownership remain explicitly joined. A standalone VFS without a bound TaskSignal
+retains its legacy kill-ID collection API; production tasks bind the original
+IoTask and receive cgroup.kill directly. The fatal signal still reaches the
+documented exit cleanup boundary. No owner-independence claim is made for that
+remaining lifecycle chain.

@@ -44,6 +44,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Cgroup(Arc<cgroup::CgroupFile>),
     Uring(Arc<Uring>),
     Signal(Arc<SignalMask>),
     Bpf(Arc<bpf::Program>),
@@ -64,8 +65,9 @@ impl SharedControl {
             Anonymous::Epoll { shared, .. } => Self::Epoll(shared.clone()),
         })
     }
-    pub(super) fn owner_projection(&self) -> Anonymous {
-        match self {
+    pub(super) fn owner_projection(&self) -> Option<Anonymous> {
+        Some(match self {
+            Self::Cgroup(_) => return None,
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
@@ -77,7 +79,7 @@ impl SharedControl {
                 cursor: shared.cursor.clone(),
                 shared: shared.clone(),
             },
-        }
+        })
     }
 }
 
@@ -356,12 +358,14 @@ impl Vfs {
             return Err(Errno(22));
         }
         let t = target.borrow();
+        let cgroup = matches!(t.control, Some(SharedControl::Cgroup(_)));
         if t.namespace.is_some()
             || matches!(t.kind, FdKind::Node(_))
                 && t.bridge.is_none()
                 && t.pipe.is_none()
                 && t.kernel_log.is_none()
                 && t.mount_file.is_none()
+                && !cgroup
         {
             return Err(Errno(1));
         }
@@ -373,6 +377,7 @@ impl Vfs {
             && t.pipe.is_none()
             && t.kernel_log.is_none()
             && t.mount_file.is_none()
+            && !cgroup
             && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
             && !matches!(
                 t.anonymous,

@@ -12,7 +12,7 @@ pub struct DescriptorFactory {
     credentials: Credentials,
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
-    devices: Arc<cgroup::DeviceAccess>,
+    devices: cgroup::DeviceAuthority,
 }
 pub(super) fn next_id(ids: &AtomicU64) -> u64 {
     (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)

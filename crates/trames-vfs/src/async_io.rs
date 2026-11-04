@@ -13,6 +13,13 @@ pub trait AsyncOwners {
 }
 pub trait TaskSignal: Send + Sync {
     fn raise(&self, signal: u32);
+    /// The original resource's scheduling state changed; consumers read its
+    /// level state after this wake. No stale state value is sent in a message.
+    fn scheduling_changed(&self) {}
+    /// Actual execution and accepted kernel work have relinquished this task.
+    fn quiescent(&self) -> bool {
+        true
+    }
 }
 #[derive(Default)]
 pub(super) struct AsyncState {

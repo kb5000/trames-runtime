@@ -312,8 +312,20 @@ impl Snapshot {
             self.io_signals.publish_mask(mask);
         }
     }
+    pub fn frozen(&self) -> bool {
+        self.io_signals
+            .cgroup()
+            .is_some_and(trames_vfs::CgroupTask::frozen)
+    }
+    pub fn quiesced(&self) -> bool {
+        self.io_signals.lifecycle().stopped() || self.frozen()
+    }
     pub fn next_io_signal(&self) -> Option<(u32, bool)> {
-        self.io_signals.next(!self.io_signals.mask())
+        self.io_signals.next(if self.frozen() {
+            1 << 8
+        } else {
+            !self.io_signals.mask()
+        })
     }
     pub fn io_frame(&self) -> trames_kernel::signal::FrameState {
         let context = *self.io_signals.context.lock().unwrap();

@@ -167,6 +167,7 @@ pub struct IoTask {
     pub inbox: Inbox,
     process: std::sync::OnceLock<Arc<Inbox>>,
     lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
+    cgroup: std::sync::OnceLock<trames_vfs::CgroupTask>,
     session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
@@ -186,6 +187,7 @@ impl Default for IoTask {
             inbox: Default::default(),
             process: Default::default(),
             lifecycle: Default::default(),
+            cgroup: Default::default(),
             session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
@@ -230,6 +232,15 @@ impl IoTask {
     }
     pub fn lifecycle(&self) -> &Arc<crate::task_control::Group> {
         self.lifecycle.get_or_init(Arc::default)
+    }
+    pub fn cgroup(&self) -> Option<&trames_vfs::CgroupTask> {
+        self.cgroup.get()
+    }
+    pub fn bind_cgroup(self: &Arc<Self>, task: trames_vfs::CgroupTask) {
+        if self.cgroup.set(task).is_ok() {
+            let target: Arc<dyn trames_vfs::TaskSignal> = self.clone();
+            self.cgroup.get().unwrap().bind(&target);
+        }
     }
     pub fn session(&self) -> u32 {
         self.session.load(Ordering::Relaxed)
@@ -424,6 +435,14 @@ struct Policy {
     can_kill: bool,
 }
 impl trames_vfs::TaskSignal for IoTask {
+    fn scheduling_changed(&self) {
+        self.lifecycle()
+            .interrupt_member(self.pid.load(Ordering::Relaxed));
+        self.wake_control();
+    }
+    fn quiescent(&self) -> bool {
+        self.lifecycle().quiescent(self.pid.load(Ordering::Relaxed))
+    }
     fn raise(&self, signal: u32) {
         if !self.live.load(Ordering::Relaxed) {
             return;

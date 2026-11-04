@@ -4,6 +4,7 @@
 mod bpf;
 pub mod capabilities;
 mod cgroup;
+pub use cgroup::CgroupTask;
 mod fs_context;
 mod path_queries;
 pub use path_queries::PathQueries;
@@ -665,7 +666,7 @@ pub struct Vfs {
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
-    cgroups: Rc<RefCell<cgroup::Cgroups>>,
+    cgroups: Arc<SharedCell<cgroup::Cgroups>>,
     dumpable: Rc<Cell<bool>>,
     pid: u32,
     lock_owner: u32,
@@ -797,7 +798,7 @@ impl Vfs {
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),
-            cgroups: Rc::default(),
+            cgroups: Arc::default(),
             dumpable: Rc::new(Cell::new(true)),
             pid: 1,
             ptys: Arc::default(),
@@ -949,7 +950,7 @@ impl Vfs {
                     if *direct_revision == revision {
                         return (
                             snapshot.clone(),
-                            DirectFds(direct.clone(), Some(self.shared_files()), None),
+                            DirectFds(direct.clone(), Some(self.shared_files()), None, None),
                         );
                     }
                 }
@@ -975,7 +976,7 @@ impl Vfs {
         }
         let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
         *cached = Some((revision, snapshot.clone()));
-        let direct = DirectFds(direct.into(), Some(self.shared_files()), None);
+        let direct = DirectFds(direct.into(), Some(self.shared_files()), None, None);
         *identity.direct.borrow_mut() = Some((revision, direct.0.clone()));
         (snapshot, direct)
     }
@@ -1137,6 +1138,13 @@ impl Vfs {
         }
         if let Some(log) = &o.kernel_log {
             return log.poll(events).0;
+        }
+        if let Some(events::SharedControl::Cgroup(file)) = &o.control {
+            return if o.flags.get() & O_PATH != 0 {
+                32
+            } else {
+                file.poll(events).0
+            };
         }
         if matches!(o.kind, FdKind::Stdout | FdKind::Stderr) {
             return events & 4;
@@ -2369,6 +2377,9 @@ impl Vfs {
         } else {
             None
         };
+        let cgroup_control = self
+            .cgroup_file(&p, &node)?
+            .map(events::SharedControl::Cgroup);
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
@@ -2383,7 +2394,7 @@ impl Vfs {
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
-                    control: None,
+                    control: cgroup_control,
                     read_node,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),

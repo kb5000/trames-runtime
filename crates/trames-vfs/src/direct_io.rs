@@ -230,6 +230,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
     TcpPoll(trames_net::TcpPoll),
     NetlinkPoll(std::sync::Weak<NetSocket>),
     Mounts(Arc<mounts::watch::MountWatch>),
@@ -344,7 +345,7 @@ impl WatchResource {
                 .is_none_or(OfdIdentity::is_live)
                 .then(|| fd.clone())?,
         };
-        Some(fd.bind_signals(reader))
+        Some(fd.bind_context(reader, None))
     }
 }
 pub(super) type DirectWatch = ((u32, u64), Arc<Mutex<events::WatchState>>, WatchResource);
@@ -398,9 +399,15 @@ impl DirectFd {
         };
         reader.take(mask.get())
     }
-    fn bind_signals(mut self, reader: Option<&Arc<dyn SignalReader>>) -> Self {
-        if let ByteResource::Epoll(epoll) = &mut self.resource {
-            epoll.signal_reader = reader.cloned();
+    fn bind_context(
+        mut self,
+        reader: Option<&Arc<dyn SignalReader>>,
+        cgroups: Option<&cgroup::CgroupAccess>,
+    ) -> Self {
+        match &mut self.resource {
+            ByteResource::Epoll(epoll) => epoll.signal_reader = reader.cloned(),
+            ByteResource::Cgroup(_, caller) => *caller = cgroups.cloned(),
+            _ => {}
         }
         self
     }
@@ -526,6 +533,9 @@ impl DirectFd {
                     | events::SharedControl::Signal(_)
                     | events::SharedControl::Bpf(_),
                 ) => return None,
+                Some(events::SharedControl::Cgroup(file)) => {
+                    ByteResource::Cgroup(file.clone(), None)
+                }
                 Some(events::SharedControl::Event(counter)) => ByteResource::Event(counter.clone()),
                 Some(events::SharedControl::Timer(timer)) => ByteResource::Timer(timer.clone()),
                 Some(events::SharedControl::Inotify(instance)) => {
@@ -635,6 +645,7 @@ impl DirectFd {
                 signal,
             )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
+            ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
             ByteResource::Regular | ByteResource::SimpleDevice(_) => Vec::new(),
             ByteResource::UnixControl(local) => local
                 .upgrade()
@@ -1060,6 +1071,13 @@ impl DirectFd {
             }),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Regular | ByteResource::SimpleDevice(_) => (events & 5, [0; 2]),
+            ByteResource::Cgroup(file, _) => {
+                if self.flags & O_PATH != 0 {
+                    (32, [0; 2])
+                } else {
+                    file.poll(events)
+                }
+            }
             ByteResource::UnixControl(local) => local.upgrade().map_or((16, [0; 2]), |local| {
                 (local.poll(events), local.poll_epoch())
             }),
@@ -1155,6 +1173,10 @@ impl DirectFd {
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
+            self.check_read_access()?;
+            return file.cgroup_read(caller, offset, count)?.ok_or(Errno(19));
+        }
         let ByteResource::SimpleDevice(kind) = self.resource else {
             return Err(Errno(29));
         };
@@ -1168,6 +1190,12 @@ impl DirectFd {
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
+            if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+                return Err(Errno(9));
+            }
+            return file.cgroup_write(caller, bytes)?.ok_or(Errno(19));
+        }
         let ByteResource::SimpleDevice(kind) = self.resource else {
             return Err(Errno(29));
         };
@@ -1177,6 +1205,12 @@ impl DirectFd {
             .open
             .simple_write::<true>(kind, bytes)
     }
+    pub fn positioned_bytes(&self) -> bool {
+        matches!(
+            self.resource,
+            ByteResource::SimpleDevice(_) | ByteResource::Cgroup(..)
+        )
+    }
     pub fn byte_seek(&self, offset: i64, whence: u32) -> Result<u64> {
         if self.flags & O_PATH != 0 {
             return Err(Errno(9));
@@ -1184,6 +1218,26 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Kmsg(log) => log.seek(offset, whence),
             ByteResource::SimpleDevice(_) => Ok(0),
+            ByteResource::Cgroup(..) => {
+                let mut position = self
+                    ._file
+                    .as_ref()
+                    .ok_or(Errno(9))?
+                    .open
+                    .file_position
+                    .lock()
+                    .unwrap();
+                let value = match whence {
+                    0 | 2 => offset as i128, // kernfs control attributes have i_size == 0
+                    1 => position.value as i128 + offset as i128,
+                    _ => return Err(Errno(22)),
+                };
+                if !(0..=i64::MAX as i128).contains(&value) {
+                    return Err(Errno(22));
+                }
+                position.value = value as u64;
+                Ok(position.value)
+            }
             _ => Err(Errno(29)),
         }
     }
@@ -1222,6 +1276,24 @@ impl DirectFd {
             return Some(Err(Errno(9)));
         }
         Some(match &self.resource {
+            ByteResource::Cgroup(file, Some(caller)) => {
+                let mut position = self
+                    ._file
+                    .as_ref()
+                    .ok_or(Errno(9))
+                    .ok()?
+                    .open
+                    .file_position
+                    .lock()
+                    .unwrap();
+                file.cgroup_read(caller, position.value, count)
+                    .and_then(|bytes| {
+                        let bytes = bytes.ok_or(Errno(19))?;
+                        position.value += bytes.len() as u64;
+                        Ok(bytes)
+                    })
+            }
+            ByteResource::Cgroup(_, None) => return None,
             ByteResource::Kmsg(log) => log.read(count),
             ByteResource::SimpleDevice(_) => unreachable!("typed device read"),
             ByteResource::Event(counter) => counter.read(count),
@@ -1310,6 +1382,20 @@ impl DirectFd {
             return Err(Errno(9));
         }
         match &self.resource {
+            ByteResource::Cgroup(file, Some(caller)) => {
+                let count = file.cgroup_write(caller, bytes)?.ok_or(Errno(19))?;
+                let mut position = self
+                    ._file
+                    .as_ref()
+                    .ok_or(Errno(9))?
+                    .open
+                    .file_position
+                    .lock()
+                    .unwrap();
+                position.value = position.value.saturating_add(count as u64);
+                Ok(count)
+            }
+            ByteResource::Cgroup(_, None) => Err(Errno(95)),
             ByteResource::Kmsg(log) => log.write(bytes),
             ByteResource::SimpleDevice(_) => unreachable!("typed device write"),
             ByteResource::Mounts(_) => Err(Errno(22)),
@@ -1340,6 +1426,7 @@ pub struct DirectFds(
     pub(super) Arc<[Option<DirectFd>]>,
     pub(super) Option<SharedFiles>,
     pub(super) Option<Arc<dyn SignalReader>>,
+    pub(super) Option<cgroup::CgroupAccess>,
 );
 impl DirectFds {
     /// Bind an accepted original OFD, including fixed io_uring files. Never
@@ -1350,18 +1437,23 @@ impl DirectFds {
             Some(DirectFd::signal(file, mask, self.2.as_ref()?.clone()))
         } else {
             file.direct_byte()
-                .map(|fd| fd.bind_signals(self.2.as_ref()))
+                .map(|fd| fd.bind_context(self.2.as_ref(), self.3.as_ref()))
         }
     }
     pub fn shared_files(&self) -> Option<SharedFiles> {
         self.1.clone()
+    }
+    pub(super) fn with_cgroup_access(mut self, access: cgroup::CgroupAccess) -> Self {
+        self.3 = Some(access);
+        self
     }
     pub fn with_signal_reader(mut self, reader: Option<Arc<dyn SignalReader>>) -> Self {
         self.2 = reader;
         self
     }
     pub fn get(&self, fd: u32) -> Option<DirectFd> {
-        self.get_raw(fd).map(|fd| fd.bind_signals(self.2.as_ref()))
+        self.get_raw(fd)
+            .map(|fd| fd.bind_context(self.2.as_ref(), self.3.as_ref()))
     }
     fn get_raw(&self, fd: u32) -> Option<DirectFd> {
         if let Some(result) = self.1.as_ref().and_then(|files| files.poll_lookup(fd)) {
@@ -1574,6 +1666,7 @@ impl Vfs {
             entries.into(),
             Some(self.shared_files()),
             self.signal_reader.borrow().clone(),
+            Some(self.cgroup_access()),
         )
     }
     pub fn direct_descriptors(&self) -> DirectFds {
@@ -1581,6 +1674,7 @@ impl Vfs {
         self.descriptor_snapshots()
             .1
             .with_signal_reader(self.signal_reader.borrow().clone())
+            .with_cgroup_access(self.cgroup_access())
     }
 }
 

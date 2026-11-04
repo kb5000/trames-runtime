@@ -642,9 +642,9 @@ impl DirectSyscalls {
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
         if number == 62 {
-            fd.is_kmsg() || fd.is_simple_device()
+            fd.is_kmsg() || fd.positioned_bytes()
         } else if matches!(number, 67..=70) {
-            fd.is_simple_device()
+            fd.positioned_bytes()
         } else if matches!(number, 22 | 441) {
             fd.is_epoll()
         } else if matches!(number, 86 | 87) {
@@ -1222,12 +1222,8 @@ impl DirectSyscalls {
             Ok(file) => file,
             Err(error) => return Some(Err(error)),
         };
-        let fd = self
-            .descriptors
-            .get(args[0] as u32)
-            .filter(|fd| fd.is_signalfd())
-            .or_else(|| file.direct_byte())?;
-        if matches!(number, 67..=70) && !fd.is_simple_device() {
+        let fd = self.descriptors.byte_file(file)?;
+        if matches!(number, 67..=70) && !fd.positioned_bytes() {
             return None;
         }
         Some(Ok(RetainedByte {

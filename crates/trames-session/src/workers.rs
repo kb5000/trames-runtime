@@ -497,7 +497,7 @@ impl<C: Cpu> Pool<C> {
                             if let Some(snapshot) = &work.syscalls {
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
-                                    if !snapshot.io_signals.lifecycle().stopped() {
+                                    if !snapshot.quiesced() {
                                     if let Some(value) = wait.request.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace) {
                                         work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
@@ -506,7 +506,7 @@ impl<C: Cpu> Pool<C> {
                                 }
                                     }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
-                                    if !snapshot.io_signals.lifecycle().stopped() {
+                                    if !snapshot.quiesced() {
                                     if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
                                         work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
@@ -581,7 +581,7 @@ impl<C: Cpu> Pool<C> {
                                     }
                                 }
                             }
-                            if work.syscalls.as_ref().is_some_and(|s|s.io_signals.lifecycle().stopped()) {
+                            if work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
                                 if job.hardware_wait.as_ref().is_some_and(|w|w.ready()) {job.hardware_wait=None;}
                                 let kernel_pending=job.pending_cpu.is_some()
                                     || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
@@ -728,7 +728,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                 }
                             }
-                            if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.io_signals.lifecycle().stopped()) {
+                            if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
                                 maintenance=true;break SliceOutcome::Yield {instructions:0};
                             }
                             if epoch.as_ref().is_some_and(|epoch| epoch.should_yield(index, began, instructions != 0 || syscalls != 0 || (!C::EXACT_INSTRUCTIONS && chunks != 0))) {
@@ -758,7 +758,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         Err(error) => break SliceOutcome::Fault(error),
                                     };
                                     if let Some(interrupt) = interrupt {
-                                        if control_lease.as_ref().is_some_and(|lease|!lease.bind_interrupt(interrupt.clone())) {maintenance=true;break SliceOutcome::Yield {instructions:0};}
+                                        if control_lease.as_ref().is_some_and(|lease|!lease.bind_interrupt(interrupt.clone()) || work.syscalls.as_ref().is_some_and(|s|s.frozen())) {maintenance=true;break SliceOutcome::Yield {instructions:0};}
                                         if let Some(domain)=&domain {
                                         let Some(guard) = domain.bind_interrupt(index, interrupt) else {
                                             yielded = true;
@@ -1455,6 +1455,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         let held=job.stop_hold().map(|held|held || service || vm_checkpoint || (!maintenance && !yielded && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && matches!(outcome,Some(SliceOutcome::Syscall{..}|SliceOutcome::NativeCall{..}|SliceOutcome::Fault(_)))));
                         lease.finish(held);
                     }
+                    if let Some(task)=job.work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()) {task.acknowledge();}
                     // The same allocation retains CPU, translations and View;
                     // only its Box pointer enters the shared queues.
                     if let Some(epoch) = &epoch {
@@ -2005,6 +2006,137 @@ mod tests {
         assert_eq!(signal_task.context.lock().unwrap().frames, 0);
         memory.commit_parallel().unwrap();
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
+    }
+
+    #[test]
+    fn cgroup_freeze_thaw_and_completed_events_use_existing_executor_slots() {
+        use trames_kernel::signal::{IoDirectory, Signals};
+        for slots in [1, 4] {
+            let mut v = trames_vfs::Vfs::default();
+            v.set_runtime_info(1, Default::default());
+            v.mkdir_at(-100, b"/sys/fs/cgroup/x", 0o755).unwrap();
+            v.cgroup_fork(1, 2, 2);
+            let procs = v
+                .open_at(-100, b"/sys/fs/cgroup/x/cgroup.procs", 1, 0)
+                .unwrap();
+            v.write(procs, b"2").unwrap();
+            let freeze = v
+                .open_at(-100, b"/sys/fs/cgroup/x/cgroup.freeze", 1, 0)
+                .unwrap();
+            let events = v
+                .open_at(-100, b"/sys/fs/cgroup/x/cgroup.events", 0, 0)
+                .unwrap();
+            let directory = IoDirectory::default();
+            let parent = Signals::default();
+            let child = Signals::default();
+            for (task, pid) in [(&parent, 1), (&child, 2)] {
+                task.publish_policy(&Default::default(), true);
+                task.begin_io();
+                directory.publish(&task.io, pid, pid, pid, 0, 0);
+                task.io.bind_cgroup(v.cgroup_task(pid).unwrap());
+            }
+            let mut memory = Memory::default();
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.write(0x2100, b"10").unwrap();
+            memory
+                .write_array(0x2118, 1_000_000u64.to_le_bytes())
+                .unwrap();
+            let mov = |r: u32, n: u32| 0xd2800000 | (n << 5) | r;
+            let mut words = vec![mov(20, 0x2000), mov(21, 0x2200)];
+            let call = |words: &mut Vec<u32>, number: u32, args: &[u32]| {
+                for (i, arg) in args.iter().enumerate() {
+                    words.push(mov(i as u32, *arg));
+                }
+                words.extend([mov(8, number), 0xd4000001]);
+            };
+            call(&mut words, 64, &[freeze, 0x2100, 1]);
+            let frozen = words.len();
+            call(&mut words, 67, &[events, 0x2200, 64, 0]);
+            words.extend([0x39404eadu32, 0x7100c5bf]); // ldrb w13,[x21,#19]; cmp w13,#'1'
+            let branch = words.len();
+            words.push(0x54000001 | ((((frozen as i32 - branch as i32) as u32) & 0x7ffff) << 5));
+            words.push(0xf9400293); // save frozen target counter in x19
+            call(&mut words, 101, &[0x2110, 0]);
+            words.extend([0xf940028a, 0xeb13015f]); // current target counter == x19
+            let failure_branch = words.len();
+            words.push(0);
+            call(&mut words, 64, &[freeze, 0x2101, 1]);
+            let resumed = words.len();
+            words.extend([0xf940028a, 0xeb13015f]);
+            let branch = words.len();
+            words.push(0x54000000 | ((((resumed as i32 - branch as i32) as u32) & 0x7ffff) << 5));
+            call(&mut words, 93, &[0]);
+            let failure = words.len();
+            call(&mut words, 93, &[99]);
+            words[failure_branch] = 0x54000001 | (((failure - failure_branch) as u32) << 5);
+            for (i, word) in words.into_iter().enumerate() {
+                memory
+                    .write_array(0x1000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            for (i, word) in [0xf940028au32, 0x9100054a, 0xf900028a, 0x17fffffd]
+                .into_iter()
+                .enumerate()
+            {
+                memory
+                    .write_array(0x1800 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let control = Arc::new(Control::new(20_000_000));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            for (task, pid, pc) in [(&child, 2, 0x1800), (&parent, 1, 0x1000)] {
+                let mut snapshot = syscall_snapshot();
+                snapshot.io_signals = task.io.clone();
+                snapshot.actions = task.actions.shared();
+                if pid == 1 {
+                    snapshot.direct = trames_linux::DirectSyscalls::new(v.direct_descriptors());
+                }
+                let mut cpu = Cpu::new(pc, 0);
+                cpu.set_x(20, 0x2000);
+                epoch.add(crate::run_queue::Job::new(
+                    Work {
+                        pid,
+                        cpu,
+                        memory: Some(Box::new(
+                            memory.parallel_view(&mut Default::default()).unwrap(),
+                        )),
+                        control: control.clone(),
+                        syscalls: Some(snapshot),
+                        gpu: None,
+                        audio: None,
+                    },
+                    (1 << slots) - 1,
+                    0,
+                    None,
+                ));
+            }
+            let mut pool = Pool::new(slots);
+            for slot in 0..slots {
+                pool.ensure(slot).unwrap();
+                pool.launch(slot, epoch.clone()).unwrap();
+            }
+            for _ in 0..slots {
+                let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
+                if !matches!(event, Some(Event::EpochStopped(_))) {
+                    epoch.stop();
+                    panic!("cgroup control requested an owner or lost its wake");
+                }
+            }
+            let results = epoch.drain();
+            let parent = results.iter().find(|d| d.pid == 1).unwrap();
+            assert_eq!(
+                (parent.cpu.x(8), parent.cpu.x(0)),
+                (93, 0),
+                "target executed after completed freeze, or thaw failed"
+            );
+            assert!(results.iter().all(|d| d.serviced_syscalls == 0));
+            assert!(!child.io.cgroup().unwrap().frozen());
+            drop(results);
+            memory.commit_parallel().unwrap();
+            assert!(memory.read_u64(0x2000).unwrap() > 0);
+        }
     }
 
     #[test]

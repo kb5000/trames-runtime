@@ -101,7 +101,7 @@ impl OpenDescription {
         let anonymous = shared
             .control
             .as_ref()
-            .map(events::SharedControl::owner_projection);
+            .and_then(events::SharedControl::owner_projection);
         let namespace = shared
             .namespace_resource
             .as_ref()
@@ -158,7 +158,10 @@ impl OpenDescription {
         {
             return false;
         }
-        self.pty.is_some()
+        self.mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
+            || self.pty.is_some()
             || self.local.is_some()
             || self.namespace_resource.is_some()
             || self.socket.is_some()

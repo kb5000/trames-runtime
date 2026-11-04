@@ -7,7 +7,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
-    pub(super) devices: Arc<cgroup::DeviceAccess>,
+    pub(super) devices: cgroup::DeviceAuthority,
     pub(super) namespace_io: bool,
     pub(super) retained: Option<(u32, SharedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
@@ -92,6 +92,11 @@ impl Authority {
             .node
             .as_ref()
             .is_some_and(|n| n.simple_device.is_none() && n.borrow().volatile)
+            && !file
+                .open
+                .mount_resource
+                .get()
+                .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
         {
             return self.defer();
         }
@@ -107,7 +112,7 @@ pub(super) fn ordinary_mount(mount: &Mount) -> bool {
     }
     matches!(
         mount.kind,
-        mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Overlay
+        mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Overlay | mounts::Kind::Cgroup
     ) || cfg!(all(feature = "hostfs", unix)) && host_mount(mount)
 }
 #[cfg(all(feature = "hostfs", unix))]
@@ -129,7 +134,8 @@ pub struct PathQueries {
 // Canonical cwd/root resources cross only through their original Arc fs_struct;
 // its PathsStore always constructs fresh private Rc mount projections.
 // Source resources cross only as their existing Send+Sync Arc capabilities,
-// including the actual pseudo inode cache (never runtime/task control state).
+// including the actual pseudo inode cache and synchronized cgroup resource
+// graph. No owner Process/CPU/Memory or unsynchronized task projection crosses.
 // Query-local clones never escape a method. Send moves the entire private island
 // exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
 // Methods return owned bytes/results, numeric FDs and original shared socket
@@ -166,6 +172,10 @@ impl Vfs {
             .collect();
         *view.mount_registry.borrow_mut() = registry.iter().map(Rc::downgrade).collect();
         view.credentials = self.credentials.clone();
+        view.cgroups = self.cgroups.clone();
+        view.pid = self.pid;
+        view.pid_ns = self.pid_ns.clone();
+        view.cgroup_namespace = self.cgroup_namespace.clone();
         view.file_size_limit = self.file_size_limit.clone();
         view.context.share_mask(&self.context);
         view.lock_owner = self.lock_owner;

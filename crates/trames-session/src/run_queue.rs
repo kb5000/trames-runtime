@@ -309,10 +309,7 @@ impl<C: Cpu> Job<C> {
         }
     }
     fn stopped(&self) -> bool {
-        self.work
-            .syscalls
-            .as_ref()
-            .is_some_and(|s| s.io_signals.lifecycle().stopped())
+        self.work.syscalls.as_ref().is_some_and(|s| s.quiesced())
     }
     pub fn stop_hold(&self) -> Option<bool> {
         if matches!(self.waiting, Some(WaitState::OwnerEvent)) {
