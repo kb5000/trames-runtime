@@ -85,7 +85,7 @@ impl<C: Cpu> Kernel<C> {
         if !ready.is_empty() || p.poll_deadline.is_some_and(|d| Instant::now() >= d) {
             trames_linux::epoll_scatter(&mut p.memory, a[1], &ready)?;
             if let Some(mask) = p.signals.wait_mask.take() {
-                p.signals.mask = mask;
+                p.signals.set_mask(mask);
             }
             p.poll_deadline = None;
             Ok(Some(ready.len() as u64))
@@ -94,7 +94,7 @@ impl<C: Cpu> Kernel<C> {
                 if p.signals.wait_mask.is_none() {
                     p.signals.wait_mask = Some(p.signals.mask);
                 }
-                p.signals.mask = mask;
+                p.signals.set_mask(mask);
             }
             Ok(None)
         }
@@ -132,7 +132,8 @@ impl<C: Cpu> Kernel<C> {
             };
             // PID reuse or a preceding signal/exit cannot apply an old wake to
             // a different wait. Stopped tasks retain the ticket until SIGCONT.
-            if matches!(&p.state, State::Futex { wait, .. } if std::sync::Arc::ptr_eq(&wait.ticket, &ticket))
+            if !p.stopped()
+                && matches!(&p.state, State::Futex { wait, .. } if std::sync::Arc::ptr_eq(&wait.ticket, &ticket))
             {
                 p.state = State::Ready;
                 p.cpu.set_x(0, 0);
@@ -143,6 +144,9 @@ impl<C: Cpu> Kernel<C> {
         progress
     }
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
+        if p.stopped() {
+            return false;
+        }
         match p.state {
             State::Futex { ref wait, .. } if wait.woken() => {
                 p.state = State::Ready;

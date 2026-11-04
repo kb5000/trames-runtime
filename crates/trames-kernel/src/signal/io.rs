@@ -21,7 +21,7 @@ pub struct Inbox {
     readiness: Arc<trames_vfs::Readiness>,
 }
 impl Inbox {
-    fn timer(&self, sig: u32, info: Info) -> i32 {
+    fn timer_quiet(&self, sig: u32, info: Info) -> (i32, bool) {
         let mut pending = self.pending.lock().unwrap();
         let mut queued = false;
         let overrun = if let Some((id, extra, _)) = info.timer {
@@ -41,6 +41,10 @@ impl Inbox {
         };
         self.bits.store(pending.bits(), Ordering::Relaxed);
         drop(pending);
+        (overrun, queued)
+    }
+    fn timer(&self, sig: u32, info: Info) -> i32 {
+        let (overrun, queued) = self.timer_quiet(sig, info);
         if queued {
             self.changed();
         }
@@ -162,6 +166,8 @@ pub struct IoContext {
 pub struct IoTask {
     pub inbox: Inbox,
     process: std::sync::OnceLock<Arc<Inbox>>,
+    lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
+    session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
     live: AtomicBool,
@@ -179,6 +185,8 @@ impl Default for IoTask {
         Self {
             inbox: Default::default(),
             process: Default::default(),
+            lifecycle: Default::default(),
+            session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
             live: AtomicBool::new(true),
@@ -218,9 +226,151 @@ impl IoTask {
     }
     pub fn share_process(&self, parent: &Self) {
         assert!(self.process.set(parent.process().clone()).is_ok());
+        assert!(self.lifecycle.set(parent.lifecycle().clone()).is_ok());
+    }
+    pub fn lifecycle(&self) -> &Arc<crate::task_control::Group> {
+        self.lifecycle.get_or_init(Arc::default)
+    }
+    pub fn session(&self) -> u32 {
+        self.session.load(Ordering::Relaxed)
+    }
+    pub fn set_session(&self, session: u32) {
+        self.session.store(session, Ordering::Relaxed);
+    }
+    pub fn live(&self) -> bool {
+        self.live.load(Ordering::Relaxed) && self.presence.get().is_none_or(|p| p.present())
+    }
+    pub fn eligible_mask(&self, mask: u64) -> u64 {
+        if self.lifecycle().stopped() {
+            mask & ((1 << 8) | (1 << 17))
+        } else {
+            mask
+        }
     }
     pub fn ready(&self) -> bool {
-        (self.inbox.bits() | self.process().bits()) & !self.mask.load(Ordering::Relaxed) != 0
+        (self.inbox.bits() | self.process().bits())
+            & self.eligible_mask(!self.mask.load(Ordering::Relaxed))
+            != 0
+    }
+    pub(crate) fn wake_control(&self) {
+        if let Some(signal) = self.wake.lock().unwrap().upgrade() {
+            signal.notify();
+        }
+    }
+    fn job_enqueue<T>(
+        &self,
+        sig: u32,
+        shared: bool,
+        forced: bool,
+        enqueue: impl FnOnce() -> T,
+        ignored: impl FnOnce() -> T,
+    ) -> T {
+        let mask = if shared {
+            self.lifecycle()
+                .tasks()
+                .iter()
+                .fold(0, |mask, t| mask | t.mask())
+        } else {
+            self.mask()
+        };
+        self.lifecycle().generate(sig, || {
+            let policy = self.policy.read().unwrap();
+            let Some(policy) = policy.as_ref() else {
+                return enqueue();
+            };
+            policy.actions.with_action(sig, |action| {
+                let masked = mask & (1u64 << (sig - 1)) != 0;
+                let init = policy.namespace.is_nested() && policy.namespace.local(self.tgid()) == 1;
+                if init && action.handler <= 1 && !masked && !(matches!(sig, 9 | 19) && forced)
+                    || action.handler == 1 && !masked
+                {
+                    ignored()
+                } else {
+                    enqueue()
+                }
+            })
+        })
+    }
+    fn wake_job(&self, shared: bool) {
+        if shared {
+            for task in self.lifecycle().tasks() {
+                if task.ready() {
+                    task.wake();
+                    break;
+                }
+            }
+        } else {
+            self.wake();
+        }
+    }
+    pub fn job_signal(
+        &self,
+        sig: u32,
+        shared: bool,
+        info: Info,
+        forced: bool,
+    ) -> Result<(), Errno> {
+        let queue = if shared {
+            self.process().as_ref()
+        } else {
+            &self.inbox
+        };
+        if self.job_enqueue(
+            sig,
+            shared,
+            forced,
+            || queue.enqueue_quiet(sig, info),
+            || Ok(false),
+        )? {
+            queue.changed();
+        }
+        self.wake_job(shared);
+        Ok(())
+    }
+    fn job_timer(&self, sig: u32, shared: bool, info: Info) -> i32 {
+        let queue = if shared {
+            self.process().as_ref()
+        } else {
+            &self.inbox
+        };
+        let (overrun, queued) = self.job_enqueue(
+            sig,
+            shared,
+            false,
+            || queue.timer_quiet(sig, info),
+            || (0, false),
+        );
+        if queued {
+            queue.changed();
+        }
+        self.wake_job(shared);
+        overrun
+    }
+    pub fn ancestor_sender(&self, sender: u32) -> bool {
+        self.policy
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.namespace.local(sender) == 0)
+    }
+    pub(crate) fn child_signal(&self, info: Info) -> bool {
+        let queued = {
+            let policy = self.policy.read().unwrap();
+            let Some(policy) = policy.as_ref() else {
+                return false;
+            };
+            policy.actions.with_action(17, |action| {
+                if action.handler == 1 || matches!(info.code, 5 | 6) && action.flags & 1 != 0 {
+                    false
+                } else {
+                    self.process().enqueue_quiet(17, info).unwrap_or(false)
+                }
+            })
+        };
+        if queued {
+            self.process().changed();
+        }
+        queued
     }
     pub fn set_wake(&self, signal: &Arc<IoSignal>) {
         *self.wake.lock().unwrap() = Arc::downgrade(signal);
@@ -234,6 +384,7 @@ impl IoTask {
     }
     pub fn exit(&self) {
         self.live.store(false, Ordering::Relaxed);
+        self.lifecycle().retire(self.pid.load(Ordering::Relaxed));
     }
     pub fn publish_mask(&self, mask: u64) {
         let old = self.mask.load(Ordering::Relaxed);
@@ -253,6 +404,7 @@ impl IoTask {
         self.mask.load(Ordering::Relaxed)
     }
     pub fn next(&self, mask: u64) -> Option<(u32, bool)> {
+        let mask = self.eligible_mask(mask);
         self.inbox
             .next(mask)
             .map(|s| (s, false))
@@ -290,6 +442,10 @@ impl trames_vfs::TaskSignal for IoTask {
                 ..Info::default()
             }
         };
+        if matches!(signal, 9 | 18..=22) {
+            let _ = self.job_signal(signal, false, info, self.ancestor_sender(info.sender));
+            return;
+        }
         let enqueue = || self.inbox.enqueue_quiet(signal, info).unwrap_or(false);
         let policy = self.policy.read().unwrap();
         let changed = policy.as_ref().map_or_else(enqueue, |p| {
@@ -325,10 +481,24 @@ impl TimerTarget {
             let Some(task) = thread.upgrade().filter(|t| t.belongs(0, self.id)) else {
                 return 0;
             };
+            if matches!(sig, 9 | 18..=22) {
+                return task.job_timer(sig, false, info);
+            }
             let overrun = task.inbox.timer(sig, info);
             task.wake();
             overrun
         } else {
+            if matches!(sig, 9 | 18..=22) {
+                let target = self
+                    .group
+                    .members
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .find(|t| t.belongs(1, self.id));
+                return target.map_or(0, |t| t.job_timer(sig, true, info));
+            }
             let overrun = self.process.timer(sig, info);
             if let Some(task) = self
                 .group
@@ -357,6 +527,21 @@ impl IoDirectory {
                 .filter(|t| t.identifies(kind, id))
                 .collect()
         })
+    }
+    pub fn orphaned(&self, task: &IoTask) -> bool {
+        let pgrp = task.group();
+        let session = task.session();
+        !self
+            .tasks(2, pgrp)
+            .into_iter()
+            .filter(|t| t.live())
+            .any(|member| {
+                member
+                    .lifecycle()
+                    .parent()
+                    .and_then(|p| p.live_task())
+                    .is_some_and(|parent| parent.session() == session && parent.group() != pgrp)
+            })
     }
     pub fn discard_process(&self, tgid: u32, sig: u32) -> bool {
         let group = self.groups.lock().unwrap().get(&(1, tgid)).cloned();
@@ -410,6 +595,7 @@ impl IoDirectory {
         uid: u32,
         euid: u32,
     ) {
+        task.lifecycle().register(task, pid);
         task.uid.store(uid, Ordering::Relaxed);
         task.suid.store(euid, Ordering::Relaxed);
         if task.pid.load(Ordering::Relaxed) == pid
@@ -570,7 +756,12 @@ impl AsyncOwner for Owner {
             } else {
                 task.process().as_ref()
             };
-            if inbox.enqueue(sig, info).is_err() {
+            let result = if matches!(sig, 9 | 18..=22) {
+                task.job_signal(sig, self.kind != 0, info, task.ancestor_sender(info.sender))
+            } else {
+                inbox.enqueue(sig, info)
+            };
+            if result.is_err() {
                 let _ = inbox.enqueue(
                     29,
                     Info {
@@ -612,6 +803,52 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timer_job_control_clears_opposing_queues_and_resumes_ignored_or_masked_cont() {
+        for thread in [false, true] {
+            for ignored in [false, true] {
+                let signals = Signals::default();
+                signals.publish_policy(&Default::default(), false);
+                signals
+                    .io_directory
+                    .publish(&signals.io, 42, 42, 42, 1000, 1000);
+                signals.actions.set_handler(18, if ignored { 1 } else { 0 });
+                if !ignored {
+                    signals.io.publish_mask(1 << 17);
+                }
+                let target = signals
+                    .io_directory
+                    .timer_target(42, thread.then_some(42))
+                    .unwrap();
+                let info = Info {
+                    timer: Some((7, 0, 99)),
+                    ..Default::default()
+                };
+                target.signal(19, info);
+                assert!(signals
+                    .io
+                    .lifecycle()
+                    .consume_stop(19, || signals.io.take(19, !thread).is_some()));
+                signals
+                    .io
+                    .job_signal(20, !thread, Info::default(), false)
+                    .unwrap();
+                assert_ne!(signals.io.pending_bits() & (1 << 19), 0);
+                target.signal(18, info);
+                assert!(!signals.io.lifecycle().stopped());
+                assert_eq!(signals.io.pending_bits() & (0xf << 18), 0);
+                if ignored {
+                    assert_eq!(signals.io.pending_bits(), 0);
+                } else {
+                    assert_eq!(target.signal(18, info), 1);
+                    assert_eq!(
+                        signals.io.take(18, !thread).unwrap().timer,
+                        Some((7, 1, 99))
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn file_size_resource_signal_preserves_origin_ignores_discard_and_retired_targets() {
         let signals = Signals::default();

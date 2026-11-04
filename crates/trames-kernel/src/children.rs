@@ -20,6 +20,14 @@ pub struct Children {
 }
 #[derive(Default)]
 pub struct Child(Mutex<State>);
+pub(crate) struct Notice(Option<Arc<Children>>);
+impl Notice {
+    pub fn notify(self) {
+        if let Some(parent) = self.0 {
+            parent.changed.notify_locked();
+        }
+    }
+}
 #[derive(Default)]
 struct State {
     id: u32,
@@ -71,26 +79,33 @@ impl Child {
             parent.changed.notify_locked();
         }
     }
-    fn publish(&self, status: Option<i32>, exited: bool) {
+    fn publish_quiet(&self, status: Option<i32>, exited: bool) -> Notice {
         let parent = {
             let mut state = self.0.lock().unwrap();
             // A consumed exit belongs to this original child, never a later
             // projection refresh or a process that happens to reuse its PID.
             if state.reaped || state.exited {
-                return;
+                return Notice(None);
             }
             let stopped = !exited && status.is_some_and(|s| s != 0xffff);
             if status.is_some() && !exited && state.stopped == stopped {
-                return;
+                return Notice(None);
             }
             state.stopped = stopped;
             state.event = status;
             state.exited = exited;
             state.parent.upgrade()
         };
-        if let Some(parent) = parent {
-            parent.changed.notify_locked();
-        }
+        Notice(parent)
+    }
+    fn publish(&self, status: Option<i32>, exited: bool) {
+        self.publish_quiet(status, exited).notify();
+    }
+    pub(crate) fn stopped_quiet(&self, signal: u32) -> Notice {
+        self.publish_quiet(Some(((signal as i32) << 8) | 0x7f), false)
+    }
+    pub(crate) fn continued_quiet(&self) -> Notice {
+        self.publish_quiet(Some(0xffff), false)
     }
     pub fn stopped(&self, signal: u32) {
         self.publish(Some(((signal as i32) << 8) | 0x7f), false);

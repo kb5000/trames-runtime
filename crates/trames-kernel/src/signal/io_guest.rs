@@ -13,13 +13,9 @@ impl Signals {
     }
 }
 impl IoRoutes {
-    /// Stop/continue also mutate lifecycle state, so retain that explicit
-    /// authority boundary until the lifecycle subsystem is shared.
+    /// Guest and resource senders use the same original queues and group control.
     pub fn send(&self, source: &IoTask, number: u32, a: [u64; 6]) -> Option<Result<u64, Errno>> {
         let sig = a[if number == 131 { 2 } else { 1 }] as u32;
-        if matches!(sig, 18..=22) {
-            return None;
-        }
         Some((|| {
             if sig > 64 {
                 return Err(Errno(22));
@@ -97,6 +93,7 @@ impl IoRoutes {
                 };
                 found = true;
                 if !can_kill
+                    && !(sig == 18 && source.session() == target.session())
                     && ![self.uid, self.euid].iter().any(|id| {
                         *id == target.uid.load(Ordering::Relaxed)
                             || *id == target.suid.load(Ordering::Relaxed)
@@ -113,6 +110,20 @@ impl IoRoutes {
                     .filter(|t| t.live.load(Ordering::Relaxed))
                     .collect();
                 let Some(target) = live.first() else { continue };
+                if matches!(sig, 9 | 18..=22) {
+                    target.job_signal(
+                        sig,
+                        !thread,
+                        Info {
+                            sender: source.tgid(),
+                            uid: self.uid,
+                            code: if thread { -6 } else { 0 },
+                            ..Default::default()
+                        },
+                        target.ancestor_sender(source.tgid()),
+                    )?;
+                    continue;
+                }
                 let queue = if thread {
                     &target.inbox
                 } else {
@@ -176,6 +187,42 @@ mod tests {
         signals.publish_policy(&PidNamespace::default(), false);
         directory.publish(&signals.io, id, id, group, uid, suid);
         signals
+    }
+    #[test]
+    fn continued_signal_uses_the_session_permission_exception_for_all_send_apis() {
+        let directory = Arc::new(IoDirectory::default());
+        let source = publish(&directory, 42, 42, 1000, 1000);
+        let target = publish(&directory, 77, 77, 2000, 2000);
+        source.io.set_session(42);
+        target.io.set_session(42);
+        let routes = IoRoutes {
+            directory,
+            uid: 1000,
+            euid: 1000,
+            ..Default::default()
+        };
+        for number in [129, 130, 131] {
+            let args = |sig| {
+                if number == 131 {
+                    [77, 77, sig, 0, 0, 0]
+                } else {
+                    [77, sig, 0, 0, 0, 0]
+                }
+            };
+            target.io.lifecycle().consume_stop(19, || true);
+            assert_eq!(
+                routes.send(&source.io, number, args(19)),
+                Some(Err(Errno(1)))
+            );
+            assert_eq!(routes.send(&source.io, number, args(18)), Some(Ok(0)));
+            assert!(!target.io.lifecycle().stopped());
+            target.io.set_session(77);
+            assert_eq!(
+                routes.send(&source.io, number, args(18)),
+                Some(Err(Errno(1)))
+            );
+            target.io.set_session(42);
+        }
     }
     #[test]
     fn guest_routes_preserve_permissions_zombies_and_reaped_pid_incarnations() {

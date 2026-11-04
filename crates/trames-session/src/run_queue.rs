@@ -283,27 +283,103 @@ impl<C: Cpu> Job<C> {
         })
     }
     pub(super) fn guest_waiting(&self) -> bool {
-        self.hardware_wait
-            .as_ref()
-            .is_some_and(|wait| !wait.ready())
+        self.stopped()
+            || self
+                .hardware_wait
+                .as_ref()
+                .is_some_and(|wait| !wait.ready())
             || self.waiting.as_ref().is_some_and(|wait| !wait.woken())
             || self.io.as_ref().is_some_and(|io| {
                 !io.signal.ready() && !io.wake_deadline().is_some_and(|d| d <= Instant::now())
             })
             || self.gpu_pending.as_ref().is_some_and(|gpu| gpu.waiting())
     }
+    /// Rearm the original task notification before the final level-state
+    /// check under the run-queue lock. A previous STOP wake may remain fired
+    /// while the stopped job parks; CONT must be able to notify it again.
+    fn rearm_signals(&self) {
+        if let Some(wake) = self
+            .work
+            .syscalls
+            .as_ref()
+            .and_then(|s| s.io_wake.as_ref())
+            .filter(|s| s.ready())
+        {
+            wake.reset();
+        }
+    }
+    fn stopped(&self) -> bool {
+        self.work
+            .syscalls
+            .as_ref()
+            .is_some_and(|s| s.io_signals.lifecycle().stopped())
+    }
+    pub fn stop_hold(&self) -> Option<bool> {
+        if matches!(self.waiting, Some(WaitState::OwnerEvent)) {
+            return None;
+        }
+        Some(
+            self.pending_cpu.is_some()
+                || self.checkpoint.is_some()
+                || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
+                || self
+                    .gpu_pending
+                    .as_ref()
+                    .is_some_and(|p| p.compile.is_some())
+                || self.io.as_ref().is_some_and(|io| {
+                    io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible())
+                })
+                || self.retry.as_ref().is_some_and(|io| {
+                    io.number == 2
+                        || io.file_checkpoint.is_some()
+                        || io.file.as_ref().is_some_and(|f| !f.interruptible())
+                }),
+        )
+    }
     fn wake_deadline(&self) -> Option<Instant> {
+        let stopped = self.stopped();
         [
-            self.waiting.as_ref().and_then(WaitState::deadline),
-            self.io.as_ref().and_then(|io| io.wake_deadline()),
-            self.gpu_pending.as_ref().and_then(|gpu| gpu.deadline()),
-            self.uring.as_ref().and_then(|ring| ring.deadline()),
+            self.waiting
+                .as_ref()
+                .filter(|w| !stopped || !matches!(w, WaitState::Signal(_)))
+                .and_then(WaitState::deadline),
+            self.io
+                .as_ref()
+                .filter(|io| {
+                    !stopped
+                        || io.number == 2
+                        || io.file_pending().is_some_and(|f| !f.interruptible())
+                })
+                .and_then(|io| io.wake_deadline()),
+            self.gpu_pending
+                .as_ref()
+                .filter(|g| !stopped || g.compile.is_some())
+                .and_then(|g| g.deadline()),
+            self.uring.as_ref().and_then(|r| r.deadline()),
         ]
         .into_iter()
         .flatten()
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if self.stopped() {
+            return self
+                .work
+                .syscalls
+                .as_ref()
+                .is_some_and(|s| s.next_io_signal().is_some_and(|(sig, _)| sig == 9))
+                || self.uring.as_ref().is_some_and(|r| {
+                    r.signal.ready() || r.deadline().is_some_and(|d| d <= Instant::now())
+                })
+                || self
+                    .gpu_pending
+                    .as_ref()
+                    .is_some_and(|g| g.compile.is_some() && !g.waiting())
+                || self.io.as_ref().is_some_and(|io| {
+                    (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
+                        && io.signal.ready()
+                });
+        }
         if let Some(WaitState::Child(wait)) = &self.waiting {
             if self.work.syscalls.as_ref().is_some_and(|s| {
                 s.children
@@ -324,16 +400,18 @@ impl<C: Cpu> Job<C> {
         }
         self.work.syscalls.as_ref().is_some_and(|s| {
             s.next_io_signal().is_some_and(|(sig, _)| {
-                s.actions.get(sig as usize).handler <= 1
-                    || !(self.gpu_pending.is_some()
-                        || self
-                            .retry
-                            .as_ref()
-                            .is_some_and(|call| call.file.is_some() || call.number == 2)
-                        || self
-                            .io
-                            .as_ref()
-                            .is_some_and(|io| io.file_pending().is_some() || io.number == 2))
+                (s.actions.get(sig as usize).handler <= 1
+                    && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
+                    || s.actions.get(sig as usize).handler > 1
+                        && !(self.gpu_pending.is_some()
+                            || self
+                                .retry
+                                .as_ref()
+                                .is_some_and(|call| call.file.is_some() || call.number == 2)
+                            || self
+                                .io
+                                .as_ref()
+                                .is_some_and(|io| io.file_pending().is_some() || io.number == 2))
             })
         }) || self.uring.as_ref().is_some_and(|ring| {
             ring.signal.ready() || ring.deadline().is_some_and(|d| d <= Instant::now())
@@ -700,6 +778,7 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         let jobs = q.domains.restore(checkpoint, resume);
         for mut job in jobs {
+            job.rearm_signals();
             if job.waiting.as_ref().is_some_and(|w| w.woken()) {
                 job.waiting = None;
                 job.work.cpu.set_x(0, 0);
@@ -896,6 +975,7 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn park(&self, mut job: Box<Job<C>>, waiting: Option<WaitState>) {
         let mut q = self.queues.lock().unwrap();
+        job.rearm_signals();
         q.running -= 1;
         q.domains.returned(job.work.pid);
         let pid = job.work.pid;
@@ -934,6 +1014,7 @@ impl<C: Cpu> Epoch<C> {
     /// It cannot complete an unrelated syscall or rearm a hardware/GPU wait.
     pub fn park_maintenance(&self, mut job: Box<Job<C>>) {
         let mut q = self.queues.lock().unwrap();
+        job.rearm_signals();
         q.running -= 1;
         q.domains.returned(job.work.pid);
         if q.domains.paused(job.work.pid) {
@@ -984,6 +1065,7 @@ impl<C: Cpu> Epoch<C> {
             }
         });
         let mut q = self.queues.lock().unwrap();
+        job.rearm_signals();
         q.running -= 1;
         q.domains.returned(pid);
         let ready = wait.ready();
@@ -991,7 +1073,7 @@ impl<C: Cpu> Epoch<C> {
         if q.domains.paused(pid) {
             q.domains.hold(job);
             q.domains.notify_ready();
-        } else if ready {
+        } else if ready || job.ring_ready() {
             job.hardware_wait = None;
             self.ready(&mut q, job);
         } else {
@@ -1001,6 +1083,7 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn park_io(&self, mut job: Box<Job<C>>, pending: trames_linux::PendingIo) {
         let mut q = self.queues.lock().unwrap();
+        job.rearm_signals();
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.stats.io_waits += 1;
@@ -1020,6 +1103,7 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn park_gpu(&self, mut job: Box<Job<C>>, pending: crate::gpu::Pending) {
         let mut q = self.queues.lock().unwrap();
+        job.rearm_signals();
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.stats.gpu.waits += 1;

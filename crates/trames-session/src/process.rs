@@ -71,7 +71,6 @@ enum State {
         info: u64,
         deadline: Option<Instant>,
     },
-    Stopped,
     Zombie(i32),
 }
 pub(crate) struct Process<C: Cpu> {
@@ -108,7 +107,6 @@ pub(crate) struct Process<C: Cpu> {
     tcp_liveness: Option<trames_net::TcpLease>,
     retained_poll: Option<Arc<trames_linux::RetainedWait>>,
     pending_open: Option<u32>,
-    stopped_state: Option<Box<State>>,
     auto_reap: bool,
     host_status: Option<Arc<std::sync::atomic::AtomicI32>>,
     tgid: u32,
@@ -124,6 +122,46 @@ pub(crate) struct Process<C: Cpu> {
     seccomp_entry: Option<seccomp::EntryDecision>,
 }
 impl<C: Cpu> Process<C> {
+    fn stopped(&self) -> bool {
+        self.signals.io.lifecycle().stopped()
+    }
+    fn runnable(&self) -> bool {
+        matches!(self.state, State::Ready) && !self.stopped()
+    }
+    fn stop_held(&self) -> bool {
+        matches!(
+            self.state,
+            State::Gpu { .. } | State::Vfork(_) | State::Blocked(2, _)
+        ) || self.file_checkpoint.is_some()
+            || self
+                .retained_file
+                .as_ref()
+                .is_some_and(|f| !f.interruptible())
+            || self
+                .byte_wait
+                .as_ref()
+                .and_then(trames_linux::PendingIo::file_pending)
+                .is_some_and(|f| !f.interruptible())
+    }
+    fn control_candidate(&self, id: u32) -> bool {
+        !self.linux.trace
+            && (matches!(
+                self.state,
+                State::Ready
+                    | State::Futex { .. }
+                    | State::Sleep(..)
+                    | State::Sigwait { .. }
+                    | State::Suspend(_)
+                    | State::Vfork(_)
+                    | State::Blocked(95 | 260, _)
+            ) || self.worker_io_candidate(id)
+                || self.worker_gpu_candidate())
+    }
+    fn publish_stop_hold(&self, id: u32) {
+        self.signals.io.lifecycle().register(&self.signals.io, id);
+        self.signals.io.lifecycle().hold(id, self.stop_held());
+    }
+
     fn bind_signals(&self) {
         self.signals.publish_policy(
             self.linux.vfs.pid_namespace(),
@@ -159,7 +197,7 @@ impl<C: Cpu> Process<C> {
     /// Original accepted calls can rearm their actual event source. New calls
     /// still use Snapshot::admit and evaluate policy only at their SVC entry.
     fn worker_event_wait(&self, id: u32) -> bool {
-        if self.retained_file.is_some() {
+        if self.retained_file.is_some() || self.retained_aio.is_some() {
             return true;
         }
         if self.retained_socket.is_some()
@@ -206,7 +244,7 @@ impl<C: Cpu> Process<C> {
         if self.file_checkpoint.is_some() {
             return false;
         }
-        if self.retained_file.is_some() {
+        if self.retained_file.is_some() || self.retained_aio.is_some() {
             return !self.linux.trace;
         }
         if let Some(poll) = &self.retained_poll {
@@ -285,7 +323,7 @@ impl<C: Cpu> Process<C> {
             || matches!(number, 63..=66) && self.linux.vfs.direct_tcp_fd(args[0] as u32).is_some()
     }
     fn byte_wait_deadline(&self) -> Option<Instant> {
-        if matches!(self.state, State::Blocked(..)) {
+        if matches!(self.state, State::Blocked(..)) && (!self.stopped() || self.stop_held()) {
             self.byte_wait
                 .as_ref()
                 .and_then(|wait| wait.wake_deadline())
@@ -415,7 +453,6 @@ impl<C: Cpu> Process<C> {
             tcp_liveness: None,
             retained_poll: None,
             pending_open: None,
-            stopped_state: None,
             auto_reap: false,
             host_status: None,
             tgid: self.tgid,
@@ -598,6 +635,7 @@ impl<C: Cpu> Kernel<C> {
             return;
         }
         p.bind_signals();
+        p.signals.io.set_session(p.session);
         p.signals.io_directory.publish(
             &p.signals.io,
             id,
@@ -1069,11 +1107,14 @@ impl<C: Cpu> Kernel<C> {
             parent: p.parent,
             group: p.group,
             session: p.session,
-            state: match p.state {
-                State::Ready => 'R',
-                State::Stopped => 'T',
-                State::Zombie(_) => 'Z',
-                _ => 'S',
+            state: if p.stopped() && !matches!(p.state, State::Zombie(_)) {
+                'T'
+            } else {
+                match p.state {
+                    State::Ready => 'R',
+                    State::Zombie(_) => 'Z',
+                    _ => 'S',
+                }
             },
             credentials: p.linux.vfs.credentials.clone(),
             namespaces: p.linux.vfs.namespace_snapshot(),
@@ -1301,22 +1342,16 @@ impl<C: Cpu> Kernel<C> {
         p.retained_poll = None;
         self.parent_thread_exited(pid, p, None);
         p.linux.vfs.cgroup_exit(pid);
-        let state = if matches!(p.state, State::Stopped) {
-            p.stopped_state.as_deref()
-        } else {
-            Some(&p.state)
-        };
-        if let Some(State::Gpu { job, .. }) = state {
+        if let State::Gpu { job, .. } = &p.state {
             if let Some(backend) = self.gpu.borrow_mut().get_mut(&p.vm_id) {
                 backend.abandon(*job);
             }
         }
-        if let Some(State::Futex { wait, .. }) = state {
+        if let State::Futex { wait, .. } = &p.state {
             wait.cancel();
         }
-        // Release active/stopped wait registrations before clear_tid wakes.
-        // A zombie must not stay eligible through a saved stopped State.
-        p.stopped_state = None;
+        // The original wait stays authoritative while stopped, and is cancelled
+        // only on exit, before clear_tid can wake an unrelated successor.
         p.state = State::Zombie(status);
         let address = p.linux.clear_tid_address();
         p.linux.exit_tid(&mut p.memory);
@@ -1340,7 +1375,7 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Zombie(status);
         self.close_exit_files(p);
         p.signals.io.inbox.clear();
-        p.wait_event.clear();
+
         if !self
             .processes
             .values()
@@ -1432,9 +1467,10 @@ impl<C: Cpu> Kernel<C> {
         self.exit_one(pid, p, status);
     }
     fn wake_vfork(&mut self, child: u32) {
-        for parent in self.processes.values_mut() {
+        for (&pid, parent) in &mut self.processes {
             if matches!(parent.state, State::Vfork(id) if id == child) {
                 parent.state = State::Ready;
+                parent.signals.io.lifecycle().hold(pid, false);
             }
         }
     }
@@ -1443,10 +1479,6 @@ impl<C: Cpu> Kernel<C> {
             return false;
         }
         p.signals.clear_opposing(sig);
-        if sig == 18 && matches!(p.state, State::Stopped) {
-            p.state = p.stopped_state.take().map_or(State::Ready, |s| *s);
-            p.wait_event.continued();
-        }
         // Unblocked default dispositions are ignored by namespace init. Blocked
         // signals remain available to signalfd/sigwait. Ancestor KILL/STOP and
         // synchronous faults retain their forced-delivery behavior.
@@ -1460,7 +1492,22 @@ impl<C: Cpu> Kernel<C> {
         }
         p.signals.should_queue(sig)
     }
-    fn queue_one(_pid: u32, p: &mut Process<C>, sig: u32, sender: u32) {
+    fn queue_one(pid: u32, p: &mut Process<C>, sig: u32, sender: u32) {
+        if matches!(sig, 9 | 18..=22) {
+            p.bind_signals();
+            p.signals.begin_io();
+            p.signals.io.lifecycle().register(&p.signals.io, pid);
+            let _ = p.signals.io.job_signal(
+                sig,
+                false,
+                Info {
+                    sender,
+                    ..Default::default()
+                },
+                p.signals.io.ancestor_sender(sender),
+            );
+            return;
+        }
         if Self::prepare_signal(p, sig, sender) {
             let _ = p.signals.io.inbox.enqueue(
                 sig,
@@ -1493,6 +1540,26 @@ impl<C: Cpu> Kernel<C> {
         tgid: Option<u32>,
         sig: u32,
     ) -> Result<u64, Errno> {
+        if matches!(sig, 9 | 18..=22) {
+            self.publish_io_tasks(Some((pid, p)));
+            let routes = trames_kernel::signal::IoRoutes {
+                directory: p.signals.io_directory.clone(),
+                namespace: p.linux.vfs.pid_namespace().clone(),
+                uid: p.linux.vfs.credentials.uid,
+                euid: p.linux.vfs.credentials.euid,
+            };
+            return routes
+                .send(
+                    &p.signals.io,
+                    if tgid.is_some() { 131 } else { 130 },
+                    if let Some(tgid) = tgid {
+                        [tgid as u64, tid as u64, sig as u64, 0, 0, 0]
+                    } else {
+                        [tid as u64, sig as u64, 0, 0, 0, 0]
+                    },
+                )
+                .expect("job control route");
+        }
         if sig > 64 {
             return Err(Errno(22));
         }
@@ -1518,25 +1585,6 @@ impl<C: Cpu> Kernel<C> {
         }
         let sender = p.tgid;
         let uid = p.linux.vfs.credentials.uid;
-        if matches!(sig, 18..=22) {
-            // Stop/continue cancellation and group resume apply to every member
-            // even when tgkill selects one thread for the pending signal.
-            let group = if tid == pid {
-                p.tgid
-            } else {
-                self.processes[&tid].tgid
-            };
-            if p.tgid == group {
-                Self::prepare_signal(p, sig, sender);
-            }
-            for other in self
-                .processes
-                .values_mut()
-                .filter(|other| other.tgid == group)
-            {
-                Self::prepare_signal(other, sig, sender);
-            }
-        }
         let target = if tid == pid {
             p
         } else {
@@ -1565,6 +1613,22 @@ impl<C: Cpu> Kernel<C> {
         target: i32,
         sig: u32,
     ) -> Result<u64, Errno> {
+        if matches!(sig, 9 | 18..=22) {
+            self.publish_io_tasks(Some((pid, p)));
+            let routes = trames_kernel::signal::IoRoutes {
+                directory: p.signals.io_directory.clone(),
+                namespace: p.linux.vfs.pid_namespace().clone(),
+                uid: p.linux.vfs.credentials.uid,
+                euid: p.linux.vfs.credentials.euid,
+            };
+            return routes
+                .send(
+                    &p.signals.io,
+                    129,
+                    [target as u32 as u64, sig as u64, 0, 0, 0, 0],
+                )
+                .expect("job control route");
+        }
         if sig > 64 {
             return Err(Errno(22));
         }
@@ -1685,7 +1749,7 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn deliver(&mut self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
-        let stopped = matches!(p.state, State::Stopped);
+        let stopped = p.stopped();
         let selected = p
             .signals
             .select(stopped, matches!(p.state, State::Gpu { .. }));
@@ -1717,7 +1781,27 @@ impl<C: Cpu> Kernel<C> {
         {
             return Ok(false);
         }
-        let info = p.take_signal(sig, shared);
+        if p.stop_held()
+            && trames_kernel::signal::disposition(sig, action)
+                == trames_kernel::signal::Disposition::Stop
+        {
+            return Ok(false);
+        }
+        let disposition = trames_kernel::signal::disposition(sig, action);
+        if disposition == trames_kernel::signal::Disposition::Stop {
+            self.publish_io_tasks(Some((pid, p)));
+            if sig == 19 || !p.signals.io_directory.orphaned(&p.signals.io) {
+                return Ok(p
+                    .signals
+                    .io
+                    .lifecycle()
+                    .consume_stop(sig, || p.signals.io.take(sig, shared).is_some()));
+            }
+            return Ok(p.signals.io.take(sig, shared).is_some());
+        }
+        let Some(info) = p.take_signal(sig, shared) else {
+            return Ok(false);
+        };
         // Timer-generated signals also reach this queue without queue_one.
         // Namespace init ignores default dispositions, except forced ancestor
         // KILL/STOP and synchronous faults, which must still make progress.
@@ -1732,22 +1816,6 @@ impl<C: Cpu> Kernel<C> {
         let disposition = trames_kernel::signal::disposition(sig, action);
         if disposition == trames_kernel::signal::Disposition::Terminate {
             self.exit(pid, p, sig as i32);
-            return Ok(true);
-        }
-        if disposition == trames_kernel::signal::Disposition::Stop {
-            if !matches!(p.state, State::Stopped) {
-                p.stopped_state = Some(Box::new(p.state.clone()));
-            }
-            p.state = State::Stopped;
-            for other in self.processes.values_mut().filter(|other| {
-                other.tgid == p.tgid && !matches!(other.state, State::Zombie(_) | State::Stopped)
-            }) {
-                other.stopped_state = Some(Box::new(other.state.clone()));
-                other.state = State::Stopped;
-                other.wait_event.stopped(sig);
-            }
-            p.wait_event.stopped(sig);
-            self.notify(p.parent, p.tgid, p.linux.vfs.credentials.uid, sig as i32, 5);
             return Ok(true);
         }
         if disposition == trames_kernel::signal::Disposition::Ignore {
@@ -2088,6 +2156,12 @@ impl<C: Cpu> Kernel<C> {
         };
         let parents: BTreeMap<_, _> = tasks().map(|(_, p)| (p.tgid, &p.children)).collect();
         for (id, p) in tasks().filter(|(id, p)| *id == p.tgid) {
+            let parent =
+                tasks().find_map(|(_, t)| (t.tgid == p.parent).then(|| t.signals.io.lifecycle()));
+            p.signals
+                .io
+                .lifecycle()
+                .bind(&p.wait_event, parent, id, p.linux.vfs.credentials.uid);
             p.wait_event.bind_presence(&p.signals.presence);
             p.wait_event.attach(
                 parents.get(&p.parent).copied(),
@@ -2740,7 +2814,7 @@ impl<C: Cpu> Kernel<C> {
                     unreachable!()
                 };
                 let old = p.signals.mask;
-                p.signals.mask = mask;
+                p.signals.set_mask(mask);
                 p.state = State::Suspend(old);
                 Ok(None)
             }
@@ -3420,7 +3494,7 @@ impl<C: Cpu> Kernel<C> {
                     p.poll_deadline = None;
                     p.retained_poll = None;
                     if let Some(mask) = p.signals.wait_mask.take() {
-                        p.signals.mask = mask;
+                        p.signals.set_mask(mask);
                     }
                 }
                 if matches!(e.0, 38 | 95) {
@@ -3488,6 +3562,7 @@ impl<C: Cpu> Kernel<C> {
         if let Some(began) = began {
             self.syscall_total += began.elapsed();
         }
+        p.publish_stop_hold(pid);
     }
     fn waits_for_host_stdin(p: &Process<C>) -> bool {
         match p.state {
@@ -3579,7 +3654,7 @@ impl<C: Cpu> Kernel<C> {
                 if p.signals.wait_mask.is_none() {
                     p.signals.wait_mask = Some(p.signals.mask);
                 }
-                p.signals.mask = mask & !UNBLOCKABLE;
+                p.signals.set_mask(mask & !UNBLOCKABLE);
             }
             p.poll_deadline = wait.deadline;
             p.retained_poll = retained.or_else(|| fresh.map(Arc::new));
@@ -3587,7 +3662,7 @@ impl<C: Cpu> Kernel<C> {
         } else {
             let result = wait.finish(&mut p.memory, result);
             if let Some(mask) = p.signals.wait_mask.take() {
-                p.signals.mask = mask;
+                p.signals.set_mask(mask);
             }
             p.poll_deadline = None;
             result.map(Some)
@@ -4256,9 +4331,10 @@ impl<C: Cpu> Kernel<C> {
             .iter()
             .any(|(&id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
         {
-            let runnable = self.processes.iter().any(|(&id, p)| {
-                !p.frozen(id) && (matches!(p.state, State::Ready) || p.worker_gpu_candidate())
-            });
+            let runnable = self
+                .processes
+                .iter()
+                .any(|(&id, p)| !p.frozen(id) && (p.runnable() || p.worker_gpu_candidate()));
             if runnable
                 || self.processes.iter().any(|(&id, p)| {
                     !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_event(&p.memory, id)
@@ -4267,9 +4343,10 @@ impl<C: Cpu> Kernel<C> {
                 return true;
             }
         }
-        let mut active = self.processes.iter().filter(|(id, p)| {
-            (matches!(p.state, State::Ready) || p.worker_gpu_candidate()) && !p.frozen(**id)
-        });
+        let mut active = self
+            .processes
+            .iter()
+            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(**id));
         let Some((&id, first)) = active.next() else {
             // Interactive transports can wake retained I/O while every CPU is
             // parked. The solo-CPU admission branch below remains unchanged.
@@ -4320,9 +4397,10 @@ impl<C: Cpu> Kernel<C> {
         self.processes.iter().any(|(&other, p)| {
             other != id
                 && !p.frozen(other)
-                && (matches!(p.state, State::Blocked(95 | 260, _))
-                    && !p.linux.trace
-                    && first.parent == p.tgid
+                && (p.stopped()
+                    || matches!(p.state, State::Blocked(95 | 260, _))
+                        && !p.linux.trace
+                        && first.parent == p.tgid
                     || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
                     || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
                         && !p.linux.trace
@@ -4403,7 +4481,9 @@ impl<C: Cpu> Kernel<C> {
                     self.exit(id, &mut p, 11);
                 }
                 // call/control/deliver publish resource changes immediately.
+                p.publish_stop_hold(id);
                 match p.state.clone() {
+                    State::Blocked(..) if p.stopped() && !p.stop_held() => {}
                     State::Blocked(..)
                         if p.worker_io_candidate(id)
                             || !p.linux.trace && matches!(p.state, State::Blocked(95 | 260, _)) =>
@@ -4427,9 +4507,7 @@ impl<C: Cpu> Kernel<C> {
         let mut ready: Vec<_> = self
             .processes
             .iter()
-            .filter(|(id, p)| {
-                (matches!(p.state, State::Ready) || p.worker_gpu_candidate()) && !p.frozen(**id)
-            })
+            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(**id))
             .map(|(&id, _)| id)
             .collect();
         let rotate = ready.partition_point(|id| *id <= self.next_parallel_pid);
@@ -4443,10 +4521,11 @@ impl<C: Cpu> Kernel<C> {
             if p.frozen(id) {
                 return None;
             }
-            ((!p.linux.trace
-                && p.linux.worker_uring_pending()
-                && !matches!(p.state, State::Ready | State::Zombie(_) | State::Stopped)
-                && !p.worker_gpu_candidate())
+            ((p.stopped() && p.control_candidate(id))
+                || (!p.linux.trace
+                    && p.linux.worker_uring_pending()
+                    && !matches!(p.state, State::Ready | State::Zombie(_))
+                    && !p.worker_gpu_candidate())
                 || (matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
                 || (matches!(p.state, State::Sleep(..))
                     && !p.linux.trace
@@ -5091,9 +5170,7 @@ impl<C: Cpu> Kernel<C> {
         let worker_vms: std::collections::BTreeSet<_> = self
             .processes
             .iter()
-            .filter(|(id, p)| {
-                !p.frozen(**id) && (matches!(p.state, State::Ready) || p.worker_gpu_candidate())
-            })
+            .filter(|(id, p)| !p.frozen(**id) && (p.runnable() || p.worker_gpu_candidate()))
             .map(|(_, p)| p.vm_id)
             .collect();
         for (&id, p) in &self.processes {
@@ -5117,6 +5194,9 @@ impl<C: Cpu> Kernel<C> {
             .flatten()
             {
                 timeout = timeout.min(deadline.saturating_duration_since(now));
+            }
+            if p.stopped() && !p.stop_held() {
+                continue;
             }
             let timerfd = (matches!(p.state, State::Blocked(..)) && !local_wait)
                 .then(|| p.linux.vfs.next_timerfd_deadline().filter(|d| *d > now))
@@ -5169,7 +5249,7 @@ impl<C: Cpu> Kernel<C> {
         if self
             .processes
             .iter()
-            .any(|(&id, p)| matches!(p.state, State::Ready) && !p.frozen(id))
+            .any(|(&id, p)| p.runnable() && !p.frozen(id))
         {
             4096
         } else {
@@ -5185,11 +5265,7 @@ impl<C: Cpu> Kernel<C> {
             self.tick_timers();
             let elapsed = self.load_sample.elapsed().as_secs_f64();
             if elapsed >= 5.0 {
-                let running = self
-                    .processes
-                    .values()
-                    .filter(|p| matches!(p.state, State::Ready))
-                    .count() as f64;
+                let running = self.processes.values().filter(|p| p.runnable()).count() as f64;
                 for (load, seconds) in self.load.iter_mut().zip([60.0, 300.0, 900.0]) {
                     let decay = (-elapsed / seconds).exp();
                     *load = *load * decay + running * (1.0 - decay);
@@ -5226,7 +5302,9 @@ impl<C: Cpu> Kernel<C> {
                         }
                     }
                     // call/control/deliver publish resource changes immediately.
+                    p.publish_stop_hold(id);
                     match p.state.clone() {
+                        State::Blocked(..) if p.stopped() && !p.stop_held() => {}
                         State::Blocked(number, a) => {
                             self.call(id, &mut p, number, a, io);
                             progress |= !matches!(p.state, State::Blocked(..));
@@ -5259,14 +5337,14 @@ impl<C: Cpu> Kernel<C> {
                     // No native borrow survives; blocking syscalls/faults still
                     // return to the scheduler. Bound work/time between control,
                     // signal and timer polls independently of guest retirement.
-                    let mut quantum = if matches!(p.state, State::Ready) {
+                    let mut quantum = if p.runnable() {
                         self.serial_quantum()
                     } else {
                         4096
                     };
                     let quantum_started = Instant::now();
                     let mut immediate_returns = 0;
-                    while matches!(p.state, State::Ready) && quantum != 0 {
+                    while p.runnable() && quantum != 0 {
                         if self.instructions >= limit {
                             self.processes.insert(id, p);
                             return Err(RuntimeError::BudgetExceeded(limit));
@@ -5404,6 +5482,20 @@ impl<C: Cpu> Kernel<C> {
         }
         for (&id, p) in &self.processes {
             if p.frozen(id) {
+                continue;
+            }
+            if p.stopped() && !p.stop_held() {
+                native_fds.extend(p.linux.uring_native_wait_fds());
+                sockets.extend(p.linux.uring_sockets());
+                for d in [
+                    p.linux.uring_deadline(),
+                    p.uring_wait.as_ref().and_then(|(_, _, d)| *d),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
                 continue;
             }
             // Only accepted pending interests can wake this wait. An unread
@@ -5614,7 +5706,6 @@ pub(super) fn run<C: Cpu>(
         tcp_liveness: None,
         retained_poll: None,
         pending_open: None,
-        stopped_state: None,
         auto_reap: false,
         host_status: None,
         tgid: 1,
@@ -6371,7 +6462,7 @@ mod tests {
         p.linux.vfs.close(reader).unwrap();
         Kernel::queue_one(1, &mut p, 19, 1);
         k.deliver(1, &mut p).unwrap();
-        assert!(matches!(p.state, State::Stopped));
+        assert!(p.stopped());
         assert!(p.retained_poll.is_some());
         Kernel::queue_one(1, &mut p, 18, 1);
         assert!(matches!(p.state, State::Blocked(73, _)));
@@ -6584,7 +6675,7 @@ mod tests {
         p.linux.vfs.close(reader).unwrap();
         Kernel::queue_one(1, &mut p, 19, 1);
         k.deliver(1, &mut p).unwrap();
-        assert!(matches!(p.state, State::Stopped));
+        assert!(p.stopped());
         assert!(p.byte_wait.is_some());
         Kernel::queue_one(1, &mut p, 18, 1);
         assert!(matches!(p.state, State::Blocked(63, _)));
@@ -6740,9 +6831,11 @@ mod tests {
             Some(deadline)
         );
         assert!(!p.byte_wait.as_ref().unwrap().signal.ready());
-        p.state = State::Stopped;
+        Kernel::queue_one(1, &mut p, 19, 0);
+        assert!(k.deliver(1, &mut p).unwrap());
         assert!(p.byte_wait_deadline().is_none());
-        p.state = State::Blocked(63, [timer as u64, 0x1000, 8, 0, 0, 0]);
+        Kernel::queue_one(1, &mut p, 18, 0);
+        assert!(!p.stopped());
         assert_eq!(p.byte_wait_deadline(), Some(deadline));
         p.linux.vfs.close(timer).unwrap();
         assert_eq!(
@@ -6941,8 +7034,9 @@ mod tests {
             p.state = State::Blocked(32, [a as u64, 2, 0, 0, 0, 0]);
             Kernel::queue_one(1, &mut p, 19, 0);
             assert_eq!(k.deliver(1, &mut p), Ok(true));
-            assert!(matches!(p.state, State::Stopped) && p.flock_wait.is_some());
-            p.state = *p.stopped_state.take().unwrap();
+            assert!(p.stopped() && p.flock_wait.is_some());
+            Kernel::queue_one(1, &mut p, 18, 0);
+            assert!(!p.stopped());
             let original_pc = p.cpu.pc;
             p.signals.actions.set(
                 10,
@@ -7126,7 +7220,6 @@ mod tests {
             tcp_liveness: None,
             retained_poll: None,
             pending_open: None,
-            stopped_state: None,
             auto_reap: false,
             host_status: None,
             tgid: 1,
@@ -8153,10 +8246,10 @@ mod tests {
         );
         Kernel::queue_one(2, &mut stopped, 19, 1);
         assert!(k.deliver(2, &mut stopped).unwrap());
-        assert!(matches!(stopped.state, State::Stopped));
-        let checkpoint = stopped.stopped_state.clone();
+        assert!(stopped.stopped());
+        let checkpoint = stopped.state.clone();
         k.exit_one(2, &mut stopped, 9);
-        assert!(stopped.stopped_state.is_none());
+        assert!(matches!(stopped.state, State::Zombie(9)));
         assert_eq!(k.futexes.wake((0, 1, 0x1000), 1, u32::MAX), 0);
         drop(checkpoint);
     }
@@ -8187,9 +8280,7 @@ mod tests {
         assert_eq!(k.futexes.wake((0, 1, 0x2000), 1, 2), 1);
         assert!(!k.resume_futex_ready());
         let mut p = k.processes.remove(&2).unwrap();
-        assert!(
-            matches!(p.stopped_state.as_deref(), Some(State::Futex { deadline: Some(d), .. }) if *d == deadline)
-        );
+        assert!(matches!(p.state, State::Futex { deadline: Some(d), .. } if d == deadline));
         Kernel::queue_one(2, &mut p, 18, 1);
         assert!(k.resume_event(&mut p));
         assert!(matches!(p.state, State::Ready));
@@ -8296,7 +8387,9 @@ mod tests {
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().state = State::Blocked(212, [0; 6]);
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
-        k.processes.get_mut(&1).unwrap().state = State::Stopped;
+        let p = k.processes.get_mut(&1).unwrap();
+        p.signals.io.lifecycle().register(&p.signals.io, 1);
+        p.signals.io.lifecycle().consume_stop(19, || true);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
     }
     #[test]
@@ -8374,14 +8467,17 @@ mod tests {
         assert!(!k.deliver(1, &mut p).unwrap());
         assert!(p.signals.io.inbox.contains_key(&10));
         Kernel::queue_one(1, &mut p, 19, 1);
-        assert!(k.deliver(1, &mut p).unwrap());
-        assert!(matches!(p.state, State::Stopped));
-        assert!(matches!(
-            p.stopped_state.as_deref(),
-            Some(State::Gpu { job: 1, .. })
-        ));
-        Kernel::queue_one(1, &mut p, 18, 1);
+        assert!(!k.deliver(1, &mut p).unwrap());
+        assert!(!p.stopped());
         assert!(matches!(p.state, State::Gpu { job: 1, .. }));
+        assert!(k.resume_gpu(1, &mut p));
+        assert!(k.deliver(1, &mut p).unwrap()); // earlier SIGUSR1 enters once work completes
+        assert_eq!(p.signals.frames, 1);
+        assert!(k.deliver(1, &mut p).unwrap()); // SIGSTOP now reaches its boundary
+        assert!(p.stopped() && matches!(p.state, State::Ready));
+        assert!(!p.signals.io.inbox.contains_key(&10));
+        Kernel::queue_one(1, &mut p, 18, 1);
+        assert!(!p.stopped() && p.runnable());
     }
     #[test]
     fn a_removed_gpu_context_completes_once_without_reexecuting_the_stub() {
@@ -8463,7 +8559,7 @@ mod tests {
         let mut k = kernel();
         p.poll_deadline = Some(Instant::now());
         p.signals.wait_mask = Some(0x200);
-        p.signals.mask = 0x400;
+        p.signals.set_mask(0x400);
         let a = [999, 0x4800, 1, u64::MAX, 0, 8];
         p.state = State::Blocked(22, a);
         k.call(
@@ -8749,12 +8845,14 @@ mod tests {
         k.processes.insert(1, leader);
         Kernel::queue_one(2, &mut thread, 19, 1);
         assert!(k.deliver(2, &mut thread).unwrap());
-        assert!(matches!(thread.state, State::Stopped));
-        assert!(matches!(k.processes[&1].state, State::Stopped));
+        assert!(thread.stopped());
+        assert!(k.processes[&1].stopped());
         k.processes.insert(2, thread);
         let mut caller = process();
         caller.tgid = 3;
+        caller.signals.io_directory = k.processes[&1].signals.io_directory.clone();
         assert_eq!(k.thread_signal(3, &mut caller, 2, Some(1), 18), Ok(0));
+        assert!(!k.processes[&1].stopped() && !k.processes[&2].stopped());
         assert!(matches!(k.processes[&1].state, State::Ready));
         assert!(matches!(k.processes[&2].state, State::Ready));
         assert_eq!(k.processes[&1].wait_event.pending(), Some(0xffff));
@@ -8785,7 +8883,7 @@ mod tests {
         p.cpu.fpsr = 17;
         p.cpu.fpcr = 1 << 22;
         p.cpu.set_vector(8, 0x0123456789abcdef0011223344556677);
-        p.signals.mask = 1 << 11;
+        p.signals.set_mask(1 << 11);
         p.signals.actions.set(
             10,
             Action {
@@ -8865,7 +8963,7 @@ mod tests {
         p.state = State::Sleep(deadline, 0);
         Kernel::queue_one(1, &mut p, 19, 1);
         k.deliver(1, &mut p).unwrap();
-        assert!(matches!(p.state, State::Stopped));
+        assert!(p.stopped());
         Kernel::queue_one(1, &mut p, 18, 1);
         assert!(matches!(p.state,State::Sleep(d,_) if d==deadline));
     }
@@ -8953,7 +9051,8 @@ mod boundary_tests {
     fn kill_is_delivered_even_with_an_older_pending_signal_while_stopped() {
         let mut p = process();
         let mut k = kernel();
-        p.state = State::Stopped;
+        Kernel::queue_one(1, &mut p, 19, 0);
+        assert!(k.deliver(1, &mut p).unwrap());
         Kernel::queue_one(1, &mut p, 10, 2);
         Kernel::queue_one(1, &mut p, 9, 2);
         k.deliver(1, &mut p).unwrap();

@@ -41,7 +41,7 @@ impl Signals {
     /// A fork starts with empty queues. CLONE_SIGHAND shares dispositions;
     /// CLONE_THREAD additionally adopts the existing process pending queue.
     pub fn fork(&self, shared_actions: bool) -> Self {
-        Self {
+        let child = Self {
             presence: Default::default(),
             reader: Default::default(),
             io: Default::default(),
@@ -55,7 +55,9 @@ impl Signals {
             wait_mask: None,
             frames: self.frames,
             alt_stack: self.alt_stack,
-        }
+        };
+        child.io.publish_mask(child.mask);
+        child
     }
     pub fn exec(&mut self) {
         self.actions = self.actions.exec();
@@ -112,10 +114,13 @@ impl Signals {
             }
         })
     }
+    pub fn set_mask(&mut self, mask: u64) {
+        self.mask = mask;
+        self.io.publish_mask(mask);
+    }
     pub fn mask_call(&mut self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
         if let Some(mask) = control::update_mask(self.mask, a, memory)? {
-            self.mask = mask;
-            self.io.publish_mask(mask);
+            self.set_mask(mask);
         }
         // Context custody is transferred only at begin_io/finish_io. An owner
         // query needs neither a context mutex nor a redundant mask publication.

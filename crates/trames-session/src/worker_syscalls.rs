@@ -484,10 +484,6 @@ impl Snapshot {
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131)
-            && !matches!(
-                cpu.x(if cpu.x(8) as u32 == 131 { 2 } else { 1 }) as u32,
-                18..=22
-            )
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if cpu.x(8) as u32 == 25 && cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {

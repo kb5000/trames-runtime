@@ -6,4 +6,5 @@ pub mod limits;
 pub mod scheduling;
 pub mod signal;
 pub mod task;
+pub mod task_control;
 pub mod timers;

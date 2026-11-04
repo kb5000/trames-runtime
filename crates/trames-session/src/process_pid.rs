@@ -19,7 +19,19 @@ impl<C: Cpu> Kernel<C> {
                 continue;
             }
             let sig = child.pdeath_signal;
-            if sig != 0 && Self::prepare_signal(child, sig, parent.tgid) {
+            if matches!(sig, 9 | 18..=22) {
+                let info = Info {
+                    sender: parent.tgid,
+                    uid: parent.linux.vfs.credentials.uid,
+                    ..Default::default()
+                };
+                let _ = child.signals.io.job_signal(
+                    sig,
+                    true,
+                    info,
+                    child.signals.io.ancestor_sender(parent.tgid),
+                );
+            } else if sig != 0 && Self::prepare_signal(child, sig, parent.tgid) {
                 let _ = child.signals.io.process().enqueue(
                     sig,
                     Info {

@@ -1135,9 +1135,10 @@ fn stopped_socket_wait_retains_ofd_but_signal_releases_it_with_original_restart_
             p.linux.vfs.close(fd).unwrap();
             Kernel::queue_one(1, &mut p, 19, 0);
             assert_eq!(k.deliver(1, &mut p), Ok(true));
-            assert!(matches!(p.state, State::Stopped));
+            assert!(p.stopped());
             assert!(weak.upgrade().is_some());
-            p.state = *p.stopped_state.take().unwrap();
+            Kernel::queue_one(1, &mut p, 18, 0);
+            assert!(!p.stopped());
             let pc = p.cpu.pc;
             p.signals.actions.set(
                 10,
@@ -1277,10 +1278,10 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
     assert!(p.retained_message_owner.is_some());
     Kernel::queue_one(1, &mut p, 19, 0);
     assert_eq!(k.deliver(1, &mut p), Ok(true));
-    assert!(matches!(p.state, State::Stopped));
+    assert!(p.stopped());
     assert!(
-        !p.worker_io_candidate(1),
-        "a retained message does not make a stopped task runnable"
+        p.worker_io_candidate(1) && !p.runnable(),
+        "a stopped task retains its source wait without running guest code"
     );
     Kernel::queue_one(1, &mut p, 18, 0);
     assert!(

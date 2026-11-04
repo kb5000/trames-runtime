@@ -468,6 +468,7 @@ impl<C: Cpu> Pool<C> {
                     let mut vm_checkpoint = false;
                     let mut interrupt_prepared = false;
                     let mut execution_guard = None;
+                    let control_lease = work.syscalls.as_ref().map(|s|s.io_signals.lifecycle().enter(&s.io_signals,work.pid));
 
                     if let Some(snapshot) = &work.syscalls {
                         snapshot.direct.swap_scratch(&mut direct_scratch);
@@ -496,19 +497,23 @@ impl<C: Cpu> Pool<C> {
                             if let Some(snapshot) = &work.syscalls {
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
+                                    if !snapshot.io_signals.lifecycle().stopped() {
                                     if let Some(value) = wait.request.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace) {
                                         work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
                                     }
                                 }
+                                    }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
+                                    if !snapshot.io_signals.lifecycle().stopped() {
                                     if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
                                         work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
                                     }
                                 }
+                                    }
                                 if let Some((sig, shared)) = snapshot.next_io_signal() {
                                     let action = snapshot.actions.get(sig as usize);
                                     let disposition = trames_kernel::signal::disposition(sig, action);
@@ -517,14 +522,25 @@ impl<C: Cpu> Pool<C> {
                                         snapshot.io_signals.take(sig, shared);
                                         continue;
                                     }
-                                    if matches!(disposition, trames_kernel::signal::Disposition::Terminate | trames_kernel::signal::Disposition::Stop) {
-                                        // Lifecycle effects retain their existing exit/stop boundary.
-                                        // Caught I/O signals below never stop the other CPUs.
+                                    if disposition == trames_kernel::signal::Disposition::Terminate {
                                         work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
+                                    }
+                                    let stop_held=job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                        || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
+                                        || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                        || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
+                                    if disposition == trames_kernel::signal::Disposition::Stop && !stop_held {
+                                        if sig!=19 && snapshot.io_routes.directory.orphaned(&snapshot.io_signals) {
+                                            snapshot.io_signals.take(sig,shared);continue;
+                                        }
+                                        if snapshot.io_signals.lifecycle().consume_stop(sig,||snapshot.io_signals.take(sig,shared).is_some()) {
+                                            maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                        }
+                                        continue;
                                     }
                                     let uninterruptible = job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
-                                    if !uninterruptible {
+                                    if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
                                             if let Some(waiting) = job.waiting.take() {
                                                 if let crate::run_queue::WaitState::Futex { wait, .. } = &waiting {
@@ -564,6 +580,14 @@ impl<C: Cpu> Pool<C> {
                                         }
                                     }
                                 }
+                            }
+                            if work.syscalls.as_ref().is_some_and(|s|s.io_signals.lifecycle().stopped()) {
+                                if job.hardware_wait.as_ref().is_some_and(|w|w.ready()) {job.hardware_wait=None;}
+                                let kernel_pending=job.pending_cpu.is_some()
+                                    || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
+                                    || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                    || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
+                                if !kernel_pending {maintenance=true;break SliceOutcome::Yield {instructions:0};}
                             }
                             if let Some(epoch) = &epoch {
                                 if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
@@ -704,6 +728,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                 }
                             }
+                            if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.io_signals.lifecycle().stopped()) {
+                                maintenance=true;break SliceOutcome::Yield {instructions:0};
+                            }
                             if epoch.as_ref().is_some_and(|epoch| epoch.should_yield(index, began, instructions != 0 || syscalls != 0 || (!C::EXACT_INSTRUCTIONS && chunks != 0))) {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
@@ -730,12 +757,15 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         Ok(interrupt) => interrupt,
                                         Err(error) => break SliceOutcome::Fault(error),
                                     };
-                                    if let (Some(domain), Some(interrupt)) = (&domain, interrupt) {
+                                    if let Some(interrupt) = interrupt {
+                                        if control_lease.as_ref().is_some_and(|lease|!lease.bind_interrupt(interrupt.clone())) {maintenance=true;break SliceOutcome::Yield {instructions:0};}
+                                        if let Some(domain)=&domain {
                                         let Some(guard) = domain.bind_interrupt(index, interrupt) else {
                                             yielded = true;
                                             break SliceOutcome::Yield { instructions: 0 };
                                         };
                                         execution_guard = Some(guard);
+                                        }
                                     }
                                     interrupt_prepared = true;
                                 }
@@ -1421,6 +1451,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     registry.metrics.worker_calls = registry.metrics.calls;
                     stats.native.merge(std::mem::take(&mut registry.metrics));
                     stats.rejected_native = rejected_native.or(stats.rejected_native);
+                    if let Some(lease)=control_lease {
+                        let held=job.stop_hold().map(|held|held || service || vm_checkpoint || (!maintenance && !yielded && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && matches!(outcome,Some(SliceOutcome::Syscall{..}|SliceOutcome::NativeCall{..}|SliceOutcome::Fault(_)))));
+                        lease.finish(held);
+                    }
                     // The same allocation retains CPU, translations and View;
                     // only its Box pointer enters the shared queues.
                     if let Some(epoch) = &epoch {
@@ -1971,6 +2005,163 @@ mod tests {
         assert_eq!(signal_task.context.lock().unwrap().frames, 0);
         memory.commit_parallel().unwrap();
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
+    }
+
+    #[test]
+    fn thread_group_stop_wait_continue_runs_on_one_slot_without_owner_requests() {
+        for slots in [1, 4] {
+            use trames_kernel::{
+                children::{Child, Children},
+                signal::{IoDirectory, Signals},
+            };
+            let directory = Arc::new(IoDirectory::default());
+            let parent = Signals {
+                io_directory: directory.clone(),
+                ..Default::default()
+            };
+            let child = Signals {
+                io_directory: directory.clone(),
+                ..Default::default()
+            };
+            let sibling = Signals {
+                actions: child.actions.shared(),
+                io_directory: directory.clone(),
+                ..Default::default()
+            };
+            sibling.io.share_process(&child.io);
+            for (task, pid, tgid) in [(&parent, 1, 1), (&child, 42, 42), (&sibling, 43, 42)] {
+                task.publish_policy(&Default::default(), true);
+                task.begin_io();
+                task.io.set_session(1);
+                directory.publish(&task.io, pid, tgid, if pid == 1 { 1 } else { 42 }, 0, 0);
+            }
+            let children = Arc::new(Children::default());
+            let event = Arc::new(Child::default());
+            event.attach(Some(&children), 42, 1, 0);
+            child
+                .io
+                .lifecycle()
+                .bind(&event, Some(parent.io.lifecycle()), 42, 0);
+            let mut memory = Memory::default();
+            memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+            let mov = |r: u32, v: u32| 0xd2800000 | (v << 5) | r;
+            let mut code = Vec::new();
+            for round in 0..4 {
+                code.extend([
+                    mov(0, 42),
+                    mov(1, 43),
+                    mov(2, if round == 0 { 19 } else { 20 }),
+                    mov(8, 131),
+                    0xd4000001,
+                ]);
+                for (flags, status) in [(2, 0x2000 + 8 * round), (8, 0x2004 + 8 * round)] {
+                    code.extend([
+                        mov(0, 42),
+                        mov(1, status),
+                        mov(2, flags),
+                        mov(3, 0),
+                        mov(8, 260),
+                        0xd4000001,
+                    ]);
+                    if flags == 2 {
+                        code.extend([mov(0, 42), mov(1, 18), mov(8, 129), 0xd4000001]);
+                    }
+                }
+            }
+            code.extend([mov(8, 93), 0xd4000001]);
+            for (i, word) in code.into_iter().enumerate() {
+                memory
+                    .write_array(0x1000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            for (i, word) in [0x91000673u32, 0x17ffffff].into_iter().enumerate() {
+                memory
+                    .write_array(0x1800 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+            let control = Arc::new(Control::new(20_000_000));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            // Both group members must return their own CPU before the parent's
+            // WUNTRACED completes. No spare host slot is reserved for the sender.
+            for (task, pid, pc) in [
+                (&child, 42, 0x1800),
+                (&sibling, 43, 0x1800),
+                (&parent, 1, 0x1000),
+            ] {
+                let mut snapshot = syscall_snapshot();
+                snapshot.io_signals = task.io.clone();
+                snapshot.actions = task.actions.shared();
+                snapshot.children = children.clone();
+                snapshot.io_routes = trames_kernel::signal::IoRoutes {
+                    directory: directory.clone(),
+                    ..Default::default()
+                };
+                epoch.add(crate::run_queue::Job::new(
+                    Work {
+                        pid,
+                        cpu: Cpu::new(pc, 0),
+                        memory: Some(Box::new(
+                            memory.parallel_view(&mut Default::default()).unwrap(),
+                        )),
+                        control: control.clone(),
+                        syscalls: Some(snapshot),
+                        gpu: None,
+                        audio: None,
+                    },
+                    (1 << slots) - 1,
+                    0,
+                    None,
+                ));
+            }
+            let mut pool = Pool::new(slots);
+            for slot in 0..slots {
+                pool.ensure(slot).unwrap();
+                pool.launch(slot, epoch.clone()).unwrap();
+            }
+            let observed = pool.event_timeout(Duration::from_secs(5)).unwrap();
+            if !matches!(observed, Some(Event::EpochStopped(_))) {
+                epoch.stop();
+                panic!("STOP/CONT requested an owner boundary or failed to wake the sole slot");
+            }
+            for _ in 1..slots {
+                assert!(matches!(
+                    pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                    Some(Event::EpochStopped(_))
+                ));
+            }
+            let results = epoch.drain();
+            assert!(results.iter().all(|d| d.serviced_syscalls == 0));
+            let sender = results.iter().find(|d| d.pid == 1).unwrap();
+            assert_eq!(
+                sender.syscalls,
+                16,
+                "slots={slots} pending={:x}/{:x} mask={:x}/{:x} stopped={} next={:?}",
+                child.io.pending_bits(),
+                sibling.io.pending_bits(),
+                child.io.mask(),
+                sibling.io.mask(),
+                child.io.lifecycle().stopped(),
+                sibling.io.next(u64::MAX)
+            );
+            assert_eq!((sender.cpu.x(0), sender.cpu.x(8)), (42, 93));
+            assert!(!child.io.lifecycle().stopped());
+            drop(results);
+            memory.commit_parallel().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(memory.read_array(0x2000).unwrap()),
+                (19 << 8) | 0x7f
+            );
+            assert_eq!(
+                u32::from_le_bytes(memory.read_array(0x2008).unwrap()),
+                (20 << 8) | 0x7f
+            );
+            assert_eq!(
+                u32::from_le_bytes(memory.read_array(0x2004).unwrap()),
+                0xffff
+            );
+        }
     }
 
     #[test]

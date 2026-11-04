@@ -208,3 +208,10 @@ mod sme_tests {
         assert_eq!(c.on_exec, None);
     }
 }
+
+/// Thread-safe request to stop the owning executor's next/active CPU entry.
+/// It carries no guest register or memory authority. A retained handle must
+/// become inert before its CPU is destroyed or its identifier can be reused.
+pub trait ExecutionInterrupt: Send + Sync {
+    fn request_exit(&self);
+}

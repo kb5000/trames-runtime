@@ -19,7 +19,7 @@ impl Signals {
         }
     }
     fn commit_frame(&mut self, frame: FrameState) {
-        self.mask = frame.mask;
+        self.set_mask(frame.mask);
         self.frames = frame.frames;
         self.alt_stack = frame.alt_stack;
     }

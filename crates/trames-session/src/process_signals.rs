@@ -10,12 +10,12 @@ impl<C: Cpu> Process<C> {
     pub(super) fn next_signal(&self, mask: u64) -> Option<(u32, bool)> {
         self.signals.next_signal(mask)
     }
-    pub(super) fn take_signal(&mut self, sig: u32, shared: bool) -> Info {
-        let mut info = self.signals.take_signal(sig, shared);
+    pub(super) fn take_signal(&mut self, sig: u32, shared: bool) -> Option<Info> {
+        let mut info = self.signals.io.take(sig, shared)?;
         if info.fault.is_none() && info.poll.is_none() {
             info.sender = self.linux.vfs.visible_pid(info.sender);
         }
-        info
+        Some(info)
     }
     pub(super) fn signal_senders(&self) -> Vec<u32> {
         self.signals.signal_senders()

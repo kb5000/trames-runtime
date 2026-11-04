@@ -60,6 +60,7 @@ impl<C: Cpu> Kernel<C> {
                 let mut p = self.processes.remove(&pid).expect("paused task");
                 assert!(!p.linux.trace);
                 p.cpu = std::mem::take(&mut job.work.cpu);
+                let control = p.signals.io.lifecycle().enter(&p.signals.io, pid);
                 p.state = State::Ready;
                 if p.seccomp.mode() != 0 {
                     let entry =
@@ -104,6 +105,7 @@ impl<C: Cpu> Kernel<C> {
                     self.vm_checkpoint_batch[2] += u64::from(extra);
                     let remaining = lease_deadline.saturating_duration_since(Instant::now());
                     if !batch
+                        || p.stopped()
                         || p.seccomp.mode() != 0
                         || remaining.is_zero()
                         || epoch.control.stopped()
@@ -143,6 +145,7 @@ impl<C: Cpu> Kernel<C> {
                     break;
                 }
                 job.work.cpu = std::mem::take(&mut p.cpu);
+                control.finish(job.stop_hold());
                 self.processes.insert(pid, p);
             }
             let members: Vec<_> = checkpoint
@@ -220,7 +223,15 @@ impl<C: Cpu> Kernel<C> {
         let now = Instant::now();
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
         Ok(self.processes.iter().any(|(&pid, p)| {
-            if members.contains(&pid) || p.frozen(pid) {
+            if p.frozen(pid) {
+                return false;
+            }
+            if members.contains(&pid) {
+                // An excluded original resource still needs its actual owner;
+                // a stopped task cannot acknowledge before that work finishes.
+                return p.stopped() && p.stop_held() && !p.control_candidate(pid);
+            }
+            if p.stopped() && !p.stop_held() && p.pending_bits() & (1 << 8) == 0 {
                 return false;
             }
             match p.state {

@@ -80,12 +80,7 @@ pub struct ClockSample {
     pub frequency: u64,
 }
 
-/// Thread-safe request to stop the owning executor's next/active CPU entry.
-/// It carries no guest register or memory authority. A retained handle must
-/// become inert before its CPU is destroyed or its identifier can be reused.
-pub trait ExecutionInterrupt: Send + Sync {
-    fn request_exit(&self);
-}
+pub use trames_execution::ExecutionInterrupt;
 
 /// Movable task state is separate from the host-thread-affine execution engine.
 /// Engines are created on the thread that executes them and never sent to a
