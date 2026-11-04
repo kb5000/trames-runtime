@@ -18,7 +18,7 @@ pub struct DirectFile {
 /// Joined admission records policy and weak resource identities once. Promoting
 /// this capability never borrows an inode or repeats a pathname/stat lookup.
 #[derive(Clone)]
-pub struct PreparedFile(Arc<FileAuthority>);
+pub struct PreparedFile(Arc<FileAuthority>, FileSizeLimit);
 struct FileAuthority {
     data: std::sync::Weak<PlainFile>,
     position: std::sync::Weak<Mutex<FilePosition>>,
@@ -72,6 +72,7 @@ struct PublishedFiles {
     epoch: Arc<PublishedEpoch>,
     clear_setid: bool,
     unlimited: bool,
+    limit: FileSizeLimit,
 }
 // Weak epoch identity prevents a later checkpoint from reusing stale admission.
 pub(super) struct PublishedFile {
@@ -114,6 +115,7 @@ impl DirectFiles {
                         if let Some(mut fast) = published.prepared.accept(Some(file.clone())) {
                             fast.clear_setid = publication.clear_setid;
                             fast.unlimited = publication.unlimited;
+                            fast.prepared.1 = publication.limit.clone();
                             return Some(FileAccess::Fast(fast));
                         }
                     }
@@ -149,6 +151,7 @@ impl DirectFiles {
         let mut accepted = prepared.accept(Some(file))?;
         accepted.clear_setid = publication.clear_setid;
         accepted.unlimited = publication.unlimited;
+        accepted.prepared.1 = publication.limit.clone();
         Some(accepted)
     }
     /// Cold preparation of fixed or already-accepted io_uring descriptions.
@@ -166,7 +169,7 @@ impl DirectFiles {
 pub struct FileEpoch {
     published: Arc<PublishedEpoch>,
     prepared: BTreeMap<(usize, bool, bool), PreparedFile>,
-    captures: BTreeMap<(usize, u64, bool, bool, u64), DirectFiles>,
+    captures: BTreeMap<(usize, u64, bool, bool, u64, usize), DirectFiles>,
 }
 impl FileEpoch {
     pub fn capture(&mut self, vfs: &Vfs, unlimited: bool) -> DirectFiles {
@@ -180,6 +183,7 @@ impl FileEpoch {
             clear_setid,
             unlimited,
             FD_FLAGS_REVISION.load(Ordering::Relaxed),
+            vfs.file_size_limit.identity(),
         );
         if let Some(capture) = self.captures.get(&key) {
             return capture.clone();
@@ -214,6 +218,7 @@ impl FileEpoch {
                 epoch: self.published.clone(),
                 clear_setid,
                 unlimited,
+                limit: vfs.file_size_limit.clone(),
             }),
         );
         self.captures.insert(key, capture.clone());
@@ -262,7 +267,10 @@ impl FileEpoch {
         let clear_setid = !vfs.credentials.has_cap(capabilities::FSETID);
         let prepared_key = (Arc::as_ptr(&o.shared) as usize, clear_setid, unlimited);
         if let Some(prepared) = self.prepared.get(&prepared_key) {
-            return Some(prepared.clone());
+            return Some(PreparedFile(
+                prepared.0.clone(),
+                vfs.file_size_limit.clone(),
+            ));
         }
         let (prepared, _, _) = Self::prepare_open(vfs, o, unlimited)?;
         self.prepared.insert(prepared_key, prepared.clone());
@@ -297,25 +305,28 @@ impl FileEpoch {
             .map_or(Ok(()), |m| m.writable())
             .and_then(|()| Vfs::pseudo_immutable_node(&n))
             .err();
-        let prepared = PreparedFile(Arc::new(FileAuthority {
-            data: Arc::downgrade(&data),
-            position: Arc::downgrade(&o.file_position),
-            locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
-            origin: OfdIdentity::new(&o.shared),
-            flock,
-            stat,
-            flags: o.flags.get(),
-            status: o.flags.clone(),
-            notifications,
-            write_error,
-            unlimited,
-            clear_setid,
-            readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
-            relatime: o
-                .mount
-                .as_ref()
-                .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
-        }));
+        let prepared = PreparedFile(
+            Arc::new(FileAuthority {
+                data: Arc::downgrade(&data),
+                position: Arc::downgrade(&o.file_position),
+                locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
+                origin: OfdIdentity::new(&o.shared),
+                flock,
+                stat,
+                flags: o.flags.get(),
+                status: o.flags.clone(),
+                notifications,
+                write_error,
+                unlimited,
+                clear_setid,
+                readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
+                relatime: o
+                    .mount
+                    .as_ref()
+                    .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
+            }),
+            vfs.file_size_limit.clone(),
+        );
         Some((prepared, node.clone(), data))
     }
     /// Compatibility lifetime boundary only. Canonical file metadata is already
@@ -466,7 +477,10 @@ impl DirectFile {
         if bytes.is_empty() {
             return Some(Ok(0));
         }
-        if !self.unlimited || self.prepared.0.flags & 0x1000 != 0 {
+        if !self.unlimited
+            || self.prepared.1.get() != u64::MAX
+            || self.prepared.0.flags & 0x1000 != 0
+        {
             return None;
         }
         let append = self.prepared.0.status.get() & 0x400 != 0;
@@ -898,6 +912,35 @@ mod tests {
         assert_eq!(reopened.pread(reopened_fd, 10, 0).unwrap(), b"helloworld");
         drop(reopened);
         std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn captured_and_published_file_authority_uses_the_callers_live_size_limit() {
+        let (mut parent, fd) = memory_file(b"abcdefgh".to_vec());
+        let child = parent.clone_with_files(true);
+        let mut epoch = FileEpoch::default();
+        let p = epoch.capture(&parent, true);
+        let c = epoch.capture(&child, true);
+        let fast = c.get(fd).unwrap();
+        let mut cache = DiskReadCache::default();
+        child.file_size_limit_handle().set(3);
+        assert_eq!(fast.write(b"X", Some(0), &mut cache), None);
+        assert_eq!(
+            p.get(fd).unwrap().write(b"P", Some(0), &mut cache),
+            Some(Ok(1))
+        );
+        child.file_size_limit_handle().set(u64::MAX);
+        assert_eq!(fast.write(b"C", Some(1), &mut cache), Some(Ok(1)));
+        let new = parent
+            .open_at(AT_FDCWD, b"/published", 2 | 0x40, 0o600)
+            .unwrap();
+        let open = parent.descriptor(new).unwrap();
+        p.publish_open(&parent, &open.open.borrow());
+        child.file_size_limit_handle().set(0);
+        assert_eq!(c.get(new).unwrap().write(b"X", None, &mut cache), None);
+        assert_eq!(
+            p.get(new).unwrap().write(b"P", None, &mut cache),
+            Some(Ok(1))
+        );
     }
     #[test]
     fn growth_and_append_execute_on_source_while_finite_and_sync_policy_use_full_file_calls() {

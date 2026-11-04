@@ -98,6 +98,28 @@ impl<C: Cpu> Kernel<C> {
             Err(Errno(3))
         }
     }
+    pub(super) fn limit_authority(
+        &self,
+        pid: u32,
+        p: &Process<C>,
+    ) -> trames_kernel::limits::Authority {
+        trames_kernel::limits::Authority {
+            directory: self.limit_directory.clone(),
+            limits: p.limits.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            pid,
+            credentials: p.linux.vfs.credentials.clone(),
+            fixed: trames_kernel::limits::Fixed {
+                address_space: if self.memory_limits.is_host_managed() {
+                    u64::MAX
+                } else {
+                    self.memory_limits.per_process as u64
+                },
+                stack: super::super::STACK_SIZE,
+                tasks: self.task_limit as u64,
+            },
+        }
+    }
     pub(super) fn rlimit(
         &self,
         pid: u32,
@@ -105,105 +127,12 @@ impl<C: Cpu> Kernel<C> {
         number: u32,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
-        let target_pid = if number == 261 && a[0] as u32 != 0 {
-            p.linux.vfs.global_pid(a[0] as u32)?
-        } else {
-            pid
-        };
-        let target = if target_pid == pid {
-            &*p
-        } else {
-            self.processes.get(&target_pid).ok_or(Errno(3))?
-        };
-        if target.tgid != p.tgid {
-            let caller = &p.linux.vfs.credentials;
-            let other = &target.linux.vfs.credentials;
-            if !caller.has_cap(capabilities::SYS_RESOURCE)
-                && !([other.uid, other.euid, other.suid]
-                    .iter()
-                    .all(|id| *id == caller.uid)
-                    && [other.gid, other.egid, other.sgid]
-                        .iter()
-                        .all(|id| *id == caller.gid))
-            {
-                return Err(Errno(1));
-            }
+        if number == 261 && a[0] as u32 != 0 {
+            // Structural lifecycle and credentials still change at custody
+            // boundaries. Refresh the joined caller's target directory once.
+            self.publish_io_tasks(Some((pid, p)));
         }
-        let (resource, new, old) = if number == 261 {
-            (a[1], a[2], a[3])
-        } else {
-            (
-                a[0],
-                if number == 164 { a[1] } else { 0 },
-                if number == 163 { a[1] } else { 0 },
-            )
-        };
-        let fixed = match resource {
-            0 | 1 | 10 | 15 => u64::MAX,
-            2 | 5 | 9 if self.memory_limits.is_host_managed() => u64::MAX,
-            2 | 5 | 9 => self.memory_limits.per_process as u64,
-            3 => super::super::STACK_SIZE,
-            4 | 8 | 12 | 13 | 14 => 0,
-            6 => self.task_limit as u64,
-            7 => trames_vfs::MAX_FDS as u64,
-            11 => 64,
-            _ => return Err(Errno(22)),
-        };
-        let previous = if resource == 1 {
-            target.file_size_limit.get()
-        } else if resource == 7 {
-            target.nofile_limit.get()
-        } else if resource == 4 {
-            target.core_limit.get()
-        } else {
-            (fixed, fixed)
-        };
-        if old != 0 {
-            Linux::check(&p.memory, old, 16, Access::Write)?;
-        }
-        let next = if new != 0 {
-            Linux::check(&p.memory, new, 16, Access::Read)?;
-            let limits = (read_u64(&p.memory, new)?, read_u64(&p.memory, new + 8)?);
-            if limits.0 > limits.1 {
-                return Err(Errno(22));
-            }
-            if limits.1 > previous.1 && !p.linux.vfs.credentials.has_cap(capabilities::SYS_RESOURCE)
-            {
-                return Err(Errno(1));
-            }
-            if !matches!(resource, 1 | 4) && limits.1 > fixed {
-                return Err(Errno(1));
-            }
-            if !matches!(resource, 1 | 4 | 7) && limits != previous {
-                return Err(Errno(95));
-            }
-            Some(limits)
-        } else {
-            None
-        };
-        if old != 0 {
-            write_u64(&mut p.memory, old, previous.0)?;
-            write_u64(&mut p.memory, old + 8, previous.1)?;
-        }
-        if let Some(next) = next {
-            // Limits are process-owned and shared by its threads. The FD
-            // allocator already uses the same atomic soft limit on workers.
-            // Keep caller memory/capabilities separate from the target state.
-            let target = if target_pid == pid {
-                &*p
-            } else {
-                &self.processes[&target_pid]
-            };
-            if resource == 1 {
-                target.file_size_limit.set(next);
-            } else if resource == 7 {
-                target.nofile_limit.set(next);
-                target.linux.vfs.set_descriptor_limit(next.0 as u32);
-            } else if resource == 4 {
-                target.core_limit.set(next);
-            }
-        }
-        Ok(0)
+        self.limit_authority(pid, p).call(number, a, &mut p.memory)
     }
 }
 
@@ -274,9 +203,9 @@ mod tests {
         write_u64(&mut child.memory, 0x1000, 4).unwrap();
         write_u64(&mut child.memory, 0x1008, 8).unwrap();
         assert_eq!(k.rlimit(1, &mut child, 261, [0, 7, 0x1000, 0, 0, 0]), Ok(0));
-        assert_eq!(p.nofile_limit.get(), (8, 16));
+        assert_eq!(p.limits.get(7), (8, 16));
         assert_eq!(p.linux.vfs.descriptor_limit(), 8);
-        assert_eq!(child.nofile_limit.get(), (4, 8));
+        assert_eq!(child.limits.get(7), (4, 8));
         assert_eq!(child.linux.vfs.descriptor_limit(), 4);
         child.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
         write_u64(&mut child.memory, 0x1008, 16).unwrap();
@@ -284,7 +213,7 @@ mod tests {
             k.rlimit(1, &mut child, 261, [0, 7, 0x1000, 0, 0, 0]),
             Err(Errno(1))
         );
-        assert_eq!(child.nofile_limit.get(), (4, 8));
+        assert_eq!(child.limits.get(7), (4, 8));
     }
     #[test]
     fn prlimit_targets_child_thread_limits_and_keeps_caller_memory_separate() {
@@ -296,7 +225,8 @@ mod tests {
         let mut thread = child.fork();
         thread.tgid = 2;
         thread.linux.vfs.activate_child_pid(3).unwrap();
-        thread.nofile_limit = child.nofile_limit.clone();
+        thread.limits = child.limits.clone();
+        thread.limits.bind(&mut thread.linux.vfs);
         thread.linux.vfs.share_descriptor_limit(&child.linux.vfs);
         k.processes.insert(2, child);
         k.processes.insert(3, thread);
@@ -306,26 +236,23 @@ mod tests {
             k.rlimit(1, &mut p, 261, [3, 7, 0x1000, 0xffff, 0, 0]),
             Err(Errno(14))
         );
-        assert_eq!(
-            k.processes[&2].nofile_limit.get().0,
-            trames_vfs::MAX_FDS as u64
-        );
+        assert_eq!(k.processes[&2].limits.get(7).0, trames_vfs::MAX_FDS as u64);
         assert_eq!(
             k.rlimit(1, &mut p, 261, [3, 7, 0x1000, 0x1000, 0, 0]),
             Ok(0)
         );
         assert_eq!(read_u64(&p.memory, 0x1000), Ok(trames_vfs::MAX_FDS as u64));
-        assert_eq!(p.nofile_limit.get().0, trames_vfs::MAX_FDS as u64);
+        assert_eq!(p.limits.get(7).0, trames_vfs::MAX_FDS as u64);
         for id in [2, 3] {
-            assert_eq!(k.processes[&id].nofile_limit.get(), (8, 16));
+            assert_eq!(k.processes[&id].limits.get(7), (8, 16));
             assert_eq!(k.processes[&id].linux.vfs.descriptor_limit(), 8);
         }
         let fork = k.processes[&2].fork();
-        assert_eq!(fork.nofile_limit.get(), (8, 16));
+        assert_eq!(fork.limits.get(7), (8, 16));
         write_u64(&mut p.memory, 0x1000, 4).unwrap();
         write_u64(&mut p.memory, 0x1008, 8).unwrap();
         assert_eq!(k.rlimit(1, &mut p, 261, [2, 7, 0x1000, 0, 0, 0]), Ok(0));
-        assert_eq!(fork.nofile_limit.get(), (8, 16));
+        assert_eq!(fork.limits.get(7), (8, 16));
         assert_eq!(fork.linux.vfs.descriptor_limit(), 8);
         k.processes.remove(&3);
         assert_eq!(k.rlimit(1, &mut p, 261, [3, 7, 0, 0, 0, 0]), Err(Errno(3)));
@@ -359,11 +286,11 @@ mod tests {
             trames_vfs::Credentials::user(1001, 1000);
         assert_eq!(k.rlimit(1, &mut p, 261, [2, 7, 0, 0, 0, 0]), Err(Errno(1)));
         p.linux.vfs.credentials = trames_vfs::Credentials::default();
-        k.processes[&2].nofile_limit.set((4, 8));
+        k.processes[&2].limits.set(7, (4, 8));
         write_u64(&mut p.memory, 0x1000, 16).unwrap();
         write_u64(&mut p.memory, 0x1008, 32).unwrap();
         assert_eq!(k.rlimit(1, &mut p, 261, [2, 7, 0x1000, 0, 0, 0]), Ok(0));
-        assert_eq!(k.processes[&2].nofile_limit.get(), (16, 32));
+        assert_eq!(k.processes[&2].limits.get(7), (16, 32));
         // The target remains unprivileged; raising uses the caller's capability.
         assert!(!k.processes[&2]
             .linux
@@ -408,18 +335,18 @@ mod tests {
             k.rlimit(1, &mut p, 261, [0, 4, 0x1000, 0x1100, 0, 0]),
             Ok(0)
         );
-        assert_eq!(p.core_limit.get(), (u64::MAX, u64::MAX));
+        assert_eq!(p.limits.get(4), (u64::MAX, u64::MAX));
         assert_eq!(read_u64(&p.memory, 0x1100).unwrap(), 0);
         let child = p.fork();
-        child.core_limit.set((1, 2));
-        assert_eq!(p.core_limit.get(), (u64::MAX, u64::MAX));
-        p.core_limit.set((0, 0));
+        child.limits.set(4, (1, 2));
+        assert_eq!(p.limits.get(4), (u64::MAX, u64::MAX));
+        p.limits.set(4, (0, 0));
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
         assert_eq!(
             k.rlimit(1, &mut p, 261, [0, 4, 0x1000, 0, 0, 0]),
             Err(Errno(1))
         );
-        assert_eq!(p.core_limit.get(), (0, 0));
+        assert_eq!(p.limits.get(4), (0, 0));
     }
     #[test]
     fn compatibility_state_and_fault_preflight() {
@@ -453,16 +380,16 @@ mod tests {
             k.rlimit(1, &mut p, 261, [0, 1, 0x1000, 0xffff, 0, 0]),
             Err(Errno(14))
         );
-        assert_eq!(p.file_size_limit.get(), (u64::MAX, u64::MAX));
+        assert_eq!(p.limits.get(1), (u64::MAX, u64::MAX));
         assert_eq!(
             k.rlimit(1, &mut p, 261, [0, 1, 0x1000, 0x1000, 0, 0]),
             Ok(0)
         );
-        assert_eq!(p.file_size_limit.get(), (10, 20));
+        assert_eq!(p.limits.get(1), (10, 20));
         assert_eq!(read_u64(&p.memory, 0x1000), Ok(u64::MAX));
         let child = p.fork();
-        child.file_size_limit.set((5, 20));
-        assert_eq!(p.file_size_limit.get(), (10, 20));
+        child.limits.set(1, (5, 20));
+        assert_eq!(p.limits.get(1), (10, 20));
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
         write_u64(&mut p.memory, 0x1000, 10).unwrap();
         write_u64(&mut p.memory, 0x1008, 21).unwrap();
@@ -470,6 +397,6 @@ mod tests {
             k.rlimit(1, &mut p, 164, [1, 0x1000, 0, 0, 0, 0]),
             Err(Errno(1))
         );
-        assert_eq!(p.file_size_limit.get(), (10, 20));
+        assert_eq!(p.limits.get(1), (10, 20));
     }
 }

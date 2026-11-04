@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub limits: Option<trames_kernel::limits::Authority>,
     pub timers: Option<Arc<trames_kernel::timers::Timers>>,
 
     pub saved_wait_mask: std::cell::Cell<Option<u64>>,
@@ -452,9 +453,11 @@ impl Snapshot {
             )
         })
     }
-    pub fn signal_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
+    pub fn task_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
-            && (matches!(cpu.x(8) as u32, 132..=137) || self.signal_send(cpu)))
+            && (matches!(cpu.x(8) as u32, 132..=137)
+                || self.signal_send(cpu)
+                || self.limit_call(cpu.x(8) as u32)))
         .then(|| {
             self.seccomp.entry_decision(
                 cpu.x(8) as u32,
@@ -462,6 +465,9 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
             )
         })
+    }
+    pub fn limit_call(&self, number: u32) -> bool {
+        self.limits.is_some() && matches!(number, 163 | 164 | 261)
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131)
@@ -480,6 +486,7 @@ impl Snapshot {
         if trames_kernel::timers::timer_call(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 132..=137)
             || self.signal_send(cpu)
+            || self.limit_call(cpu.x(8) as u32)
         {
             return false;
         }
@@ -500,7 +507,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 139 | 166 | 168 | 172..=178
+            25 | 101 | 113..=115 | 124 | 139 | 163 | 164 | 261 | 166 | 168 | 172..=178
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -667,6 +674,11 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
             ),
+            number @ (163 | 164 | 261) => {
+                self.limits
+                    .as_ref()?
+                    .call(number, std::array::from_fn(|i| cpu.x(i)), memory)
+            }
             166 => Ok(self.umask.swap(cpu.x(0) as u32) as u64),
             214 if cpu.x(0) == 0 => Ok(self.program_break.get()),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
@@ -802,6 +814,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),
@@ -929,6 +942,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),
@@ -986,6 +1000,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),
@@ -1087,6 +1102,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),
@@ -1152,6 +1168,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),

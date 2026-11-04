@@ -2273,3 +2273,33 @@ then create a new wait on the same or requeued key and require its first wake to
 succeed. External acceptance uses stock Debian Go tools with normal async
 preemption, repeated Docker health/exec/stop/remove cycles and an unmodified
 Python `sendall` reproducer transferring 3,777,458 bytes.
+
+
+## Worker-owned process resource limits (2026-11-05)
+
+The same execution-independent resource-limit decoder serves owner and source
+calls. getrlimit/setrlimit/prlimit64 use the original process-owned pair object;
+thread clones share it, fork copies it, exec preserves it. Lookup uses the caller's
+PID namespace and full UID/GID/capability authority, then retains the original
+limit object independently of its numeric PID. Weak task presence distinguishes
+reaping from a retained object. Fixed-limit and unsupported-update results do not
+fall back to an owner syscall. Tracing and actual seccomp task/signal effects
+retain their existing authority boundary.
+
+The file-size soft field and FD-allocation soft field are the original relaxed
+atomics consulted by enforcement. Accepted file contexts retain the same file
+limit; a worker's previously prepared file capability cannot bypass a newly
+lowered FSIZE. Resource metadata for the original OFD remains shared, while the
+caller's limit is bound separately, including dynamically published descriptors
+and fixed/retained io_uring files. A file operation samples its bound once where
+arithmetic requires a stable value. Lowering a limit does not introduce global
+file locks, deterministic guest races or an ordinary-memory barrier.
+
+Validation uses atomic new/old pointer alias exchanges, concurrent updates,
+full cross-process credentials, nested PID/TID lookup, retained/reused identities,
+actual EMFILE, fork copies, and a thread that opened a file before another thread
+lowered FSIZE. The latter must short-write then raise SIGXFSZ at the boundary.
+Worker tests count one BPF decision per completed call and no owner returns for
+both successful queries and ERRNO denials. Separate timing/path-counter runs
+compare the unchanged old stable binary, the shared production interpreter,
+Mac HVF and the same static ARM64 ELF on native ARM Linux.

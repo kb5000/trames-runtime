@@ -294,6 +294,9 @@ impl SharedFiles {
             pending: true,
         })
     }
+    pub fn limit_handle(&self) -> super::DescriptorLimit {
+        super::DescriptorLimit(self.1.clone())
+    }
     pub fn descriptor_limit(&self) -> u32 {
         self.1.load(Ordering::Relaxed)
     }
@@ -685,6 +688,9 @@ pub(super) struct DescriptorVersion {
     pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
 }
 impl DescriptorTable {
+    pub(super) fn bind_limit(&mut self, limit: Arc<std::sync::atomic::AtomicU32>) {
+        self.1 .1 = limit;
+    }
     pub(super) fn available(&self, min: u32) -> Option<u32> {
         self.1
              .0

@@ -117,9 +117,7 @@ pub(crate) struct Process<C: Cpu> {
     rekey: Option<u32>,
     subreaper: bool,
     membarrier_registered: Rc<Cell<bool>>,
-    file_size_limit: Rc<Cell<(u64, u64)>>,
-    core_limit: Rc<Cell<(u64, u64)>>,
-    nofile_limit: Rc<Cell<(u64, u64)>>,
+    limits: Arc<trames_kernel::limits::Limits>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
     seccomp_entry: Option<seccomp::EntryDecision>,
@@ -381,6 +379,7 @@ impl<C: Cpu> Process<C> {
         let linux = self
             .linux
             .clone_with_resources(shared_files, shared_fs, shared_vm);
+        let limits = self.limits.fork(&linux.vfs);
         Box::new(Self {
             cpu: self.cpu.fork_cpu(shared_vm),
             affinity: self.affinity,
@@ -424,9 +423,7 @@ impl<C: Cpu> Process<C> {
             rekey: None,
             subreaper: false,
             membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
-            file_size_limit: Rc::new(Cell::new(self.file_size_limit.get())),
-            core_limit: Rc::new(Cell::new(self.core_limit.get())),
-            nofile_limit: Rc::new(Cell::new(self.nofile_limit.get())),
+            limits,
             oom: Arc::new(self.oom.fork()),
             seccomp: self.seccomp.clone(),
             seccomp_entry: None,
@@ -449,6 +446,7 @@ impl trames_vfs::IoWake for JoinedByteWake {
 pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
     file_layouts: Vec<file_io::FileLayout>,
+    limit_directory: Arc<trames_kernel::limits::Directory>,
     memory_limits: super::MemoryLimits,
     cpu_count: usize,
     task_limit: usize,
@@ -590,7 +588,9 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
 }
 impl<C: Cpu> Kernel<C> {
     fn publish_io_tasks(&self, current: Option<(u32, &Process<C>)>) {
-        fn publish<C: Cpu>(id: u32, p: &Process<C>) {
+        self.limit_directory.prune();
+        fn publish<C: Cpu>(directory: &trames_kernel::limits::Directory, id: u32, p: &Process<C>) {
+            directory.publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
             if matches!(p.state, State::Zombie(_)) {
                 return;
             }
@@ -605,10 +605,10 @@ impl<C: Cpu> Kernel<C> {
             );
         }
         for (&id, p) in &self.processes {
-            publish(id, p);
+            publish(&self.limit_directory, id, p);
         }
         if let Some((id, p)) = current {
-            publish(id, p);
+            publish(&self.limit_directory, id, p);
         }
     }
     fn native_call(
@@ -1113,9 +1113,9 @@ impl<C: Cpu> Kernel<C> {
             } else {
                 Vec::new()
             },
-            file_size_limits: Some(p.file_size_limit.get()),
-            core_limits: Some(p.core_limit.get()),
-            nofile_limits: Some(p.nofile_limit.get()),
+            file_size_limits: Some(p.limits.get(1)),
+            core_limits: Some(p.limits.get(4)),
+            nofile_limits: Some(p.limits.get(7)),
             address_space_limit: Some(if self.memory_limits.is_host_managed() {
                 u64::MAX
             } else {
@@ -2572,10 +2572,8 @@ impl<C: Cpu> Kernel<C> {
                     child.oom = Arc::new(p.oom.thread());
                     child.signals.io.share_process(&p.signals.io);
                     child.subreaper = p.subreaper;
-                    child.file_size_limit = p.file_size_limit.clone();
-                    child.core_limit = p.core_limit.clone();
-                    child.nofile_limit = p.nofile_limit.clone();
-                    child.linux.vfs.share_descriptor_limit(&p.linux.vfs);
+                    child.limits = p.limits.clone();
+                    child.limits.bind(&mut child.linux.vfs);
                 }
                 child
                     .linux
@@ -3054,7 +3052,6 @@ impl<C: Cpu> Kernel<C> {
         }
         p.linux.vfs.set_process_context(pid);
         p.linux.vfs.set_lock_owner(p.tgid);
-        p.linux.vfs.set_file_size_limit(p.file_size_limit.get().0);
         let mut prepared_stat = (number == 79).then(|| p.linux.prepare_stat(a, &p.memory));
         let proc_path = match number {
             27 => Some((trames_vfs::AT_FDCWD, a[1])),
@@ -4504,6 +4501,7 @@ impl<C: Cpu> Kernel<C> {
                     events: p.linux.vfs.native_events(),
                 }
             });
+            let limits = self.limit_authority(id, &self.processes[&id]);
             let p = self.processes.get_mut(&id).expect("cohort process");
             p.signals.begin_io();
             let waiting = if let State::Futex { wait, deadline } = &p.state {
@@ -4547,16 +4545,12 @@ impl<C: Cpu> Kernel<C> {
             };
             let c = &p.linux.vfs.credentials;
             let direct_files = if !p.linux.trace {
-                file_epoch.capture(&p.linux.vfs, p.file_size_limit.get().0 == u64::MAX)
+                file_epoch.capture(&p.linux.vfs, true)
             } else {
                 Default::default()
             };
             let retained_files = if !p.linux.trace {
-                file_epoch.capture_uring_rings(
-                    &p.linux.vfs,
-                    p.file_size_limit.get().0 == u64::MAX,
-                    p.linux.uring_rings(),
-                )
+                file_epoch.capture_uring_rings(&p.linux.vfs, true, p.linux.uring_rings())
             } else {
                 Default::default()
             };
@@ -4568,6 +4562,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    limits: Some(limits),
                     timers: Some(self.timers.clone()),
                     saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
                     seccomp: p.seccomp.clone(),
@@ -5541,6 +5536,8 @@ pub(super) fn run<C: Cpu>(
         .map_or_else(Instant::now, |server| server.guest_clock_origin());
     runtime.linux.set_uring_clock(started);
     super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, started)?;
+    let linux = std::mem::replace(&mut runtime.linux, Linux::new(0));
+    let limits = trames_kernel::limits::Limits::new(&linux.vfs);
     let mut root = Process::<C> {
         cpu: std::mem::take(&mut runtime.cpu),
         affinity: (1u64 << runtime.cpu_count.clamp(1, 32)) - 1,
@@ -5548,7 +5545,7 @@ pub(super) fn run<C: Cpu>(
         nice: 0,
         scheduler: 0,
         memory: std::mem::take(&mut runtime.memory),
-        linux: std::mem::replace(&mut runtime.linux, Linux::new(0)),
+        linux,
         parent: 0,
         parent_thread: 0,
         pdeath_signal: 0,
@@ -5584,12 +5581,7 @@ pub(super) fn run<C: Cpu>(
         rekey: None,
         subreaper: false,
         membarrier_registered: Rc::new(Cell::new(false)),
-        file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
-        core_limit: Rc::new(Cell::new((0, u64::MAX))),
-        nofile_limit: Rc::new(Cell::new((
-            trames_vfs::MAX_FDS as u64,
-            trames_vfs::MAX_FDS as u64,
-        ))),
+        limits,
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
@@ -5599,6 +5591,7 @@ pub(super) fn run<C: Cpu>(
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         file_layouts: Vec::new(),
+        limit_directory: Default::default(),
         memory_limits: runtime.memory_limits,
         cpu_count: count,
         task_limit: root.linux.task_limit.max(1),
@@ -6976,6 +6969,8 @@ mod tests {
     pub(super) fn process() -> Box<Process> {
         let mut memory = Memory::default();
         memory.map(0x1000, 8 * PAGE_SIZE, Permissions::RW).unwrap();
+        let linux = Linux::new(0xa000);
+        let limits = trames_kernel::limits::Limits::new(&linux.vfs);
         let process = Box::new(Process {
             cpu: Cpu::new(0x4000, 0x9000),
             affinity: 1,
@@ -6983,7 +6978,7 @@ mod tests {
             nice: 0,
             scheduler: 0,
             memory,
-            linux: Linux::new(0xa000),
+            linux,
             parent: 0,
             parent_thread: 0,
             pdeath_signal: 0,
@@ -7019,12 +7014,7 @@ mod tests {
             rekey: None,
             subreaper: false,
             membarrier_registered: Rc::new(Cell::new(false)),
-            file_size_limit: Rc::new(Cell::new((u64::MAX, u64::MAX))),
-            core_limit: Rc::new(Cell::new((0, u64::MAX))),
-            nofile_limit: Rc::new(Cell::new((
-                trames_vfs::MAX_FDS as u64,
-                trames_vfs::MAX_FDS as u64,
-            ))),
+            limits,
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,
@@ -7195,6 +7185,7 @@ mod tests {
         Kernel {
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             file_layouts: Vec::new(),
+            limit_directory: Default::default(),
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
             task_limit: trames_vfs::MAX_TASKS,

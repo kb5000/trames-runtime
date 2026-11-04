@@ -109,19 +109,45 @@ access requires matching real caller UID/GID against all target real/effective/
 saved IDs, or the caller's CAP_SYS_RESOURCE. Hard-limit raises use the caller's
 capability, not the target's. No host process limit is changed.
 
-This is a compatibility correction at the existing joined policy-mutation
-boundary. It does not claim worker-local resource-limit syscalls or introduce
+At the time this compatibility correction retained the joined policy-mutation
+boundary. The 2026-11-05 migration below supersedes that execution boundary. It did not introduce
 a new message, coordinator/service thread, global lock, or file-I/O check.
 The original caller-memory preflight and alias-safe new/old argument behavior
-remain. A future source-worker migration must move process-limit authority and
-all enforcement consumers together, rather than publish a stale snapshot.
+remain. The source-worker migration below moves process-limit authority and
+all enforcement consumers together, rather than publishing a stale snapshot.
+
+### Shared resource-limit subsystem (2026-11-05)
+
+All supported getrlimit/setrlimit/prlimit64 operations execute on the source
+worker, including namespace-visible non-self PID/TID targets, permission failures,
+invalid operands and supported-policy rejections. An original process object owns
+FSIZE/CORE/NOFILE pairs; a mutex protects their multi-field update. Threads share
+it, forks copy it, and exec retains it. The NOFILE field is the FD allocator's
+original relaxed atomic. FSIZE is one shared relaxed atomic used by both ordinary
+VFS and accepted file work. Fast file capabilities test the live field, keeping
+OFD metadata shared across fork while binding the actual caller's limit. Raising
+an initially finite limit can use the fast path without ending the cohort.
+
+The keyed directory retains weak task presence and limit identities. A retained
+old limit object cannot keep a reaped PID visible or redirect a reused PID.
+Credentials and structural PID membership are published at their existing
+custody boundary; this migration does not move credential or lifecycle mutation.
+Self queries bypass directory lookup. Cross-target lookup releases the directory
+lock before memory access or the actual limit transaction. Existing fixed limits
+and unsupported mutations retain their explicit errors. No host limit changes.
+
+Allowed filtered calls and ERRNO/unsupported TRACE/USER_NOTIF results execute
+locally with one exact BPF entry decision. Actual TRAP/KILL effects and tracing
+retain their connected signal/task-policy boundary. No new service/coordinator
+thread, syscall RPC, polling bus, ordinary-memory fence or file-wide lock is added.
+A separate CPU-allowance checkpoint is not a resource-limit fallback.
 
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Joined owner path. Child/task/VM ownership and pending contexts are changed on the owner. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
-| Signals and mutable security/task policy | Default stop/termination, STOP/CONT group state, credentials/capabilities, affinity/limits, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT and default termination still require lifecycle state, parent wait/SIGCHLD and cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
+| Signals and mutable security/task policy | Default stop/termination, STOP/CONT group state, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT and default termination still require lifecycle state, parent wait/SIGCHLD and cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, owner cgroup/proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and owner Rc control graphs have not been migrated. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are now separate shared resources. Do not classify every network socket or netlink message as owner-only. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted cgroup/nsfs/mqueue mounts, volatile owner descriptors, controlling-terminal acquisition and excluded open types | Before-effects defer. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, old epoll creation, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |

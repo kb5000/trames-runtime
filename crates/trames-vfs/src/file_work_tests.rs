@@ -325,3 +325,35 @@ fn path_truncate_accepts_the_original_ofd_without_publishing_or_leaking_a_tempor
     assert_eq!(read_path(&mut v, b"/file"), b"replacement");
     assert_eq!(v.fds.entries().len(), before);
 }
+
+#[test]
+fn retained_file_work_observes_live_process_limit_and_reports_size_signal() {
+    let mut v = Vfs::default();
+    let fd = v.open_at(AT_FDCWD, b"/limited", 2 | 0x40, 0o600).unwrap();
+    let work = FileWork::from_vfs(
+        &v,
+        target(&v, fd),
+        FileCommand::Write {
+            bytes: b"abcdef".to_vec(),
+            offset: None,
+        },
+    );
+    v.file_size_limit_handle().set(3);
+    assert_eq!(count(work), Ok(3));
+    let work = FileWork::from_vfs(
+        &v,
+        target(&v, fd),
+        FileCommand::Write {
+            bytes: b"x".to_vec(),
+            offset: None,
+        },
+    );
+    match work.run() {
+        FileOutcome::Complete(reply) => {
+            assert!(reply.file_size_signal);
+            assert!(matches!(reply.result, Err(Errno(27))));
+        }
+        _ => panic!("file size limit must not request an owner"),
+    }
+    assert_eq!(v.pread(fd, 10, 0).unwrap(), b"abc");
+}

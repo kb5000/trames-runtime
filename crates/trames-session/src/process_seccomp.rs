@@ -403,6 +403,81 @@ impl<C: Cpu> Kernel<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    #[test]
+    fn resource_limit_loops_and_seccomp_denials_retire_on_workers_without_owner_returns() {
+        use super::super::tests::{kernel, process};
+        for decision in [0x7fff0000, 0x5007b] {
+            let mut p = process();
+            p.affinity = 3;
+            // getrlimit(7, 0x1000), repeated 1000 times, then owner exit boundary.
+            let code = [
+                0xd28000e0u32,
+                0xd2820001,
+                0xd2801468,
+                0xd4000001,
+                0xf1000529,
+                0x54ffff61,
+                0x14000000,
+            ];
+            for (i, word) in code.into_iter().enumerate() {
+                p.memory
+                    .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu.set_x(9, 1000);
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+            ));
+            let evaluations = p.seccomp.evaluations.clone();
+            let mut peer = p.fork();
+            peer.vm_id = 2;
+            peer.tgid = 2;
+            let mut k = kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(2);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            // A faster spinner may exhaust one epoch's instruction allowance
+            // before its peer finishes. Resume the same tasks, without running
+            // an owner syscall, until both fixed workloads have completed.
+            for _ in 0..32 {
+                let allowance = k.instructions + 100_000;
+                assert!(k
+                    .parallel_epoch(
+                        &mut trames_linux::CapturedOutput::default(),
+                        allowance,
+                        true
+                    )
+                    .unwrap());
+                if k.processes.values().all(|p| p.cpu.x(9) == 0) {
+                    break;
+                }
+            }
+            assert!(k.processes.values().all(|p| p.cpu.x(9) == 0));
+            assert_eq!(k.service_requests, 0);
+            assert_eq!(evaluations.load(std::sync::atomic::Ordering::Relaxed), 2000);
+            assert!(!k.cohort_return_syscalls.contains_key(&163));
+            assert!(k.worker_syscalls >= 2000);
+            for p in k.processes.values() {
+                assert_eq!(
+                    p.memory.read_u64(0x1000).unwrap(),
+                    if decision == 0x7fff0000 {
+                        trames_vfs::MAX_FDS as u64
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+    }
     use trames_cpu::Cpu;
     type Kernel = crate::process::Kernel<Cpu>;
 
@@ -423,6 +498,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -633,6 +709,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -732,6 +809,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    limits: None,
                     timers: Some(timers),
 
                     saved_wait_mask: Default::default(),
@@ -858,6 +936,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    limits: None,
                     timers: None,
 
                     saved_wait_mask: Default::default(),
@@ -970,6 +1049,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    limits: None,
                     timers: None,
 
                     saved_wait_mask: Default::default(),
@@ -1083,6 +1163,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -1620,6 +1701,7 @@ mod tests {
             .wait((0, 7, 0x1000), 3, 1, || Ok::<_, ()>(()))
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),
@@ -1878,6 +1960,7 @@ mod tests {
                         .unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    limits: None,
                     timers: None,
 
                     saved_wait_mask: Default::default(),
@@ -1920,6 +2003,7 @@ mod tests {
             ));
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -1971,6 +2055,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -2015,6 +2100,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -2037,7 +2123,7 @@ mod tests {
                 futex: Default::default(),
             };
             assert!(!snapshot.admit(&p.cpu));
-            assert_eq!(snapshot.signal_entry(&p.cpu).unwrap().allowed(), allowed);
+            assert_eq!(snapshot.task_entry(&p.cpu).unwrap().allowed(), allowed);
             if allowed {
                 assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
             }
@@ -2047,7 +2133,7 @@ mod tests {
             );
             p.cpu.set_x(1, 0x1100);
             assert!(!snapshot.admit(&p.cpu));
-            assert_eq!(snapshot.signal_entry(&p.cpu).unwrap().allowed(), allowed);
+            assert_eq!(snapshot.task_entry(&p.cpu).unwrap().allowed(), allowed);
             if allowed {
                 assert_eq!(snapshot.invoke(&p.cpu, &mut p.memory), Some(0));
             }
@@ -2069,6 +2155,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -2123,6 +2210,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -2179,6 +2267,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                limits: None,
                 timers: None,
 
                 saved_wait_mask: Default::default(),
@@ -2230,6 +2319,7 @@ mod tests {
                 ));
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    limits: None,
                     timers: None,
 
                     saved_wait_mask: Default::default(),

@@ -89,7 +89,7 @@ impl Vfs {
                     if seals.is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old) {
                         return Err(Errno(1));
                     }
-                    if mode == 0 && end > self.file_size_limit {
+                    if mode == 0 && end > self.file_size_limit.get() {
                         return Err(Errno(27));
                     }
                 } else if mode != 0 {
@@ -108,7 +108,7 @@ impl Vfs {
         if seals.is_some_and(|s| s & 2 != 0 && length < old || s & 4 != 0 && length > old) {
             return Err(Errno(1));
         }
-        if length > old && length > self.file_size_limit {
+        if length > old && length > self.file_size_limit.get() {
             self.file_size_signal.set(true);
             return Err(Errno(27));
         }

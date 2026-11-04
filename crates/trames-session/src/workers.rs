@@ -968,8 +968,8 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     break result;
                                 }
                                 if let Some(snapshot)=&work.syscalls {
-                                    if matches!(work.cpu.x(8) as u32, 132..=137) || snapshot.signal_send(&work.cpu) {
-                                        if let Some(entry)=snapshot.signal_entry(&work.cpu) {
+                                    if matches!(work.cpu.x(8) as u32, 132..=137) || snapshot.signal_send(&work.cpu) || snapshot.limit_call(work.cpu.x(8) as u32) {
+                                        if let Some(entry)=snapshot.task_entry(&work.cpu) {
                                             if !entry.allowed() {
                                                 if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
                                                 job.seccomp_entry=Some(entry);break result;
@@ -987,7 +987,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(began)=began{syscall_time+=began.elapsed();}
                                             syscalls+=1;break SliceOutcome::Yield{instructions:0};
                                         }
-                                        let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("signal control View")).expect("shared signal control");
+                                        let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("task control View")).expect("shared task control");
                                         if let Some(began)=began{syscall_time+=began.elapsed();}
                                         work.cpu.set_x(0,value);syscalls+=1;continue;
                                     }
@@ -1718,6 +1718,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),

@@ -166,7 +166,7 @@ impl Vfs {
             .collect();
         *view.mount_registry.borrow_mut() = registry.iter().map(Rc::downgrade).collect();
         view.credentials = self.credentials.clone();
-        view.file_size_limit = self.file_size_limit;
+        view.file_size_limit = self.file_size_limit.clone();
         view.context.share_mask(&self.context);
         view.lock_owner = self.lock_owner;
         *view.mount_resources.borrow_mut() = self.mount_resources.borrow().clone();

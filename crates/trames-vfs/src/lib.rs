@@ -26,7 +26,9 @@ pub use stream_transfer::{StreamTransfer, TransferWait};
 mod descriptor_factory;
 mod fd_allocator;
 mod fd_table;
+mod resource_limits;
 pub use descriptor_factory::DescriptorFactory;
+pub use resource_limits::{DescriptorLimit, FileSizeLimit};
 mod open_handle;
 pub use open_handle::OfdIdentity;
 use open_handle::{OpenHandle, OpenMount, OpenWeak};
@@ -668,7 +670,7 @@ pub struct Vfs {
     pid: u32,
     lock_owner: u32,
     record_locks: Arc<locks::Registry>,
-    file_size_limit: u64,
+    file_size_limit: FileSizeLimit,
     file_size_signal: Cell<bool>,
     next_open: Arc<AtomicU64>,
     proc_accessed: Cell<bool>,
@@ -745,7 +747,7 @@ impl Vfs {
             pid: self.pid,
             lock_owner: self.lock_owner,
             record_locks: self.record_locks.clone(),
-            file_size_limit: self.file_size_limit,
+            file_size_limit: self.file_size_limit.fork(),
             file_size_signal: self.file_size_signal.clone(),
             next_open: self.next_open.clone(),
             proc_accessed: self.proc_accessed.clone(),
@@ -801,7 +803,7 @@ impl Vfs {
             controlling_pair: None,
             lock_owner: 1,
             record_locks: Arc::default(),
-            file_size_limit: u64::MAX,
+            file_size_limit: FileSizeLimit::default(),
             file_size_signal: Cell::new(false),
             next_open: Arc::new(AtomicU64::new(1)),
             proc_accessed: Cell::new(false),
@@ -2822,8 +2824,18 @@ impl Vfs {
         self.file_write_description(descriptor, bytes, None)
     }
     /// Per-task RLIMIT_FSIZE; disk quota remains a separate ENOSPC constraint.
+    pub fn file_size_limit_handle(&self) -> FileSizeLimit {
+        self.file_size_limit.clone()
+    }
+    pub fn descriptor_limit_handle(&self) -> DescriptorLimit {
+        self.shared_files().limit_handle()
+    }
+    pub fn bind_resource_limits(&mut self, file_size: FileSizeLimit, nofile: DescriptorLimit) {
+        self.file_size_limit = file_size;
+        self.fds.bind_limit(nofile.0);
+    }
     pub fn set_file_size_limit(&mut self, limit: u64) {
-        self.file_size_limit = limit;
+        self.file_size_limit.set(limit);
         self.file_size_signal.set(false);
     }
     pub fn take_file_size_signal(&self) -> bool {
@@ -2839,6 +2851,7 @@ impl Vfs {
         bytes: &[u8],
         offset: Option<u64>,
     ) -> Result<usize> {
+        let file_size_limit = self.file_size_limit.get();
         let mut o = descriptor.open.borrow_mut();
         if let Some(mount) = &o.mount {
             mount.writable()?;
@@ -2882,10 +2895,9 @@ impl Vfs {
                     let mut position = o.file_position.lock().unwrap();
                     let at = offset.unwrap_or(position.value);
                     let append = o.flags.get() & 0x400 != 0;
-                    let result =
-                        data.write_limited(at, bytes, append, self.file_size_limit, || {
-                            self.file_size_signal.set(true)
-                        });
+                    let result = data.write_limited(at, bytes, append, file_size_limit, || {
+                        self.file_size_signal.set(true)
+                    });
                     if let Ok((_, end)) = result {
                         if offset.is_none() {
                             position.value = end;
@@ -2938,13 +2950,13 @@ impl Vfs {
                 let bytes = if plain {
                     bytes
                 } else {
-                    if position >= self.file_size_limit {
+                    if position >= file_size_limit {
                         self.file_size_signal.set(true);
                         return Err(Errno(27));
                     }
-                    let bytes = &bytes[..bytes.len().min(
-                        usize::try_from(self.file_size_limit - position).unwrap_or(usize::MAX),
-                    )];
+                    let bytes = &bytes[..bytes
+                        .len()
+                        .min(usize::try_from(file_size_limit - position).unwrap_or(usize::MAX))];
                     let end = position
                         .checked_add(bytes.len() as u64)
                         .filter(|&n| n <= i64::MAX as u64)
@@ -2971,7 +2983,7 @@ impl Vfs {
                     position,
                     bytes,
                     o.flags.get() & 0x400 != 0,
-                    self.file_size_limit,
+                    file_size_limit,
                     || self.file_size_signal.set(true),
                 )?;
                 if offset.is_none() {

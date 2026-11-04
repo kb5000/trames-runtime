@@ -94,7 +94,6 @@ impl<C: Cpu> Kernel<C> {
         }
         p.linux.vfs.set_process_context(request.pid);
         p.linux.vfs.set_lock_owner(p.tgid);
-        p.linux.vfs.set_file_size_limit(p.file_size_limit.get().0);
         let began = self.profile_syscalls.then(Instant::now);
         let number = request.number;
         let result = match number {
@@ -174,6 +173,7 @@ mod tests {
         cpu.set_x(8, number as u64);
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
+            limits: None,
             timers: None,
 
             saved_wait_mask: Default::default(),

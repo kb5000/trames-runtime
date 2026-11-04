@@ -488,8 +488,11 @@ mod tests {
                     })
                 })
                 .collect();
-            for job in jobs {
-                match job.join().unwrap() {
+            // Retire both concurrent attempts before retrying a parked one;
+            // its peer may still own the input reservation until it returns.
+            let outcomes: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+            for outcome in outcomes {
+                match outcome {
                     FileOutcome::Waiting(work) => assert_eq!(finish(work), Ok(4096)),
                     FileOutcome::Complete(reply) => assert!(matches!(
                         reply.result,

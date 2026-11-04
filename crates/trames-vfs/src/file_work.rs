@@ -519,7 +519,7 @@ impl PathQueries {
             .clone();
         let mut view = Vfs::empty(fs);
         view.credentials = original.credentials.clone();
-        view.file_size_limit = original.file_size_limit;
+        view.file_size_limit = original.file_size_limit.clone();
         view.query = Some(original.query.as_ref().map_or_else(
             || path_queries::Authority::file_root(original),
             path_queries::Authority::file_projection,

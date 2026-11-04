@@ -725,7 +725,7 @@ impl Vfs {
         let reservation = files.reserve()?;
         let mut open = self.memfd_open(b"io_uring", 1)?;
         let file = Self::shared_file_open(&open)?;
-        if ring_bytes + sqe_bytes > self.file_size_limit {
+        if ring_bytes + sqe_bytes > self.file_size_limit.get() {
             return Err(Errno(27));
         }
         file.set_len((ring_bytes + sqe_bytes) as usize)
