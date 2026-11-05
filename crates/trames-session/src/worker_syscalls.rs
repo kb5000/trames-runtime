@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
     pub exit_files: Option<trames_vfs::FileTableOwner>,
     pub children: Arc<trames_kernel::children::Children>,
@@ -513,9 +514,10 @@ impl Snapshot {
         let Some(files) = &self.exit_files else {
             return false;
         };
-        // Actual excluded controls retain their original destructor boundary;
-        // no owner-only description can be published by this active cohort.
-        if files.has_owner_controls() || !self.io_signals.try_exit_nonlast(pid, status) {
+        // Logical Files retirement is shared. Opaque owner descriptions retain
+        // their original Rc projection until the returned CPU's cold event;
+        // no View or calling worker waits for that destructor.
+        if !self.io_signals.try_exit_nonlast(pid, status) {
             return false;
         }
         self.direct
@@ -927,6 +929,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),
@@ -1058,6 +1061,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),
@@ -1119,6 +1123,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),
@@ -1224,6 +1229,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),
@@ -1293,6 +1299,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),

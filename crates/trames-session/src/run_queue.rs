@@ -23,6 +23,7 @@ pub(super) enum WaitState {
     OwnerEvent,
     Signal(Arc<SignalWait>),
     Child(Arc<ChildWait>),
+    Vfork(Arc<VforkWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -31,6 +32,23 @@ pub(super) enum WaitState {
         deadline: Instant,
         remaining: u64,
     },
+}
+pub(super) struct VforkWait {
+    pub release: Arc<trames_kernel::vfork::Release>,
+    subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
+}
+impl VforkWait {
+    pub fn new(release: Arc<trames_kernel::vfork::Release>) -> Arc<Self> {
+        Arc::new(Self {
+            release,
+            subscriptions: Default::default(),
+        })
+    }
+    fn bind(&self, task: &trames_kernel::signal::IoTask, signal: &Arc<trames_vfs::IoSignal>) {
+        let mut subscriptions = task.subscribe(signal);
+        subscriptions.push(self.release.subscribe(signal));
+        *self.subscriptions.lock().unwrap() = subscriptions;
+    }
 }
 pub(super) struct ChildWait {
     pub request: trames_kernel::children::Wait,
@@ -74,7 +92,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
-            Self::OwnerEvent | Self::Child(_) => None,
+            Self::OwnerEvent | Self::Child(_) | Self::Vfork(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
@@ -316,7 +334,8 @@ impl<C: Cpu> Job<C> {
             return None;
         }
         Some(
-            self.pending_cpu.is_some()
+            matches!(self.waiting, Some(WaitState::Vfork(ref wait)) if !wait.release.finished())
+                || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
                 || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
                 || self
@@ -372,10 +391,16 @@ impl<C: Cpu> Job<C> {
                     .gpu_pending
                     .as_ref()
                     .is_some_and(|g| g.compile.is_some() && !g.waiting())
+                || matches!(&self.waiting, Some(WaitState::Vfork(wait)) if wait.release.finished())
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
                         && io.signal.ready()
                 });
+        }
+        if let Some(WaitState::Vfork(wait)) = &self.waiting {
+            if wait.release.finished() {
+                return true;
+            }
         }
         if let Some(WaitState::Child(wait)) = &self.waiting {
             if self.work.syscalls.as_ref().is_some_and(|s| {
@@ -400,7 +425,8 @@ impl<C: Cpu> Job<C> {
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
-                        && !(self.gpu_pending.is_some()
+                        && !(matches!(&self.waiting, Some(WaitState::Vfork(wait)) if !wait.release.finished())
+                            || self.gpu_pending.is_some()
                             || self
                                 .retry
                                 .as_ref()
@@ -429,6 +455,23 @@ impl<C: Cpu> Job<C> {
             self.stats
                 .finish(work.pid, work.cpu, outcome, self.waiting, io, gpu_pending);
         done.seccomp_entry = self.seccomp_entry;
+        done
+    }
+    pub fn finish_retired(self, outcome: Option<SliceOutcome>, peer: u64, status: i32) -> Done<C> {
+        let vfork = self
+            .work
+            .syscalls
+            .as_ref()
+            .and_then(|s| s.vfork_release.clone());
+        let mut done = self.finish(outcome, peer);
+        if done.outcome.is_some() {
+            // The dying CPU can no longer access the old mm. Parent release
+            // does not wait for unrelated FD/metadata destruction on its owner.
+            if let Some(release) = vfork {
+                release.finish();
+            }
+            done.thread_exit = Some(status);
+        }
         done
     }
 }
@@ -494,6 +537,8 @@ struct Queues<C: Cpu> {
     running: usize,
     services: usize,
     finished: Vec<Done<C>>,
+    projected: usize,
+    retirement_notified: bool,
     initial_slots: BTreeMap<u32, usize>,
     gpu_peak_pending: usize,
     host_waiting: bool,
@@ -700,6 +745,9 @@ impl<C: Cpu> Epoch<C> {
             }
             if let Some(WaitState::Child(wait)) = &job.waiting {
                 wait.bind(&snapshot.children, &snapshot.io_signals, &signal);
+            }
+            if let Some(WaitState::Vfork(wait)) = &job.waiting {
+                wait.bind(&snapshot.io_signals, &signal);
             }
             snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
@@ -1199,10 +1247,28 @@ impl<C: Cpu> Epoch<C> {
         q.domains.notify_ready();
         let exited = done.thread_exit.is_some();
         q.finished.push(done);
+        if exited && !q.retirement_notified {
+            if let Some(events) = &q.domains.events {
+                let _ = events.send(crate::workers::Event::<C>::Retired);
+                q.retirement_notified = true;
+            }
+        }
         if !exited {
             self.control.stop();
         }
         self.notify(&mut q);
+    }
+    /// CPUs and metrics stay in the original completion queue until collection.
+    /// Only actual returned source exits publish a cold-projection event.
+    pub fn take_retired_projections(&self) -> Vec<(u32, i32)> {
+        let mut q = self.queues.lock().unwrap();
+        let retired = q.finished[q.projected..]
+            .iter()
+            .filter_map(|done| done.thread_exit.map(|status| (done.pid, status)))
+            .collect();
+        q.projected = q.finished.len();
+        q.retirement_notified = false;
+        retired
     }
     /// All launched workers must have acknowledged stop before this call.
     pub fn drain(&self) -> Vec<Done<C>> {
@@ -1210,6 +1276,8 @@ impl<C: Cpu> Epoch<C> {
         assert_eq!(q.running, 0);
         assert_eq!(q.services, 0, "in-flight service still owns a View");
         let mut done = std::mem::take(&mut q.finished);
+        q.projected = 0;
+        q.retirement_notified = false;
         let mut jobs: Vec<_> = q.ready.drain(..).collect();
         jobs.extend(std::mem::take(&mut q.parked).into_values());
         jobs.extend(q.domains.drain());

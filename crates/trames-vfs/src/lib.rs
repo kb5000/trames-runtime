@@ -2537,6 +2537,7 @@ impl Vfs {
     /// Collect owner-local projections after the original FileTableOwner has
     /// retired. Source exits must not re-run descriptor or process-lock release.
     pub fn collect_retired_descriptors(&mut self) {
+        self.fds.retire_owner_controls(Some(self.lock_owner));
         self.detach_file_table();
         self.reap_local_rights();
         self.reap_detached_mounts();

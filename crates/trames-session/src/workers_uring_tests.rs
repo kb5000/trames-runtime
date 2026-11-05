@@ -6,6 +6,7 @@ use trames_cpu::Cpu;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
+        vfork_release: None,
         native_space: None,
         exit_files: None,
         children: Default::default(),
@@ -34,7 +35,7 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
 }
 #[test]
 fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_slot() {
-    for mode in 0..4 {
+    for mode in 0..5 {
         let mut linux = trames_linux::Linux::new(0x100000);
         let [reader, writer] = linux.vfs.pipe(0).unwrap();
         let (fd, ring) = linux.vfs.uring_create(4, 8).unwrap();
@@ -123,9 +124,12 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
                 deadline: None,
             },
             2 => crate::run_queue::WaitState::OwnerEvent,
-            _ => crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(
+            3 => crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(
                 trames_kernel::children::Wait::prepare(95, [0, 0, 0, 4, 0, 0]).unwrap(),
             )),
+            _ => {
+                crate::run_queue::WaitState::Vfork(crate::run_queue::VforkWait::new(Arc::default()))
+            }
         };
         epoch.add(crate::run_queue::Job::new(
             Work {

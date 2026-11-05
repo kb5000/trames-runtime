@@ -158,6 +158,7 @@ pub(super) enum Event<C: Cpu> {
     Service(Box<Request<C>>),
     EpochStopped(usize),
     VmReady,
+    Retired,
     Idle,
 }
 /// A production request retains the task's original allocation and View. The
@@ -498,6 +499,9 @@ impl<C: Cpu> Pool<C> {
                             }
                             if let Some(snapshot) = &work.syscalls {
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
+                                if matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if wait.release.finished()) {
+                                    job.waiting=None;continue;
+                                }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
                                     if let Some(value) = wait.request.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace) {
@@ -527,7 +531,7 @@ impl<C: Cpu> Pool<C> {
                                     if disposition == trames_kernel::signal::Disposition::Terminate {
                                         work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
                                     }
-                                    let stop_held=job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -540,7 +544,7 @@ impl<C: Cpu> Pool<C> {
                                         }
                                         continue;
                                     }
-                                    let uninterruptible = job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -1486,12 +1490,12 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
                         if parked.is_some() || yielded { epoch.park(job, parked); continue; }
-                        let exiting = thread_exit.and_then(|_|job.work.syscalls.as_ref().map(|s|s.io_signals.clone()));
-                        let mut completed = job.finish(outcome, epoch.progress.load(Ordering::Relaxed));
-                        // Membership covers cleanup and the final View, not
-                        // merely the point where the task stopped executing.
-                        if let Some(task)=exiting {task.finish_exit(completed.pid);}
-                        completed.thread_exit = thread_exit.filter(|_|completed.outcome.is_some());
+                        let completed = if let Some(status)=thread_exit {
+                            job.finish_retired(outcome, epoch.progress.load(Ordering::Relaxed),status)
+                        } else {job.finish(outcome, epoch.progress.load(Ordering::Relaxed))};
+                        // The returned CPU publishes completion. Original
+                        // membership also covers cold Rc/Memory projections;
+                        // their actual owner finishes it on the Retired event.
                         epoch.finish(completed);
                     } else if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }
                     }
@@ -1565,9 +1569,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
             match self.received(event) {
                 Event::<C>::Done(done) => return Ok(*done),
                 Event::<C>::Service(request) => request.respond(None),
-                Event::<C>::EpochStopped(_) | Event::<C>::VmReady | Event::<C>::Idle => {
-                    return Err(())
-                }
+                Event::<C>::EpochStopped(_)
+                | Event::<C>::VmReady
+                | Event::<C>::Idle
+                | Event::<C>::Retired => return Err(()),
             }
         }
     }
@@ -1578,9 +1583,12 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
             match self.event_timeout(deadline.saturating_duration_since(Instant::now()))? {
                 Some(Event::<C>::Done(done)) => return Ok(Some(*done)),
                 Some(Event::<C>::Service(request)) => request.respond(None),
-                Some(Event::<C>::EpochStopped(_) | Event::<C>::VmReady | Event::<C>::Idle) => {
-                    return Err(())
-                }
+                Some(
+                    Event::<C>::EpochStopped(_)
+                    | Event::<C>::VmReady
+                    | Event::<C>::Idle
+                    | Event::<C>::Retired,
+                ) => return Err(()),
                 None => return Ok(None),
             }
         }
@@ -1603,7 +1611,7 @@ impl<C: Cpu> Drop for Pool<C> {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
-                Ok(Some(Event::<C>::VmReady | Event::<C>::Idle)) => {}
+                Ok(Some(Event::<C>::VmReady | Event::<C>::Idle | Event::<C>::Retired)) => {}
                 Ok(None) => {
                     for worker in self.workers.iter_mut().flatten() {
                         if worker.join.is_finished() {
@@ -1799,6 +1807,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            vfork_release: None,
             native_space: None,
             exit_files: None,
             children: Default::default(),
@@ -1937,7 +1946,7 @@ mod tests {
             let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
             if !matches!(event, Some(Event::EpochStopped(0))) {
                 epoch.stop();
-                panic!("child wait completion missing: number={number} caught={caught} restart={restart} adopted={adopted} event={}", match event {None=>"none",Some(Event::Service(_))=>"service",Some(Event::Done(_))=>"done",Some(Event::Idle)=>"idle",Some(Event::VmReady)=>"vm",Some(Event::EpochStopped(_))=>"other worker"});
+                panic!("child wait completion missing: number={number} caught={caught} restart={restart} adopted={adopted} event={}", match event {None=>"none",Some(Event::Service(_))=>"service",Some(Event::Done(_))=>"done",Some(Event::Idle)=>"idle",Some(Event::VmReady)=>"vm",Some(Event::Retired)=>"retired",Some(Event::EpochStopped(_))=>"other worker"});
             }
             let done = epoch.drain();
             let caller = done.iter().find(|d| d.pid == 1).unwrap();
@@ -2105,7 +2114,13 @@ mod tests {
                     pool.ensure(slot).unwrap();
                     pool.launch(slot, epoch.clone()).unwrap();
                 }
-                if !owner_control && !legacy_wait {
+                if !legacy_wait {
+                    assert!(matches!(
+                        receive.recv_timeout(Duration::from_secs(5)),
+                        Ok(Event::Retired)
+                    ));
+                    assert_eq!(epoch.take_retired_projections(), [(30, 23 << 8)]);
+                    assert!(epoch.take_retired_projections().is_empty());
                     assert!(matches!(
                         receive.recv_timeout(Duration::from_secs(5)),
                         Ok(Event::Idle)
@@ -2120,19 +2135,20 @@ mod tests {
                     ));
                 }
                 let completed = epoch.drain().pop().unwrap();
-                assert_eq!(completed.thread_exit, (!owner_control).then_some(23 << 8));
+                vfs.collect_retired_descriptors();
+                original.finish_exit(30);
+                assert_eq!(completed.thread_exit, Some(23 << 8));
                 assert_eq!(completed.serviced_syscalls, 0);
                 assert!(
                     native.upgrade().is_some(),
                     "the real mm peer still owns its devices"
                 );
                 native_peer.retire();
-                assert_eq!(
+                assert!(
                     native.upgrade().is_none(),
-                    !owner_control,
                     "source exit, not a later owner projection, retires its mm reference"
                 );
-                if !owner_control {
+                {
                     assert!(!original.live());
                     assert!(
                         !visible.present(),
@@ -2149,13 +2165,6 @@ mod tests {
                     if let Some(wait) = &second_legacy {
                         assert!(!wait.woken(), "clear_tid must wake only one waiter");
                     }
-                }
-                if owner_control {
-                    assert!(original.live(), "deferred exit changed task state");
-                    assert!(visible.present());
-                    assert_eq!(addresses.clear_tid(), 0x9000);
-                    assert_eq!(accepted.read(1), Err(trames_vfs::Errno(11)));
-                    assert!(child.process().take(35).is_none());
                 }
             }
         }

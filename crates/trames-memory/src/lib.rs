@@ -338,6 +338,20 @@ impl Default for Memory {
     }
 }
 
+/// Coordinator-local weak custody of an original CLONE_VM graph. Capturing it
+/// neither adds an address-space owner nor retains guest RAM after final exit.
+pub struct SharedRoot(std::rc::Weak<RefCell<Memory>>);
+impl SharedRoot {
+    /// The cohort's Views have returned; another original task/host owner may
+    /// still retain the graph even when its dispatched task already exited.
+    pub fn commit_parallel(&self) -> Result<(), MemoryError> {
+        if let Some(memory) = self.0.upgrade() {
+            memory.borrow_mut().commit_parallel()?;
+        }
+        Ok(())
+    }
+}
+
 impl Memory {
     /// CLONE_VM shares mappings, protections, bytes and the decoder revision.
     /// The inner address space remains private. A local CPU slice may borrow it
@@ -360,6 +374,11 @@ impl Memory {
         self.shared.as_ref().map_or((self.identity, 1), |shared| {
             (shared.borrow().identity, Rc::strong_count(shared))
         })
+    }
+    pub fn shared_root(&self) -> Option<SharedRoot> {
+        self.shared
+            .as_ref()
+            .map(|memory| SharedRoot(Rc::downgrade(memory)))
     }
     pub fn limit(&self) -> usize {
         self.shared

@@ -61,7 +61,7 @@ enum State {
     Blocked(u32, [u64; 6]),
     Sleep(Instant, u64),
     Suspend(u64),
-    Vfork(u32),
+    Vfork(Arc<trames_kernel::vfork::Release>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -107,7 +107,7 @@ pub(crate) struct Process<C: Cpu> {
     retained_poll: Option<Arc<trames_linux::RetainedWait>>,
     pending_open: Option<u32>,
     auto_reap: bool,
-    host_status: Option<Arc<std::sync::atomic::AtomicI32>>,
+    vfork: Option<Arc<trames_kernel::vfork::Release>>,
     tgid: u32,
     started: Instant,
     cpu_time: Duration,
@@ -128,10 +128,9 @@ impl<C: Cpu> Process<C> {
         matches!(self.state, State::Ready) && !self.stopped()
     }
     fn stop_held(&self) -> bool {
-        matches!(
-            self.state,
-            State::Gpu { .. } | State::Vfork(_) | State::Blocked(2, _)
-        ) || self.file_checkpoint.is_some()
+        matches!(self.state, State::Gpu { .. } | State::Blocked(2, _))
+            || matches!(&self.state, State::Vfork(release) if !release.finished())
+            || self.file_checkpoint.is_some()
             || self
                 .retained_file
                 .as_ref()
@@ -458,7 +457,7 @@ impl<C: Cpu> Process<C> {
             retained_poll: None,
             pending_open: None,
             auto_reap: false,
-            host_status: None,
+            vfork: None,
             tgid: self.tgid,
             started: Instant::now(),
             cpu_time: Duration::ZERO,
@@ -1040,7 +1039,7 @@ impl<C: Cpu> Kernel<C> {
             self.memory_limits.per_process,
             self.started,
         )?;
-        child.host_status = Some(request.status);
+        child.family.bind_host_status(request.status);
         child.vm_id = self.resource_id();
         child.linux.vfs.cgroup_fork(1, id, id);
         self.processes.insert(id, child);
@@ -1334,6 +1333,7 @@ impl<C: Cpu> Kernel<C> {
     /// Source exits already retired original resources. Only the owner-local
     /// CPU/Memory/VFS projections return here; never replay accepted effects.
     fn collect_source_exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        p.linux.vfs.set_lock_owner(p.tgid);
         p.linux.vfs.collect_retired_descriptors();
         self.collect_exit_projection(pid, p, status);
     }
@@ -1357,7 +1357,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.state = State::Zombie(status);
         p.signals.io.finish_exit(pid);
-        self.wake_vfork(pid);
+        Self::release_vfork(p);
         if pid != p.tgid {
             p.auto_reap = true;
             self.finish_group(p.tgid);
@@ -1367,9 +1367,6 @@ impl<C: Cpu> Kernel<C> {
 
         if let Some(status) = p.signals.io.lifecycle().exit_status() {
             p.state = State::Zombie(status);
-            if let Some(completion) = &p.host_status {
-                completion.store(status, std::sync::atomic::Ordering::Relaxed);
-            }
             self.reap_namespace_children(
                 pid,
                 p.linux.vfs.pid_namespace(),
@@ -1387,9 +1384,6 @@ impl<C: Cpu> Kernel<C> {
             if let Some(status) = leader.signals.io.lifecycle().exit_status() {
                 leader.state = State::Zombie(status);
                 self.timers.clear_process(tgid, false);
-                if let Some(completion) = &leader.host_status {
-                    completion.store(status, std::sync::atomic::Ordering::Relaxed);
-                }
                 let family = leader.family.clone();
                 let directory = leader.signals.io_directory.clone();
                 let namespace = leader.linux.vfs.pid_namespace().clone();
@@ -1422,6 +1416,7 @@ impl<C: Cpu> Kernel<C> {
                 self.wake_futex(&thread, address, 1, u32::MAX);
                 self.close_exit_files(&mut thread);
                 thread.memory = Memory::default();
+                Self::release_vfork(&mut thread);
                 thread.signals.io.finish_exit(id);
             }
         }
@@ -1433,12 +1428,9 @@ impl<C: Cpu> Kernel<C> {
         }
         self.exit_one(pid, p, status);
     }
-    fn wake_vfork(&mut self, child: u32) {
-        for (&pid, parent) in &mut self.processes {
-            if matches!(parent.state, State::Vfork(id) if id == child) {
-                parent.state = State::Ready;
-                parent.signals.io.lifecycle().hold(pid, false);
-            }
+    fn release_vfork(p: &mut Process<C>) {
+        if let Some(release) = p.vfork.take() {
+            release.finish();
         }
     }
     fn prepare_signal(p: &mut Process<C>, sig: u32, sender: u32) -> bool {
@@ -2663,7 +2655,9 @@ impl<C: Cpu> Kernel<C> {
                 self.publish_task(id, &child);
                 self.processes.insert(id, child);
                 if a[0] & 0x4000 != 0 {
-                    p.state = State::Vfork(id);
+                    let release = Arc::new(trames_kernel::vfork::Release::default());
+                    self.processes.get_mut(&id).unwrap().vfork = Some(release.clone());
+                    p.state = State::Vfork(release);
                     p.cpu.set_x(0, parent_tid as u64);
                     return Ok(None);
                 }
@@ -2700,10 +2694,11 @@ impl<C: Cpu> Kernel<C> {
                         self.wake_futex(&t, address, 1, u32::MAX);
                         t.linux.vfs.release_descriptors();
                         t.space.retire();
+                        Self::release_vfork(&mut t);
                     }
                 }
                 self.timers.clear_process(p.tgid, true);
-                self.wake_vfork(pid);
+                Self::release_vfork(p);
                 if pid != p.tgid {
                     p.linux.vfs.cgroup_exec_rekey(pid, p.tgid);
                     p.rekey = Some(p.tgid);
@@ -4505,7 +4500,10 @@ impl<C: Cpu> Kernel<C> {
                     && vms.contains(&p.vm_id))
                 || (matches!(
                     p.state,
-                    State::Sigwait { .. } | State::Suspend(_) | State::Blocked(95 | 260, _)
+                    State::Sigwait { .. }
+                        | State::Suspend(_)
+                        | State::Blocked(95 | 260, _)
+                        | State::Vfork(_)
                 ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
@@ -4537,6 +4535,19 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         };
         self.admit_private_views(&mut views);
+        // Weak roots preserve final publication when a returned task drops its
+        // wrapper but an undispatched CLONE_VM task still owns the real graph.
+        // They do not alter private-view admission or keep retired RAM alive.
+        let mut rooted = std::collections::BTreeSet::new();
+        let roots: Vec<_> = members
+            .iter()
+            .filter_map(|&(pid, _)| {
+                let memory = &self.processes[&pid].memory;
+                rooted
+                    .insert(memory.coordinator_ownership().0)
+                    .then(|| (pid, memory.shared_root()))
+            })
+            .collect();
         self.parallel_memory_time += began.elapsed();
         for &(_, slot) in &chosen {
             self.workers
@@ -4614,6 +4625,10 @@ impl<C: Cpu> Kernel<C> {
                         args,
                     }),
                 ))
+            } else if let State::Vfork(release) = &p.state {
+                Some(crate::run_queue::WaitState::Vfork(
+                    crate::run_queue::VforkWait::new(release.clone()),
+                ))
             } else if !matches!(p.state, State::Ready) && !source_io && !p.worker_gpu_candidate() {
                 Some(crate::run_queue::WaitState::OwnerEvent)
             } else {
@@ -4638,6 +4653,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    vfork_release: p.vfork.clone(),
                     native_space: Some(p.space.clone()),
                     exit_files: Some(p.linux.vfs.file_table_owner()),
                     children: p.children.clone(),
@@ -4814,6 +4830,7 @@ impl<C: Cpu> Kernel<C> {
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
         let mut checkpoint_error = None;
+        let mut projected_exits = std::collections::BTreeSet::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -4839,6 +4856,17 @@ impl<C: Cpu> Kernel<C> {
                     break;
                 }
                 Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
+                Some(crate::workers::Event::<C>::Retired) => {
+                    for (pid, status) in epoch.take_retired_projections() {
+                        let mut p = self.processes.remove(&pid).expect("returned source task");
+                        self.collect_source_exit(pid, &mut p, status);
+                        // Cohort domain/index records keep their original IDs.
+                        // Physical projections are gone; the tombstone lasts
+                        // only until every cohort CPU returns its metrics.
+                        self.processes.insert(pid, p);
+                        projected_exits.insert(pid);
+                    }
+                }
                 Some(crate::workers::Event::<C>::VmReady) => {
                     while !control.stopped() {
                         let Some(checkpoint) = epoch.take_checkpoint() else {
@@ -4893,7 +4921,11 @@ impl<C: Cpu> Kernel<C> {
             {
                 Some(crate::workers::Event::<C>::EpochStopped(_)) => stopped += 1,
                 Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
-                Some(crate::workers::Event::<C>::VmReady | crate::workers::Event::<C>::Idle) => {}
+                Some(
+                    crate::workers::Event::<C>::VmReady
+                    | crate::workers::Event::<C>::Idle
+                    | crate::workers::Event::<C>::Retired,
+                ) => {}
                 Some(crate::workers::Event::<C>::Service(request)) => request.respond(None),
                 None => {}
             }
@@ -4919,12 +4951,12 @@ impl<C: Cpu> Kernel<C> {
         // exits/exec/fork, which may remove peers. Worker WAIT already compared
         // and enqueued under its futex bucket; completed calls are not replayed.
         let began = Instant::now();
-        for (index, &(id, _)) in members.iter().enumerate() {
-            let vm_id = self.processes[&id].vm_id;
-            if members[..index]
-                .iter()
-                .any(|&(peer, _)| self.processes[&peer].vm_id == vm_id)
-            {
+        for (id, root) in roots {
+            if let Some(root) = root {
+                root.commit_parallel()?;
+                continue;
+            }
+            if projected_exits.contains(&id) {
                 continue;
             }
             self.processes
@@ -5016,6 +5048,7 @@ impl<C: Cpu> Kernel<C> {
                     crate::run_queue::WaitState::Child(wait) => {
                         State::Blocked(wait.request.number, wait.request.args)
                     }
+                    crate::run_queue::WaitState::Vfork(wait) => State::Vfork(wait.release.clone()),
                     crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
                 })
             };
@@ -5094,6 +5127,7 @@ impl<C: Cpu> Kernel<C> {
                 );
             }
             if let Some(status) = done.thread_exit {
+                p.state = State::Zombie(status);
                 thread_exits.push((done.pid, status));
             } else {
                 outcomes.push((done.pid, outcome));
@@ -5104,7 +5138,9 @@ impl<C: Cpu> Kernel<C> {
         // the last member's process/group exit inspects this process graph.
         for (pid, status) in thread_exits {
             if let Some(mut p) = self.processes.remove(&pid) {
-                self.collect_source_exit(pid, &mut p, status);
+                if !projected_exits.contains(&pid) {
+                    self.collect_source_exit(pid, &mut p, status);
+                }
                 if !p.auto_reap || pid == 1 {
                     self.processes.insert(pid, p);
                 }
@@ -5715,7 +5751,7 @@ pub(super) fn run<C: Cpu>(
         retained_poll: None,
         pending_open: None,
         auto_reap: false,
-        host_status: None,
+        vfork: None,
         tgid: 1,
         started: Instant::now(),
         cpu_time: Duration::ZERO,
@@ -7231,7 +7267,7 @@ mod tests {
             retained_poll: None,
             pending_open: None,
             auto_reap: false,
-            host_status: None,
+            vfork: None,
             tgid: 1,
             started: Instant::now(),
             cpu_time: Duration::ZERO,
@@ -8579,6 +8615,218 @@ mod tests {
         );
     }
     #[test]
+    fn vfork_parent_resumes_from_source_retirement_while_peer_cpu_keeps_running() {
+        use std::sync::mpsc;
+        use trames_engine::Cpu as _;
+        struct Wake(mpsc::Sender<()>);
+        impl trames_vfs::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+                let _ = self.0.send(());
+            }
+        }
+        struct Output {
+            entered: Option<mpsc::Sender<()>>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl GuestOutput for Output {
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(bytes.len())
+            }
+        }
+        for (owner_control, owner_busy) in [(false, false), (true, false), (true, true)] {
+            let (entered, owner_entered) = mpsc::channel();
+            let (resume_owner, owner_resume) = mpsc::channel();
+            let (publish, handles) = mpsc::channel();
+            let (start, go) = mpsc::channel();
+            let (finished, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                let mut root = process();
+                root.affinity = 3;
+                let [reader, writer] = root.linux.vfs.pipe(0).unwrap();
+                let [resume, _] = root.linux.vfs.pipe(0).unwrap();
+                let [child_gate, release_child] = root.linux.vfs.pipe(0).unwrap();
+                let release_child = root
+                    .linux
+                    .vfs
+                    .shared_files()
+                    .lookup(release_child)
+                    .unwrap()
+                    .unwrap()
+                    .direct_byte()
+                    .unwrap();
+                let observed = root
+                    .linux
+                    .vfs
+                    .shared_files()
+                    .lookup(reader)
+                    .unwrap()
+                    .unwrap()
+                    .direct_byte()
+                    .unwrap();
+                root.memory.write(0x1100, b"P").unwrap();
+                let mov = |reg: u32, value: u32| 0xd2800000 | value << 5 | reg;
+                for (base, words) in [
+                    (
+                        0x4000,
+                        vec![
+                            mov(0, writer),
+                            mov(1, 0x1100),
+                            mov(2, 1),
+                            mov(8, 64),
+                            0xd4000001,
+                            mov(0, resume),
+                            mov(1, 0x1200),
+                            mov(2, 1),
+                            mov(8, 63),
+                            0xd4000001,
+                            0x14000000,
+                        ],
+                    ),
+                    (
+                        0x4100,
+                        vec![
+                            mov(0, child_gate),
+                            mov(1, 0x1300),
+                            mov(2, 1),
+                            mov(8, 63),
+                            0xd4000001,
+                            mov(0, 23),
+                            mov(8, 93),
+                            0xd4000001,
+                        ],
+                    ),
+                    (
+                        0x4300,
+                        vec![
+                            mov(0, 1),
+                            mov(1, 0x1100),
+                            mov(2, 1),
+                            mov(8, 64),
+                            0xd4000001,
+                            0x14000000,
+                        ],
+                    ),
+                    (0x4200, vec![0x14000000]),
+                ] {
+                    for (i, word) in words.into_iter().enumerate() {
+                        root.memory
+                            .write_array(base + i as u64 * 4, word.to_le_bytes())
+                            .unwrap();
+                    }
+                }
+                root.memory
+                    .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                    .unwrap();
+                k.syscall(
+                    1,
+                    &mut root,
+                    220,
+                    [0x4111, 0, 0, 0, 0, 0],
+                    &mut trames_linux::CapturedOutput::default(),
+                )
+                .unwrap();
+                let task = root.signals.io.clone();
+                k.processes.insert(1, root);
+                let mut child = k.processes.remove(&2).unwrap();
+                child.cpu.set_pc(0x4100);
+                k.syscall(
+                    2,
+                    &mut child,
+                    220,
+                    [0x10b00, 0, 0, 0, 0, 0],
+                    &mut trames_linux::CapturedOutput::default(),
+                )
+                .unwrap();
+                k.processes.get_mut(&3).unwrap().cpu.set_pc(0x4200);
+                if owner_busy {
+                    k.syscall(
+                        2,
+                        &mut child,
+                        220,
+                        [0x10b00, 0, 0, 0, 0, 0],
+                        &mut trames_linux::CapturedOutput::default(),
+                    )
+                    .unwrap();
+                    k.processes.get_mut(&4).unwrap().cpu.set_pc(0x4300);
+                }
+                if owner_control {
+                    child.linux.vfs.epoll_create(0).unwrap();
+                }
+                k.processes.insert(2, child);
+                publish.send((observed, task, release_child)).unwrap();
+                go.recv().unwrap();
+                let mut output = Output {
+                    entered: owner_busy.then_some(entered),
+                    resume: owner_resume,
+                };
+                let result = k.parallel_epoch(&mut output, u64::MAX / 2, true);
+                finished
+                    .send((
+                        result.is_ok(),
+                        matches!(k.processes[&2].state, State::Zombie(status) if status == 23 << 8),
+                        k.cohort_return_syscalls.get(&93).copied().unwrap_or(0),
+                    ))
+                    .unwrap();
+            });
+            let (observed, task, release_child) =
+                handles.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (wake, readable) = mpsc::channel();
+            let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake(wake));
+            let signal = trames_vfs::IoSignal::new(0, Arc::downgrade(&target));
+            let _subscription = observed.subscribe(&signal);
+            start.send(()).unwrap();
+            let owner_blocked =
+                !owner_busy || owner_entered.recv_timeout(Duration::from_secs(1)).is_ok();
+            assert_eq!(release_child.write(b"R"), Ok(1));
+            let notification = readable.recv_timeout(Duration::from_secs(1));
+            let bytes = observed.read(1);
+            let still_running = matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty));
+            // Release the harness even when a regression strands the parent.
+            let _ = resume_owner.send(());
+            task.job_signal(9, false, Info::default(), true).unwrap();
+            let result = done.recv_timeout(Duration::from_secs(5));
+            worker.join().unwrap();
+            assert!(
+                owner_blocked && notification.is_ok() && bytes == Ok(b"P".to_vec()) && still_running,
+                "vfork parent waited for cohort return: owner={owner_control} busy={owner_busy} blocked={owner_blocked} bytes={bytes:?}"
+            );
+            assert!(matches!(result, Ok((true, true, 0))));
+        }
+    }
+    #[test]
+    fn released_vfork_acknowledges_stop_without_running_guest_code() {
+        let mut k = kernel();
+        let mut parent = process();
+        let release = Arc::new(trames_kernel::vfork::Release::default());
+        parent.state = State::Vfork(release.clone());
+        k.publish_io_tasks(Some((1, &parent)));
+        let group = parent.signals.io.lifecycle().clone();
+        let lease = group.enter(&parent.signals.io, 1);
+        assert!(group.consume_stop(19, || true));
+        lease.finish(Some(true));
+        assert!(!k.resume_event(&mut parent));
+        assert_eq!(parent.wait_event.pending(), None);
+        release.finish();
+        assert!(k.resume_event(&mut parent));
+        assert!(
+            !parent.runnable(),
+            "release must preserve the original stop"
+        );
+        parent.publish_stop_hold(1);
+        assert_eq!(parent.wait_event.pending(), Some((19 << 8) | 0x7f));
+    }
+    #[test]
     fn original_group_completion_uses_final_thread_or_first_group_exit_status() {
         for group_exit in [false, true] {
             let mut k = kernel();
@@ -8591,7 +8839,7 @@ mod tests {
             k.syscall(2, &mut child, 220, [0x10f00, 0, 0, 0, 0, 0], &mut output)
                 .unwrap();
             let status = Arc::new(std::sync::atomic::AtomicI32::new(-1));
-            child.host_status = Some(status.clone());
+            child.family.bind_host_status(status.clone());
             k.publish_io_tasks(Some((2, &child)));
             k.exit_one(2, &mut child, 11 << 8);
             assert!(!child.auto_reap);

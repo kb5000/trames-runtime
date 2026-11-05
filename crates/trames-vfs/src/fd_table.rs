@@ -135,17 +135,6 @@ pub struct FileTableRetirement {
     pub owner_controls: usize,
 }
 impl FileTableOwner {
-    /// Owner-only control projections cannot be introduced by an admitted
-    /// worker publication. Their actual destructor still needs its boundary.
-    pub fn has_owner_controls(&self) -> bool {
-        self.0
-            .membership
-            .entries
-            .lock()
-            .unwrap()
-            .values()
-            .any(|slot| matches!(slot.open, SlotOpen::Owner(..)))
-    }
     fn initial(files: &SharedFiles) -> Self {
         Self(Arc::new(TaskFiles {
             membership: files.0.clone(),
@@ -882,9 +871,8 @@ impl DescriptorTable {
     }
     pub(super) fn retire(&self, lock_owner: u32) {
         self.2.retire(lock_owner);
-        self.retire_owner_controls(Some(lock_owner));
     }
-    fn retire_owner_controls(&self, lock_owner: Option<u32>) {
+    pub(super) fn retire_owner_controls(&self, lock_owner: Option<u32>) {
         if self.1 .0.owners.load(Ordering::Relaxed) != 0 {
             return;
         }
@@ -1290,6 +1278,14 @@ mod tests {
         let mut v = Vfs::default();
         let epoll = v.epoll_create(0).unwrap();
         let open = Arc::downgrade(&v.descriptor(epoll).unwrap().open.borrow().shared);
+        let control = match v.descriptor(epoll).unwrap().open {
+            OpenHandle::Owner(control) => Rc::downgrade(&control),
+            _ => panic!("legacy control must retain its original owner projection"),
+        };
+        let mut epoch = crate::FileEpoch::default();
+        let captured = epoch.capture(&v, true);
+        let bytes = v.direct_descriptors();
+        let files = v.shared_files();
         let owner = v.file_table_owner();
         let result = std::thread::spawn(move || owner.retire(1))
             .join()
@@ -1303,12 +1299,14 @@ mod tests {
             }
         );
         assert!(open.upgrade().is_some());
-        assert_eq!(
-            v.flags(epoll),
-            Err(Errno(9)),
-            "numeric membership has retired"
-        );
-        v.release_descriptors();
+        assert!(control.upgrade().is_some());
+        assert!(matches!(files.lookup(epoll), Some(Err(Errno(9)))));
+        // Cold ownership, not a whole-cohort join: captured source capabilities
+        // remain live while the real private Rc control is destroyed here.
+        v.collect_retired_descriptors();
+        assert!(control.upgrade().is_none());
+        drop((captured, bytes));
+        epoch.finish();
         assert!(open.upgrade().is_none());
     }
     #[test]

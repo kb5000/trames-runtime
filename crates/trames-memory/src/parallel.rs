@@ -2440,6 +2440,22 @@ mod tests {
         assert_eq!(memory.commit_parallel(), Err(MemoryError::BackingIo(5)));
         memory.commit_parallel().unwrap();
         assert_eq!(memory.read_u64(0x1020).unwrap(), 42);
+        // The dispatched wrapper can retire while a blocked, undispatched
+        // CLONE_VM task still owns this exact graph. Weak cohort custody must
+        // publish its legacy backing without adding an owner or retaining RAM.
+        let peer = memory.share();
+        let root = memory.shared_root().unwrap();
+        assert_eq!(memory.coordinator_ownership().1, 2);
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.write_array(0x3020, 99u64.to_le_bytes()).unwrap();
+        drop(view);
+        drop(memory);
+        assert_eq!(peer.coordinator_ownership().1, 1);
+        root.commit_parallel().unwrap();
+        assert_eq!(peer.read_u64(0x1020).unwrap(), 99);
+        assert_eq!(u64::from_le_bytes(object.bytes.borrow()[32..40].try_into().unwrap()), 99);
+        drop(peer);
+        assert!(root.0.upgrade().is_none());
     }
     #[test]
     fn immutable_code_ignores_unrelated_live_code_epochs() {

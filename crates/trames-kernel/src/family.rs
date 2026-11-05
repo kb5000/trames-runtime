@@ -25,6 +25,8 @@ pub struct Family {
     presence: AtomicUsize,
     parent_changed: AtomicBool,
     registry: std::sync::OnceLock<Weak<Families>>,
+    status: std::sync::OnceLock<i32>,
+    host_status: std::sync::OnceLock<Arc<std::sync::atomic::AtomicI32>>,
 }
 impl Default for Family {
     fn default() -> Self {
@@ -37,6 +39,8 @@ impl Default for Family {
             presence: AtomicUsize::new(0),
             parent_changed: AtomicBool::new(false),
             registry: Default::default(),
+            status: Default::default(),
+            host_status: Default::default(),
         }
     }
 }
@@ -61,6 +65,12 @@ impl Family {
     pub fn registry(&self) -> Option<Arc<Families>> {
         self.registry.get()?.upgrade()
     }
+    pub fn status(&self) -> Option<i32> {
+        self.status.get().copied()
+    }
+    pub fn bind_host_status(&self, status: Arc<std::sync::atomic::AtomicI32>) {
+        self.host_status.get_or_init(|| status);
+    }
 }
 pub struct Binding {
     pub id: u32,
@@ -77,6 +87,9 @@ struct Entry {
     binding: Binding,
     parent: Weak<Family>,
     children: BTreeMap<u32, Weak<Family>>,
+    pending: Option<i32>,
+    waiting: usize,
+    dependents: Vec<Weak<Family>>,
 }
 #[derive(Default)]
 struct State {
@@ -137,6 +150,7 @@ pub struct Families(Mutex<State>);
 pub struct Victim {
     pub id: u32,
     pub family: Arc<Family>,
+    pub control: Arc<Group>,
 }
 #[derive(Default)]
 pub struct Retirement {
@@ -176,6 +190,9 @@ impl Families {
                         binding,
                         parent: Weak::new(),
                         children: BTreeMap::new(),
+                        pending: None,
+                        waiting: 0,
+                        dependents: Vec::new(),
                     });
                 }
                 std::collections::btree_map::Entry::Vacant(e) => {
@@ -184,6 +201,9 @@ impl Families {
                         binding,
                         parent: Weak::new(),
                         children: BTreeMap::new(),
+                        pending: None,
+                        waiting: 0,
+                        dependents: Vec::new(),
                     });
                 }
             }
@@ -203,7 +223,10 @@ impl Families {
                 .entries
                 .iter()
                 .filter_map(|(&id, e)| {
-                    (!e.family.live() && !e.binding.presence.present()).then_some(id)
+                    (!e.family.live()
+                        && e.family.status().is_some()
+                        && !e.binding.presence.present())
+                    .then_some(id)
                 })
                 .collect();
             let mut removed = Vec::new();
@@ -241,17 +264,31 @@ impl Families {
             }
             let namespace = entry.binding.namespace.clone();
             let id = entry.binding.id;
-            if namespace.is_nested() && namespace.init() == id && !namespace.is_dead() {
+            if namespace.is_nested() && namespace.init() == id {
                 namespace.terminate();
-                let victims = state
+                let victims: Vec<_> = state
                     .entries
                     .values()
                     .filter(|e| e.binding.id != id && namespace.contains(&e.binding.namespace))
                     .map(|e| Victim {
                         id: e.binding.id,
                         family: e.family.clone(),
+                        control: e.binding.control.clone(),
                     })
                     .collect();
+                let mut waiting = 0;
+                for victim in &victims {
+                    if victim.family.status().is_none() {
+                        state
+                            .entries
+                            .get_mut(&victim.id)
+                            .unwrap()
+                            .dependents
+                            .push(Arc::downgrade(family));
+                        waiting += 1;
+                    }
+                }
+                state.entries.get_mut(&id).unwrap().waiting = waiting;
                 return Retirement { victims };
             }
             let mut reaper = state
@@ -312,32 +349,74 @@ impl Families {
         }
         retirement
     }
-    /// Publish the original final status and disposition without a Process scan.
-    /// CPU/mm teardown still supplies the final group-completion boundary.
+    /// Complete the original group, deferring namespace init notification until
+    /// its actual shutdown victims complete. Dependencies are original family
+    /// references, not a Process scan or a retry on an owner thread.
     pub fn complete(&self, family: &Arc<Family>, status: i32) -> bool {
-        let (exit, reaped) = {
-            let state = self.0.lock().unwrap();
-            let Some(entry) = state.original(family) else {
+        let (exits, reaped) = {
+            let mut state = self.0.lock().unwrap();
+            let Some(_) = state.original(family) else {
                 return false;
             };
-            let auto = state
-                .parent_of(family)
-                .and_then(|f| state.original(&f))
-                .is_some_and(|e| e.binding.control.auto_reap_children());
-            let exit =
-                entry
-                    .binding
-                    .child
-                    .finish_quiet(Some(status), auto)
-                    .map(|(notice, status)| {
-                        (
-                            notice,
-                            exit_info(entry.binding.id, entry.binding.uid, status),
-                        )
-                    });
-            (exit, entry.binding.child.reaped())
+            let id = family.id.load(Ordering::Relaxed);
+            state
+                .entries
+                .get_mut(&id)
+                .unwrap()
+                .pending
+                .get_or_insert(status);
+            let mut ready = vec![family.clone()];
+            let mut exits = Vec::new();
+            while let Some(current) = ready.pop() {
+                let Some(entry) = state.original(&current) else {
+                    continue;
+                };
+                if entry.waiting != 0 || current.status().is_some() {
+                    continue;
+                }
+                let Some(status) = entry.pending else {
+                    continue;
+                };
+                let auto = state
+                    .parent_of(&current)
+                    .and_then(|f| state.original(&f))
+                    .is_some_and(|e| e.binding.control.auto_reap_children());
+                current
+                    .status
+                    .set(status)
+                    .expect("one original family completion");
+                if let Some(host) = current.host_status.get() {
+                    host.store(status, Ordering::Relaxed);
+                }
+                if let Some((notice, status)) = entry.binding.child.finish_quiet(Some(status), auto)
+                {
+                    exits.push((
+                        notice,
+                        exit_info(entry.binding.id, entry.binding.uid, status),
+                    ));
+                }
+                let id = current.id.load(Ordering::Relaxed);
+                let dependents =
+                    std::mem::take(&mut state.entries.get_mut(&id).unwrap().dependents);
+                for dependent in dependents {
+                    let Some(dependent) =
+                        dependent.upgrade().filter(|f| state.original(f).is_some())
+                    else {
+                        continue;
+                    };
+                    let entry = state
+                        .entries
+                        .get_mut(&dependent.id.load(Ordering::Relaxed))
+                        .unwrap();
+                    entry.waiting -= 1;
+                    if entry.waiting == 0 && entry.pending.is_some() {
+                        ready.push(dependent);
+                    }
+                }
+            }
+            (exits, state.entries[&id].binding.child.reaped())
         };
-        if let Some((notice, info)) = exit {
+        for (notice, info) in exits {
             notice.signal(info);
         }
         reaped
@@ -564,6 +643,45 @@ mod tests {
         families.retire(&replacement.family, &parents);
         assert_eq!(child.family.parent(), 1);
         assert_eq!(child.parentage.parent_thread(), 1);
+    }
+    #[test]
+    fn nested_namespace_completion_follows_original_victims_not_cleanup_order() {
+        use std::sync::atomic::AtomicI32;
+        let families = Arc::new(Families::default());
+        let parents = Parents::default();
+        let mut vfs = Vfs::default();
+        let root = vfs.pid_namespace().clone();
+        let outside = Process::new(&families, &parents, &root, 1, 0);
+        vfs.unshare_pid().unwrap();
+        vfs.activate_child_pid(10).unwrap();
+        let outer_ns = vfs.pid_namespace().clone();
+        let outer = Process::new(&families, &parents, &outer_ns, 10, 1);
+        let peer = Process::new(&families, &parents, &outer_ns, 20, 10);
+        vfs.unshare_pid().unwrap();
+        vfs.activate_child_pid(30).unwrap();
+        let inner_ns = vfs.pid_namespace().clone();
+        let inner = Process::new(&families, &parents, &inner_ns, 30, 10);
+        let leaf = Process::new(&families, &parents, &inner_ns, 40, 30);
+        let host = Arc::new(AtomicI32::new(i32::MIN));
+        outer.family.bind_host_status(host.clone());
+        assert_eq!(families.retire(&outer.family, &parents).victims.len(), 3);
+        assert_eq!(families.retire(&inner.family, &parents).victims.len(), 1);
+        families.complete(&outer.family, 7 << 8);
+        families.complete(&inner.family, 31 << 8);
+        assert_eq!(outer.family.status(), None);
+        assert_eq!(outer.child.pending(), None);
+        assert_eq!(host.load(Ordering::Relaxed), i32::MIN);
+        families.retire(&peer.family, &parents);
+        families.complete(&peer.family, 9);
+        assert_eq!(outer.family.status(), None);
+        families.retire(&leaf.family, &parents);
+        families.complete(&leaf.family, 9);
+        assert_eq!(inner.family.status(), Some(31 << 8));
+        assert_eq!(outer.family.status(), Some(7 << 8));
+        assert_eq!(host.load(Ordering::Relaxed), 7 << 8);
+        assert_eq!(outside.wait(&root), Ok(Some(10)));
+        families.complete(&leaf.family, 0);
+        assert_eq!(outside.wait(&root), Err(Errno(10)));
     }
     #[test]
     fn nonleader_exec_replaces_presence_without_losing_original_family_or_children() {
