@@ -96,6 +96,46 @@ struct State {
     entries: BTreeMap<u32, Entry>,
 }
 impl State {
+    fn publish(&mut self, family: &Arc<Family>, binding: Binding) -> Vec<crate::children::Notice> {
+        let metadata = ((binding.group as u64) << 32) | binding.uid as u64;
+        let id = binding.id;
+        let presence = binding.presence.identity();
+        family.id.store(id, Ordering::Relaxed);
+        let parent = self.entries.get(&family.parent()).map(|e| e.family.clone());
+        match self.entries.entry(id) {
+            std::collections::btree_map::Entry::Occupied(mut e)
+                if Arc::ptr_eq(&e.get().family, family) =>
+            {
+                e.get_mut().binding = binding;
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.insert(Entry {
+                    family: family.clone(),
+                    binding,
+                    parent: Weak::new(),
+                    children: BTreeMap::new(),
+                    pending: None,
+                    waiting: 0,
+                    dependents: Vec::new(),
+                });
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(Entry {
+                    family: family.clone(),
+                    binding,
+                    parent: Weak::new(),
+                    children: BTreeMap::new(),
+                    pending: None,
+                    waiting: 0,
+                    dependents: Vec::new(),
+                });
+            }
+        }
+        let notices = self.attach(id, parent);
+        family.metadata.store(metadata, Ordering::Relaxed);
+        family.presence.store(presence, Ordering::Relaxed);
+        notices
+    }
     fn original(&self, family: &Arc<Family>) -> Option<&Entry> {
         self.entries
             .get(&family.id.load(Ordering::Relaxed))
@@ -169,52 +209,30 @@ impl Families {
         {
             return;
         }
-        let notices = {
+        let notices = self.0.lock().unwrap().publish(family, binding);
+        for notice in notices {
+            notice.notify();
+        }
+    }
+    /// Commit original PID/group membership and family birth against namespace
+    /// shutdown under their existing relationship lock. The closure performs
+    /// no guest byte access, backing I/O or CPU/native execution.
+    pub fn birth<R>(
+        self: &Arc<Self>,
+        family: &Arc<Family>,
+        operation: impl FnOnce() -> Result<(Option<Binding>, R), trames_vfs::Errno>,
+    ) -> Result<R, trames_vfs::Errno> {
+        family.registry.get_or_init(|| Arc::downgrade(self));
+        let (notices, value) = {
             let mut state = self.0.lock().unwrap();
-            let id = binding.id;
-            let presence = binding.presence.identity();
-            family.id.store(id, Ordering::Relaxed);
-            let parent = state
-                .entries
-                .get(&family.parent())
-                .map(|e| e.family.clone());
-            match state.entries.entry(id) {
-                std::collections::btree_map::Entry::Occupied(mut e)
-                    if Arc::ptr_eq(&e.get().family, family) =>
-                {
-                    e.get_mut().binding = binding;
-                }
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    e.insert(Entry {
-                        family: family.clone(),
-                        binding,
-                        parent: Weak::new(),
-                        children: BTreeMap::new(),
-                        pending: None,
-                        waiting: 0,
-                        dependents: Vec::new(),
-                    });
-                }
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(Entry {
-                        family: family.clone(),
-                        binding,
-                        parent: Weak::new(),
-                        children: BTreeMap::new(),
-                        pending: None,
-                        waiting: 0,
-                        dependents: Vec::new(),
-                    });
-                }
-            }
-            let notices = state.attach(id, parent);
-            family.metadata.store(metadata, Ordering::Relaxed);
-            family.presence.store(presence, Ordering::Relaxed);
-            notices
+            let (binding, value) = operation()?;
+            let notices = binding.map_or_else(Vec::new, |binding| state.publish(family, binding));
+            (notices, value)
         };
         for notice in notices {
             notice.notify();
         }
+        Ok(value)
     }
     pub fn prune(&self) {
         let removed = {
@@ -720,5 +738,85 @@ mod tests {
         assert_eq!(init.wait(&ns), Ok(Some(10)));
         assert!(!survivor.presence.present());
         assert_eq!(init.wait(&ns), Ok(Some(0))); // the adopted child remains live
+    }
+    #[test]
+    fn birth_and_namespace_shutdown_share_one_original_publication_transaction() {
+        use std::sync::mpsc;
+        for dead_first in [false, true] {
+            let families = Arc::new(Families::default());
+            let parents = Arc::new(Parents::default());
+            let mut vfs = Vfs::default();
+            let root_ns = vfs.pid_namespace().clone();
+            let _root = Process::new(&families, &parents, &root_ns, 1, 0);
+            vfs.unshare_pid().unwrap();
+            vfs.activate_child_pid(10).unwrap();
+            let ns = vfs.pid_namespace().clone();
+            let init = Process::new(&families, &parents, &ns, 10, 1);
+            let child = Process {
+                family: Arc::default(),
+                signals: Signals::default(),
+                child: Arc::default(),
+                children: Arc::default(),
+                parentage: Arc::default(),
+            };
+            child.family.set_parent(10);
+            child.child.bind_presence(&child.signals.presence);
+            let (start, go) = mpsc::channel();
+            let (exited, exit) = mpsc::channel();
+            let worker = {
+                let families = families.clone();
+                let parents = parents.clone();
+                let init = init.family.clone();
+                std::thread::spawn(move || {
+                    go.recv().unwrap();
+                    let plan = families.retire(&init, &parents);
+                    exited.send(plan).unwrap();
+                })
+            };
+            if dead_first {
+                start.send(()).unwrap();
+                assert!(exit
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .victims
+                    .is_empty());
+            }
+            let result = families.birth(&child.family, || {
+                if ns.is_dead() {
+                    return Err(Errno(12));
+                }
+                if !dead_first {
+                    start.send(()).unwrap();
+                }
+                Ok((
+                    Some(Binding {
+                        id: 11,
+                        group: 11,
+                        uid: 1000,
+                        namespace: ns.clone(),
+                        child: child.child.clone(),
+                        children: child.children.clone(),
+                        control: child.signals.io.lifecycle().clone(),
+                        presence: child.signals.presence.visibility(),
+                    }),
+                    (),
+                ))
+            });
+            if dead_first {
+                assert_eq!(result, Err(Errno(12)));
+            } else {
+                assert_eq!(result, Ok(()));
+                let plan = exit
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert_eq!(plan.victims.len(), 1);
+                assert!(Arc::ptr_eq(&plan.victims[0].family, &child.family));
+                families.complete(&init.family, 0);
+                assert_eq!(init.family.status(), None);
+                families.complete(&child.family, 9);
+                assert_eq!(init.family.status(), Some(0));
+            }
+            worker.join().unwrap();
+        }
     }
 }

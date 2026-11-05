@@ -113,6 +113,11 @@ pub(super) fn vm_call(number: u32) -> bool {
 pub(super) fn vm_entry<C: Cpu>(cpu: &C) -> bool {
     vm_call(cpu.x(8) as u32) || cpu.x(8) as u32 == 427 && matches!(cpu.x(1), 0 | 22)
 }
+/// Task birth uses only the original parent mm's custody, including filtered
+/// ALLOW entries. Namespace/Files/parent resources keep their own actual locks.
+pub(super) fn custody_entry<C: Cpu>(cpu: &C) -> bool {
+    vm_entry(cpu) || cpu.x(8) as u32 == 220
+}
 
 /// These calls can request the coordinator without stopping peer CPUs. The
 /// service still admits the actual descriptor kind before doing any effects.

@@ -88,10 +88,6 @@ impl PidNamespace {
         ids.push(self.local(global));
         ids
     }
-    pub(super) fn lock_visibility(&self) -> Option<BTreeMap<u32, u32>> {
-        self.is_nested()
-            .then(|| self.0.maps.lock().unwrap().ids.clone())
-    }
     pub fn id(&self) -> u64 {
         self.0.inode
     }
@@ -293,7 +289,6 @@ mod tests {
             assert_eq!(worker.global(42), Some(42));
             assert_eq!(worker.hierarchy(42), vec![42]);
             assert_eq!(worker.allocate(42), Ok(()));
-            assert_eq!(worker.lock_visibility(), None);
             assert!(worker.namespace_alive(0));
         })
         .join()

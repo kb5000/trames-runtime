@@ -32,19 +32,32 @@ impl<C: Cpu> Kernel<C> {
         }
         let result = (|| {
             self.process_exits(Some(epoch))?;
+            let metadata =
+                !checkpoint.mm_only || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
+            let creation_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
+                && checkpoint
+                    .jobs
+                    .iter()
+                    .filter(|job| job.checkpoint.is_some())
+                    .all(|job| job.work.cpu.x(8) as u32 == 220);
+            let mut created = Vec::new();
             let mut committed = std::collections::BTreeSet::new();
-            for job in checkpoint.jobs.iter().filter(|_| !checkpoint.bytes_only) {
+            for job in checkpoint.jobs.iter().filter(|_| metadata) {
                 let p = &mut self.processes.get_mut(&job.work.pid).unwrap();
                 let id = p.memory.coordinator_ownership().0;
                 if committed.insert(id) {
                     if !p.memory.parallel_views_quiescent() {
-                        return Ok(false); // an externally retained generation
+                        if !creation_only {
+                            return Ok(false);
+                        }
+                        p.memory.commit_retired_parallel()?;
+                    } else {
+                        p.memory.commit_parallel()?;
                     }
-                    p.memory.commit_parallel()?;
                 }
             }
             self.vm_checkpoint_groups += 1;
-            self.vm_checkpoint_spaces += if checkpoint.bytes_only {
+            self.vm_checkpoint_spaces += if checkpoint.mm_only {
                 checkpoint.ids.len() as u64
             } else {
                 committed.len() as u64
@@ -92,6 +105,42 @@ impl<C: Cpu> Kernel<C> {
                         self.processes.insert(pid, p);
                         return Ok(false);
                     }
+                }
+                if p.cpu.x(8) as u32 == 220 {
+                    // Copy actual signal state before inheriting it. Mapping
+                    // custody alone did not need this task-state handoff.
+                    p.signals.finish_io();
+                    let a = args(&p.cpu);
+                    let call_began = Instant::now();
+                    self.call(pid, &mut p, 220, a, io);
+                    self.vm_checkpoint_time[3] += call_began.elapsed();
+                    let value = p.cpu.x(0);
+                    if value != 0 && value <= i32::MAX as u64 {
+                        // Translate the actual successful syscall result in its
+                        // original namespace, never guess the allocator's ID.
+                        let child = p
+                            .linux
+                            .vfs
+                            .global_pid(value as u32)
+                            .expect("created child identity");
+                        assert!(self.processes.contains_key(&child));
+                        created.push(child);
+                    }
+                    if let State::Vfork(release) = &p.state {
+                        let wait = crate::run_queue::VforkWait::new(release.clone());
+                        if let Some(snapshot) = &job.work.syscalls {
+                            wait.bind(
+                                &snapshot.io_signals,
+                                snapshot.io_wake.as_ref().expect("bound parent"),
+                            );
+                        }
+                        job.waiting = Some(crate::run_queue::WaitState::Vfork(wait));
+                    }
+                    p.signals.begin_io();
+                    job.work.cpu = std::mem::take(&mut p.cpu);
+                    control.finish(job.stop_hold());
+                    self.processes.insert(pid, p);
+                    continue;
                 }
                 let mut extra = false;
                 let mut used_window = false;
@@ -167,13 +216,23 @@ impl<C: Cpu> Kernel<C> {
                 }
                 self.processes.insert(pid, p);
             }
-            let members: Vec<_> = checkpoint
-                .jobs
+            self.publish_children(None);
+            // Prepare children before their creators. Freezing a writable COW
+            // page materializes one private copy; put it in the new mm so the
+            // existing parent keeps its physical storage and hardware mappings.
+            // All affected actors remain paused until every View is installed.
+            let mut members: Vec<_> = created
                 .iter()
-                .map(|job| (job.work.pid, job.stats.worker))
+                .map(|&id| (id, self.processes[&id].last_cpu))
                 .collect();
+            members.extend(
+                checkpoint
+                    .jobs
+                    .iter()
+                    .map(|job| (job.work.pid, job.stats.worker)),
+            );
             let began = Instant::now();
-            let mut views = if checkpoint.bytes_only {
+            let mut views = if !metadata {
                 let views: Option<Vec<_>> = members
                     .iter()
                     .map(|&(pid, slot)| {
@@ -188,20 +247,29 @@ impl<C: Cpu> Kernel<C> {
                 };
                 views
             } else {
-                let Some(views) = self.prepare_parallel_views(&members) else {
+                let Some(views) = self.prepare_views(&members, creation_only) else {
                     return Ok(false); // changed to an excluded backing; join once
                 };
                 views
             };
             self.admit_private_views(&mut views);
+            let mut files = trames_vfs::FileEpoch::default();
+            let mut urings = trames_linux::UringEpoch::default();
+            let mut network = trames_vfs::NetworkEpoch::default();
             for (pid, _, view) in views {
-                checkpoint
-                    .jobs
-                    .iter_mut()
-                    .find(|job| job.work.pid == pid)
-                    .unwrap()
-                    .work
-                    .memory = Some(view);
+                if let Some(job) = checkpoint.jobs.iter_mut().find(|job| job.work.pid == pid) {
+                    job.work.memory = Some(view);
+                } else {
+                    let job = self.capture_worker(
+                        pid,
+                        view,
+                        &epoch.control,
+                        &mut files,
+                        &mut urings,
+                        &mut network,
+                    );
+                    epoch.admit_checkpoint(&mut checkpoint, job);
+                }
             }
             let elapsed = began.elapsed();
             self.parallel_memory_time += elapsed;
@@ -1141,6 +1209,185 @@ mod tests {
         for p in k.processes.values_mut() {
             assert!(p.retained_byte.is_none());
             assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(all(test, trames_interpreter_conformance))]
+mod creation_tests {
+    use super::*;
+    use std::sync::mpsc;
+    struct Wake(mpsc::Sender<()>);
+    impl trames_vfs::IoWake for Wake {
+        fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+            let _ = self.0.send(());
+        }
+    }
+    #[test]
+    fn task_birth_and_wait_finish_without_stopping_a_foreign_cpu() {
+        for mode in 0..10 {
+            let (publish, handles) = mpsc::channel();
+            let (start, go) = mpsc::channel();
+            let (finished, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut k = super::super::tests::kernel();
+                k.cpu_count = 3;
+                k.workers = crate::workers::Pool::new(3);
+                k.per_cpu = vec![Duration::ZERO; 3];
+                k.profile_syscalls = true;
+                let mut root = super::super::tests::process();
+                root.affinity = 7;
+                let [reader, writer] = root.linux.vfs.pipe(0).unwrap();
+                let [resume, _] = root.linux.vfs.pipe(0).unwrap();
+                let observed = root
+                    .linux
+                    .vfs
+                    .shared_files()
+                    .lookup(reader)
+                    .unwrap()
+                    .unwrap()
+                    .direct_byte()
+                    .unwrap();
+                root.memory.write(0x1100, b"P").unwrap();
+                let mov = |reg: u32, value: u32| 0xd2800000 | (value & 0xffff) << 5 | reg;
+                let flags: u64 = match mode {
+                    0 => 17,
+                    1 => 0x111,
+                    2 => 0x4111,
+                    3 => 0x310b00,
+                    4 => trames_vfs::CLONE_NEWPID | 17,
+                    5 => {
+                        trames_vfs::CLONE_NEWPID
+                            | trames_vfs::CLONE_NEWNS
+                            | trames_vfs::CLONE_NEWUTS
+                            | trames_vfs::CLONE_NEWIPC
+                            | trames_vfs::CLONE_NEWNET
+                            | trames_vfs::CLONE_NEWCGROUP
+                            | 17
+                    }
+                    6 => 0x100011,
+                    7 => 0x1000011,
+                    8 => 0x200011,
+                    _ => 17,
+                };
+                let mut code = vec![
+                    mov(0, flags as u32),
+                    0xf2a00000 | ((flags >> 16) as u32) << 5,
+                    mov(1, 0),
+                    mov(2, if mode == 3 { 0x1300 } else { 0 }),
+                    mov(3, 0),
+                    mov(4, if mode == 3 { 0x1300 } else { 0 }),
+                    mov(8, 220),
+                    0xd4000001,
+                    // cbnz x0,+16: parent skips the child's exit path.
+                    0xb5000080,
+                    mov(0, 27),
+                    mov(8, 93),
+                    0xd4000001,
+                ];
+                if mode == 3 {
+                    code.extend([
+                        mov(0, 0x1300),
+                        mov(1, 0),
+                        mov(2, 3),
+                        mov(3, 0),
+                        mov(4, 0),
+                        mov(5, 0),
+                        mov(8, 98),
+                        0xd4000001,
+                    ]);
+                } else {
+                    code.extend([
+                        mov(1, 0x1200),
+                        mov(2, 0),
+                        mov(3, 0),
+                        mov(4, 0),
+                        mov(8, 260),
+                        0xd4000001,
+                    ]);
+                }
+                code.extend([
+                    mov(0, writer),
+                    mov(1, 0x1100),
+                    mov(2, 1),
+                    mov(8, 64),
+                    0xd4000001,
+                    mov(0, resume),
+                    mov(1, 0x1500),
+                    mov(2, 1),
+                    mov(8, 63),
+                    0xd4000001,
+                    0x14000000,
+                ]);
+                for (i, word) in code.into_iter().enumerate() {
+                    root.memory
+                        .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                root.memory
+                    .write_array(0x4300, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                root.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                let mut output = trames_linux::CapturedOutput::default();
+                k.syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
+                    .unwrap();
+                k.processes.get_mut(&2).unwrap().cpu.set_pc(0x4300);
+                root.cpu.set_pc(0x4000);
+                let task = root.signals.io.clone();
+                let borrow = if mode == 9 {
+                    Some(root.memory.parallel_view(&mut k.parallel_memory).unwrap())
+                } else {
+                    None
+                };
+                k.processes.insert(1, root);
+                publish.send((observed, task, borrow)).unwrap();
+                go.recv().unwrap();
+                let result = k.parallel_epoch(&mut output, u64::MAX / 2, true);
+                let value = if mode == 3 {
+                    k.processes[&1].memory.read_u64(0x1300).unwrap() as u32
+                } else {
+                    k.processes[&1].memory.read_u64(0x1200).unwrap() as u32
+                };
+                finished
+                    .send((
+                        result.is_ok(),
+                        value,
+                        k.cohort_return_syscalls.get(&220).copied().unwrap_or(0),
+                        k.parallel_rounds,
+                    ))
+                    .unwrap();
+            });
+            let (observed, task, borrow) = handles.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (wake, readable) = mpsc::channel();
+            let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake(wake));
+            let signal = trames_vfs::IoSignal::new(0, Arc::downgrade(&target));
+            let _subscription = observed.subscribe(&signal);
+            start.send(()).unwrap();
+            let notified = readable.recv_timeout(Duration::from_secs(1));
+            let bytes = observed.read(1);
+            let early = done.try_recv().ok();
+            let live = early.is_none();
+            drop(borrow);
+            let _ = task.job_signal(9, false, Info::default(), true);
+            let result = early
+                .map(Ok)
+                .unwrap_or_else(|| done.recv_timeout(Duration::from_secs(5)));
+            worker.join().unwrap();
+            assert!(
+                notified.is_ok() && bytes == Ok(b"P".to_vec()) && live,
+                "mode={mode}: birth stopped foreign CPU: {bytes:?} {result:?}"
+            );
+            let expected = if mode == 3 { 0 } else { 27 << 8 };
+            assert!(
+                matches!(result,Ok((true,value,0,1)) if value==expected),
+                "mode={mode}: {result:?}"
+            );
         }
     }
 }

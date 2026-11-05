@@ -62,9 +62,10 @@ struct Entry<C: Cpu> {
     jobs: Vec<Box<Job<C>>>,
     running: usize,
     services: usize,
+    members: usize,
     notified: bool,
     owned: bool,
-    bytes_only: bool,
+    mm_only: bool,
     requested: Option<Instant>,
     quiescent: Option<Instant>,
 }
@@ -76,7 +77,7 @@ pub(super) struct Domains<C: Cpu> {
 }
 pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
-    pub bytes_only: bool,
+    pub mm_only: bool,
     pub jobs: Vec<Box<Job<C>>>,
     pub requested: Instant,
     pub quiescent: Instant,
@@ -103,14 +104,27 @@ impl<C: Cpu> Domains<C> {
             jobs: Vec::new(),
             running: 0,
             services: 0,
+            members: 0,
             notified: false,
             owned: false,
-            bytes_only: false,
+            mm_only: false,
             requested: None,
             quiescent: None,
         });
+        entry.members += 1;
         assert!(self.tasks.insert(job.work.pid, id).is_none());
         job.domain = Some(entry.domain.clone());
+    }
+    pub fn retire(&mut self, pid: u32) {
+        let id = self.tasks.remove(&pid).expect("returned original task");
+        let entry = self.entries.get_mut(&id).unwrap();
+        entry.members -= 1;
+        if entry.members == 0 {
+            assert_eq!(entry.running, 0);
+            assert_eq!(entry.services, 0);
+            assert!(entry.jobs.is_empty() && !entry.owned);
+            self.entries.remove(&id);
+        }
     }
     pub fn contains(&self, id: u64) -> bool {
         self.entries.contains_key(&id)
@@ -121,7 +135,7 @@ impl<C: Cpu> Domains<C> {
     pub fn pause_bytes(&mut self, id: u64) {
         let entry = self.entries.get_mut(&id).unwrap();
         if !entry.domain.paused() {
-            entry.bytes_only = true;
+            entry.mm_only = true;
             entry.requested = Some(Instant::now());
             entry.quiescent = None;
             entry.domain.pause();
@@ -174,7 +188,7 @@ impl<C: Cpu> Domains<C> {
     pub fn pause(&mut self, ids: BTreeSet<u64>) {
         for id in self.closure(ids) {
             let entry = self.entries.get_mut(&id).unwrap();
-            entry.bytes_only = false;
+            entry.mm_only = false;
             if !entry.domain.paused() {
                 entry.requested = Some(Instant::now());
                 entry.quiescent = None;
@@ -210,7 +224,7 @@ impl<C: Cpu> Domains<C> {
             if !entry.domain.paused() || entry.owned || seen.contains(&id) {
                 continue;
             }
-            let ids = if entry.bytes_only {
+            let ids = if entry.mm_only {
                 BTreeSet::from([id])
             } else {
                 self.closure(BTreeSet::from([id]))
@@ -245,7 +259,7 @@ impl<C: Cpu> Domains<C> {
                 .map(|job| job.work.pid)
                 .collect();
             return Some(Checkpoint::<C> {
-                bytes_only: ids.iter().all(|id| self.entries[id].bytes_only),
+                mm_only: ids.iter().all(|id| self.entries[id].mm_only),
                 ids,
                 jobs,
                 requested,
@@ -256,6 +270,24 @@ impl<C: Cpu> Domains<C> {
         }
         None
     }
+    pub fn admit(&mut self, checkpoint: &mut Checkpoint<C>, job: Box<Job<C>>) {
+        let id = self.tasks[&job.work.pid];
+        let entry = self.entries.get_mut(&id).unwrap();
+        if checkpoint.ids.insert(id) {
+            // A fork made a new mm. It has no execution or service actor yet.
+            assert_eq!(entry.running, 0);
+            assert_eq!(entry.services, 0);
+            assert!(entry.jobs.is_empty());
+            entry.domain.pause();
+            entry.owned = true;
+            entry.mm_only = checkpoint.mm_only;
+            entry.requested = Some(checkpoint.requested);
+            entry.quiescent = Some(checkpoint.quiescent);
+        } else {
+            assert!(entry.owned);
+        }
+        checkpoint.jobs.push(job);
+    }
     /// Update layout dependencies before releasing any CPU. A new alias may
     /// join another already-paused VM; merge that checkpoint before resuming.
     pub fn restore(&mut self, checkpoint: Checkpoint<C>, resume: bool) -> Vec<Box<Job<C>>> {
@@ -263,7 +295,7 @@ impl<C: Cpu> Domains<C> {
             ids,
             jobs,
             requesters,
-            bytes_only,
+            mm_only,
             ..
         } = checkpoint;
         let mut updated = BTreeSet::new();
@@ -286,7 +318,7 @@ impl<C: Cpu> Domains<C> {
         if !resume {
             return Vec::new();
         }
-        let closure = if bytes_only && ids.iter().all(|id| self.entries[id].bytes_only) {
+        let closure = if mm_only && ids.iter().all(|id| self.entries[id].mm_only) {
             ids.clone()
         } else {
             self.closure(ids.clone())

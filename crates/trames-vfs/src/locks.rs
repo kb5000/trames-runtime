@@ -243,13 +243,13 @@ impl Vfs {
         })
     }
 }
-/// Frozen PID visibility while task/namespace changes still checkpoint. This
-/// owns copied IDs and the original shared registry, never the Rc namespace or
+/// Live original PID visibility across in-epoch task birth. This
+/// owns original shared PID/lock resources, never a coordinator Rc namespace or
 /// a process/VFS reference.
 #[derive(Clone, Default)]
 pub struct RecordLockContext {
     pub owner: u32,
-    visible: Option<BTreeMap<u32, u32>>,
+    visible: Option<PidNamespace>,
     registry: Option<Arc<Registry>>,
 }
 /// Original process-owned lock domain; does not retain any file or task.
@@ -272,7 +272,7 @@ impl RecordLockContext {
     pub fn visible_pid(&self, owner: u32) -> u32 {
         self.visible
             .as_ref()
-            .map_or(owner, |ids| ids.get(&owner).copied().unwrap_or(0))
+            .map_or(owner, |namespace| namespace.local(owner))
     }
 }
 impl Vfs {
@@ -285,7 +285,7 @@ impl Vfs {
     pub fn record_lock_context(&self, owner: u32) -> RecordLockContext {
         RecordLockContext {
             owner,
-            visible: self.pid_ns.lock_visibility(),
+            visible: self.pid_ns.is_nested().then(|| self.pid_ns.clone()),
             registry: Some(self.record_locks.clone()),
         }
     }
@@ -694,5 +694,17 @@ mod tests {
                 .join()
                 .unwrap()
         });
+    }
+    #[test]
+    fn record_lock_pid_context_observes_birth_and_reaping_without_recapture() {
+        let mut vfs = Vfs::default();
+        vfs.unshare_pid().unwrap();
+        vfs.activate_child_pid(10).unwrap();
+        let context = vfs.record_lock_context(10);
+        assert_eq!(context.visible_pid(11), 0);
+        vfs.activate_child_pid(11).unwrap();
+        assert_eq!(context.visible_pid(11), 2);
+        vfs.pid_namespace().retain_ids(&[10].into());
+        assert_eq!(context.visible_pid(11), 0);
     }
 }

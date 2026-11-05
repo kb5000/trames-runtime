@@ -86,17 +86,18 @@ an asynchronous completion event. A cold group member sharing an executing mm
 uses a byte checkpoint of that mm alone. It does not stop unrelated mm/backing
 users or rebuild its mappings. External guarded mm borrows retain physical custody
 independently of guest parent notification, keyed by the original mm identity.
-Structural fork/exec, tracing and non-ALLOW security-policy effects retain their
-actual boundaries. Robust-futex owner-death support is not added by this work.
+Task creation now uses the creator mm checkpoint and dynamically admits children
+into the same execution queue. Structural exec, tracing and non-ALLOW
+security-policy effects retain their actual joined boundaries. Robust-futex owner-death support is not added by this work.
 
 
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
-| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Structural creation/exec, tracing, non-ALLOW policy and legacy unadmitted waiter adoption retain their boundaries. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
+| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec, tracing, non-ALLOW policy and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes and structural fork entry still join. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes still join; fork admission uses the original family/cgroup transactions at its creator-mm checkpoint. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted nsfs/mqueue mounts, dynamic file bodies, controlling-terminal acquisition and excluded open types | Before-effects defer. Actual cgroup mounts are admitted through their original shared graph and OFDs. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles remaining owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, old epoll creation, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
@@ -297,15 +298,14 @@ operation to a replacement control file. The implementation was compared with
 [the freezer](https://github.com/torvalds/linux/blob/v6.18/kernel/cgroup/freezer.c)
 and the [cgroup v2 interface](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
 
-This removes the cgroup resource dependency, not the remaining task-lifecycle
-entry. Structural fork admission and final exit still call the same hierarchy
-at their current joined boundaries. BPF control installation, cgroup
-namespace/mount topology, full exit cancellation and final Files/mm/native
-ownership remain explicitly joined. A standalone VFS without a bound TaskSignal
-retains its legacy kill-ID collection API; production tasks bind the original
-IoTask and receive cgroup.kill directly. The fatal signal still reaches the
-documented exit cleanup boundary. No owner-independence claim is made for that
-remaining lifecycle chain.
+Task birth now checks current limits and publishes membership in one original
+cgroup graph transaction. Notifications run after the family publication lock
+is released. An accepted cgroup.kill marks actual member identities before
+signal delivery, closing the newborn-binding window without retargeting reused
+PIDs. Production tasks bind their original IoTask; standalone VFS users retain
+the legacy unbound kill-ID collection API. Source exit retires the same original
+membership. BPF installation and cgroup namespace/mount topology retain their
+joined boundaries; owner-local cold projection cleanup remains asynchronous.
 
 
 ### Original task addresses and resource retirement (2026-11-05)
@@ -650,3 +650,42 @@ publication race. Linux semantics are checked against original
 [exit_mm and exit task work](https://github.com/torvalds/linux/blob/v6.18/kernel/exit.c).
 Remaining boundaries include structural clone/exec, mapping topology, tracing and
 non-ALLOW policy, excluded owner resources and original legacy waiter adoption.
+
+
+## Task creation: creator-mm custody and live admission — 2026-11-05
+
+All currently accepted fork/clone/vfork flag combinations use the existing
+creator-mm custody mechanism. Only actual actors of that mm return their Views;
+other mms continue on existing executors. Construction still runs on the
+original owner of the Rc task/VFS graph. This is scoped owner work, not a claim
+that task construction itself is source-thread independent. Initial and newborn
+jobs use the same resource-capture helper, policy and original authorities.
+
+The queue registers actual returned child IDs and mm identities before making
+newborns runnable, grows participation only on existing CPU workers, and removes
+retired membership/domain rows. Parent waits and vfork release retain original
+notification objects. Woken continuations prefer an idle original executor,
+never wait for a busy one, and leave capacity for new tasks. Initially parked
+tasks have no stale CPU reservation. No polling bus or new service thread exists.
+
+Birth and PID-namespace shutdown serialize at the original family relationship
+lock; cgroup admission checks and commits at its original hierarchy lock. No
+backing I/O or guest byte access runs under the family lock. Accepted fatal-group
+state closes publication. Linux TID copyout faults do not cancel an already born
+task. Record-lock PID translation reads the original live namespace, including
+newborn/reaped mappings, without recapturing unrelated task contexts. Compare
+[Linux task publication and TID stores](https://github.com/torvalds/linux/blob/v6.18/kernel/fork.c)
+and [cgroup fork/kill ordering](https://github.com/torvalds/linux/blob/v6.18/kernel/cgroup/cgroup.c).
+
+A creation-only checkpoint can retain external guarded borrows. Fork isolates
+the child instead of invalidating unchanged parent storage, and preserves its
+mapping snapshot and dirty journal until the last borrower returns. Writable
+COW preparation freezes new children first, placing the new physical copy in
+the child and preserving existing parent hardware mappings. No extra byte
+barrier or unsafe admission is added.
+
+Tracing and non-ALLOW seccomp effects still return to the full task-policy
+boundary before effects, without replaying the policy decision. Genuine mapping
+changes mixed with creation retain their affected backing closure and external
+borrow boundary. Exec, namespace administration, excluded backings and native
+lifecycle boundaries remain explicit. One-CPU/solo caller execution is unchanged.

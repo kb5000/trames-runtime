@@ -259,8 +259,14 @@ impl Clone for Memory {
             return shared.borrow().clone();
         }
         self.invalidate_translations();
-        self.mmu.retire();
-        self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
+        // Retained guarded Views require an isolated child copy, not parent
+        // COW aliases. Keep the parent's unchanged snapshot/dirty journal and
+        // hardware tables. Capture this once: a borrower may finish mid-copy.
+        let retained = self.has_parallel_users();
+        if !retained {
+            self.mmu.retire();
+            self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
+        }
         let account = self.fork_account();
         let mut cloned = Self {
             mmu: self.mmu.empty_like(),
@@ -278,7 +284,7 @@ impl Clone for Memory {
                     source.as_ref().map(|source| {
                         let pinned = !self.pinned.is_empty() && self.page_pinned(source);
                         let mut page = source.clone();
-                        if (self.has_parallel_users() || pinned) && page.bytes.shared().is_some() {
+                        if (retained || pinned) && page.bytes.shared().is_some() {
                             page.bytes = Rc::new(if page.charge.resident() {
                                 (*page.bytes).clone()
                             } else {
@@ -319,7 +325,7 @@ impl Clone for Memory {
         for base in self.anonymous.populated() {
             let source = self.sparse_page(base);
             let mut page = source.clone();
-            if self.has_parallel_users() {
+            if retained {
                 page.bytes = Rc::new((*page.bytes).clone());
             }
             page.charge = Charge::new(&cloned.account);

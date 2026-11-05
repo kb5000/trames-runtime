@@ -185,6 +185,11 @@ impl Group {
             .checked_sub(1)
             .map(|status| status as i32)
     }
+    /// Task birth checks the original fatal-group state at publication. A kill
+    /// accepted after this check is ordered after that birth decision.
+    pub fn permits_birth(&self) -> bool {
+        !self.state.lock().unwrap().killed
+    }
     pub fn members(&self) -> Vec<(u32, Arc<IoTask>)> {
         self.state
             .lock()
@@ -506,6 +511,16 @@ mod tests {
         let child = Arc::new(Child::default());
         group.bind(&child, None, 42, 1000);
         (a, b, child)
+    }
+    #[test]
+    fn accepted_group_exit_closes_new_task_publication() {
+        let (a, _, _) = family();
+        let group = a.lifecycle();
+        assert!(group.permits_birth());
+        assert_eq!(group.request_exit(17), 17);
+        assert!(!group.permits_birth());
+        assert_eq!(group.request_exit(23), 17);
+        assert!(!group.permits_birth());
     }
     #[test]
     fn stop_acknowledgement_waits_for_running_members_and_original_kernel_work() {

@@ -44,7 +44,7 @@ impl VforkWait {
             subscriptions: Default::default(),
         })
     }
-    fn bind(&self, task: &trames_kernel::signal::IoTask, signal: &Arc<trames_vfs::IoSignal>) {
+    pub fn bind(&self, task: &trames_kernel::signal::IoTask, signal: &Arc<trames_vfs::IoSignal>) {
         let mut subscriptions = task.subscribe(signal);
         subscriptions.push(self.release.subscribe(signal));
         *self.subscriptions.lock().unwrap() = subscriptions;
@@ -693,6 +693,19 @@ impl<C: Cpu> Epoch<C> {
     }
     fn ready(&self, q: &mut Queues<C>, job: Box<Job<C>>) {
         q.idle_notified = false;
+        let slot = job.stats.worker;
+        if job.stats.assignments != 0
+            && job.affinity & (1 << slot) != 0
+            && q.sleeping_slots & (1 << slot) != 0
+            && q.ready.len() < q.sleeping_slots.count_ones() as usize
+            && !q.initial_slots.values().any(|&reserved| reserved == slot)
+        {
+            // Reserve the first claim on an idle original executor, retaining
+            // its MMU/native caches. Never wait for a busy CPU; new tasks have
+            // no prior executor and remain freely stealable.
+            q.initial_slots.insert(job.work.pid, slot);
+            self.slot_changed[slot].notify_one();
+        }
         q.ready.push_back(job);
         self.refresh_ready(q);
     }
@@ -749,8 +762,8 @@ impl<C: Cpu> Epoch<C> {
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
     }
-    /// Only before launch: every View is prepared/admitted before any CPU runs.
-    pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
+    /// Bind original readiness before publishing either an initial or new job.
+    fn bind_job(&self, job: &mut Job<C>) {
         let pid = job.work.pid;
         if let Some(snapshot) = &mut job.work.syscalls {
             let signal = trames_vfs::IoSignal::new(pid, self.io_target.clone());
@@ -767,6 +780,10 @@ impl<C: Cpu> Epoch<C> {
             snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
+    }
+    pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
+        self.bind_job(&mut job);
+        let pid = job.work.pid;
         let mut q = self.queues.lock().unwrap();
         assert!(q.members.insert(pid), "duplicate cohort task");
         q.domains.register(&mut job);
@@ -790,7 +807,13 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn assign(&self, chosen: &[(u32, usize)]) {
         let mut q = self.queues.lock().unwrap();
-        q.initial_slots.extend(chosen.iter().copied());
+        // Initial placement belongs to runnable work. A parked parent must
+        // not reserve a CPU that its child's new peer can later occupy.
+        for &(pid, slot) in chosen {
+            if q.ready.iter().any(|job| job.work.pid == pid) {
+                q.initial_slots.insert(pid, slot);
+            }
+        }
         self.refresh_ready(&q);
     }
     fn capture_paused(&self, q: &mut Queues<C>) {
@@ -817,10 +840,51 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.checkpoint = Some(outcome);
-        q.domains.pause(BTreeSet::from([id]));
+        if job.work.cpu.x(8) as u32 == 220 {
+            q.domains.pause_bytes(id);
+        } else {
+            q.domains.pause(BTreeSet::from([id]));
+        }
         q.domains.hold(job);
         self.capture_paused(&mut q);
         self.notify(&mut q);
+    }
+    /// The creator's checkpoint still owns all private execution actors of
+    /// this mm. Register a child there, never in the runnable queue early.
+    pub fn admit_checkpoint(&self, checkpoint: &mut Checkpoint<C>, mut job: Box<Job<C>>) {
+        self.bind_job(&mut job);
+        let mut q = self.queues.lock().unwrap();
+        assert!(q.members.insert(job.work.pid), "duplicate created task");
+        q.domains.register(&mut job);
+        q.domains.admit(checkpoint, job);
+    }
+    /// Extend existing CPU participation only when ready/running work needs
+    /// it, including a child whose affinity excludes every active executor.
+    pub fn additional_slots(&self, active: u64, cpus: usize) -> Vec<usize> {
+        let q = self.queues.lock().unwrap();
+        let valid = if cpus == 64 {
+            u64::MAX
+        } else {
+            (1u64 << cpus) - 1
+        };
+        let desired = (q.running + q.ready.len()).min(cpus);
+        let eligible = q.ready.iter().fold(0, |mask, job| mask | job.affinity) & valid;
+        let mut selected = active;
+        for job in &q.ready {
+            let choices = job.affinity & valid;
+            if choices != 0 && choices & selected == 0 {
+                selected |= 1 << choices.trailing_zeros();
+            }
+        }
+        let mut available = eligible & !selected;
+        while (selected.count_ones() as usize) < desired && available != 0 {
+            let bit = 1 << available.trailing_zeros();
+            selected |= bit;
+            available &= !bit;
+        }
+        (0..cpus)
+            .filter(|slot| (selected & !active) & (1 << slot) != 0)
+            .collect()
     }
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
         self.queues.lock().unwrap().domains.take()
@@ -1294,13 +1358,25 @@ impl<C: Cpu> Epoch<C> {
         let mut i = 0;
         while i < q.finished.len() {
             if q.finished[i].thread_exit.is_some() {
-                retired.push(q.finished.swap_remove(i));
+                let done = q.finished.swap_remove(i);
+                assert!(q.members.remove(&done.pid));
+                q.domains.retire(done.pid);
+                retired.push(done);
             } else {
                 i += 1;
             }
         }
         q.retirement_notified = false;
         retired
+    }
+    pub fn member_ids(&self) -> Vec<u32> {
+        self.queues
+            .lock()
+            .unwrap()
+            .members
+            .iter()
+            .copied()
+            .collect()
     }
     pub fn contains(&self, pid: u32) -> bool {
         self.queues.lock().unwrap().members.contains(&pid)
@@ -1405,6 +1481,53 @@ mod tests {
 
     use super::*;
     use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn initially_parked_task_can_resume_while_its_old_cpu_is_occupied() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        let mut parent = job(1, &epoch);
+        parent.affinity = 3;
+        parent.waiting = Some(WaitState::Sleep {
+            deadline: Instant::now() + Duration::from_millis(30),
+            remaining: 0,
+        });
+        let mut producer = job(2, &epoch);
+        producer.affinity = 3;
+        epoch.add(parent);
+        epoch.add(producer);
+        epoch.assign(&[(1, 0), (2, 1)]);
+        let producer = epoch.take(1).unwrap();
+        let mut peer = job(3, &epoch);
+        peer.affinity = 3;
+        epoch.add(peer);
+        let peer = epoch.take(0).unwrap();
+        assert_eq!(peer.work.pid, 3);
+        epoch.finish(producer.finish_retired(
+            Some(SliceOutcome::Yield { instructions: 0 }),
+            0,
+            crate::worker_syscalls::Exit {
+                status: 0,
+                groups: Vec::new(),
+            },
+        ));
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = {
+            let epoch = epoch.clone();
+            std::thread::spawn(move || {
+                let result = epoch.take(1).map(|job| {
+                    let pid = job.work.pid;
+                    epoch.finish(job.finish(Some(SliceOutcome::Yield { instructions: 0 }), 0));
+                    pid
+                });
+                send.send(result).unwrap();
+            })
+        };
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        epoch.stop();
+        worker.join().unwrap();
+        epoch.finish(peer.finish(Some(SliceOutcome::Yield { instructions: 0 }), 0));
+        let _ = epoch.drain();
+        assert_eq!(result, Ok(Some(1)));
+    }
     #[test]
     fn vm_checkpoint_requeues_an_unarmed_adopted_gpu_compile() {
         let epoch = Epoch::new(Arc::new(Control::new(100)));

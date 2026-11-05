@@ -47,6 +47,8 @@ pub(crate) use trames_kernel::signal::UNBLOCKABLE;
 mod caps;
 #[path = "process_compat.rs"]
 mod compat;
+#[path = "process_dispatch.rs"]
+mod dispatch;
 #[path = "process_events.rs"]
 mod events;
 #[path = "process_exit.rs"]
@@ -658,6 +660,17 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
 }
 impl<C: Cpu> Kernel<C> {
     fn publish_task(&self, id: u32, p: &Process<C>) {
+        self.publish_task_core(id, p);
+        self.bind_task_cgroup(id, p);
+    }
+    fn bind_task_cgroup(&self, id: u32, p: &Process<C>) {
+        if !matches!(p.state, State::Zombie(_)) && p.signals.io.cgroup().is_none() {
+            if let Some(task) = p.linux.vfs.cgroup_task(id) {
+                p.signals.io.bind_cgroup(task);
+            }
+        }
+    }
+    fn publish_task_core(&self, id: u32, p: &Process<C>) {
         self.children_dirty.set(true);
         self.limit_directory
             .publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
@@ -674,11 +687,6 @@ impl<C: Cpu> Kernel<C> {
             .parents
             .publish(&p.signals.io, id, &p.parentage);
         p.signals.io.set_session(p.session);
-        if p.signals.io.cgroup().is_none() {
-            if let Some(task) = p.linux.vfs.cgroup_task(id) {
-                p.signals.io.bind_cgroup(task);
-            }
-        }
         p.signals.io_directory.publish(
             &p.signals.io,
             id,
@@ -996,7 +1004,6 @@ impl<C: Cpu> Kernel<C> {
             .filter(|v| *v < i32::MAX as u32)
             .ok_or(Errno(11))?;
         let root = self.processes.get(&1).ok_or(Errno(3))?;
-        root.linux.vfs.cgroup_can_fork(1)?;
         let mut child = root.fork_state(Memory::default(), false, false, false);
         child
             .memory
@@ -1066,7 +1073,10 @@ impl<C: Cpu> Kernel<C> {
         )?;
         child.family.bind_host_status(request.status);
         child.vm_id = self.resource_id();
-        child.linux.vfs.cgroup_fork(1, id, id);
+        let birth = child.linux.vfs.cgroup_birth(1, id, id);
+        let admitted = birth.result();
+        birth.notify();
+        admitted?;
         self.processes.insert(id, child);
         self.publish_io_tasks(None);
         Ok(id)
@@ -2516,6 +2526,7 @@ impl<C: Cpu> Kernel<C> {
             }
             220 => {
                 self.reap_waited();
+                self.publish_children(Some(p));
                 const ALLOWED: u64 = 0xff
                     | 0xf00
                     | 0x4000
@@ -2550,14 +2561,7 @@ impl<C: Cpu> Kernel<C> {
                 {
                     return Err(Errno(11));
                 }
-                if a[0] & 0x100000 != 0 {
-                    Linux::check(&p.memory, a[2], 4, Access::Write)?;
-                }
-                if a[0] & (0x1000000 | 0x200000) != 0 {
-                    Linux::check(&p.memory, a[4], 4, Access::Write)?;
-                }
                 let id = self.next_pid;
-                p.linux.vfs.cgroup_can_fork(pid)?;
                 self.next_pid = self
                     .next_pid
                     .checked_add(1)
@@ -2604,10 +2608,6 @@ impl<C: Cpu> Kernel<C> {
                 if a[0] & trames_vfs::CLONE_NEWCGROUP != 0 {
                     child.linux.vfs.unshare_cgroup()?;
                 }
-                child.linux.vfs.activate_child_pid(id)?;
-                child.bind_signals();
-                let parent_tid = p.linux.vfs.visible_pid(id);
-                let child_tid = child.linux.vfs.visible_pid(id);
                 // PID namespace init inherits its parent's PGID/SID/tty, as
                 // Linux copy_process does. Ancestor-only IDs appear as zero
                 // inside the new namespace; init can then establish setsid().
@@ -2655,20 +2655,49 @@ impl<C: Cpu> Kernel<C> {
                 if a[0] & 0x80000 != 0 {
                     child.cpu.set_tls(a[3]);
                 }
+                child.wait_event.bind_presence(&child.signals.presence);
+                let families = self.families.clone();
+                let family = child.family.clone();
+                let mut cgroup_birth = None;
+                let result = families.birth(&family, || {
+                    if !p.signals.io.lifecycle().permits_birth() {
+                        return Err(Errno(4));
+                    }
+                    child.linux.vfs.activate_child_pid(id)?;
+                    child.bind_signals();
+                    child.linux.vfs.set_process_context(id);
+                    let birth = child.linux.vfs.cgroup_birth(pid, id, child.tgid);
+                    let admitted = birth.result();
+                    cgroup_birth = Some(birth);
+                    admitted?;
+                    self.publish_task_core(id, &child);
+                    let binding = (!threaded).then(|| trames_kernel::family::Binding {
+                        id,
+                        group: child.group,
+                        uid: child.linux.vfs.credentials.uid,
+                        namespace: child.linux.vfs.pid_namespace().clone(),
+                        child: child.wait_event.clone(),
+                        children: child.children.clone(),
+                        control: child.signals.io.lifecycle().clone(),
+                        presence: child.signals.presence.visibility(),
+                    });
+                    Ok((binding, ()))
+                });
+                if let Some(birth) = cgroup_birth {
+                    birth.notify();
+                }
+                result?;
+                self.bind_task_cgroup(id, &child);
+                // Linux stores these user TIDs after task birth and ignores
+                // copyout faults. CHILD_CLEARTID only records its address.
+                let parent_tid = p.linux.vfs.visible_pid(id);
+                let child_tid = child.linux.vfs.visible_pid(id);
                 if a[0] & 0x100000 != 0 {
-                    p.memory
-                        .write(a[2], &parent_tid.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
+                    let _ = p.memory.write(a[2], &parent_tid.to_le_bytes());
                 }
                 if a[0] & 0x1000000 != 0 {
-                    child
-                        .memory
-                        .write(a[4], &child_tid.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
+                    let _ = child.memory.write(a[4], &child_tid.to_le_bytes());
                 }
-                child.linux.vfs.set_process_context(id);
-                child.linux.vfs.cgroup_fork(pid, id, child.tgid);
-                self.publish_task(id, &child);
                 self.processes.insert(id, child);
                 if a[0] & 0x4000 != 0 {
                     let release = Arc::new(trames_kernel::vfork::Release::default());
@@ -4237,6 +4266,13 @@ impl<C: Cpu> Kernel<C> {
         &mut self,
         chosen: &[(u32, usize)],
     ) -> Option<Vec<(u32, usize, Box<trames_memory::parallel::View>)>> {
+        self.prepare_views(chosen, false)
+    }
+    fn prepare_views(
+        &mut self,
+        chosen: &[(u32, usize)],
+        reuse_retained: bool,
+    ) -> Option<Vec<(u32, usize, Box<trames_memory::parallel::View>)>> {
         let mut views: Vec<(u32, usize, Box<trames_memory::parallel::View>)> =
             Vec::with_capacity(chosen.len());
         let mut published = BTreeMap::<u64, usize>::new();
@@ -4249,6 +4285,15 @@ impl<C: Cpu> Kernel<C> {
                 // they must not give this VM's peers different snapshots.
                 self.parallel_memory.metrics.cache_hits += 1;
                 views[index].2.clone()
+            } else if reuse_retained && !p.memory.parallel_views_quiescent() {
+                // This is a creation-only checkpoint. All private execution
+                // actors returned; retained guarded borrows still use exactly
+                // these parent bytes. Fork isolated its child, and CLONE_VM
+                // introduced no parent mapping or permission change.
+                let mut view = Box::new(p.memory.current_parallel_view()?);
+                C::prepare_hardware_view(&mut view);
+                published.insert(identity, views.len());
+                view
             } else {
                 if let Err(error) =
                     C::prepare_hardware_memory(&mut p.memory, &mut self.parallel_memory)
@@ -4572,257 +4617,14 @@ impl<C: Cpu> Kernel<C> {
         let mut network_epoch = trames_vfs::NetworkEpoch::default();
         let began = Instant::now();
         for (id, _, view) in views {
-            let p = &self.processes[&id];
-            let gpu = (accelerated(p, trames_vulkan::AUXV_KEY, trames_vulkan::PROFILE)
-                || accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE))
-            .then(|| crate::gpu::Authority {
-                context: self.gpu_context(p),
-                video: self.video_context(p),
-                images: Some(p.linux.vfs.image_fds()),
-                auth: p.linux.vfs.wayland_auth(),
-                events: Some(p.linux.vfs.native_events()),
-            });
-            let audio = accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE).then(|| {
-                crate::devices::Audio {
-                    context: self.audio_context(p),
-                    events: p.linux.vfs.native_events(),
-                }
-            });
-            let limits = self.limit_authority(id, &self.processes[&id]);
-            let p = self.processes.get_mut(&id).expect("cohort process");
-            p.signals.begin_io();
-            let source_io = p.worker_io_candidate(id);
-            let waiting = if let State::Futex { wait, deadline } = &p.state {
-                Some(crate::run_queue::WaitState::Futex {
-                    wait: wait.clone(),
-                    deadline: *deadline,
-                })
-            } else if let State::Sleep(deadline, remaining) = p.state {
-                Some(crate::run_queue::WaitState::Sleep {
-                    deadline,
-                    remaining,
-                })
-            } else if let State::Sigwait {
-                mask,
-                info,
-                deadline,
-            } = p.state
-            {
-                Some(crate::run_queue::WaitState::Signal(
-                    crate::run_queue::SignalWait::new(trames_kernel::signal::SignalWait::Timed {
-                        mask,
-                        info,
-                        deadline,
-                    }),
-                ))
-            } else if let State::Suspend(old) = p.state {
-                p.signals.wait_mask = Some(old);
-                p.signals.begin_io();
-                Some(crate::run_queue::WaitState::Signal(
-                    crate::run_queue::SignalWait::new(trames_kernel::signal::SignalWait::Suspend {
-                        mask: p.signals.mask,
-                    }),
-                ))
-            } else if let State::Blocked(number @ (95 | 260), args) = p.state {
-                Some(crate::run_queue::WaitState::Child(
-                    crate::run_queue::ChildWait::new(trames_kernel::children::Wait {
-                        number,
-                        args,
-                    }),
-                ))
-            } else if let State::Vfork(release) = &p.state {
-                Some(crate::run_queue::WaitState::Vfork(
-                    crate::run_queue::VforkWait::new(release.clone()),
-                ))
-            } else if !matches!(p.state, State::Ready) && !source_io && !p.worker_gpu_candidate() {
-                Some(crate::run_queue::WaitState::OwnerEvent)
-            } else {
-                None
-            };
-            let c = &p.linux.vfs.credentials;
-            let direct_files = if !p.linux.trace {
-                file_epoch.capture(&p.linux.vfs, true)
-            } else {
-                Default::default()
-            };
-            let retained_files = if !p.linux.trace {
-                file_epoch.capture_uring_rings(&p.linux.vfs, true, p.linux.uring_rings())
-            } else {
-                Default::default()
-            };
-            let work = crate::workers::Work::<C> {
-                gpu,
-                audio,
-                pid: id,
-                cpu: std::mem::take(&mut p.cpu),
-                memory: Some(view),
-                control: control.clone(),
-                syscalls: Some(crate::worker_syscalls::Snapshot {
-                    owner_syscalls: p.linux.trace,
-                    vfork_release: p.vfork.clone(),
-                    native_space: Some(p.space.clone()),
-                    exit_files: Some(p.linux.vfs.file_table_owner()),
-                    children: p.children.clone(),
-                    limits: Some(limits),
-                    timers: Some(self.timers.clone()),
-                    saved_wait_mask: std::cell::Cell::new(p.signals.wait_mask),
-                    seccomp: p.seccomp.clone(),
-                    identities: [
-                        p.linux.vfs.visible_pid(p.tgid) as u64,
-                        p.linux.vfs.visible_pid(p.family.parent()) as u64,
-                        c.uid as u64,
-                        c.euid as u64,
-                        c.gid as u64,
-                        c.egid as u64,
-                        p.linux.vfs.visible_pid(id) as u64,
-                    ],
-                    started: self.started,
-                    processor: p.last_cpu as u32,
-                    profile: self.profile_syscalls,
-                    streams: p.linux.vfs.stream_descriptors(),
-
-                    fd_flags: p.linux.vfs.fd_flags_snapshot(),
-                    umask: p.linux.vfs.umask_capability(),
-                    actions: p.signals.actions.shared(),
-                    io_signals: p.signals.io.clone(),
-                    io_wake: None,
-                    io_routes: trames_kernel::signal::IoRoutes {
-                        directory: p.signals.io_directory.clone(),
-                        namespace: p.linux.vfs.pid_namespace().clone(),
-                        uid: c.uid,
-                        euid: c.euid,
-                    },
-                    program_break: p.linux.program_break(),
-                    uts: Some(p.linux.vfs.uts_capability()),
-                    direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
-                        .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
-                        .with_task_signal(p.signals.io.clone())
-                        .with_local_identity([
-                            p.tgid,
-                            p.linux.vfs.credentials.uid,
-                            p.linux.vfs.credentials.gid,
-                        ])
-                        .with_membership(p.linux.vfs.shared_files())
-                        .with_paths(p.linux.vfs.path_queries())
-                        .with_resources(p.linux.vfs.descriptor_factory())
-                        .with_file_executor(self.workers.file_executor())
-                        .with_kernel_log(p.linux.vfs.kernel_log_capability())
-                        .with_urings(
-                            uring_epoch
-                                .capture_all(
-                                    &p.linux.vfs,
-                                    p.memory.instruction_identity().0,
-                                    id,
-                                    &direct_files,
-                                    &retained_files,
-                                )
-                                .with_actor(p.linux.uring_actor_root()),
-                        )
-                        .with_network(network_epoch.capture(&p.linux.vfs))
-                        .with_clock(self.started)
-                        .with_boot_clock(p.linux.boot_clock())
-                        .with_terminal(trames_vfs::TerminalAccess {
-                            session: p.session,
-                            group: p.group,
-                            controlling: p.linux.vfs.controlling_terminal,
-                            ignore_ttou: p.signals.mask & (1 << 21) != 0
-                                || p.signals.actions.get(22).handler == 1,
-                        })
-                        .with_files(direct_files)
-                        .with_lock_context(p.linux.vfs.record_lock_context(p.tgid))
-                        .with_signal_reader(p.signals.reader(p.linux.vfs.pid_namespace())),
-                    futex: crate::futex::Authority::new(self.futexes.clone(), p.vm_id),
-                }),
-            };
-            let mut job = crate::run_queue::Job::<C>::new(work, p.affinity, p.last_cpu, waiting);
-            if let State::Gpu {
-                job: compile,
-                pc,
-                operation,
-                began,
-                retired: true,
-                instructions,
-                peer_instructions,
-            } = p.state
-            {
-                job.gpu_pending = Some(crate::gpu::Pending::adopted(crate::gpu::Compile {
-                    call: crate::gpu::Call {
-                        pc,
-                        operation,
-                        args: [operation, 0, 0],
-                    },
-                    job: compile,
-                    began,
-                    peer_instructions: peer_instructions
-                        + self.instructions.saturating_sub(instructions),
-                }));
-            }
-            let io_retry = match p.state {
-                State::Blocked(number, args)
-                    if !matches!(job.waiting, Some(crate::run_queue::WaitState::Child(_))) =>
-                {
-                    Some((number, args))
-                }
-                _ => None,
-            };
-            if let Some((number, args)) = io_retry {
-                // A child wait owns its accepted request, not a second I/O
-                // retry. Existing owner-event compatibility state still uses
-                // its legacy envelope until that resource is migrated.
-                // Re-arm against the new epoch target. The owner's notification
-                // target cannot schedule a parked worker in this cohort.
-                let previous = p.byte_wait.take();
-                let tcp_liveness = previous
-                    .as_ref()
-                    .and_then(trames_linux::PendingIo::tcp_liveness)
-                    .or_else(|| p.tcp_liveness.take());
-                let retained_socket = previous
-                    .as_ref()
-                    .and_then(|wait| wait.retained_socket.clone())
-                    .or_else(|| p.retained_socket.take());
-                let retained_file = previous
-                    .as_ref()
-                    .and_then(trames_linux::PendingIo::file_pending)
-                    .or_else(|| p.retained_file.take());
-                let retained_aio = previous
-                    .as_ref()
-                    .and_then(|wait| wait.aio.clone())
-                    .or_else(|| p.retained_aio.take());
-                let retained_byte = previous
-                    .and_then(|wait| wait.retained_byte)
-                    .or_else(|| p.retained_byte.take());
-                job.retry = Some(crate::run_queue::IoCall {
-                    aio: retained_aio,
-                    file: retained_file,
-                    file_checkpoint: p.file_checkpoint.take(),
-                    uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {
-                        trames_linux::UringEnter {
-                            submitted,
-                            ring,
-                            deadline,
-                        }
-                    }),
-                    flock: if p.flock_wait.as_ref().is_some_and(|(r, _)| r.retains_file()) {
-                        // The parked owner must not delay a worker's final
-                        // close/notification until the next cohort join.
-                        p.flock_wait.take().map(|(request, _)| request)
-                    } else {
-                        p.flock_wait.as_ref().map(|(request, _)| request.clone())
-                    },
-                    retained_byte,
-                    retained_socket,
-                    tcp_liveness,
-                    retained_poll: p.retained_poll.take(),
-                    number,
-                    args,
-                    deadline: if matches!(number, 63..=66 | 202 | 203 | 242) {
-                        p.socket_deadline
-                    } else {
-                        p.poll_deadline
-                    },
-                });
-            }
-            epoch.add(job);
+            epoch.add(self.capture_worker(
+                id,
+                view,
+                &control,
+                &mut file_epoch,
+                &mut uring_epoch,
+                &mut network_epoch,
+            ));
         }
         // No cached connection/policy decision survives into guest execution.
         drop(network_epoch);
@@ -4833,6 +4635,9 @@ impl<C: Cpu> Kernel<C> {
                 .map_err(|_| RuntimeError::Arguments("CPU worker disconnected"))?;
         }
         self.parallel_dispatch_time += began.elapsed();
+        let mut active_slots = chosen
+            .iter()
+            .fold(0u64, |mask, (_, slot)| mask | (1 << slot));
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
         let mut checkpoint_error = None;
@@ -4886,7 +4691,28 @@ impl<C: Cpu> Kernel<C> {
                             break;
                         };
                         match self.vm_checkpoint(&epoch, checkpoint, io) {
-                            Ok(true) => {}
+                            Ok(true) => {
+                                members =
+                                    epoch.member_ids().into_iter().map(|pid| (pid, 0)).collect();
+                                let launch = (|| {
+                                    for slot in epoch.additional_slots(active_slots, self.cpu_count)
+                                    {
+                                        self.workers.ensure(slot).map_err(|_| {
+                                            RuntimeError::Arguments("cannot start CPU worker")
+                                        })?;
+                                        self.workers.launch(slot, epoch.clone()).map_err(|_| {
+                                            RuntimeError::Arguments("CPU worker disconnected")
+                                        })?;
+                                        active_slots |= 1 << slot;
+                                    }
+                                    Ok::<_, RuntimeError>(())
+                                })();
+                                if let Err(error) = launch {
+                                    checkpoint_error = Some(error);
+                                    epoch.stop();
+                                    break;
+                                }
+                            }
                             result => {
                                 checkpoint_error = result.err();
                                 epoch.stop();
@@ -4926,7 +4752,7 @@ impl<C: Cpu> Kernel<C> {
         let began = Instant::now();
         // Native file work owns its resources and publishes directly to its
         // accepted source. Joining CPU Views never waits for unrelated disk I/O.
-        while stopped < chosen.len() || epoch.pending_services() != 0 {
+        while stopped < active_slots.count_ones() as usize || epoch.pending_services() != 0 {
             match self
                 .workers
                 .event_timeout(Duration::from_secs(1))
@@ -4973,24 +4799,17 @@ impl<C: Cpu> Kernel<C> {
         let began = Instant::now();
         // Source returns committed quiescent mms or retained their real idle
         // dependency. Live wrappers publish the remaining ordinary cohort work.
-        for (index, &(id, _)) in members.iter().enumerate() {
-            let p = &self.processes[&id];
-            if !p.signals.io.live() || self.exits.waiting(id) {
+        let mut committed = std::collections::BTreeSet::new();
+        for &(id, _) in &members {
+            let Some(p) = self.processes.get_mut(&id) else {
                 continue;
+            };
+            if p.signals.io.live()
+                && !self.exits.waiting(id)
+                && committed.insert(p.memory.coordinator_ownership().0)
+            {
+                p.memory.commit_parallel()?;
             }
-            let vm_id = p.vm_id;
-            if members[..index].iter().any(|&(peer, _)| {
-                self.processes[&peer].signals.io.live()
-                    && !self.exits.waiting(peer)
-                    && self.processes[&peer].vm_id == vm_id
-            }) {
-                continue;
-            }
-            self.processes
-                .get_mut(&id)
-                .unwrap()
-                .memory
-                .commit_parallel()?;
         }
         self.parallel_memory_time += began.elapsed();
         outcomes.retain(|(pid, _)| self.processes[pid].signals.io.live());

@@ -93,3 +93,50 @@ fn retired_publication_keeps_new_dirty_bits_until_the_last_borrow_returns() {
     memory.commit_parallel().unwrap();
     assert_eq!(second.bytes.borrow()[0], 9);
 }
+
+#[test]
+fn fork_with_a_retained_borrow_keeps_late_parent_backing_writes() {
+    let backing = Rc::new(Backing {
+        identity: new_backing_identity(),
+        bytes: RefCell::new([0; PAGE_SIZE as usize]),
+        gate: RefCell::new(None),
+    });
+    let mut memory = Memory::default();
+    memory
+        .map_backed(0x1000, vec![backing.clone()], true, Permissions::RW, false)
+        .unwrap();
+    let mut registry = Registry::default();
+    let mut borrowed = memory.parallel_view(&mut registry).unwrap();
+    borrowed.write_array(0x1000, [7]).unwrap();
+    memory.commit_retired_parallel().unwrap();
+    assert_eq!(backing.bytes.borrow()[0], 7);
+    let _child = memory.clone();
+    let resumed = memory.parallel_view(&mut registry).unwrap();
+    borrowed.write_array(0x1000, [9]).unwrap();
+    assert_eq!(resumed.read_array::<1>(0x1000).unwrap(), [9]);
+    drop((borrowed, resumed));
+    memory.commit_parallel().unwrap();
+    assert_eq!(backing.bytes.borrow()[0], 9);
+}
+
+#[test]
+fn retained_private_parent_and_child_diverge_after_fork() {
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+    let mut registry = Registry::default();
+    let mut borrowed = memory.parallel_view(&mut registry).unwrap();
+    borrowed.write_array(0x1000, 7u64.to_le_bytes()).unwrap();
+    memory.commit_retired_parallel().unwrap();
+    let mut child = memory.clone();
+    let mut resumed = memory.parallel_view(&mut registry).unwrap();
+    borrowed.write_array(0x1000, 9u64.to_le_bytes()).unwrap();
+    resumed.write_array(0x2000, 11u64.to_le_bytes()).unwrap();
+    assert_eq!(child.read_u64(0x1000).unwrap(), 7);
+    assert_eq!(child.read_u64(0x2000).unwrap(), 0);
+    child.write_array(0x1000, 13u64.to_le_bytes()).unwrap();
+    assert_eq!(borrowed.read_u64(0x1000).unwrap(), 9);
+    drop((borrowed, resumed));
+    memory.commit_parallel().unwrap();
+    assert_eq!(memory.read_u64(0x1000).unwrap(), 9);
+    assert_eq!(memory.read_u64(0x2000).unwrap(), 11);
+}

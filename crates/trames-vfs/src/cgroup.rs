@@ -107,6 +107,7 @@ struct Member {
     group: AtomicU64,
     frozen: AtomicBool,
     acknowledged: AtomicBool,
+    kill_pending: AtomicBool,
     wake: Mutex<Option<Weak<dyn TaskSignal>>>,
 }
 impl Member {
@@ -117,6 +118,7 @@ impl Member {
             group: AtomicU64::new(group),
             frozen: AtomicBool::new(frozen),
             acknowledged: AtomicBool::new(frozen),
+            kill_pending: AtomicBool::new(false),
             wake: Mutex::default(),
         }
     }
@@ -131,6 +133,19 @@ impl Member {
         if let Some(target) = target {
             target.scheduling_changed();
         }
+    }
+}
+/// Deferred notifications from the actual cgroup task-birth transaction.
+pub struct CgroupBirth {
+    result: Result<()>,
+    events: Vec<Arc<ControlEvents>>,
+}
+impl CgroupBirth {
+    pub fn result(&self) -> Result<()> {
+        self.result
+    }
+    pub fn notify(self) {
+        notify_events(self.events);
     }
 }
 /// One actual task's cgroup membership. Retaining it neither retains a PID nor
@@ -156,27 +171,36 @@ impl CgroupTask {
             }
             *wake = Some(next);
         }
-        let events = {
+        let (events, pending, frozen) = {
             let mut cg = self.groups.borrow_mut();
-            if !self.frozen()
-                || !cg
-                    .tasks
-                    .get(&self.pid())
-                    .is_some_and(|m| Arc::ptr_eq(m, &self.member))
-            {
-                return;
+            let original = cg
+                .tasks
+                .get(&self.pid())
+                .is_some_and(|m| Arc::ptr_eq(m, &self.member));
+            let pending = original && self.member.kill_pending.load(Ordering::Relaxed);
+            if pending {
+                cg.kill.remove(&self.pid());
             }
-            let ack = target.quiescent();
-            let old = self.member.acknowledged.swap(ack, Ordering::Relaxed);
-            let id = self.member.group();
-            let before = cg.event_states(cg.ancestors(id));
-            cg.adjust(id, 0, i64::from(ack) - i64::from(old));
-            cg.changed_events(before)
+            let frozen = self.frozen() && original;
+            let events = if frozen {
+                let ack = target.quiescent();
+                let old = self.member.acknowledged.swap(ack, Ordering::Relaxed);
+                let id = self.member.group();
+                let before = cg.event_states(cg.ancestors(id));
+                cg.adjust(id, 0, i64::from(ack) - i64::from(old));
+                cg.changed_events(before)
+            } else {
+                Vec::new()
+            };
+            (events, pending, frozen)
         };
-        // The consumer checks original level state, so this callback cannot
-        // publish an obsolete freeze value if a writer raced the binding.
-        self.member.notify();
+        if frozen {
+            self.member.notify();
+        }
         notify_events(events);
+        if pending {
+            target.raise(9);
+        }
     }
     pub fn exit(&self) {
         let events = {
@@ -192,6 +216,7 @@ impl CgroupTask {
             let id = self.member.group();
             let before = cg.event_states(cg.ancestors(id));
             cg.tasks.remove(&pid);
+            cg.kill.remove(&pid);
             cg.adjust(
                 id,
                 -1,
@@ -342,6 +367,61 @@ impl Default for Cgroups {
     }
 }
 impl Cgroups {
+    fn check_fork(&mut self, pid: u32) -> (Result<()>, Vec<Arc<ControlEvents>>) {
+        if self
+            .tasks
+            .get(&pid)
+            .is_some_and(|task| task.kill_pending.load(Ordering::Relaxed))
+        {
+            return (Err(Errno(4)), Vec::new());
+        }
+        let id = self.tasks.get(&pid).map_or(ROOT, |task| task.group());
+        for group in self.ancestors(id) {
+            if !self.pids_enabled(group) {
+                continue;
+            }
+            let count = self.current(group) + 1;
+            if self.groups[&group]
+                .pids_max
+                .is_some_and(|limit| count > limit)
+            {
+                self.groups
+                    .get_mut(&group)
+                    .expect("group")
+                    .pids_events_local += 1;
+                let mut events = vec![self.groups[&group].pids_local_signal.clone()];
+                for ancestor in self.ancestors(group) {
+                    if self.pids_enabled(ancestor) {
+                        self.groups
+                            .get_mut(&ancestor)
+                            .expect("ancestor")
+                            .pids_events += 1;
+                        events.push(self.groups[&ancestor].pids_signal.clone());
+                    }
+                }
+                return (Err(Errno(11)), events);
+            }
+            let entry = self.groups.get_mut(&group).expect("group");
+            entry.pids_peak = entry.pids_peak.max(count);
+        }
+        (Ok(()), Vec::new())
+    }
+    fn fork_member(&mut self, parent: u32, child: u32, tgid: u32) -> Vec<Arc<ControlEvents>> {
+        let id = self.tasks.get(&parent).map_or(ROOT, |task| task.group());
+        let before = self.event_states(self.ancestors(id));
+        let frozen = self.frozen(id);
+        let pending = self
+            .tasks
+            .get(&parent)
+            .is_some_and(|task| task.kill_pending.load(Ordering::Relaxed));
+        let member = Arc::new(Member::new(child, tgid, id, frozen));
+        member.kill_pending.store(pending, Ordering::Relaxed);
+        assert!(self.tasks.insert(child, member).is_none());
+        self.adjust(id, 1, i64::from(frozen));
+        self.update_peak(id);
+        self.changed_events(before)
+    }
+
     fn add_node(&self, path: Vec<u8>, directory: bool, mode: u32) -> u64 {
         let mut fs = self.fs.borrow_mut();
         let inode = fs.next_inode;
@@ -727,33 +807,9 @@ impl Vfs {
     /// Called before clone commits IDs/TID stores. All workers have joined;
     /// the following membership insertion cannot race another charge.
     pub fn cgroup_can_fork(&self, pid: u32) -> Result<()> {
-        let mut cg = self.cgroups.borrow_mut();
-        let id = cg.tasks.get(&pid).map_or(ROOT, |task| task.group());
-        for group in cg.ancestors(id) {
-            if !cg.pids_enabled(group) {
-                continue;
-            }
-            let count = cg.current(group) + 1;
-            if cg.groups[&group]
-                .pids_max
-                .is_some_and(|limit| count > limit)
-            {
-                cg.groups.get_mut(&group).expect("group").pids_events_local += 1;
-                let mut events = vec![cg.groups[&group].pids_local_signal.clone()];
-                for ancestor in cg.ancestors(group) {
-                    if cg.pids_enabled(ancestor) {
-                        cg.groups.get_mut(&ancestor).expect("ancestor").pids_events += 1;
-                        events.push(cg.groups[&ancestor].pids_signal.clone());
-                    }
-                }
-                drop(cg);
-                notify_events(events);
-                return Err(Errno(11));
-            }
-            let entry = cg.groups.get_mut(&group).expect("group");
-            entry.pids_peak = entry.pids_peak.max(count);
-        }
-        Ok(())
+        let (result, events) = self.cgroups.borrow_mut().check_fork(pid);
+        notify_events(events);
+        result
     }
     pub(super) fn cgroup_subsystems(&self) -> Vec<u8> {
         format!(
@@ -770,7 +826,8 @@ impl Vfs {
             .get(&pid)
             .is_some_and(|task| task.frozen.load(Ordering::Relaxed))
     }
-    /// The write snapshots the entire subtree before any task can move/fork.
+    /// Unbound original tasks await binding; source-bound tasks receive the
+    /// request directly. Pending state follows the original membership object.
     pub fn take_cgroup_kills(&self) -> BTreeSet<u32> {
         std::mem::take(&mut self.cgroups.borrow_mut().kill)
     }
@@ -851,22 +908,21 @@ impl Vfs {
         }
         Ok(())
     }
-    /// Called only after clone's fallible setup has succeeded.
+    /// Compatibility setup for an already admitted task. Production birth
+    /// validates limits and commits membership in cgroup_birth instead.
     pub fn cgroup_fork(&self, parent: u32, child: u32, tgid: u32) {
-        let events = {
-            let mut cg = self.cgroups.borrow_mut();
-            let id = cg.tasks.get(&parent).map_or(ROOT, |task| task.group());
-            let before = cg.event_states(cg.ancestors(id));
-            let frozen = cg.frozen(id);
-            assert!(cg
-                .tasks
-                .insert(child, Arc::new(Member::new(child, tgid, id, frozen)))
-                .is_none());
-            cg.adjust(id, 1, i64::from(frozen));
-            cg.update_peak(id);
-            cg.changed_events(before)
-        };
+        let events = self.cgroups.borrow_mut().fork_member(parent, child, tgid);
         notify_events(events);
+    }
+    /// One original membership/limit transaction; notifications are published
+    /// only after the caller releases its family publication lock.
+    pub fn cgroup_birth(&self, parent: u32, child: u32, tgid: u32) -> CgroupBirth {
+        let mut cg = self.cgroups.borrow_mut();
+        let (result, mut events) = cg.check_fork(parent);
+        if result.is_ok() {
+            events.extend(cg.fork_member(parent, child, tgid));
+        }
+        CgroupBirth { result, events }
     }
     pub fn cgroup_task(&self, pid: u32) -> Option<CgroupTask> {
         let member = self.cgroups.borrow().tasks.get(&pid)?.clone();
@@ -1124,6 +1180,14 @@ impl CgroupFile {
                     .filter(|(_, task)| below(&cg.groups[&task.group()].path, path))
                     .map(|(pid, task)| (*pid, task.clone()))
                     .collect();
+                let groups: BTreeSet<_> = targets.iter().map(|(_, task)| task.tgid()).collect();
+                for task in cg
+                    .tasks
+                    .values()
+                    .filter(|task| groups.contains(&task.tgid()))
+                {
+                    task.kill_pending.store(true, Ordering::Relaxed);
+                }
                 let mut signals = Vec::new();
                 for (pid, task) in targets {
                     let signal = task.wake.lock().unwrap().as_ref().and_then(Weak::upgrade);
@@ -1575,5 +1639,92 @@ mod tests {
         assert_eq!(v.stat_at(AT_FDCWD, &path), Err(Errno(2)));
         assert_eq!(v.capacity().used_bytes, before.used_bytes);
         assert_eq!(v.capacity().nodes_used, before.nodes_used);
+    }
+    #[test]
+    fn birth_commits_the_current_group_limit_and_member_together() {
+        let mut v = setup();
+        let controllers = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/cgroup.subtree_control", 1, 0)
+            .unwrap();
+        v.write(controllers, b"+pids").unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/x", 0o755).unwrap();
+        v.cgroup_fork(1, 2, 2);
+        let procs = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(procs, b"2").unwrap();
+        let limit = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/pids.max", 1, 0)
+            .unwrap();
+        v.write(limit, b"1").unwrap();
+        let denied = v.cgroup_birth(2, 3, 3);
+        assert_eq!(denied.result(), Err(Errno(11)));
+        denied.notify();
+        assert!(v.cgroup_task(3).is_none());
+        v.write(limit, b"2").unwrap();
+        let admitted = v.cgroup_birth(2, 3, 3);
+        assert_eq!(admitted.result(), Ok(()));
+        admitted.notify();
+        assert!(v.cgroup_task(3).is_some());
+        let denied = v.cgroup_birth(2, 4, 4);
+        assert_eq!(denied.result(), Err(Errno(11)));
+        denied.notify();
+        assert!(v.cgroup_task(4).is_none());
+        let current = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/pids.current", 0, 0)
+            .unwrap();
+        assert_eq!(v.read(current, 32).unwrap(), b"2\n");
+    }
+    #[test]
+    fn accepted_kill_closes_unbound_birth_and_cannot_follow_reused_pid() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/x", 0o755).unwrap();
+        v.cgroup_fork(1, 2, 2);
+        let procs = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(procs, b"2").unwrap();
+        let birth = v.cgroup_birth(2, 3, 3);
+        assert_eq!(birth.result(), Ok(()));
+        birth.notify();
+        let old = v.cgroup_task(3).unwrap();
+        let kill = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.kill", 1, 0)
+            .unwrap();
+        v.write(kill, b"1").unwrap();
+        let denied = v.cgroup_birth(2, 4, 4);
+        assert_eq!(denied.result(), Err(Errno(4)));
+        denied.notify();
+        let receiver = Arc::new(TaskProbe {
+            task: old.clone(),
+            idle: AtomicBool::new(true),
+            wakes: AtomicU32::new(0),
+            kills: AtomicU32::new(0),
+        });
+        let target: Arc<dyn TaskSignal> = receiver.clone();
+        old.bind(&target);
+        assert_eq!(receiver.kills.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.wakes.load(Ordering::Relaxed), 0);
+        assert_eq!(v.take_cgroup_kills(), [2].into());
+        old.exit();
+        let birth = v.cgroup_birth(1, 3, 3);
+        assert_eq!(birth.result(), Ok(()));
+        birth.notify();
+        let current = v.cgroup_task(3).unwrap();
+        let replacement = Arc::new(TaskProbe {
+            task: current.clone(),
+            idle: AtomicBool::new(true),
+            wakes: AtomicU32::new(0),
+            kills: AtomicU32::new(0),
+        });
+        let target: Arc<dyn TaskSignal> = replacement.clone();
+        current.bind(&target);
+        old.exit();
+        assert!(Arc::ptr_eq(
+            &v.cgroup_task(3).unwrap().member,
+            &current.member
+        ));
+        assert_eq!(replacement.kills.load(Ordering::Relaxed), 0);
+        assert!(v.take_cgroup_kills().is_empty());
     }
 }

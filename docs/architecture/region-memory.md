@@ -59,8 +59,12 @@ owners. Its epoch invalidates the parent's cached mapping view even if no bytes
 changed. Before writable fork pages return to workers, they detach once into
 owned physical storage; read-only shared storage can stay shared. A safe fork
 with an externally retained writer snapshots the child's private bytes, because
-the old view still has a writable capability. Normal runtime fork joins workers
-first. `CLONE_VM` never detaches or duplicates bytes. Source mapping changes
+the old view still has a writable capability. This retained-borrow branch keeps
+the unchanged parent mapping snapshot and dirty journal: late writes must still
+reach their original backing. Runtime creation quiesces private execution actors
+of the creator mm, without joining unrelated mms. Child-first writable COW
+preparation keeps the parent's old physical storage and hardware mappings.
+`CLONE_VM` never detaches or duplicates bytes. Source mapping changes
 retire CPU windows if any external View survives, including views from previous
 snapshot generations. A VM-level lifetime counter changes only when a View is
 created/dropped; ordinary CPU/native byte accesses do not update it. This keeps

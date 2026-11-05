@@ -1033,7 +1033,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                 // only an allowed call may mutate that domain.
                                 if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                     && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0 || work.cpu.x(8) as u32 == 427)
-                                    && crate::worker_syscalls::vm_entry(&work.cpu)
+                                    && crate::worker_syscalls::custody_entry(&work.cpu)
                                     && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
                                 {
                                     vm_checkpoint = true;
@@ -1272,7 +1272,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                         && snapshot.seccomp.mode() == 0
-                                        && crate::worker_syscalls::vm_entry(&work.cpu)
+                                        && crate::worker_syscalls::custody_entry(&work.cpu)
                                     {
                                         vm_checkpoint = true;
                                         break result;

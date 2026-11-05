@@ -4,7 +4,7 @@
 mod bpf;
 pub mod capabilities;
 mod cgroup;
-pub use cgroup::CgroupTask;
+pub use cgroup::{CgroupBirth, CgroupTask};
 mod fs_context;
 mod path_queries;
 pub use path_queries::PathQueries;
