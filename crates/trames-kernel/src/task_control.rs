@@ -21,17 +21,21 @@ pub struct Group {
 #[derive(Default)]
 struct State {
     members: BTreeMap<u32, Member>,
+    live: usize,
     child: Weak<Child>,
     tgid: u32,
     uid: u32,
     killed: bool,
     stop: Option<(u32, bool)>, // signo, fully acknowledged
+    exit_status: Option<i32>,
+    completed: bool,
 }
 struct Member {
     task: Weak<IoTask>,
     running: bool,
     held: bool,
     interrupt: Option<Arc<dyn trames_execution::ExecutionInterrupt>>,
+    retiring: bool,
 }
 // ExecutionInterrupt is supplied by the backend; no CPU itself crosses here.
 pub struct Lease {
@@ -111,12 +115,15 @@ impl Group {
                     .map(|task| (pid, task))
             })
     }
-    /// Claim an individual exit while another member remains alive. The last
-    /// member keeps the actual process/group cleanup boundary before effects.
-    pub(crate) fn try_retire_nonlast(
+    /// Stop accepting signals/execution, but retain membership until the
+    /// original resources and executor View have actually returned. The last
+    /// source exit still retains its process/mm boundary before effects.
+    pub(crate) fn begin_exit(
         &self,
         pid: u32,
         task: &Arc<IoTask>,
+        status: i32,
+        nonlast: bool,
         mark: impl FnOnce(),
     ) -> bool {
         let notice = {
@@ -125,22 +132,60 @@ impl Group {
             if !state
                 .members
                 .get(&pid)
-                .is_some_and(|m| m.task.ptr_eq(&original))
-                || !state
-                    .members
-                    .iter()
-                    .any(|(&id, m)| id != pid && m.task.upgrade().is_some_and(|t| t.live()))
+                .is_some_and(|m| m.task.ptr_eq(&original) && !m.retiring)
+                || nonlast && state.live <= 1
             {
                 return false;
             }
             mark();
-            state.members.remove(&pid);
+            state.members.get_mut(&pid).unwrap().retiring = true;
+            state.live -= 1;
+            if state.live == 0 {
+                state.exit_status.get_or_insert(status);
+            }
             state.acknowledge()
         };
         if let Some(notice) = notice {
             notice.publish();
         }
         true
+    }
+    /// Explicit group termination fixes the status before member cleanup;
+    /// ordinary individual exits fix it when the last member begins exiting.
+    pub fn begin_group_exit(&self, status: i32) {
+        self.state.lock().unwrap().exit_status.get_or_insert(status);
+    }
+    pub(crate) fn finish_exit(&self, pid: u32, task: &Arc<IoTask>) -> Option<i32> {
+        let (notice, status) = {
+            let mut state = self.state.lock().unwrap();
+            let original = Arc::downgrade(task);
+            if !state
+                .members
+                .get(&pid)
+                .is_some_and(|member| member.retiring && member.task.ptr_eq(&original))
+            {
+                return None;
+            }
+            state.members.remove(&pid);
+            let status = if state.members.is_empty() && !state.completed {
+                state.completed = true;
+                state.exit_status
+            } else {
+                None
+            };
+            (state.acknowledge(), status)
+        };
+        if let Some(notice) = notice {
+            notice.publish();
+        }
+        status
+    }
+    pub fn exit_status(&self) -> Option<i32> {
+        let state = self.state.lock().unwrap();
+        state.completed.then_some(state.exit_status).flatten()
+    }
+    pub fn has_live_members(&self) -> bool {
+        self.state.lock().unwrap().live != 0
     }
     pub fn interrupt_member(&self, pid: u32) {
         let state = self.state.lock().unwrap();
@@ -171,6 +216,11 @@ impl Group {
     }
     pub fn register(&self, task: &Arc<IoTask>, pid: u32) {
         let mut state = self.state.lock().unwrap();
+        // Owner stop/hold projections may arrive after original retirement.
+        // They cannot create a new logical task reference for a dead task.
+        if !task.live() {
+            return;
+        }
         let identity = Arc::downgrade(task);
         if state
             .members
@@ -185,22 +235,36 @@ impl Group {
             .find_map(|(&id, m)| m.task.ptr_eq(&identity).then_some(id));
         let member = old
             .and_then(|id| state.members.remove(&id))
-            .unwrap_or(Member {
-                task: identity,
-                running: false,
-                held: false,
-                interrupt: None,
+            .unwrap_or_else(|| {
+                state.live += 1;
+                Member {
+                    task: identity,
+                    running: false,
+                    held: false,
+                    interrupt: None,
+                    retiring: false,
+                }
             });
         // A non-leader exec replaces the old leader's PID with this original task.
-        state.members.insert(pid, member);
+        if state
+            .members
+            .insert(pid, member)
+            .is_some_and(|m| !m.retiring)
+        {
+            state.live -= 1;
+        }
     }
     pub fn enter(self: &Arc<Self>, task: &Arc<IoTask>, pid: u32) -> Lease {
         let mut state = self.state.lock().unwrap();
+        if !state.members.contains_key(&pid) {
+            state.live += 1;
+        }
         let member = state.members.entry(pid).or_insert_with(|| Member {
             task: Arc::downgrade(task),
             running: false,
             held: false,
             interrupt: None,
+            retiring: false,
         });
         assert!(!member.running, "one executor per task");
         member.running = true;
@@ -223,10 +287,13 @@ impl Group {
             notice.publish();
         }
     }
-    pub fn retire(&self, pid: u32) {
+    pub(crate) fn retire(&self, pid: u32, mark: impl FnOnce()) {
         let notice = {
             let mut s = self.state.lock().unwrap();
-            s.members.remove(&pid);
+            mark();
+            if s.members.remove(&pid).is_some_and(|m| !m.retiring) {
+                s.live -= 1;
+            }
             s.acknowledge()
         };
         if let Some(notice) = notice {
@@ -495,5 +562,46 @@ mod tests {
         });
         let pending = a.pending_bits() | b.pending_bits();
         assert_ne!(pending & ((1 << 17) | (1 << 18)), (1 << 17) | (1 << 18));
+    }
+    #[test]
+    fn final_status_waits_for_original_cleanup_and_ignores_finish_order() {
+        for group_exit in [false, true] {
+            let (leader, peer, _) = family();
+            let group = leader.lifecycle();
+            leader.begin_exit(42, 11 << 8);
+            if group_exit {
+                group.begin_group_exit(31 << 8);
+                group.begin_group_exit(9);
+            }
+            peer.begin_exit(43, 37 << 8);
+            assert!(group.survivor().is_none());
+            assert_eq!(peer.finish_exit(43), None);
+            assert_eq!(group.exit_status(), None);
+            let expected = if group_exit { 31 } else { 37 } << 8;
+            assert_eq!(leader.finish_exit(42), Some(expected));
+            assert_eq!(group.exit_status(), Some(expected));
+            assert_eq!(leader.finish_exit(42), None, "one completion publication");
+        }
+    }
+    #[test]
+    fn stale_cleanup_cannot_retire_a_rekeyed_original_member() {
+        let (leader, peer, _) = family();
+        leader.begin_exit(42, 11 << 8);
+        leader.lifecycle().register(&peer, 42);
+        assert_eq!(leader.finish_exit(42), None);
+        assert_eq!(leader.lifecycle().survivor().unwrap().0, 42);
+        assert!(peer.live());
+    }
+    #[test]
+    fn late_owner_hold_publication_cannot_resurrect_a_retired_member() {
+        let (leader, peer, _) = family();
+        let group = leader.lifecycle();
+        leader.begin_exit(42, 11 << 8);
+        assert_eq!(leader.finish_exit(42), None);
+        group.register(&leader, 42);
+        group.hold(42, false);
+        peer.begin_exit(43, 37 << 8);
+        assert_eq!(peer.finish_exit(43), Some(37 << 8));
+        assert_eq!(group.exit_status(), Some(37 << 8));
     }
 }

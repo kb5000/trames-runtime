@@ -285,7 +285,7 @@ mod tests {
                     let barrier = barrier.clone();
                     scope.spawn(move || {
                         barrier.wait();
-                        task.try_exit_nonlast(*pid)
+                        task.try_exit_nonlast(*pid, (*pid as i32) << 8)
                     })
                 })
                 .collect();
@@ -297,7 +297,20 @@ mod tests {
         assert_eq!(results.iter().filter(|&&exited| exited).count(), 15);
         assert_eq!(tasks.iter().filter(|(_, task)| task.live()).count(), 1);
         let (last, task) = group.survivor().unwrap();
-        assert!(!task.try_exit_nonlast(last));
+        assert!(!task.try_exit_nonlast(last, 23 << 8));
+        task.begin_exit(last, 23 << 8);
+        assert_eq!(
+            task.finish_exit(last),
+            None,
+            "earlier cleanup is still active"
+        );
+        assert_eq!(group.exit_status(), None);
+        let mut completions = Vec::new();
+        for (pid, task) in &tasks {
+            completions.extend(task.finish_exit(*pid));
+        }
+        assert_eq!(completions, [23 << 8]);
+        assert_eq!(group.exit_status(), Some(23 << 8));
     }
 
     #[test]

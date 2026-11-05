@@ -1021,8 +1021,9 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             }
                                         }
                                         if work.cpu.x(8) as u32 == 93 {
-                                            if epoch.is_some() && snapshot.exit_thread(work.pid,work.memory.as_deref_mut().expect("exit View")) {
-                                                thread_exit=Some((work.cpu.x(0) as u8 as i32)<<8);syscalls+=1;
+                                            let status=(work.cpu.x(0) as u8 as i32)<<8;
+                                            if epoch.is_some() && snapshot.exit_thread(work.pid,status,work.memory.as_deref_mut().expect("exit View")) {
+                                                thread_exit=Some(status);syscalls+=1;
                                                 // An actual excluded legacy waiter still needs its
                                                 // existing owner adoption, after accepted cleanup.
                                                 if snapshot.futex.take_readied() {work.control.stop();}
@@ -1485,7 +1486,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
                         if parked.is_some() || yielded { epoch.park(job, parked); continue; }
+                        let exiting = thread_exit.and_then(|_|job.work.syscalls.as_ref().map(|s|s.io_signals.clone()));
                         let mut completed = job.finish(outcome, epoch.progress.load(Ordering::Relaxed));
+                        // Membership covers cleanup and the final View, not
+                        // merely the point where the task stopped executing.
+                        if let Some(task)=exiting {task.finish_exit(completed.pid);}
                         completed.thread_exit = thread_exit.filter(|_|completed.outcome.is_some());
                         epoch.finish(completed);
                     } else if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }

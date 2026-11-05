@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through original native mm
-ownership and completion retirement, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
+This is the consolidated implementation audit through original thread-group
+exit completion, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
 below, 2026-11-04, use calling workers and shared resources from their first implementation.
@@ -500,3 +500,34 @@ backend. Native audio/decoder stop APIs retain their existing behavior. Last/gro
 and default-fatal task entry, final CPU/Memory projection custody, robust futex and
 actual owner controls still need their connected migration. This batch removes
 the native ownership/polling dependency, not the remaining full process boundary.
+
+## Original thread-group exit completion — 2026-11-05
+
+The original Group now separates execution retirement from cleanup completion.
+Begin-exit marks the original IoTask dead under the group lock, decrements its
+live membership, and retains its member until cleanup finishes. Source non-last
+exits finish membership only after Job::finish drops their retained guest View.
+Owner exits finish after original resources and local projections have returned.
+The last begin-exit fixes an ordinary final status; an earlier explicit group
+termination fixes it once. Cleanup finish order cannot change this status.
+
+The same original group supplies last-member and final completion decisions to
+process locks, family publication and host completion. These decisions no longer
+scan ProcessMap or infer death from a temporarily absent owner-held caller. Live
+membership is maintained under the existing group mutex; no ordinary guest
+access gains a fence or a new global/resource lock. Member identity still uses
+the original IoTask, including nonleader exec rekeying. A late stop/hold
+projection cannot register a retired task as a new member.
+
+Returning source-exit CPUs collect only owner-local Memory/VFS and scheduling
+projections. They do not repeat io_uring cancellation, parent-death delivery,
+clear_tid, descriptor/native retirement or native-job abandonment. A guarded
+regression holds the original native context occupied while this collection
+finishes; injecting legacy native cleanup makes it fail without hanging.
+
+The completion phases are a prerequisite for, not completion of, source last-
+member/group/default-fatal exit. Their entry still joins the cohort. Final
+CPU/Memory custody, original vfork release, namespace-init shutdown victims and
+their completion ordering, robust futex support and actual owner controls remain
+connected work. No new service thread, polling bus, owner RPC or admission gate
+is introduced in this batch.

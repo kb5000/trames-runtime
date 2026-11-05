@@ -427,12 +427,26 @@ impl IoTask {
         }
     }
     pub fn exit(&self) {
-        self.live.store(false, Ordering::Relaxed);
-        self.lifecycle().retire(self.pid.load(Ordering::Relaxed));
-    }
-    pub fn try_exit_nonlast(self: &Arc<Self>, pid: u32) -> bool {
         self.lifecycle()
-            .try_retire_nonlast(pid, self, || self.live.store(false, Ordering::Relaxed))
+            .retire(self.pid.load(Ordering::Relaxed), || {
+                self.live.store(false, Ordering::Relaxed)
+            });
+    }
+    pub fn begin_exit(self: &Arc<Self>, pid: u32, status: i32) {
+        if self.live() {
+            self.lifecycle().register(self, pid);
+            self.lifecycle().begin_exit(pid, self, status, false, || {
+                self.live.store(false, Ordering::Relaxed)
+            });
+        }
+    }
+    pub fn try_exit_nonlast(self: &Arc<Self>, pid: u32, status: i32) -> bool {
+        self.lifecycle().begin_exit(pid, self, status, true, || {
+            self.live.store(false, Ordering::Relaxed)
+        })
+    }
+    pub fn finish_exit(self: &Arc<Self>, pid: u32) -> Option<i32> {
+        self.lifecycle().finish_exit(pid, self)
     }
     pub fn reap_thread_presence(&self) {
         if self.pid.load(Ordering::Relaxed) != self.tgid() {

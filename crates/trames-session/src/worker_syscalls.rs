@@ -509,13 +509,13 @@ impl Snapshot {
             _ => false,
         }
     }
-    pub fn exit_thread(&self, pid: u32, memory: &mut impl CpuMemory) -> bool {
+    pub fn exit_thread(&self, pid: u32, status: i32, memory: &mut impl CpuMemory) -> bool {
         let Some(files) = &self.exit_files else {
             return false;
         };
         // Actual excluded controls retain their original destructor boundary;
         // no owner-only description can be published by this active cohort.
-        if files.has_owner_controls() || !self.io_signals.try_exit_nonlast(pid) {
+        if files.has_owner_controls() || !self.io_signals.try_exit_nonlast(pid, status) {
             return false;
         }
         self.direct

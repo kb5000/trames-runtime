@@ -1305,14 +1305,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.executable_file = None;
         p.space.retire();
         p.linux.vfs.set_lock_owner(p.tgid);
-        let live = |t: &&Process<C>| !matches!(t.state, State::Zombie(_));
-        if !self
-            .processes
-            .values()
-            .map(Box::as_ref)
-            .filter(live)
-            .any(|t| t.tgid == p.tgid)
-        {
+        if !p.signals.io.lifecycle().has_live_members() {
             p.linux.vfs.release_process_locks();
         }
         p.linux.vfs.release_descriptors();
@@ -1322,8 +1315,26 @@ impl<C: Cpu> Kernel<C> {
         if p.family.registry().is_none() {
             self.publish_children(Some(p));
         }
-        p.signals.io.exit();
+        p.signals.io.begin_exit(pid, status);
         p.linux.cancel_uring(&mut p.memory, pid);
+        Self::parent_thread_exited(p, None);
+        p.linux.vfs.cgroup_exit(pid);
+        Self::cancel_native_task(p);
+        if let State::Futex { wait, .. } = &p.state {
+            wait.cancel();
+        }
+        // Cancel the original wait before clear_tid can wake a successor.
+        p.state = State::Zombie(status);
+        let address = p.linux.clear_tid_address();
+        p.linux.exit_tid(&mut p.memory);
+        self.wake_futex(p, address, 1, u32::MAX);
+        self.close_exit_files(p);
+        self.collect_exit_projection(pid, p, status);
+    }
+    /// Source exits already retired original resources. Only the owner-local
+    /// CPU/Memory/VFS projections return here; never replay accepted effects.
+    fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        self.children_dirty.set(true);
         p.uring_wait = None;
         p.flock_wait = None;
         p.record_wait = None;
@@ -1336,39 +1347,23 @@ impl<C: Cpu> Kernel<C> {
         p.retained_message_owner = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
-        Self::parent_thread_exited(p, None);
-        p.linux.vfs.cgroup_exit(pid);
-        Self::cancel_native_task(p);
-        if let State::Futex { wait, .. } = &p.state {
-            wait.cancel();
-        }
-        // The original wait stays authoritative while stopped, and is cancelled
-        // only on exit, before clear_tid can wake an unrelated successor.
-        p.state = State::Zombie(status);
-        let address = p.linux.clear_tid_address();
-        p.linux.exit_tid(&mut p.memory);
-        self.wake_futex(p, address, 1, u32::MAX);
-        self.wake_vfork(pid);
-        if pid != p.tgid {
-            p.state = State::Zombie(status);
-            p.auto_reap = true;
-            self.close_exit_files(p);
-            p.memory = Memory::default();
-            self.finish_group(p.tgid);
-            return;
-        }
+        p.linux.executable_file = None;
+        p.linux.vfs.detach_file_table();
         if pid != 1 {
             p.memory = Memory::default();
         }
         p.state = State::Zombie(status);
-        self.close_exit_files(p);
+        p.signals.io.finish_exit(pid);
+        self.wake_vfork(pid);
+        if pid != p.tgid {
+            p.auto_reap = true;
+            self.finish_group(p.tgid);
+            return;
+        }
         p.signals.io.inbox.clear();
 
-        if !self
-            .processes
-            .values()
-            .any(|t| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_)))
-        {
+        if let Some(status) = p.signals.io.lifecycle().exit_status() {
+            p.state = State::Zombie(status);
             if let Some(completion) = &p.host_status {
                 completion.store(status, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1385,16 +1380,10 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn finish_group(&mut self, tgid: u32) {
-        if self
-            .processes
-            .values()
-            .any(|t| t.tgid == tgid && !matches!(t.state, State::Zombie(_)))
-        {
-            return;
-        }
-        self.timers.clear_process(tgid, false);
-        if let Some(leader) = self.processes.get(&tgid) {
-            if let State::Zombie(status) = leader.state {
+        if let Some(leader) = self.processes.get_mut(&tgid) {
+            if let Some(status) = leader.signals.io.lifecycle().exit_status() {
+                leader.state = State::Zombie(status);
+                self.timers.clear_process(tgid, false);
                 if let Some(completion) = &leader.host_status {
                     completion.store(status, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1409,7 +1398,8 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
-        p.signals.io.exit();
+        p.signals.io.lifecycle().begin_group_exit(status);
+        p.signals.io.begin_exit(pid, status);
 
         let members: Vec<_> = self
             .processes
@@ -1419,7 +1409,7 @@ impl<C: Cpu> Kernel<C> {
             .collect();
         for id in members.iter().copied().filter(|id| *id != p.tgid) {
             if let Some(mut thread) = self.processes.remove(&id) {
-                thread.signals.io.exit();
+                thread.signals.io.begin_exit(id, status);
                 Self::cancel_native_task(&thread);
                 thread.linux.cancel_uring(&mut thread.memory, id);
                 Self::parent_thread_exited(&thread, None);
@@ -1428,6 +1418,8 @@ impl<C: Cpu> Kernel<C> {
                 thread.linux.exit_tid(&mut thread.memory);
                 self.wake_futex(&thread, address, 1, u32::MAX);
                 self.close_exit_files(&mut thread);
+                thread.memory = Memory::default();
+                thread.signals.io.finish_exit(id);
             }
         }
         if pid != p.tgid {
@@ -2147,8 +2139,8 @@ impl<C: Cpu> Kernel<C> {
                     presence: p.signals.presence.visibility(),
                 },
             );
-            if let State::Zombie(status) = p.state {
-                if !tasks().any(|(_, t)| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_))) {
+            if matches!(p.state, State::Zombie(_)) {
+                if let Some(status) = p.signals.io.lifecycle().exit_status() {
                     self.families.complete(&p.family, status);
                 }
             }
@@ -5109,7 +5101,7 @@ impl<C: Cpu> Kernel<C> {
         // the last member's process/group exit inspects this process graph.
         for (pid, status) in thread_exits {
             if let Some(mut p) = self.processes.remove(&pid) {
-                self.exit_one(pid, &mut p, status);
+                self.collect_exit_projection(pid, &mut p, status);
                 if !p.auto_reap || pid == 1 {
                     self.processes.insert(pid, p);
                 }
@@ -6113,16 +6105,20 @@ mod tests {
             .iter()
             .any(|s| s == b"X=literal value"));
         assert_eq!(status.load(Ordering::Relaxed), trames_linux::HOST_RUNNING);
-        let memory = child.memory.share();
-        let mut thread = child.fork_state(memory, true, true, true);
-        thread.tgid = id;
-        k.processes.insert(id + 1, thread);
+        k.syscall(
+            id,
+            &mut child,
+            220,
+            [0x10f00, 0, 0, 0, 0, 0],
+            &mut trames_linux::CapturedOutput::default(),
+        )
+        .unwrap();
         k.exit_one(id, &mut child, 42 << 8);
         assert_eq!(status.load(Ordering::Relaxed), trames_linux::HOST_RUNNING);
         k.processes.insert(id, child);
         let mut thread = k.processes.remove(&(id + 1)).unwrap();
         k.exit_one(id + 1, &mut thread, 0);
-        assert_eq!(status.load(Ordering::Relaxed), 42 << 8);
+        assert_eq!(status.load(Ordering::Relaxed), 0);
         assert!(k.processes.contains_key(&1));
     }
     #[test]
@@ -7161,13 +7157,14 @@ mod tests {
             let mut child = parent.fork();
             child.tgid = 42;
             child.family.set_parent(1);
-            child.state = State::Zombie(23 << 8);
             let mut kernel = kernel();
             kernel.cpu_count = 2;
             kernel.workers = crate::workers::Pool::new(2);
             kernel.per_cpu = vec![Duration::ZERO; 2];
             kernel.processes.insert(1, parent);
             kernel.processes.insert(2, peer);
+            kernel.publish_io_tasks(Some((42, &child)));
+            kernel.exit_one(42, &mut child, 23 << 8);
             kernel.processes.insert(42, child);
             let expected = if number == 260 { 42 } else { 0 };
             for _ in 0..8 {
@@ -8529,6 +8526,91 @@ mod tests {
             matches!(result, Ok(Ok(0))),
             "unrelated headless execution waited behind native maintenance: {result:?}"
         );
+    }
+    #[test]
+    fn source_exit_projection_never_replays_native_cleanup() {
+        let (published, context) = std::sync::mpsc::channel();
+        let (start, go) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut root = process();
+            let mut k = kernel();
+            let memory = root.memory.share();
+            let mut peer = root.fork_with_memory(memory);
+            peer.tgid = 1;
+            peer.family = root.family.clone();
+            peer.signals.io.share_process(&root.signals.io);
+            root.signals.io.lifecycle().register(&root.signals.io, 1);
+            peer.signals.io.lifecycle().register(&peer.signals.io, 2);
+            let context = k.gpu_context(&root);
+            // The CPU completed its pending GPU operation and exited while
+            // the owner still retains the old GPU scheduling projection.
+            peer.state = State::Gpu {
+                retired: true,
+                peer_instructions: 0,
+                job: 1,
+                pc: 0x4000,
+                operation: 27,
+                instructions: 0,
+                began: Instant::now(),
+            };
+            assert!(peer.signals.io.try_exit_nonlast(2, 23 << 8));
+            peer.linux.vfs.file_table_owner().retire(1);
+            peer.space.retire();
+            peer.signals.io.finish_exit(2);
+            published.send(context).unwrap();
+            k.processes.insert(1, root);
+            go.recv().unwrap();
+            k.collect_exit_projection(2, &mut peer, 23 << 8);
+            finished.send(peer.auto_reap).unwrap();
+        });
+        let context = context.recv_timeout(Duration::from_secs(5)).unwrap();
+        let lease = context.try_lock().unwrap();
+        start.send(()).unwrap();
+        let result = done.recv_timeout(Duration::from_secs(1));
+        drop(lease);
+        worker.join().unwrap();
+        assert!(
+            matches!(result, Ok(true)),
+            "projection replayed native cleanup"
+        );
+    }
+    #[test]
+    fn original_group_completion_uses_final_thread_or_first_group_exit_status() {
+        for group_exit in [false, true] {
+            let mut k = kernel();
+            let mut root = process();
+            let mut output = trames_linux::CapturedOutput::default();
+            k.syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
+                .unwrap();
+            k.processes.insert(1, root);
+            let mut child = k.processes.remove(&2).unwrap();
+            k.syscall(2, &mut child, 220, [0x10f00, 0, 0, 0, 0, 0], &mut output)
+                .unwrap();
+            let status = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+            child.host_status = Some(status.clone());
+            k.publish_io_tasks(Some((2, &child)));
+            k.exit_one(2, &mut child, 11 << 8);
+            assert!(!child.auto_reap);
+            assert_eq!(child.wait_event.pending(), None);
+            assert_eq!(status.load(std::sync::atomic::Ordering::Relaxed), -1);
+            let event = child.wait_event.clone();
+            k.processes.insert(2, child);
+            let mut peer = k.processes.remove(&3).unwrap();
+            // Owner custody temporarily removes a live caller from ProcessMap.
+            // A structural refresh must consult the original group completion.
+            k.publish_children(None);
+            assert_eq!(event.pending(), None);
+            if group_exit {
+                k.exit(3, &mut peer, 31 << 8);
+            } else {
+                k.exit_one(3, &mut peer, 37 << 8);
+            }
+            let expected = if group_exit { 31 } else { 37 } << 8;
+            assert_eq!(event.pending(), Some(expected));
+            assert_eq!(status.load(std::sync::atomic::Ordering::Relaxed), expected);
+            assert!(matches!(k.processes[&2].state, State::Zombie(s) if s == expected));
+        }
     }
     #[test]
     fn native_mm_contexts_follow_original_memory_across_clone_and_stale_exit_snapshots() {
