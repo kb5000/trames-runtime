@@ -135,6 +135,17 @@ pub struct FileTableRetirement {
     pub owner_controls: usize,
 }
 impl FileTableOwner {
+    /// Owner-only control projections cannot be introduced by an admitted
+    /// worker publication. Their actual destructor still needs its boundary.
+    pub fn has_owner_controls(&self) -> bool {
+        self.0
+            .membership
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .any(|slot| matches!(slot.open, SlotOpen::Owner(..)))
+    }
     fn initial(files: &SharedFiles) -> Self {
         Self(Arc::new(TaskFiles {
             membership: files.0.clone(),

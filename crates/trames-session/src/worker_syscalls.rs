@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub exit_files: Option<trames_vfs::FileTableOwner>,
     pub children: Arc<trames_kernel::children::Children>,
     pub limits: Option<trames_kernel::limits::Authority>,
     pub timers: Option<Arc<trames_kernel::timers::Timers>>,
@@ -482,7 +483,7 @@ impl Snapshot {
         (self.seccomp.mode() != 0
             && (matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
                 || self.signal_send(cpu)
-                || self.thread_call(cpu.x(8) as u32)
+                || self.thread_call(cpu)
                 || self.limit_call(cpu.x(8) as u32)))
         .then(|| {
             self.seccomp.entry_decision(
@@ -495,8 +496,50 @@ impl Snapshot {
     pub fn limit_call(&self, number: u32) -> bool {
         self.limits.is_some() && matches!(number, 163 | 164 | 261)
     }
-    pub fn thread_call(&self, number: u32) -> bool {
-        number == 96 && self.io_signals.thread_addresses().is_some()
+    pub fn thread_call<C: Cpu>(&self, cpu: &C) -> bool {
+        match cpu.x(8) as u32 {
+            93 => self.exit_files.is_some(),
+            96 => self.io_signals.thread_addresses().is_some(),
+            167 => matches!(cpu.x(0) as u32, 1 | 2) && self.io_signals.parentage().is_some(),
+            _ => false,
+        }
+    }
+    pub fn exit_thread(&self, pid: u32, memory: &mut impl CpuMemory) -> bool {
+        let Some(files) = &self.exit_files else {
+            return false;
+        };
+        // Actual excluded controls retain their original destructor boundary;
+        // no owner-only description can be published by this active cohort.
+        if files.has_owner_controls() || !self.io_signals.try_exit_nonlast(pid) {
+            return false;
+        }
+        self.direct
+            .cancel_task_uring(memory.instruction_identity().0, pid);
+        self.io_routes.directory.parents.retire_with(
+            &self.io_signals,
+            || self.io_signals.lifecycle().survivor(),
+            trames_kernel::signal::Info {
+                sender: self.io_signals.tgid(),
+                uid: self.io_routes.uid,
+                ..Default::default()
+            },
+        );
+        if let Some(task) = self.io_signals.cgroup() {
+            task.exit();
+        }
+        if let Some(addresses) = self.io_signals.thread_addresses() {
+            let address = addresses.take_clear_tid();
+            if address != 0 {
+                let _ = memory.write(address, &[0; 4]);
+                if let Ok(key) = futex_key(memory, self.futex.vm, address, false) {
+                    self.futex
+                        .record(&self.futex.table.wake_local(key, 1, u32::MAX), false);
+                }
+            }
+        }
+        files.retire(self.io_signals.tgid());
+        self.io_signals.reap_thread_presence();
+        true
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131)
@@ -511,7 +554,7 @@ impl Snapshot {
         if trames_kernel::timers::timer_call(cpu.x(8) as u32)
             || matches!(cpu.x(8) as u32, 95 | 260 | 132..=137)
             || self.signal_send(cpu)
-            || self.thread_call(cpu.x(8) as u32)
+            || self.thread_call(cpu)
             || self.limit_call(cpu.x(8) as u32)
         {
             return false;
@@ -582,6 +625,20 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            167 if matches!(cpu.x(0) as u32, 1 | 2) => {
+                let parentage = self.io_signals.parentage()?;
+                match cpu.x(0) as u32 {
+                    1 if cpu.x(1) > 64 => Err(Errno(22)),
+                    1 => {
+                        parentage.set_death_signal(cpu.x(1) as u32);
+                        Ok(0)
+                    }
+                    _ => memory
+                        .write(cpu.x(1), &parentage.death_signal().to_le_bytes())
+                        .map(|()| 0)
+                        .map_err(|_| Errno(14)),
+                }
+            }
             96 => {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
@@ -844,6 +901,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -973,6 +1031,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1032,6 +1091,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1135,6 +1195,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1202,6 +1263,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,

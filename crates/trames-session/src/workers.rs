@@ -113,6 +113,7 @@ impl GpuStats {
     }
 }
 pub(super) struct Done<C: Cpu> {
+    pub thread_exit: Option<i32>,
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
     pub pid: u32,
     pub cpu: C,
@@ -463,6 +464,7 @@ impl<C: Cpu> Pool<C> {
                     let mut parked_io = None;
                     let mut parked_gpu = None;
                     let mut maintenance = false;
+                    let mut thread_exit = None;
                     let mut yielded = false;
                     let mut service = false;
                     let mut vm_checkpoint = false;
@@ -1010,12 +1012,22 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     break result;
                                 }
                                 if let Some(snapshot)=&work.syscalls {
-                                    if matches!(work.cpu.x(8) as u32, 132..=137) || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260) || snapshot.signal_send(&work.cpu) || snapshot.thread_call(work.cpu.x(8) as u32) || snapshot.limit_call(work.cpu.x(8) as u32) {
-                                        if let Some(entry)=snapshot.task_entry(&work.cpu) {
-                                            if !entry.allowed() {
-                                                if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
-                                                job.seccomp_entry=Some(entry);break result;
+                                    if matches!(work.cpu.x(8) as u32, 132..=137) || epoch.is_some() && matches!(work.cpu.x(8) as u32, 95 | 260) || snapshot.signal_send(&work.cpu) || snapshot.thread_call(&work.cpu) || snapshot.limit_call(work.cpu.x(8) as u32) {
+                                        let mut entry = snapshot.task_entry(&work.cpu);
+                                        if let Some(decision)=entry.as_ref() {
+                                            if !decision.allowed() {
+                                                if let Some(value)=decision.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                                job.seccomp_entry=entry.take();break result;
                                             }
+                                        }
+                                        if work.cpu.x(8) as u32 == 93 {
+                                            if epoch.is_some() && snapshot.exit_thread(work.pid,work.memory.as_deref_mut().expect("exit View")) {
+                                                thread_exit=Some((work.cpu.x(0) as u8 as i32)<<8);syscalls+=1;
+                                                // An actual excluded legacy waiter still needs its
+                                                // existing owner adoption, after accepted cleanup.
+                                                if snapshot.futex.take_readied() {work.control.stop();}
+                                            } else {job.seccomp_entry=entry;}
+                                            break result;
                                         }
                                         let began=snapshot.profile.then(Instant::now);
                                         let number=work.cpu.x(8) as u32;
@@ -1398,7 +1410,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         }
                     }))
                     .ok();
-                    if let Some(epoch) = &epoch {
+                    if let Some(epoch) = epoch.as_ref().filter(|_|thread_exit.is_none()) {
                         if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                         if let Some(ring) = &mut job.uring {
                             if !ring.progress(work.memory.as_deref_mut().expect("source task View")) { work.control.stop(); }
@@ -1413,7 +1425,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     // Syscall, deferred native, fault and yield request a checkpoint
                     // immediately, before the coordinator receives this message.
-                    if !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
+                    if thread_exit.is_none() && !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
                     let elapsed = began.elapsed().saturating_sub(service_wait);
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
@@ -1473,7 +1485,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
                         if parked.is_some() || yielded { epoch.park(job, parked); continue; }
-                        epoch.finish(job.finish(outcome, epoch.progress.load(Ordering::Relaxed)));
+                        let mut completed = job.finish(outcome, epoch.progress.load(Ordering::Relaxed));
+                        completed.thread_exit = thread_exit.filter(|_|completed.outcome.is_some());
+                        epoch.finish(completed);
                     } else if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }
                     }
                     // Bound descriptors by host workers, not queued guest
@@ -1780,6 +1794,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            exit_files: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -2006,6 +2021,122 @@ mod tests {
         assert_eq!(signal_task.context.lock().unwrap().frames, 0);
         memory.commit_parallel().unwrap();
         assert_eq!(u64::from_le_bytes(memory.read_array(0x2000).unwrap()), 29);
+    }
+
+    #[test]
+    fn source_thread_exit_releases_resources_and_notifies_children_without_stopping_peers() {
+        for slots in [1, 4] {
+            for (owner_control, legacy_wait) in [(false, false), (true, false), (false, true)] {
+                let control = Arc::new(Control::new(100000));
+                let (send, receive) = std::sync::mpsc::channel();
+                let epoch = crate::run_queue::Epoch::with_events(control.clone(), send, true);
+                let mut caller = work(30, &[0xd2800ba8, 0xd4000001], 23, control.clone());
+                let mut snapshot = syscall_snapshot();
+                let signals = trames_kernel::signal::Signals::default();
+                signals.publish_policy(&trames_vfs::PidNamespace::default(), false);
+                let visible = signals.presence.visibility();
+                snapshot.io_signals = signals.io.clone();
+                let survivor = Arc::new(trames_kernel::signal::IoTask::default());
+                snapshot.io_signals.share_process(&survivor);
+                let directory = &snapshot.io_routes.directory;
+                directory.publish(&survivor, 10, 10, 10, 0, 0);
+                directory.publish(&snapshot.io_signals, 30, 10, 10, 0, 0);
+                directory.parents.publish(&survivor, 10, &Arc::default());
+                directory
+                    .parents
+                    .publish(&snapshot.io_signals, 30, &Arc::default());
+                let child = Arc::new(trames_kernel::signal::IoTask::default());
+                let parentage = Arc::new(trames_kernel::task_parent::Parentage::default());
+                parentage.set_parent_thread(30);
+                parentage.set_death_signal(35);
+                directory.parents.publish(&child, 40, &parentage);
+                let address = if legacy_wait { 0x1000 } else { 0x9000 };
+                let legacy = legacy_wait.then(|| {
+                    snapshot
+                        .futex
+                        .table
+                        .wait((0, 0, address), 99, u32::MAX, || Ok::<(), ()>(()))
+                        .unwrap()
+                });
+                let second_legacy = legacy_wait.then(|| {
+                    snapshot
+                        .futex
+                        .table
+                        .wait((0, 0, address), 100, u32::MAX, || Ok::<(), ()>(()))
+                        .unwrap()
+                });
+                let addresses = Arc::new(trames_execution::ThreadAddresses::new(address));
+                snapshot.io_signals.bind_thread_addresses(&addresses);
+                let original = snapshot.io_signals.clone();
+                let mut vfs = trames_vfs::Vfs::default();
+                let [reader, writer] = vfs.pipe(trames_vfs::O_NONBLOCK).unwrap();
+                let accepted = vfs
+                    .shared_files()
+                    .lookup(reader)
+                    .unwrap()
+                    .unwrap()
+                    .direct_byte()
+                    .unwrap();
+                if owner_control {
+                    vfs.epoll_create(0).unwrap();
+                }
+                snapshot.exit_files = Some(vfs.file_table_owner());
+                caller.syscalls = Some(snapshot);
+                epoch.add(crate::run_queue::Job::new(
+                    caller,
+                    (1 << slots) - 1,
+                    0,
+                    None,
+                ));
+                let mut pool = Pool::new(slots);
+                for slot in 0..slots {
+                    pool.ensure(slot).unwrap();
+                    pool.launch(slot, epoch.clone()).unwrap();
+                }
+                if !owner_control && !legacy_wait {
+                    assert!(matches!(
+                        receive.recv_timeout(Duration::from_secs(5)),
+                        Ok(Event::Idle)
+                    ));
+                    assert!(!control.stopped(), "individual exit stopped its live peer");
+                    epoch.stop();
+                }
+                for _ in 0..slots {
+                    assert!(matches!(
+                        pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                        Some(Event::EpochStopped(_))
+                    ));
+                }
+                let completed = epoch.drain().pop().unwrap();
+                assert_eq!(completed.thread_exit, (!owner_control).then_some(23 << 8));
+                assert_eq!(completed.serviced_syscalls, 0);
+                if !owner_control {
+                    assert!(!original.live());
+                    assert!(
+                        !visible.present(),
+                        "dead thread remains in shared PID directories"
+                    );
+                    assert_eq!(addresses.clear_tid(), 0);
+                    assert_eq!(accepted.read(1).unwrap(), b"");
+                    assert_eq!(vfs.flags(writer), Err(trames_vfs::Errno(9)));
+                    assert_eq!(parentage.parent_thread(), 10);
+                    assert_eq!(child.process().take(35).unwrap().sender, 10);
+                    if let Some(wait) = &legacy {
+                        assert!(wait.woken());
+                    }
+                    if let Some(wait) = &second_legacy {
+                        assert!(!wait.woken(), "clear_tid must wake only one waiter");
+                    }
+                }
+                if owner_control {
+                    assert!(original.live(), "deferred exit changed task state");
+                    assert!(visible.present());
+                    assert_eq!(addresses.clear_tid(), 0x9000);
+                    assert_eq!(accepted.read(1), Err(trames_vfs::Errno(11)));
+                    assert!(child.process().take(35).is_none());
+                }
+            }
+        }
     }
 
     #[test]

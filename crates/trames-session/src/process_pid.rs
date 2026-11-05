@@ -3,50 +3,18 @@
 use super::*;
 impl<C: Cpu> Kernel<C> {
     pub(super) fn parent_thread_exited(
-        &mut self,
-        tid: u32,
         parent: &Process<C>,
-        survivor: Option<u32>,
+        survivor: Option<(u32, Arc<trames_kernel::signal::IoTask>)>,
     ) {
-        let successor = survivor.or_else(|| {
-            self.processes.iter().find_map(|(&id, t)| {
-                (id != tid && t.tgid == parent.tgid && !matches!(t.state, State::Zombie(_)))
-                    .then_some(id)
-            })
-        });
-        for child in self.processes.values_mut() {
-            if child.parent_thread != tid || matches!(child.state, State::Zombie(_)) {
-                continue;
-            }
-            let sig = child.pdeath_signal;
-            if matches!(sig, 9 | 18..=22) {
-                let info = Info {
-                    sender: parent.tgid,
-                    uid: parent.linux.vfs.credentials.uid,
-                    ..Default::default()
-                };
-                let _ = child.signals.io.job_signal(
-                    sig,
-                    true,
-                    info,
-                    child.signals.io.ancestor_sender(parent.tgid),
-                );
-            } else if sig != 0 && Self::prepare_signal(child, sig, parent.tgid) {
-                let _ = child.signals.io.process().enqueue(
-                    sig,
-                    Info {
-                        sender: parent.tgid,
-                        uid: parent.linux.vfs.credentials.uid,
-                        status: 0,
-                        code: 0,
-                        timer: None,
-                        fault: None,
-                        poll: None,
-                    },
-                );
-            }
-            child.parent_thread = successor.unwrap_or(0);
-        }
+        parent.signals.io_directory.parents.retire_with(
+            &parent.signals.io,
+            || survivor.or_else(|| parent.signals.io.lifecycle().survivor()),
+            Info {
+                sender: parent.tgid,
+                uid: parent.linux.vfs.credentials.uid,
+                ..Default::default()
+            },
+        );
     }
 
     pub(super) fn reap_namespace_children(
@@ -109,7 +77,12 @@ impl<C: Cpu> Kernel<C> {
         for (&id, child) in &mut self.processes {
             if child.parent == pid {
                 child.parent = reaper;
-                child.parent_thread = reaper;
+                child.parentage.set_parent_thread(reaper);
+                child
+                    .signals
+                    .io_directory
+                    .parents
+                    .reparent(&child.signals.io, reaper);
                 if id == child.tgid {
                     if let State::Zombie(s) = child.state {
                         zombies.push((id, s));

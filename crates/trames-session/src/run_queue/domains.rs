@@ -385,6 +385,35 @@ mod tests {
         assert_eq!(epoch.drain().len(), 3);
     }
     #[test]
+    fn source_exit_publishes_the_final_view_return_to_a_waiting_mm_checkpoint() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let control = Arc::new(Control::new(10000));
+        let epoch = Epoch::with_events(control.clone(), send, true);
+        let mut memory = memory();
+        let view = memory.parallel_view(&mut Default::default()).unwrap();
+        epoch.add(job(1, Box::new(view.clone()), &epoch));
+        epoch.add(job(2, Box::new(view), &epoch));
+        let caller = epoch.take(0).unwrap();
+        let peer = epoch.take(1).unwrap();
+        epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 1 });
+        assert!(epoch.take_checkpoint().is_none());
+        assert!(receive.try_recv().is_err());
+        let mut completed = peer.finish(Some(SliceOutcome::Syscall { instructions: 1 }), 0);
+        completed.thread_exit = Some(0);
+        epoch.finish(completed);
+        assert!(!control.stopped());
+        assert!(matches!(
+            receive.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(crate::workers::Event::VmReady)
+        ));
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        assert_eq!(checkpoint.jobs.len(), 1);
+        epoch.restore_checkpoint(checkpoint, false);
+        epoch.stop();
+        assert_eq!(epoch.drain().len(), 2);
+    }
+
+    #[test]
     fn exclusive_cpu_capacity_requires_every_admitted_job_to_be_in_the_checkpoint() {
         let epoch = Epoch::new(Arc::new(Control::new(10000)));
         let mut memory = memory();

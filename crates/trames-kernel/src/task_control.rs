@@ -103,6 +103,51 @@ impl State {
     }
 }
 impl Group {
+    pub fn survivor(&self) -> Option<(u32, Arc<IoTask>)> {
+        self.state
+            .lock()
+            .unwrap()
+            .members
+            .iter()
+            .find_map(|(&pid, member)| {
+                member
+                    .task
+                    .upgrade()
+                    .filter(|task| task.live())
+                    .map(|task| (pid, task))
+            })
+    }
+    /// Claim an individual exit while another member remains alive. The last
+    /// member keeps the actual process/group cleanup boundary before effects.
+    pub(crate) fn try_retire_nonlast(
+        &self,
+        pid: u32,
+        task: &Arc<IoTask>,
+        mark: impl FnOnce(),
+    ) -> bool {
+        let notice = {
+            let mut state = self.state.lock().unwrap();
+            let original = Arc::downgrade(task);
+            if !state
+                .members
+                .get(&pid)
+                .is_some_and(|m| m.task.ptr_eq(&original))
+                || !state
+                    .members
+                    .iter()
+                    .any(|(&id, m)| id != pid && m.task.upgrade().is_some_and(|t| t.live()))
+            {
+                return false;
+            }
+            mark();
+            state.members.remove(&pid);
+            state.acknowledge()
+        };
+        if let Some(notice) = notice {
+            notice.publish();
+        }
+        true
+    }
     pub fn interrupt_member(&self, pid: u32) {
         let state = self.state.lock().unwrap();
         if let Some(interrupt) = state.members.get(&pid).and_then(|m| m.interrupt.as_ref()) {

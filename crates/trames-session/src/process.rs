@@ -82,8 +82,7 @@ pub(crate) struct Process<C: Cpu> {
     memory: Memory,
     linux: Linux,
     parent: u32,
-    parent_thread: u32,
-    pdeath_signal: u32,
+    parentage: Arc<trames_kernel::task_parent::Parentage>,
     group: u32,
     session: u32,
     state: State,
@@ -434,8 +433,7 @@ impl<C: Cpu> Process<C> {
             memory,
             linux,
             parent: 0,
-            parent_thread: 0,
-            pdeath_signal: 0,
+            parentage: Arc::default(),
             group: self.group,
             session: self.session,
             state: State::Ready,
@@ -644,6 +642,10 @@ impl<C: Cpu> Kernel<C> {
         p.signals
             .io
             .bind_thread_addresses(p.linux.thread_addresses());
+        p.signals
+            .io_directory
+            .parents
+            .publish(&p.signals.io, id, &p.parentage);
         p.signals.io.set_session(p.session);
         if p.signals.io.cgroup().is_none() {
             if let Some(task) = p.linux.vfs.cgroup_task(id) {
@@ -985,7 +987,7 @@ impl<C: Cpu> Kernel<C> {
         child.linux.vfs.set_process_context(id);
         child.linux.fork_tid(0);
         child.parent = 1;
-        child.parent_thread = 1;
+        child.parentage.set_parent_thread(1);
         child.tgid = id;
         child.session = id;
         child.group = id;
@@ -1354,7 +1356,7 @@ impl<C: Cpu> Kernel<C> {
         p.retained_message_owner = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
-        self.parent_thread_exited(pid, p, None);
+        Self::parent_thread_exited(p, None);
         p.linux.vfs.cgroup_exit(pid);
         if let State::Gpu { job, .. } = &p.state {
             if let Some(backend) = self.gpu.borrow_mut().get_mut(&p.vm_id) {
@@ -1369,7 +1371,7 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Zombie(status);
         let address = p.linux.clear_tid_address();
         p.linux.exit_tid(&mut p.memory);
-        self.wake_futex(p, address, u32::MAX, u32::MAX);
+        self.wake_futex(p, address, 1, u32::MAX);
         self.wake_vfork(pid);
         if pid != p.tgid {
             p.state = State::Zombie(status);
@@ -1465,10 +1467,13 @@ impl<C: Cpu> Kernel<C> {
             .collect();
         for id in members.iter().copied().filter(|id| *id != p.tgid) {
             if let Some(mut thread) = self.processes.remove(&id) {
+                thread.signals.io.exit();
+                thread.linux.cancel_uring(&mut thread.memory, id);
+                Self::parent_thread_exited(&thread, None);
                 thread.linux.vfs.cgroup_exit(id);
                 let address = thread.linux.clear_tid_address();
                 thread.linux.exit_tid(&mut thread.memory);
-                self.wake_futex(&thread, address, u32::MAX, u32::MAX);
+                self.wake_futex(&thread, address, 1, u32::MAX);
                 self.close_exit_files(&mut thread);
             }
         }
@@ -2673,11 +2678,13 @@ impl<C: Cpu> Kernel<C> {
                 } else {
                     p.tgid
                 };
-                child.parent_thread = if threaded || a[0] & 0x8000 != 0 {
-                    p.parent_thread
-                } else {
-                    pid
-                };
+                child
+                    .parentage
+                    .set_parent_thread(if threaded || a[0] & 0x8000 != 0 {
+                        p.parentage.parent_thread()
+                    } else {
+                        pid
+                    });
                 child.cpu.set_x(0, 0);
                 if a[1] != 0 {
                     child.cpu.set_sp(a[1]);
@@ -2729,12 +2736,13 @@ impl<C: Cpu> Kernel<C> {
                     .collect();
                 for id in ids {
                     if let Some(mut t) = self.processes.remove(&id) {
+                        t.signals.io.exit();
                         t.linux.cancel_uring(&mut t.memory, id);
-                        self.parent_thread_exited(id, &t, Some(p.tgid));
+                        Self::parent_thread_exited(&t, Some((p.tgid, p.signals.io.clone())));
                         t.linux.vfs.cgroup_exit(id);
                         let address = t.linux.clear_tid_address();
                         t.linux.exit_tid(&mut t.memory);
-                        self.wake_futex(&t, address, u32::MAX, u32::MAX);
+                        self.wake_futex(&t, address, 1, u32::MAX);
                         t.linux.vfs.release_descriptors();
                     }
                 }
@@ -2744,8 +2752,13 @@ impl<C: Cpu> Kernel<C> {
                     p.linux.vfs.cgroup_exec_rekey(pid, p.tgid);
                     p.rekey = Some(p.tgid);
                     for child in self.processes.values_mut() {
-                        if child.parent_thread == pid {
-                            child.parent_thread = p.tgid;
+                        if child.parentage.parent_thread() == pid {
+                            child.parentage.set_parent_thread(p.tgid);
+                            child
+                                .signals
+                                .io_directory
+                                .parents
+                                .reparent(&child.signals.io, p.tgid);
                         }
                     }
                 }
@@ -2769,11 +2782,11 @@ impl<C: Cpu> Kernel<C> {
                 if a[1] > 64 {
                     return Err(Errno(22));
                 }
-                p.pdeath_signal = a[1] as u32;
+                p.parentage.set_death_signal(a[1] as u32);
                 Ok(Some(0))
             }
             167 if a[0] == 2 => {
-                write_u32(&mut p.memory, a[1], p.pdeath_signal)?;
+                write_u32(&mut p.memory, a[1], p.parentage.death_signal())?;
                 Ok(Some(0))
             }
             167 if a[0] == 3 => Ok(Some(p.linux.vfs.dumpable())),
@@ -3483,7 +3496,7 @@ impl<C: Cpu> Kernel<C> {
         let after_ids = ids(&p.linux.vfs.credentials);
         if after_ids != before_ids {
             if after_ids[..4] != before_ids[..4] {
-                p.pdeath_signal = 0;
+                p.parentage.set_death_signal(0);
             }
             self.publish_task(pid, p);
         }
@@ -4681,6 +4694,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    exit_files: Some(p.linux.vfs.file_table_owner()),
                     children: p.children.clone(),
                     limits: Some(limits),
                     timers: Some(self.timers.clone()),
@@ -4976,6 +4990,7 @@ impl<C: Cpu> Kernel<C> {
         }
         self.parallel_memory_time += began.elapsed();
         let mut outcomes = Vec::new();
+        let mut thread_exits = Vec::new();
         for done in completed {
             self.native.metrics.merge(done.native);
             let p = self
@@ -5072,7 +5087,7 @@ impl<C: Cpu> Kernel<C> {
             self.decode_misses += done.after.misses - done.before.misses;
             self.instructions_decoded += done.after.instructions - done.before.instructions;
             let outcome = done.outcome.expect("checked worker completion");
-            if self.profile_syscalls {
+            if self.profile_syscalls && done.thread_exit.is_none() {
                 match &outcome {
                     SliceOutcome::Syscall { .. } => {
                         *self
@@ -5133,7 +5148,22 @@ impl<C: Cpu> Kernel<C> {
                     ),
                 );
             }
-            outcomes.push((done.pid, outcome));
+            if let Some(status) = done.thread_exit {
+                thread_exits.push((done.pid, status));
+            } else {
+                outcomes.push((done.pid, outcome));
+            }
+        }
+        // All Views have returned. Source exits already released their shared
+        // resources; collect remaining owner projections before PID queries or
+        // the last member's process/group exit inspects this process graph.
+        for (pid, status) in thread_exits {
+            if let Some(mut p) = self.processes.remove(&pid) {
+                self.exit_one(pid, &mut p, status);
+                if !p.auto_reap || pid == 1 {
+                    self.processes.insert(pid, p);
+                }
+            }
         }
         self.parallel_rounds += 1;
         self.next_parallel_pid = chosen.last().expect("cohort task").0;
@@ -5718,8 +5748,7 @@ pub(super) fn run<C: Cpu>(
         memory: std::mem::take(&mut runtime.memory),
         linux,
         parent: 0,
-        parent_thread: 0,
-        pdeath_signal: 0,
+        parentage: Arc::default(),
         group: 1,
         session: 1,
         state: State::Ready,
@@ -7232,8 +7261,7 @@ mod tests {
             memory,
             linux,
             parent: 0,
-            parent_thread: 0,
-            pdeath_signal: 0,
+            parentage: Arc::default(),
             group: 1,
             session: 1,
             state: State::Ready,

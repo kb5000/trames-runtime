@@ -169,6 +169,7 @@ pub struct IoTask {
     lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
     cgroup: std::sync::OnceLock<trames_vfs::CgroupTask>,
     thread_addresses: std::sync::OnceLock<Arc<trames_execution::ThreadAddresses>>,
+    parentage: std::sync::OnceLock<Arc<crate::task_parent::Parentage>>,
     session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
@@ -190,6 +191,7 @@ impl Default for IoTask {
             lifecycle: Default::default(),
             cgroup: Default::default(),
             thread_addresses: Default::default(),
+            parentage: Default::default(),
             session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
@@ -243,6 +245,13 @@ impl IoTask {
     }
     pub fn bind_thread_addresses(&self, addresses: &Arc<trames_execution::ThreadAddresses>) {
         self.thread_addresses.get_or_init(|| addresses.clone());
+    }
+    pub fn parentage(&self) -> Option<&Arc<crate::task_parent::Parentage>> {
+        self.parentage.get()
+    }
+    pub fn bind_parentage(&self, parentage: &Arc<crate::task_parent::Parentage>) {
+        let original = self.parentage.get_or_init(|| parentage.clone());
+        debug_assert!(Arc::ptr_eq(original, parentage));
     }
     pub fn bind_cgroup(self: &Arc<Self>, task: trames_vfs::CgroupTask) {
         if self.cgroup.set(task).is_ok() {
@@ -405,6 +414,17 @@ impl IoTask {
         self.live.store(false, Ordering::Relaxed);
         self.lifecycle().retire(self.pid.load(Ordering::Relaxed));
     }
+    pub fn try_exit_nonlast(self: &Arc<Self>, pid: u32) -> bool {
+        self.lifecycle()
+            .try_retire_nonlast(pid, self, || self.live.store(false, Ordering::Relaxed))
+    }
+    pub fn reap_thread_presence(&self) {
+        if self.pid.load(Ordering::Relaxed) != self.tgid() {
+            if let Some(presence) = self.presence.get() {
+                presence.reap();
+            }
+        }
+    }
     pub fn publish_mask(&self, mask: u64) {
         let old = self.mask.load(Ordering::Relaxed);
         if old & !mask != 0 {
@@ -488,6 +508,7 @@ impl trames_vfs::TaskSignal for IoTask {
 }
 #[derive(Default)]
 pub struct IoDirectory {
+    pub parents: crate::task_parent::Parents,
     groups: Mutex<BTreeMap<(u32, u32), Arc<Group>>>,
     updates: AtomicU32,
 }

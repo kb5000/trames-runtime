@@ -7,4 +7,5 @@ pub mod scheduling;
 pub mod signal;
 pub mod task;
 pub mod task_control;
+pub mod task_parent;
 pub mod timers;

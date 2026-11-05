@@ -444,6 +444,7 @@ impl Stats {
         gpu_pending: Option<crate::gpu::Compile>,
     ) -> Done<C> {
         Done::<C> {
+            thread_exit: None,
             pid,
             cpu,
             outcome,
@@ -1193,8 +1194,14 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         q.running -= 1;
         q.domains.returned(done.pid);
+        // A source exit can be the final active View of an already requested
+        // mm checkpoint. Publish its quiescence without stopping other jobs.
+        q.domains.notify_ready();
+        let exited = done.thread_exit.is_some();
         q.finished.push(done);
-        self.control.stop();
+        if !exited {
+            self.control.stop();
+        }
         self.notify(&mut q);
     }
     /// All launched workers must have acknowledged stop before this call.

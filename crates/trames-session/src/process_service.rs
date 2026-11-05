@@ -173,6 +173,7 @@ mod tests {
         cpu.set_x(8, number as u64);
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
+            exit_files: None,
             children: p.children.clone(),
             limits: None,
             timers: None,

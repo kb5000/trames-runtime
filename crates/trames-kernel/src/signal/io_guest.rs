@@ -12,6 +12,34 @@ impl Signals {
         });
     }
 }
+impl IoTask {
+    /// A trusted lifecycle producer, using the child's original policy/queues.
+    /// No guest sender permission or owner Process projection is involved.
+    pub(crate) fn parent_death(&self, signal: u32, info: Info) {
+        if matches!(signal, 9 | 18..=22) {
+            let _ = self.job_signal(signal, true, info, self.ancestor_sender(info.sender));
+            return;
+        }
+        let queued = {
+            let policy = self.policy.read().unwrap();
+            let enqueue = || self.process().enqueue_quiet(signal, info);
+            policy.as_ref().map_or_else(enqueue, |policy| {
+                policy.actions.with_action(signal, |action| {
+                    let masked = self.mask() & (1 << (signal - 1)) != 0;
+                    let init =
+                        policy.namespace.is_nested() && policy.namespace.local(self.tgid()) == 1;
+                    if !masked && (action.handler == 1 || init && action.handler <= 1) {
+                        return Ok(false);
+                    }
+                    enqueue()
+                })
+            })
+        };
+        if matches!(queued, Ok(true)) {
+            self.process().changed();
+        }
+    }
+}
 impl IoRoutes {
     /// Guest and resource senders use the same original queues and group control.
     pub fn send(&self, source: &IoTask, number: u32, a: [u64; 6]) -> Option<Result<u64, Errno>> {
@@ -50,13 +78,16 @@ impl IoRoutes {
                 let target = a[0] as i32;
                 if target > 0 {
                     let id = self.namespace.global(target as u32).ok_or(Errno(3))?;
-                    let task = self
+                    let group = self
                         .directory
                         .tasks(0, id)
-                        .into_iter()
-                        .next()
-                        .ok_or(Errno(3))?;
-                    groups.push(self.directory.tasks(1, task.tgid()));
+                        .first()
+                        .map_or(id, |task| task.tgid());
+                    let tasks = self.directory.tasks(1, group);
+                    if tasks.is_empty() {
+                        return Err(Errno(3));
+                    }
+                    groups.push(tasks);
                 } else {
                     let registered: Vec<_> = self
                         .directory

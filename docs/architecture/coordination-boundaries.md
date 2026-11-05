@@ -1,6 +1,6 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through the original task resource
+This is the consolidated implementation audit through the source thread-exit and parent-thread resource
 batch, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
@@ -18,7 +18,7 @@ flowchart LR
     Disk --> Wait
     Entry --> VM[Affected mm or backing checkpoint]
     VM --> Owner[Kernel owner and task control]
-    Entry --> Compat[Unsupported owner resource or lifecycle exit]
+    Entry --> Compat[Unsupported owner resource or final group exit]
     Compat --> Owner
     Owner --> Entry
 ```
@@ -89,7 +89,7 @@ chain is still open; forwarding an entry alone does not remove those dependencie
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
-| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT and set_tid_address run on source workers. Files membership and cancellation APIs use original shared resources; actual exit entry, structural child/task/VM ownership and pending-context collection remain on the owner. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
+| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT and set_tid_address run on source workers. Individual exit(93) with another live group member retires original resources on its source worker. Final group exit, actual excluded control destructors, structural child/task/VM ownership and projection collection retain their boundaries. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination still requires exit cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes and the structural fork/exit entry still join. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted nsfs/mqueue mounts, dynamic file bodies, controlling-terminal acquisition and excluded open types | Before-effects defer. Actual cgroup mounts are admitted through their original shared graph and OFDs. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles remaining owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
@@ -355,3 +355,56 @@ mm/native maps or CPU/VFS projection collection. `Epoch::finish` still stops its
 cohort. The next dependency migration must address those actual graphs, not
 label an owner cleanup request as a source exit. Tracing, vfork and accepted
 mapped-file/owner work keep their existing custody boundaries.
+
+
+### Source individual thread exit and original parent-thread links (2026-11-05)
+
+The original group arbitrates individual exit under its existing control lock.
+It keeps one actual last member for final process cleanup; sixteen simultaneous
+exitters leave exactly one live member. An allowed exit(93), with another live
+member and complete shared OFDs, cancels the submitter's ring requests, retires
+cgroup membership, clears its original clear_tid address, wakes one original
+futex waiter and retires Files on the calling worker. Non-leader PID visibility
+is retired immediately. A leader's waitable process identity remains, and
+ordinary process signals still reach its live group after that leader exits.
+
+`Parents` owns the actual parent-thread graph; each task has one original
+`Parentage` with relaxed scalar registration. Source and owner paths share this
+graph. PR_SET/GET_PDEATHSIG run on the calling worker under existing filter
+semantics. Death updates only that parent's original children, selects a live
+survivor within the relationship transaction and notifies after unlocking.
+A retained task cannot target a new task that reused its TID. Non-leader exec
+retains the actual surviving thread through future-TID publication. Normal
+cohort capture does not lock/rebuild this graph. Childless retirement does not
+search a process table, select a survivor or acquire another group lock.
+
+Already accepted source exit returns its CPU/View to the existing queue without
+stopping unrelated jobs or sending an owner service. Remaining owner projections
+are collected after all Views return and before another returned syscall can
+query them or complete final group exit. Their collection is not presented as
+already performed on the source. Clear_tid joins can proceed before that cold
+collection, as ordinary exit already permits before all teardown completes.
+Actual legacy futex-wait adoption keeps its existing scheduling boundary.
+
+Removing the unconditional stop exposed a missing mm completion notification.
+If another task had requested a mapping checkpoint, an exiting peer could return
+the final active View without publishing VmReady. The owner then waited while
+the requester remained held, although its futex ticket was already woken.
+`Epoch::finish` now notifies original domain quiescence. A deterministic test
+fails without this notification and passes with it; it asserts that the cohort
+continues. No all-CPU stop, timer retry, polling loop or service thread substitutes
+for the missing notification. Temporary diagnostic code was removed.
+
+Owner group exit and exec also mark every removed original task dead; group exit
+uses the same original parent-death and ring-cancellation resources instead of
+silently dropping those threads. The Linux reference is
+[exit.c](https://github.com/torvalds/linux/blob/v6.18/kernel/exit.c).
+
+**The full lifecycle migration remains open.** The last member, exit_group,
+default fatal termination, full process reparenting/subreaper and namespace-init
+teardown, robust-futex support/cleanup and final mm/native ownership still need
+their actual dependency migration. Owner epoll/namespace/proc/mount controls keep
+their explicit before-effects boundary; a source table cannot admit those owner
+projections while the cohort is active. Tracing, vfork, legacy ancillary reaping
+and accepted owner/mapped-file operations retain their documented custody.
+The ordinary syscall/native hot paths gain no new policy or guest-memory fence.
