@@ -28,10 +28,12 @@ impl<C: Cpu> Kernel<C> {
         // coordinator Rc graphs stay here; no unrelated Memory is inspected.
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
+            job.work.cpu.clear_exclusive();
         }
         let result = (|| {
+            self.process_exits(Some(epoch))?;
             let mut committed = std::collections::BTreeSet::new();
-            for job in &checkpoint.jobs {
+            for job in checkpoint.jobs.iter().filter(|_| !checkpoint.bytes_only) {
                 let p = &mut self.processes.get_mut(&job.work.pid).unwrap();
                 let id = p.memory.coordinator_ownership().0;
                 if committed.insert(id) {
@@ -42,7 +44,11 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             self.vm_checkpoint_groups += 1;
-            self.vm_checkpoint_spaces += committed.len() as u64;
+            self.vm_checkpoint_spaces += if checkpoint.bytes_only {
+                checkpoint.ids.len() as u64
+            } else {
+                committed.len() as u64
+            };
             let elapsed = began.elapsed();
             self.parallel_memory_time += elapsed;
             self.vm_checkpoint_time[2] += elapsed;
@@ -52,6 +58,15 @@ impl<C: Cpu> Kernel<C> {
             // forever. Other exits retain ordinary worker authority and order.
             let lease_deadline = Instant::now() + Duration::from_micros(250);
             for job in &mut checkpoint.jobs {
+                if job
+                    .work
+                    .syscalls
+                    .as_ref()
+                    .is_some_and(|s| s.io_signals.lifecycle().termination().is_some())
+                {
+                    job.checkpoint = None;
+                    continue;
+                }
                 let Some(outcome) = job.checkpoint.take() else {
                     continue;
                 };
@@ -158,8 +173,25 @@ impl<C: Cpu> Kernel<C> {
                 .map(|job| (job.work.pid, job.stats.worker))
                 .collect();
             let began = Instant::now();
-            let Some(mut views) = self.prepare_parallel_views(&members) else {
-                return Ok(false); // changed to an excluded backing; join once
+            let mut views = if checkpoint.bytes_only {
+                let views: Option<Vec<_>> = members
+                    .iter()
+                    .map(|&(pid, slot)| {
+                        let mut view =
+                            Box::new(self.processes[&pid].memory.current_parallel_view()?);
+                        C::prepare_hardware_view(&mut view);
+                        Some((pid, slot, view))
+                    })
+                    .collect();
+                let Some(views) = views else {
+                    return Ok(false);
+                };
+                views
+            } else {
+                let Some(views) = self.prepare_parallel_views(&members) else {
+                    return Ok(false); // changed to an excluded backing; join once
+                };
+                views
             };
             self.admit_private_views(&mut views);
             for (pid, _, view) in views {

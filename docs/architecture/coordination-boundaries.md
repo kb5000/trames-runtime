@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through original thread-group
-exit completion, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
+This is the consolidated implementation audit through source process exit and
+CPU/mm return, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
 below, 2026-11-04, use calling workers and shared resources from their first implementation.
@@ -18,7 +18,7 @@ flowchart LR
     Disk --> Wait
     Entry --> VM[Affected mm or backing checkpoint]
     VM --> Owner[Kernel owner and task control]
-    Entry --> Compat[Unsupported owner resource or final group exit]
+    Entry --> Compat[Unsupported owner resource or task policy]
     Compat --> Owner
     Owner --> Entry
 ```
@@ -78,25 +78,30 @@ ABI uses the same decoder without an unnecessary context mutex roundtrip.
 
 STOP/CONT now uses the original shared thread-group control and parent wait
 objects described below. It no longer requires the entire cohort to return.
-The remaining connected lifecycle unit is default termination -> task/group
-exit -> clear_tid/robust-futex and accepted-operation cancellation -> final
-files/mm/native-context release -> reparenting and reaping. Structural fork/exec
-and security-policy mutation retain their actual boundaries. The full lifecycle
-chain is still open; forwarding an entry alone does not remove those dependencies.
+Ordinary exit, group/default-fatal termination, clear_tid, accepted-operation
+cancellation, namespace-init victim termination and original family completion
+now use source resources. Full returned CPUs and metrics are adopted while other
+CPUs continue. Private Rc projections still return to their existing owner through
+an asynchronous completion event. A cold group member sharing an executing mm
+uses a byte checkpoint of that mm alone. It does not stop unrelated mm/backing
+users or rebuild its mappings. External guarded mm borrows retain physical custody
+independently of guest parent notification, keyed by the original mm identity.
+Structural fork/exec, tracing and non-ALLOW security-policy effects retain their
+actual boundaries. Robust-futex owner-death support is not added by this work.
 
 
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
-| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93) with another live group member retires original resources on its source worker, including Files with opaque owner controls. Cold Rc projections are collected on their existing owner while peer CPUs continue. Final group exit and structural child/task/VM ownership still retain their joined boundaries. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
-| Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination still requires exit cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes and the structural fork/exit entry still join. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Structural creation/exec, tracing, non-ALLOW policy and legacy unadmitted waiter adoption retain their boundaries. The current whole-cohort scope is an implementation boundary, not a claim that every unrelated address space fundamentally needs pausing. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
+| Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes and structural fork entry still join. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted nsfs/mqueue mounts, dynamic file bodies, controlling-terminal acquisition and excluded open types | Before-effects defer. Actual cgroup mounts are admitted through their original shared graph and OFDs. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles remaining owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, old epoll creation, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
-| POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination and lifecycle cleanup retain their actual boundary; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
-| Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination still requests exit cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
+| POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination uses original source group cleanup; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
+| Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
 | Unix ancillary owner controls | SCM_RIGHTS that contains an actual excluded owner control; owner-ledger reaping and a legacy destination/control projection | Retained original endpoint/rights handoff and owner graph work. Portable Unix sockets/rights and ordinary native Wayland transport already share the real resource graph. A mixed owner set is still excluded. | [message handoff](../../crates/trames-linux/src/direct/local_message.rs), [rights ledger](../../crates/trames-vfs/src/ipc.rs), [portable graph](../../crates/trames-vfs/src/ipc/shared_rights.rs) |
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. The owner commits and rebuilds the required Views; unsupported/external generations, tracing or non-ALLOW policy can escalate to a joined path. Additive private-anonymous mmap has a separate in-cohort owner publication path. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Only affected original mm instruction views are quiesced, then the same disk pool runs the accepted file operation. Completion releases overlapping pause counts. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
@@ -601,3 +606,47 @@ Last-member exit(93), exit_group(94), default-fatal cleanup, final mm/CPU custod
 source namespace victim termination and excluded control operations remain open.
 The current source path keeps one live group member for that joined completion;
 this batch does not add another admission gate or claim full owner independence.
+
+## Source process exit and CPU/mm return — 2026-11-05
+
+This supersedes the historical last/group-exit and final-CPU restrictions above.
+An original Group records one terminal request and kicks its existing execution
+interrupts. Running, parked, stopped/frozen and traced peers observe that request
+before executing more guest code. Normal traced syscalls and non-ALLOW seccomp
+effects keep their explicit policy boundary. The caller retires original parents,
+cgroup membership, clear_tid/futex wake, Files, process locks, timers, ring work
+and native-space references once. Namespace-init retirement returns original
+victim groups, including nested dependencies whose ancestor is already dead.
+
+The existing completion queue hands the full Done CPU, metrics and actual exit
+resources to its owner immediately, rather than saving a PID-only projection
+until cohort drain. The owner destroys its local Rc controls, publishes necessary
+backing writes and finishes original group/family cleanup. Parent waits may then
+resume in the same execution cohort while unrelated CPUs are still busy. No new
+service thread, syscall RPC, polling bus, ordinary guest barrier or unsafe block
+is introduced.
+
+Cold members outside the cohort retire through the same original resources.
+If another live process shares their mm, a byte-only mm checkpoint returns its
+private execution actors and clears their exclusive reservations. Cleanup borrows
+the unchanged snapshot and restores those CPUs without a mapping rebuild or
+backing-domain closure. A concurrent structural request upgrades that checkpoint
+before it resumes. Original task identity guards cold work; original mm identity
+guards detached physical memory, so PID reuse cannot redirect either completion.
+
+Guarded external borrowers may outlive a task. Retired publication keeps the mm's
+dirty-word journal until those generations return, including a borrower marking a
+second frame while the provider publishes the first. Lazy original readiness
+notifies the existing owner when the last View returns. Logical group/parent
+completion does not wait for that external reference. Private execution is never
+concurrent with coordinator byte publication; actual object locks and existing
+private-view admission retain the same memory contract on Mac and iPad.
+
+Validation includes parent resumption before unrelated CPUs finish for individual,
+group, default signal and synchronous fatal exits; running, sleeping, traced and
+cold group members; clear_tid visible to a surviving CLONE_VM process; an external
+mm borrow held across wait/reap/PID reuse; and a deterministic late dirty-bit
+publication race. Linux semantics are checked against original
+[exit_mm and exit task work](https://github.com/torvalds/linux/blob/v6.18/kernel/exit.c).
+Remaining boundaries include structural clone/exec, mapping topology, tracing and
+non-ALLOW policy, excluded owner resources and original legacy waiter adoption.

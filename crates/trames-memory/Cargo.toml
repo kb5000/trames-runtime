@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 libc = "=0.2.190"
+trames-shared = { path = "../trames-shared" }
 
 [lints]
 workspace = true

@@ -378,6 +378,14 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if self
+            .work
+            .syscalls
+            .as_ref()
+            .is_some_and(|s| s.io_signals.lifecycle().termination().is_some())
+        {
+            return true;
+        }
         if self.stopped() {
             return self
                 .work
@@ -457,7 +465,12 @@ impl<C: Cpu> Job<C> {
         done.seccomp_entry = self.seccomp_entry;
         done
     }
-    pub fn finish_retired(self, outcome: Option<SliceOutcome>, peer: u64, status: i32) -> Done<C> {
+    pub fn finish_retired(
+        self,
+        outcome: Option<SliceOutcome>,
+        peer: u64,
+        exit: crate::worker_syscalls::Exit,
+    ) -> Done<C> {
         let vfork = self
             .work
             .syscalls
@@ -470,7 +483,8 @@ impl<C: Cpu> Job<C> {
             if let Some(release) = vfork {
                 release.finish();
             }
-            done.thread_exit = Some(status);
+            done.thread_exit = Some(exit.status);
+            done.exit_groups = exit.groups;
         }
         done
     }
@@ -488,6 +502,8 @@ impl Stats {
     ) -> Done<C> {
         Done::<C> {
             thread_exit: None,
+            fatal_fault: None,
+            exit_groups: Vec::new(),
             pid,
             cpu,
             outcome,
@@ -537,7 +553,6 @@ struct Queues<C: Cpu> {
     running: usize,
     services: usize,
     finished: Vec<Done<C>>,
-    projected: usize,
     retirement_notified: bool,
     initial_slots: BTreeMap<u32, usize>,
     gpu_peak_pending: usize,
@@ -1217,6 +1232,20 @@ impl<C: Cpu> Epoch<C> {
         q.services -= 1;
         q.domains.end_service(job.work.pid);
         match value {
+            Ok(None)
+                if job
+                    .work
+                    .syscalls
+                    .as_ref()
+                    .is_some_and(|s| s.io_signals.lifecycle().termination().is_some()) =>
+            {
+                if q.domains.paused(job.work.pid) {
+                    q.domains.hold(job);
+                    q.domains.notify_ready();
+                } else {
+                    self.ready(&mut q, job);
+                }
+            }
             Ok(Some(value)) => {
                 job.work.cpu.set_x(0, value);
                 job.stats.serviced_syscalls += 1;
@@ -1258,17 +1287,36 @@ impl<C: Cpu> Epoch<C> {
         }
         self.notify(&mut q);
     }
-    /// CPUs and metrics stay in the original completion queue until collection.
-    /// Only actual returned source exits publish a cold-projection event.
-    pub fn take_retired_projections(&self) -> Vec<(u32, i32)> {
+    /// The complete CPU/metrics return once, without waiting for unrelated Views.
+    pub fn take_retired(&self) -> Vec<Done<C>> {
         let mut q = self.queues.lock().unwrap();
-        let retired = q.finished[q.projected..]
-            .iter()
-            .filter_map(|done| done.thread_exit.map(|status| (done.pid, status)))
-            .collect();
-        q.projected = q.finished.len();
+        let mut retired = Vec::new();
+        let mut i = 0;
+        while i < q.finished.len() {
+            if q.finished[i].thread_exit.is_some() {
+                retired.push(q.finished.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
         q.retirement_notified = false;
         retired
+    }
+    pub fn contains(&self, pid: u32) -> bool {
+        self.queues.lock().unwrap().members.contains(&pid)
+    }
+    pub fn memory_owned(&self, id: u64) -> bool {
+        self.queues.lock().unwrap().domains.memory_owned(id)
+    }
+    pub fn pause_memory(&self, id: u64) -> bool {
+        let mut q = self.queues.lock().unwrap();
+        if !q.domains.contains(id) {
+            return false;
+        }
+        q.domains.pause_bytes(id);
+        self.capture_paused(&mut q);
+        self.notify(&mut q);
+        true
     }
     /// All launched workers must have acknowledged stop before this call.
     pub fn drain(&self) -> Vec<Done<C>> {
@@ -1276,7 +1324,6 @@ impl<C: Cpu> Epoch<C> {
         assert_eq!(q.running, 0);
         assert_eq!(q.services, 0, "in-flight service still owns a View");
         let mut done = std::mem::take(&mut q.finished);
-        q.projected = 0;
         q.retirement_notified = false;
         let mut jobs: Vec<_> = q.ready.drain(..).collect();
         jobs.extend(std::mem::take(&mut q.parked).into_values());

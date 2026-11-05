@@ -10,9 +10,17 @@ impl<C: Cpu> Kernel<C> {
         mut request: Box<crate::workers::Request<C>>,
         io: &mut impl GuestOutput,
     ) -> bool {
-        let value = self.service_request(&mut request, io);
+        let terminating = self
+            .processes
+            .get(&request.pid)
+            .is_some_and(|p| p.signals.io.lifecycle().termination().is_some());
+        let value = if terminating {
+            None
+        } else {
+            self.service_request(&mut request, io)
+        };
         request.respond(value);
-        value.is_some()
+        value.is_some() || terminating
     }
     pub(super) fn service_request(
         &mut self,
@@ -173,6 +181,7 @@ mod tests {
         cpu.set_x(8, number as u64);
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,

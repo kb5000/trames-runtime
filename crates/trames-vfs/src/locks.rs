@@ -244,11 +244,13 @@ impl Vfs {
     }
 }
 /// Frozen PID visibility while task/namespace changes still checkpoint. This
-/// owns only copied IDs, never the Rc namespace or a process/VFS reference.
+/// owns copied IDs and the original shared registry, never the Rc namespace or
+/// a process/VFS reference.
 #[derive(Clone, Default)]
 pub struct RecordLockContext {
     pub owner: u32,
     visible: Option<BTreeMap<u32, u32>>,
+    registry: Option<Arc<Registry>>,
 }
 /// Original process-owned lock domain; does not retain any file or task.
 #[derive(Clone)]
@@ -262,6 +264,11 @@ impl ProcessRecordLocks {
     }
 }
 impl RecordLockContext {
+    pub fn release(&self) {
+        if let Some(registry) = &self.registry {
+            registry.release(self.owner);
+        }
+    }
     pub fn visible_pid(&self, owner: u32) -> u32 {
         self.visible
             .as_ref()
@@ -279,6 +286,7 @@ impl Vfs {
         RecordLockContext {
             owner,
             visible: self.pid_ns.lock_visibility(),
+            registry: Some(self.record_locks.clone()),
         }
     }
     pub(super) fn inode_record_locks(&self, node: &Node) -> Arc<Records> {

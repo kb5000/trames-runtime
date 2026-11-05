@@ -8,7 +8,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -16,6 +16,7 @@ use std::{
 #[derive(Default)]
 pub struct Group {
     stopped: AtomicBool,
+    termination: AtomicU32,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -116,8 +117,8 @@ impl Group {
             })
     }
     /// Stop accepting signals/execution, but retain membership until the
-    /// original resources and executor View have actually returned. The last
-    /// source exit still retains its process/mm boundary before effects.
+    /// original resources and executor View have actually returned. Final
+    /// completion is published only after every member finishes cleanup.
     pub(crate) fn begin_exit(
         &self,
         pid: u32,
@@ -125,8 +126,8 @@ impl Group {
         status: i32,
         nonlast: bool,
         mark: impl FnOnce(),
-    ) -> bool {
-        let notice = {
+    ) -> Option<bool> {
+        let (notice, last) = {
             let mut state = self.state.lock().unwrap();
             let original = Arc::downgrade(task);
             if !state
@@ -135,7 +136,7 @@ impl Group {
                 .is_some_and(|m| m.task.ptr_eq(&original) && !m.retiring)
                 || nonlast && state.live <= 1
             {
-                return false;
+                return None;
             }
             mark();
             state.members.get_mut(&pid).unwrap().retiring = true;
@@ -143,17 +144,61 @@ impl Group {
             if state.live == 0 {
                 state.exit_status.get_or_insert(status);
             }
-            state.acknowledge()
+            (state.acknowledge(), state.live == 0)
         };
         if let Some(notice) = notice {
             notice.publish();
         }
-        true
+        Some(last)
     }
     /// Explicit group termination fixes the status before member cleanup;
     /// ordinary individual exits fix it when the last member begins exiting.
     pub fn begin_group_exit(&self, status: i32) {
         self.state.lock().unwrap().exit_status.get_or_insert(status);
+    }
+    /// Original members observe one terminal request at their next boundary.
+    /// Kicks and readiness target existing executors; no owner RPC is needed.
+    pub fn request_exit(&self, status: i32) -> i32 {
+        let (status, tasks) = {
+            let mut state = self.state.lock().unwrap();
+            let status = *state.exit_status.get_or_insert(status);
+            if self.termination.load(Ordering::Relaxed) != 0 {
+                return status;
+            }
+            self.termination.store(status as u32 + 1, Ordering::Relaxed);
+            state.killed = true;
+            for member in state.members.values() {
+                if let Some(interrupt) = &member.interrupt {
+                    interrupt.request_exit();
+                }
+            }
+            (status, state.tasks())
+        };
+        for task in tasks {
+            task.wake_control();
+        }
+        status
+    }
+    pub fn termination(&self) -> Option<i32> {
+        self.termination
+            .load(Ordering::Relaxed)
+            .checked_sub(1)
+            .map(|status| status as i32)
+    }
+    pub fn members(&self) -> Vec<(u32, Arc<IoTask>)> {
+        self.state
+            .lock()
+            .unwrap()
+            .members
+            .iter()
+            .filter_map(|(&pid, member)| {
+                member
+                    .task
+                    .upgrade()
+                    .filter(|task| task.live())
+                    .map(|task| (pid, task))
+            })
+            .collect()
     }
     pub(crate) fn finish_exit(&self, pid: u32, task: &Arc<IoTask>) -> Option<i32> {
         let (notice, status) = {

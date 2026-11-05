@@ -441,7 +441,14 @@ impl IoTask {
         }
     }
     pub fn try_exit_nonlast(self: &Arc<Self>, pid: u32, status: i32) -> bool {
-        self.lifecycle().begin_exit(pid, self, status, true, || {
+        self.lifecycle()
+            .begin_exit(pid, self, status, true, || {
+                self.live.store(false, Ordering::Relaxed)
+            })
+            .is_some()
+    }
+    pub fn try_exit(self: &Arc<Self>, pid: u32, status: i32) -> Option<bool> {
+        self.lifecycle().begin_exit(pid, self, status, false, || {
             self.live.store(false, Ordering::Relaxed)
         })
     }

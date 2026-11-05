@@ -64,6 +64,7 @@ struct Entry<C: Cpu> {
     services: usize,
     notified: bool,
     owned: bool,
+    bytes_only: bool,
     requested: Option<Instant>,
     quiescent: Option<Instant>,
 }
@@ -75,6 +76,7 @@ pub(super) struct Domains<C: Cpu> {
 }
 pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
+    pub bytes_only: bool,
     pub jobs: Vec<Box<Job<C>>>,
     pub requested: Instant,
     pub quiescent: Instant,
@@ -103,11 +105,27 @@ impl<C: Cpu> Domains<C> {
             services: 0,
             notified: false,
             owned: false,
+            bytes_only: false,
             requested: None,
             quiescent: None,
         });
         assert!(self.tasks.insert(job.work.pid, id).is_none());
         job.domain = Some(entry.domain.clone());
+    }
+    pub fn contains(&self, id: u64) -> bool {
+        self.entries.contains_key(&id)
+    }
+    pub fn memory_owned(&self, id: u64) -> bool {
+        self.entries.get(&id).is_none_or(|entry| entry.owned)
+    }
+    pub fn pause_bytes(&mut self, id: u64) {
+        let entry = self.entries.get_mut(&id).unwrap();
+        if !entry.domain.paused() {
+            entry.bytes_only = true;
+            entry.requested = Some(Instant::now());
+            entry.quiescent = None;
+            entry.domain.pause();
+        }
     }
     pub fn running(&mut self, pid: u32) {
         let entry = self.entry(pid);
@@ -156,6 +174,7 @@ impl<C: Cpu> Domains<C> {
     pub fn pause(&mut self, ids: BTreeSet<u64>) {
         for id in self.closure(ids) {
             let entry = self.entries.get_mut(&id).unwrap();
+            entry.bytes_only = false;
             if !entry.domain.paused() {
                 entry.requested = Some(Instant::now());
                 entry.quiescent = None;
@@ -191,7 +210,11 @@ impl<C: Cpu> Domains<C> {
             if !entry.domain.paused() || entry.owned || seen.contains(&id) {
                 continue;
             }
-            let ids = self.closure(BTreeSet::from([id]));
+            let ids = if entry.bytes_only {
+                BTreeSet::from([id])
+            } else {
+                self.closure(BTreeSet::from([id]))
+            };
             seen.extend(ids.iter().copied());
             if ids.iter().any(|id| {
                 let entry = &self.entries[id];
@@ -222,6 +245,7 @@ impl<C: Cpu> Domains<C> {
                 .map(|job| job.work.pid)
                 .collect();
             return Some(Checkpoint::<C> {
+                bytes_only: ids.iter().all(|id| self.entries[id].bytes_only),
                 ids,
                 jobs,
                 requested,
@@ -239,6 +263,7 @@ impl<C: Cpu> Domains<C> {
             ids,
             jobs,
             requesters,
+            bytes_only,
             ..
         } = checkpoint;
         let mut updated = BTreeSet::new();
@@ -261,7 +286,11 @@ impl<C: Cpu> Domains<C> {
         if !resume {
             return Vec::new();
         }
-        let closure = self.closure(ids.clone());
+        let closure = if bytes_only && ids.iter().all(|id| self.entries[id].bytes_only) {
+            ids.clone()
+        } else {
+            self.closure(ids.clone())
+        };
         if closure
             .iter()
             .any(|id| !ids.contains(id) && self.entries[id].domain.paused())

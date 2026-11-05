@@ -10,7 +10,73 @@ use trames_engine::Cpu;
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
+pub(super) struct Exit {
+    pub status: i32,
+    pub groups: Vec<Arc<trames_kernel::task_control::Group>>,
+}
+/// Actual shared resources, used by worker exit and quiescent cold peers.
+/// No policy/FD-kind decision or owner-local Rc enters this capability.
+pub(super) struct ExitResources<'a> {
+    pub task: &'a Arc<trames_kernel::signal::IoTask>,
+    pub files: &'a trames_vfs::FileTableOwner,
+    pub parents: &'a trames_kernel::task_parent::Parents,
+    pub uid: u32,
+    pub futex: &'a crate::futex::Authority,
+    pub native: Option<&'a crate::space::Native>,
+}
+impl ExitResources<'_> {
+    pub fn retire(&self, status: i32, last: bool, memory: &mut impl CpuMemory) -> Exit {
+        self.parents.retire_with(
+            self.task,
+            || self.task.lifecycle().survivor(),
+            trames_kernel::signal::Info {
+                sender: self.task.tgid(),
+                uid: self.uid,
+                ..Default::default()
+            },
+        );
+        if let Some(task) = self.task.cgroup() {
+            task.exit();
+        }
+        if let Some(addresses) = self.task.thread_addresses() {
+            let address = addresses.take_clear_tid();
+            if address != 0 {
+                let _ = memory.write(address, &[0; 4]);
+                if let Ok(key) = futex_key(memory, self.futex.vm, address, false) {
+                    self.futex
+                        .record(&self.futex.table.wake_local(key, 1, u32::MAX), false);
+                }
+            }
+        }
+        self.files.retire(self.task.tgid());
+        if let Some(space) = &self.native {
+            space.retire();
+        }
+        self.task.reap_thread_presence();
+        let groups = if last {
+            self.task
+                .family()
+                .and_then(|family| family.registry().map(|registry| (family.clone(), registry)))
+                .map_or_else(Vec::new, |(family, registry)| {
+                    registry
+                        .retire(&family, self.parents)
+                        .victims
+                        .into_iter()
+                        .map(|victim| {
+                            victim.control.request_exit(9);
+                            victim.control
+                        })
+                        .collect()
+                })
+        } else {
+            Vec::new()
+        };
+        Exit { status, groups }
+    }
+}
+
 pub(super) struct Snapshot {
+    pub owner_syscalls: bool,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
     pub exit_files: Option<trames_vfs::FileTableOwner>,
@@ -316,9 +382,11 @@ impl Snapshot {
         }
     }
     pub fn frozen(&self) -> bool {
-        self.io_signals
-            .cgroup()
-            .is_some_and(trames_vfs::CgroupTask::frozen)
+        self.io_signals.lifecycle().termination().is_none()
+            && self
+                .io_signals
+                .cgroup()
+                .is_some_and(trames_vfs::CgroupTask::frozen)
     }
     pub fn quiesced(&self) -> bool {
         self.io_signals.lifecycle().stopped() || self.frozen()
@@ -500,7 +568,7 @@ impl Snapshot {
     }
     pub fn thread_call<C: Cpu>(&self, cpu: &C) -> bool {
         match cpu.x(8) as u32 {
-            93 => self.exit_files.is_some(),
+            93 | 94 => self.exit_files.is_some(),
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) as u32 {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -510,46 +578,28 @@ impl Snapshot {
             _ => false,
         }
     }
-    pub fn exit_thread(&self, pid: u32, status: i32, memory: &mut impl CpuMemory) -> bool {
-        let Some(files) = &self.exit_files else {
-            return false;
-        };
-        // Logical Files retirement is shared. Opaque owner descriptions retain
-        // their original Rc projection until the returned CPU's cold event;
-        // no View or calling worker waits for that destructor.
-        if !self.io_signals.try_exit_nonlast(pid, status) {
-            return false;
+    pub fn exit_thread(&self, pid: u32, status: i32, memory: &mut impl CpuMemory) -> Option<Exit> {
+        let files = self.exit_files.as_ref()?;
+        let last = self.io_signals.try_exit(pid, status)?;
+        if last {
+            self.direct.release_process_locks();
+            if let Some(timers) = &self.timers {
+                timers.clear_process(self.io_signals.tgid(), false);
+            }
         }
         self.direct
             .cancel_task_uring(memory.instruction_identity().0, pid);
-        self.io_routes.directory.parents.retire_with(
-            &self.io_signals,
-            || self.io_signals.lifecycle().survivor(),
-            trames_kernel::signal::Info {
-                sender: self.io_signals.tgid(),
+        Some(
+            ExitResources {
+                task: &self.io_signals,
+                files,
+                parents: &self.io_routes.directory.parents,
                 uid: self.io_routes.uid,
-                ..Default::default()
-            },
-        );
-        if let Some(task) = self.io_signals.cgroup() {
-            task.exit();
-        }
-        if let Some(addresses) = self.io_signals.thread_addresses() {
-            let address = addresses.take_clear_tid();
-            if address != 0 {
-                let _ = memory.write(address, &[0; 4]);
-                if let Ok(key) = futex_key(memory, self.futex.vm, address, false) {
-                    self.futex
-                        .record(&self.futex.table.wake_local(key, 1, u32::MAX), false);
-                }
+                futex: &self.futex,
+                native: self.native_space.as_ref(),
             }
-        }
-        files.retire(self.io_signals.tgid());
-        if let Some(space) = &self.native_space {
-            space.retire();
-        }
-        self.io_signals.reap_thread_presence();
-        true
+            .retire(status, last, memory),
+        )
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131)
@@ -929,6 +979,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,
@@ -1061,6 +1112,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,
@@ -1123,6 +1175,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,
@@ -1229,6 +1282,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,
@@ -1299,6 +1353,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,

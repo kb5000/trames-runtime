@@ -245,6 +245,11 @@ impl DirectSyscalls {
     pub fn cancel_task_uring(&self, owner: u64, task: u32) {
         self.urings.cancel_task(owner, task);
     }
+    pub fn release_process_locks(&self) {
+        if let Some(context) = &self.lock_context {
+            context.release();
+        }
+    }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
         self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
         if let Some(descriptors) = self.urings.descriptors.take() {

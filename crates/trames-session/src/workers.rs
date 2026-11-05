@@ -114,6 +114,8 @@ impl GpuStats {
 }
 pub(super) struct Done<C: Cpu> {
     pub thread_exit: Option<i32>,
+    pub fatal_fault: Option<trames_engine::CpuFault>,
+    pub exit_groups: Vec<Arc<trames_kernel::task_control::Group>>,
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
     pub pid: u32,
     pub cpu: C,
@@ -466,6 +468,7 @@ impl<C: Cpu> Pool<C> {
                     let mut parked_gpu = None;
                     let mut maintenance = false;
                     let mut thread_exit = None;
+                    let mut fatal_fault = None;
                     let mut yielded = false;
                     let mut service = false;
                     let mut vm_checkpoint = false;
@@ -498,6 +501,15 @@ impl<C: Cpu> Pool<C> {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if let Some(snapshot) = &work.syscalls {
+                                if let Some(status) = snapshot.io_signals.lifecycle().termination() {
+                                    if let (Some(pending),Some(authority)) = (job.gpu_pending.as_mut(),work.gpu.as_ref()) {
+                                        if let Some(compile) = pending.compile.take() { authority.context.abandon(compile.job); }
+                                    }
+                                    if let Some(crate::run_queue::WaitState::Futex { wait, .. }) = &job.waiting { wait.cancel(); }
+                                    thread_exit = snapshot.exit_thread(work.pid, status, work.memory.as_deref_mut().expect("exit View"));
+                                    if snapshot.futex.take_readied() { work.control.stop(); }
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
                                 if matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if wait.release.finished()) {
                                     job.waiting=None;continue;
@@ -529,7 +541,8 @@ impl<C: Cpu> Pool<C> {
                                         continue;
                                     }
                                     if disposition == trames_kernel::signal::Disposition::Terminate {
-                                        work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
+                                        snapshot.io_signals.lifecycle().request_exit(sig as i32);
+                                        continue;
                                     }
                                     let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
@@ -798,8 +811,19 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             if profile_native_overlap {
                                 if let Some(epoch) = &epoch { epoch.progress.fetch_add(retired, Ordering::Relaxed); }
                             }
+                            if let (SliceOutcome::Fault(fault),Some(snapshot)) = (&result,work.syscalls.as_ref()) {
+                                if let Some(info) = crate::process::fault_info(fault) {
+                                    let blocked = snapshot.io_signals.context.lock().unwrap().mask & (1 << (info.signal-1)) != 0;
+                                    if snapshot.actions.get(info.signal as usize).handler <= 1 || blocked {
+                                        fatal_fault=match result { SliceOutcome::Fault(fault)=>Some(fault), _=>unreachable!() };
+                                        snapshot.io_signals.lifecycle().request_exit(info.signal as i32);
+                                        continue;
+                                    }
+                                }
+                            }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
+                                if work.syscalls.as_ref().is_some_and(|s| s.owner_syscalls) { break result; }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
                                     if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { syscalls += 1; continue; }
                                     let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
@@ -1024,10 +1048,11 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                 job.seccomp_entry=entry.take();break result;
                                             }
                                         }
-                                        if work.cpu.x(8) as u32 == 93 {
+                                        if matches!(work.cpu.x(8) as u32, 93 | 94) {
                                             let status=(work.cpu.x(0) as u8 as i32)<<8;
-                                            if epoch.is_some() && snapshot.exit_thread(work.pid,status,work.memory.as_deref_mut().expect("exit View")) {
-                                                thread_exit=Some(status);syscalls+=1;
+                                            if work.cpu.x(8) as u32 == 94 { snapshot.io_signals.lifecycle().request_exit(status); }
+                                            if let Some(exit) = epoch.as_ref().and_then(|_| snapshot.exit_thread(work.pid,status,work.memory.as_deref_mut().expect("exit View"))) {
+                                                thread_exit=Some(exit);syscalls+=1;
                                                 // An actual excluded legacy waiter still needs its
                                                 // existing owner adoption, after accepted cleanup.
                                                 if snapshot.futex.take_readied() {work.control.stop();}
@@ -1490,12 +1515,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(pending) = parked_io { epoch.park_io(job, pending); continue; }
                         if let Some(pending) = parked_gpu { epoch.park_gpu(job, pending); continue; }
                         if parked.is_some() || yielded { epoch.park(job, parked); continue; }
-                        let completed = if let Some(status)=thread_exit {
+                        let mut completed = if let Some(status)=thread_exit {
                             job.finish_retired(outcome, epoch.progress.load(Ordering::Relaxed),status)
                         } else {job.finish(outcome, epoch.progress.load(Ordering::Relaxed))};
                         // The returned CPU publishes completion. Original
                         // membership also covers cold Rc/Memory projections;
                         // their actual owner finishes it on the Retired event.
+                        completed.fatal_fault = fatal_fault;
                         epoch.finish(completed);
                     } else if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }
                     }
@@ -1807,6 +1833,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            owner_syscalls: false,
             vfork_release: None,
             native_space: None,
             exit_files: None,
@@ -2114,13 +2141,20 @@ mod tests {
                     pool.ensure(slot).unwrap();
                     pool.launch(slot, epoch.clone()).unwrap();
                 }
+                let mut returned = None;
                 if !legacy_wait {
                     assert!(matches!(
                         receive.recv_timeout(Duration::from_secs(5)),
                         Ok(Event::Retired)
                     ));
-                    assert_eq!(epoch.take_retired_projections(), [(30, 23 << 8)]);
-                    assert!(epoch.take_retired_projections().is_empty());
+                    let mut results = epoch.take_retired();
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(
+                        (results[0].pid, results[0].thread_exit),
+                        (30, Some(23 << 8))
+                    );
+                    returned = results.pop();
+                    assert!(epoch.take_retired().is_empty());
                     assert!(matches!(
                         receive.recv_timeout(Duration::from_secs(5)),
                         Ok(Event::Idle)
@@ -2134,7 +2168,9 @@ mod tests {
                         Some(Event::EpochStopped(_))
                     ));
                 }
-                let completed = epoch.drain().pop().unwrap();
+                let mut rest = epoch.drain();
+                let completed = returned.or_else(|| rest.pop()).unwrap();
+                assert!(rest.is_empty(), "accepted CPU was returned twice");
                 vfs.collect_retired_descriptors();
                 original.finish_exit(30);
                 assert_eq!(completed.thread_exit, Some(23 << 8));

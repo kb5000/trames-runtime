@@ -11,6 +11,8 @@ pub(super) mod page;
 #[cfg(test)]
 mod readonly;
 #[cfg(test)]
+mod retirement;
+#[cfg(test)]
 mod sharing;
 mod snapshot;
 use super::*;
@@ -591,7 +593,7 @@ pub(super) struct Snapshot {
     dirty_pages: Arc<[AtomicU64]>,
     reservations: BTreeMap<u64, u64>,
     code_epoch: Arc<AtomicU64>,
-    users: Arc<std::sync::atomic::AtomicUsize>,
+    users: Arc<Users>,
 }
 pub(super) struct SnapshotCache {
     pub(super) snapshot: Arc<Snapshot>,
@@ -615,6 +617,13 @@ enum PrivateMode {
     Exclusive = 1,
     ReadOnly = 2,
 }
+/// The original mm's all-generation View lifetime and optional idle waiters.
+/// The readiness object is allocated only when a real retirement must wait.
+#[derive(Default)]
+pub(super) struct Users {
+    count: std::sync::atomic::AtomicUsize,
+    idle: std::sync::OnceLock<Arc<trames_shared::Readiness>>,
+}
 /// Send, with worker-local translations; never Sync and never retains Rc data.
 pub struct View {
     snapshot: Arc<Snapshot>,
@@ -635,7 +644,11 @@ impl Clone for View {
 }
 impl Drop for View {
     fn drop(&mut self) {
-        self.snapshot.users.fetch_sub(1, Ordering::Release);
+        if self.snapshot.users.count.fetch_sub(1, Ordering::Release) == 1 {
+            if let Some(idle) = self.snapshot.users.idle.get() {
+                idle.notify_atomic();
+            }
+        }
     }
 }
 impl View {
@@ -646,7 +659,7 @@ impl View {
         self.snapshot.backings.commit_domains()
     }
     fn new(snapshot: Arc<Snapshot>) -> Self {
-        snapshot.users.fetch_add(1, Ordering::Relaxed);
+        snapshot.users.count.fetch_add(1, Ordering::Relaxed);
         Self {
             snapshot,
             mmu_cache: mmu::Cache::default(),
@@ -671,7 +684,7 @@ impl View {
         if self.hardware_mode {
             return false;
         }
-        if self.snapshot.users.load(Ordering::Acquire) != 1 {
+        if self.snapshot.users.count.load(Ordering::Acquire) != 1 {
             return false;
         }
         self.private_mode = PrivateMode::Exclusive;
@@ -699,7 +712,7 @@ impl View {
             return false;
         };
         if views.iter().any(|v| v.hardware_mode)
-            || first.snapshot.users.load(Ordering::Acquire) != views.len()
+            || first.snapshot.users.count.load(Ordering::Acquire) != views.len()
             || views
                 .iter()
                 .any(|v| !Arc::ptr_eq(&first.snapshot, &v.snapshot))
@@ -1241,6 +1254,31 @@ impl CpuMemory for View {
 impl Memory {
     /// A layout checkpoint must account for retained Views from every mapping
     /// generation, not just the scheduler's current job list.
+    /// Reborrow this frozen generation after the caller has quiesced every
+    /// private execution actor. Guarded external borrows may remain. This does
+    /// not rebuild mappings, change permissions or extend a private epoch.
+    pub fn current_parallel_view(&self) -> Option<View> {
+        if let Some(memory) = &self.shared {
+            return memory.borrow().current_parallel_view();
+        }
+        self.parallel_cache
+            .as_ref()
+            .map(|cache| View::new(cache.snapshot.clone()))
+    }
+    /// Subscribe before checking quiescence. This covers external retained
+    /// generations as well as jobs in the current execution queue.
+    pub fn subscribe_parallel_idle(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        if let Some(memory) = &self.shared {
+            return memory.borrow().subscribe_parallel_idle(signal);
+        }
+        self.parallel_users
+            .idle
+            .get_or_init(Default::default)
+            .subscribe(signal)
+    }
     pub fn parallel_views_quiescent(&self) -> bool {
         self.shared.as_ref().map_or_else(
             || !self.has_parallel_users(),
@@ -1259,7 +1297,7 @@ impl Memory {
         }
     }
     pub(super) fn has_parallel_users(&self) -> bool {
-        self.parallel_users.load(Ordering::Acquire) != 0
+        self.parallel_users.count.load(Ordering::Acquire) != 0
     }
     pub(super) fn prepare_shared_storage(
         &mut self,
@@ -1550,8 +1588,23 @@ impl Memory {
     /// source pages already contain the writes; only legacy/custom backings copy
     /// dirty fragments through the provider's write method.
     pub fn commit_parallel(&mut self) -> Result<(), MemoryError> {
+        self.commit_parallel_state(false)
+    }
+    /// Publish a retired task's writes while guarded external borrows remain.
+    /// No private execution actor may run: the unsafe private-epoch admission
+    /// contract still forbids concurrent coordinate access. Do not clear this
+    /// mm's dirty-word journal until every retained generation returns; a later
+    /// borrower can write another frame while a provider is publishing this one.
+    pub fn commit_retired_parallel(&mut self) -> Result<(), MemoryError> {
+        self.commit_parallel_state(true)?;
+        if self.parallel_views_quiescent() {
+            self.commit_parallel_state(false)?;
+        }
+        Ok(())
+    }
+    fn commit_parallel_state(&mut self, retain_dirty: bool) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow_mut().commit_parallel();
+            return shared.borrow_mut().commit_parallel_state(retain_dirty);
         }
         let Some(mut cache) = self.parallel_cache.take() else {
             return Ok(());
@@ -1571,7 +1624,9 @@ impl Memory {
                     let mut dirty = frame.bytes.dirty.swap(0, Ordering::Relaxed);
                     if dirty == 0 {
                         pending &= pending - 1;
-                        word.store(pending, Ordering::Relaxed);
+                        if !retain_dirty {
+                            word.store(pending, Ordering::Relaxed);
+                        }
                         continue;
                     }
                     if frame.direct {
@@ -1666,7 +1721,9 @@ impl Memory {
                         Ordering::Relaxed,
                     );
                     pending &= pending - 1;
-                    word.store(pending, Ordering::Relaxed);
+                    if !retain_dirty {
+                        word.store(pending, Ordering::Relaxed);
+                    }
                 }
             }
             Ok(())
@@ -2453,7 +2510,10 @@ mod tests {
         assert_eq!(peer.coordinator_ownership().1, 1);
         root.commit_parallel().unwrap();
         assert_eq!(peer.read_u64(0x1020).unwrap(), 99);
-        assert_eq!(u64::from_le_bytes(object.bytes.borrow()[32..40].try_into().unwrap()), 99);
+        assert_eq!(
+            u64::from_le_bytes(object.bytes.borrow()[32..40].try_into().unwrap()),
+            99
+        );
         drop(peer);
         assert!(root.0.upgrade().is_none());
     }

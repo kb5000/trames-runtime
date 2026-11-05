@@ -10,6 +10,28 @@ use std::{
     time::{Duration, Instant},
 };
 use trames_engine::{Cpu, SliceOutcome};
+/// The same guest fault classification is used by source and owner delivery.
+pub(super) fn fault_info(fault: &trames_engine::CpuFault) -> Option<trames_kernel::signal::Fault> {
+    use trames_engine::CpuFault as F;
+    use trames_kernel::signal::Fault;
+    Some(match fault {
+        F::Host(_) => return None,
+        F::Trap {
+            pc, signal, code, ..
+        } => Fault {
+            signal: *signal,
+            code: *code,
+            address: *pc,
+        },
+        F::Instruction { pc, .. } => Fault {
+            signal: 4,
+            code: 1,
+            address: *pc,
+        },
+        F::Memory { pc, error } => Fault::memory(*pc, error),
+    })
+}
+
 use trames_linux::{GuestOutput, Linux, OutputFd, SyscallOutcome, TerminalEvent, MAX_WRITE};
 use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
@@ -27,6 +49,8 @@ mod caps;
 mod compat;
 #[path = "process_events.rs"]
 mod events;
+#[path = "process_exit.rs"]
+mod exit;
 #[path = "process_pid.rs"]
 mod pid_namespace;
 #[path = "process_signals.rs"]
@@ -491,6 +515,7 @@ impl trames_vfs::IoWake for JoinedByteWake {
 }
 pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
+    exits: exit::Retirements,
     file_layouts: Vec<file_io::FileLayout>,
     families: Arc<trames_kernel::family::Families>,
     limit_directory: Arc<trames_kernel::limits::Directory>,
@@ -1332,18 +1357,20 @@ impl<C: Cpu> Kernel<C> {
     }
     /// Source exits already retired original resources. Only the owner-local
     /// CPU/Memory/VFS projections return here; never replay accepted effects.
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn collect_source_exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         p.linux.vfs.set_lock_owner(p.tgid);
         p.linux.vfs.collect_retired_descriptors();
         self.collect_exit_projection(pid, p, status);
     }
-    fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
-        self.children_dirty.set(true);
+    fn clear_exit_resources(p: &mut Process<C>) {
         p.uring_wait = None;
         p.flock_wait = None;
         p.record_wait = None;
         p.byte_wait = None;
         p.retained_file = None;
+        p.retained_aio = None;
+        p.pending_open = None;
         p.file_checkpoint = None;
         p.file_entry = None;
         p.retained_socket = None;
@@ -1352,6 +1379,10 @@ impl<C: Cpu> Kernel<C> {
         p.tcp_liveness = None;
         p.retained_poll = None;
         p.linux.executable_file = None;
+    }
+    fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        self.children_dirty.set(true);
+        Self::clear_exit_resources(p);
         if pid != 1 {
             p.memory = Memory::default();
         }
@@ -1675,26 +1706,11 @@ impl<C: Cpu> Kernel<C> {
                 String::from_utf8_lossy(&p.linux.command_name)
             ),
         );
-        use trames_engine::CpuFault as F;
-        use trames_kernel::signal::Fault;
-        let fault_info = match fault {
-            F::Host(error) => {
+        let Some(fault_info) = fault_info(fault) else {
+            if let trames_engine::CpuFault::Host(error) = fault {
                 self.backend_error = Some(error.clone());
-                return;
             }
-            F::Trap {
-                pc, signal, code, ..
-            } => Fault {
-                signal: *signal,
-                code: *code,
-                address: *pc,
-            },
-            F::Instruction { pc, .. } => Fault {
-                signal: 4,
-                code: 1,
-                address: *pc,
-            },
-            F::Memory { pc, error } => Fault::memory(*pc, error),
+            return;
         };
         if !p.signals.force_fault(fault_info) {
             if pid == 1 {
@@ -4537,9 +4553,6 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         };
         self.admit_private_views(&mut views);
-        // Only a returned task that drops a shared wrapper needs a weak
-        // publication root. Ordinary cohort capture allocates no root registry.
-        let mut retired_roots = std::collections::BTreeMap::new();
         self.parallel_memory_time += began.elapsed();
         for &(_, slot) in &chosen {
             self.workers
@@ -4644,7 +4657,8 @@ impl<C: Cpu> Kernel<C> {
                 cpu: std::mem::take(&mut p.cpu),
                 memory: Some(view),
                 control: control.clone(),
-                syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                syscalls: Some(crate::worker_syscalls::Snapshot {
+                    owner_syscalls: p.linux.trace,
                     vfork_release: p.vfork.clone(),
                     native_space: Some(p.space.clone()),
                     exit_files: Some(p.linux.vfs.file_table_owner()),
@@ -4822,7 +4836,6 @@ impl<C: Cpu> Kernel<C> {
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
         let mut checkpoint_error = None;
-        let mut projected_exits = std::collections::BTreeSet::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -4849,17 +4862,22 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
                 Some(crate::workers::Event::<C>::Retired) => {
-                    for (pid, status) in epoch.take_retired_projections() {
-                        let mut p = self.processes.remove(&pid).expect("returned source task");
-                        if let Some(root) = p.memory.shared_root() {
-                            retired_roots.entry(p.vm_id).or_insert(root);
+                    let result = (|| {
+                        for done in epoch.take_retired() {
+                            self.accept_source_return(done)?;
                         }
-                        self.collect_source_exit(pid, &mut p, status);
-                        // Cohort domain/index records keep their original IDs.
-                        // Physical projections are gone; the tombstone lasts
-                        // only until every cohort CPU returns its metrics.
-                        self.processes.insert(pid, p);
-                        projected_exits.insert(pid);
+                        self.process_exits(Some(&epoch))
+                    })();
+                    if let Err(error) = result {
+                        checkpoint_error = Some(error);
+                        break;
+                    }
+                    if self
+                        .processes
+                        .get(&1)
+                        .is_some_and(|p| p.family.status().is_some())
+                    {
+                        break;
                     }
                 }
                 Some(crate::workers::Event::<C>::VmReady) => {
@@ -4942,213 +4960,40 @@ impl<C: Cpu> Kernel<C> {
             }
             return Err(RuntimeError::Arguments("CPU worker panicked"));
         }
-        // Release every cohort View and restore all CPUs/bytes before handling
-        // exits/exec/fork, which may remove peers. Worker WAIT already compared
-        // and enqueued under its futex bucket; completed calls are not replayed.
+        let mut outcomes = Vec::new();
+        for done in completed {
+            if done.thread_exit.is_some() {
+                self.accept_source_return(done)?;
+            } else {
+                let (pid, _, outcome) = self.restore_worker_return(done);
+                outcomes.push((pid, outcome));
+            }
+        }
+        self.process_exits(None)?;
         let began = Instant::now();
+        // Source returns committed quiescent mms or retained their real idle
+        // dependency. Live wrappers publish the remaining ordinary cohort work.
         for (index, &(id, _)) in members.iter().enumerate() {
-            if projected_exits.contains(&id) {
+            let p = &self.processes[&id];
+            if !p.signals.io.live() || self.exits.waiting(id) {
                 continue;
             }
-            let vm_id = self.processes[&id].vm_id;
+            let vm_id = p.vm_id;
             if members[..index].iter().any(|&(peer, _)| {
-                !projected_exits.contains(&peer) && self.processes[&peer].vm_id == vm_id
+                self.processes[&peer].signals.io.live()
+                    && !self.exits.waiting(peer)
+                    && self.processes[&peer].vm_id == vm_id
             }) {
                 continue;
             }
-            // This live wrapper supplies the same original graph. A weak root
-            // is only needed if every dispatched wrapper for it has retired.
-            retired_roots.remove(&vm_id);
             self.processes
                 .get_mut(&id)
-                .expect("dispatched process")
+                .unwrap()
                 .memory
                 .commit_parallel()?;
         }
-        for root in retired_roots.into_values() {
-            root.commit_parallel()?;
-        }
         self.parallel_memory_time += began.elapsed();
-        let mut outcomes = Vec::new();
-        let mut thread_exits = Vec::new();
-        for done in completed {
-            self.native.metrics.merge(done.native);
-            let p = self
-                .processes
-                .get_mut(&done.pid)
-                .expect("dispatched process");
-            p.cpu = done.cpu;
-            p.signals.finish_io();
-            if let Some(entry) = done.seccomp_entry {
-                p.seccomp_entry = Some(entry);
-            }
-            p.retain_worker_flock(done.io.as_ref());
-            p.retain_local_message_owner(done.io.as_ref());
-            p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
-            p.retained_socket = done
-                .io
-                .as_ref()
-                .and_then(|call| call.retained_socket.clone());
-            p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
-            p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
-            p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
-            p.retained_aio = done.io.as_ref().and_then(|call| call.aio.clone());
-            p.file_checkpoint = done
-                .io
-                .as_ref()
-                .and_then(|call| call.file_checkpoint.clone());
-            p.file_entry = done
-                .io
-                .as_ref()
-                .filter(|call| call.file.is_some() || call.file_checkpoint.is_some())
-                .map(|call| (p.cpu.pc(), call.number, call.args));
-            p.state = if let Some(compile) = done.gpu_pending {
-                State::Gpu {
-                    retired: true,
-                    peer_instructions: compile.peer_instructions,
-                    job: compile.job,
-                    pc: compile.call.pc,
-                    operation: compile.call.operation,
-                    began: compile.began,
-                    instructions: self.instructions,
-                }
-            } else if let Some(call) = done.io {
-                if let Some(uring) = call.uring {
-                    p.uring_wait = Some((uring.submitted, uring.ring, uring.deadline));
-                }
-                if matches!(call.number, 63..=66 | 202 | 203 | 242) {
-                    p.socket_deadline = call.deadline;
-                } else {
-                    p.poll_deadline = call.deadline;
-                }
-                State::Blocked(call.number, call.args)
-            } else {
-                if !matches!(done.waiting, Some(crate::run_queue::WaitState::OwnerEvent)) {
-                    p.poll_deadline = None;
-                }
-                done.waiting.map_or(State::Ready, |w| match w {
-                    crate::run_queue::WaitState::Futex { wait, deadline } => {
-                        State::Futex { wait, deadline }
-                    }
-                    crate::run_queue::WaitState::Sleep {
-                        deadline,
-                        remaining,
-                    } => State::Sleep(deadline, remaining),
-                    crate::run_queue::WaitState::Signal(wait) => match wait.request {
-                        trames_kernel::signal::SignalWait::Timed {
-                            mask,
-                            info,
-                            deadline,
-                        } => State::Sigwait {
-                            mask,
-                            info,
-                            deadline,
-                        },
-                        trames_kernel::signal::SignalWait::Suspend { .. } => State::Suspend(
-                            p.signals.wait_mask.take().expect("suspend restore mask"),
-                        ),
-                    },
-                    crate::run_queue::WaitState::Child(wait) => {
-                        State::Blocked(wait.request.number, wait.request.args)
-                    }
-                    crate::run_queue::WaitState::Vfork(wait) => State::Vfork(wait.release.clone()),
-                    crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
-                })
-            };
-            if let Some((pc, module, function)) = done.rejected_native {
-                p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name)));
-            }
-            p.last_cpu = done.worker;
-            p.cpu_time += done.elapsed;
-            self.cpu_total += done.elapsed;
-            for (slot, time) in done.cpu_times.iter().take(self.cpu_count).enumerate() {
-                self.per_cpu[slot] += *time;
-            }
-            self.decode_lookups += done.after.lookups - done.before.lookups;
-            self.decode_misses += done.after.misses - done.before.misses;
-            self.instructions_decoded += done.after.instructions - done.before.instructions;
-            let outcome = done.outcome.expect("checked worker completion");
-            if self.profile_syscalls && done.thread_exit.is_none() {
-                match &outcome {
-                    SliceOutcome::Syscall { .. } => {
-                        *self
-                            .cohort_return_syscalls
-                            .entry(p.cpu.x(8) as u32)
-                            .or_default() += 1;
-                    }
-                    SliceOutcome::NativeCall {
-                        module, function, ..
-                    } => {
-                        *self
-                            .cohort_return_native
-                            .entry((*module, *function))
-                            .or_default() += 1;
-                    }
-                    _ => {}
-                }
-            }
-            self.instructions += done.instructions;
-            self.worker_chunks += done.chunks;
-            self.worker_syscalls += done.syscalls;
-            self.worker_direct_syscalls += done.direct_syscalls;
-            self.worker_futex_wakes += done.futex_wakes;
-            self.worker_futex_woken += done.futex_woken;
-            self.worker_futex_requeues += done.futex_requeues;
-            self.serviced_syscalls += done.serviced_syscalls;
-            self.service_wait += done.service_wait;
-            self.syscalls += done.syscalls + done.serviced_syscalls;
-            self.syscall_total += done.syscall_time;
-            self.worker_slices += done.assignments;
-            self.context_switches += done.assignments;
-            self.worker_futex_waits += done.waits;
-            self.worker_task_resumes += done.resumes;
-            self.worker_task_yields += done.yields;
-            self.worker_io_waits += done.io_waits;
-            self.worker_service_waits += done.service_waits;
-            self.worker_file_syscalls += done.file_syscalls;
-            self.worker_socket_syscalls += done.socket_syscalls;
-            self.worker_timer_syscalls += done.timer_syscalls;
-            self.worker_poll_syscalls += done.poll_syscalls;
-            self.worker_uring_syscalls += done.uring_syscalls;
-            self.worker_fd_syscalls += done.fd_syscalls;
-            self.worker_gpu_calls += done.gpu.calls;
-            self.worker_gpu_waits += done.gpu.waits;
-            self.gpu_compiles += done.gpu.compiles;
-            self.gpu_wait_time += done.gpu.wait_time;
-            self.gpu_peer_instructions += done.gpu.peer_instructions;
-            self.gpu_transfers.merge(done.gpu.transfers);
-            if let Some((pc, operation, value)) = done.gpu.last_error {
-                p.linux.vfs.log(
-                    4,
-                    &format!(
-                        "pid={} Vulkan op={operation} result={} pc={pc:#x} errors={} comm={:?}",
-                        done.pid,
-                        value as i64,
-                        done.gpu.errors,
-                        String::from_utf8_lossy(&p.linux.command_name)
-                    ),
-                );
-            }
-            if let Some(status) = done.thread_exit {
-                p.state = State::Zombie(status);
-                thread_exits.push((done.pid, status));
-            } else {
-                outcomes.push((done.pid, outcome));
-            }
-        }
-        // All Views have returned. Source exits already released their shared
-        // resources; collect remaining owner projections before PID queries or
-        // the last member's process/group exit inspects this process graph.
-        for (pid, status) in thread_exits {
-            if let Some(mut p) = self.processes.remove(&pid) {
-                if !projected_exits.contains(&pid) {
-                    self.collect_source_exit(pid, &mut p, status);
-                }
-                if !p.auto_reap || pid == 1 {
-                    self.processes.insert(pid, p);
-                }
-            }
-        }
+        outcomes.retain(|(pid, _)| self.processes[pid].signals.io.live());
         self.parallel_rounds += 1;
         self.next_parallel_pid = chosen.last().expect("cohort task").0;
         // Successful worker wakes are already committed. Publish readiness
@@ -5187,7 +5032,197 @@ impl<C: Cpu> Kernel<C> {
                 self.processes.insert(actual, p);
             }
         }
+        self.processes
+            .retain(|&pid, p| pid == 1 || !p.auto_reap || self.exits.waiting(pid));
         Ok(true)
+    }
+    fn restore_worker_return(
+        &mut self,
+        done: crate::workers::Done<C>,
+    ) -> (u32, Option<i32>, SliceOutcome) {
+        if let Some(fault) = &done.fatal_fault {
+            let p = &self.processes[&done.pid];
+            p.linux.vfs.log(
+                4,
+                &format!(
+                    "pid={} tgid={} {fault} comm={:?}",
+                    done.pid,
+                    p.tgid,
+                    String::from_utf8_lossy(&p.linux.command_name)
+                ),
+            );
+            if p.linux.trace {
+                eprintln!("trames pid {}: {fault}", done.pid);
+            }
+            if done.pid == 1 {
+                eprintln!("trames: {fault}");
+            }
+        }
+        let group = self.processes[&done.pid].signals.io.lifecycle().clone();
+        if group.termination().is_some() {
+            self.queue_exit_group(group);
+        }
+        self.native.metrics.merge(done.native);
+        let p = self
+            .processes
+            .get_mut(&done.pid)
+            .expect("dispatched process");
+        p.cpu = done.cpu;
+        p.signals.finish_io();
+        if let Some(entry) = done.seccomp_entry {
+            p.seccomp_entry = Some(entry);
+        }
+        p.retain_worker_flock(done.io.as_ref());
+        p.retain_local_message_owner(done.io.as_ref());
+        p.retained_byte = done.io.as_ref().and_then(|call| call.retained_byte.clone());
+        p.retained_socket = done
+            .io
+            .as_ref()
+            .and_then(|call| call.retained_socket.clone());
+        p.tcp_liveness = done.io.as_ref().and_then(|call| call.tcp_liveness.clone());
+        p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
+        p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
+        p.retained_aio = done.io.as_ref().and_then(|call| call.aio.clone());
+        p.file_checkpoint = done
+            .io
+            .as_ref()
+            .and_then(|call| call.file_checkpoint.clone());
+        p.file_entry = done
+            .io
+            .as_ref()
+            .filter(|call| call.file.is_some() || call.file_checkpoint.is_some())
+            .map(|call| (p.cpu.pc(), call.number, call.args));
+        p.state = if let Some(compile) = done.gpu_pending {
+            State::Gpu {
+                retired: true,
+                peer_instructions: compile.peer_instructions,
+                job: compile.job,
+                pc: compile.call.pc,
+                operation: compile.call.operation,
+                began: compile.began,
+                instructions: self.instructions,
+            }
+        } else if let Some(call) = done.io {
+            if let Some(uring) = call.uring {
+                p.uring_wait = Some((uring.submitted, uring.ring, uring.deadline));
+            }
+            if matches!(call.number, 63..=66 | 202 | 203 | 242) {
+                p.socket_deadline = call.deadline;
+            } else {
+                p.poll_deadline = call.deadline;
+            }
+            State::Blocked(call.number, call.args)
+        } else {
+            if !matches!(done.waiting, Some(crate::run_queue::WaitState::OwnerEvent)) {
+                p.poll_deadline = None;
+            }
+            done.waiting.map_or(State::Ready, |w| match w {
+                crate::run_queue::WaitState::Futex { wait, deadline } => {
+                    State::Futex { wait, deadline }
+                }
+                crate::run_queue::WaitState::Sleep {
+                    deadline,
+                    remaining,
+                } => State::Sleep(deadline, remaining),
+                crate::run_queue::WaitState::Signal(wait) => match wait.request {
+                    trames_kernel::signal::SignalWait::Timed {
+                        mask,
+                        info,
+                        deadline,
+                    } => State::Sigwait {
+                        mask,
+                        info,
+                        deadline,
+                    },
+                    trames_kernel::signal::SignalWait::Suspend { .. } => {
+                        State::Suspend(p.signals.wait_mask.take().expect("suspend restore mask"))
+                    }
+                },
+                crate::run_queue::WaitState::Child(wait) => {
+                    State::Blocked(wait.request.number, wait.request.args)
+                }
+                crate::run_queue::WaitState::Vfork(wait) => State::Vfork(wait.release.clone()),
+                crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
+            })
+        };
+        if let Some((pc, module, function)) = done.rejected_native {
+            p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name)));
+        }
+        p.last_cpu = done.worker;
+        p.cpu_time += done.elapsed;
+        self.cpu_total += done.elapsed;
+        for (slot, time) in done.cpu_times.iter().take(self.cpu_count).enumerate() {
+            self.per_cpu[slot] += *time;
+        }
+        self.decode_lookups += done.after.lookups - done.before.lookups;
+        self.decode_misses += done.after.misses - done.before.misses;
+        self.instructions_decoded += done.after.instructions - done.before.instructions;
+        let outcome = done.outcome.expect("checked worker completion");
+        if self.profile_syscalls && done.thread_exit.is_none() {
+            match &outcome {
+                SliceOutcome::Syscall { .. } => {
+                    *self
+                        .cohort_return_syscalls
+                        .entry(p.cpu.x(8) as u32)
+                        .or_default() += 1;
+                }
+                SliceOutcome::NativeCall {
+                    module, function, ..
+                } => {
+                    *self
+                        .cohort_return_native
+                        .entry((*module, *function))
+                        .or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        self.instructions += done.instructions;
+        self.worker_chunks += done.chunks;
+        self.worker_syscalls += done.syscalls;
+        self.worker_direct_syscalls += done.direct_syscalls;
+        self.worker_futex_wakes += done.futex_wakes;
+        self.worker_futex_woken += done.futex_woken;
+        self.worker_futex_requeues += done.futex_requeues;
+        self.serviced_syscalls += done.serviced_syscalls;
+        self.service_wait += done.service_wait;
+        self.syscalls += done.syscalls + done.serviced_syscalls;
+        self.syscall_total += done.syscall_time;
+        self.worker_slices += done.assignments;
+        self.context_switches += done.assignments;
+        self.worker_futex_waits += done.waits;
+        self.worker_task_resumes += done.resumes;
+        self.worker_task_yields += done.yields;
+        self.worker_io_waits += done.io_waits;
+        self.worker_service_waits += done.service_waits;
+        self.worker_file_syscalls += done.file_syscalls;
+        self.worker_socket_syscalls += done.socket_syscalls;
+        self.worker_timer_syscalls += done.timer_syscalls;
+        self.worker_poll_syscalls += done.poll_syscalls;
+        self.worker_uring_syscalls += done.uring_syscalls;
+        self.worker_fd_syscalls += done.fd_syscalls;
+        self.worker_gpu_calls += done.gpu.calls;
+        self.worker_gpu_waits += done.gpu.waits;
+        self.gpu_compiles += done.gpu.compiles;
+        self.gpu_wait_time += done.gpu.wait_time;
+        self.gpu_peer_instructions += done.gpu.peer_instructions;
+        self.gpu_transfers.merge(done.gpu.transfers);
+        if let Some((pc, operation, value)) = done.gpu.last_error {
+            p.linux.vfs.log(
+                4,
+                &format!(
+                    "pid={} Vulkan op={operation} result={} pc={pc:#x} errors={} comm={:?}",
+                    done.pid,
+                    value as i64,
+                    done.gpu.errors,
+                    String::from_utf8_lossy(&p.linux.command_name)
+                ),
+            );
+        }
+        if let Some(status) = done.thread_exit {
+            p.state = State::Zombie(status);
+        }
+        (done.pid, done.thread_exit, outcome)
     }
     fn parallel_timeout(&self) -> Duration {
         let now = Instant::now();
@@ -5288,6 +5323,7 @@ impl<C: Cpu> Kernel<C> {
     }
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
         'drive: loop {
+            self.process_exits(None)?;
             if let Some(error) = self.backend_error.take() {
                 return Err(RuntimeError::Backend(error));
             }
@@ -5440,17 +5476,13 @@ impl<C: Cpu> Kernel<C> {
                     self.processes.insert(actual_id, p);
                 }
                 let root_status = self.processes.get(&1).and_then(|root| {
-                    if let State::Zombie(s) = root.state {
-                        Some(s)
+                    if let State::Zombie(status) = root.state {
+                        root.family.status().map(|_| status)
                     } else {
                         None
                     }
                 });
                 if let Some(status) = root_status {
-                    if !self
-                        .processes
-                        .values()
-                        .any(|t| t.tgid == 1 && !matches!(t.state, State::Zombie(_)))
                     {
                         // Session teardown is explicit: root exit cancels remaining virtual children.
                         if let Some(root) = self.processes.get(&1) {
@@ -5481,7 +5513,7 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if !progress {
-                let external = !self.file_layouts.is_empty() || self.processes.values().any(|p| {
+                let external = self.exit_memory_pending() || !self.file_layouts.is_empty() || self.processes.values().any(|p| {
                     p.retained_file.is_some() || p.file_checkpoint.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
@@ -5771,6 +5803,7 @@ pub(super) fn run<C: Cpu>(
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
+        exits: Default::default(),
         file_layouts: Vec::new(),
         families: Arc::default(),
         limit_directory: Default::default(),
@@ -7448,6 +7481,7 @@ mod tests {
     pub(super) fn kernel() -> Kernel {
         Kernel {
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
+            exits: Default::default(),
             file_layouts: Vec::new(),
             families: Arc::default(),
             limit_directory: Default::default(),
@@ -8057,6 +8091,11 @@ mod tests {
             0xf8e10003u32,
             0xf1000442,
             0x54ffffc1,
+            0xd2800020, // stdout
+            0xd2900001, // counter address 0x8000
+            0xd2800102, // eight bytes
+            0xd2800808, // write
+            0xd4000001,
             0xd2800ba8,
             0xd2800000,
             0xd4000001,
@@ -8077,7 +8116,32 @@ mod tests {
         p.affinity = 3;
         let mut peer = p.fork();
         peer.vm_id = 2;
+        peer.tgid = 2;
         peer.family.set_parent(1);
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        for (i, word) in [
+            0xd2800040u32,
+            0xd2800001,
+            0xd2800002,
+            0xd2800003,
+            0xd2802088,
+            0xd4000001,
+            0xd2800ba8,
+            0xd2800000,
+            0xd4000001,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            p.memory
+                .write_array(0x4020 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        p.memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RX)
+            .unwrap();
         let mut k = kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
@@ -8085,14 +8149,15 @@ mod tests {
         k.next_pid = 3;
         k.processes.insert(1, p);
         k.processes.insert(2, peer);
-        let exit = k
-            .drive(&mut trames_linux::CapturedOutput::default(), 400000)
-            .unwrap();
+        let mut output = trames_linux::CapturedOutput::default();
+        let exit = k.drive(&mut output, 400000).unwrap();
         assert_eq!(exit.code, 0);
-        assert_eq!(exit.instructions, 300006);
-        for p in k.processes.values() {
-            assert_eq!(p.memory.read_u64(0x8000).unwrap(), 50000);
+        assert_eq!(exit.instructions, 300022);
+        assert_eq!(output.stdout.len(), 16);
+        for bytes in output.stdout.chunks_exact(8) {
+            assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 50000);
         }
+        assert_eq!(k.processes[&1].memory.read_u64(0x8000).unwrap(), 50000);
         assert!(k.parallel_memory.metrics.exclusive_private_views >= 2);
     }
     #[test]
@@ -8139,18 +8204,15 @@ mod tests {
         p.cpu.set_x(1, 1);
         p.cpu.set_x(2, 50000);
         p.affinity = 3;
-        let mut peer = p.fork();
-        peer.memory = p.memory.share();
-        peer.tgid = 1;
-        peer.family.set_parent(1);
-        peer.auto_reap = false;
         let mut k = kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
-        k.next_pid = 3;
+        let mut output = trames_linux::CapturedOutput::default();
+        k.syscall(1, &mut p, 220, [0x10b00, 0, 0, 0, 0, 0], &mut output)
+            .unwrap();
+        k.processes.get_mut(&2).unwrap().cpu.set_x(0, 0x8000);
         k.processes.insert(1, p);
-        k.processes.insert(2, peer);
         let exit = k
             .drive(&mut trames_linux::CapturedOutput::default(), 400000)
             .unwrap();
