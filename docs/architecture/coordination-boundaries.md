@@ -563,11 +563,20 @@ wrapper while other CPU Views continue. Group cleanup membership finishes after
 that cold collection. CPU/metrics adoption still occurs once at cohort drain.
 The event is asynchronous cleanup, not a source syscall RPC or a new owner poll.
 
-Weak, owner-local references to original shared Memory graphs preserve final
-backing publication if the dispatched wrapper retired but an undispatched
+Weak, owner-local references, captured only when a source exit actually returns
+its wrapper, preserve final backing publication if the dispatched wrapper retired but an undispatched
 CLONE_VM task retains the actual graph. They add no real mm owner, keep no RAM
 alive and do not change private-view admission. A guarded mapped-file test drops
 the wrapper before commit and verifies both the retained peer and real backing.
+A full queue regression also leaves the only other mm owner undispatched and
+checks the real backing, not merely a still-cached guest view. Disabling the
+retired-root commit makes it fail. Ordinary capture allocates no weak-root
+registry; unchanged live wrappers use the prior commit deduplication.
+
+A sole runnable original vfork child can now admit its actual waiting parent by
+release-object identity. It no longer needs an unrelated runnable task to enter
+the source queue. Removing this admission fails the same full-queue regression
+before dispatch. Structural clone/exec authority remains on its existing owner.
 
 Original Families now store final status, optional host completion and pending
 namespace dependencies in their existing relationship graph. Retiring nested

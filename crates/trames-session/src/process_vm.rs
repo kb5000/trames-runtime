@@ -387,6 +387,126 @@ mod tests {
             Err(MemoryError::InvalidRange)
         }
     }
+    #[test]
+    fn source_exit_publishes_backing_when_only_an_undispatched_mm_owner_remains() {
+        struct Legacy {
+            bytes: RefCell<[u8; PAGE_SIZE as usize]>,
+            version: Cell<u64>,
+            identity: u64,
+        }
+        impl PageBacking for Legacy {
+            fn parallel_key(&self) -> Option<(u64, u64)> {
+                Some((self.identity, 0))
+            }
+            fn check(&self, _: u64) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+                out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+                Ok(())
+            }
+            fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
+                self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+                self.version.set(self.version.get() + 1);
+                trames_memory::backing_changed();
+                Ok(())
+            }
+            fn writable(&self) -> bool {
+                true
+            }
+            fn sync(&self) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            fn version(&self) -> u64 {
+                self.version.get()
+            }
+            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+                Err(MemoryError::InvalidRange)
+            }
+        }
+        let mut k = super::super::tests::kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(2);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        let mut parent = super::super::tests::process();
+        parent.affinity = 3;
+        let [reader, _writer] = parent.linux.vfs.pipe(0).unwrap();
+        let mov = |register: u32, value: u32| 0xd2800000 | value << 5 | register;
+        for (i, word) in [
+            mov(0, reader),
+            mov(1, 0x1300),
+            mov(2, 1),
+            mov(8, 63),
+            0xd4000001,
+            0x14000000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            parent
+                .memory
+                .write_array(0x4200 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        parent.cpu.pc = 0x4200;
+        parent
+            .memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RX)
+            .unwrap();
+        let mut output = trames_linux::CapturedOutput::default();
+        // No CLONE_VM: the parent cannot accidentally publish the child's
+        // legacy backing through its own independent address space.
+        k.syscall(1, &mut parent, 220, [0x4011, 0, 0, 0, 0, 0], &mut output)
+            .unwrap();
+        k.processes.insert(1, parent);
+        let mut child = k.processes.remove(&2).unwrap();
+        child.memory.unmap(0x6000, PAGE_SIZE).unwrap();
+        let backing = Rc::new(Legacy {
+            bytes: RefCell::new([0; PAGE_SIZE as usize]),
+            version: Cell::new(0),
+            identity: trames_memory::new_backing_identity(),
+        });
+        child
+            .memory
+            .map_backed(0x6000, vec![backing.clone()], true, Permissions::RW, false)
+            .unwrap();
+        child
+            .memory
+            .protect(0x4000, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        code(
+            &mut child,
+            &[
+                mov(1, 0x6000),
+                mov(0, 99),
+                0xf9000020,
+                mov(0, 23),
+                mov(8, 93),
+                0xd4000001,
+            ],
+        );
+        child.cpu.pc = 0x4000;
+        k.syscall(2, &mut child, 220, [0x10b00, 0, 0, 0, 0, 0], &mut output)
+            .unwrap();
+        let peer = k.processes.get_mut(&3).unwrap();
+        peer.state = State::Suspend(0);
+        peer.linux.trace = true; // real owner outside the admitted cohort
+        k.processes.insert(2, child);
+        assert!(k.parallel_epoch(&mut output, 100000000, false).unwrap());
+        assert!(matches!(k.processes[&2].state, State::Zombie(status) if status == 23 << 8));
+        assert!(
+            k.processes[&2].memory.read_array::<1>(0x6000).is_err(),
+            "returned wrapper was not collected during the cohort"
+        );
+        assert_eq!(
+            u64::from_le_bytes(backing.bytes.borrow()[..8].try_into().unwrap()),
+            99
+        );
+        assert_eq!(
+            u64::from_le_bytes(k.processes[&3].memory.read_array(0x6000).unwrap()),
+            99
+        );
+    }
     fn map(
         p: &mut Process,
         base: u64,

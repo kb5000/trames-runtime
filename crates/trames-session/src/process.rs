@@ -4366,6 +4366,8 @@ impl<C: Cpu> Kernel<C> {
             other != id
                 && !p.frozen(other)
                 && (p.stopped()
+                    || matches!(&p.state, State::Vfork(release)
+                        if first.vfork.as_ref().is_some_and(|producer| Arc::ptr_eq(producer, release)))
                     || matches!(p.state, State::Blocked(95 | 260, _))
                         && !p.linux.trace
                         && first.family.parent() == p.tgid
@@ -4535,19 +4537,9 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         };
         self.admit_private_views(&mut views);
-        // Weak roots preserve final publication when a returned task drops its
-        // wrapper but an undispatched CLONE_VM task still owns the real graph.
-        // They do not alter private-view admission or keep retired RAM alive.
-        let mut rooted = std::collections::BTreeSet::new();
-        let roots: Vec<_> = members
-            .iter()
-            .filter_map(|&(pid, _)| {
-                let memory = &self.processes[&pid].memory;
-                rooted
-                    .insert(memory.coordinator_ownership().0)
-                    .then(|| (pid, memory.shared_root()))
-            })
-            .collect();
+        // Only a returned task that drops a shared wrapper needs a weak
+        // publication root. Ordinary cohort capture allocates no root registry.
+        let mut retired_roots = std::collections::BTreeMap::new();
         self.parallel_memory_time += began.elapsed();
         for &(_, slot) in &chosen {
             self.workers
@@ -4859,6 +4851,9 @@ impl<C: Cpu> Kernel<C> {
                 Some(crate::workers::Event::<C>::Retired) => {
                     for (pid, status) in epoch.take_retired_projections() {
                         let mut p = self.processes.remove(&pid).expect("returned source task");
+                        if let Some(root) = p.memory.shared_root() {
+                            retired_roots.entry(p.vm_id).or_insert(root);
+                        }
                         self.collect_source_exit(pid, &mut p, status);
                         // Cohort domain/index records keep their original IDs.
                         // Physical projections are gone; the tombstone lasts
@@ -4951,19 +4946,27 @@ impl<C: Cpu> Kernel<C> {
         // exits/exec/fork, which may remove peers. Worker WAIT already compared
         // and enqueued under its futex bucket; completed calls are not replayed.
         let began = Instant::now();
-        for (id, root) in roots {
-            if let Some(root) = root {
-                root.commit_parallel()?;
-                continue;
-            }
+        for (index, &(id, _)) in members.iter().enumerate() {
             if projected_exits.contains(&id) {
                 continue;
             }
+            let vm_id = self.processes[&id].vm_id;
+            if members[..index].iter().any(|&(peer, _)| {
+                !projected_exits.contains(&peer) && self.processes[&peer].vm_id == vm_id
+            }) {
+                continue;
+            }
+            // This live wrapper supplies the same original graph. A weak root
+            // is only needed if every dispatched wrapper for it has retired.
+            retired_roots.remove(&vm_id);
             self.processes
                 .get_mut(&id)
                 .expect("dispatched process")
                 .memory
                 .commit_parallel()?;
+        }
+        for root in retired_roots.into_values() {
+            root.commit_parallel()?;
         }
         self.parallel_memory_time += began.elapsed();
         let mut outcomes = Vec::new();
