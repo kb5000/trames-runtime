@@ -554,7 +554,7 @@ mod tests {
                 k.per_cpu = vec![Duration::ZERO; 3];
                 k.profile_syscalls = true;
                 let mut root = super::super::tests::process();
-                root.affinity = 7;
+                root.signals.io.scheduling.set_affinity(7);
                 let backing = Rc::new(Backing(RefCell::new([0; PAGE_SIZE as usize])));
                 if mode == 5 {
                     root.memory.unmap(0x6000, PAGE_SIZE).unwrap();
@@ -684,7 +684,13 @@ mod tests {
                     .unwrap();
                     if mode == 3 {
                         root.cpu.set_pc(0x4300);
-                        k.processes.get_mut(&2).unwrap().affinity = 2;
+                        k.processes
+                            .get_mut(&2)
+                            .unwrap()
+                            .signals
+                            .io
+                            .scheduling
+                            .set_affinity(2);
                     } else {
                         k.processes.get_mut(&2).unwrap().cpu.set_pc(0x4300);
                     }
@@ -693,7 +699,13 @@ mod tests {
                     .unwrap();
                 let foreign = k.next_pid - 1;
                 k.processes.get_mut(&foreign).unwrap().cpu.set_pc(0x4300);
-                k.processes.get_mut(&foreign).unwrap().affinity = 4;
+                k.processes
+                    .get_mut(&foreign)
+                    .unwrap()
+                    .signals
+                    .io
+                    .scheduling
+                    .set_affinity(4);
                 let task = if mode == 3 {
                     k.processes[&2].signals.io.clone()
                 } else {

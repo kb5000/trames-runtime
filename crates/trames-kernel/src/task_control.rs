@@ -37,6 +37,12 @@ struct Member {
     held: bool,
     interrupt: Option<Arc<dyn trames_execution::ExecutionInterrupt>>,
     retiring: bool,
+    migrations: Vec<Weak<crate::completion::Completion>>,
+}
+fn complete_migrations(migrations: Vec<Weak<crate::completion::Completion>>) {
+    for wait in migrations.into_iter().filter_map(|wait| wait.upgrade()) {
+        wait.finish();
+    }
 }
 // ExecutionInterrupt is supplied by the backend; no CPU itself crosses here.
 pub struct Lease {
@@ -206,7 +212,7 @@ impl Group {
             .collect()
     }
     pub(crate) fn finish_exit(&self, pid: u32, task: &Arc<IoTask>) -> Option<i32> {
-        let (notice, status) = {
+        let (notice, status, migrations) = {
             let mut state = self.state.lock().unwrap();
             let original = Arc::downgrade(task);
             if !state
@@ -216,15 +222,16 @@ impl Group {
             {
                 return None;
             }
-            state.members.remove(&pid);
+            let migrations = state.members.remove(&pid).unwrap().migrations;
             let status = if state.members.is_empty() && !state.completed {
                 state.completed = true;
                 state.exit_status
             } else {
                 None
             };
-            (state.acknowledge(), status)
+            (state.acknowledge(), status, migrations)
         };
+        complete_migrations(migrations);
         if let Some(notice) = notice {
             notice.publish();
         }
@@ -236,6 +243,34 @@ impl Group {
     }
     pub fn has_live_members(&self) -> bool {
         self.state.lock().unwrap().live != 0
+    }
+    /// Mask publication and execution entry share the original task-control
+    /// lock. An accepted migration waits only for this original running lease.
+    pub fn affinity(
+        &self,
+        task: &Arc<IoTask>,
+        mask: u64,
+    ) -> Option<Arc<crate::completion::Completion>> {
+        let mut state = self.state.lock().unwrap();
+        if !task.scheduling.replace_affinity(mask) {
+            return None;
+        }
+        let member = state
+            .members
+            .values_mut()
+            .find(|m| m.task.ptr_eq(&Arc::downgrade(task)));
+        let wait = member.filter(|m| m.running).map(|m| {
+            let wait = Arc::new(crate::completion::Completion::default());
+            m.migrations.retain(|w| w.strong_count() != 0);
+            m.migrations.push(Arc::downgrade(&wait));
+            if let Some(interrupt) = &m.interrupt {
+                interrupt.request_exit();
+            }
+            wait
+        });
+        drop(state);
+        task.wake_control();
+        wait
     }
     pub fn interrupt_member(&self, pid: u32) {
         let state = self.state.lock().unwrap();
@@ -293,15 +328,17 @@ impl Group {
                     held: false,
                     interrupt: None,
                     retiring: false,
+                    migrations: Vec::new(),
                 }
             });
         // A non-leader exec replaces the old leader's PID with this original task.
-        if state
-            .members
-            .insert(pid, member)
-            .is_some_and(|m| !m.retiring)
-        {
+        let replaced = state.members.insert(pid, member);
+        if replaced.as_ref().is_some_and(|m| !m.retiring) {
             state.live -= 1;
+        }
+        drop(state);
+        if let Some(member) = replaced {
+            complete_migrations(member.migrations);
         }
     }
     pub fn enter(self: &Arc<Self>, task: &Arc<IoTask>, pid: u32) -> Lease {
@@ -315,6 +352,7 @@ impl Group {
             held: false,
             interrupt: None,
             retiring: false,
+            migrations: Vec::new(),
         });
         assert!(!member.running, "one executor per task");
         member.running = true;
@@ -338,14 +376,19 @@ impl Group {
         }
     }
     pub(crate) fn retire(&self, pid: u32, mark: impl FnOnce()) {
-        let notice = {
+        let (notice, migrations) = {
             let mut s = self.state.lock().unwrap();
             mark();
-            if s.members.remove(&pid).is_some_and(|m| !m.retiring) {
+            let removed = s.members.remove(&pid);
+            if removed.as_ref().is_some_and(|m| !m.retiring) {
                 s.live -= 1;
             }
-            s.acknowledge()
+            (
+                s.acknowledge(),
+                removed.map_or_else(Vec::new, |m| m.migrations),
+            )
         };
+        complete_migrations(migrations);
         if let Some(notice) = notice {
             notice.publish();
         }
@@ -460,21 +503,24 @@ impl Group {
         self.state.lock().unwrap().tasks().into_iter().next()
     }
     fn finish(&self, pid: u32, task: &Weak<IoTask>, held: Option<bool>) {
-        let notice = {
+        let (notice, migrations) = {
             let mut s = self.state.lock().unwrap();
             let member = match s.members.get_mut(&pid) {
                 Some(member) => Some(member),
                 None => s.members.values_mut().find(|m| m.task.ptr_eq(task)),
             };
+            let mut migrations = Vec::new();
             if let Some(m) = member {
+                migrations = std::mem::take(&mut m.migrations);
                 m.running = false;
                 m.interrupt = None;
                 if let Some(held) = held {
                     m.held = held;
                 }
             }
-            s.acknowledge()
+            (s.acknowledge(), migrations)
         };
+        complete_migrations(migrations);
         if let Some(notice) = notice {
             notice.publish();
         }
@@ -500,6 +546,56 @@ impl Drop for Lease {
 mod tests {
     use super::*;
     use crate::signal::Signals;
+
+    #[test]
+    fn affinity_completion_follows_original_running_lease_across_rekey_and_exit() {
+        let (a, b, _) = family();
+        let group = a.lifecycle();
+        let lease = group.enter(&a, 42);
+        let first = group.affinity(&a, 2).unwrap();
+        let second = group.affinity(&a, 1).unwrap();
+        assert!(group.affinity(&b, 4).is_none());
+        assert!(!first.finished() && !second.finished());
+        group.register(&a, 99);
+        drop(lease);
+        assert!(first.finished() && second.finished());
+        assert_eq!(a.scheduling.affinity(), 1);
+        assert_eq!(b.scheduling.affinity(), 4);
+        let lease = group.enter(&a, 99);
+        let retiring = group.affinity(&a, 2).unwrap();
+        assert!(a.try_exit(99, 0).is_some());
+        a.finish_exit(99);
+        assert!(retiring.finished());
+        drop(lease);
+    }
+
+    #[test]
+    fn affinity_wait_callbacks_can_reenter_the_original_group_after_departure() {
+        struct Wake {
+            group: Arc<Group>,
+            seen: std::sync::atomic::AtomicUsize,
+        }
+        impl trames_vfs::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+                assert!(self.group.quiescent(42));
+                self.seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (a, _, _) = family();
+        let group = a.lifecycle();
+        let lease = group.enter(&a, 42);
+        let wait = group.affinity(&a, 2).unwrap();
+        let wake = Arc::new(Wake {
+            group: group.clone(),
+            seen: Default::default(),
+        });
+        let erased: Arc<dyn trames_vfs::IoWake> = wake.clone();
+        let signal = trames_vfs::IoSignal::new(7, Arc::downgrade(&erased));
+        let _subscription = wait.subscribe(&signal);
+        drop(lease);
+        assert!(wait.finished());
+        assert_eq!(wake.seen.load(Ordering::Relaxed), 1);
+    }
 
     fn family() -> (Arc<IoTask>, Arc<IoTask>, Arc<Child>) {
         let a = Arc::new(IoTask::default());

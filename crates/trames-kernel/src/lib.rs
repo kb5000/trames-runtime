@@ -2,6 +2,7 @@
 //! Execution-independent Linux task state and scheduling policy.
 //! Backend transports, decoders and product integration belong to their callers.
 pub mod children;
+pub mod completion;
 pub mod family;
 pub mod limits;
 pub mod scheduling;

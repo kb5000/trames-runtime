@@ -408,7 +408,7 @@ mod tests {
         use super::super::tests::{kernel, process};
         for decision in [0x7fff0000, 0x5007b] {
             let mut p = process();
-            p.affinity = 3;
+            p.signals.io.scheduling.set_affinity(3);
             // getrlimit(7, 0x1000), repeated 1000 times, then owner exit boundary.
             let code = [
                 0xd28000e0u32,
@@ -484,7 +484,7 @@ mod tests {
         for number in [95u32, 260] {
             for decision in [ALLOW, 0x5000d] {
                 let mut p = process();
-                p.affinity = 3;
+                p.signals.io.scheduling.set_affinity(3);
                 let args = if number == 260 {
                     [u32::MAX as u64, 0, 1, 0, 0, 0]
                 } else {
@@ -603,6 +603,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -710,7 +711,7 @@ mod tests {
                         )
                         .unwrap();
                     p.cpu = Cpu::new(0x4000, 0);
-                    p.affinity = 3;
+                    p.signals.io.scheduling.set_affinity(3);
                     if let Some(decision) = decision {
                         p.seccomp.push(Arc::new(
                             Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
@@ -819,6 +820,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: p.linux.vfs.stream_descriptors(),
 
@@ -927,6 +929,7 @@ mod tests {
                     identities: [0; 7],
                     started: Instant::now(),
                     processor: 0,
+                    cpus: 4,
                     profile: false,
                     streams: Default::default(),
                     fd_flags: Default::default(),
@@ -1056,6 +1059,7 @@ mod tests {
                     identities: [0; 7],
                     started: Instant::now(),
                     processor: 0,
+                    cpus: 4,
                     profile: false,
                     streams: Default::default(),
                     fd_flags: Default::default(),
@@ -1174,6 +1178,7 @@ mod tests {
                     identities: [0; 7],
                     started: Instant::now(),
                     processor: 0,
+                    cpus: 4,
                     profile: false,
                     streams: Default::default(),
 
@@ -1300,6 +1305,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: p.linux.vfs.stream_descriptors(),
 
@@ -1405,7 +1411,7 @@ mod tests {
                 p.cpu.set_x(1, 0x1234);
                 p.cpu.set_x(2, 2);
             }
-            p.affinity = 3;
+            p.signals.io.scheduling.set_affinity(3);
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
@@ -1475,7 +1481,7 @@ mod tests {
                     )
                     .unwrap();
                 p.cpu = Cpu::new(0x4000, 0);
-                p.affinity = (1 << slots) - 1;
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
                 p.seccomp.push(Arc::new(
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
@@ -1551,7 +1557,7 @@ mod tests {
             p.cpu = Cpu::new(0x4000, 0);
             p.cpu.set_x(1, 0x1234);
             p.cpu.set_x(2, 0x1800);
-            p.affinity = 3;
+            p.signals.io.scheduling.set_affinity(3);
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
@@ -1627,7 +1633,7 @@ mod tests {
                 )
                 .unwrap();
             p.cpu = Cpu::new(0x4000, 0);
-            p.affinity = 3;
+            p.signals.io.scheduling.set_affinity(3);
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
@@ -1719,7 +1725,7 @@ mod tests {
                     )
                     .unwrap();
                 p.cpu = Cpu::new(0x4000, 0);
-                p.affinity = 3;
+                p.signals.io.scheduling.set_affinity(3);
                 if let Some(decision) = decision {
                     p.seccomp.push(Arc::new(
                         Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
@@ -1786,7 +1792,7 @@ mod tests {
             )
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
-        p.affinity = 15;
+        p.signals.io.scheduling.set_affinity(15);
         p.seccomp
             .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
         let mut kernel = super::super::tests::kernel();
@@ -1843,6 +1849,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: Default::default(),
 
@@ -1905,7 +1912,7 @@ mod tests {
                 )
                 .unwrap();
             p.cpu = Cpu::new(0x4000, 0);
-            p.affinity = 15;
+            p.signals.io.scheduling.set_affinity(15);
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
@@ -2018,7 +2025,7 @@ mod tests {
         p.cpu = Cpu::new(0x4000, 0);
         p.cpu.set_x(8, 63);
         put_args(&mut p.cpu, [read as u64, 0x1000, 4, 0, 0, 0]);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         p.seccomp.strict = true;
         let peer = p.fork();
         peer.family.set_parent(1);
@@ -2068,7 +2075,7 @@ mod tests {
         p.cpu = Cpu::new(0x4000, 0);
         p.cpu.set_x(8, 63);
         put_args(&mut p.cpu, [read as u64, 0x1000, 8, 0, 0, 0]);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         p.seccomp.push(Arc::new(
             Filter::validate(vec![i(6, 0, 0, 0x5007b)]).unwrap(),
         ));
@@ -2139,6 +2146,7 @@ mod tests {
                     identities: [0; 7],
                     started: Instant::now(),
                     processor: 0,
+                    cpus: 4,
                     profile: false,
                     streams: p.linux.vfs.stream_descriptors(),
 
@@ -2187,6 +2195,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2244,6 +2253,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2294,6 +2304,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2354,6 +2365,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2414,6 +2426,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2476,6 +2489,7 @@ mod tests {
                 identities: [0; 7],
                 started: Instant::now(),
                 processor: 0,
+                cpus: 4,
                 profile: false,
                 streams: Default::default(),
 
@@ -2533,6 +2547,7 @@ mod tests {
                     identities: [0; 7],
                     started: Instant::now(),
                     processor: 0,
+                    cpus: 4,
                     profile: false,
                     streams: p.linux.vfs.stream_descriptors(),
 
@@ -2590,7 +2605,7 @@ mod tests {
             )
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         p.seccomp.push(Arc::new(
             Filter::validate(vec![i(6, 0, 0, 0x5007b)]).unwrap(),
         ));

@@ -393,8 +393,21 @@ impl<C: Cpu> trames_linux::FileExecutor for DiskPool<C> {
         self.submit(DiskJob(job.queued(), result));
     }
 }
+/// Shared authority over existing CPU slots. Only startup/teardown and command
+/// publication take a per-slot lock; no guest CPU/Memory crosses that lock.
+pub(super) struct Starter<C: Cpu> {
+    workers: Arc<Vec<Mutex<Option<Worker<C>>>>>,
+    send: mpsc::Sender<Event<C>>,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    peak_native: Arc<AtomicUsize>,
+    active_native: Arc<AtomicUsize>,
+    profile_native_overlap: bool,
+    closed: Arc<AtomicBool>,
+}
 pub(super) struct Pool<C: Cpu> {
-    workers: Vec<Option<Worker<C>>>,
+    workers: Arc<Vec<Mutex<Option<Worker<C>>>>>,
+    closed: Arc<AtomicBool>,
     send: mpsc::Sender<Event<C>>,
     receive: mpsc::Receiver<Event<C>>,
     active: Arc<AtomicUsize>,
@@ -415,7 +428,8 @@ impl<C: Cpu> Pool<C> {
     pub fn with_profiling(count: usize, profile_native_overlap: bool) -> Self {
         let (send, receive) = mpsc::channel();
         Self {
-            workers: (0..count).map(|_| None).collect(),
+            workers: Arc::new((0..count).map(|_| Mutex::new(None)).collect()),
+            closed: Arc::new(AtomicBool::new(false)),
             disk: Arc::new(DiskPool {
                 workers: Mutex::new(Vec::new()),
                 next: AtomicUsize::new(0),
@@ -432,8 +446,132 @@ impl<C: Cpu> Pool<C> {
             profile_native_overlap,
         }
     }
+    pub fn starter(&self) -> Starter<C> {
+        Starter {
+            workers: self.workers.clone(),
+            send: self.send.clone(),
+            active: self.active.clone(),
+            peak: self.peak.clone(),
+            peak_native: self.peak_native.clone(),
+            active_native: self.active_native.clone(),
+            profile_native_overlap: self.profile_native_overlap,
+            closed: self.closed.clone(),
+        }
+    }
     pub fn ensure(&mut self, index: usize) -> std::io::Result<()> {
-        if self.workers[index].is_some() {
+        self.starter().ensure(index)
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn dispatch(&mut self, index: usize, work: Work<C>) -> Result<(), ()> {
+        let mut slot = self.workers[index].lock().unwrap();
+        let worker = slot.as_mut().ok_or(())?;
+        if worker.control.is_some() {
+            return Err(());
+        }
+        worker.control = Some(work.control.clone());
+        worker
+            .send
+            .send(Command::<C>::One(Box::new(work)))
+            .map_err(|_| ())
+    }
+    pub fn launch(
+        &mut self,
+        index: usize,
+        epoch: Arc<crate::run_queue::Epoch<C>>,
+    ) -> Result<(), ()> {
+        epoch.bind_starter(self.starter());
+        epoch.activate(index).map_err(|_| ())
+    }
+    pub fn file_executor(&self) -> Arc<dyn trames_linux::FileExecutor> {
+        self.disk.clone()
+    }
+    fn received(&mut self, event: Event<C>) -> Event<C> {
+        if let Event::<C>::EpochStopped(slot) = &event {
+            let mut entry = self.workers[*slot].lock().unwrap();
+            let worker = entry.as_mut().expect("cohort worker");
+            worker.control = None;
+            worker.epoch = None;
+        }
+        if let Event::<C>::Done(done) = &event {
+            self.workers[done.worker]
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("completed worker")
+                .control = None;
+        }
+        event
+    }
+    pub fn event_timeout(&mut self, timeout: Duration) -> Result<Option<Event<C>>, ()> {
+        match self.receive.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(self.received(event))),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn complete(&mut self) -> Result<Done<C>, ()> {
+        loop {
+            let event = self.receive.recv().map_err(|_| ())?;
+            match self.received(event) {
+                Event::<C>::Done(done) => return Ok(*done),
+                Event::<C>::Service(request) => request.respond(None),
+                Event::<C>::EpochStopped(_)
+                | Event::<C>::VmReady
+                | Event::<C>::Idle
+                | Event::<C>::Retired => return Err(()),
+            }
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn complete_timeout(&mut self, timeout: Duration) -> Result<Option<Done<C>>, ()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.event_timeout(deadline.saturating_duration_since(Instant::now()))? {
+                Some(Event::<C>::Done(done)) => return Ok(Some(*done)),
+                Some(Event::<C>::Service(request)) => request.respond(None),
+                Some(
+                    Event::<C>::EpochStopped(_)
+                    | Event::<C>::VmReady
+                    | Event::<C>::Idle
+                    | Event::<C>::Retired,
+                ) => return Err(()),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+impl<C: Cpu> Starter<C> {
+    pub fn capacity(&self) -> usize {
+        self.workers.len()
+    }
+    pub fn start(
+        &self,
+        index: usize,
+        epoch: Arc<crate::run_queue::Epoch<C>>,
+    ) -> std::io::Result<()> {
+        self.ensure(index)?;
+        let mut slot = self.workers[index].lock().unwrap();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("CPU pool closed"));
+        }
+        let worker = slot.as_mut().expect("started CPU");
+        if worker.control.is_some() {
+            return Err(std::io::Error::other("CPU slot already executing"));
+        }
+        worker.control = Some(epoch.control.clone());
+        worker.epoch = Some(epoch.clone());
+        worker
+            .send
+            .send(Command::Epoch(epoch))
+            .map_err(|_| std::io::Error::other("CPU worker disconnected"))
+    }
+    #[rustfmt::skip]
+    pub fn ensure(&self, index: usize) -> std::io::Result<()> {
+        let mut slot = self.workers[index].lock().unwrap();
+        if self.closed.load(Ordering::Relaxed) { return Err(std::io::Error::other("CPU pool closed")); }
+        if slot.is_some() {
             return Ok(());
         }
         let (send, receive) = mpsc::channel::<Command<C>>();
@@ -501,6 +639,10 @@ impl<C: Cpu> Pool<C> {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if let Some(snapshot) = &work.syscalls {
+                                if epoch.is_some() && snapshot.io_signals.scheduling.affinity() & (1u64 << index) == 0 {
+                                    yielded = true;
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
                                 if let Some(status) = snapshot.io_signals.lifecycle().termination() {
                                     if let (Some(pending),Some(authority)) = (job.gpu_pending.as_mut(),work.gpu.as_ref()) {
                                         if let Some(compile) = pending.compile.take() { authority.context.abandon(compile.job); }
@@ -511,7 +653,7 @@ impl<C: Cpu> Pool<C> {
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
-                                if matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if wait.release.finished()) {
+                                if matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if wait.release.finished()) {
                                     job.waiting=None;continue;
                                 }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
@@ -544,7 +686,7 @@ impl<C: Cpu> Pool<C> {
                                         snapshot.io_signals.lifecycle().request_exit(sig as i32);
                                         continue;
                                     }
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -557,7 +699,7 @@ impl<C: Cpu> Pool<C> {
                                         }
                                         continue;
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Vfork(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -1092,6 +1234,24 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(began)=began{syscall_time+=began.elapsed();}
                                             syscalls+=1;break SliceOutcome::Yield{instructions:0};
                                         }
+                                        if number == 122 {
+                                            let reply = snapshot.io_routes.scheduling_request(&snapshot.io_signals, snapshot.cpus, number, std::array::from_fn(|i| work.cpu.x(i)), work.memory.as_deref_mut().expect("affinity View"));
+                                            if let Some(began)=began {syscall_time+=began.elapsed();}
+                                            syscalls+=1;
+                                            match reply {
+                                                Err(e) => {work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));continue;}
+                                                Ok((value, wait)) => {
+                                                    work.cpu.set_x(0,value);
+                                                    if let (Some(_),Some(wait)) = (&epoch, wait.filter(|w| !w.finished())) {
+                                                        let waiting = crate::run_queue::CompletionWait::new(wait);
+                                                        if let Some(signal)=&snapshot.io_wake {waiting.bind(&snapshot.io_signals,signal);}
+                                                        parked=Some(crate::run_queue::WaitState::Completion(waiting));
+                                                        break SliceOutcome::Yield {instructions:0};
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("task control View")).expect("shared task control");
                                         if let Some(began)=began{syscall_time+=began.elapsed();}
                                         work.cpu.set_x(0,value);syscalls+=1;continue;
@@ -1537,7 +1697,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     if epoch.is_some() && done.send(Event::<C>::EpochStopped(index)).is_err() { return; }
                 }
             })?;
-        self.workers[index] = Some(Worker::<C> {
+        *slot = Some(Worker::<C> {
             send,
             join,
             control: None,
@@ -1545,116 +1705,56 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
         });
         Ok(())
     }
-    #[cfg(all(test, trames_interpreter_conformance))]
-    pub fn dispatch(&mut self, index: usize, work: Work<C>) -> Result<(), ()> {
-        let worker = self.workers[index].as_mut().ok_or(())?;
-        if worker.control.is_some() {
-            return Err(());
-        }
-        worker.control = Some(work.control.clone());
-        worker
-            .send
-            .send(Command::<C>::One(Box::new(work)))
-            .map_err(|_| ())
-    }
-    pub fn launch(
-        &mut self,
-        index: usize,
-        epoch: Arc<crate::run_queue::Epoch<C>>,
-    ) -> Result<(), ()> {
-        let worker = self.workers[index].as_mut().ok_or(())?;
-        if worker.control.is_some() {
-            return Err(());
-        }
-        worker.control = Some(epoch.control.clone());
-        worker.epoch = Some(epoch.clone());
-        worker.send.send(Command::<C>::Epoch(epoch)).map_err(|_| ())
-    }
-    pub fn file_executor(&self) -> Arc<dyn trames_linux::FileExecutor> {
-        self.disk.clone()
-    }
-    fn received(&mut self, event: Event<C>) -> Event<C> {
-        if let Event::<C>::EpochStopped(slot) = &event {
-            let worker = self.workers[*slot].as_mut().expect("cohort worker");
-            worker.control = None;
-            worker.epoch = None;
-        }
-        if let Event::<C>::Done(done) = &event {
-            self.workers[done.worker]
-                .as_mut()
-                .expect("completed worker")
-                .control = None;
-        }
-        event
-    }
-    pub fn event_timeout(&mut self, timeout: Duration) -> Result<Option<Event<C>>, ()> {
-        match self.receive.recv_timeout(timeout) {
-            Ok(event) => Ok(Some(self.received(event))),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
-        }
-    }
-    #[cfg(all(test, trames_interpreter_conformance))]
-    pub fn complete(&mut self) -> Result<Done<C>, ()> {
-        loop {
-            let event = self.receive.recv().map_err(|_| ())?;
-            match self.received(event) {
-                Event::<C>::Done(done) => return Ok(*done),
-                Event::<C>::Service(request) => request.respond(None),
-                Event::<C>::EpochStopped(_)
-                | Event::<C>::VmReady
-                | Event::<C>::Idle
-                | Event::<C>::Retired => return Err(()),
-            }
-        }
-    }
-    #[cfg(all(test, trames_interpreter_conformance))]
-    pub fn complete_timeout(&mut self, timeout: Duration) -> Result<Option<Done<C>>, ()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.event_timeout(deadline.saturating_duration_since(Instant::now()))? {
-                Some(Event::<C>::Done(done)) => return Ok(Some(*done)),
-                Some(Event::<C>::Service(request)) => request.respond(None),
-                Some(
-                    Event::<C>::EpochStopped(_)
-                    | Event::<C>::VmReady
-                    | Event::<C>::Idle
-                    | Event::<C>::Retired,
-                ) => return Err(()),
-                None => return Ok(None),
-            }
-        }
-    }
 }
 
 impl<C: Cpu> Drop for Pool<C> {
     fn drop(&mut self) {
-        for worker in self.workers.iter().flatten() {
-            if let Some(control) = &worker.control {
+        self.closed.store(true, Ordering::Relaxed);
+        let controls: Vec<_> = self
+            .workers
+            .iter()
+            .filter_map(|slot| {
+                slot.lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|worker| (worker.control.clone(), worker.epoch.clone()))
+            })
+            .collect();
+        for (control, epoch) in controls {
+            if let Some(control) = control {
                 control.stop();
             }
-            if let Some(epoch) = &worker.epoch {
+            if let Some(epoch) = epoch {
                 epoch.stop();
             }
         }
         // A stopped worker may be parked waiting for a queued service request.
         // Return its view before joining; no request is abandoned or replayed.
-        while self.workers.iter().flatten().any(|w| w.control.is_some()) {
+        while self.workers.iter().any(|slot| {
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|w| w.control.is_some())
+        }) {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
                 Ok(Some(Event::<C>::VmReady | Event::<C>::Idle | Event::<C>::Retired)) => {}
                 Ok(None) => {
-                    for worker in self.workers.iter_mut().flatten() {
-                        if worker.join.is_finished() {
-                            worker.control = None;
+                    for slot in self.workers.iter() {
+                        if let Some(worker) = slot.lock().unwrap().as_mut() {
+                            if worker.join.is_finished() {
+                                worker.control = None;
+                            }
                         }
                     }
                 }
                 Err(()) => break,
             }
         }
-        for worker in self.workers.iter_mut().filter_map(Option::take) {
+        for slot in self.workers.iter() {
+            let worker = slot.lock().unwrap().take();
+            let Some(worker) = worker else { continue };
             drop(worker.send);
             let _ = worker.join.join();
         }
@@ -1667,6 +1767,27 @@ mod tests {
     use trames_cpu::Cpu;
     type Pool = crate::workers::Pool<Cpu>;
     type Work = crate::workers::Work<Cpu>;
+
+    #[test]
+    fn closed_cpu_pool_reports_source_activation_failure_and_keeps_the_job() {
+        let pool = Pool::new(2);
+        let control = Arc::new(Control::new(1000));
+        let epoch = crate::run_queue::Epoch::with_events(control.clone(), pool.events(), true);
+        epoch.bind_starter(pool.starter());
+        pool.closed.store(true, Ordering::Relaxed);
+        epoch.add(crate::run_queue::Job::new(
+            work(7, &[0xd4000001], 0, control),
+            2,
+            0,
+            None,
+        ));
+        assert!(epoch.activation_failed());
+        assert!(epoch.control.stopped());
+        assert_eq!(epoch.active_slots(), 0);
+        let returned = epoch.drain();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].pid, 7);
+    }
 
     use super::*;
     use std::{
@@ -1856,6 +1977,7 @@ mod tests {
             identities: [21, 12, 1000, 1001, 2000, 2001, 22],
             started: Instant::now(),
             processor: 1,
+            cpus: 4,
             profile: true,
             streams: Default::default(),
 

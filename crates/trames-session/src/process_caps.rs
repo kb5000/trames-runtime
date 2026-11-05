@@ -48,6 +48,10 @@ impl<C: Cpu> Kernel<C> {
                 .credentials
                 .caps
                 .set(masks[0], masks[1], masks[2])?;
+            p.signals
+                .io
+                .scheduling
+                .publish_credentials(&p.linux.vfs.credentials);
         } else {
             let c = if target == 0 || target as u32 == local {
                 &p.linux.vfs.credentials.caps

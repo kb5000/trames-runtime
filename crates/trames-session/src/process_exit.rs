@@ -393,7 +393,7 @@ mod tests {
                 k.per_cpu = vec![Duration::ZERO; 3];
                 k.profile_syscalls = true;
                 let mut root = super::super::tests::process();
-                root.affinity = 7;
+                root.signals.io.scheduling.set_affinity(7);
                 let [reader, writer] = root.linux.vfs.pipe(0).unwrap();
                 let [resume, _] = root.linux.vfs.pipe(0).unwrap();
                 let observed = root

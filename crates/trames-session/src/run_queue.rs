@@ -23,7 +23,7 @@ pub(super) enum WaitState {
     OwnerEvent,
     Signal(Arc<SignalWait>),
     Child(Arc<ChildWait>),
-    Vfork(Arc<VforkWait>),
+    Completion(Arc<CompletionWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -33,12 +33,12 @@ pub(super) enum WaitState {
         remaining: u64,
     },
 }
-pub(super) struct VforkWait {
-    pub release: Arc<trames_kernel::vfork::Release>,
+pub(super) struct CompletionWait {
+    pub release: Arc<trames_kernel::completion::Completion>,
     subscriptions: Mutex<Vec<trames_vfs::IoSubscription>>,
 }
-impl VforkWait {
-    pub fn new(release: Arc<trames_kernel::vfork::Release>) -> Arc<Self> {
+impl CompletionWait {
+    pub fn new(release: Arc<trames_kernel::completion::Completion>) -> Arc<Self> {
         Arc::new(Self {
             release,
             subscriptions: Default::default(),
@@ -92,7 +92,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
-            Self::OwnerEvent | Self::Child(_) | Self::Vfork(_) => None,
+            Self::OwnerEvent | Self::Child(_) | Self::Completion(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
@@ -300,6 +300,12 @@ impl<C: Cpu> Job<C> {
             },
         })
     }
+    pub fn affinity(&self) -> u64 {
+        self.work
+            .syscalls
+            .as_ref()
+            .map_or(self.affinity, |s| s.io_signals.scheduling.affinity())
+    }
     pub(super) fn guest_waiting(&self) -> bool {
         self.stopped()
             || self
@@ -334,7 +340,7 @@ impl<C: Cpu> Job<C> {
             return None;
         }
         Some(
-            matches!(self.waiting, Some(WaitState::Vfork(ref wait)) if !wait.release.finished())
+            matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
                 || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -399,13 +405,13 @@ impl<C: Cpu> Job<C> {
                     .gpu_pending
                     .as_ref()
                     .is_some_and(|g| g.compile.is_some() && !g.waiting())
-                || matches!(&self.waiting, Some(WaitState::Vfork(wait)) if wait.release.finished())
+                || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished())
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
                         && io.signal.ready()
                 });
         }
-        if let Some(WaitState::Vfork(wait)) = &self.waiting {
+        if let Some(WaitState::Completion(wait)) = &self.waiting {
             if wait.release.finished() {
                 return true;
             }
@@ -433,7 +439,7 @@ impl<C: Cpu> Job<C> {
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Vfork(wait)) if !wait.release.finished())
+                        && !(matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
                                 .retry
@@ -569,7 +575,11 @@ pub(super) struct Epoch<C: Cpu> {
     slot_changed: [Condvar; 32],
     host_events: OnceLock<Option<Arc<trames_vfs::HostEvents>>>,
     pub io_target: Weak<dyn trames_vfs::IoWake>,
+    me: Weak<Self>,
     timers: OnceLock<Arc<trames_kernel::timers::Timers>>,
+    starter: OnceLock<crate::workers::Starter<C>>,
+    active_slots: AtomicU64,
+    activation_failed: std::sync::atomic::AtomicBool,
     deadline_origin: Instant,
     next_deadline: AtomicU64,
     ready_slots: AtomicU64,
@@ -599,7 +609,11 @@ impl<C: Cpu> Epoch<C> {
             slot_changed: std::array::from_fn(|_| Condvar::new()),
             host_events: OnceLock::new(),
             io_target: me.clone(),
+            me: me.clone(),
             timers: OnceLock::new(),
+            starter: OnceLock::new(),
+            active_slots: AtomicU64::new(0),
+            activation_failed: std::sync::atomic::AtomicBool::new(false),
             deadline_origin: Instant::now(),
             next_deadline: AtomicU64::new(u64::MAX),
             ready_slots: AtomicU64::new(0),
@@ -616,6 +630,42 @@ impl<C: Cpu> Epoch<C> {
         persistent: bool,
     ) -> Arc<Self> {
         Self::configured(control, Some(events), persistent)
+    }
+    pub fn bind_starter(&self, starter: crate::workers::Starter<C>) {
+        self.starter.get_or_init(|| starter);
+    }
+    pub fn active_slots(&self) -> u64 {
+        self.active_slots.load(Ordering::Relaxed)
+    }
+    pub fn activation_failed(&self) -> bool {
+        self.activation_failed.load(Ordering::Relaxed)
+    }
+    pub fn activate(&self, slot: usize) -> std::io::Result<()> {
+        let bit = 1u64 << slot;
+        if self.active_slots.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+            return Ok(());
+        }
+        let starter = self.starter.get().expect("bound CPU pool");
+        let epoch = self.me.upgrade().expect("live execution epoch");
+        if let Err(error) = starter.start(slot, epoch) {
+            self.active_slots.fetch_and(!bit, Ordering::Relaxed);
+            self.activation_failed.store(true, Ordering::Relaxed);
+            self.control.stop();
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn activate_for(&self, mask: u64) {
+        if self.control.stopped() {
+            return;
+        }
+        let Some(starter) = self.starter.get() else {
+            return;
+        };
+        let mask = mask & ((1u64 << starter.capacity()) - 1);
+        if mask != 0 && mask & self.active_slots() == 0 {
+            let _ = self.activate(mask.trailing_zeros() as usize);
+        }
     }
     pub fn bind_timers(self: &Arc<Self>, timers: Arc<trames_kernel::timers::Timers>) {
         assert!(self.timers.set(timers.clone()).is_ok());
@@ -639,7 +689,7 @@ impl<C: Cpu> Epoch<C> {
                 let eligible = q
                     .initial_slots
                     .get(&job.work.pid)
-                    .map_or(job.affinity, |slot| 1 << slot)
+                    .map_or(job.affinity(), |slot| 1 << slot)
                     & q.sleeping_slots
                     & !wake;
                 if eligible != 0 {
@@ -687,7 +737,7 @@ impl<C: Cpu> Epoch<C> {
             mask | q
                 .initial_slots
                 .get(&job.work.pid)
-                .map_or(job.affinity, |slot| 1 << slot)
+                .map_or(job.affinity(), |slot| 1 << slot)
         });
         self.ready_slots.store(slots, Ordering::Relaxed);
     }
@@ -695,7 +745,7 @@ impl<C: Cpu> Epoch<C> {
         q.idle_notified = false;
         let slot = job.stats.worker;
         if job.stats.assignments != 0
-            && job.affinity & (1 << slot) != 0
+            && job.affinity() & (1 << slot) != 0
             && q.sleeping_slots & (1 << slot) != 0
             && q.ready.len() < q.sleeping_slots.count_ones() as usize
             && !q.initial_slots.values().any(|&reserved| reserved == slot)
@@ -706,6 +756,7 @@ impl<C: Cpu> Epoch<C> {
             q.initial_slots.insert(job.work.pid, slot);
             self.slot_changed[slot].notify_one();
         }
+        self.activate_for(job.affinity());
         q.ready.push_back(job);
         self.refresh_ready(q);
     }
@@ -774,7 +825,7 @@ impl<C: Cpu> Epoch<C> {
             if let Some(WaitState::Child(wait)) = &job.waiting {
                 wait.bind(&snapshot.children, &snapshot.io_signals, &signal);
             }
-            if let Some(WaitState::Vfork(wait)) = &job.waiting {
+            if let Some(WaitState::Completion(wait)) = &job.waiting {
                 wait.bind(&snapshot.io_signals, &signal);
             }
             snapshot.io_wake = Some(signal);
@@ -874,10 +925,10 @@ impl<C: Cpu> Epoch<C> {
             (1u64 << cpus) - 1
         };
         let desired = (q.running + q.ready.len()).min(cpus);
-        let eligible = q.ready.iter().fold(0, |mask, job| mask | job.affinity) & valid;
+        let eligible = q.ready.iter().fold(0, |mask, job| mask | job.affinity()) & valid;
         let mut selected = active;
         for job in &q.ready {
-            let choices = job.affinity & valid;
+            let choices = job.affinity() & valid;
             if choices != 0 && choices & selected == 0 {
                 selected |= 1 << choices.trailing_zeros();
             }
@@ -1004,7 +1055,7 @@ impl<C: Cpu> Epoch<C> {
                 .position(|j| q.initial_slots.get(&j.work.pid) == Some(&slot));
             let available = preferred.or_else(|| {
                 q.ready.iter().position(|j| {
-                    j.affinity & (1 << slot) != 0 && !q.initial_slots.contains_key(&j.work.pid)
+                    j.affinity() & (1 << slot) != 0 && !q.initial_slots.contains_key(&j.work.pid)
                 })
             });
             let external = q.parked.values().any(|j| {
@@ -1473,6 +1524,26 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             self.ready(&mut q, job);
             self.notify(&mut q);
         }
+        if q.ready.iter().any(|job| {
+            job.work.pid == signal.pid
+                && job
+                    .work
+                    .syscalls
+                    .as_ref()
+                    .and_then(|s| s.io_wake.as_ref())
+                    .is_some_and(|s| Arc::ptr_eq(s, signal))
+        }) {
+            let mask = q
+                .ready
+                .iter()
+                .find(|j| j.work.pid == signal.pid)
+                .unwrap()
+                .affinity();
+            self.activate_for(mask);
+            q.initial_slots.remove(&signal.pid);
+            self.refresh_ready(&q);
+            self.notify(&mut q);
+        }
         // If still running, park_io consumes the signal's fired bit under this
         // same queue lock. Notifications never access a guest Memory or CPU.
     }
@@ -1487,6 +1558,33 @@ mod tests {
 
     use super::*;
     use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn ready_affinity_starts_only_the_required_cold_cpu_without_an_owner_request() {
+        let mut pool = crate::workers::Pool::<Cpu>::new(4);
+        let epoch = Epoch::with_events(Arc::new(Control::new(1000)), pool.events(), true);
+        epoch.bind_starter(pool.starter());
+        let mut source = job(7, &epoch);
+        source.affinity = 8;
+        epoch.add(source);
+        assert_eq!(epoch.active_slots(), 8);
+        assert!(!epoch.activation_failed());
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            match pool
+                .event_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Some(crate::workers::Event::EpochStopped(3)) => break,
+                Some(crate::workers::Event::Idle | crate::workers::Event::Retired) => epoch.stop(),
+                None => panic!("cold CPU did not finish"),
+                _ => panic!("unexpected owner request"),
+            }
+        }
+        let returned = epoch.drain();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].worker, 3);
+        assert_eq!(returned[0].pid, 7);
+    }
     #[test]
     fn initially_parked_task_can_resume_while_its_old_cpu_is_occupied() {
         let epoch = Epoch::new(Arc::new(Control::new(1000)));

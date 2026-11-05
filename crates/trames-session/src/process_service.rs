@@ -197,6 +197,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: p.linux.vfs.stream_descriptors(),
 
@@ -406,7 +407,7 @@ mod tests {
             .protect(0x4000, PAGE_SIZE, Permissions::RX)
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let peer = p.fork();
         peer.family.set_parent(1);
         let mut k = super::super::tests::kernel();
@@ -460,7 +461,7 @@ mod tests {
             .protect(0x4000, PAGE_SIZE, Permissions::RX)
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let peer = p.fork();
         peer.family.set_parent(1);
         let mut k = super::super::tests::kernel();

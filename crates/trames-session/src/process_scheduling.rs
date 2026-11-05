@@ -3,97 +3,20 @@
 //! priorities are deliberately independent from guest permissions and policy.
 use super::*;
 impl<C: Cpu> Kernel<C> {
-    pub(super) fn priority(
-        &mut self,
-        pid: u32,
+    pub(super) fn scheduling(
+        &self,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
-    ) -> Result<Option<u64>, Errno> {
-        let which = a[0] as u32;
-        if which > 2 {
-            return Err(Errno(22));
+    ) -> Result<u64, Errno> {
+        let c = &p.linux.vfs.credentials;
+        trames_kernel::signal::IoRoutes {
+            directory: p.signals.io_directory.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            uid: c.uid,
+            euid: c.euid,
         }
-        let who = a[1] as u32;
-        let uid = if who == 0 {
-            p.linux.vfs.credentials.uid
-        } else {
-            who
-        };
-        let group = if who == 0 {
-            p.linux.vfs.visible_pid(p.group)
-        } else {
-            who
-        };
-        let matches = |id: u32, target: &Process<C>| {
-            let visible = p.linux.vfs.visible_pid(id);
-            visible != 0
-                && !matches!(target.state, State::Zombie(_))
-                && match which {
-                    0 => {
-                        visible
-                            == if who == 0 {
-                                p.linux.vfs.visible_pid(pid)
-                            } else {
-                                who
-                            }
-                    }
-                    1 => p.linux.vfs.visible_pid(target.group) == group,
-                    _ => target.linux.vfs.credentials.uid == uid,
-                }
-        };
-        let mut targets = self
-            .processes
-            .iter()
-            .filter(|(id, t)| matches(**id, t))
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        if matches(pid, p) {
-            targets.push(pid);
-        }
-        if targets.is_empty() {
-            return Err(Errno(3));
-        }
-        if number == 141 {
-            let nice = targets
-                .iter()
-                .map(|id| {
-                    if *id == pid {
-                        p.nice
-                    } else {
-                        self.processes[id].nice
-                    }
-                })
-                .min()
-                .unwrap();
-            return Ok(Some((20 - nice) as u64)); // raw Linux ABI, not libc's -20..19
-        }
-        let nice = (a[2] as u32 as i32).clamp(-20, 19);
-        let privileged = p.linux.vfs.credentials.has_cap(capabilities::SYS_NICE);
-        let caller = p.linux.vfs.credentials.euid;
-        let mut error = None;
-        for id in targets {
-            let target = if id == pid {
-                &mut *p
-            } else {
-                self.processes.get_mut(&id).unwrap()
-            };
-            if !privileged
-                && caller != target.linux.vfs.credentials.uid
-                && caller != target.linux.vfs.credentials.euid
-            {
-                error = Some(Errno(1));
-            } else if !privileged && nice < target.nice {
-                error = Some(Errno(13));
-            } else {
-                target.nice = nice;
-            }
-        }
-        if let Some(error) = error {
-            Err(error)
-        } else {
-            Ok(Some(0))
-        }
+        .scheduling(&p.signals.io, self.cpu_count, number, a, &mut p.memory)
     }
     pub(super) fn mempolicy(p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         let flags = a[4];
@@ -147,9 +70,120 @@ mod tests {
     use super::super::tests::{kernel, process};
     use super::*;
     #[test]
+    fn scheduling_subsystem_completes_on_sources_with_one_filter_decision_per_entry() {
+        for cpus in [2, 4] {
+            for decision in [None, Some(0x7fff_0000u32), Some(0x0005_007b)] {
+                for (number, args, expected) in [
+                    (118, [0, 0x1200, 0, 0, 0, 0], 0),
+                    (119, [0, 3, 0x1200, 0, 0, 0], 0),
+                    (120, [0; 6], 0),
+                    (121, [0, 0x1200, 0, 0, 0, 0], 0),
+                    (122, [0, 8, 0x1210, 0, 0, 0], 0),
+                    (123, [0, 8, 0x1220, 0, 0, 0], 8),
+                    (125, [1, 0, 0, 0, 0, 0], 99),
+                    (126, [1, 0, 0, 0, 0, 0], 1),
+                    (127, [0; 6], 0u64.wrapping_sub(38)),
+                    (140, [0, 0, 7, 0, 0, 0], 0),
+                    (141, [0; 6], 20),
+                    (274, [0; 6], 0u64.wrapping_sub(38)),
+                    (275, [0; 6], 0u64.wrapping_sub(38)),
+                ] {
+                    let mut p = process();
+                    let mut k = kernel();
+                    k.cpu_count = cpus;
+                    k.workers = crate::workers::Pool::new(cpus);
+                    k.per_cpu = vec![Duration::ZERO; cpus];
+                    p.signals.io.scheduling.set_affinity((1 << cpus) - 1);
+                    p.memory
+                        .write_array(0x1210, ((1u64 << cpus) - 1).to_le_bytes())
+                        .unwrap();
+                    if let Some(value) = decision {
+                        let mut instruction = [0; 8];
+                        instruction[..2].copy_from_slice(&6u16.to_le_bytes());
+                        instruction[4..].copy_from_slice(&value.to_le_bytes());
+                        p.memory.write(0x1100, &instruction).unwrap();
+                        p.memory.write_array(0x1000, 1u64.to_le_bytes()).unwrap();
+                        p.memory
+                            .write_array(0x1008, 0x1100u64.to_le_bytes())
+                            .unwrap();
+                        assert_eq!(k.seccomp(&mut p, [1, 0, 0x1000, 0, 0, 0]), Ok(0));
+                    }
+                    let mut code: Vec<u32> = args
+                        .into_iter()
+                        .enumerate()
+                        .map(|(r, value)| 0xd2800000 | ((value as u32) << 5) | r as u32)
+                        .collect();
+                    code.extend([0xd2800008 | (number << 5), 0xd4000001, 0xaa0003e6]);
+                    code.push(0x14000000 | ((-(code.len() as i32)) as u32 & 0x03ff_ffff));
+                    for (i, word) in code.into_iter().enumerate() {
+                        p.memory
+                            .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                            .unwrap();
+                    }
+                    p.memory
+                        .protect(
+                            0x4000,
+                            trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RX,
+                        )
+                        .unwrap();
+                    p.cpu = Cpu::new(0x4000, 0);
+                    for id in 2..=4 {
+                        k.processes.insert(id, p.fork());
+                    }
+                    k.processes.insert(1, p);
+                    let expected = if decision == Some(0x0005_007b) {
+                        0u64.wrapping_sub(123)
+                    } else {
+                        expected
+                    };
+                    for _ in 0..4 {
+                        assert!(
+                            k.parallel_round(
+                                &mut trames_linux::CapturedOutput::default(),
+                                k.instructions + 30_000
+                            )
+                            .unwrap(),
+                            "{number} {cpus} {decision:?}"
+                        );
+                        if k.worker_syscalls > 0
+                            && k.processes.values().any(|p| p.cpu.x(6) == expected)
+                        {
+                            break;
+                        }
+                    }
+                    assert!(
+                        k.worker_syscalls > 0,
+                        "{number} {cpus} {decision:?}: worker={} all={} returns={:?}",
+                        k.worker_syscalls,
+                        k.syscalls,
+                        k.cohort_return_syscalls
+                    );
+                    assert_eq!(
+                        k.syscalls, k.worker_syscalls,
+                        "{number} must not join peers"
+                    );
+                    assert_eq!(k.service_requests, 0);
+                    assert!(
+                        k.processes.values().any(|p| p.cpu.x(6) == expected),
+                        "{number} result {expected}"
+                    );
+                    if decision.is_some() {
+                        assert_eq!(
+                            k.processes[&1].seccomp.evaluations(),
+                            k.syscalls,
+                            "{number}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn desktop_priorities_and_batch_idle_policy_roundtrip_and_inherit() {
         let mut k = kernel();
         let mut p = process();
+        k.publish_task(1, &p);
         let mut io = trames_linux::CapturedOutput::default();
         for policy in [0, 3, 5] {
             write_u32(&mut p.memory, 0x1000, 0).unwrap();
@@ -165,9 +199,10 @@ mod tests {
         );
         assert_eq!(k.syscall(1, &mut p, 141, [0; 6], &mut io), Ok(Some(1)));
         let child = p.fork();
-        assert_eq!(child.nice, 19);
-        assert_eq!(child.scheduler, 5);
+        assert_eq!(child.signals.io.scheduling.nice(), 19);
+        assert_eq!(child.signals.io.scheduling.policy(), 5);
         k.processes.insert(2, p.fork());
+        k.publish_io_tasks(Some((1, &p)));
         assert_eq!(
             k.syscall(1, &mut p, 119, [2, 3, 0x1000, 0, 0, 0], &mut io),
             Ok(Some(0))
@@ -176,8 +211,9 @@ mod tests {
             k.syscall(1, &mut p, 120, [2, 0, 0, 0, 0, 0], &mut io),
             Ok(Some(3))
         );
-        assert_eq!(p.scheduler, 5);
+        assert_eq!(p.signals.io.scheduling.policy(), 5);
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        k.publish_task(1, &p);
         assert_eq!(
             k.syscall(1, &mut p, 140, [0, 0, 0, 0, 0, 0], &mut io),
             Err(Errno(13))
@@ -190,6 +226,44 @@ mod tests {
             k.syscall(1, &mut p, 140, [0, 999, 0, 0, 0, 0], &mut io),
             Err(Errno(3))
         );
+    }
+    #[test]
+    fn structural_group_and_capability_changes_publish_at_their_actual_write_boundary() {
+        let mut k = kernel();
+        let mut p = process();
+        let mut child = p.fork();
+        child.tgid = 2;
+        child.family.set_parent(1);
+        k.publish_task(1, &p);
+        k.publish_task(2, &child);
+        k.processes.insert(2, child);
+        let mut io = trames_linux::CapturedOutput::default();
+        assert_eq!(
+            k.syscall(1, &mut p, 154, [2, 0, 0, 0, 0, 0], &mut io),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            k.syscall(1, &mut p, 140, [1, 2, 7, 0, 0, 0], &mut io),
+            Ok(Some(0))
+        );
+        assert_eq!(p.signals.io.scheduling.nice(), 0);
+        assert_eq!(k.processes[&2].signals.io.scheduling.nice(), 7);
+        assert_eq!(
+            k.syscall(1, &mut p, 141, [1, 0, 0, 0, 0, 0], &mut io),
+            Ok(Some(20))
+        );
+        write_u32(&mut p.memory, 0x1000, 0x2008_0522).unwrap();
+        write_u32(&mut p.memory, 0x1004, 0).unwrap();
+        p.memory.write(0x1100, &[0; 24]).unwrap();
+        assert_eq!(
+            k.syscall(1, &mut p, 91, [0x1000, 0x1100, 0, 0, 0, 0], &mut io),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            k.syscall(1, &mut p, 140, [0, 0, 7, 0, 0, 0], &mut io),
+            Ok(Some(0))
+        );
+        assert_eq!(k.syscall(1, &mut p, 140, [0; 6], &mut io), Err(Errno(13)));
     }
     #[test]
     fn numa_default_allowed_mask_and_address_queries_are_consistent() {

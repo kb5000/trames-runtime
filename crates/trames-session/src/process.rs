@@ -89,7 +89,7 @@ enum State {
     Blocked(u32, [u64; 6]),
     Sleep(Instant, u64),
     Suspend(u64),
-    Vfork(Arc<trames_kernel::vfork::Release>),
+    Completion(Arc<trames_kernel::completion::Completion>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -103,10 +103,7 @@ enum State {
 }
 pub(crate) struct Process<C: Cpu> {
     cpu: C,
-    affinity: u64,
     last_cpu: usize,
-    nice: i32,
-    scheduler: u32,
     memory: Memory,
     linux: Linux,
     family: Arc<trames_kernel::family::Family>,
@@ -157,7 +154,7 @@ impl<C: Cpu> Process<C> {
     }
     fn stop_held(&self) -> bool {
         matches!(self.state, State::Gpu { .. } | State::Blocked(2, _))
-            || matches!(&self.state, State::Vfork(release) if !release.finished())
+            || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.file_checkpoint.is_some()
             || self
                 .retained_file
@@ -178,7 +175,7 @@ impl<C: Cpu> Process<C> {
                     | State::Sleep(..)
                     | State::Sigwait { .. }
                     | State::Suspend(_)
-                    | State::Vfork(_)
+                    | State::Completion(_)
                     | State::Blocked(95 | 260, _)
             ) || self.worker_io_candidate(id)
                 || self.worker_gpu_candidate())
@@ -192,6 +189,10 @@ impl<C: Cpu> Process<C> {
     }
 
     fn bind_signals(&self) {
+        self.signals
+            .io
+            .scheduling
+            .publish_credentials(&self.linux.vfs.credentials);
         self.signals.publish_policy(
             self.linux.vfs.pid_namespace(),
             self.linux.vfs.credentials.has_cap(capabilities::KILL),
@@ -453,10 +454,7 @@ impl<C: Cpu> Process<C> {
         let limits = self.limits.fork(&linux.vfs);
         Box::new(Self {
             cpu: self.cpu.fork_cpu(shared_vm),
-            affinity: self.affinity,
             last_cpu: self.last_cpu,
-            nice: self.nice,
-            scheduler: self.scheduler,
             memory,
             linux,
             family: Arc::default(),
@@ -1190,10 +1188,10 @@ impl<C: Cpu> Kernel<C> {
             mapped_bytes: resident_bytes,
             virtual_bytes: p.memory.virtual_bytes(),
             maps,
-            affinity: p.affinity,
+            affinity: p.signals.io.scheduling.affinity(),
             processor: p.last_cpu as u32,
-            nice: p.nice,
-            scheduler: p.scheduler,
+            nice: p.signals.io.scheduling.nice(),
+            scheduler: p.signals.io.scheduling.policy(),
             user_ticks: (p.cpu_time.as_millis() / 10) as u64,
             start_ticks: (p
                 .started
@@ -2109,7 +2107,9 @@ impl<C: Cpu> Kernel<C> {
                 2 => self.seccomp(p, [1, 0, a[2], 0, 0, 0]).map(Some),
                 _ => Err(Errno(22)),
             },
-            140 | 141 => self.priority(pid, p, number, a),
+            number if trames_kernel::scheduling::call(number) => {
+                self.scheduling(p, number, a).map(Some)
+            }
             236 => Self::mempolicy(p, a),
             90 | 91 => self.capcall(pid, p, number == 91, a).map(Some),
             142 => self.reboot_guest(pid, p, a),
@@ -2120,88 +2120,6 @@ impl<C: Cpu> Kernel<C> {
                     self.exit(pid, p, (a[0] as u8 as i32) << 8);
                 }
                 Ok(None)
-            }
-            118..=123 => {
-                if (a[0] as u32 as i32) < 0 {
-                    return Err(Errno(22));
-                }
-                let target_id = if a[0] as u32 == 0 {
-                    pid
-                } else {
-                    p.linux.vfs.global_pid(a[0] as u32)?
-                };
-                let target = if target_id == pid {
-                    &*p
-                } else {
-                    self.processes
-                        .get(&target_id)
-                        .filter(|p| !matches!(p.state, State::Zombie(_)))
-                        .ok_or(Errno(3))?
-                };
-                if matches!(number, 118 | 119 | 122)
-                    && !p.linux.vfs.credentials.has_cap(capabilities::SYS_NICE)
-                    && ((p.linux.vfs.credentials.euid != target.linux.vfs.credentials.uid
-                        && p.linux.vfs.credentials.euid != target.linux.vfs.credentials.euid)
-                        || target.linux.vfs.credentials.caps.permitted
-                            & !p.linux.vfs.credentials.caps.permitted
-                            != 0)
-                {
-                    return Err(Errno(1));
-                }
-                match number {
-                    118 | 119 => {
-                        let pointer = if number == 118 { a[1] } else { a[2] };
-                        let priority = read_u32(&p.memory, pointer)? as i32;
-                        if number == 119 && !matches!(a[1] as u32, 0 | 3 | 5) {
-                            return Err(Errno(if matches!(a[1] as u32, 1 | 2) { 95 } else { 22 }));
-                        }
-                        if priority != 0 {
-                            return Err(Errno(22));
-                        }
-                        if number == 119 {
-                            if target_id == pid {
-                                p.scheduler = a[1] as u32;
-                            } else {
-                                self.processes.get_mut(&target_id).unwrap().scheduler = a[1] as u32;
-                            }
-                        }
-                        Ok(Some(0)) // Policy is guest metadata; host workers retain their priorities.
-                    }
-                    120 => Ok(Some(target.scheduler as u64)),
-                    121 => {
-                        Linux::check(&p.memory, a[1], 4, Access::Write)?;
-                        p.memory.write(a[1], &[0; 4]).map_err(|_| Errno(14))?;
-                        Ok(Some(0))
-                    }
-                    122 => {
-                        if a[1] == 0 {
-                            return Err(Errno(22));
-                        }
-                        Linux::check(&p.memory, a[2], a[1].min(8) as usize, Access::Read)?;
-                        let mut bytes = [0; 8];
-                        p.memory
-                            .read(a[2], &mut bytes[..a[1].min(8) as usize])
-                            .map_err(|_| Errno(14))?;
-                        let mask = u64::from_le_bytes(bytes) & ((1u64 << self.cpu_count) - 1);
-                        if mask == 0 {
-                            return Err(Errno(22));
-                        }
-                        if target_id == pid {
-                            p.affinity = mask;
-                        } else {
-                            self.processes.get_mut(&target_id).ok_or(Errno(3))?.affinity = mask;
-                        }
-                        Ok(Some(0))
-                    }
-                    _ => {
-                        if a[1] < 8 {
-                            return Err(Errno(22));
-                        }
-                        let mask = target.affinity;
-                        write_u64(&mut p.memory, a[2], mask)?;
-                        Ok(Some(8))
-                    }
-                }
             }
             39 => {
                 p.linux.vfs.umount(&Linux::path(&p.memory, a[0])?, a[1])?;
@@ -2512,7 +2430,7 @@ impl<C: Cpu> Kernel<C> {
                 if a[0] & 0x4000 != 0 {
                     let release = Arc::new(trames_kernel::vfork::Release::default());
                     self.processes.get_mut(&id).unwrap().vfork = Some(release.clone());
-                    p.state = State::Vfork(release);
+                    p.state = State::Completion(release);
                     p.cpu.set_x(0, parent_tid as u64);
                     return Ok(None);
                 }
@@ -2662,6 +2580,7 @@ impl<C: Cpu> Kernel<C> {
                 for other in self.processes.values_mut().filter(|t| t.tgid == target) {
                     other.group = group;
                 }
+                self.publish_io_tasks(Some((pid, p)));
                 Ok(Some(0))
             }
             155 | 156 => {
@@ -2695,6 +2614,7 @@ impl<C: Cpu> Kernel<C> {
                     t.group = p.group;
                     t.linux.vfs.set_controlling_terminal(None)?;
                 }
+                self.publish_io_tasks(Some((pid, p)));
                 Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64))
             }
             101 | 115 => {
@@ -4211,7 +4131,7 @@ impl<C: Cpu> Kernel<C> {
             other != id
                 && !p.frozen(other)
                 && (p.stopped()
-                    || matches!(&p.state, State::Vfork(release)
+                    || matches!(&p.state, State::Completion(release)
                         if first.vfork.as_ref().is_some_and(|producer| Arc::ptr_eq(producer, release)))
                     || matches!(p.state, State::Blocked(95 | 260, _))
                         && !p.linux.trace
@@ -4350,7 +4270,7 @@ impl<C: Cpu> Kernel<C> {
                     State::Sigwait { .. }
                         | State::Suspend(_)
                         | State::Blocked(95 | 260, _)
-                        | State::Vfork(_)
+                        | State::Completion(_)
                 ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
@@ -4366,7 +4286,7 @@ impl<C: Cpu> Kernel<C> {
         let chosen = assign_cpus(
             members
                 .iter()
-                .map(|(id, _)| (*id, self.processes[id].affinity)),
+                .map(|(id, _)| (*id, self.processes[id].signals.io.scheduling.affinity())),
             self.cpu_count,
         );
         if chosen.is_empty() {
@@ -4419,9 +4339,6 @@ impl<C: Cpu> Kernel<C> {
                 .map_err(|_| RuntimeError::Arguments("CPU worker disconnected"))?;
         }
         self.parallel_dispatch_time += began.elapsed();
-        let mut active_slots = chosen
-            .iter()
-            .fold(0u64, |mask, (_, slot)| mask | (1 << slot));
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
         let mut checkpoint_error = None;
@@ -4479,7 +4396,8 @@ impl<C: Cpu> Kernel<C> {
                                 members =
                                     epoch.member_ids().into_iter().map(|pid| (pid, 0)).collect();
                                 let launch = (|| {
-                                    for slot in epoch.additional_slots(active_slots, self.cpu_count)
+                                    for slot in
+                                        epoch.additional_slots(epoch.active_slots(), self.cpu_count)
                                     {
                                         self.workers.ensure(slot).map_err(|_| {
                                             RuntimeError::Arguments("cannot start CPU worker")
@@ -4487,7 +4405,6 @@ impl<C: Cpu> Kernel<C> {
                                         self.workers.launch(slot, epoch.clone()).map_err(|_| {
                                             RuntimeError::Arguments("CPU worker disconnected")
                                         })?;
-                                        active_slots |= 1 << slot;
                                     }
                                     Ok::<_, RuntimeError>(())
                                 })();
@@ -4536,7 +4453,8 @@ impl<C: Cpu> Kernel<C> {
         let began = Instant::now();
         // Native file work owns its resources and publishes directly to its
         // accepted source. Joining CPU Views never waits for unrelated disk I/O.
-        while stopped < active_slots.count_ones() as usize || epoch.pending_services() != 0 {
+        while stopped < epoch.active_slots().count_ones() as usize || epoch.pending_services() != 0
+        {
             match self
                 .workers
                 .event_timeout(Duration::from_secs(1))
@@ -4554,6 +4472,9 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         self.parallel_stop_time += began.elapsed();
+        if epoch.activation_failed() {
+            checkpoint_error = Some(RuntimeError::Arguments("cannot start CPU worker"));
+        }
         let completed = epoch.drain();
         let _ = uring_epoch.finish();
         self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
@@ -4751,7 +4672,9 @@ impl<C: Cpu> Kernel<C> {
                 crate::run_queue::WaitState::Child(wait) => {
                     State::Blocked(wait.request.number, wait.request.args)
                 }
-                crate::run_queue::WaitState::Vfork(wait) => State::Vfork(wait.release.clone()),
+                crate::run_queue::WaitState::Completion(wait) => {
+                    State::Completion(wait.release.clone())
+                }
                 crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
             })
         };
@@ -5054,7 +4977,7 @@ impl<C: Cpu> Kernel<C> {
                             decode_after.instructions - decode_before.instructions;
                         p.cpu_time += elapsed;
                         self.cpu_total += elapsed;
-                        p.last_cpu = p.affinity.trailing_zeros() as usize;
+                        p.last_cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
                         self.per_cpu[p.last_cpu] += elapsed;
                         self.context_switches += 1;
                         let immediate_return = self.finish_slice(id, &mut p, outcome, io, true);
@@ -5364,10 +5287,7 @@ pub(super) fn run<C: Cpu>(
     let limits = trames_kernel::limits::Limits::new(&linux.vfs);
     let mut root = Process::<C> {
         cpu: std::mem::take(&mut runtime.cpu),
-        affinity: (1u64 << runtime.cpu_count.clamp(1, 32)) - 1,
         last_cpu: 0,
-        nice: 0,
-        scheduler: 0,
         memory: std::mem::take(&mut runtime.memory),
         linux,
         family: Arc::default(),
@@ -5409,6 +5329,10 @@ pub(super) fn run<C: Cpu>(
         seccomp: seccomp::Seccomp::default(),
         seccomp_entry: None,
     };
+    root.signals
+        .io
+        .scheduling
+        .set_affinity((1u64 << runtime.cpu_count.clamp(1, 32)) - 1);
     root.bind_signals();
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
@@ -5507,6 +5431,7 @@ pub(super) fn run<C: Cpu>(
     // that never touch /proc. Subsequent full snapshots are demand-driven.
     kernel.refresh_proc(1, &mut root, host_memory);
     kernel.proc_refreshes += 1;
+    kernel.publish_task(1, &root);
     kernel.processes.insert(1, Box::new(root));
     let result = kernel.drive(io, limit);
     runtime.metrics = super::RuntimeMetrics {
@@ -6229,7 +6154,7 @@ mod tests {
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
         let mut p = process();
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let [reader, writer] = p.linux.vfs.pipe(0).unwrap();
         let [ack_reader, ack_writer] = p.linux.vfs.pipe(0).unwrap();
         p.memory.write(0x1200, b"a").unwrap();
@@ -6420,7 +6345,7 @@ mod tests {
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
         let mut p = process();
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         // Spin after the read completes, while the producer's exit joins.
         p.memory
             .write(0x4000, &0x14000000u32.to_le_bytes())
@@ -6597,7 +6522,7 @@ mod tests {
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
         let mut p = process();
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let a = p.linux.vfs.open_at(-100, b"/lock", 0x42, 0o600).unwrap();
         let b = p.linux.vfs.open_at(-100, b"/lock", 2, 0).unwrap();
         p.linux.vfs.flock(b, 6).unwrap();
@@ -6805,7 +6730,7 @@ mod tests {
         use trames_engine::Cpu as _;
         for number in [95, 260] {
             let mut parent = process();
-            parent.affinity = 3;
+            parent.signals.io.scheduling.set_affinity(3);
             parent.state = State::Blocked(
                 number,
                 if number == 260 {
@@ -6881,10 +6806,7 @@ mod tests {
         let limits = trames_kernel::limits::Limits::new(&linux.vfs);
         let process = Box::new(Process {
             cpu: Cpu::new(0x4000, 0x9000),
-            affinity: 1,
             last_cpu: 0,
-            nice: 0,
-            scheduler: 0,
             memory,
             linux,
             family: Arc::default(),
@@ -6926,6 +6848,7 @@ mod tests {
             seccomp: seccomp::Seccomp::default(),
             seccomp_entry: None,
         });
+        process.signals.io.scheduling.set_affinity(1);
         process.bind_signals();
         process
     }
@@ -6940,7 +6863,7 @@ mod tests {
         k.workers = crate::workers::Pool::new(8);
         k.per_cpu.resize(8, Duration::ZERO);
         let mut cpu = process();
-        cpu.affinity = 255;
+        cpu.signals.io.scheduling.set_affinity(255);
         // One real owner syscall per round, with no guest byte effects.
         // getrusage(RUSAGE_SELF, NULL) returns EFAULT through the normal path.
         let code: Vec<_> = [
@@ -6960,7 +6883,7 @@ mod tests {
         for id in 2..=TASKS {
             let mut peer = cpu.fork();
             peer.memory = cpu.memory.share();
-            peer.affinity = 255;
+            peer.signals.io.scheduling.set_affinity(255);
             peer.state = State::Futex {
                 wait: k
                     .futexes
@@ -7723,7 +7646,7 @@ mod tests {
         p.cpu.set_x(0, 0x8000);
         p.cpu.set_x(1, 1);
         p.cpu.set_x(2, 50000);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let mut peer = p.fork();
         peer.vm_id = 2;
         peer.tgid = 2;
@@ -7813,7 +7736,7 @@ mod tests {
         p.cpu.set_x(0, 0x8000);
         p.cpu.set_x(1, 1);
         p.cpu.set_x(2, 50000);
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let mut k = kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
@@ -7850,7 +7773,7 @@ mod tests {
                 trames_memory::Permissions::RX,
             )
             .unwrap();
-        p.affinity = 3;
+        p.signals.io.scheduling.set_affinity(3);
         let mut peer = p.fork();
         peer.memory = p.memory.share();
         peer.family.set_parent(1);
@@ -8327,7 +8250,7 @@ mod tests {
                 k.workers = crate::workers::Pool::new(2);
                 k.per_cpu = vec![Duration::ZERO; 2];
                 let mut root = process();
-                root.affinity = 3;
+                root.signals.io.scheduling.set_affinity(3);
                 let [reader, writer] = root.linux.vfs.pipe(0).unwrap();
                 let [resume, _] = root.linux.vfs.pipe(0).unwrap();
                 let [child_gate, release_child] = root.linux.vfs.pipe(0).unwrap();
@@ -8484,7 +8407,7 @@ mod tests {
         let mut k = kernel();
         let mut parent = process();
         let release = Arc::new(trames_kernel::vfork::Release::default());
-        parent.state = State::Vfork(release.clone());
+        parent.state = State::Completion(release.clone());
         k.publish_io_tasks(Some((1, &parent)));
         let group = parent.signals.io.lifecycle().clone();
         let lease = group.enter(&parent.signals.io, 1);

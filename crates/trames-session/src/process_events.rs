@@ -144,7 +144,7 @@ impl<C: Cpu> Kernel<C> {
         progress
     }
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
-        if matches!(&p.state, State::Vfork(release) if release.finished()) {
+        if matches!(&p.state, State::Completion(release) if release.finished()) {
             p.state = State::Ready;
             return true;
         }

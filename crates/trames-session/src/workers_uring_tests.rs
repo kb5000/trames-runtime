@@ -23,6 +23,7 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
         identities: [1; 7],
         started: Instant::now(),
         processor: 0,
+        cpus: 4,
         profile: false,
         streams: Default::default(),
 
@@ -128,9 +129,9 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
             3 => crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(
                 trames_kernel::children::Wait::prepare(95, [0, 0, 0, 4, 0, 0]).unwrap(),
             )),
-            _ => {
-                crate::run_queue::WaitState::Vfork(crate::run_queue::VforkWait::new(Arc::default()))
-            }
+            _ => crate::run_queue::WaitState::Completion(crate::run_queue::CompletionWait::new(
+                Arc::default(),
+            )),
         };
         epoch.add(crate::run_queue::Job::new(
             Work {

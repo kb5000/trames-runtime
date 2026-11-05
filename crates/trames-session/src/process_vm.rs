@@ -133,15 +133,15 @@ impl<C: Cpu> Kernel<C> {
                         assert!(self.processes.contains_key(&child));
                         created.push(child);
                     }
-                    if let State::Vfork(release) = &p.state {
-                        let wait = crate::run_queue::VforkWait::new(release.clone());
+                    if let State::Completion(release) = &p.state {
+                        let wait = crate::run_queue::CompletionWait::new(release.clone());
                         if let Some(snapshot) = &job.work.syscalls {
                             wait.bind(
                                 &snapshot.io_signals,
                                 snapshot.io_wake.as_ref().expect("bound parent"),
                             );
                         }
-                        job.waiting = Some(crate::run_queue::WaitState::Vfork(wait));
+                        job.waiting = Some(crate::run_queue::WaitState::Completion(wait));
                     }
                     p.signals.begin_io();
                     job.work.cpu = std::mem::take(&mut p.cpu);
@@ -536,7 +536,7 @@ mod tests {
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
         let mut parent = super::super::tests::process();
-        parent.affinity = 3;
+        parent.signals.io.scheduling.set_affinity(3);
         let [reader, _writer] = parent.linux.vfs.pipe(0).unwrap();
         let mov = |register: u32, value: u32| 0xd2800000 | value << 5 | register;
         for (i, word) in [
@@ -698,7 +698,7 @@ mod tests {
         let memory = a.memory.share();
         let mut b = a.fork_with_memory(memory);
         b.cpu.pc = 0x4100;
-        b.affinity = 2;
+        b.signals.io.scheduling.set_affinity(2);
         k.processes.insert(1, a);
         k.processes.insert(2, b);
         let mut io = Completed {
@@ -823,11 +823,11 @@ mod tests {
         } else {
             None
         };
-        a.affinity = 1;
+        a.signals.io.scheduling.set_affinity(1);
         if let Some(b) = &mut related {
             b.tgid = 2;
             b.vm_id = if relation == 2 { 1 } else { 2 };
-            b.affinity = 2;
+            b.signals.io.scheduling.set_affinity(2);
             b.cpu.set_x(1, if relation == 4 { 0x6000 } else { 0x1000 });
         }
         let mut peer = super::super::tests::process();
@@ -835,7 +835,10 @@ mod tests {
         map(&mut peer, 0x1000, progressing.clone(), None);
         code(&mut peer, &[0xf9400020, 0x91000400, 0xf9000020, 0x17fffffd]);
         peer.cpu.set_x(1, 0x1000);
-        peer.affinity = 1 << (k.cpu_count - 1);
+        peer.signals
+            .io
+            .scheduling
+            .set_affinity(1 << (k.cpu_count - 1));
         peer.tgid = 3;
         peer.vm_id = 3;
         k.processes.insert(1, a);
@@ -912,7 +915,7 @@ mod tests {
         code(&mut b, &[0x14000000]);
         b.tgid = 2;
         b.vm_id = 2;
-        b.affinity = 2;
+        b.signals.io.scheduling.set_affinity(2);
         k.processes.insert(1, a);
         k.processes.insert(2, b);
         assert!(k
@@ -968,7 +971,7 @@ mod tests {
             let mut p = super::super::tests::process();
             p.tgid = id;
             p.vm_id = id as u64;
-            p.affinity = 1 << (id - 1);
+            p.signals.io.scheduling.set_affinity(1 << (id - 1));
             code(&mut p, &[0x14000000]);
             k.processes.insert(id, p);
         }
@@ -1009,7 +1012,7 @@ mod tests {
                 let mut p = super::super::tests::process();
                 p.tgid = id;
                 p.vm_id = id as u64;
-                p.affinity = 1 << (id - 1);
+                p.signals.io.scheduling.set_affinity(1 << (id - 1));
                 code(&mut p, &[0xd4000001, 0x17ffffff]);
                 p.cpu.set_x(8, number);
                 k.processes.insert(id, p);
@@ -1078,7 +1081,7 @@ mod tests {
         let mut b = a.fork();
         b.tgid = 2;
         b.vm_id = 2;
-        b.affinity = 2;
+        b.signals.io.scheduling.set_affinity(2);
         let progress = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
         map(&mut b, 0x2000, progress.clone(), None);
         b.cpu.set_x(1, 0x2000);
@@ -1182,7 +1185,7 @@ mod tests {
         let mut b = a.fork();
         b.tgid = 2;
         b.vm_id = 2;
-        b.affinity = 2;
+        b.signals.io.scheduling.set_affinity(2);
         let completed = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
         let mut io = Input {
             checks: 0,
@@ -1243,7 +1246,7 @@ mod creation_tests {
                 k.per_cpu = vec![Duration::ZERO; 3];
                 k.profile_syscalls = true;
                 let mut root = super::super::tests::process();
-                root.affinity = 7;
+                root.signals.io.scheduling.set_affinity(7);
                 let [reader, writer] = root.linux.vfs.pipe(0).unwrap();
                 let [resume, _] = root.linux.vfs.pipe(0).unwrap();
                 let observed = root

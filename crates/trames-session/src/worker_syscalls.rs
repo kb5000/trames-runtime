@@ -93,6 +93,7 @@ pub(super) struct Snapshot {
     pub identities: [u64; 7],
     pub started: Instant,
     pub processor: u32,
+    pub cpus: usize,
     pub profile: bool,
     pub streams: trames_vfs::FdMask,
     pub fd_flags: trames_vfs::FdFlags,
@@ -573,6 +574,7 @@ impl Snapshot {
     }
     pub fn thread_call<C: Cpu>(&self, cpu: &C) -> bool {
         match cpu.x(8) as u32 {
+            number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) as u32 {
@@ -690,6 +692,13 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            number if trames_kernel::scheduling::call(number) => self.io_routes.scheduling(
+                &self.io_signals,
+                self.cpus,
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            ),
             167 if matches!(cpu.x(0) as u32, 36 | 37) => {
                 let family = self.io_signals.family()?;
                 if cpu.x(0) as u32 == 36 {
@@ -1000,6 +1009,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: Default::default(),
 
@@ -1133,6 +1143,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: Default::default(),
 
@@ -1196,6 +1207,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: vfs.stream_descriptors(),
 
@@ -1303,6 +1315,7 @@ mod tests {
             identities: [0; 7],
             started: Instant::now(),
             processor: 0,
+            cpus: 4,
             profile: false,
             streams: vfs.stream_descriptors(),
 
@@ -1374,6 +1387,7 @@ mod tests {
             identities: [1, 0, 1000, 1001, 2000, 2001, 2],
             started: Instant::now(),
             processor: 3,
+            cpus: 4,
             profile: false,
             streams: Default::default(),
 

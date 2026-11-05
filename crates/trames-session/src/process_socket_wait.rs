@@ -99,7 +99,7 @@ fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services(
         program(&mut p, make(true));
         program(&mut sender, make(false));
         if slots == 2 {
-            sender.affinity = 2;
+            sender.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -253,7 +253,7 @@ fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
         );
         program(&mut peer, make(&[(event, 0x1810, 8)]));
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -413,7 +413,7 @@ fn netlink_link_changes_wake_poll_and_message_receivers_on_one_or_two_workers() 
             .concat(),
         );
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -598,7 +598,7 @@ fn raw_ip_scalar_vector_pairs_run_without_owner_on_native_and_packet_stack_trans
                         ]),
                     );
                     if slots == 2 {
-                        peer.affinity = 2;
+                        peer.signals.io.scheduling.set_affinity(2);
                     }
                     k.cpu_count = 2;
                     k.workers = crate::workers::Pool::new(slots);
@@ -748,7 +748,7 @@ fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
                 ]),
             );
             if slots == 2 {
-                peer.affinity = 2;
+                peer.signals.io.scheduling.set_affinity(2);
             }
             k.cpu_count = 2;
             k.workers = crate::workers::Pool::new(slots);
@@ -932,7 +932,7 @@ fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
         .protect(0x4000, PAGE_SIZE, Permissions::RX)
         .unwrap();
     p.cpu = Interpreter::new(0x4000, 0);
-    p.affinity = 1;
+    p.signals.io.scheduling.set_affinity(1);
 }
 fn mov(rd: u32, value: u32) -> u32 {
     0xd2800000 | (value << 5) | rd
@@ -1407,7 +1407,7 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -1527,7 +1527,7 @@ fn worker_devpts_create_unlock_peer_and_close_need_no_coordinator_services() {
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -1697,7 +1697,7 @@ fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -1812,7 +1812,7 @@ fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decisio
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -1932,7 +1932,7 @@ fn filtered_worker_unix_creation_controls_and_membership_need_no_services() {
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -2246,7 +2246,7 @@ fn filtered_unix_path_bind_connect_accept_and_bytes_finish_locally_on_one_or_two
         program(&mut p, code.clone());
         program(&mut peer, code);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -2340,7 +2340,7 @@ fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
         program(&mut p, parent);
         program(&mut peer, child);
         if slots == 2 {
-            peer.affinity = 2;
+            peer.signals.io.scheduling.set_affinity(2);
         }
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(slots);
@@ -2831,7 +2831,7 @@ fn stateless_device_lifecycles_and_unix_rights_complete_on_workers_with_one_filt
             program(&mut p, code.clone());
             program(&mut peer, code);
             if slots == 2 {
-                peer.affinity = 2;
+                peer.signals.io.scheduling.set_affinity(2);
             }
             k.cpu_count = 2;
             k.workers = crate::workers::Pool::new(slots);

@@ -12,6 +12,8 @@ use std::{
 use trames_vfs::{AsyncOwner, AsyncOwners, IoSignal, PidNamespace};
 #[path = "io_guest.rs"]
 mod guest;
+#[path = "io_scheduling.rs"]
+mod scheduling;
 
 #[derive(Default)]
 pub struct Inbox {
@@ -164,6 +166,7 @@ pub struct IoContext {
     pub alt_stack: AltStack,
 }
 pub struct IoTask {
+    pub scheduling: crate::scheduling::Attributes,
     pub inbox: Inbox,
     process: std::sync::OnceLock<Arc<Inbox>>,
     lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
@@ -187,6 +190,7 @@ pub struct IoTask {
 impl Default for IoTask {
     fn default() -> Self {
         Self {
+            scheduling: Default::default(),
             inbox: Default::default(),
             process: Default::default(),
             lifecycle: Default::default(),

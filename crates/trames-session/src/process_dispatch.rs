@@ -66,9 +66,9 @@ impl<C: Cpu> Kernel<C> {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(trames_kernel::children::Wait { number, args }),
             ))
-        } else if let State::Vfork(release) = &p.state {
-            Some(crate::run_queue::WaitState::Vfork(
-                crate::run_queue::VforkWait::new(release.clone()),
+        } else if let State::Completion(release) = &p.state {
+            Some(crate::run_queue::WaitState::Completion(
+                crate::run_queue::CompletionWait::new(release.clone()),
             ))
         } else if !matches!(p.state, State::Ready) && !source_io && !p.worker_gpu_candidate() {
             Some(crate::run_queue::WaitState::OwnerEvent)
@@ -114,6 +114,7 @@ impl<C: Cpu> Kernel<C> {
                 ],
                 started: self.started,
                 processor: p.last_cpu as u32,
+                cpus: self.cpu_count,
                 profile: self.profile_syscalls,
                 streams: p.linux.vfs.stream_descriptors(),
 
@@ -170,7 +171,12 @@ impl<C: Cpu> Kernel<C> {
                 futex: crate::futex::Authority::new(self.futexes.clone(), p.vm_id),
             }),
         };
-        let mut job = crate::run_queue::Job::<C>::new(work, p.affinity, p.last_cpu, waiting);
+        let mut job = crate::run_queue::Job::<C>::new(
+            work,
+            p.signals.io.scheduling.affinity(),
+            p.last_cpu,
+            waiting,
+        );
         if let State::Gpu {
             job: compile,
             pc,

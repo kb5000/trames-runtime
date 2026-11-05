@@ -57,6 +57,7 @@ impl Signals {
             alt_stack: self.alt_stack,
         };
         child.io.publish_mask(child.mask);
+        child.io.scheduling.inherit(&self.io.scheduling);
         child
     }
     pub fn exec(&mut self) {
