@@ -116,7 +116,7 @@ pub(super) fn vm_entry<C: Cpu>(cpu: &C) -> bool {
 /// Task birth uses only the original parent mm's custody, including filtered
 /// ALLOW entries. Namespace/Files/parent resources keep their own actual locks.
 pub(super) fn custody_entry<C: Cpu>(cpu: &C) -> bool {
-    vm_entry(cpu) || cpu.x(8) as u32 == 220
+    vm_entry(cpu) || matches!(cpu.x(8) as u32, 220 | 221 | 281)
 }
 
 /// These calls can request the coordinator without stopping peer CPUs. The

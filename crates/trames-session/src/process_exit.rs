@@ -40,6 +40,41 @@ impl<C: Cpu> trames_vfs::IoWake for Wake<C> {
     }
 }
 impl<C: Cpu> Kernel<C> {
+    /// Detached exec mms outlive their task identity only when an actual guarded
+    /// borrower remains. Other live CLONE_VM owners already retain this root.
+    pub(super) fn retire_detached_memory(
+        &mut self,
+        mut memory: Memory,
+    ) -> Result<(), trames_memory::MemoryError> {
+        if memory.coordinator_ownership().1 != 1 {
+            return Ok(());
+        }
+        if memory.parallel_views_quiescent() {
+            return memory.commit_parallel();
+        }
+        memory.commit_retired_parallel()?;
+        let id = memory.coordinator_ownership().0;
+        let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
+            events: self.workers.events(),
+            owner: std::thread::current(),
+        });
+        let signal = trames_vfs::IoSignal::new(0, Arc::downgrade(&target));
+        let subscription = memory.subscribe_parallel_idle(&signal);
+        self.exits.memory.insert(
+            id,
+            MemoryWait {
+                memory,
+                signal,
+                _subscription: subscription,
+                _target: target,
+            },
+        );
+        if self.exits.memory[&id].memory.parallel_views_quiescent() {
+            let mut wait = self.exits.memory.remove(&id).unwrap();
+            wait.memory.commit_parallel()?;
+        }
+        Ok(())
+    }
     pub(super) fn queue_exit_group(&mut self, group: Arc<Group>) {
         self.exits
             .groups

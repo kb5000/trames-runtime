@@ -1028,14 +1028,20 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     job.seccomp_entry = Some(entry);
                                     break result;
                                 }
-                                // A filtered mapping entry has no worker-side
-                                // effects. Evaluate BPF once on its mm owner;
-                                // only an allowed call may mutate that domain.
+                                // Decide before custody: pure policy errors need
+                                // neither mm quiescence nor an owner callback.
+                                // Carry an allowed/deferred decision exactly once.
                                 if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                     && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0 || work.cpu.x(8) as u32 == 427)
                                     && crate::worker_syscalls::custody_entry(&work.cpu)
                                     && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
                                 {
+                                    let snapshot=work.syscalls.as_ref().expect("custody task");
+                                    if snapshot.seccomp.mode()!=0 {
+                                        let entry=snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i)));
+                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        job.seccomp_entry=Some(entry);
+                                    }
                                     vm_checkpoint = true;
                                     break result;
                                 }

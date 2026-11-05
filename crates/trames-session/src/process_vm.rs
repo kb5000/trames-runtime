@@ -31,15 +31,18 @@ impl<C: Cpu> Kernel<C> {
             job.work.cpu.clear_exclusive();
         }
         let result = (|| {
+            for done in epoch.take_retired() {
+                self.accept_source_return(done)?;
+            }
             self.process_exits(Some(epoch))?;
             let metadata =
                 !checkpoint.mm_only || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
-            let creation_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
+            let lifecycle_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
                 && checkpoint
                     .jobs
                     .iter()
                     .filter(|job| job.checkpoint.is_some())
-                    .all(|job| job.work.cpu.x(8) as u32 == 220);
+                    .all(|job| matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281));
             let mut created = Vec::new();
             let mut committed = std::collections::BTreeSet::new();
             for job in checkpoint.jobs.iter().filter(|_| metadata) {
@@ -47,7 +50,7 @@ impl<C: Cpu> Kernel<C> {
                 let id = p.memory.coordinator_ownership().0;
                 if committed.insert(id) {
                     if !p.memory.parallel_views_quiescent() {
-                        if !creation_only {
+                        if !lifecycle_only {
                             return Ok(false);
                         }
                         p.memory.commit_retired_parallel()?;
@@ -69,6 +72,9 @@ impl<C: Cpu> Kernel<C> {
             // instead of waking every peer between consecutive VM syscalls.
             // The hardware timer bounds the window even if guest code computes
             // forever. Other exits retain ordinary worker authority and order.
+            if !self.exec_checkpoint(epoch, &mut checkpoint, io, &mut created)? {
+                return Ok(false);
+            }
             let lease_deadline = Instant::now() + Duration::from_micros(250);
             for job in &mut checkpoint.jobs {
                 if job
@@ -91,9 +97,10 @@ impl<C: Cpu> Kernel<C> {
                 let control = p.signals.io.lifecycle().enter(&p.signals.io, pid);
                 p.state = State::Ready;
                 if p.seccomp.mode() != 0 {
-                    let entry =
+                    let entry = job.seccomp_entry.take().unwrap_or_else(|| {
                         p.seccomp
-                            .entry_decision(p.cpu.x(8) as u32, p.cpu.pc(), args(&p.cpu));
+                            .entry_decision(p.cpu.x(8) as u32, p.cpu.pc(), args(&p.cpu))
+                    });
                     let allowed = entry.allowed();
                     p.seccomp_entry = Some(entry);
                     if !allowed {
@@ -247,7 +254,7 @@ impl<C: Cpu> Kernel<C> {
                 };
                 views
             } else {
-                let Some(views) = self.prepare_views(&members, creation_only) else {
+                let Some(views) = self.prepare_views(&members, lifecycle_only) else {
                     return Ok(false); // changed to an excluded backing; join once
                 };
                 views

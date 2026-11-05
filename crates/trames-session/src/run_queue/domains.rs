@@ -122,9 +122,21 @@ impl<C: Cpu> Domains<C> {
         if entry.members == 0 {
             assert_eq!(entry.running, 0);
             assert_eq!(entry.services, 0);
-            assert!(entry.jobs.is_empty() && !entry.owned);
-            self.entries.remove(&id);
+            assert!(entry.jobs.is_empty());
+            if !entry.owned {
+                self.entries.remove(&id);
+            }
         }
+    }
+    /// An exec checkpoint owns this returned job; keep the empty owned entry
+    /// until restore consumes its scope, even when its last PID was replaced.
+    pub fn forget_owned(&mut self, pid: u32) {
+        let id = self.tasks.remove(&pid).expect("owned original task");
+        let entry = self.entries.get_mut(&id).unwrap();
+        assert!(entry.owned && entry.domain.paused());
+        assert_eq!(entry.running, 0);
+        assert_eq!(entry.services, 0);
+        entry.members -= 1;
     }
     pub fn contains(&self, id: u64) -> bool {
         self.entries.contains_key(&id)
@@ -292,7 +304,7 @@ impl<C: Cpu> Domains<C> {
     /// join another already-paused VM; merge that checkpoint before resuming.
     pub fn restore(&mut self, checkpoint: Checkpoint<C>, resume: bool) -> Vec<Box<Job<C>>> {
         let Checkpoint::<C> {
-            ids,
+            mut ids,
             jobs,
             requesters,
             mm_only,
@@ -315,6 +327,14 @@ impl<C: Cpu> Domains<C> {
             entry.owned = false;
             entry.notified = false;
         }
+        ids.retain(|id| {
+            if self.entries[id].members != 0 {
+                return true;
+            }
+            let entry = self.entries.remove(id).unwrap();
+            assert!(entry.jobs.is_empty());
+            false
+        });
         if !resume {
             return Vec::new();
         }

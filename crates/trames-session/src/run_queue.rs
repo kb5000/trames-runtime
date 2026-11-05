@@ -840,7 +840,7 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.checkpoint = Some(outcome);
-        if job.work.cpu.x(8) as u32 == 220 {
+        if matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281) {
             q.domains.pause_bytes(id);
         } else {
             q.domains.pause(BTreeSet::from([id]));
@@ -857,6 +857,12 @@ impl<C: Cpu> Epoch<C> {
         assert!(q.members.insert(job.work.pid), "duplicate created task");
         q.domains.register(&mut job);
         q.domains.admit(checkpoint, job);
+    }
+    pub fn forget_checkpoint_member(&self, pid: u32) {
+        let mut q = self.queues.lock().unwrap();
+        assert!(q.members.remove(&pid));
+        q.initial_slots.remove(&pid);
+        q.domains.forget_owned(pid);
     }
     /// Extend existing CPU participation only when ready/running work needs
     /// it, including a child whose affinity excludes every active executor.

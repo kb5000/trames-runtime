@@ -87,15 +87,16 @@ uses a byte checkpoint of that mm alone. It does not stop unrelated mm/backing
 users or rebuild its mappings. External guarded mm borrows retain physical custody
 independently of guest parent notification, keyed by the original mm identity.
 Task creation now uses the creator mm checkpoint and dynamically admits children
-into the same execution queue. Structural exec, tracing and non-ALLOW
-security-policy effects retain their actual joined boundaries. Robust-futex owner-death support is not added by this work.
+into the same execution queue. Exec now replaces its image at the creator-mm
+checkpoint, collecting original group peers and retaining borrowed old memory.
+Tracing and security decisions with lifecycle effects retain joined boundaries. Robust-futex owner-death support is not added by this work.
 
 
 ### Other boundaries
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
-| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec, tracing, non-ALLOW policy and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exec_at`, `exit_one`, `wait`, `syscall`) |
+| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec prepares and commits on the original owner at creator-mm custody, including nonleader identity replacement and failed-image recovery. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF syscall/control installation, dynamic proc/sysfs projections | Joined owner path. Mount and task namespace topology, credentials and remaining owner Rc control graphs have not been migrated. Cgroup paths, controls, membership and notifications use the shared resource graph described below; cgroup namespace/mount changes still join; fork admission uses the original family/cgroup transactions at its creator-mm checkpoint. Ordinary mkdir/unlink/rename/metadata and shared cwd/root are separate shared resources. | [owner syscall dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace topology](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Dynamic proc/sys refresh, non-admitted nsfs/mqueue mounts, dynamic file bodies, controlling-terminal acquisition and excluded open types | Before-effects defer. Actual cgroup mounts are admitted through their original shared graph and OFDs. Namespace calls preserve copied operands and accepted shared FDs in `FileOutcome::Owner`; the joined resolver handles remaining owner controls. Other path queries return `None` for their owner entry. A typed defer is not a new guest errno. | [path authority](../../crates/trames-vfs/src/path_queries.rs), [node/open admission](../../crates/trames-vfs/src/lib.rs), [proc synthesis](../../crates/trames-vfs/src/pseudo.rs), [namespace handoff](../../crates/trames-vfs/src/namespace_work.rs) |
@@ -104,7 +105,7 @@ security-policy effects retain their actual joined boundaries. Robust-futex owne
 | POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination uses original source group cleanup; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
 | Unix ancillary owner controls | SCM_RIGHTS that contains an actual excluded owner control; owner-ledger reaping and a legacy destination/control projection | Retained original endpoint/rights handoff and owner graph work. Portable Unix sockets/rights and ordinary native Wayland transport already share the real resource graph. A mixed owner set is still excluded. | [message handoff](../../crates/trames-linux/src/direct/local_message.rs), [rights ledger](../../crates/trames-vfs/src/ipc.rs), [portable graph](../../crates/trames-vfs/src/ipc/shared_rights.rs) |
-| VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. The owner commits and rebuilds the required Views; unsupported/external generations, tracing or non-ALLOW policy can escalate to a joined path. Additive private-anonymous mmap has a separate in-cohort owner publication path. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
+| VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. The owner commits and rebuilds the required Views; unsupported/external generations, tracing or security decisions with lifecycle effects can escalate to a joined path. Pure policy errors in continuous-worker custody entries complete on the source worker before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap has a separate in-cohort owner publication path. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Only affected original mm instruction views are quiesced, then the same disk pool runs the accepted file operation. Completion releases overlapping pause counts. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
 | io_uring owner escalation | Actual owner resource/SQE, unavailable event subscription or source pump, mapped layout; buffer pins requiring structural authority | Canonical ring state stays shared. `owner_required` hands real owner work back to the Kernel; accepted SQEs keep their original source context. Source background progress on sleep/futex is ordinarily event-driven. No separate ring service thread exists. New namespace SQE opcodes are not added by the namespace batch. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
@@ -612,8 +613,8 @@ this batch does not add another admission gate or claim full owner independence.
 This supersedes the historical last/group-exit and final-CPU restrictions above.
 An original Group records one terminal request and kicks its existing execution
 interrupts. Running, parked, stopped/frozen and traced peers observe that request
-before executing more guest code. Normal traced syscalls and non-ALLOW seccomp
-effects keep their explicit policy boundary. The caller retires original parents,
+before executing more guest code. Normal traced syscalls and seccomp actions with lifecycle or signal effects
+keep their explicit policy boundary. The caller retires original parents,
 cgroup membership, clear_tid/futex wake, Files, process locks, timers, ring work
 and native-space references once. Namespace-init retirement returns original
 victim groups, including nested dependencies whose ancestor is already dead.
@@ -648,8 +649,10 @@ cold group members; clear_tid visible to a surviving CLONE_VM process; an extern
 mm borrow held across wait/reap/PID reuse; and a deterministic late dirty-bit
 publication race. Linux semantics are checked against original
 [exit_mm and exit task work](https://github.com/torvalds/linux/blob/v6.18/kernel/exit.c).
-Remaining boundaries include structural clone/exec, mapping topology, tracing and
-non-ALLOW policy, excluded owner resources and original legacy waiter adoption.
+Remaining boundaries include actual mapping/backing publication, tracing,
+policy actions with lifecycle effects, excluded owner resources and original
+legacy waiter adoption. Clone and exec construction now use scoped original-owner
+custody instead of returning every address space.
 
 
 ## Task creation: creator-mm custody and live admission — 2026-11-05
@@ -684,8 +687,63 @@ COW preparation freezes new children first, placing the new physical copy in
 the child and preserving existing parent hardware mappings. No extra byte
 barrier or unsafe admission is added.
 
-Tracing and non-ALLOW seccomp effects still return to the full task-policy
-boundary before effects, without replaying the policy decision. Genuine mapping
+Tracing and seccomp effects requiring full task handling still return to their
+joined boundary before effects, without replaying the policy decision. Pure
+custody-entry policy errors now complete on the worker before mm quiescence. Genuine mapping
 changes mixed with creation retain their affected backing closure and external
-borrow boundary. Exec, namespace administration, excluded backings and native
-lifecycle boundaries remain explicit. One-CPU/solo caller execution is unchanged.
+borrow boundary. Exec now uses the scoped replacement described below;
+namespace administration, excluded backings and native lifecycle boundaries
+remain explicit. One-CPU/solo caller execution is unchanged.
+
+
+## Exec image replacement without a whole-cohort return — 2026-11-05
+
+The same creator-mm custody path now handles execve and execveat. Normal accepted
+entries replace images without stopping unrelated address spaces. The original
+Rc owner still reads argv/environment, resolves the original executable and
+interpreter, constructs the new Runtime, and commits replacement. No Rc graph is
+transferred to another thread. This removes the whole-cohort dependency, not the
+remaining scoped construction/communication cost.
+
+Preparation precedes destructive effects. A failed image preserves the old CPU,
+Files, background-ring custody and task group. Successful replacement collects
+actual peer CPUs/statistics before the shared de-thread cleanup; unrelated
+CLONE_VM processes keep their original jobs. Live queue membership removes old
+PIDs/mm entries and admits the replacement before any new image can run. An
+owned empty mm entry survives only until its checkpoint is restored. Source
+returns already queued before exec are adopted before peers can be removed.
+
+Nonleader exec rekeys the surviving original task to the process ID. Old process
+visibility remains alive until replacement publication; the child wait object,
+resource directory, cgroup identity and parent links follow the survivor. Process
+age and returned peer CPU accounting are preserved without counting global CPU
+time twice. Old pending-open/AIO/retry state, deadlines and temporary wait-mask
+restoration are cleared; the current signal mask remains. CLOEXEC still unshares
+the caller's table first. Compare the ordering and identity requirements in
+[Linux de_thread and exec_mmap](https://github.com/torvalds/linux/blob/v6.18/fs/exec.c).
+
+Detached old memory uses its actual mm identity and the existing last-borrow
+notification. Known writes publish before retirement; the dirty journal and
+physical custody remain until late guarded borrowers return. It does not retain
+a guest PID or delay the new image. Shared old mms continue under their surviving
+owners. Post-commit backing failures remain host execution errors, rather than a
+guest errno implying the old image survived.
+
+Untraced continuous-worker custody entries evaluate seccomp once before effects.
+Pure ERRNO/unsupported TRACE/USER_NOTIF results finish there without pausing an mm.
+Allowed/deferred entry tokens reach the owner unchanged. Tracing and actual
+signal/termination policy effects retain their explicit task-policy boundary.
+
+An accepted cgroup.kill targets the original process inbox/group, even if its
+captured leader has retired during exec. It cannot escape through de-threading or
+follow a reused TID into another process. Ordinary resource-directed signals keep
+their existing retired-target behavior. This uses original group/mailbox locks,
+readiness and workers, with no new service thread, polling bus, unsafe block or
+ordinary guest-memory barrier.
+
+Remaining costs include scoped original-owner image construction, dynamic proc
+path refresh (including openat of /proc/self/exe), namespace administration and
+actual excluded mapping/backing/native controls. Single-CPU/solo execution stays
+on its coordinated caller path. This change is shared by Mac and iPad; native
+Mach-O and ARM Linux reference programs are controls, not claims of identical OS
+semantics or a general CPU/Firefox speedup.

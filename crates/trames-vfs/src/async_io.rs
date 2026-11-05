@@ -13,6 +13,12 @@ pub trait AsyncOwners {
 }
 pub trait TaskSignal: Send + Sync {
     fn raise(&self, signal: u32);
+    /// An accepted process-wide kill retains the original process incarnation,
+    /// even if the particular member captured by the resource has retired.
+    fn terminate_process(&self) {
+        self.raise(9);
+    }
+
     /// The original resource's scheduling state changed; consumers read its
     /// level state after this wake. No stale state value is sent in a message.
     fn scheduling_changed(&self) {}

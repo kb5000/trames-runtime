@@ -51,6 +51,8 @@ mod compat;
 mod dispatch;
 #[path = "process_events.rs"]
 mod events;
+#[path = "process_exec.rs"]
+mod exec;
 #[path = "process_exit.rs"]
 mod exit;
 #[path = "process_pid.rs"]
@@ -1925,198 +1927,6 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Ready;
         Ok(())
     }
-    fn exec(
-        p: &mut Process<C>,
-        a: [u64; 6],
-        budget: usize,
-        clock_origin: Instant,
-    ) -> Result<(), Errno> {
-        Self::exec_at(p, AT_FDCWD, a, 0, budget, clock_origin)
-    }
-    fn exec_at(
-        p: &mut Process<C>,
-        dirfd: i32,
-        a: [u64; 6],
-        flags: u32,
-        budget: usize,
-        clock_origin: Instant,
-    ) -> Result<(), Errno> {
-        let path = Linux::path(&p.memory, a[0])?;
-        let argv = strings(&p.memory, a[1])?;
-        let envp = strings(&p.memory, a[2])?;
-        Self::exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn exec_strings(
-        p: &mut Process<C>,
-        dirfd: i32,
-        mut path: Vec<u8>,
-        mut argv: Vec<Vec<u8>>,
-        envp: Vec<Vec<u8>>,
-        flags: u32,
-        budget: usize,
-        clock_origin: Instant,
-    ) -> Result<(), Errno> {
-        if path.is_empty() && flags & 0x1000 == 0 {
-            return Err(Errno(2));
-        }
-        if flags & !0x1100 != 0 {
-            return Err(Errno(22));
-        }
-        let via_fd = path.is_empty() || !path.starts_with(b"/") && dirfd != AT_FDCWD;
-        let filename = if via_fd {
-            let mut name = format!("/dev/fd/{dirfd}").into_bytes();
-            if !path.is_empty() {
-                name.push(b'/');
-                name.extend_from_slice(&path);
-            }
-            name
-        } else {
-            path.clone()
-        };
-        let mut file = p.linux.vfs.executable_file_at(dirfd, &path, flags)?;
-        let inaccessible = via_fd && p.linux.vfs.flags(dirfd as u32)? & trames_vfs::O_CLOEXEC != 0;
-        if argv.is_empty() {
-            argv.push(Vec::new());
-        }
-        for depth in 0..5 {
-            let bytes = file.bytes()?;
-            if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
-                if depth == 0 && inaccessible {
-                    return Err(Errno(2));
-                }
-                if depth == 4 {
-                    return Err(Errno(40));
-                }
-                let mut next = vec![interpreter.clone()];
-                if let Some(argument) = optional {
-                    next.push(argument);
-                }
-                next.push(if depth == 0 {
-                    filename.clone()
-                } else {
-                    path.clone()
-                });
-                next.extend(argv.into_iter().skip(1));
-                argv = next;
-                path = interpreter;
-                file = p.linux.vfs.executable_file_at(AT_FDCWD, &path, 0)?;
-                continue;
-            }
-            let mut execute_vfs = p.linux.vfs.clone();
-            execute_vfs.apply_exec_file_credentials(&file)?;
-            let mut runtime = Runtime::<C>::load_guest_execfn(
-                &bytes,
-                &argv,
-                &envp,
-                &execute_vfs,
-                super::RuntimeOptions {
-                    memory_limits: super::MemoryLimits {
-                        per_process: budget,
-                        total: budget,
-                    },
-                    pure_accelerator: accelerated(
-                        p,
-                        trames_accel::native::AUXV_KEY,
-                        trames_accel::native::PROFILE,
-                    ),
-                    audio_output: p.linux.auxiliary.chunks_exact(16).any(|pair| {
-                        pair[..8] == trames_audio::CAPS_KEY.to_le_bytes()
-                            && u64::from_le_bytes(pair[8..].try_into().unwrap()) & 1 != 0
-                    }),
-                    audio_input: p.linux.auxiliary.chunks_exact(16).any(|pair| {
-                        pair[..8] == trames_audio::CAPS_KEY.to_le_bytes()
-                            && u64::from_le_bytes(pair[8..].try_into().unwrap()) & 2 != 0
-                    }),
-                    video_accelerator: accelerated(
-                        p,
-                        trames_video::AUXV_KEY,
-                        trames_video::PROFILE,
-                    ),
-                    vulkan_accelerator: accelerated(
-                        p,
-                        trames_vulkan::AUXV_KEY,
-                        trames_vulkan::PROFILE,
-                    ),
-                    native_bsearch: p.linux.auxiliary.chunks_exact(16).any(|pair| {
-                        pair[..8] == trames_accel::callbacks::SEARCH_AUXV_KEY.to_le_bytes()
-                            && pair[8..] == 1u64.to_le_bytes()
-                    }),
-                    native_allocator: p.linux.auxiliary.chunks_exact(16).any(|pair| {
-                        pair[..8] == trames_accel::allocator::AUXV_KEY.to_le_bytes()
-                            && pair[8..] == trames_accel::allocator::PROFILE.to_le_bytes()
-                    }),
-                },
-                Some(&filename),
-            )
-            .map_err(|e| match e {
-                RuntimeError::Arguments(_) => Errno(7),
-                RuntimeError::Memory(_) | RuntimeError::Configuration(_) => Errno(12),
-                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
-                _ => Errno(8),
-            })?;
-            super::clock::initialize::<C>(
-                &mut runtime.memory,
-                &runtime.linux.auxiliary,
-                clock_origin,
-            )
-            .map_err(|_| Errno(12))?;
-            if runtime.memory.resident_bytes() > budget {
-                return Err(Errno(12));
-            }
-            runtime
-                .memory
-                .inherit_total_limit(&p.memory)
-                .map_err(|_| Errno(12))?;
-            runtime.linux.executable_path = p.linux.vfs.executable_display(&file);
-            runtime.linux.executable_file = Some(file);
-            runtime.linux.command_name = filename
-                .rsplit(|b| *b == b'/')
-                .next()
-                .unwrap_or_default()
-                .iter()
-                .copied()
-                .take(15)
-                .collect();
-            let task = p.linux.vfs.process_context();
-            p.linux.cancel_uring(&mut p.memory, task);
-            p.uring_wait = None;
-            p.flock_wait = None;
-            p.record_wait = None;
-            p.byte_wait = None;
-            p.retained_file = None;
-            p.file_checkpoint = None;
-            p.file_entry = None;
-            p.retained_socket = None;
-            p.retained_byte = None;
-            p.retained_message_owner = None;
-            p.tcp_liveness = None;
-            p.retained_poll = None;
-            p.linux.vfs.unshare_descriptors();
-            p.linux.vfs.close_exec();
-            let credentials = execute_vfs.credentials.clone();
-            std::mem::swap(&mut runtime.linux.vfs, &mut p.linux.vfs);
-            runtime.linux.vfs.credentials = credentials;
-            runtime.linux.vfs.unshare_dumpable();
-            runtime.linux.vfs.set_dumpable(execute_vfs.dumpable())?;
-            runtime.linux.trace = p.linux.trace;
-            runtime.linux.task_limit = p.linux.task_limit;
-            runtime.linux.set_uring_clock(clock_origin);
-            runtime.linux.set_boot_clock(p.linux.boot_clock());
-            runtime.linux.inherit_exec_addresses(&p.linux);
-            p.linux = runtime.linux;
-            runtime.cpu.inherit_exec(&p.cpu);
-            p.cpu = runtime.cpu;
-            p.space.retire();
-            p.space = Default::default();
-            p.memory = runtime.memory;
-            p.signals.exec();
-            p.membarrier_registered = Rc::new(Cell::new(false));
-            p.state = State::Ready;
-            return Ok(());
-        }
-        Err(Errno(40))
-    }
     fn reap_waited(&mut self) {
         self.processes
             .retain(|id, p| *id != p.tgid || p.signals.presence.present());
@@ -2709,57 +2519,18 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(parent_tid as u64))
             }
             221 | 281 => {
-                if number == 221 {
-                    Self::exec(p, a, self.memory_limits.per_process, self.started)?;
-                } else {
-                    Self::exec_at(
-                        p,
-                        a[0] as i32,
-                        [a[1], a[2], a[3], 0, 0, 0],
-                        a[4] as u32,
-                        self.memory_limits.per_process,
-                        self.started,
-                    )?;
+                let image = Self::prepare_exec_request(
+                    p,
+                    number,
+                    a,
+                    self.memory_limits.per_process,
+                    self.started,
+                )?;
+                if let Err(error) = self.commit_exec_task(pid, p, image) {
+                    // A post-commit backing failure is a host execution error,
+                    // never a guest errno suggesting the old image survived.
+                    self.backend_error = Some(format!("{error:?}"));
                 }
-                let ids: Vec<_> = self
-                    .processes
-                    .iter()
-                    .filter(|(_, t)| t.tgid == p.tgid)
-                    .map(|(&id, _)| id)
-                    .collect();
-                for id in ids {
-                    if let Some(mut t) = self.processes.remove(&id) {
-                        t.signals.io.exit();
-                        Self::cancel_native_task(&t);
-                        t.linux.cancel_uring(&mut t.memory, id);
-                        Self::parent_thread_exited(&t, Some((p.tgid, p.signals.io.clone())));
-                        t.linux.vfs.cgroup_exit(id);
-                        let address = t.linux.clear_tid_address();
-                        t.linux.exit_tid(&mut t.memory);
-                        self.wake_futex(&t, address, 1, u32::MAX);
-                        t.linux.vfs.release_descriptors();
-                        t.space.retire();
-                        Self::release_vfork(&mut t);
-                    }
-                }
-                self.timers.clear_process(p.tgid, true);
-                Self::release_vfork(p);
-                if pid != p.tgid {
-                    p.linux.vfs.cgroup_exec_rekey(pid, p.tgid);
-                    p.rekey = Some(p.tgid);
-                    for child in self.processes.values_mut() {
-                        if child.parentage.parent_thread() == pid {
-                            child.parentage.set_parent_thread(p.tgid);
-                            child
-                                .signals
-                                .io_directory
-                                .parents
-                                .reparent(&child.signals.io, p.tgid);
-                        }
-                    }
-                }
-                let resource = self.resource_id();
-                p.vm_id = resource;
                 Ok(None)
             }
             98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
@@ -3124,6 +2895,19 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) {
+        self.call_with(pid, p, number, a, io, |kernel, pid, p, io| {
+            kernel.syscall(pid, p, number, a, io)
+        });
+    }
+    fn call_with<I: GuestOutput>(
+        &mut self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        a: [u64; 6],
+        io: &mut I,
+        syscall: impl FnOnce(&mut Self, u32, &mut Process<C>, &mut I) -> Result<Option<u64>, Errno>,
+    ) {
         if p.byte_wait.as_ref().is_some_and(|wait| {
             !wait.signal.ready()
                 && !wait.external_wait()
@@ -3471,7 +3255,7 @@ impl<C: Cpu> Kernel<C> {
             }
             None => match prepared_stat {
                 Some((stat, _)) => Linux::finish_stat(a, &mut p.memory, stat).map(Some),
-                None => self.syscall(pid, p, number, a, io),
+                None => syscall(self, pid, p, io),
             },
         };
         if was_local && !matches!(result, Ok(None)) {
@@ -3482,7 +3266,7 @@ impl<C: Cpu> Kernel<C> {
             if after_ids[..4] != before_ids[..4] {
                 p.parentage.set_death_signal(0);
             }
-            self.publish_task(pid, p);
+            self.publish_task(p.rekey.unwrap_or(pid), p);
         }
         let raw = match result {
             Ok(Some(raw)) => {
@@ -3575,7 +3359,7 @@ impl<C: Cpu> Kernel<C> {
         if let Some(began) = began {
             self.syscall_total += began.elapsed();
         }
-        p.publish_stop_hold(pid);
+        p.publish_stop_hold(p.rekey.unwrap_or(pid));
     }
     fn waits_for_host_stdin(p: &Process<C>) -> bool {
         match p.state {
@@ -4286,10 +4070,10 @@ impl<C: Cpu> Kernel<C> {
                 self.parallel_memory.metrics.cache_hits += 1;
                 views[index].2.clone()
             } else if reuse_retained && !p.memory.parallel_views_quiescent() {
-                // This is a creation-only checkpoint. All private execution
+                // This is a task-lifecycle-only checkpoint. All private execution
                 // actors returned; retained guarded borrows still use exactly
-                // these parent bytes. Fork isolated its child, and CLONE_VM
-                // introduced no parent mapping or permission change.
+                // these parent bytes. Fork isolated its child, CLONE_VM introduced no parent mapping
+                // change, and exec installed a different mm without editing this one.
                 let mut view = Box::new(p.memory.current_parallel_view()?);
                 C::prepare_hardware_view(&mut view);
                 published.insert(identity, views.len());
@@ -4859,6 +4643,13 @@ impl<C: Cpu> Kernel<C> {
         &mut self,
         done: crate::workers::Done<C>,
     ) -> (u32, Option<i32>, SliceOutcome) {
+        self.adopt_worker_return(done, true)
+    }
+    fn adopt_worker_return(
+        &mut self,
+        done: crate::workers::Done<C>,
+        joined: bool,
+    ) -> (u32, Option<i32>, SliceOutcome) {
         if let Some(fault) = &done.fatal_fault {
             let p = &self.processes[&done.pid];
             p.linux.vfs.log(
@@ -4977,7 +4768,7 @@ impl<C: Cpu> Kernel<C> {
         self.decode_misses += done.after.misses - done.before.misses;
         self.instructions_decoded += done.after.instructions - done.before.instructions;
         let outcome = done.outcome.expect("checked worker completion");
-        if self.profile_syscalls && done.thread_exit.is_none() {
+        if joined && self.profile_syscalls && done.thread_exit.is_none() {
             match &outcome {
                 SliceOutcome::Syscall { .. } => {
                     *self

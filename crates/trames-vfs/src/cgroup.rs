@@ -199,7 +199,7 @@ impl CgroupTask {
         }
         notify_events(events);
         if pending {
-            target.raise(9);
+            target.terminate_process();
         }
     }
     pub fn exit(&self) {
@@ -1199,7 +1199,7 @@ impl CgroupFile {
                 }
                 drop(cg);
                 for signal in signals {
-                    signal.raise(9);
+                    signal.terminate_process();
                 }
             }
             b"cgroup.subtree_control" => {

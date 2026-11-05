@@ -60,6 +60,9 @@ impl Signals {
         child
     }
     pub fn exec(&mut self) {
+        // Preserve the current mask, but no abandoned pselect/suspend restore
+        // may later overwrite it in the new image.
+        self.wait_mask = None;
         self.actions = self.actions.exec();
         self.frames = 0;
         self.alt_stack = AltStack::default();

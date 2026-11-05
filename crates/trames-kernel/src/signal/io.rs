@@ -500,6 +500,19 @@ struct Policy {
     can_kill: bool,
 }
 impl trames_vfs::TaskSignal for IoTask {
+    fn terminate_process(&self) {
+        // The resource already accepted a kill of this original process. Its
+        // leader may have retired during exec; its shared inbox/group did not.
+        let _ = self.job_signal(
+            9,
+            true,
+            Info {
+                code: 128,
+                ..Default::default()
+            },
+            true,
+        );
+    }
     fn scheduling_changed(&self) {
         self.lifecycle()
             .interrupt_member(self.pid.load(Ordering::Relaxed));
@@ -933,6 +946,28 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn accepted_process_kill_survives_exec_leader_retirement_and_tid_reuse() {
+        let leader = Signals::default();
+        let directory = IoDirectory::default();
+        let ns = PidNamespace::default();
+        leader.publish_policy(&ns, true);
+        directory.publish(&leader.io, 42, 42, 42, 1000, 1000);
+        let survivor = leader.fork(true);
+        survivor.io.share_process(&leader.io);
+        survivor.publish_policy(&ns, true);
+        directory.publish(&survivor.io, 43, 42, 42, 1000, 1000);
+        let accepted: Arc<dyn trames_vfs::TaskSignal> = leader.io.clone();
+        leader.io.exit();
+        directory.publish(&survivor.io, 42, 42, 42, 1000, 1000);
+        let replacement = Signals::default();
+        replacement.publish_policy(&ns, true);
+        directory.publish(&replacement.io, 43, 43, 43, 1000, 1000);
+        accepted.terminate_process();
+        assert_eq!(survivor.io.process().bits() & (1 << 8), 1 << 8);
+        assert!(!survivor.io.lifecycle().permits_birth());
+        assert_eq!(replacement.pending_bits(), 0);
     }
     #[test]
     fn file_size_resource_signal_preserves_origin_ignores_discard_and_retired_targets() {
