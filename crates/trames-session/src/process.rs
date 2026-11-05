@@ -1333,6 +1333,10 @@ impl<C: Cpu> Kernel<C> {
     }
     /// Source exits already retired original resources. Only the owner-local
     /// CPU/Memory/VFS projections return here; never replay accepted effects.
+    fn collect_source_exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
+        p.linux.vfs.collect_retired_descriptors();
+        self.collect_exit_projection(pid, p, status);
+    }
     fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         self.children_dirty.set(true);
         p.uring_wait = None;
@@ -1348,7 +1352,6 @@ impl<C: Cpu> Kernel<C> {
         p.tcp_liveness = None;
         p.retained_poll = None;
         p.linux.executable_file = None;
-        p.linux.vfs.detach_file_table();
         if pid != 1 {
             p.memory = Memory::default();
         }
@@ -5101,7 +5104,7 @@ impl<C: Cpu> Kernel<C> {
         // the last member's process/group exit inspects this process graph.
         for (pid, status) in thread_exits {
             if let Some(mut p) = self.processes.remove(&pid) {
-                self.collect_exit_projection(pid, &mut p, status);
+                self.collect_source_exit(pid, &mut p, status);
                 if !p.auto_reap || pid == 1 {
                     self.processes.insert(pid, p);
                 }
@@ -8561,7 +8564,7 @@ mod tests {
             published.send(context).unwrap();
             k.processes.insert(1, root);
             go.recv().unwrap();
-            k.collect_exit_projection(2, &mut peer, 23 << 8);
+            k.collect_source_exit(2, &mut peer, 23 << 8);
             finished.send(peer.auto_reap).unwrap();
         });
         let context = context.recv_timeout(Duration::from_secs(5)).unwrap();

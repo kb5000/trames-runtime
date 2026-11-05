@@ -524,6 +524,9 @@ projections. They do not repeat io_uring cancellation, parent-death delivery,
 clear_tid, descriptor/native retirement or native-job abandonment. A guarded
 regression holds the original native context occupied while this collection
 finishes; injecting legacy native cleanup makes it fail without hanging.
+Original owner-local ancillary-rights and detached-mount projection collection
+still runs after source descriptor retirement; original OFDs are not retired
+again. Ordinary owner exits use that same collector once.
 
 The completion phases are a prerequisite for, not completion of, source last-
 member/group/default-fatal exit. Their entry still joins the cohort. Final

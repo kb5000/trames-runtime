@@ -188,10 +188,9 @@ fn worker_directory_open_and_detached_submount_keep_original_membership() {
     let expected = owner.getdents(sub, 4096).unwrap();
     q.directory_seek(sub, 0, 0).unwrap().unwrap();
     assert_eq!(q.getdents(sub, 4096, || Ok(())), Some(Ok(expected)));
-    owner.close(sub).unwrap();
-    owner.close(fd).unwrap();
     drop(q);
-    owner.reap_detached_mounts();
+    owner.file_table_owner().retire(1);
+    owner.collect_retired_descriptors();
     assert!(owner.detached_mounts.borrow().is_empty());
     epoch.finish();
 }
