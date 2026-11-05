@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
 
 pub(super) struct Snapshot {
+    pub native_space: Option<crate::space::Native>,
     pub exit_files: Option<trames_vfs::FileTableOwner>,
     pub children: Arc<trames_kernel::children::Children>,
     pub limits: Option<trames_kernel::limits::Authority>,
@@ -542,6 +543,9 @@ impl Snapshot {
             }
         }
         files.retire(self.io_signals.tgid());
+        if let Some(space) = &self.native_space {
+            space.retire();
+        }
         self.io_signals.reap_thread_presence();
         true
     }
@@ -923,6 +927,7 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -1053,6 +1058,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -1113,6 +1119,7 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -1217,6 +1224,7 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -1285,6 +1293,7 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,

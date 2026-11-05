@@ -112,6 +112,7 @@ pub(crate) struct Process<C: Cpu> {
     started: Instant,
     cpu_time: Duration,
     vm_id: u64,
+    space: crate::space::Native,
     rekey: Option<u32>,
     membarrier_registered: Rc<Cell<bool>>,
     limits: Arc<trames_kernel::limits::Limits>,
@@ -462,6 +463,11 @@ impl<C: Cpu> Process<C> {
             started: Instant::now(),
             cpu_time: Duration::ZERO,
             vm_id: self.vm_id,
+            space: if shared_vm {
+                self.space.share()
+            } else {
+                Default::default()
+            },
             rekey: None,
             membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
             limits,
@@ -567,9 +573,6 @@ pub(crate) struct Kernel<C: Cpu> {
     next_resource: u64,
     timers: Arc<trames_kernel::timers::Timers>,
     native: trames_accel::native::Registry,
-    gpu: RefCell<BTreeMap<u64, trames_vulkan::Context>>,
-    video: RefCell<BTreeMap<u64, trames_video::Context>>,
-    audio: RefCell<BTreeMap<u64, trames_audio::Context>>,
     gpu_budget: trames_vulkan::Budget,
     gpu_display: trames_vulkan::Display,
     gpu_compiles: u64,
@@ -819,10 +822,8 @@ impl<C: Cpu> Kernel<C> {
         }))
     }
     fn audio_context(&self, p: &Process<C>) -> trames_audio::Context {
-        self.audio
-            .borrow_mut()
-            .entry(p.vm_id)
-            .or_insert_with(|| {
+        p.space
+            .audio(|| {
                 let caps = p
                     .linux
                     .auxiliary
@@ -834,16 +835,14 @@ impl<C: Cpu> Kernel<C> {
                     .unwrap_or(0);
                 trames_audio::Context::new(caps)
             })
-            .clone()
+            .expect("live native address space")
     }
     fn video_context(&self, p: &Process<C>) -> trames_video::Context {
-        self.video.borrow_mut().entry(p.vm_id).or_default().clone()
+        p.space.video().expect("live native address space")
     }
     fn gpu_context(&self, p: &Process<C>) -> trames_vulkan::Context {
-        self.gpu
-            .borrow_mut()
-            .entry(p.vm_id)
-            .or_insert_with(|| {
+        p.space
+            .gpu(|| {
                 trames_vulkan::Context::new(
                     trames_vulkan::Backend::with_budget(self.gpu_budget.clone())
                         .with_native_images()
@@ -851,7 +850,10 @@ impl<C: Cpu> Kernel<C> {
                         .with_wayland(p.linux.vfs.wayland_server()),
                 )
             })
-            .clone()
+            .expect("live native address space")
+    }
+    fn existing_gpu(p: &Process<C>) -> Option<trames_vulkan::Context> {
+        p.space.existing_gpu()
     }
     fn resume_gpu(&mut self, pid: u32, p: &mut Process<C>) -> bool {
         let State::Gpu {
@@ -873,13 +875,9 @@ impl<C: Cpu> Kernel<C> {
             p.state = State::Ready;
             return true;
         }
-        let result = self
-            .gpu
-            .borrow_mut()
-            .get_mut(&p.vm_id)
-            .map_or(Ok(Some((-4i64) as u64)), |backend| {
-                backend.poll(&mut p.memory, job)
-            });
+        let result = Self::existing_gpu(p).map_or(Ok(Some((-4i64) as u64)), |backend| {
+            backend.poll(&mut p.memory, job)
+        });
         if matches!(result, Ok(None)) {
             return false;
         }
@@ -1296,17 +1294,16 @@ impl<C: Cpu> Kernel<C> {
             },
         );
     }
+    fn cancel_native_task(p: &Process<C>) {
+        if let State::Gpu { job, .. } = p.state {
+            if let Some(context) = Self::existing_gpu(p) {
+                context.abandon(job);
+            }
+        }
+    }
     fn close_exit_files(&self, p: &mut Process<C>) {
         p.linux.executable_file = None;
-        if !self
-            .processes
-            .values()
-            .any(|other| other.vm_id == p.vm_id && !matches!(other.state, State::Zombie(_)))
-        {
-            self.gpu.borrow_mut().remove(&p.vm_id);
-            self.video.borrow_mut().remove(&p.vm_id);
-            self.audio.borrow_mut().remove(&p.vm_id);
-        }
+        p.space.retire();
         p.linux.vfs.set_lock_owner(p.tgid);
         let live = |t: &&Process<C>| !matches!(t.state, State::Zombie(_));
         if !self
@@ -1341,11 +1338,7 @@ impl<C: Cpu> Kernel<C> {
         p.retained_poll = None;
         Self::parent_thread_exited(p, None);
         p.linux.vfs.cgroup_exit(pid);
-        if let State::Gpu { job, .. } = &p.state {
-            if let Some(backend) = self.gpu.borrow_mut().get_mut(&p.vm_id) {
-                backend.abandon(*job);
-            }
-        }
+        Self::cancel_native_task(p);
         if let State::Futex { wait, .. } = &p.state {
             wait.cancel();
         }
@@ -1427,6 +1420,7 @@ impl<C: Cpu> Kernel<C> {
         for id in members.iter().copied().filter(|id| *id != p.tgid) {
             if let Some(mut thread) = self.processes.remove(&id) {
                 thread.signals.io.exit();
+                Self::cancel_native_task(&thread);
                 thread.linux.cancel_uring(&mut thread.memory, id);
                 Self::parent_thread_exited(&thread, None);
                 thread.linux.vfs.cgroup_exit(id);
@@ -2100,6 +2094,8 @@ impl<C: Cpu> Kernel<C> {
             p.linux = runtime.linux;
             runtime.cpu.inherit_exec(&p.cpu);
             p.cpu = runtime.cpu;
+            p.space.retire();
+            p.space = Default::default();
             p.memory = runtime.memory;
             p.signals.exec();
             p.membarrier_registered = Rc::new(Cell::new(false));
@@ -2679,7 +2675,6 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(parent_tid as u64))
             }
             221 | 281 => {
-                let old_vm = p.vm_id;
                 if number == 221 {
                     Self::exec(p, a, self.memory_limits.per_process, self.started)?;
                 } else {
@@ -2701,6 +2696,7 @@ impl<C: Cpu> Kernel<C> {
                 for id in ids {
                     if let Some(mut t) = self.processes.remove(&id) {
                         t.signals.io.exit();
+                        Self::cancel_native_task(&t);
                         t.linux.cancel_uring(&mut t.memory, id);
                         Self::parent_thread_exited(&t, Some((p.tgid, p.signals.io.clone())));
                         t.linux.vfs.cgroup_exit(id);
@@ -2708,6 +2704,7 @@ impl<C: Cpu> Kernel<C> {
                         t.linux.exit_tid(&mut t.memory);
                         self.wake_futex(&t, address, 1, u32::MAX);
                         t.linux.vfs.release_descriptors();
+                        t.space.retire();
                     }
                 }
                 self.timers.clear_process(p.tgid, true);
@@ -2728,15 +2725,6 @@ impl<C: Cpu> Kernel<C> {
                 }
                 let resource = self.resource_id();
                 p.vm_id = resource;
-                if !self
-                    .processes
-                    .values()
-                    .any(|other| other.vm_id == old_vm && !matches!(other.state, State::Zombie(_)))
-                {
-                    self.gpu.borrow_mut().remove(&old_vm);
-                    self.video.borrow_mut().remove(&old_vm);
-                    self.audio.borrow_mut().remove(&old_vm);
-                }
                 Ok(None)
             }
             98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
@@ -4655,6 +4643,7 @@ impl<C: Cpu> Kernel<C> {
                 memory: Some(view),
                 control: control.clone(),
                 syscalls: (!p.linux.trace).then(|| crate::worker_syscalls::Snapshot {
+                    native_space: Some(p.space.clone()),
                     exit_files: Some(p.linux.vfs.file_table_owner()),
                     children: p.children.clone(),
                     limits: Some(limits),
@@ -5281,9 +5270,6 @@ impl<C: Cpu> Kernel<C> {
             }
             self.control(io)?;
             self.poll_file_layouts();
-            for backend in self.gpu.borrow_mut().values_mut() {
-                backend.reap_abandoned();
-            }
             let mut progress = self.pump_terminal(io)?;
             if let Some(root) = self.processes.get(&1) {
                 root.linux.vfs.dispatch_native_events();
@@ -5739,6 +5725,7 @@ pub(super) fn run<C: Cpu>(
         started: Instant::now(),
         cpu_time: Duration::ZERO,
         vm_id: 1,
+        space: Default::default(),
         rekey: None,
         membarrier_registered: Rc::new(Cell::new(false)),
         limits,
@@ -5831,9 +5818,6 @@ pub(super) fn run<C: Cpu>(
         next_resource: 2,
         timers: Default::default(),
         native: trames_accel::native::Registry::default(),
-        gpu: RefCell::new(BTreeMap::new()),
-        video: RefCell::new(BTreeMap::new()),
-        audio: RefCell::new(BTreeMap::new()),
         gpu_budget: runtime.memory_limits.gpu_budget(),
         gpu_display: runtime.vulkan_display.clone(),
         gpu_compiles: 0,
@@ -7252,6 +7236,7 @@ mod tests {
             started: Instant::now(),
             cpu_time: Duration::ZERO,
             vm_id: 1,
+            space: Default::default(),
             rekey: None,
             membarrier_registered: Rc::new(Cell::new(false)),
             limits,
@@ -7505,9 +7490,6 @@ mod tests {
             next_resource: 2,
             timers: Default::default(),
             native: trames_accel::native::Registry::default(),
-            gpu: RefCell::new(BTreeMap::new()),
-            video: RefCell::new(BTreeMap::new()),
-            audio: RefCell::new(BTreeMap::new()),
             gpu_budget: trames_vulkan::Budget::default(),
             gpu_display: trames_vulkan::Display::default(),
             gpu_compiles: 0,
@@ -8504,6 +8486,78 @@ mod tests {
         assert!(!p.signals.io.inbox.contains_key(&10));
         Kernel::queue_one(1, &mut p, 18, 1);
         assert!(!p.stopped() && p.runnable());
+    }
+    #[test]
+    fn unrelated_headless_execution_does_not_wait_for_a_busy_native_address_space() {
+        let (published, context) = std::sync::mpsc::channel();
+        let (start, go) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut root = process();
+            let mut k = kernel();
+            for (i, word) in [0xd2800ba8u32, 0xd2800000, 0xd4000001]
+                .into_iter()
+                .enumerate()
+            {
+                root.memory
+                    .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            root.memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                .unwrap();
+            let mut device_owner = root.fork();
+            device_owner.tgid = 2;
+            device_owner.family.set_parent(1);
+            device_owner.state = State::Sleep(Instant::now() + Duration::from_secs(60), 0);
+            published.send(k.gpu_context(&device_owner)).unwrap();
+            k.processes.insert(1, root);
+            k.processes.insert(2, device_owner);
+            go.recv().unwrap();
+            let result = k
+                .drive(&mut trames_linux::CapturedOutput::default(), 100000)
+                .map(|r| r.code);
+            finished.send(result).unwrap();
+        });
+        let context = context.recv_timeout(Duration::from_secs(5)).unwrap();
+        let lease = context.try_lock().unwrap();
+        start.send(()).unwrap();
+        let result = done.recv_timeout(Duration::from_secs(1));
+        drop(lease);
+        worker.join().unwrap();
+        assert!(
+            matches!(result, Ok(Ok(0))),
+            "unrelated headless execution waited behind native maintenance: {result:?}"
+        );
+    }
+    #[test]
+    fn native_mm_contexts_follow_original_memory_across_clone_and_stale_exit_snapshots() {
+        let mut parent = process();
+        let k = kernel();
+        let accepted = k.gpu_context(&parent);
+        let original = accepted.downgrade();
+        drop(accepted);
+        let memory = parent.memory.share();
+        let peer = parent.fork_with_memory(memory);
+        let saved = parent.space.clone();
+        let context = k.gpu_context(&peer);
+        let shared = context.downgrade();
+        drop(context);
+        parent.space.retire();
+        assert!(original.upgrade().is_some());
+        let fork = peer.fork();
+        let own = k.gpu_context(&fork);
+        let independent = own.downgrade();
+        drop(own);
+        peer.space.retire();
+        assert!(original.upgrade().is_none());
+        assert!(shared.upgrade().is_none());
+        assert!(saved
+            .with(|_| panic!("late exit snapshot cannot recreate an mm context"))
+            .is_none());
+        assert!(independent.upgrade().is_some());
+        fork.space.retire();
+        assert!(independent.upgrade().is_none());
     }
     #[test]
     fn a_removed_gpu_context_completes_once_without_reexecuting_the_stub() {

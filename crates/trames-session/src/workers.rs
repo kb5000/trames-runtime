@@ -1794,6 +1794,7 @@ mod tests {
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -2080,6 +2081,12 @@ mod tests {
                 if owner_control {
                     vfs.epoll_create(0).unwrap();
                 }
+                let space = crate::space::Native::default();
+                let native_peer = space.share();
+                let context = trames_vulkan::Context::new(Default::default());
+                let native = context.downgrade();
+                space.with(|resources| resources.gpu = Some(context));
+                snapshot.native_space = Some(space.clone());
                 snapshot.exit_files = Some(vfs.file_table_owner());
                 caller.syscalls = Some(snapshot);
                 epoch.add(crate::run_queue::Job::new(
@@ -2110,6 +2117,16 @@ mod tests {
                 let completed = epoch.drain().pop().unwrap();
                 assert_eq!(completed.thread_exit, (!owner_control).then_some(23 << 8));
                 assert_eq!(completed.serviced_syscalls, 0);
+                assert!(
+                    native.upgrade().is_some(),
+                    "the real mm peer still owns its devices"
+                );
+                native_peer.retire();
+                assert_eq!(
+                    native.upgrade().is_none(),
+                    !owner_control,
+                    "source exit, not a later owner projection, retires its mm reference"
+                );
                 if !owner_control {
                     assert!(!original.live());
                     assert!(

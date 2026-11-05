@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through original process families
-and parent completion, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
+This is the consolidated implementation audit through original native mm
+ownership and completion retirement, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
 below, 2026-11-04, use calling workers and shared resources from their first implementation.
@@ -104,7 +104,7 @@ chain is still open; forwarding an entry alone does not remove those dependencie
 | Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Legacy futex wake target cannot schedule into its current epoch; a newly eligible nonmember, affinity/control change, instruction allowance or actual owner signal or task event requires scheduling | Current cohort scheduling boundary. Existing epoch members and ordinary readiness continue locally. Idle or periodic host-control checks do not automatically imply teardown: `cohort_control` decides whether to join. | [legacy wake](../../crates/trames-session/src/futex.rs), [worker stop](../../crates/trames-session/src/workers.rs), [cohort selection/collection](../../crates/trames-session/src/process.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
 | Embedding and terminal/session lifecycle | Transfer/timezone command, pause/cancel, terminal create/close/resize, foreground group signal/hangup, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
-| Final teardown and faults | Unfinished compiler/native context cancellation, task/context destruction, guest synchronous fault delivery or backend failure | Owner lifecycle remains. CPU View collection does not wait for unrelated accepted native disk work. Guest faults use the original signal path; a host backend error is an error, not an automatic full-VM or software CPU fallback. | [task exit/fault](../../crates/trames-session/src/process.rs), [native lifecycle contract](execution-backends.md#live-native-device-authority--2026-11-03), [HVF error mapping](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-hvf/src/kernel.rs) |
+| Final teardown and faults | Last/group/default-fatal task completion, final CPU/Memory projections, actual non-notifying native-driver idle/stop, synchronous faults or backend failure | Original GPU/video/audio roots follow actual mm references; pending GPU cancellation/retirement uses completion/unlock notifications. Final task entry and CPU/Memory custody remain owned. CPU View collection does not wait for unrelated accepted native disk work. Guest faults use the original signal path; a host backend error is an error, not an automatic full-VM or software CPU fallback. | [task exit/fault](../../crates/trames-session/src/process.rs), [native lifecycle contract](execution-backends.md#live-native-device-authority--2026-11-03), [HVF error mapping](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-hvf/src/kernel.rs) |
 
 ## Fallbacks that do not identify an owner transition
 
@@ -451,3 +451,52 @@ leader projection first used to skip original group completion, including when
 that leader was already a zombie. The regression covers both live and previously
 exited leaders and fails against the old per-thread collection loop. This fixes
 resource retirement; the final cleanup itself is still owned, not a source exit.
+
+### Original native address-space lifetime and completion retirement (2026-11-05)
+
+Native GPU, video and audio contexts belong to one actual mm resource, not the
+Kernel's maps keyed by a projected vm_id. A real CLONE_VM task acquires one mm
+reference. Capturing or cloning a worker capability retains that same task
+reference; it cannot postpone logical retirement. Fork gets a separate native
+space. Successful exec retires the old task's reference and creates a fresh
+space; other real CLONE_VM users retain their original devices. Failed exec does
+not change ownership. Source individual exit and owner lifecycle cleanup retire
+the same original reference, idempotently.
+
+The final reference takes original resources under their membership mutex and
+releases them after unlocking. Device/context leases accepted earlier keep their
+actual native dependencies. Weak caches do not own contexts: initialized ordinary
+lookups bypass mm membership locking, and source native calls keep their existing
+captured context/stream leases. No device is created for an ordinary headless mm.
+The private Rc Vulkan graph remains behind its existing exclusive context lease;
+this batch adds no unsafe Send/Sync declaration or guest-memory access policy.
+
+Canceled native compilation and final GPU retirement use original completion
+and availability subscriptions. A temporary keepalive retains the original graph
+until its native work finishes, then breaks outside both object locks. Driver
+callbacks try the context once and return when busy; an actual unlock retries the
+pending event. A notification state machine closes completion/unlock races and
+coalesces reentrant notifications. Its loop drains actual events, never polls a
+busy mutex. Signals are rearmed for later completions, and reaper unlock also
+notifies displaced normal native callers. An unlock also collects a completion
+already observed by another native caller. The reaper excludes its own listener
+when publishing its unlock, so it cannot create self-triggered polling. Only
+actual retirement work registers these callbacks. Normal context leases gain no new retirement check.
+
+Kernel-owned GPU/video/audio lifetime maps, ProcessMap native-liveness scans and
+the owner drive-loop abandoned-GPU poll are removed. Group exit/exec also abandon
+the removed original threads' accepted GPU jobs. Tests prove that unrelated
+headless execution continues while another native context is occupied, and that
+last-mm release returns before two gated native compilation jobs complete.
+Reintroducing the old owner poll or removing completion-owned retirement makes
+those guarded regressions fail. They release their gates before failing; a test
+failure cannot strand a compiler or Kernel test thread.
+
+The existing native final idle/destruction algorithms are retained. MoltenVK
+observed fences provide asynchronous pending-submission retirement on Mac/iPad.
+A backend without native fence notifications retains its actual native idle call;
+this is not advertised as a new asynchronous fence implementation for that
+backend. Native audio/decoder stop APIs retain their existing behavior. Last/group
+and default-fatal task entry, final CPU/Memory projection custody, robust futex and
+actual owner controls still need their connected migration. This batch removes
+the native ownership/polling dependency, not the remaining full process boundary.

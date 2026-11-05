@@ -5,7 +5,7 @@ pub const AUXV_KEY: u64 = 0x5452_0008;
 mod backend;
 pub use backend::{Backend, Invocation, TransferMetrics};
 mod context;
-pub use context::Context;
+pub use context::{Context, WeakContext};
 mod budget;
 mod display;
 mod task;

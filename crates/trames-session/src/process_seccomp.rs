@@ -587,6 +587,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -800,6 +801,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -902,6 +904,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    native_space: None,
                     exit_files: None,
                     children: Default::default(),
                     limits: None,
@@ -1031,6 +1034,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    native_space: None,
                     exit_files: None,
                     children: Default::default(),
                     limits: None,
@@ -1146,6 +1150,7 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    native_space: None,
                     exit_files: None,
                     children: Default::default(),
                     limits: None,
@@ -1269,6 +1274,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -1809,6 +1815,7 @@ mod tests {
             .wait((0, 7, 0x1000), 3, 1, || Ok::<_, ()>(()))
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
+            native_space: None,
             exit_files: None,
             children: Default::default(),
             limits: None,
@@ -2102,6 +2109,7 @@ mod tests {
                         .unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    native_space: None,
                     exit_files: None,
                     children: Default::default(),
                     limits: None,
@@ -2147,6 +2155,7 @@ mod tests {
             ));
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2201,6 +2210,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2248,6 +2258,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2305,6 +2316,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2362,6 +2374,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2421,6 +2434,7 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
+                native_space: None,
                 exit_files: None,
                 children: Default::default(),
                 limits: None,
@@ -2475,6 +2489,7 @@ mod tests {
                 ));
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
+                    native_space: None,
                     exit_files: None,
                     children: Default::default(),
                     limits: None,

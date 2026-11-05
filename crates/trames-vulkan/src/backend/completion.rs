@@ -302,3 +302,162 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    fn pending(backend: &mut Backend, id: u64) -> mpsc::Sender<()> {
+        let (release, gate) = mpsc::channel();
+        let task =
+            crate::task::Task::spawn_notifying(Some(backend.completion.clone()), move || {
+                gate.recv().unwrap();
+                Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })
+            .unwrap();
+        backend.compiles.insert(
+            id,
+            Compile {
+                task,
+                dependencies: Vec::new(),
+                bind_point: vk::PipelineBindPoint::COMPUTE,
+                creation_flags: 0,
+                subpass: 0,
+                vertex_inputs: Vec::new(),
+                static_states: 0,
+                output: 0,
+                abandoned: false,
+            },
+        );
+        release
+    }
+    fn gone(context: &crate::WeakContext) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while context.upgrade().is_some() {
+            assert!(
+                Instant::now() < until,
+                "native completion must release its graph without owner polling"
+            );
+            std::thread::yield_now();
+        }
+    }
+    #[test]
+    fn final_mm_release_returns_before_two_native_jobs_and_each_completion_releases_its_graph() {
+        let mut backend = Backend::new();
+        let first = pending(&mut backend, 37);
+        let second = pending(&mut backend, 38);
+        let context = crate::Context::new(backend);
+        let weak = context.downgrade();
+        let (sent, returned) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            context.retire();
+            drop(context);
+            sent.send(()).unwrap();
+        });
+        let early = returned.recv_timeout(Duration::from_secs(1));
+        if early.is_err() {
+            first.send(()).unwrap();
+            second.send(()).unwrap();
+            worker.join().unwrap();
+            panic!("guest task slot waited for unfinished native work");
+        }
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_some());
+        first.send(()).unwrap();
+        assert!(weak.upgrade().is_some());
+        second.send(()).unwrap();
+        gone(&weak);
+    }
+    #[test]
+    fn a_busy_context_defers_driver_callback_cleanup_to_unlock_without_losing_completion() {
+        for _ in 0..30 {
+            let mut backend = Backend::new();
+            let release = pending(&mut backend, 37);
+            let completion = backend.completion.clone();
+            let context = crate::Context::new(backend);
+            let weak = context.downgrade();
+            context.abandon(37);
+            let lease = context.try_lock().unwrap();
+            let (sent, notified) = mpsc::channel();
+            let notify = std::thread::spawn(move || {
+                completion.notify_atomic();
+                sent.send(()).unwrap();
+            });
+            let early = notified.recv_timeout(Duration::from_secs(1));
+            if early.is_err() {
+                drop(lease);
+                release.send(()).unwrap();
+                notify.join().unwrap();
+                panic!("driver callback blocked behind native context lease");
+            }
+            notify.join().unwrap();
+            release.send(()).unwrap();
+            drop(lease);
+            drop(context);
+            gone(&weak);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retirement_unlock_tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    struct Wake(mpsc::Sender<()>);
+    impl trames_shared::IoWake for Wake {
+        fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+            let _ = self.0.send(());
+        }
+    }
+    #[test]
+    fn unlock_collects_finished_work_even_if_another_native_caller_consumed_the_completion() {
+        let mut backend = Backend::new();
+        let (release, gate) = mpsc::channel();
+        // No aggregate delivery: completion was observed through its original
+        // task readiness, as another native caller can do before context unlock.
+        let task = crate::task::Task::spawn_notifying(None, move || {
+            gate.recv().unwrap();
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })
+        .unwrap();
+        let (sent, finished) = mpsc::channel();
+        let wake: Arc<dyn trames_shared::IoWake> = Arc::new(Wake(sent));
+        let signal = trames_shared::IoSignal::new(0, Arc::downgrade(&wake));
+        let _subscription = task.subscribe(&signal);
+        backend.compiles.insert(
+            37,
+            Compile {
+                task,
+                dependencies: Vec::new(),
+                bind_point: vk::PipelineBindPoint::COMPUTE,
+                creation_flags: 0,
+                subpass: 0,
+                vertex_inputs: Vec::new(),
+                static_states: 0,
+                output: 0,
+                abandoned: false,
+            },
+        );
+        let context = crate::Context::new(backend);
+        let weak = context.downgrade();
+        context.abandon(37);
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(context.try_lock().unwrap());
+        drop(context);
+        let until = Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() {
+            assert!(
+                Instant::now() < until,
+                "a native unlock must retire the completed original graph without an owner poll"
+            );
+            std::thread::yield_now();
+        }
+    }
+}

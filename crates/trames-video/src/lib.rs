@@ -139,7 +139,16 @@ struct Inner {
 }
 #[derive(Clone, Default)]
 pub struct Context(Arc<Inner>);
+pub struct WeakContext(std::sync::Weak<Inner>);
+impl WeakContext {
+    pub fn upgrade(&self) -> Option<Context> {
+        self.0.upgrade().map(Context)
+    }
+}
 impl Context {
+    pub fn downgrade(&self) -> WeakContext {
+        WeakContext(Arc::downgrade(&self.0))
+    }
     pub fn allocate_image(
         &self,
         format: trames_graphics::Format,

@@ -13,6 +13,7 @@ mod gpu;
 mod process;
 mod run_queue;
 mod signal_actions;
+mod space;
 mod terminal;
 mod video;
 mod worker_syscalls;

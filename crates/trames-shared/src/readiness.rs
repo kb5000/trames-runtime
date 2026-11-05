@@ -226,6 +226,23 @@ impl Readiness {
             self.notify();
         }
     }
+    /// Publish a resource unlock while excluding its own maintenance listener.
+    /// Normal waiters and exclusive-wake selection keep their original behavior.
+    /// This is only used by an actual completion handler, not ordinary I/O.
+    pub fn notify_atomic_except(&self, excluded: &Arc<IoSignal>) {
+        if self.armed.fetch_or(0, Ordering::Release) == 0 {
+            return;
+        }
+        let signals: Vec<_> = self
+            .listeners
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|s| !Arc::ptr_eq(s, excluded))
+            .collect();
+        notify(&signals);
+    }
     pub fn notify_locked(&self) {
         // Pipe retries and mutations already synchronize through the pipe lock.
         if self.armed.load(Ordering::Relaxed) != 0 {

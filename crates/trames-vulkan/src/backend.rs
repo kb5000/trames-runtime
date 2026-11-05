@@ -918,6 +918,32 @@ impl Backend {
             !done
         });
     }
+    pub(crate) fn subscribe_completion(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.completion.subscribe(signal)
+    }
+    pub(crate) fn has_abandoned(&self) -> bool {
+        self.compiles.values().any(|c| c.abandoned) || self.teardowns.values().any(|t| t.abandoned)
+    }
+    pub(crate) fn retire_jobs(&mut self) {
+        self.waits.clear();
+        for task in self.compiles.values_mut() {
+            task.abandoned = true;
+        }
+        // A dying mm has no guest teardown result to deliver. Final resource
+        // destruction keeps native work alive, without waiting for GUI feedback.
+        self.teardowns.clear();
+    }
+    pub(crate) fn retirement_ready(&self) -> bool {
+        self.compiles.is_empty()
+            && (!completion::available()
+                || self
+                    .submissions
+                    .iter()
+                    .all(|s| !matches!(Self::fence_ready(&s.fence), Ok(false))))
+    }
     pub fn reap_abandoned(&mut self) {
         self.compiles
             .retain(|_, c| !c.abandoned || matches!(c.task.poll(), Ok(None)));

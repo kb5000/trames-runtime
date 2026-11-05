@@ -27,12 +27,21 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct Context(Arc<Inner>);
+pub struct WeakContext(std::sync::Weak<Inner>);
+impl WeakContext {
+    pub fn upgrade(&self) -> Option<Context> {
+        self.0.upgrade().map(Context)
+    }
+}
 impl Default for Context {
     fn default() -> Self {
         Self::new(0)
     }
 }
 impl Context {
+    pub fn downgrade(&self) -> WeakContext {
+        WeakContext(Arc::downgrade(&self.0))
+    }
     pub fn new(capabilities: u64) -> Self {
         Self(Arc::new(Inner {
             capabilities,

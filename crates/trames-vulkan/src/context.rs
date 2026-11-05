@@ -3,6 +3,7 @@
 use crate::{Backend, Invocation, TransferMetrics};
 use std::sync::{Arc, Mutex};
 use trames_memory::{CpuMemory, MemoryError};
+mod retirement;
 
 // Backend deliberately remains !Send/!Sync. Its private Rc/RefCell graph never
 // escapes through its public interface. Only this consuming envelope may move
@@ -22,9 +23,17 @@ struct Inner {
     backend: Mutex<OwnedBackend>,
     available: Arc<trames_shared::Readiness>,
     display: crate::Display,
+    retirement: Mutex<Option<Arc<retirement::Retirement>>>,
 }
 #[derive(Clone)]
 pub struct Context(Arc<Inner>);
+/// Non-owning observation of an original native device graph.
+pub struct WeakContext(std::sync::Weak<Inner>);
+impl WeakContext {
+    pub fn upgrade(&self) -> Option<Context> {
+        self.0.upgrade().map(Context)
+    }
+}
 pub type Call = (Result<Invocation, MemoryError>, TransferMetrics);
 /// A synchronous exclusive lease; neither Backend nor its Rc graph escapes.
 pub struct Lease<'a> {
@@ -105,12 +114,16 @@ impl crate::display::SuspensionFence for Inner {
     }
 }
 impl Context {
+    pub fn downgrade(&self) -> WeakContext {
+        WeakContext(Arc::downgrade(&self.0))
+    }
     pub fn new(backend: Backend) -> Self {
         let display = backend.host_display();
         let inner = Arc::new(Inner {
             backend: Mutex::new(OwnedBackend(backend)),
             available: Arc::default(),
             display: display.clone(),
+            retirement: Mutex::default(),
         });
         display.register_context(&(inner.clone() as Arc<dyn crate::display::SuspensionFence>));
         Self(inner)
@@ -164,10 +177,22 @@ impl Context {
         self.lock().poll(memory, job)
     }
     pub fn abandon(&self, job: u64) {
-        self.lock().backend.as_mut().unwrap().0.abandon(job);
+        let mut lease = self.lock();
+        let backend = lease.backend.as_mut().unwrap();
+        backend.0.abandon(job);
+        if backend.0.has_abandoned() {
+            retirement::Retirement::arm(&self.0, backend, false);
+        }
     }
-    pub fn reap_abandoned(&self) {
-        self.lock().backend.as_mut().unwrap().0.reap_abandoned();
+    /// End an original mm's authority. Accepted native work retains the graph
+    /// through its completion; no guest View or task slot waits for destruction.
+    pub fn retire(&self) {
+        let mut lease = self.lock();
+        let backend = lease.backend.as_mut().unwrap();
+        backend.0.retire_jobs();
+        if backend.0.has_abandoned() || !backend.0.retirement_ready() {
+            retirement::Retirement::arm(&self.0, backend, true);
+        }
     }
 }
 
