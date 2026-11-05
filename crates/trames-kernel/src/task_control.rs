@@ -22,7 +22,6 @@ pub struct Group {
 struct State {
     members: BTreeMap<u32, Member>,
     child: Weak<Child>,
-    parent: Weak<Group>,
     tgid: u32,
     uid: u32,
     killed: bool,
@@ -43,16 +42,12 @@ pub struct Lease {
 }
 struct Publication {
     event: Option<Notice>,
-    parent: Weak<Group>,
     info: Info,
 }
 impl Publication {
     fn publish(self) {
         if let Some(event) = self.event {
-            event.notify();
-        }
-        if let Some(parent) = self.parent.upgrade() {
-            parent.notify_child(self.info);
+            event.signal(self.info);
         }
     }
 }
@@ -91,7 +86,6 @@ impl State {
         self.stop = Some((signal, true));
         Some(Publication {
             event: self.child.upgrade().map(|c| c.stopped_quiet(signal)),
-            parent: self.parent.clone(),
             info: Info {
                 sender: self.tgid,
                 uid: self.uid,
@@ -166,9 +160,12 @@ impl Group {
         self.stopped.load(Ordering::Relaxed)
     }
     pub fn bind(&self, child: &Arc<Child>, parent: Option<&Arc<Group>>, tgid: u32, uid: u32) {
+        self.bind_metadata(child, tgid, uid);
+        child.bind_parent_group(parent);
+    }
+    pub(crate) fn bind_metadata(&self, child: &Arc<Child>, tgid: u32, uid: u32) {
         let mut state = self.state.lock().unwrap();
         state.child = Arc::downgrade(child);
-        state.parent = parent.map_or_else(Weak::new, Arc::downgrade);
         state.tgid = tgid;
         state.uid = uid;
     }
@@ -293,7 +290,6 @@ impl Group {
                     });
                     Publication {
                         event,
-                        parent: state.parent.clone(),
                         info: Info {
                             sender: state.tgid,
                             uid: state.uid,
@@ -322,7 +318,11 @@ impl Group {
         }
         value
     }
-    fn notify_child(&self, info: Info) {
+    pub(crate) fn auto_reap_children(&self) -> bool {
+        self.live_task()
+            .is_some_and(|task| task.auto_reap_children())
+    }
+    pub(crate) fn notify_child(&self, info: Info) {
         let tasks = self.state.lock().unwrap().tasks();
         if let Some(first) = tasks.first() {
             if first.child_signal(info) {
@@ -336,7 +336,8 @@ impl Group {
         self.state.lock().unwrap().tasks()
     }
     pub fn parent(&self) -> Option<Arc<Group>> {
-        self.state.lock().unwrap().parent.upgrade()
+        let child = self.state.lock().unwrap().child.upgrade();
+        child.and_then(|child| child.parent_group())
     }
     pub fn live_task(&self) -> Option<Arc<IoTask>> {
         self.state.lock().unwrap().tasks().into_iter().next()

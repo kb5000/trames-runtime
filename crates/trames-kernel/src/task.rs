@@ -8,6 +8,9 @@ use std::sync::{
 #[derive(Clone, Default)]
 pub struct Visibility(Arc<AtomicBool>);
 impl Visibility {
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     pub fn present(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }

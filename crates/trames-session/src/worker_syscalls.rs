@@ -500,7 +500,11 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             93 => self.exit_files.is_some(),
             96 => self.io_signals.thread_addresses().is_some(),
-            167 => matches!(cpu.x(0) as u32, 1 | 2) && self.io_signals.parentage().is_some(),
+            167 => match cpu.x(0) as u32 {
+                1 | 2 => self.io_signals.parentage().is_some(),
+                36 | 37 => self.io_signals.family().is_some(),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -625,6 +629,18 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            167 if matches!(cpu.x(0) as u32, 36 | 37) => {
+                let family = self.io_signals.family()?;
+                if cpu.x(0) as u32 == 36 {
+                    family.set_subreaper(cpu.x(1) != 0);
+                    Ok(0)
+                } else {
+                    memory
+                        .write(cpu.x(1), &u32::from(family.subreaper()).to_le_bytes())
+                        .map(|()| 0)
+                        .map_err(|_| Errno(14))
+                }
+            }
             167 if matches!(cpu.x(0) as u32, 1 | 2) => {
                 let parentage = self.io_signals.parentage()?;
                 match cpu.x(0) as u32 {
@@ -768,6 +784,12 @@ impl Snapshot {
             }
             166 => Ok(self.umask.swap(cpu.x(0) as u32) as u64),
             214 if cpu.x(0) == 0 => Ok(self.program_break.get()),
+            173 => Ok(self
+                .io_signals
+                .family()
+                .map_or(self.identities[1], |family| {
+                    self.io_routes.namespace.local(family.parent()) as u64
+                })),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
             number @ (113 | 114) => clock_with_boot(
                 memory,

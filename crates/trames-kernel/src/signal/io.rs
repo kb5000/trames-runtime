@@ -170,6 +170,7 @@ pub struct IoTask {
     cgroup: std::sync::OnceLock<trames_vfs::CgroupTask>,
     thread_addresses: std::sync::OnceLock<Arc<trames_execution::ThreadAddresses>>,
     parentage: std::sync::OnceLock<Arc<crate::task_parent::Parentage>>,
+    family: std::sync::OnceLock<Arc<crate::family::Family>>,
     session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
@@ -192,6 +193,7 @@ impl Default for IoTask {
             cgroup: Default::default(),
             thread_addresses: Default::default(),
             parentage: Default::default(),
+            family: Default::default(),
             session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
@@ -248,6 +250,13 @@ impl IoTask {
     }
     pub fn parentage(&self) -> Option<&Arc<crate::task_parent::Parentage>> {
         self.parentage.get()
+    }
+    pub fn family(&self) -> Option<&Arc<crate::family::Family>> {
+        self.family.get()
+    }
+    pub fn bind_family(&self, family: &Arc<crate::family::Family>) {
+        let original = self.family.get_or_init(|| family.clone());
+        debug_assert!(Arc::ptr_eq(original, family));
     }
     pub fn bind_parentage(&self, parentage: &Arc<crate::task_parent::Parentage>) {
         let original = self.parentage.get_or_init(|| parentage.clone());
@@ -380,6 +389,13 @@ impl IoTask {
             .unwrap()
             .as_ref()
             .is_some_and(|p| p.namespace.local(sender) == 0)
+    }
+    pub(crate) fn auto_reap_children(&self) -> bool {
+        self.policy.read().unwrap().as_ref().is_some_and(|policy| {
+            policy
+                .actions
+                .with_action(17, |action| action.handler == 1 || action.flags & 2 != 0)
+        })
     }
     pub(crate) fn child_signal(&self, info: Info) -> bool {
         let queued = {

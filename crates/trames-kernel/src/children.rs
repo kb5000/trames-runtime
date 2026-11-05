@@ -20,11 +20,19 @@ pub struct Children {
 }
 #[derive(Default)]
 pub struct Child(Mutex<State>);
-pub(crate) struct Notice(Option<Arc<Children>>);
+pub(crate) struct Notice(Option<Arc<Children>>, Weak<crate::task_control::Group>);
 impl Notice {
     pub fn notify(self) {
         if let Some(parent) = self.0 {
             parent.changed.notify_locked();
+        }
+    }
+    pub fn signal(self, info: crate::signal::Info) {
+        if let Some(parent) = self.0 {
+            parent.changed.notify_locked();
+        }
+        if let Some(parent) = self.1.upgrade() {
+            parent.notify_child(info);
         }
     }
 }
@@ -34,6 +42,7 @@ struct State {
     group: u32,
     uid: u32,
     parent: Weak<Children>,
+    parent_group: Weak<crate::task_control::Group>,
     event: Option<i32>,
     stopped: bool,
     exited: bool,
@@ -41,12 +50,32 @@ struct State {
     presence: crate::task::Visibility,
 }
 impl Child {
+    pub(crate) fn parent_group(&self) -> Option<Arc<crate::task_control::Group>> {
+        self.0.lock().unwrap().parent_group.upgrade()
+    }
+    pub(crate) fn bind_parent_group(&self, parent: Option<&Arc<crate::task_control::Group>>) {
+        self.0.lock().unwrap().parent_group = parent.map_or_else(Weak::new, Arc::downgrade);
+    }
     pub fn bind_presence(&self, presence: &Arc<crate::task::Presence>) {
         self.0.lock().unwrap().presence = presence.visibility();
     }
     /// Parentage changes are structural lifecycle operations. Never hold a
     /// child lock while acquiring a parent's membership lock or calling wakes.
     pub fn attach(self: &Arc<Self>, parent: Option<&Arc<Children>>, id: u32, group: u32, uid: u32) {
+        let signal_parent = self.parent_group();
+        for notice in self.attach_quiet(parent, signal_parent.as_ref(), id, group, uid) {
+            notice.notify();
+        }
+    }
+    pub(crate) fn attach_quiet(
+        self: &Arc<Self>,
+        parent: Option<&Arc<Children>>,
+        signal_parent: Option<&Arc<crate::task_control::Group>>,
+        id: u32,
+        group: u32,
+        uid: u32,
+    ) -> Vec<Notice> {
+        let mut notices = Vec::new();
         let (previous, previous_id) = {
             let mut state = self.0.lock().unwrap();
             let previous_id = state.id;
@@ -54,21 +83,22 @@ impl Child {
             state.id = id;
             state.group = group;
             state.uid = uid;
+            state.parent_group = signal_parent.map_or_else(Weak::new, Arc::downgrade);
             let next = parent.map_or_else(Weak::new, Arc::downgrade);
             if Weak::ptr_eq(&state.parent, &next) {
                 drop(state);
                 if group_changed {
                     if let Some(parent) = parent {
-                        parent.changed.notify_locked();
+                        notices.push(Notice(Some(parent.clone()), Weak::new()));
                     }
                 }
-                return;
+                return notices;
             }
             (std::mem::replace(&mut state.parent, next), previous_id)
         };
         if let Some(old) = previous.upgrade() {
             old.entries.lock().unwrap().remove(&previous_id);
-            old.changed.notify_locked();
+            notices.push(Notice(Some(old), Weak::new()));
         }
         if let Some(parent) = parent {
             parent
@@ -76,8 +106,9 @@ impl Child {
                 .lock()
                 .unwrap()
                 .insert(id, Arc::downgrade(self));
-            parent.changed.notify_locked();
+            notices.push(Notice(Some(parent.clone()), Weak::new()));
         }
+        notices
     }
     fn publish_quiet(&self, status: Option<i32>, exited: bool) -> Notice {
         let parent = {
@@ -85,18 +116,18 @@ impl Child {
             // A consumed exit belongs to this original child, never a later
             // projection refresh or a process that happens to reuse its PID.
             if state.reaped || state.exited {
-                return Notice(None);
+                return Notice(None, Weak::new());
             }
             let stopped = !exited && status.is_some_and(|s| s != 0xffff);
             if status.is_some() && !exited && state.stopped == stopped {
-                return Notice(None);
+                return Notice(None, Weak::new());
             }
             state.stopped = stopped;
             state.event = status;
             state.exited = exited;
-            state.parent.upgrade()
+            (state.parent.upgrade(), state.parent_group.clone())
         };
-        Notice(parent)
+        Notice(parent.0, parent.1)
     }
     fn publish(&self, status: Option<i32>, exited: bool) {
         self.publish_quiet(status, exited).notify();
@@ -115,6 +146,32 @@ impl Child {
     }
     pub fn exited(&self, status: i32) {
         self.publish(Some(status), true);
+    }
+    /// Complete once, or re-notify an already exited child after adoption.
+    /// Parent identity, status and automatic reaping form one child transaction.
+    pub(crate) fn finish_quiet(
+        &self,
+        status: Option<i32>,
+        auto_reap: bool,
+    ) -> Option<(Notice, i32)> {
+        let mut state = self.0.lock().unwrap();
+        if state.reaped || status.is_some() == state.exited {
+            return None;
+        }
+        let status = status.or(state.event)?;
+        state.exited = true;
+        state.stopped = false;
+        state.event = Some(status);
+        let parent = state.parent.upgrade();
+        if auto_reap {
+            state.reaped = true;
+            state.event = None;
+            state.presence.reap();
+            if let Some(parent) = &parent {
+                parent.reaped.store(true, Ordering::Relaxed);
+            }
+        }
+        Some((Notice(parent, state.parent_group.clone()), status))
     }
     pub fn clear(&self) {
         self.publish(None, false);

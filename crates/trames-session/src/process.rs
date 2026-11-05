@@ -81,7 +81,7 @@ pub(crate) struct Process<C: Cpu> {
     scheduler: u32,
     memory: Memory,
     linux: Linux,
-    parent: u32,
+    family: Arc<trames_kernel::family::Family>,
     parentage: Arc<trames_kernel::task_parent::Parentage>,
     group: u32,
     session: u32,
@@ -113,7 +113,6 @@ pub(crate) struct Process<C: Cpu> {
     cpu_time: Duration,
     vm_id: u64,
     rekey: Option<u32>,
-    subreaper: bool,
     membarrier_registered: Rc<Cell<bool>>,
     limits: Arc<trames_kernel::limits::Limits>,
     oom: Arc<trames_vfs::OomTask>,
@@ -432,7 +431,7 @@ impl<C: Cpu> Process<C> {
             scheduler: self.scheduler,
             memory,
             linux,
-            parent: 0,
+            family: Arc::default(),
             parentage: Arc::default(),
             group: self.group,
             session: self.session,
@@ -464,7 +463,6 @@ impl<C: Cpu> Process<C> {
             cpu_time: Duration::ZERO,
             vm_id: self.vm_id,
             rekey: None,
-            subreaper: false,
             membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
             limits,
             oom: Arc::new(self.oom.fork()),
@@ -489,6 +487,7 @@ impl trames_vfs::IoWake for JoinedByteWake {
 pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
     file_layouts: Vec<file_io::FileLayout>,
+    families: Arc<trames_kernel::family::Families>,
     limit_directory: Arc<trames_kernel::limits::Directory>,
     children_dirty: Cell<bool>,
     memory_limits: super::MemoryLimits,
@@ -639,6 +638,7 @@ impl<C: Cpu> Kernel<C> {
             return;
         }
         p.bind_signals();
+        p.signals.io.bind_family(&p.family);
         p.signals
             .io
             .bind_thread_addresses(p.linux.thread_addresses());
@@ -986,7 +986,7 @@ impl<C: Cpu> Kernel<C> {
         child.bind_signals();
         child.linux.vfs.set_process_context(id);
         child.linux.fork_tid(0);
-        child.parent = 1;
+        child.family.set_parent(1);
         child.parentage.set_parent_thread(1);
         child.tgid = id;
         child.session = id;
@@ -1120,7 +1120,7 @@ impl<C: Cpu> Kernel<C> {
         trames_vfs::ProcessInfo {
             pid,
             tgid: p.tgid,
-            parent: p.parent,
+            parent: p.family.parent(),
             group: p.group,
             session: p.session,
             state: if p.stopped() && !matches!(p.state, State::Zombie(_)) {
@@ -1296,26 +1296,6 @@ impl<C: Cpu> Kernel<C> {
             },
         );
     }
-    fn notify(&mut self, parent: u32, child: u32, uid: u32, status: i32, code: i32) {
-        if let Some(p) = self.processes.get_mut(&parent) {
-            let action = p.signals.actions.get(17);
-            if action.handler == 1 || (matches!(code, 5 | 6) && action.flags & 1 != 0) {
-                return;
-            }
-            let _ = p.signals.io.process().enqueue(
-                17,
-                Info {
-                    sender: child,
-                    uid,
-                    status,
-                    code,
-                    timer: None,
-                    fault: None,
-                    poll: None,
-                },
-            );
-        }
-    }
     fn close_exit_files(&self, p: &mut Process<C>) {
         p.linux.executable_file = None;
         if !self
@@ -1342,6 +1322,9 @@ impl<C: Cpu> Kernel<C> {
     }
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         self.children_dirty.set(true);
+        if p.family.registry().is_none() {
+            self.publish_children(Some(p));
+        }
         p.signals.io.exit();
         p.linux.cancel_uring(&mut p.memory, pid);
         p.uring_wait = None;
@@ -1381,10 +1364,6 @@ impl<C: Cpu> Kernel<C> {
             self.finish_group(p.tgid);
             return;
         }
-        p.auto_reap = self.processes.get(&p.parent).is_some_and(|parent| {
-            let action = parent.signals.actions.get(17);
-            action.handler == 1 || action.flags & 2 != 0
-        });
         if pid != 1 {
             p.memory = Memory::default();
         }
@@ -1400,19 +1379,14 @@ impl<C: Cpu> Kernel<C> {
             if let Some(completion) = &p.host_status {
                 completion.store(status, std::sync::atomic::Ordering::Relaxed);
             }
-            self.reap_namespace_children(pid, p.linux.vfs.pid_namespace(), p.parent);
-            self.timers.clear_process(p.tgid, false);
-            self.notify(
-                p.parent,
+            self.reap_namespace_children(
                 pid,
-                p.linux.vfs.credentials.uid,
-                if status & 127 == 0 {
-                    status >> 8
-                } else {
-                    status & 127
-                },
-                if status & 127 == 0 { 1 } else { 2 },
+                p.linux.vfs.pid_namespace(),
+                &p.family,
+                &p.signals.io_directory.parents,
             );
+            self.timers.clear_process(p.tgid, false);
+            p.auto_reap = self.families.complete(&p.family, status);
         } else {
             p.auto_reap = false;
         }
@@ -1431,26 +1405,11 @@ impl<C: Cpu> Kernel<C> {
                 if let Some(completion) = &leader.host_status {
                     completion.store(status, std::sync::atomic::Ordering::Relaxed);
                 }
-                let parent = leader.parent;
-                let uid = leader.linux.vfs.credentials.uid;
+                let family = leader.family.clone();
+                let directory = leader.signals.io_directory.clone();
                 let namespace = leader.linux.vfs.pid_namespace().clone();
-                self.reap_namespace_children(tgid, &namespace, parent);
-                self.notify(
-                    parent,
-                    tgid,
-                    uid,
-                    if status & 127 == 0 {
-                        status >> 8
-                    } else {
-                        status & 127
-                    },
-                    if status & 127 == 0 { 1 } else { 2 },
-                );
-                let auto = self.processes.get(&parent).is_some_and(|p| {
-                    let action = p.signals.actions.get(17);
-                    action.handler == 1 || action.flags & 2 != 0
-                });
-                if auto && tgid != 1 {
+                self.reap_namespace_children(tgid, &namespace, &family, &directory.parents);
+                if self.families.complete(&family, status) && tgid != 1 {
                     self.processes.remove(&tgid);
                 }
             }
@@ -2174,24 +2133,27 @@ impl<C: Cpu> Kernel<C> {
                     )
                 }))
         };
-        let parents: BTreeMap<_, _> = tasks().map(|(_, p)| (p.tgid, &p.children)).collect();
-        for (id, p) in tasks().filter(|(id, p)| *id == p.tgid) {
-            let parent =
-                tasks().find_map(|(_, t)| (t.tgid == p.parent).then(|| t.signals.io.lifecycle()));
-            p.signals
-                .io
-                .lifecycle()
-                .bind(&p.wait_event, parent, id, p.linux.vfs.credentials.uid);
+        self.families.prune();
+        let mut leaders: Vec<_> = tasks().filter(|(id, p)| *id == p.tgid).collect();
+        leaders.sort_by_key(|(id, _)| *id);
+        for (id, p) in leaders {
             p.wait_event.bind_presence(&p.signals.presence);
-            p.wait_event.attach(
-                parents.get(&p.parent).copied(),
-                id,
-                p.group,
-                p.linux.vfs.credentials.uid,
+            self.families.publish(
+                &p.family,
+                trames_kernel::family::Binding {
+                    id,
+                    group: p.group,
+                    uid: p.linux.vfs.credentials.uid,
+                    namespace: p.linux.vfs.pid_namespace().clone(),
+                    child: p.wait_event.clone(),
+                    children: p.children.clone(),
+                    control: p.signals.io.lifecycle().clone(),
+                    presence: p.signals.presence.visibility(),
+                },
             );
             if let State::Zombie(status) = p.state {
                 if !tasks().any(|(_, t)| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_))) {
-                    p.wait_event.exited(status);
+                    self.families.complete(&p.family, status);
                 }
             }
         }
@@ -2548,7 +2510,7 @@ impl<C: Cpu> Kernel<C> {
             }
             172 => Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64)),
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),
-            173 => Ok(Some(p.linux.vfs.visible_pid(p.parent) as u64)),
+            173 => Ok(Some(p.linux.vfs.visible_pid(p.family.parent()) as u64)),
             96 => {
                 p.linux.dispatch(&mut p.cpu, &mut p.memory, io);
                 Ok(Some(p.linux.vfs.visible_pid(pid) as u64))
@@ -2666,18 +2628,20 @@ impl<C: Cpu> Kernel<C> {
                     child.wait_event = p.wait_event.clone();
                     child.oom = Arc::new(p.oom.thread());
                     child.signals.io.share_process(&p.signals.io);
-                    child.subreaper = p.subreaper;
+                    child.family = p.family.clone();
                     child.limits = p.limits.clone();
                     child.limits.bind(&mut child.linux.vfs);
                 }
                 child
                     .linux
                     .fork_tid(if a[0] & 0x200000 != 0 { a[4] } else { 0 });
-                child.parent = if threaded || a[0] & 0x8000 != 0 {
-                    p.parent
-                } else {
-                    p.tgid
-                };
+                if !threaded {
+                    child.family.set_parent(if a[0] & 0x8000 != 0 {
+                        p.family.parent()
+                    } else {
+                        p.tgid
+                    });
+                }
                 child
                     .parentage
                     .set_parent_thread(if threaded || a[0] & 0x8000 != 0 {
@@ -2793,14 +2757,11 @@ impl<C: Cpu> Kernel<C> {
             167 if a[0] == 4 => p.linux.vfs.set_dumpable(a[1]).map(|()| Some(0)),
             167 if matches!(a[0], 36 | 37) => match a[0] {
                 36 => {
-                    p.subreaper = a[1] != 0;
-                    for t in self.processes.values_mut().filter(|t| t.tgid == p.tgid) {
-                        t.subreaper = p.subreaper;
-                    }
+                    p.family.set_subreaper(a[1] != 0);
                     Ok(Some(0))
                 }
                 37 => {
-                    write_u32(&mut p.memory, a[1], u32::from(p.subreaper))?;
+                    write_u32(&mut p.memory, a[1], u32::from(p.family.subreaper()))?;
                     Ok(Some(0))
                 }
                 _ => Err(Errno(22)),
@@ -2877,14 +2838,14 @@ impl<C: Cpu> Kernel<C> {
                     p.linux.vfs.global_pid(a[1] as u32).map_err(|_| Errno(1))?
                 };
                 let (session, parent) = if target == p.tgid {
-                    (p.session, p.parent)
+                    (p.session, p.family.parent())
                 } else {
                     let c = self
                         .processes
                         .get(&target)
                         .filter(|c| c.tgid == target)
                         .ok_or(Errno(3))?;
-                    (c.session, c.parent)
+                    (c.session, c.family.parent())
                 };
                 if target != p.tgid && parent != p.tgid {
                     return Err(Errno(3));
@@ -4429,7 +4390,7 @@ impl<C: Cpu> Kernel<C> {
                 && (p.stopped()
                     || matches!(p.state, State::Blocked(95 | 260, _))
                         && !p.linux.trace
-                        && first.parent == p.tgid
+                        && first.family.parent() == p.tgid
                     || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
                     || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
                         && !p.linux.trace
@@ -4702,7 +4663,7 @@ impl<C: Cpu> Kernel<C> {
                     seccomp: p.seccomp.clone(),
                     identities: [
                         p.linux.vfs.visible_pid(p.tgid) as u64,
-                        p.linux.vfs.visible_pid(p.parent) as u64,
+                        p.linux.vfs.visible_pid(p.family.parent()) as u64,
                         c.uid as u64,
                         c.euid as u64,
                         c.gid as u64,
@@ -5747,7 +5708,7 @@ pub(super) fn run<C: Cpu>(
         scheduler: 0,
         memory: std::mem::take(&mut runtime.memory),
         linux,
-        parent: 0,
+        family: Arc::default(),
         parentage: Arc::default(),
         group: 1,
         session: 1,
@@ -5779,7 +5740,6 @@ pub(super) fn run<C: Cpu>(
         cpu_time: Duration::ZERO,
         vm_id: 1,
         rekey: None,
-        subreaper: false,
         membarrier_registered: Rc::new(Cell::new(false)),
         limits,
         oom: Arc::new(trames_vfs::OomTask::default()),
@@ -5791,6 +5751,7 @@ pub(super) fn run<C: Cpu>(
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         file_layouts: Vec::new(),
+        families: Arc::default(),
         limit_directory: Default::default(),
         children_dirty: Cell::new(true),
         memory_limits: runtime.memory_limits,
@@ -6634,7 +6595,7 @@ mod tests {
         assert!(producer.retained_poll.is_none());
         producer.tgid = 2;
         producer.vm_id = 2;
-        producer.parent = 1;
+        producer.family.set_parent(1);
         producer.signals.actions.set_handler(13, 1);
         producer.memory.write(0x1100, b"o").unwrap();
         // write(old_writer); read(ack_reader); write(old_writer).
@@ -6809,7 +6770,7 @@ mod tests {
         let mut producer = p.fork();
         producer.tgid = 2;
         producer.vm_id = 2;
-        producer.parent = 1;
+        producer.family.set_parent(1);
         producer.memory.write(0x1100, b"o").unwrap();
         // write(writer, buf, 1); exit(0).
         let code: Vec<_> = [0xd4000001u32, 0xd2800ba8, 0xd2800000, 0xd4000001]
@@ -7005,7 +6966,7 @@ mod tests {
         assert!(producer.flock_wait.is_none());
         producer.tgid = 2;
         producer.vm_id = 2;
-        producer.parent = 1;
+        producer.family.set_parent(1);
         // unlock(b); read(ack) until not EAGAIN; flock(b, LOCK_EX | LOCK_NB).
         // Keep a guest runnable across a cohort's host-time cutoff. If both
         // tasks block, the kernel may legitimately return to owner scheduling,
@@ -7211,11 +7172,11 @@ mod tests {
                 .unwrap();
             let mut peer = parent.fork();
             peer.tgid = 2;
-            peer.parent = 1;
+            peer.family.set_parent(1);
             peer.cpu.set_pc(0x4010);
             let mut child = parent.fork();
             child.tgid = 42;
-            child.parent = 1;
+            child.family.set_parent(1);
             child.state = State::Zombie(23 << 8);
             let mut kernel = kernel();
             kernel.cpu_count = 2;
@@ -7260,7 +7221,7 @@ mod tests {
             scheduler: 0,
             memory,
             linux,
-            parent: 0,
+            family: Arc::default(),
             parentage: Arc::default(),
             group: 1,
             session: 1,
@@ -7292,7 +7253,6 @@ mod tests {
             cpu_time: Duration::ZERO,
             vm_id: 1,
             rekey: None,
-            subreaper: false,
             membarrier_registered: Rc::new(Cell::new(false)),
             limits,
             oom: Arc::new(trames_vfs::OomTask::default()),
@@ -7465,6 +7425,7 @@ mod tests {
         Kernel {
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             file_layouts: Vec::new(),
+            families: Arc::default(),
             limit_directory: Default::default(),
             children_dirty: Cell::new(true),
             memory_limits: super::super::MemoryLimits::default(),
@@ -8095,7 +8056,7 @@ mod tests {
         p.affinity = 3;
         let mut peer = p.fork();
         peer.vm_id = 2;
-        peer.parent = 1;
+        peer.family.set_parent(1);
         let mut k = kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
@@ -8160,7 +8121,7 @@ mod tests {
         let mut peer = p.fork();
         peer.memory = p.memory.share();
         peer.tgid = 1;
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.auto_reap = false;
         let mut k = kernel();
         k.cpu_count = 2;
@@ -8199,7 +8160,7 @@ mod tests {
         p.affinity = 3;
         let mut peer = p.fork();
         peer.memory = p.memory.share();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         let mut k = kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);

@@ -56,7 +56,7 @@ fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services(
         p.memory.write_array(0x1310, carried.to_le_bytes()).unwrap();
         filter(&mut k, &mut p, 0x7fff0000);
         let mut sender = p.fork();
-        sender.parent = 1;
+        sender.family.set_parent(1);
         sender.tgid = 2;
         sender.vm_id = 2;
         let make = |receive: bool| {
@@ -215,7 +215,7 @@ fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
         p.memory.write_array(0x1810, 1u64.to_le_bytes()).unwrap();
         filter(&mut k, &mut p, 0x7fff0000);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         peer.vm_id = 2;
         let make = |calls: &[(u32, u32, u32)]| {
@@ -352,7 +352,7 @@ fn netlink_link_changes_wake_poll_and_message_receivers_on_one_or_two_workers() 
         p.memory.write_array(0x1104, 1u16.to_le_bytes()).unwrap();
         filter(&mut k, &mut p, 0x7fff0000);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         peer.vm_id = 2;
         let finish = [
@@ -551,7 +551,7 @@ fn raw_ip_scalar_vector_pairs_run_without_owner_on_native_and_packet_stack_trans
                     }
                     filter(&mut k, &mut p, 0x7fff0000);
                     let mut peer = p.fork();
-                    peer.parent = 1;
+                    peer.family.set_parent(1);
                     peer.tgid = 2;
                     peer.memory.write(0x1400, b"abcxyz").unwrap();
                     let finish = [
@@ -683,7 +683,7 @@ fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
             }
             filter(&mut k, &mut p, 0x7fff0000);
             let mut peer = p.fork();
-            peer.parent = 1;
+            peer.family.set_parent(1);
             peer.tgid = 2;
             peer.memory.write(0x1100, &left_address).unwrap();
             peer.memory.write(0x1400, b"abcxyz").unwrap();
@@ -853,7 +853,7 @@ fn native_message_epipe_hands_only_saved_task_effects_to_owner() {
             }
             filter(&mut k, &mut p, 0x7fff0000);
             let mut peer = p.fork();
-            peer.parent = 1;
+            peer.family.set_parent(1);
             peer.tgid = 2;
             let flags = if no_signal { 0x4000 } else { 0 };
             let args = match number {
@@ -980,7 +980,7 @@ fn blocking_accept_returns_the_only_slot_for_a_connecting_peer_without_service()
             filter(&mut k, &mut p, 0x7fff0000);
         }
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         // Parent accept parks. The only worker must then run the peer's
         // blocking connect, and return to the accepted original call.
         program(
@@ -1232,7 +1232,7 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
     filter(&mut k, &mut p, 0x7fff0000);
     let mut peer = p.fork();
     peer.tgid = 2;
-    peer.parent = 1;
+    peer.family.set_parent(1);
     p.linux.vfs.close(tx).unwrap();
     p.linux.vfs.close(event).unwrap();
     peer.linux.vfs.close(rx).unwrap();
@@ -1402,7 +1402,7 @@ fn directory_lifecycle_and_enumeration_stay_on_workers_with_one_filter_decision_
             0x14000000,
         ]);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         program(&mut p, code.clone());
         program(&mut peer, code);
@@ -1522,7 +1522,7 @@ fn worker_devpts_create_unlock_peer_and_close_need_no_coordinator_services() {
             0x14000000,
         ]);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         program(&mut p, code.clone());
         program(&mut peer, code);
@@ -1692,7 +1692,7 @@ fn pty_aliases_and_short_controls_run_on_workers_with_one_filter_decision() {
             0x14000000,
         ]);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         program(&mut p, code.clone());
         program(&mut peer, code);
@@ -1807,7 +1807,7 @@ fn signalfd_lifecycle_updates_and_aliases_run_on_workers_with_one_filter_decisio
             0x14000000,
         ]);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         program(&mut p, code.clone());
         program(&mut peer, code);
@@ -1927,7 +1927,7 @@ fn filtered_worker_unix_creation_controls_and_membership_need_no_services() {
             0x14000000,
         ]);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         program(&mut p, code.clone());
         program(&mut peer, code);
@@ -2084,7 +2084,7 @@ fn unix_blocking_accept_returns_its_slot_for_a_connecting_peer_without_services(
                 filter(&mut k, &mut p, 0x7fff0000);
             }
             let mut peer = p.fork();
-            peer.parent = 1;
+            peer.family.set_parent(1);
             peer.tgid = 2;
             let park = [
                 mov(0, 0x1060),
@@ -2183,7 +2183,7 @@ fn filtered_unix_path_bind_connect_accept_and_bytes_finish_locally_on_one_or_two
         p.memory.write(0x1040, b"x").unwrap();
         filter(&mut k, &mut p, 0x7fff0000);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         let mut code = Vec::new();
         for i in 0..8 {
@@ -2295,7 +2295,7 @@ fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
         p.memory.write(0x1000, address).unwrap();
         filter(&mut k, &mut p, 0x7fff0000);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         let park = [
             mov(0, 0x1060),
@@ -2420,7 +2420,7 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                         filter(&mut k, &mut p, 0x7fff0000);
                     }
                     let mut peer = p.fork();
-                    peer.parent = 1;
+                    peer.family.set_parent(1);
                     peer.tgid = 2;
                     let park = [
                         mov(0, 0x1060),
@@ -2560,7 +2560,7 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                     filter(&mut k, &mut p, 0x7fff0000);
                 }
                 let mut peer = p.fork();
-                peer.parent = 1;
+                peer.family.set_parent(1);
                 peer.tgid = 2;
                 let park = [
                     mov(0, 0x1060),
@@ -2688,7 +2688,7 @@ fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filt
         }
         filter(&mut k, &mut p, 0x7fff0000);
         let mut peer = p.fork();
-        peer.parent = 1;
+        peer.family.set_parent(1);
         peer.tgid = 2;
         let park = [
             mov(0, 0x1060),
@@ -2768,7 +2768,7 @@ fn stateless_device_lifecycles_and_unix_rights_complete_on_workers_with_one_filt
             p.memory.write_array(0x110c, 1u32.to_le_bytes()).unwrap();
             filter(&mut k, &mut p, 0x7fff0000);
             let mut peer = p.fork();
-            peer.parent = 1;
+            peer.family.set_parent(1);
             peer.tgid = 2;
             let mut code = Vec::new();
             let mut results = Vec::new();

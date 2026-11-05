@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through the source thread-exit and parent-thread resource
-batch, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
+This is the consolidated implementation audit through original process families
+and parent completion, 2026-11-05. Mac HVF and the iPad interpreter use the same userspace Linux
 kernel. The remaining boundaries below are still present; completing the latest
 batch does not make the whole runtime coordinator-free. The Docker I/O additions
 below, 2026-11-04, use calling workers and shared resources from their first implementation.
@@ -408,3 +408,46 @@ their explicit before-effects boundary; a source table cannot admit those owner
 projections while the cohort is active. Tracing, vfork, legacy ancillary reaping
 and accepted owner/mapped-file operations retain their documented custody.
 The ordinary syscall/native hot paths gain no new policy or guest-memory fence.
+
+### Original process families and completion notifications (2026-11-05)
+
+`Family` is the process group's actual shared parent/subreaper state. Threads
+share it; a fork gets a fresh subreaper flag. Source getppid and
+PR_SET/GET_CHILD_SUBREAPER read/write those original scalars, including the
+existing ALLOW/ERRNO filter decision and checked guest copyout. They do not copy
+parentage into a worker-only policy table or broadcast a change across Process
+projections. Scalar accesses remain relaxed atomics.
+
+`Families` owns the original parent/children graph. Structural registration,
+adoption, final-status publication and PID-namespace victim selection transact
+there; callbacks follow its lock. Parent wait membership and the parent signal
+group are one Child relationship, so later STOP/CONT notifications reach the
+same original parent as waits. Adoption updates the shared process parent and
+all original live parent-thread links. Subreaper search stays within the active
+PID namespace. A zombie adopted by an ignoring/NOCLDWAIT parent retires its
+original wait/PID presence directly. Disposition comes from an actual live
+parent member even if its leader thread has already exited.
+
+Nonleader exec keeps the original Family, Child and descendants while replacing
+the original task-presence binding. Registration must refresh that identity even
+when numeric PID, process group and UID do not change. Pruning retains a live
+family through this handover. The deterministic regression loses the original
+children/wait result without these changes, and passes with them. This fixes the
+full namespace program's blocked parent without a timeout, retry or polling fix.
+
+This is dependency migration, **not final source process exit**. The existing
+lifecycle owner still determines the last-member boundary and holds CPU/VFS/mm
+and native-context teardown. It calls the same Family retirement/completion API;
+namespace victims are original identities, then their remaining CPU projections
+are collected by their existing custodian. Last-member exit, exit_group/default
+fatal exit, robust-futex support and final mm/native ownership remain open, as do
+actual owner epoll/namespace/proc/mount destructors, tracing/vfork and accepted
+owner/mapped-file work. No resource thread, message bus, ordinary guest-memory
+barrier or extra native permission model is added.
+
+Namespace shutdown passes each original victim group to the existing full-group
+cleanup, retaining its waitable leader until its peers retire. Removing the
+leader projection first used to skip original group completion, including when
+that leader was already a zombie. The regression covers both live and previously
+exited leaders and fails against the old per-thread collection loop. This fixes
+resource retirement; the final cleanup itself is still owned, not a source exit.

@@ -205,7 +205,7 @@ mod tests {
         let root = process();
         let mut child = root.fork();
         child.tgid = 2;
-        child.parent = 1;
+        child.family.set_parent(1);
         k.processes.insert(1, root);
         assert_eq!(
             k.reboot_guest(

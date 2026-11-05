@@ -527,7 +527,7 @@ mod tests {
                 thread.wait_event = p.wait_event.clone();
                 let mut child = p.fork();
                 child.tgid = 42;
-                child.parent = 1;
+                child.family.set_parent(1);
                 child.state = State::Sleep(Instant::now() + Duration::from_secs(60), 0);
                 let mut k = kernel();
                 k.cpu_count = 2;
@@ -713,8 +713,8 @@ mod tests {
                             Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                         ));
                     }
-                    let mut peer = p.fork();
-                    peer.parent = 1;
+                    let peer = p.fork();
+                    peer.family.set_parent(1);
                     let mut k = super::super::tests::kernel();
                     k.cpu_count = 2;
                     k.workers = crate::workers::Pool::new(2);
@@ -1391,8 +1391,8 @@ mod tests {
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
-            let mut peer = p.fork();
-            peer.parent = 1;
+            let peer = p.fork();
+            peer.family.set_parent(1);
             let mut kernel = super::super::tests::kernel();
             kernel.cpu_count = 2;
             kernel.workers = crate::workers::Pool::new(2);
@@ -1461,8 +1461,8 @@ mod tests {
                 p.seccomp.push(Arc::new(
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
-                let mut peer = p.fork();
-                peer.parent = 1;
+                let peer = p.fork();
+                peer.family.set_parent(1);
                 let mut kernel = super::super::tests::kernel();
                 kernel.cpu_count = 2;
                 kernel.workers = crate::workers::Pool::new(2);
@@ -1541,8 +1541,8 @@ mod tests {
             kernel.cpu_count = 2;
             kernel.workers = crate::workers::Pool::new(2);
             kernel.per_cpu = vec![Duration::ZERO; 2];
-            let mut peer = p.fork();
-            peer.parent = 1;
+            let peer = p.fork();
+            peer.family.set_parent(1);
             kernel.processes.insert(1, p);
             kernel.processes.insert(2, peer);
             assert!(kernel
@@ -1613,8 +1613,8 @@ mod tests {
             p.seccomp.push(Arc::new(
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
-            let mut peer = p.fork();
-            peer.parent = 1;
+            let peer = p.fork();
+            peer.family.set_parent(1);
             let mut kernel = super::super::tests::kernel();
             kernel.cpu_count = 2;
             kernel.workers = crate::workers::Pool::new(2);
@@ -1707,8 +1707,8 @@ mod tests {
                         Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                     ));
                 }
-                let mut peer = p.fork();
-                peer.parent = 1;
+                let peer = p.fork();
+                peer.family.set_parent(1);
                 let mut kernel = super::super::tests::kernel();
                 kernel.cpu_count = 2;
                 kernel.workers = crate::workers::Pool::new(2);
@@ -1776,8 +1776,8 @@ mod tests {
         kernel.workers = crate::workers::Pool::new(4);
         kernel.per_cpu = vec![Duration::ZERO; 4];
         for id in 2..=4 {
-            let mut peer = p.fork();
-            peer.parent = 1;
+            let peer = p.fork();
+            peer.family.set_parent(1);
             kernel.processes.insert(id, peer);
         }
         kernel.processes.insert(1, p);
@@ -1893,8 +1893,8 @@ mod tests {
             kernel.workers = crate::workers::Pool::new(4);
             kernel.per_cpu = vec![Duration::ZERO; 4];
             for id in 2..=4 {
-                let mut peer = p.fork();
-                peer.parent = 1;
+                let peer = p.fork();
+                peer.family.set_parent(1);
                 kernel.processes.insert(id, peer);
             }
             kernel.processes.insert(1, p);
@@ -1999,8 +1999,8 @@ mod tests {
         put_args(&mut p.cpu, [read as u64, 0x1000, 4, 0, 0, 0]);
         p.affinity = 3;
         p.seccomp.strict = true;
-        let mut peer = p.fork();
-        peer.parent = 1;
+        let peer = p.fork();
+        peer.family.set_parent(1);
         let mut kernel = super::super::tests::kernel();
         kernel.cpu_count = 2;
         kernel.workers = crate::workers::Pool::new(2);
@@ -2051,8 +2051,8 @@ mod tests {
         p.seccomp.push(Arc::new(
             Filter::validate(vec![i(6, 0, 0, 0x5007b)]).unwrap(),
         ));
-        let mut peer = p.fork();
-        peer.parent = 1;
+        let peer = p.fork();
+        peer.family.set_parent(1);
         let mut kernel = super::super::tests::kernel();
         kernel.cpu_count = 2;
         kernel.workers = crate::workers::Pool::new(2);
@@ -2549,8 +2549,8 @@ mod tests {
         p.seccomp.push(Arc::new(
             Filter::validate(vec![i(6, 0, 0, 0x5007b)]).unwrap(),
         ));
-        let mut peer = p.fork();
-        peer.parent = 1;
+        let peer = p.fork();
+        peer.family.set_parent(1);
         let mut kernel = super::super::tests::kernel();
         kernel.cpu_count = 2;
         kernel.workers = crate::workers::Pool::new(2);

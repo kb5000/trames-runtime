@@ -396,8 +396,8 @@ mod tests {
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
         p.affinity = 3;
-        let mut peer = p.fork();
-        peer.parent = 1;
+        let peer = p.fork();
+        peer.family.set_parent(1);
         let mut k = super::super::tests::kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
@@ -450,8 +450,8 @@ mod tests {
             .unwrap();
         p.cpu = Cpu::new(0x4000, 0);
         p.affinity = 3;
-        let mut peer = p.fork();
-        peer.parent = 1;
+        let peer = p.fork();
+        peer.family.set_parent(1);
         let mut k = super::super::tests::kernel();
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
