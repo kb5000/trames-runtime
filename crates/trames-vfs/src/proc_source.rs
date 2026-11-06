@@ -380,7 +380,7 @@ impl ProcResources {
                 Arc::downgrade(paths.root_node.as_ref().unwrap_or(&mount.root)),
             )
         });
-        Rc::get_mut(&mut lease)
+        Arc::get_mut(&mut lease)
             .expect("fresh namespace projection")
             ._root = paths.root_mount.clone();
         if demand.paths() {
@@ -631,6 +631,9 @@ impl ProcessView {
                 }
             }
         }
+    }
+    pub fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.time.load(Ordering::Relaxed))
     }
     pub fn publish_time(&self, elapsed: Duration) {
         self.time.fetch_max(

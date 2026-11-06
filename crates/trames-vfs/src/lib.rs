@@ -104,7 +104,7 @@ pub use task_namespace::{
     TaskNamespaces,
 };
 mod pid_namespace;
-pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
+pub use pid_namespace::{PidNamespace, PidReference, CLONE_NEWPID};
 mod namespace;
 mod xattr;
 pub use linux_namespace::{
@@ -733,13 +733,14 @@ pub struct Vfs {
     ipc_namespace: Arc<linux_namespace::IpcNamespace>,
     cgroup_namespace: Arc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
+    pid_identity: Option<PidReference>,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
     mount_registry: mounts::Registry,
     mount_resources: Arc<SharedCell<Vec<std::sync::Weak<mounts::MountIdentity>>>>,
     detached_mounts: Arc<SharedCell<Vec<Vec<Arc<Mount>>>>>,
     pub credentials: Credentials,
-    pseudo: Rc<RefCell<pseudo::PseudoFs>>,
+    pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
     cgroups: Arc<SharedCell<cgroup::Cgroups>>,
     dumpable: Dumpable,
@@ -753,7 +754,7 @@ pub struct Vfs {
     proc_refresh: Cell<ProcRefresh>,
     source_observed: Cell<Option<proc_source::Observation>>,
     ptys: Arc<std::sync::Mutex<BTreeMap<u32, std::sync::Weak<Pty>>>>,
-    embedding_terminal: Rc<Cell<bool>>,
+    embedding_terminal: Arc<std::sync::atomic::AtomicBool>,
     pub controlling_terminal: Option<u32>,
     controlling_pair: Option<Arc<Pty>>,
     bridge: Option<trames_bridge::Broker>,
@@ -817,6 +818,7 @@ impl Vfs {
             ipc_namespace: self.ipc_namespace.clone(),
             cgroup_namespace: self.cgroup_namespace.clone(),
             pid_ns: self.pid_ns.clone(),
+            pid_identity: self.pid_identity.clone(),
             pid_children: self.pid_children.clone(),
             mounts: self.mounts.clone(),
             mount_registry: self.mount_registry.clone(),
@@ -869,19 +871,20 @@ impl Vfs {
             ipc_namespace: Arc::default(),
             cgroup_namespace: Arc::default(),
             pid_ns: pid_ns.clone(),
+            pid_identity: None,
             pid_children: pid_ns,
             mounts: None,
             mount_registry,
             mount_resources: Arc::default(),
             detached_mounts: Arc::default(),
             credentials: Credentials::default(),
-            pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
+            pseudo: Arc::new(SharedCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),
             cgroups: Arc::default(),
             dumpable: Dumpable::default(),
             pid: 1,
             ptys: Arc::default(),
-            embedding_terminal: Rc::default(),
+            embedding_terminal: Arc::default(),
             controlling_terminal: None,
             controlling_pair: None,
             lock_owner: 1,
@@ -1021,13 +1024,12 @@ impl Vfs {
         self.descriptor_snapshots().0
     }
     fn descriptor_snapshots(&self) -> (FdFlags, DirectFds) {
-        let identity = self.fds.identity();
         let revision = FD_FLAGS_REVISION.load(Ordering::Relaxed);
-        let metadata = self.fds.metadata();
-        let mut cached = metadata.flags.borrow_mut();
-        if let Some((old, snapshot)) = &*cached {
+        let mut cache = self.fds.cache();
+        let cached = &cache.flags;
+        if let Some((old, snapshot)) = cached {
             if *old == revision {
-                if let Some((direct_revision, direct)) = &*identity.direct.borrow() {
+                if let Some((direct_revision, direct)) = &cache.direct {
                     if *direct_revision == revision {
                         return (
                             snapshot.clone(),
@@ -1056,9 +1058,9 @@ impl Vfs {
             }
         }
         let snapshot = FdFlags(entries.into(), Some(self.shared_files()));
-        *cached = Some((revision, snapshot.clone()));
+        cache.flags = Some((revision, snapshot.clone()));
         let direct = DirectFds(direct.into(), Some(self.shared_files()), None, None);
-        *identity.direct.borrow_mut() = Some((revision, direct.0.clone()));
+        cache.direct = Some((revision, direct.0.clone()));
         (snapshot, direct)
     }
     fn ordinary_stream(o: &OpenDescription) -> bool {
@@ -1075,7 +1077,7 @@ impl Vfs {
     }
     fn descriptor_io_masks(&self) -> (FdMask, FdMask) {
         self.fds
-            .identity()
+            .cache()
             .io
             .get_or_init(|| {
                 let descriptors = self.fds.entries();
@@ -1265,7 +1267,7 @@ impl Vfs {
         ready
     }
     pub fn enable_terminal(&mut self) -> Result<()> {
-        self.embedding_terminal.set(true);
+        self.embedding_terminal.store(true, Ordering::Relaxed);
         self.controlling_terminal = Some(0);
         if self.node(b"/dev/tty").is_err() {
             self.insert(b"/dev/tty".to_vec(), Content::Terminal, 0o20666)?;
@@ -4173,3 +4175,6 @@ mod shared_control_tests;
 
 #[cfg(test)]
 mod file_work_tests;
+
+#[cfg(test)]
+mod task_transfer;

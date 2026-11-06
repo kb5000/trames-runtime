@@ -16,7 +16,9 @@ use std::{
     },
 };
 
+mod custody;
 mod logical_size;
+pub use custody::{Admission, Custody, CustodyRead, CustodyWrite, OwnedRead, OwnedWrite};
 pub use logical_size::{LogicalSize, SizeCycle};
 mod readiness;
 pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness, ReadinessDriver};

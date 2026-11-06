@@ -864,45 +864,42 @@ impl Descriptor {
         }
     }
 }
-/// CLONE_FILES retains this exact table; fork copies membership/CLOEXEC only.
+/// CLONE_FILES retains original membership; fork copies membership/CLOEXEC only.
 /// Private caches never own descriptions; every lifetime belongs to membership.
-pub(super) struct DescriptorTable(Rc<RefCell<TableState>>, SharedFiles, FileTableOwner);
+pub(super) struct DescriptorTable(RefCell<TableState>, SharedFiles, FileTableOwner);
 impl Default for DescriptorTable {
     fn default() -> Self {
         let files = SharedFiles::default();
         Self(
-            Rc::default(),
+            RefCell::default(),
             files.clone(),
             FileTableOwner::initial(&files),
         )
     }
 }
-#[derive(Default)]
-struct TableState {
-    observed: u64,
-    pub(super) identity: Rc<DescriptorVersion>,
-    pub(super) metadata: Rc<DescriptorMetadata>,
-}
+/// Per-VFS memoization: never shared mutably by CLONE_FILES or fork.
+/// The version marker and populated immutable arrays can be retained cheaply.
 #[derive(Clone, Default)]
-pub(super) struct DescriptorMetadata {
-    pub(super) flags: RefCell<Option<(u64, FdFlags)>>,
+pub(super) struct TableState {
+    observed: u64,
+    identity: Arc<DescriptorVersion>,
+    pub(super) flags: Option<(u64, FdFlags)>,
+    pub(super) io: OnceCell<(FdMask, FdMask)>,
+    pub(super) direct: Option<(u64, PreparedBytes)>,
+    pub(super) urings: OnceCell<Arc<[std::sync::Weak<Uring>]>>,
+    pub(super) timers: OnceCell<Arc<[std::sync::Weak<TimerFd>]>>,
 }
 type PreparedBytes = Arc<[Option<DirectFd>]>;
-#[derive(Clone, Default)]
-pub(super) struct DescriptorVersion {
-    pub(super) io: OnceCell<(FdMask, FdMask)>,
-    pub(super) direct: RefCell<Option<(u64, PreparedBytes)>>,
-    pub(super) urings: OnceCell<Vec<std::sync::Weak<Uring>>>,
-    pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
-}
+#[derive(Default)]
+pub(super) struct DescriptorVersion;
 impl DescriptorTable {
     pub(super) fn observe(files: SharedFiles) -> Self {
         let owner = FileTableOwner::observation(&files);
-        Self(Rc::default(), files, owner)
+        Self(RefCell::default(), files, owner)
     }
     pub(super) fn adopt(files: SharedFiles, owner: FileTableOwner) -> Self {
         debug_assert!(Arc::ptr_eq(&files.0, &owner.0.membership));
-        Self(Rc::default(), files, owner)
+        Self(RefCell::default(), files, owner)
     }
     pub(super) fn disown(&mut self) {
         self.2 = FileTableOwner::observation(&self.1);
@@ -960,7 +957,7 @@ impl DescriptorTable {
     pub(super) fn shared(&self) -> Self {
         let files = self.1.copy_limit();
         Self(
-            self.0.clone(),
+            RefCell::new(self.sync_cache().clone()),
             files.clone(),
             FileTableOwner::shared(&files),
         )
@@ -1009,11 +1006,11 @@ impl DescriptorTable {
         }
         state
     }
-    pub(super) fn identity(&self) -> Rc<DescriptorVersion> {
+    pub(super) fn identity(&self) -> Arc<DescriptorVersion> {
         self.sync_cache().identity.clone()
     }
-    pub(super) fn metadata(&self) -> Rc<DescriptorMetadata> {
-        self.sync_cache().metadata.clone()
+    pub(super) fn cache(&self) -> std::cell::RefMut<'_, TableState> {
+        self.sync_cache()
     }
     pub(super) fn insert(&mut self, fd: u32, descriptor: Descriptor) -> Option<Descriptor> {
         self.install(fd, descriptor, &mut self.1 .0.entries.lock().unwrap())
@@ -1119,21 +1116,16 @@ impl Drop for DescriptorTable {
 }
 impl TableState {
     fn changed(&mut self) {
-        // An owner capture can still borrow the old cache while another worker
-        // edits membership. Do not clone a borrowed RefCell merely to clear it.
-        if let Some(version) = Rc::get_mut(&mut self.identity) {
-            version.io.take();
-            version.direct.get_mut().take();
-            version.urings.take();
-            version.timers.take();
-        } else {
-            self.identity = Rc::default();
+        // A captured immutable marker keeps its old identity. All memoization
+        // lives on this exclusively owned VFS, without a shared cache lock.
+        if Arc::get_mut(&mut self.identity).is_none() {
+            self.identity = Arc::default();
         }
-        if let Some(metadata) = Rc::get_mut(&mut self.metadata) {
-            metadata.flags.get_mut().take();
-        } else {
-            self.metadata = Rc::default();
-        }
+        self.io.take();
+        self.direct = None;
+        self.urings.take();
+        self.timers.take();
+        self.flags = None;
     }
 }
 impl SharedFiles {
@@ -1141,6 +1133,10 @@ impl SharedFiles {
     /// including cold controls, retain their own lifetime; CLOEXEC is private.
     /// In-flight numeric reservations are not open descriptors in the new table.
     pub fn fork(&self) -> (Self, FileTableOwner) {
+        let (files, owner, _) = self.fork_with_revision();
+        (files, owner)
+    }
+    fn fork_with_revision(&self) -> (Self, FileTableOwner, u64) {
         let source = self.0.entries.lock().unwrap();
         let mut free = source.free.clone();
         for fd in &source.reserved {
@@ -1154,6 +1150,7 @@ impl SharedFiles {
                 (fd, copy)
             })
             .collect();
+        let revision = self.0.revision.load(Ordering::Relaxed);
         drop(source);
         let files = Self(
             Arc::new(Membership {
@@ -1169,23 +1166,21 @@ impl SharedFiles {
             self.1.clone(),
         );
         let owner = FileTableOwner::initial(&files);
-        (files, owner)
+        (files, owner, revision)
     }
 }
 impl Clone for DescriptorTable {
     fn clone(&self) -> Self {
-        let (files, owner) = self.1.copy_limit().fork();
-        // Resource identities are unchanged by fork. Reuse prepared capability
-        // caches, while binding live lookups and CLOEXEC to the new membership.
-        Self(
-            Rc::new(RefCell::new(TableState {
-                observed: 0,
-                identity: self.identity(),
-                metadata: Rc::default(),
-            })),
-            files,
-            owner,
-        )
+        let mut cache = self.sync_cache().clone();
+        let (files, owner, revision) = self.1.copy_limit().fork_with_revision();
+        // Membership may change on a peer between cache capture and fork.
+        // Only memoization of the actual copied version can cross this fork.
+        if cache.observed != revision {
+            cache = TableState::default();
+        }
+        cache.observed = 0;
+        cache.flags = None; // CLOEXEC and live Files now belong to the child.
+        Self(RefCell::new(cache), files, owner)
     }
 }
 
@@ -1211,7 +1206,7 @@ mod tests {
         let (copy, owner) = std::thread::spawn(move || files.fork()).join().unwrap();
         assert_eq!(copy.reserve().unwrap().fd, reserved);
         let mut child = Vfs {
-            fds: DescriptorTable(Rc::default(), copy.clone(), owner),
+            fds: DescriptorTable(RefCell::default(), copy.clone(), owner),
             ..Vfs::default()
         };
         assert_eq!(child.flags(epoll).unwrap() & O_CLOEXEC, O_CLOEXEC);
@@ -1681,7 +1676,7 @@ mod tests {
         let fork = parent.clone();
         let alias = parent.dup(writer, 64, true).unwrap();
         for peer in &peers {
-            assert!(Rc::ptr_eq(&peer.fds.0, &parent.fds.0));
+            assert!(peer.fds.shares_with(&parent.fds));
             assert!(peer.flags(alias).is_ok());
         }
         parent.close(writer).unwrap();
@@ -1770,7 +1765,7 @@ mod tests {
         assert_eq!(peer.fcntl(fd, 1, 0), Ok(1));
         assert_eq!(child.fd_flags_snapshot().fcntl(fd, 1, 0), Ok(0));
         assert_eq!(flags.fcntl(alias, 1, 0), Ok(0));
-        assert!(Rc::ptr_eq(&parent.fds.identity(), &old));
+        assert!(Arc::ptr_eq(&parent.fds.identity(), &old));
         // Owner updates also reach existing snapshots without synchronizing maps.
         shared.set_cloexec(fd, false).unwrap();
         assert_eq!(flags.fcntl(fd, 1, 0), Ok(0));

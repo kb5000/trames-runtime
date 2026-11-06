@@ -60,6 +60,9 @@ impl Control {
 }
 
 pub(super) struct Work<C: Cpu> {
+    /// Original task body, retained through every queue/checkpoint and return.
+    /// Execution touches CPU/View without holding task-body custody.
+    pub task: Option<crate::process::tasks::Handle<C>>,
     pub pid: u32,
     pub cpu: C,
     // Keep worker-local translation caches stationary through preparation,
@@ -113,6 +116,7 @@ impl GpuStats {
     }
 }
 pub(super) struct Done<C: Cpu> {
+    pub task: Option<crate::process::tasks::Handle<C>>,
     pub thread_exit: Option<i32>,
     pub fatal_fault: Option<trames_engine::CpuFault>,
     pub exit_groups: Vec<Arc<trames_kernel::task_control::Group>>,
@@ -133,6 +137,8 @@ pub(super) struct Done<C: Cpu> {
     pub futex_woken: u64,
     pub futex_requeues: u64,
     pub serviced_syscalls: u64,
+    pub additive_mmaps: u64,
+    pub additive_time: Duration,
     pub service_wait: Duration,
     pub syscall_time: Duration,
     pub native: trames_accel::native::Metrics,
@@ -316,40 +322,61 @@ struct Worker<C: Cpu> {
     control: Option<Arc<Control>>,
     epoch: Option<Arc<crate::run_queue::Epoch<C>>>,
 }
-struct DiskWorker {
-    send: mpsc::Sender<DiskJob>,
+struct DiskWorker<C: Cpu> {
+    send: mpsc::Sender<DiskJob<C>>,
     join: thread::JoinHandle<()>,
 }
-struct DiskJob(trames_vfs::FileWork, Arc<trames_linux::FileResult>);
-impl DiskJob {
+// Keep ordinary file jobs inline as before; only cold image requests allocate.
+#[allow(clippy::large_enum_variant)]
+enum DiskJob<C: Cpu> {
+    File(trames_vfs::FileWork, Arc<trames_linux::FileResult>),
+    Image(
+        Box<crate::process::exec::Request>,
+        Arc<crate::process::exec::Pending<C>>,
+    ),
+}
+impl<C: Cpu> DiskJob<C> {
+    fn fail(self) {
+        match self {
+            Self::File(_, result) => result.fail(5),
+            Self::Image(_, result) => result.complete(Err(trames_vfs::Errno(5))),
+        }
+    }
     fn run(self) {
-        let Self(job, result) = self;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
-            Ok(reply) => result.complete(reply),
-            Err(_) => result.fail(5),
+        match self {
+            Self::File(job, result) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
+                    Ok(reply) => result.complete(reply),
+                    Err(_) => result.fail(5),
+                }
+            }
+            Self::Image(request, result) => result.complete(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.load()))
+                    .unwrap_or(Err(trames_vfs::Errno(5))),
+            ),
         }
     }
 }
 struct DiskPool<C: Cpu> {
-    workers: Mutex<Vec<DiskWorker>>,
+    workers: Mutex<Vec<DiskWorker<C>>>,
     next: AtomicUsize,
     limit: usize,
     marker: std::marker::PhantomData<fn() -> C>,
     closed: AtomicBool,
 }
 impl<C: Cpu> DiskPool<C> {
-    fn submit(&self, job: DiskJob) {
+    fn submit(&self, job: DiskJob<C>) {
         let mut workers = self.workers.lock().unwrap();
         if self.closed.load(Ordering::Relaxed) {
             drop(workers);
-            job.1.fail(5);
+            job.fail();
             return;
         }
         // The existing lazy pool keeps at most two host workers. Ordinary
         // requests and bounded ring submissions share these same queues.
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.limit;
         if index >= workers.len() {
-            let (send, receive) = mpsc::channel::<DiskJob>();
+            let (send, receive) = mpsc::channel::<DiskJob<C>>();
             if let Ok(join) = thread::Builder::new()
                 .name("trames-disk".into())
                 .spawn(move || {
@@ -390,7 +417,16 @@ impl<C: Cpu> DiskPool<C> {
 impl<C: Cpu> trames_linux::FileExecutor for DiskPool<C> {
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<trames_linux::FileResult>) {
         result.begin();
-        self.submit(DiskJob(job.queued(), result));
+        self.submit(DiskJob::File(job.queued(), result));
+    }
+}
+impl<C: Cpu> crate::process::exec::Executor<C> for DiskPool<C> {
+    fn submit_image(
+        &self,
+        request: crate::process::exec::Request,
+        result: Arc<crate::process::exec::Pending<C>>,
+    ) {
+        self.submit(DiskJob::Image(Box::new(request), result));
     }
 }
 /// Shared authority over existing CPU slots. Only startup/teardown and command
@@ -483,6 +519,9 @@ impl<C: Cpu> Pool<C> {
         epoch.activate(index).map_err(|_| ())
     }
     pub fn file_executor(&self) -> Arc<dyn trames_linux::FileExecutor> {
+        self.disk.clone()
+    }
+    pub(crate) fn image_executor(&self) -> Arc<dyn crate::process::exec::Executor<C>> {
         self.disk.clone()
     }
     fn received(&mut self, event: Event<C>) -> Event<C> {
@@ -597,7 +636,7 @@ impl<C: Cpu> Starter<C> {
                         Command::<C>::Epoch(epoch) => (Some(epoch), None),
                     };
                     loop {
-                    let Some(mut job) = (if let Some(epoch) = &epoch { epoch.take(index) } else { single.take() }) else { break };
+                    let Some(mut job) = (if let Some(epoch) = &epoch { epoch.take_with_engine(index, &mut engine) } else { single.take() }) else { break };
                     let domain = job.domain.clone();
                     let work = &mut job.work;
                     let mut parked = None;
@@ -655,6 +694,10 @@ impl<C: Cpu> Starter<C> {
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
                                 if matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if wait.release.finished()) {
                                     job.waiting=None;continue;
+                                }
+                                if let Some(crate::run_queue::WaitState::Custody(wait)) = &job.waiting {
+                                    if wait.signal.ready() { job.waiting=None; }
+                                    else { maintenance=true;break SliceOutcome::Yield {instructions:0}; }
                                 }
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
@@ -733,7 +776,7 @@ impl<C: Cpu> Starter<C> {
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
                                                 } else { work.cpu.set_x(0, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
                                             }
-                                            if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, info, action).is_err() {
+                                            if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
                                                 let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
                                                 work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
                                             }
@@ -1479,9 +1522,25 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         && work.cpu.x(8) as u32 == 222
                                         && trames_linux::Linux::mmap_is_additive(std::array::from_fn(|i|work.cpu.x(i)))
                                     {
-                                        // New anonymous ownership only. The
-                                        // existing owner publishes its interval;
-                                        // peers and their translations continue.
+                                        if let Some(task) = &work.task {
+                                            let began=Instant::now();
+                                            let attempt=crate::process::lifecycle::mapping::additive(task,work.pid,std::array::from_fn(|i|work.cpu.x(i)),&epoch.as_ref().unwrap().io_target);
+                                            match attempt {
+                                                Ok(value)=>{
+                                                    let elapsed=began.elapsed();
+                                                    job.stats.additive_mmaps+=1;
+                                                    job.stats.additive_time+=elapsed;
+                                                    if snapshot.profile {syscall_time+=elapsed;}
+                                                    work.cpu.set_x(0,value);syscalls+=1;continue;
+                                                },
+                                                Err(wait)=>{
+                                                    job.pending_cpu=Some(result);
+                                                    parked=Some(crate::run_queue::WaitState::Custody(Arc::new(wait)));
+                                                    break SliceOutcome::Yield {instructions:0};
+                                                }
+                                            }
+                                        }
+                                        // Legacy embeddings without original task custody.
                                         service = true;
                                         break SliceOutcome::Yield { instructions: 0 };
                                     }
@@ -1842,14 +1901,61 @@ mod tests {
     }
 
     use super::*;
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-    };
+    use std::cell::Cell;
     use trames_memory::{
         CpuMemory, Memory, MemoryError, NativeMemory, PageBacking, Permissions, PAGE_SIZE,
     };
 
+    #[test]
+    fn source_handler_translates_retained_sender_after_its_task_is_gone() {
+        let mut init = trames_vfs::Vfs::default();
+        init.unshare_pid().unwrap();
+        init.activate_child_pid(100).unwrap();
+        let mut sender = init.clone();
+        sender.activate_child_pid(200).unwrap();
+        let signals = trames_kernel::signal::Signals::default();
+        signals.publish_policy(init.pid_namespace(), true);
+        signals
+            .io
+            .inbox
+            .enqueue(
+                35,
+                trames_kernel::signal::Info {
+                    sender: 200,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(sender);
+        let queued = signals.io.take(35, false).unwrap();
+        let mut snapshot = syscall_snapshot();
+        snapshot.io_signals = signals.io.clone();
+        snapshot.io_routes.namespace = init.pid_namespace().clone();
+        let mut memory = Memory::default();
+        memory
+            .map(0x10000, 16 * PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        let mut cpu = Cpu::new(0x30000, 0x20000);
+        snapshot
+            .enter_io_signal(
+                &mut cpu,
+                &mut memory,
+                35,
+                *queued,
+                trames_kernel::signal::Action {
+                    handler: 0x30000,
+                    flags: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(memory.read_array(cpu.x(1) + 16).unwrap()),
+            2
+        );
+        drop(queued);
+        assert_eq!(init.visible_pid(200), 0);
+    }
     #[test]
     fn cohort_blocked_recvmsg_checkpoint_restores_original_arguments() {
         let mut vfs = trames_vfs::Vfs::default();
@@ -1889,6 +1995,7 @@ mod tests {
         snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
         let mut job = crate::run_queue::Job::new(
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 7,
@@ -1945,9 +2052,9 @@ mod tests {
     }
 
     struct LivePage {
-        bytes: RefCell<[u8; PAGE_SIZE as usize]>,
-        version: Cell<u64>,
-        unstable: Cell<bool>,
+        bytes: Mutex<[u8; PAGE_SIZE as usize]>,
+        version: AtomicU64,
+        unstable: AtomicBool,
     }
     impl PageBacking for LivePage {
         fn parallel_key(&self) -> Option<(u64, u64)> {
@@ -1957,15 +2064,15 @@ mod tests {
             Ok(())
         }
         fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-            out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
-            if self.unstable.get() {
-                self.version.set(self.version.get().wrapping_add(1));
+            out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
+            if self.unstable.load(Ordering::Relaxed) {
+                self.version.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         }
         fn write(&self, offset: usize, input: &[u8]) -> Result<(), MemoryError> {
-            self.bytes.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
-            self.version.set(self.version.get().wrapping_add(1));
+            self.bytes.lock().unwrap()[offset..offset + input.len()].copy_from_slice(input);
+            self.version.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         fn native_resident(&self) -> bool {
@@ -1975,12 +2082,12 @@ mod tests {
             Ok(())
         }
         fn version(&self) -> u64 {
-            self.version.get()
+            self.version.load(Ordering::Relaxed)
         }
         fn writable(&self) -> bool {
             true
         }
-        fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+        fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
             Err(MemoryError::InvalidRange)
         }
     }
@@ -1998,6 +2105,7 @@ mod tests {
         cpu.set_x(0, count);
         cpu.set_native_calls(true);
         Work {
+            task: None,
             audio: None,
             gpu: None,
             pid,
@@ -2106,6 +2214,7 @@ mod tests {
             let epoch = crate::run_queue::Epoch::new(control.clone());
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     pid: 1,
                     cpu,
                     memory: Some(Box::new(
@@ -2222,6 +2331,7 @@ mod tests {
         let control = Arc::new(Control::new(100));
         let epoch = crate::run_queue::Epoch::new(control.clone());
         let work = Work {
+            task: None,
             pid: 1,
             cpu,
             memory: Some(Box::new(
@@ -2530,6 +2640,7 @@ mod tests {
                 cpu.set_x(20, 0x2000);
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         pid,
                         cpu,
                         memory: Some(Box::new(
@@ -2665,6 +2776,7 @@ mod tests {
                 };
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         pid,
                         cpu: Cpu::new(pc, 0),
                         memory: Some(Box::new(
@@ -2817,6 +2929,7 @@ mod tests {
                 }
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         pid,
                         cpu,
                         memory: Some(Box::new(
@@ -2945,6 +3058,7 @@ mod tests {
         epoch.bind_timers(timers.clone());
         epoch.add(crate::run_queue::Job::new(
             Work {
+                task: None,
                 pid: 1,
                 cpu,
                 memory: Some(Box::new(
@@ -3046,6 +3160,7 @@ mod tests {
             let epoch = crate::run_queue::Epoch::new(control.clone());
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     pid: 1,
                     cpu,
                     memory: Some(Box::new(
@@ -3154,6 +3269,7 @@ mod tests {
         let mut snapshot = syscall_snapshot();
         snapshot.direct = direct();
         let source = Work {
+            task: None,
             pid: 1,
             cpu: Cpu::new(0x1000, 0),
             memory: Some(Box::new(
@@ -3196,6 +3312,7 @@ mod tests {
         let mut snapshot = syscall_snapshot();
         snapshot.direct = direct();
         let work = Work {
+            task: None,
             pid: 1,
             cpu: source.cpu,
             memory: Some(Box::new(
@@ -3373,6 +3490,7 @@ mod tests {
             snapshot.futex = crate::futex::Authority::new(table.clone(), i as u64 + 10);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     audio: None,
                     gpu: None,
                     pid: i as u32 + 1,
@@ -3463,6 +3581,7 @@ mod tests {
             snapshot.futex = crate::futex::Authority::new(table.clone(), 1);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     audio: None,
                     gpu: None,
                     pid,
@@ -3589,6 +3708,7 @@ mod tests {
                 snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         audio: None,
                         gpu: None,
                         pid,
@@ -3736,6 +3856,7 @@ mod tests {
                     .with_kernel_log(vfs.kernel_log_capability());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         audio: None,
                         gpu: None,
                         pid,
@@ -3817,6 +3938,7 @@ mod tests {
                 .with_files(capabilities.clone());
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     audio: None,
                     gpu: None,
                     pid,
@@ -3886,6 +4008,7 @@ mod tests {
             cpu.set_x(1, 0x3020);
             epoch.add(crate::run_queue::Job::new(
                 Work {
+                    task: None,
                     audio: None,
                     gpu: None,
                     pid,
@@ -4001,6 +4124,7 @@ mod tests {
                 snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
                 epoch.add(crate::run_queue::Job::new(
                     Work {
+                        task: None,
                         audio: None,
                         gpu: None,
                         pid,
@@ -4268,6 +4392,7 @@ mod tests {
         cpu.set_x(2, 8);
         (
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 1,
@@ -4763,6 +4888,7 @@ mod tests {
         let memory_view = memory.parallel_view(&mut Default::default()).unwrap();
         (
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 1,
@@ -4788,6 +4914,7 @@ mod tests {
                 control.clone(),
             );
             let Work {
+                task: _,
                 mut cpu,
                 memory: old,
                 ..
@@ -4809,6 +4936,7 @@ mod tests {
             pool.dispatch(
                 0,
                 Work {
+                    task: None,
                     audio: None,
                     gpu: context
                         .then(|| trames_vulkan::Context::new(trames_vulkan::Backend::new()).into()),
@@ -4861,6 +4989,7 @@ mod tests {
         let (work, mut memory) =
             native_work(1, [79, 0x2000, 128], Permissions::RW, control.clone());
         let Work {
+            task: _,
             mut cpu,
             memory: old,
             ..
@@ -4876,6 +5005,7 @@ mod tests {
         cpu.set_vulkan_calls(true);
         (
             Work {
+                task: None,
                 audio: None,
                 gpu: Some(context.into()),
                 pid: 1,
@@ -5048,20 +5178,22 @@ mod tests {
         let control = Arc::new(Control::new(4));
         let (work, mut memory) = native_work(3, [0x2000, 7, 128], Permissions::RW, control.clone());
         let Work {
+            task: _,
             cpu,
             memory: old_view,
             ..
         } = work;
         drop(old_view);
-        let live = Rc::new(LivePage {
-            bytes: RefCell::new([0; PAGE_SIZE as usize]),
-            version: Cell::new(0),
-            unstable: Cell::new(false),
+        let live = Arc::new(LivePage {
+            bytes: Mutex::new([0; PAGE_SIZE as usize]),
+            version: AtomicU64::new(0),
+            unstable: AtomicBool::new(false),
         });
         memory
             .map_backed(0x2000, vec![live.clone()], false, Permissions::RW, true)
             .unwrap();
         let work = Work {
+            task: None,
             audio: None,
             gpu: None,
             pid: 1,
@@ -5098,12 +5230,12 @@ mod tests {
             .unwrap();
         assert!(!value.fallback);
         assert_eq!(memory.read_array::<128>(0x2000).unwrap(), [7; 128]);
-        assert_eq!(live.bytes.borrow()[..128], [0; 128]);
+        assert_eq!(live.bytes.lock().unwrap()[..128], [0; 128]);
 
-        let code = Rc::new(LivePage {
-            bytes: RefCell::new(memory.read_array(0x1000).unwrap()),
-            version: Cell::new(0),
-            unstable: Cell::new(true),
+        let code = Arc::new(LivePage {
+            bytes: Mutex::new(memory.read_array(0x1000).unwrap()),
+            version: AtomicU64::new(0),
+            unstable: AtomicBool::new(true),
         });
         memory
             .map_backed(0x1000, vec![code.clone()], false, Permissions::RX, true)
@@ -5126,7 +5258,7 @@ mod tests {
         assert_eq!(registry.metrics.faults, 0);
         assert_eq!(registry.metrics.checkpoint_retries, 2);
         assert_eq!(memory.read_array::<128>(0x2000).unwrap(), [7; 128]);
-        code.unstable.set(false);
+        code.unstable.store(false, Ordering::Relaxed);
         registry
             .invoke_scoped(
                 &mut memory,
@@ -5155,6 +5287,7 @@ mod tests {
             peer_cpu.set_x(0, peer_address);
             peer_cpu.set_x(1, 0x52);
             let peer = Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 2,

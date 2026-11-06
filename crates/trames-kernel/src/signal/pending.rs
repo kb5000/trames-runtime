@@ -4,19 +4,47 @@ use std::collections::{BTreeMap, VecDeque};
 use trames_vfs::Errno;
 
 #[derive(Default)]
-pub struct Pending(BTreeMap<u32, VecDeque<Info>>);
+pub struct Pending(BTreeMap<u32, VecDeque<RetainedInfo>>);
+/// Keep sender translations alive through dequeue and ABI conversion, not just
+/// while the signal is queued. No reference to the sender's task is retained.
+pub struct RetainedInfo {
+    info: Info,
+    _sender: Option<trames_vfs::PidReference>,
+}
+impl std::ops::Deref for RetainedInfo {
+    type Target = Info;
+    fn deref(&self) -> &Info {
+        &self.info
+    }
+}
+impl std::ops::DerefMut for RetainedInfo {
+    fn deref_mut(&mut self) -> &mut Info {
+        &mut self.info
+    }
+}
 impl Pending {
     pub fn enqueue(&mut self, sig: u32, info: Info) -> Result<(), Errno> {
+        self.enqueue_retained(sig, info, None)
+    }
+    pub(super) fn enqueue_retained(
+        &mut self,
+        sig: u32,
+        info: Info,
+        sender: Option<trames_vfs::PidReference>,
+    ) -> Result<(), Errno> {
         if sig < 32 && self.0.contains_key(&sig) {
             return Ok(()); // Standard signals coalesce, preserving the first info.
         }
         if sig >= 32 && self.0.values().map(VecDeque::len).sum::<usize>() >= 4096 {
             return Err(Errno(11));
         }
-        self.0.entry(sig).or_default().push_back(info);
+        self.0.entry(sig).or_default().push_back(RetainedInfo {
+            info,
+            _sender: sender,
+        });
         Ok(())
     }
-    pub fn remove(&mut self, sig: &u32) -> Option<Info> {
+    pub fn remove(&mut self, sig: &u32) -> Option<RetainedInfo> {
         let q = self.0.get_mut(sig)?;
         let info = q.pop_front();
         if q.is_empty() {
@@ -47,18 +75,19 @@ impl Pending {
         (bits != 0).then(|| bits.trailing_zeros() + 1)
     }
     pub fn values(&self) -> impl Iterator<Item = &Info> {
-        self.0.values().flatten()
+        self.0.values().flatten().map(|queued| &queued.info)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &Info)> {
         self.0
             .iter()
-            .map(|(sig, q)| (sig, q.front().expect("nonempty signal queue")))
+            .map(|(sig, q)| (sig, &q.front().expect("nonempty signal queue").info))
     }
     pub fn timer_mut(&mut self, sig: u32, id: i32) -> Option<&mut Info> {
         self.0
             .get_mut(&sig)?
             .iter_mut()
             .find(|i| i.timer.is_some_and(|t| t.0 == id))
+            .map(|queued| &mut queued.info)
     }
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -67,7 +96,7 @@ impl Pending {
 impl std::ops::Index<&u32> for Pending {
     type Output = Info;
     fn index(&self, sig: &u32) -> &Info {
-        self.0[sig].front().unwrap()
+        &self.0[sig].front().unwrap().info
     }
 }
 

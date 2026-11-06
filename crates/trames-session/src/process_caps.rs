@@ -78,10 +78,10 @@ mod tests {
         job.work.credential_call(146, [1000, 0, 0, 0, 0, 0]);
         assert_eq!(job.work.cpu.x(0), 0);
         // The cold Process has not been collected or used to publish metadata.
-        assert_eq!(k.processes[&2].linux.vfs.credentials.uid, 0);
+        assert_eq!(k.processes.read(&2).linux.vfs.credentials.uid, 0);
         assert_eq!(original.credentials().read().uid, 1000);
         assert_eq!(wait_event.uid(), 1000);
-        assert_eq!(k.processes[&2].parentage.death_signal(), 0);
+        assert_eq!(k.processes.read(&2).parentage.death_signal(), 0);
         assert!(!dumpable.get());
         let observed = original.observe(ProcRefresh::Metadata, None).unwrap();
         assert_eq!(observed.credentials.uid, 1000);
@@ -93,7 +93,7 @@ mod tests {
             (1000, 1000)
         );
         assert_eq!(snapshot.limits.as_ref().unwrap().credentials.uid, 1000);
-        let mut observer = k.limit_authority(1, &k.processes[&1]);
+        let mut observer = k.limit_authority(1, &k.processes.read(&1));
         observer.credentials = Credentials::user(0, 0);
         observer.credentials.caps.effective = 0;
         let mut scratch = Memory::default();
@@ -113,7 +113,7 @@ mod tests {
             .unwrap();
         scratch.write_array(0x1004, 2u32.to_le_bytes()).unwrap();
         let mut c = Credentials::default();
-        let directory = k.processes[&1].signals.io_directory.clone();
+        let directory = k.processes.read(&1).signals.io_directory.clone();
         trames_linux::credential_call(
             &mut c,
             &Default::default(),
@@ -147,7 +147,7 @@ mod tests {
             .linux
             .vfs
             .adopt_task_namespaces(state);
-        assert_eq!(k.processes[&2].linux.vfs.credentials.uid, 1000);
-        assert_eq!(k.processes[&1].linux.vfs.credentials.uid, 0);
+        assert_eq!(k.processes.read(&2).linux.vfs.credentials.uid, 1000);
+        assert_eq!(k.processes.read(&1).linux.vfs.credentials.uid, 0);
     }
 }

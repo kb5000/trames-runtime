@@ -18,6 +18,45 @@ impl Vfs {
         path: &[u8],
         flags: u32,
     ) -> Result<Arc<ExecutableFile>> {
+        Ok(self
+            .executable_file_inner(dirfd, path, flags, true)?
+            .expect("native executable opening enabled"))
+    }
+    /// Private-store namespace metadata is resident even when file bytes are
+    /// on disk. Resolve its inode/errno here without queueing a disk operation.
+    /// Host/overlay lookup and foreign native executable handles stay deferred.
+    pub fn executable_file_from_resident_namespace(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+    ) -> Result<Option<Arc<ExecutableFile>>> {
+        let external = |fs: &FsHandle| {
+            #[cfg(all(feature = "hostfs", unix))]
+            if fs.host.is_some() {
+                return true;
+            }
+            fs.has_overlay()
+        };
+        if external(&self.fs)
+            || self
+                .mount_resources
+                .borrow()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|mount| external(&mount.fs))
+        {
+            return Ok(None);
+        }
+        self.executable_file_inner(dirfd, path, flags, false)
+    }
+    fn executable_file_inner(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+        _open_host: bool,
+    ) -> Result<Option<Arc<ExecutableFile>>> {
         if path.is_empty() && flags & 0x1000 == 0 {
             return Err(Errno(2));
         }
@@ -79,18 +118,22 @@ impl Vfs {
         }
         drop(n);
         #[cfg(all(feature = "hostfs", unix))]
+        if !_open_host && node.host.get().is_some() {
+            return Ok(None);
+        }
+        #[cfg(all(feature = "hostfs", unix))]
         let host_file = node.host.get().map(|file| file.file(false)).transpose()?;
         let mount_use = mount
             .as_ref()
             .map(|mount| mounts::MountUse::new(mount.identity.clone()));
-        Ok(Arc::new(ExecutableFile {
+        Ok(Some(Arc::new(ExecutableFile {
             _mount_use: mount_use,
             #[cfg(all(feature = "hostfs", unix))]
             _host_file: host_file,
             node: node.clone(),
             label: label.clone(),
             mount: mount.as_ref().map(|mount| mount.shared.clone()),
-        }))
+        })))
     }
     pub fn executable_display(&self, file: &ExecutableFile) -> Vec<u8> {
         let mount = file.mount.as_ref().map(|mount| {
@@ -144,6 +187,46 @@ impl ExecutableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resident_exec_lookup_accepts_private_inodes_and_reports_missing_files() {
+        let path = std::env::temp_dir().join(format!(
+            "trames-resident-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut v = Vfs::open_disk(&path, Default::default()).unwrap();
+        assert!(v.namespace_host_work());
+        assert!(matches!(
+            v.executable_file_from_resident_namespace(AT_FDCWD, b"/missing", 0),
+            Err(Errno(2))
+        ));
+        v.import_executable(b"/image", b"payload".to_vec()).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/image", O_CLOEXEC, 0).unwrap();
+        let file = v
+            .executable_file_from_resident_namespace(fd as i32, b"", 0x1000)
+            .unwrap()
+            .unwrap();
+        v.close(fd).unwrap();
+        v.unlink_at(AT_FDCWD, b"/image", false).unwrap();
+        assert_eq!(file.bytes().unwrap(), b"payload");
+        drop(file);
+        drop(v);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    #[test]
+    fn native_exec_namespace_defers_lookup_including_missing_names() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/host", 0o755).unwrap();
+        v.mount_host(b"/host", std::env::temp_dir(), true).unwrap();
+        assert!(v
+            .executable_file_from_resident_namespace(AT_FDCWD, b"/host/missing", 0)
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn shebang_parser_keeps_one_optional_argument_and_rejects_invalid_headers() {
         assert_eq!(script_interpreter(b"ELF").unwrap(), None);

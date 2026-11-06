@@ -451,7 +451,7 @@ mod tests {
             .unwrap();
         let frame = memory.pages[&0x1000];
         memory.frames[frame].as_mut().unwrap().bytes =
-            std::rc::Rc::new(crate::mmu::PageBytes::Concurrent(Arc::new(page)));
+            std::sync::Arc::new(crate::mmu::PageBytes::Concurrent(Arc::new(page)));
         for word in 0..32u64 {
             memory.write_array(0x1018, word.to_le_bytes()).unwrap();
             assert_eq!(memory.read_array::<8>(0x1018).unwrap(), word.to_le_bytes());

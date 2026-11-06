@@ -225,7 +225,7 @@ fn retired_and_empty_cpu_windows_release_va_without_dropping_fork_bytes() {
     memory.map(base, 65536, Permissions::RW).unwrap();
     memory.write_array(base, [42; 8]).unwrap();
     let window = memory.mmu.window(base, false).unwrap();
-    let cpu_view = Rc::downgrade(&window);
+    let cpu_view = Arc::downgrade(&window);
     let physical = Arc::downgrade(window.mapping.as_ref().unwrap());
     drop(window);
     let child = memory.clone();
@@ -237,7 +237,7 @@ fn retired_and_empty_cpu_windows_release_va_without_dropping_fork_bytes() {
     assert_eq!(child.read_array::<8>(base), Ok([42; 8]));
     memory.write_array(base, [17; 8]).unwrap();
     let window = memory.mmu.window(base, false).unwrap();
-    let replacement = Rc::downgrade(&window);
+    let replacement = Arc::downgrade(&window);
     drop(window);
     memory.unmap(base, 65536).unwrap();
     assert!(

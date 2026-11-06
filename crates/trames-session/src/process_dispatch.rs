@@ -11,30 +11,89 @@ impl<C: Cpu> Kernel<C> {
         uring_epoch: &mut trames_linux::UringEpoch,
         network_epoch: &mut trames_vfs::NetworkEpoch,
     ) -> Box<crate::run_queue::Job<C>> {
-        self.processes
-            .get_mut(&id)
-            .expect("dispatch task")
-            .linux
-            .vfs
-            .sync_task_namespaces();
-        let p = &self.processes[&id];
+        Dispatch::capture(self).job(
+            (
+                id,
+                self.processes
+                    .directory()
+                    .handle(&id)
+                    .expect("dispatch task"),
+            ),
+            view,
+            control,
+            file_epoch,
+            uring_epoch,
+            network_epoch,
+        )
+    }
+}
+
+// Captures original shared authorities, never a Kernel/task-table projection.
+pub(super) struct Dispatch {
+    limits: Arc<trames_kernel::limits::Directory>,
+    fixed: trames_kernel::limits::Fixed,
+    timers: Arc<trames_kernel::timers::Timers>,
+    futexes: crate::futex::Futexes,
+    files: Arc<dyn trames_linux::FileExecutor>,
+    gpu_budget: trames_vulkan::Budget,
+    gpu_display: trames_vulkan::Display,
+    started: Instant,
+    cpus: usize,
+    profile: bool,
+    instructions: u64,
+}
+impl Dispatch {
+    pub(super) fn capture<C: Cpu>(k: &Kernel<C>) -> Self {
+        Self {
+            limits: k.limit_directory.clone(),
+            fixed: k.fixed_limits(),
+            timers: k.timers.clone(),
+            futexes: k.futexes.clone(),
+            files: k.workers.file_executor(),
+            gpu_budget: k.gpu_budget.clone(),
+            gpu_display: k.gpu_display.clone(),
+            started: k.started,
+            cpus: k.cpu_count,
+            profile: k.profile_syscalls,
+            instructions: k.instructions,
+        }
+    }
+    pub(super) fn job<C: Cpu>(
+        &self,
+        task: (u32, tasks::Handle<C>),
+        view: Box<trames_memory::parallel::View>,
+        control: &Arc<crate::workers::Control>,
+        file_epoch: &mut trames_vfs::FileEpoch,
+        uring_epoch: &mut trames_linux::UringEpoch,
+        network_epoch: &mut trames_vfs::NetworkEpoch,
+    ) -> Box<crate::run_queue::Job<C>> {
+        let (id, task) = task;
+        let mut custody = task.write();
+        let p = &mut *custody;
+        p.linux.vfs.sync_task_namespaces();
         let gpu = (accelerated(p, trames_vulkan::AUXV_KEY, trames_vulkan::PROFILE)
             || accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE))
         .then(|| crate::gpu::Authority {
-            context: self.gpu_context(p),
-            video: self.video_context(p),
+            context: p.gpu_context(&self.gpu_budget, &self.gpu_display),
+            video: p.video_context(),
             images: Some(p.linux.vfs.image_fds()),
             auth: p.linux.vfs.wayland_auth(),
             events: Some(p.linux.vfs.native_events()),
         });
         let audio = accelerated(p, trames_audio::AUXV_KEY, trames_audio::PROFILE).then(|| {
             crate::devices::Audio {
-                context: self.audio_context(p),
+                context: p.audio_context(),
                 events: p.linux.vfs.native_events(),
             }
         });
-        let limits = self.limit_authority(id, &self.processes[&id]);
-        let p = self.processes.get_mut(&id).expect("cohort process");
+        let limits = trames_kernel::limits::Authority {
+            directory: self.limits.clone(),
+            limits: p.limits.clone(),
+            namespace: p.linux.vfs.pid_namespace().clone(),
+            pid: id,
+            credentials: p.linux.vfs.credentials.clone(),
+            fixed: self.fixed,
+        };
         p.signals.begin_io();
         let source_io = p.worker_io_candidate(id);
         let waiting = if let State::Futex { wait, deadline } = &p.state {
@@ -83,7 +142,10 @@ impl<C: Cpu> Kernel<C> {
         } else {
             None
         };
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         let namespaces = p.linux.vfs.task_namespaces();
         let c = &p.linux.vfs.credentials;
         let direct_files = if !p.linux.trace {
@@ -97,6 +159,7 @@ impl<C: Cpu> Kernel<C> {
             Default::default()
         };
         let work = crate::workers::Work::<C> {
+            task: Some(task),
             gpu,
             audio,
             pid: id,
@@ -126,8 +189,8 @@ impl<C: Cpu> Kernel<C> {
                 ],
                 started: self.started,
                 processor: p.last_cpu as u32,
-                cpus: self.cpu_count,
-                profile: self.profile_syscalls,
+                cpus: self.cpus,
+                profile: self.profile,
                 streams: p.linux.vfs.stream_descriptors(),
 
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
@@ -154,7 +217,7 @@ impl<C: Cpu> Kernel<C> {
                     .with_membership(p.linux.vfs.shared_files())
                     .with_paths(p.linux.vfs.path_queries())
                     .with_resources(p.linux.vfs.descriptor_factory())
-                    .with_file_executor(self.workers.file_executor())
+                    .with_file_executor(self.files.clone())
                     .with_kernel_log(p.linux.vfs.kernel_log_capability())
                     .with_urings(
                         uring_epoch
@@ -278,4 +341,51 @@ impl<C: Cpu> Kernel<C> {
         }
         job
     }
+}
+
+/// Prepare a complete quiescent cohort from original task and mapping resources.
+/// The joined caller currently supplies custody; source admission must acquire
+/// it without blocking a CPU slot before invoking this preparation path.
+pub(super) fn prepare_views<C: Cpu>(
+    tasks: &tasks::Directory<C>,
+    registry: &mut trames_memory::parallel::Registry,
+    chosen: &[(u32, usize)],
+    reuse_retained: bool,
+    backend_error: &mut Option<String>,
+) -> Option<Vec<(u32, usize, Box<trames_memory::parallel::View>)>> {
+    let mut views: Vec<(u32, usize, Box<trames_memory::parallel::View>)> =
+        Vec::with_capacity(chosen.len());
+    let mut published = BTreeMap::<u64, usize>::new();
+    for &(id, slot) in chosen {
+        let task = tasks.handle(&id).expect("selected process");
+        let p = &mut *task.write();
+        let (identity, _) = p.memory.coordinator_ownership();
+        let view = if let Some(&index) = published.get(&identity) {
+            // Freeze one VM once per epoch. Backing checks of another VM
+            // may advance a global epoch between selected CPU preparations;
+            // they must not give this VM's peers different snapshots.
+            registry.metrics.cache_hits += 1;
+            views[index].2.clone()
+        } else if reuse_retained && !p.memory.parallel_views_quiescent() {
+            // This is a task-lifecycle-only checkpoint. All private execution
+            // actors returned; retained guarded borrows still use exactly
+            // these parent bytes. Fork isolated its child, CLONE_VM introduced no parent mapping
+            // change, and exec installed a different mm without editing this one.
+            let mut view = Box::new(p.memory.current_parallel_view()?);
+            C::prepare_hardware_view(&mut view);
+            published.insert(identity, views.len());
+            view
+        } else {
+            if let Err(error) = C::prepare_hardware_memory(&mut p.memory, registry) {
+                *backend_error = Some(error.to_string());
+                return None;
+            }
+            let mut view = Box::new(p.memory.parallel_view(registry)?);
+            C::prepare_hardware_view(&mut view);
+            published.insert(identity, views.len());
+            view
+        };
+        views.push((id, slot, view));
+    }
+    Some(views)
 }

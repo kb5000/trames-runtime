@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Actual-driver regression; run after building the standard compute fixture.
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,22 +16,22 @@ const OUT: u64 = 0x2000;
 const COUNT: u64 = 0x2080;
 const RESULT: u64 = 0xa000;
 struct FallibleOutput {
-    fail: Cell<bool>,
-    bytes: RefCell<[u8; PAGE_SIZE as usize]>,
+    fail: AtomicBool,
+    bytes: Mutex<[u8; PAGE_SIZE as usize]>,
 }
 impl PageBacking for FallibleOutput {
     fn check(&self, _: u64) -> Result<(), MemoryError> {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-        out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+        out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
         Ok(())
     }
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-        if self.fail.get() {
+        if self.fail.load(Ordering::Relaxed) {
             return Err(MemoryError::BackingIo(5));
         }
-        self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.bytes.lock().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
     fn sync(&self) -> Result<(), MemoryError> {
@@ -41,7 +43,7 @@ impl PageBacking for FallibleOutput {
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
 }
@@ -152,16 +154,16 @@ fn main() {
         assert_eq!(b.poll(&mut m, job).unwrap(), Some((-4i64) as u64));
     }
     println!("260 live-output unmaps: faults, no ID publication/table exhaustion");
-    let output = Rc::new(FallibleOutput {
-        fail: Cell::new(false),
-        bytes: RefCell::new([0; PAGE_SIZE as usize]),
+    let output = Arc::new(FallibleOutput {
+        fail: AtomicBool::new(false),
+        bytes: Mutex::new([0; PAGE_SIZE as usize]),
     });
     m.map_backed(RESULT, vec![output.clone()], true, Permissions::RW, false)
         .unwrap();
     for _ in 0..260 {
-        output.fail.set(false);
+        output.fail.store(false, Ordering::Relaxed);
         let job = start(&mut b, &mut m, device, layout, shader);
-        output.fail.set(true);
+        output.fail.store(true, Ordering::Relaxed);
         assert_eq!(poll(&mut b, &mut m, job), Err(MemoryError::BackingIo(5)));
         assert_eq!(word(&m, RESULT), 0);
     }
@@ -225,19 +227,19 @@ fn graphics(b: &mut Backend, m: &mut Memory, device: u64, vertex: &str, fragment
     }
     println!("260 graphics output unmaps: no pipeline publication/table exhaustion");
     m.unmap(RESULT, PAGE_SIZE).unwrap();
-    let output = Rc::new(FallibleOutput {
-        fail: Cell::new(false),
-        bytes: RefCell::new([0; PAGE_SIZE as usize]),
+    let output = Arc::new(FallibleOutput {
+        fail: AtomicBool::new(false),
+        bytes: Mutex::new([0; PAGE_SIZE as usize]),
     });
     m.map_backed(RESULT, vec![output.clone()], true, Permissions::RW, false)
         .unwrap();
     for _ in 0..260 {
-        output.fail.set(false);
+        output.fail.store(false, Ordering::Relaxed);
         m.write(RESULT, &[0; 8]).unwrap();
         let Invocation::Pending(job) = request(b, m, 70, &args) else {
             panic!("graphics must compile asynchronously")
         };
-        output.fail.set(true);
+        output.fail.store(true, Ordering::Relaxed);
         assert_eq!(poll(b, m, job), Err(MemoryError::BackingIo(5)));
         assert_eq!(word(m, RESULT), 0);
         assert_eq!(
@@ -250,7 +252,7 @@ fn graphics(b: &mut Backend, m: &mut Memory, device: u64, vertex: &str, fragment
         );
     }
     println!("260 graphics pipeline, 260 image and 260 sampler backing failures: unpublished native outputs rolled back");
-    output.fail.set(false);
+    output.fail.store(false, Ordering::Relaxed);
     m.unmap(RESULT, PAGE_SIZE).unwrap();
     m.map(RESULT, PAGE_SIZE, Permissions::RW).unwrap();
     m.write(RESULT, &[0; 8]).unwrap();

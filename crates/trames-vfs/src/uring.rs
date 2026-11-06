@@ -674,10 +674,10 @@ impl Vfs {
         Some(rings)
     }
     /// Retain the exact CPU byte domain of both ring mappings for one frozen
-    /// cohort. The Rc page backings stay on the owner; only SharedPage Arcs
-    /// cross the boundary. Even malformed concurrent guest writes remain under
+    /// cohort. Providers retain original OFDs; queue access shares their canonical
+    /// SharedPage allocation. Even malformed concurrent guest writes remain under
     /// the interpreter's existing region guards, never bare Mapping copies.
-    pub fn uring_queue_pages(&self, fd: u32) -> Result<Vec<Rc<dyn trames_memory::PageBacking>>> {
+    pub fn uring_queue_pages(&self, fd: u32) -> Result<Vec<Arc<dyn trames_memory::PageBacking>>> {
         let ring = self.uring(fd)?;
         let mut pages = self.mapping_pages(fd, 0, ring.ring_bytes, true, true)?;
         pages.extend(self.mapping_pages(fd, 0x1000_0000, ring.sqe_bytes, true, true)?);
@@ -771,7 +771,7 @@ impl Vfs {
     }
     pub fn urings(&self) -> Vec<Arc<Uring>> {
         self.fds
-            .identity()
+            .cache()
             .urings
             .get_or_init(|| {
                 let mut rings = Vec::new();
@@ -785,7 +785,7 @@ impl Vfs {
                         }
                     }
                 }
-                rings
+                rings.into()
             })
             .iter()
             .filter_map(std::sync::Weak::upgrade)
@@ -800,10 +800,7 @@ impl Vfs {
         let id = trames_memory::new_backing_identity();
         let token = Arc::new(());
         let file = SharedFd::new(retained.0.open.borrow().shared.clone());
-        self.local_rights
-            .uring
-            .borrow_mut()
-            .insert(id, (Arc::downgrade(&token), retained));
+        self.local_rights.retain_uring(id, &token, retained);
         Ok(UringFile {
             lease: None,
             file,

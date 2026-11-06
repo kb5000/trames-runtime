@@ -131,6 +131,18 @@ impl Charge {
             state: AtomicU8::new(0),
         })
     }
+    /// A fresh fork charge has no concurrent consumers until task publication.
+    /// Reserve against the actual shared budgets, then publish its final state;
+    /// the first-touch state machine is only needed by already shared charges.
+    pub(super) fn fork(account: &Arc<Account>, resident: bool) -> Result<Arc<Self>, MemoryError> {
+        if resident {
+            account.take(PAGE_SIZE as usize)?;
+        }
+        Ok(Arc::new(Self {
+            account: account.clone(),
+            state: AtomicU8::new(if resident { 2 } else { 0 }),
+        }))
+    }
     pub(super) fn native(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
@@ -301,8 +313,8 @@ impl Memory {
     pub(super) fn fork_account(&self) -> Arc<Account> {
         self.account.fork()
     }
-    /// Check quotas before cloning. Clone is non-fallible, so Kernel performs
-    /// this admission while all workers are joined, immediately before fork.
+    /// Advisory quota query only. Independent mms can allocate after this
+    /// check; guest task creation must use try_fork's fallible accounting.
     pub fn can_fork(&self) -> bool {
         if let Some(shared) = &self.shared {
             return shared.borrow().can_fork();
@@ -333,7 +345,7 @@ impl Memory {
             let bytes = self
                 .mmu
                 .page(base)
-                .unwrap_or_else(|| Rc::new(PageBytes::new([0; PAGE_SIZE as usize])));
+                .unwrap_or_else(|| Arc::new(PageBytes::new([0; PAGE_SIZE as usize])));
             self.frames[frame].as_mut().expect("mapped page").bytes = bytes;
             return Ok(true);
         }
@@ -354,7 +366,7 @@ impl Memory {
                 page.bytes = self
                     .mmu
                     .page(base)
-                    .unwrap_or_else(|| Rc::new(PageBytes::new([0; PAGE_SIZE as usize])));
+                    .unwrap_or_else(|| Arc::new(PageBytes::new([0; PAGE_SIZE as usize])));
                 changed = true;
             }
         }
@@ -414,6 +426,109 @@ mod tests {
         assert_eq!(child.read_array::<1>(0x11000), Ok([42]));
         drop(child);
         parent.write_array(0x10000, [99u8]).unwrap();
+    }
+    #[test]
+    fn fork_of_read_only_sparse_zeros_does_not_consume_the_resident_budget() {
+        for retained in [false, true] {
+            let mut parent = Memory::new(4 * P);
+            parent.set_total_limit(P).unwrap();
+            parent.map(0x10000, 1024 * 1024, Permissions::RW).unwrap();
+            let mut registry = Registry::default();
+            let view = parent.parallel_view(&mut registry).unwrap();
+            for address in [0x10000, 0x90000] {
+                assert_eq!(view.read_array::<8>(address), Ok([0; 8]));
+            }
+            let held = if retained {
+                Some(view)
+            } else {
+                drop(view);
+                None
+            };
+            assert_eq!(parent.resident_bytes(), 0);
+            let mut child = parent.try_fork().unwrap();
+            assert_eq!(child.resident_bytes(), 0);
+            assert_eq!(
+                parent
+                    .account
+                    .total
+                    .as_ref()
+                    .unwrap()
+                    .used
+                    .load(Ordering::Relaxed),
+                0
+            );
+            child.write_array(0x10000, [41u8]).unwrap();
+            assert_eq!(parent.read_array::<1>(0x10000), Ok([0]));
+            assert_eq!(parent.write_array(0x10000, [43u8]), Err(MemoryError::Limit));
+            drop(child);
+            drop(held);
+            parent.write_array(0x10000, [43u8]).unwrap();
+            assert_eq!(parent.resident_bytes(), P);
+        }
+    }
+    #[test]
+    fn fork_quota_race_rolls_back_child_charges_and_preserves_parent_custody() {
+        for sparse in [false, true] {
+            for retained in [false, true] {
+                let mut parent = Memory::new(8 * P);
+                parent.set_total_limit(6 * P).unwrap();
+                parent
+                    .map(
+                        0x10000,
+                        if sparse { 32 } else { 4 } * PAGE_SIZE,
+                        Permissions::RW,
+                    )
+                    .unwrap();
+                let mut registry = Registry::default();
+                if sparse {
+                    let mut view = parent.parallel_view(&mut registry).unwrap();
+                    view.write_array(0x10000, [17u8]).unwrap();
+                    view.write_array(0x11000, [23u8]).unwrap();
+                    drop(view);
+                    parent.commit_parallel().unwrap();
+                    assert!(parent.pages.is_empty(), "exercise sparse fork charging");
+                } else {
+                    parent.write_array(0x10000, [17u8]).unwrap();
+                    parent.write_array(0x11000, [23u8]).unwrap();
+                }
+                let held = retained.then(|| parent.parallel_view(&mut registry).unwrap());
+                let mut peer = parent.try_fork().unwrap();
+                assert!(parent.can_fork());
+                let mut worker = peer.parallel_view(&mut registry).unwrap();
+                // Deterministically place another mm's first touch between
+                // the formerly authoritative admission check and the fork.
+                let mut worker = std::thread::spawn(move || {
+                    worker.write_array(0x12000, [29u8]).unwrap();
+                    worker
+                })
+                .join()
+                .unwrap();
+                let epoch = parent.fork_epoch.get();
+                let identity = parent.instruction_identity();
+                let total = parent.account.total.as_ref().unwrap();
+                assert_eq!(total.used.load(Ordering::Relaxed), 5 * P);
+                assert!(matches!(parent.try_fork(), Err(MemoryError::Limit)));
+                assert_eq!(total.used.load(Ordering::Relaxed), 5 * P);
+                assert_eq!(parent.fork_epoch.get(), epoch);
+                assert_eq!(parent.instruction_identity(), identity);
+                assert_eq!(parent.read_array::<1>(0x10000), Ok([17]));
+                assert_eq!(parent.read_array::<1>(0x11000), Ok([23]));
+                // The failed fork reserved one page before failing on its
+                // second. This store can use it only if rollback released it.
+                worker.write_array(0x13000, [31u8]).unwrap();
+                assert_eq!(total.used.load(Ordering::Relaxed), 6 * P);
+                drop(worker);
+                drop(peer);
+                assert_eq!(total.used.load(Ordering::Relaxed), 2 * P);
+                let mut child = parent.try_fork().unwrap();
+                child.write_array(0x10000, [41u8]).unwrap();
+                assert_eq!(parent.read_array::<1>(0x10000), Ok([17]));
+                assert_eq!(child.read_array::<1>(0x10000), Ok([41]));
+                drop(child);
+                drop(held);
+                assert_eq!(total.used.load(Ordering::Relaxed), 2 * P);
+            }
+        }
     }
     #[test]
     fn concurrent_first_stores_share_charges_and_enforce_the_total_before_effects() {

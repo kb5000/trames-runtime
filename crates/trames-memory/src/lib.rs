@@ -25,6 +25,9 @@ mod report;
 mod reservations;
 mod residency;
 pub use report::{ImageRanges, MemoryReport};
+#[cfg(test)]
+mod ownership_tests;
+mod root;
 mod slots;
 use backing::Backed;
 pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource};
@@ -32,13 +35,17 @@ pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;
 use residency::{Account, Charge};
+use root::Root;
+pub use root::{MemoryAdmission, Write as SharedMemoryWrite};
 use slots::Slots;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     fmt,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -125,10 +132,11 @@ impl std::error::Error for MemoryError {}
 
 #[derive(Clone)]
 struct Page {
-    // Rc counts coordinator/fork owners only; worker Arc handles refer to the
-    // same SharedPage without causing false COW. The Rc and backing providers
-    // stay !Send/!Sync; every shared byte borrow uses the common region guards.
-    bytes: Rc<PageBytes>,
+    // This Arc counts address-space COW owners only. Execution Views retain
+    // the inner SharedPage instead, so they never cause false COW. Atomic
+    // ownership lets distinct original mms retire or detach their page bytes
+    // independently; the remaining root/backing graph is still owner-local.
+    bytes: Arc<PageBytes>,
     charge: std::sync::Arc<Charge>,
     permissions: Permissions,
     instruction_revision: u64,
@@ -232,7 +240,7 @@ pub struct Memory {
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
     anonymous: anonymous::Anonymous,
-    sparse_pages: RefCell<BTreeMap<u64, Rc<Page>>>,
+    sparse_pages: RefCell<BTreeMap<u64, Arc<Page>>>,
     parallel_anonymous_dirty: bool,
     parallel_anonymous_changes: Vec<std::ops::Range<u64>>,
     anonymous_retired: Vec<anonymous::Retirement>,
@@ -247,7 +255,7 @@ pub struct Memory {
     code_revision: u64,
     identity: u64,
     original_identity: u64,
-    shared: Option<Rc<RefCell<Memory>>>,
+    shared: Option<Arc<Root<Memory>>>,
     has_backings: bool,
     has_external_code: bool,
     cpu_borrow_safe: bool,
@@ -261,21 +269,46 @@ pub struct Memory {
 }
 impl Clone for Memory {
     fn clone(&self) -> Self {
+        self.try_fork()
+            .expect("Memory::clone exhausted resident budget; use try_fork for guest forks")
+    }
+}
+impl Memory {
+    /// Take a COW snapshot with transactional resident accounting. The caller
+    /// holds this mm's structural custody; independent mms may still allocate
+    /// from the shared total. A failed charge drops all tentative child owners
+    /// and leaves the parent's translation/epoch state intact.
+    pub fn try_fork(&self) -> Result<Self, MemoryError> {
         // fork always takes a COW snapshot, including when its parent has threads.
         if let Some(shared) = &self.shared {
-            return shared.borrow().clone();
+            return shared.borrow().try_fork();
         }
-        self.invalidate_translations();
         // Retained guarded Views require an isolated child copy, not parent
         // COW aliases. Keep the parent's unchanged snapshot/dirty journal and
         // hardware tables. Capture this once: a borrower may finish mid-copy.
         let retained = self.has_parallel_users();
-        if !retained {
-            self.mmu.retire();
-            self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
-        }
         let account = self.fork_account();
         let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
+        let mut frames = Slots::new();
+        for source in self.frames.iter() {
+            let Some(source) = source else {
+                frames.push(None);
+                continue;
+            };
+            let pinned = !self.pinned.is_empty() && self.page_pinned(source);
+            let resident = source.charge.resident();
+            let mut page = source.clone();
+            if (retained || pinned) && page.bytes.shared().is_some() {
+                page.bytes = Arc::new(if resident {
+                    (*page.bytes).clone()
+                } else {
+                    PageBytes::Zero
+                });
+            }
+            page.charge = Charge::fork(&account, resident)?;
+            page.parallel_dirty = false;
+            frames.push(Some(page));
+        }
         let mut cloned = Self {
             mmu: self.mmu.empty_like(),
             pages: self.pages.clone(),
@@ -285,30 +318,7 @@ impl Clone for Memory {
             parallel_anonymous_changes: Vec::new(),
             anonymous_retired: Vec::new(),
             reservations: self.reservations.clone(),
-            frames: self
-                .frames
-                .iter()
-                .map(|source| {
-                    source.as_ref().map(|source| {
-                        let pinned = !self.pinned.is_empty() && self.page_pinned(source);
-                        let mut page = source.clone();
-                        if (retained || pinned) && page.bytes.shared().is_some() {
-                            page.bytes = Rc::new(if page.charge.resident() {
-                                (*page.bytes).clone()
-                            } else {
-                                PageBytes::Zero
-                            });
-                        }
-                        let charge = Charge::new(&account);
-                        if page.charge.resident() {
-                            charge.ensure().expect("fork admitted by can_fork");
-                        }
-                        page.charge = charge;
-                        page.parallel_dirty = false;
-                        page
-                    })
-                })
-                .collect(),
+            frames,
             free_frames: self.free_frames.clone(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit: self.limit,
@@ -332,20 +342,31 @@ impl Clone for Memory {
             parallel_reservations_dirty: false,
         };
         // A retained worker can have reached pages absent from the coordinator's
-        // descriptor table. Fork them through the same Rc/COW boundary as pages.
+        // descriptor table. Fork them through the same COW boundary as pages.
         for base in self.anonymous.populated() {
             let source = self.sparse_page(base);
+            let resident = source.charge.resident();
             let mut page = source.clone();
             if retained {
-                page.bytes = Rc::new((*page.bytes).clone());
+                page.bytes = Arc::new(if resident {
+                    (*page.bytes).clone()
+                } else {
+                    PageBytes::Zero
+                });
             }
-            page.charge = Charge::new(&cloned.account);
-            page.charge.ensure().expect("fork admitted by can_fork");
+            page.charge = Charge::fork(&cloned.account, resident)?;
             page.parallel_dirty = false;
             cloned.anonymous.remove(base, base + PAGE_SIZE);
             cloned.insert_owned_page(base, page);
         }
-        cloned
+        // Commit only after every child charge succeeded. No tentative child
+        // can execute while it shares a still-writable parent CPU alias.
+        self.invalidate_translations();
+        if !retained {
+            self.mmu.retire();
+            self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
+        }
+        Ok(cloned)
     }
 }
 
@@ -357,7 +378,7 @@ impl Default for Memory {
 
 /// Coordinator-local weak custody of an original CLONE_VM graph. Capturing it
 /// neither adds an address-space owner nor retains guest RAM after final exit.
-pub struct SharedRoot(std::rc::Weak<RefCell<Memory>>);
+pub struct SharedRoot(std::sync::Weak<Root<Memory>>);
 impl SharedRoot {
     /// The cohort's Views have returned; another original task/host owner may
     /// still retain the graph even when its dispatched task already exited.
@@ -376,26 +397,26 @@ impl Memory {
     pub fn share(&mut self) -> Self {
         if self.shared.is_none() {
             let owned = std::mem::replace(self, Self::new(self.limit));
-            self.shared = Some(Rc::new(RefCell::new(owned)));
+            self.shared = Some(Arc::new(Root::new(owned)));
         }
         Self {
             shared: self.shared.clone(),
             ..Self::new(self.limit)
         }
     }
-    /// Address-space identity and number of coordinator-local `Memory` owners.
+    /// Address-space identity and number of original `Memory` owners.
     /// A scheduler can compare the count with its own handles before admitting
     /// exclusive worker access. This includes aliases retained by host callbacks;
     /// published worker Views are counted separately across all generations.
     pub fn coordinator_ownership(&self) -> (u64, usize) {
         self.shared.as_ref().map_or((self.identity, 1), |shared| {
-            (shared.borrow().identity, Rc::strong_count(shared))
+            (shared.borrow().identity, Arc::strong_count(shared))
         })
     }
     pub fn shared_root(&self) -> Option<SharedRoot> {
         self.shared
             .as_ref()
-            .map(|memory| SharedRoot(Rc::downgrade(memory)))
+            .map(|memory| SharedRoot(Arc::downgrade(memory)))
     }
     pub fn limit(&self) -> usize {
         self.shared
@@ -601,7 +622,8 @@ impl Memory {
         // SAFETY: entries are filled only from pages -> live slab slots. Every
         // mapping mutation flushes translations before another access, and no
         // callback/mutation occurs between translation and dereference. This
-        // local Memory is !Send/!Sync; no worker can edit its page table.
+        // Memory is !Sync; shared roots hold structural custody for the borrow.
+        // Moving an exclusively owned Memory cannot mutate it during this read.
         if entry.frame & anonymous::TOKEN != 0 {
             // SAFETY: immutable anonymous range metadata owns this Page. Every
             // mapping/descriptor mutation clears the TLB before dropping it.
@@ -941,7 +963,7 @@ impl Memory {
             let mut page = (*source).clone();
             page.permissions = permissions;
             page.instruction_revision = self.code_revision;
-            self.anonymous.insert_store(a, b, Rc::new(page), store);
+            self.anonymous.insert_store(a, b, Arc::new(page), store);
         }
         self.remove_reservations(address, end)?;
         for (a, b) in reserved {
@@ -1370,7 +1392,7 @@ mod tests {
         memory.read(0, &mut bytes).unwrap();
         let frame = memory.pages[&0];
         assert_eq!(
-            Rc::strong_count(&memory.frames[frame].as_ref().unwrap().bytes),
+            Arc::strong_count(&memory.frames[frame].as_ref().unwrap().bytes),
             1
         );
         let mut child = memory.clone();

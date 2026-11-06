@@ -313,7 +313,7 @@ impl SharedNamespaceSnapshot {
             root: None,
         }
     }
-    pub fn project(&self) -> (NamespaceSnapshot, Rc<NamespaceProjection>) {
+    pub fn project(&self) -> (NamespaceSnapshot, Arc<NamespaceProjection>) {
         let mount = self
             .mount
             .upgrade()
@@ -344,7 +344,7 @@ impl SharedNamespaceSnapshot {
         };
         (
             snapshot,
-            Rc::new(NamespaceProjection {
+            Arc::new(NamespaceProjection {
                 _mount: mount,
                 _root: root.map(|(m, _)| m),
             }),

@@ -42,7 +42,7 @@ impl IoTask {
             .alt_stack
             .call(sp, a[0], a[1], memory)
     }
-    pub fn dequeue(&self, mask: u64) -> Option<(u32, Info)> {
+    pub fn dequeue(&self, mask: u64) -> Option<(u32, RetainedInfo)> {
         self.inbox
             .dequeue(mask)
             .or_else(|| self.process().dequeue(mask))

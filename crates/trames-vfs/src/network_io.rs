@@ -82,7 +82,7 @@ impl DirectNetwork {
 /// retain that membership allocation, preventing address reuse during the epoch.
 #[derive(Default)]
 pub struct NetworkEpoch {
-    captures: BTreeMap<usize, (Rc<fd_table::DescriptorVersion>, DirectNetwork)>,
+    captures: BTreeMap<usize, (Arc<fd_table::DescriptorVersion>, DirectNetwork)>,
 }
 impl NetworkEpoch {
     pub fn capture(&mut self, vfs: &Vfs) -> DirectNetwork {
@@ -433,7 +433,7 @@ mod tests {
         let mut parent = Vfs::default();
         parent.configure_network(NetworkMode::Loopback).unwrap();
         let mut child = parent.clone();
-        assert!(Rc::ptr_eq(&parent.fds.identity(), &child.fds.identity()));
+        assert!(Arc::ptr_eq(&parent.fds.identity(), &child.fds.identity()));
         let mut epoch = NetworkEpoch::default();
         let a = epoch.capture(&parent);
         let b = epoch.capture(&child);

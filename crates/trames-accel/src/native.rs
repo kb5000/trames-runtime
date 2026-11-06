@@ -902,31 +902,31 @@ mod tests {
     }
     #[test]
     fn cached_stub_tokens_follow_live_backing_aliases_and_eof_checks() {
-        use std::{
-            cell::{Cell, RefCell},
-            rc::Rc,
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex,
         };
         use trames_memory::{backing_changed, PageBacking};
         struct Backing {
-            bytes: RefCell<[u8; PAGE_SIZE as usize]>,
-            version: Cell<u64>,
-            valid: Cell<bool>,
+            bytes: Mutex<[u8; PAGE_SIZE as usize]>,
+            version: AtomicU64,
+            valid: AtomicBool,
         }
         impl PageBacking for Backing {
             fn check(&self, address: u64) -> Result<(), MemoryError> {
-                if self.valid.get() {
+                if self.valid.load(Ordering::Relaxed) {
                     Ok(())
                 } else {
                     Err(MemoryError::Bus(address))
                 }
             }
             fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-                out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+                out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
                 Ok(())
             }
             fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-                self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
-                self.version.set(self.version.get() + 1);
+                self.bytes.lock().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
+                self.version.fetch_add(1, Ordering::Relaxed);
                 backing_changed();
                 Ok(())
             }
@@ -934,19 +934,19 @@ mod tests {
                 Ok(())
             }
             fn version(&self) -> u64 {
-                self.version.get()
+                self.version.load(Ordering::Relaxed)
             }
             fn writable(&self) -> bool {
                 true
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 Err(MemoryError::InvalidRange)
             }
         }
-        let backing = Rc::new(Backing {
-            bytes: RefCell::new([0; PAGE_SIZE as usize]),
-            version: Cell::new(1),
-            valid: Cell::new(true),
+        let backing = Arc::new(Backing {
+            bytes: Mutex::new([0; PAGE_SIZE as usize]),
+            version: AtomicU64::new(1),
+            valid: AtomicBool::new(true),
         });
         for (i, word) in [
             0xd2800030u32,
@@ -972,12 +972,12 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(r.metrics.validation_hits, 1);
-        backing.valid.set(false);
+        backing.valid.store(false, Ordering::Relaxed);
         assert!(matches!(
             r.invoke(&mut m, 0x100c, PROFILE, 3, [0x5000, 1, 128]),
             Err(Error::InvalidEntry)
         ));
-        backing.valid.set(true);
+        backing.valid.store(true, Ordering::Relaxed);
         m.fill_with(0x3000, 4, |bytes| {
             bytes.copy_from_slice(&0xd503201fu32.to_le_bytes())
         })

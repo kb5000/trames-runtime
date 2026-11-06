@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Original native driver regression for the new wire operations (also Metal).
 use std::{
-    cell::RefCell,
-    rc::Rc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -51,13 +50,13 @@ fn poll(b: &mut Backend, m: &mut Memory, op: u64, args: &[u64], pending: u64) {
         thread::sleep(Duration::from_micros(100));
     }
 }
-struct FailedOutput(RefCell<[u8; PAGE_SIZE as usize]>);
+struct FailedOutput(Mutex<[u8; PAGE_SIZE as usize]>);
 impl PageBacking for FailedOutput {
     fn check(&self, _: u64) -> Result<(), MemoryError> {
         Ok(())
     }
     fn read(&self, at: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-        out.copy_from_slice(&self.0.borrow()[at..at + out.len()]);
+        out.copy_from_slice(&self.0.lock().unwrap()[at..at + out.len()]);
         Ok(())
     }
     fn write(&self, _: usize, _: &[u8]) -> Result<(), MemoryError> {
@@ -72,7 +71,7 @@ impl PageBacking for FailedOutput {
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
 }
@@ -756,7 +755,7 @@ fn main() {
             if depth && rp2 {
                 m.map_backed(
                     0xa000,
-                    vec![Rc::new(FailedOutput(RefCell::new([0; PAGE_SIZE as usize])))],
+                    vec![Arc::new(FailedOutput(Mutex::new([0; PAGE_SIZE as usize])))],
                     true,
                     Permissions::RW,
                     false,

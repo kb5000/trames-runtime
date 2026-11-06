@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Read-only mm metadata. Reports retain accounting and immutable layout, never
-//! a guest byte actor, a Memory Rc, a physical page, or an execution View.
+//! a guest byte actor, a Memory Arc, a physical page, or an execution View.
 use super::*;
 use std::sync::{Arc, OnceLock, RwLock};
 

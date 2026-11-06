@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Allocation metadata follows the actual VM ownership domain. Mapping edits
 //! still join the VM; a worker may only read the current program break.
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -16,11 +14,13 @@ impl ProgramBreak {
     }
 }
 
-pub(crate) struct Heap(Rc<State>);
+pub(crate) struct Heap(Arc<State>);
 struct State {
     base: u64,
     current: ProgramBreak,
-    next: Cell<u64>,
+    // Structural edits retain original mm custody. This scalar allows the
+    // complete Linux state to move; it does not admit concurrent mapping edits.
+    next: AtomicU64,
 }
 impl Clone for Heap {
     fn clone(&self) -> Self {
@@ -32,10 +32,10 @@ impl Heap {
         Self::from_values(base, base, 0x1000_0000)
     }
     fn from_values(base: u64, current: u64, next: u64) -> Self {
-        Self(Rc::new(State {
+        Self(Arc::new(State {
             base,
             current: ProgramBreak(Arc::new(AtomicU64::new(current))),
-            next: Cell::new(next),
+            next: AtomicU64::new(next),
         }))
     }
     pub(crate) fn shared(&self) -> Self {
@@ -48,7 +48,7 @@ impl Heap {
         self.0.current.get()
     }
     pub(crate) fn cursor(&self) -> u64 {
-        self.0.next.get()
+        self.0.next.load(Ordering::Relaxed)
     }
     pub(crate) fn set_current(&self, value: u64) {
         // Query value only. Existing VM commit/join publishes mappings; this
@@ -56,7 +56,7 @@ impl Heap {
         self.0.current.0.store(value, Ordering::Relaxed);
     }
     pub(crate) fn set_cursor(&self, value: u64) {
-        self.0.next.set(value);
+        self.0.next.store(value, Ordering::Relaxed);
     }
     pub(crate) fn break_capability(&self) -> ProgramBreak {
         self.0.current.clone()

@@ -935,6 +935,27 @@ impl Vfs {
         }
         CgroupBirth { result, events }
     }
+    /// Task construction commits PID allocation and cgroup membership together.
+    /// In particular, a rejected first child must leave namespace PID 1 free.
+    /// Lock order is cgroup -> ancestor PID maps, matching cgroup PID queries;
+    /// task/family publication and notifications happen after these guards drop.
+    pub fn activate_child_birth(&mut self, parent: u32, child: u32, tgid: u32) -> CgroupBirth {
+        let mut cg = self.cgroups.borrow_mut();
+        let mut events = Vec::new();
+        let identity = self.pid_children.allocate_with(child, || {
+            let (result, changes) = cg.check_fork(parent);
+            events.extend(changes);
+            result?;
+            events.extend(cg.fork_member(parent, child, tgid));
+            Ok(())
+        });
+        drop(cg);
+        let result = identity.map(|identity| {
+            self.pid_identity = identity;
+            self.pid_ns = self.pid_children.clone();
+        });
+        CgroupBirth { result, events }
+    }
     pub fn cgroup_task(&self, pid: u32) -> Option<CgroupTask> {
         let member = self.cgroups.borrow().tasks.get(&pid)?.clone();
         Some(CgroupTask {
@@ -1650,6 +1671,53 @@ mod tests {
         assert_eq!(v.stat_at(AT_FDCWD, &path), Err(Errno(2)));
         assert_eq!(v.capacity().used_bytes, before.used_bytes);
         assert_eq!(v.capacity().nodes_used, before.nodes_used);
+    }
+    #[test]
+    fn rejected_birth_preserves_first_namespace_init_and_ancestor_ids() {
+        let mut v = setup();
+        let controllers = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/cgroup.subtree_control", 1, 0)
+            .unwrap();
+        v.write(controllers, b"+pids").unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/x", 0o755).unwrap();
+        v.cgroup_fork(1, 2, 2);
+        let procs = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(procs, b"2").unwrap();
+        let limit = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/x/pids.max", 1, 0)
+            .unwrap();
+        v.write(limit, b"1").unwrap();
+        v.unshare_pid().unwrap();
+        v.activate_child_pid(2).unwrap();
+        let ancestor = v.pid_namespace().clone();
+        v.unshare_pid().unwrap();
+        let namespace = v.pid_children_namespace().clone();
+        for id in 3..6 {
+            let birth = v.activate_child_birth(2, id, id);
+            assert_eq!(birth.result(), Err(Errno(11)));
+            birth.notify();
+            assert_eq!(namespace.global(1), None);
+            assert_eq!(ancestor.local(id), 0);
+            assert!(v.cgroup_task(id).is_none());
+            assert_eq!(v.pid_namespace().id(), ancestor.id());
+        }
+        v.write(limit, b"2").unwrap();
+        let birth = v.activate_child_birth(2, 6, 6);
+        assert_eq!(birth.result(), Ok(()));
+        birth.notify();
+        assert_eq!(namespace.init(), 6);
+        assert_eq!(namespace.local(6), 1);
+        assert_eq!(ancestor.local(6), 2);
+        assert!(v.cgroup_task(6).is_some());
+        // Namespace validation precedes cgroup mutation, too.
+        namespace.terminate();
+        v.write(limit, b"3").unwrap();
+        let birth = v.activate_child_birth(6, 7, 7);
+        assert_eq!(birth.result(), Err(Errno(12)));
+        birth.notify();
+        assert!(v.cgroup_task(7).is_none());
     }
     #[test]
     fn birth_commits_the_current_group_limit_and_member_together() {

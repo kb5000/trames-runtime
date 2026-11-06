@@ -82,7 +82,7 @@ impl SignalWait {
             return Some((|| {
                 if info != 0 {
                     let mut bytes = [0; 128];
-                    write_siginfo(&mut bytes, sig, value);
+                    write_siginfo(&mut bytes, sig, *value);
                     memory.write_array(info, bytes).map_err(|_| Errno(14))?;
                 }
                 Ok(sig as u64)

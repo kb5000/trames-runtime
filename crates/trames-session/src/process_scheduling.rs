@@ -170,7 +170,7 @@ mod tests {
                     );
                     if decision.is_some() {
                         assert_eq!(
-                            k.processes[&1].seccomp.evaluations(),
+                            k.processes.read(&1).seccomp.evaluations(),
                             k.syscalls,
                             "{number}"
                         );
@@ -247,7 +247,7 @@ mod tests {
             Ok(Some(0))
         );
         assert_eq!(p.signals.io.scheduling.nice(), 0);
-        assert_eq!(k.processes[&2].signals.io.scheduling.nice(), 7);
+        assert_eq!(k.processes.read(&2).signals.io.scheduling.nice(), 7);
         assert_eq!(
             k.syscall(1, &mut p, 141, [1, 0, 0, 0, 0, 0], &mut io),
             Ok(Some(20))

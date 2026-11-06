@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! CPU/native views between quiescent kernel checkpoints. Scoped page guards
-//! stay on workers; Rc backings, mappings and persistence stay coordinated.
+//! stay on workers; mapping preparation shares original backing identities.
 //! Mutable byte cells have an audited region-guard Sync boundary in page.rs.
 pub(super) mod anonymous;
 #[cfg(test)]
@@ -10,6 +10,7 @@ mod native;
 pub(super) mod page;
 #[cfg(test)]
 mod readonly;
+mod registry;
 #[cfg(test)]
 mod retirement;
 #[cfg(test)]
@@ -22,7 +23,7 @@ use std::sync::{Arc, Weak};
 pub struct Registry {
     hardware: bool,
     mmu: mmu::Pool,
-    shared: BTreeMap<(u64, u64), Weak<ConcurrentPage>>,
+    shared: registry::SharedPages,
     code_epoch: Arc<AtomicU64>,
     pub metrics: Metrics,
 }
@@ -51,6 +52,28 @@ pub struct Metrics {
     /// Dispatches sharing immutable private pages across CPUs of one VM.
     pub readonly_private_views: u64,
 }
+impl Metrics {
+    pub fn merge(&mut self, other: Self) {
+        self.cache_hits += other.cache_hits;
+        self.dirty_refreshes += other.dirty_refreshes;
+        self.full_rebuilds += other.full_rebuilds;
+        self.full_rebuild_pages += other.full_rebuild_pages;
+        self.backing_invalidations += other.backing_invalidations;
+        self.backing_domain_checks += other.backing_domain_checks;
+        self.backing_page_checks += other.backing_page_checks;
+        self.code_invalidations += other.code_invalidations;
+        self.source_page_reads += other.source_page_reads;
+        self.incremental_updates += other.incremental_updates;
+        self.direct_frame_refreshes += other.direct_frame_refreshes;
+        self.incremental_pages += other.incremental_pages;
+        self.shared_frames += other.shared_frames;
+        self.copied_publish_bytes += other.copied_publish_bytes;
+        self.cow_detach_bytes += other.cow_detach_bytes;
+        self.exclusive_private_views += other.exclusive_private_views;
+        self.readonly_private_views += other.readonly_private_views;
+    }
+}
+
 pub(super) struct ConcurrentPage {
     identity: u64,
     hardware_constant: std::sync::OnceLock<Arc<SharedPage>>,
@@ -366,62 +389,57 @@ fn prepare_frame(
     let bytes = if let Some(shared) = resident_backing {
         registry.metrics.shared_frames += 1;
         let previous = previous.map(|f| &f.bytes);
-        let reused = previous
-            .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
-            .cloned()
-            .or_else(|| {
-                key.and_then(|key| registry.shared.get(&key))
-                    .and_then(Weak::upgrade)
-                    .filter(|bytes| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared)))
-            });
-        let bytes = reused.unwrap_or_else(|| {
-            Arc::new(ConcurrentPage::shared(shared, registry.code_epoch.clone()))
-        });
+        let matches =
+            |bytes: &ConcurrentPage| bytes.mutable().is_some_and(|old| Arc::ptr_eq(old, &shared));
+        let make = || {
+            previous
+                .filter(|bytes| matches(bytes))
+                .cloned()
+                .unwrap_or_else(|| {
+                    Arc::new(ConcurrentPage::shared(
+                        shared.clone(),
+                        registry.code_epoch.clone(),
+                    ))
+                })
+        };
         if let Some(key) = key {
-            registry.shared.insert(key, Arc::downgrade(&bytes));
+            registry.shared.intern(key, matches, make).0
+        } else {
+            make()
         }
-        bytes
     } else if let Some(source) = source {
         let private = page
             .backing
             .as_ref()
             .is_some_and(|b| !b.shared && page.permissions.write);
         let source_key = page.backing.as_ref().and_then(|b| b.object.parallel_key());
-        let reused = same.map(|frame| frame.bytes.clone()).or_else(|| {
-            (!private)
-                .then(|| {
-                    source_key
-                        .and_then(|key| registry.shared.get(&key))
-                        .and_then(Weak::upgrade)
-                })
-                .flatten()
-        });
-        let bytes = reused.unwrap_or_else(|| {
-            Arc::new(ConcurrentPage::deferred(
-                if private {
-                    new_backing_identity()
-                } else {
-                    source_key.map_or_else(new_backing_identity, |key| key.0)
-                },
-                source,
-                private,
-                registry.code_epoch.clone(),
-            ))
-        });
-        if !private {
-            if let Some(key) = source_key {
-                registry.shared.insert(key, Arc::downgrade(&bytes));
-            }
+        let make = || {
+            same.map(|frame| frame.bytes.clone()).unwrap_or_else(|| {
+                Arc::new(ConcurrentPage::deferred(
+                    if private {
+                        new_backing_identity()
+                    } else {
+                        source_key.map_or_else(new_backing_identity, |key| key.0)
+                    },
+                    source,
+                    private,
+                    registry.code_epoch.clone(),
+                ))
+            })
+        };
+        if let Some(key) = source_key.filter(|_| !private) {
+            registry.shared.intern(key, |_| true, make).0
+        } else {
+            make()
         }
-        bytes
     } else if direct_owned {
         let shared = if page.bytes.shared().is_some()
-            && (Rc::strong_count(&page.bytes) == 1 || !page.permissions.write)
+            && (Arc::strong_count(&page.bytes) == 1 || !page.permissions.write)
         {
             page.bytes.shared().unwrap().clone()
         } else {
-            let old = std::mem::replace(&mut page.bytes, Rc::new(PageBytes::Zero));
-            let owned = Rc::try_unwrap(old).unwrap_or_else(|old| {
+            let old = std::mem::replace(&mut page.bytes, Arc::new(PageBytes::Zero));
+            let owned = Arc::try_unwrap(old).unwrap_or_else(|old| {
                 if !page.charge.resident() {
                     return PageBytes::Zero;
                 }
@@ -440,7 +458,7 @@ fn prepare_frame(
                 })
                 .flatten();
             let shared = Arc::new(SharedPage::from_owned(owned, slot));
-            page.bytes = Rc::new(PageBytes::Concurrent(shared.clone()));
+            page.bytes = Arc::new(PageBytes::Concurrent(shared.clone()));
             shared
         };
         registry.metrics.shared_frames += 1;
@@ -475,20 +493,23 @@ fn prepare_frame(
             page.read_bytes(0, &mut data).ok()?;
         }
         if let Some(key) = key {
-            if let Some(bytes) = registry.shared.get(&key).and_then(Weak::upgrade) {
+            let (bytes, inserted) = registry.shared.intern(
+                key,
+                |_| true,
+                || {
+                    Arc::new(ConcurrentPage::new(
+                        data,
+                        false,
+                        false,
+                        registry.code_epoch.clone(),
+                        None,
+                    ))
+                },
+            );
+            if !inserted {
                 bytes.refresh(&data).ok()?;
-                bytes
-            } else {
-                let bytes = Arc::new(ConcurrentPage::new(
-                    data,
-                    false,
-                    false,
-                    registry.code_epoch.clone(),
-                    None,
-                ));
-                registry.shared.insert(key, Arc::downgrade(&bytes));
-                bytes
             }
+            bytes
         } else if let Some(frame) = previous.filter(|f| f.bytes.constant.is_none()) {
             frame.bytes.refresh(&data).ok()?;
             frame.bytes.clone()
@@ -515,7 +536,7 @@ fn prepare_frame(
     }
 
     let private_unique = direct_owned
-        && Rc::strong_count(&page.bytes) == 1
+        && Arc::strong_count(&page.bytes) == 1
         && bytes
             .mutable()
             .is_some_and(|bytes| Arc::strong_count(bytes) == 2);
@@ -629,7 +650,7 @@ pub(super) struct Users {
     count: std::sync::atomic::AtomicUsize,
     idle: std::sync::OnceLock<Arc<trames_shared::Readiness>>,
 }
-/// Send, with worker-local translations; never Sync and never retains Rc data.
+/// Send, with worker-local translations; never Sync and never retains Arc data.
 pub struct View {
     snapshot: Arc<Snapshot>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -1348,7 +1369,7 @@ impl Memory {
         if page.backing.is_some() || !page.charge.resident() {
             return;
         }
-        let forked = Rc::strong_count(&page.bytes) > 1;
+        let forked = Arc::strong_count(&page.bytes) > 1;
         let zero = page.bytes.is_zero() || (!page.charge.resident() && forked);
         let copy = !zero
             && ((forked && page.permissions.write) || matches!(&*page.bytes, PageBytes::Heap(_)));
@@ -1359,7 +1380,7 @@ impl Memory {
             let data = copy.then(|| page.bytes.snapshot());
             if let Some(mut bytes) = self.mmu.page(base) {
                 if let Some(data) = data {
-                    Rc::get_mut(&mut bytes)
+                    Arc::get_mut(&mut bytes)
                         .expect("fresh page owner")
                         .with_write(0, PAGE_SIZE as usize, |out| out.copy_from_slice(&data));
                     if forked {
@@ -1476,7 +1497,7 @@ impl Memory {
         }) {
             return None;
         }
-        registry.shared.retain(|_, page| page.strong_count() != 0);
+        registry.shared.prune();
         registry.mmu.prune();
         registry.metrics.full_rebuilds += 1;
         registry.metrics.full_rebuild_pages += self.pages.len() as u64;
@@ -2423,11 +2444,11 @@ mod tests {
     #[test]
     fn commit_coalesces_dirty_runs_and_preserves_clean_backing_alias_holes() {
         struct Backing {
-            bytes: RefCell<[u8; 4096]>,
-            writes: RefCell<Vec<(usize, usize)>>,
-            version: Cell<u64>,
+            bytes: std::sync::Mutex<[u8; 4096]>,
+            writes: std::sync::Mutex<Vec<(usize, usize)>>,
+            version: AtomicU64,
             identity: u64,
-            fail_once: Cell<bool>,
+            fail_once: std::sync::atomic::AtomicBool,
         }
         impl PageBacking for Backing {
             fn parallel_key(&self) -> Option<(u64, u64)> {
@@ -2437,16 +2458,16 @@ mod tests {
                 Ok(())
             }
             fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-                out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+                out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
                 Ok(())
             }
             fn write(&self, offset: usize, input: &[u8]) -> Result<(), MemoryError> {
-                if self.fail_once.replace(false) {
+                if self.fail_once.swap(false, Ordering::Relaxed) {
                     return Err(MemoryError::BackingIo(5));
                 }
-                self.bytes.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
-                self.writes.borrow_mut().push((offset, input.len()));
-                self.version.set(self.version.get().wrapping_add(1));
+                self.bytes.lock().unwrap()[offset..offset + input.len()].copy_from_slice(input);
+                self.writes.lock().unwrap().push((offset, input.len()));
+                self.version.fetch_add(1, Ordering::Relaxed);
                 backing_changed();
                 Ok(())
             }
@@ -2457,21 +2478,21 @@ mod tests {
                 Ok(())
             }
             fn version(&self) -> u64 {
-                self.version.get()
+                self.version.load(Ordering::Relaxed)
             }
             fn writable(&self) -> bool {
                 true
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 Err(MemoryError::InvalidRange)
             }
         }
-        let object = Rc::new(Backing {
-            bytes: RefCell::new([0; 4096]),
-            writes: RefCell::new(Vec::new()),
-            version: Cell::new(0),
+        let object = Arc::new(Backing {
+            bytes: std::sync::Mutex::new([0; 4096]),
+            writes: std::sync::Mutex::new(Vec::new()),
+            version: AtomicU64::new(0),
             identity: new_backing_identity(),
-            fail_once: Cell::new(false),
+            fail_once: std::sync::atomic::AtomicBool::new(false),
         });
         let mut memory = Memory::default();
         memory
@@ -2498,8 +2519,8 @@ mod tests {
         view.fill_with(0x1000, 4096, |b| b.fill(1)).unwrap();
         drop(view);
         memory.commit_parallel().unwrap();
-        assert_eq!(*object.writes.borrow(), [(0, 4096)]);
-        object.writes.borrow_mut().clear();
+        assert_eq!(*object.writes.lock().unwrap(), [(0, 4096)]);
+        object.writes.lock().unwrap().clear();
         let mut view = memory.parallel_view(&mut registry).unwrap();
         view.fill_with(0x3000, 64, |b| b.fill(7)).unwrap();
         view.fill_with(0x3080, 64, |b| b.fill(8)).unwrap();
@@ -2507,23 +2528,23 @@ mod tests {
         // An independent backing alias can change a clean hole. Commit must
         // retain it instead of publishing the old snapshot's whole page.
         object.write(64, &[9; 64]).unwrap();
-        object.writes.borrow_mut().clear();
+        object.writes.lock().unwrap().clear();
         memory.commit_parallel().unwrap();
-        assert_eq!(*object.writes.borrow(), [(0, 64), (128, 64)]);
+        assert_eq!(*object.writes.lock().unwrap(), [(0, 64), (128, 64)]);
         assert_eq!(memory.read_array::<64>(0x1000).unwrap(), [7; 64]);
         assert_eq!(memory.read_array::<64>(0x1040).unwrap(), [9; 64]);
         assert_eq!(memory.read_array::<64>(0x1080).unwrap(), [8; 64]);
-        object.writes.borrow_mut().clear();
+        object.writes.lock().unwrap().clear();
         let mut view = memory.parallel_view(&mut registry).unwrap();
         view.fill_with(0x1000, 128, |b| b.fill(2)).unwrap();
         drop(view);
         memory.commit_parallel().unwrap();
-        assert_eq!(*object.writes.borrow(), [(0, 128)]);
+        assert_eq!(*object.writes.lock().unwrap(), [(0, 128)]);
         // A transient persistence failure must keep uncommitted fragments.
         let mut view = memory.parallel_view(&mut registry).unwrap();
         view.write_array(0x3020, 42u64.to_le_bytes()).unwrap();
         drop(view);
-        object.fail_once.set(true);
+        object.fail_once.store(true, Ordering::Relaxed);
         assert_eq!(memory.commit_parallel(), Err(MemoryError::BackingIo(5)));
         memory.commit_parallel().unwrap();
         assert_eq!(memory.read_u64(0x1020).unwrap(), 42);
@@ -2541,7 +2562,7 @@ mod tests {
         root.commit_parallel().unwrap();
         assert_eq!(peer.read_u64(0x1020).unwrap(), 99);
         assert_eq!(
-            u64::from_le_bytes(object.bytes.borrow()[32..40].try_into().unwrap()),
+            u64::from_le_bytes(object.bytes.lock().unwrap()[32..40].try_into().unwrap()),
             99
         );
         drop(peer);

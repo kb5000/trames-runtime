@@ -75,7 +75,7 @@ impl PageBacking for ImportedPage {
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
 }
@@ -120,7 +120,7 @@ impl Memory {
                             .unwrap(),
                     )
                 };
-                Rc::new(ImportedPage(Arc::new(page), domain)) as Rc<dyn PageBacking>
+                Arc::new(ImportedPage(Arc::new(page), domain)) as Arc<dyn PageBacking>
             })
             .collect();
         self.map_backed(address, objects, true, Permissions::RW, true)

@@ -15,10 +15,7 @@ impl<C: Cpu> Process<C> {
         if info.fault.is_none() && info.poll.is_none() {
             info.sender = self.linux.vfs.visible_pid(info.sender);
         }
-        Some(info)
-    }
-    pub(super) fn signal_senders(&self) -> Vec<u32> {
-        self.signals.signal_senders()
+        Some(*info)
     }
 }
 

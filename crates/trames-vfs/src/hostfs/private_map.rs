@@ -102,20 +102,20 @@ impl PageSource for Source {
     }
 }
 struct PrivatePage {
-    open: OpenHandle,
+    open: Arc<SharedOpenDescription>,
     source: Arc<Source>,
     identity: u64,
     executable: bool,
 }
 impl PrivatePage {
     fn new(
-        open: OpenHandle,
+        open: Arc<SharedOpenDescription>,
         file: Arc<OpenFile>,
         domain: Arc<LoadDomain>,
         offset: u64,
         executable: bool,
-    ) -> Rc<Self> {
-        Rc::new(Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
             open,
             source: Arc::new(Source {
                 file,
@@ -207,7 +207,7 @@ impl PageBacking for PrivatePage {
     fn executable(&self) -> bool {
         self.executable
     }
-    fn next_page(&self, pages: u64) -> std::result::Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, pages: u64) -> std::result::Result<Arc<dyn PageBacking>, MemoryError> {
         let offset = pages
             .checked_mul(PAGE_SIZE)
             .and_then(|n| self.source.offset.checked_add(n))
@@ -222,13 +222,13 @@ impl PageBacking for PrivatePage {
     }
 }
 pub(crate) fn pages(
-    open: OpenHandle,
+    open: Arc<SharedOpenDescription>,
     file: Arc<OpenFile>,
     host: Arc<HostFile>,
     offset: u64,
     len: u64,
     executable: bool,
-) -> Result<Vec<Rc<dyn PageBacking>>> {
+) -> Result<Vec<Arc<dyn PageBacking>>> {
     let end = offset
         .checked_add(len)
         .filter(|&end| end <= i64::MAX as u64)
@@ -244,7 +244,7 @@ pub(crate) fn pages(
         .step_by(PAGE_SIZE as usize)
         .map(|at| {
             PrivatePage::new(open.clone(), file.clone(), domain.clone(), at, executable)
-                as Rc<dyn PageBacking>
+                as Arc<dyn PageBacking>
         })
         .collect())
 }

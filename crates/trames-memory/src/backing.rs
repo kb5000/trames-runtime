@@ -22,7 +22,10 @@ pub trait PageSource: Send + Sync {
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
 }
 
-pub trait PageBacking {
+/// Retained original mapping resources, movable with their address space.
+/// Implementations synchronize their own metadata and physical byte owners;
+/// Send + Sync does not authorize concurrent structural changes to a Memory.
+pub trait PageBacking: Send + Sync {
     /// Device publications can change executable bytes outside CPU write hooks.
     /// Only address spaces that map such storage executable watch its code epoch.
     fn external_code_updates(&self) -> bool {
@@ -43,12 +46,12 @@ pub trait PageBacking {
         false
     }
     /// Stable backing-page identity for quiescent parallel snapshots. External
-    /// shared backings must opt in; no thread ever receives this Rc object.
+    /// shared backings must opt in; this key describes their original byte owner.
     fn parallel_key(&self) -> Option<(u64, u64)> {
         None
     }
-    /// Share resident physical bytes with workers. The provider keeps metadata
-    /// coordinator-local; every CPU/native byte access must use these guards.
+    /// Share resident physical bytes with workers. Provider metadata has its own
+    /// synchronization; byte access keeps the existing SharedPage protocol.
     fn shared_page(&self) -> Option<std::sync::Arc<SharedPage>> {
         None
     }
@@ -68,7 +71,7 @@ pub trait PageBacking {
     /// covered by the generation. An unchanged generation guarantees unchanged
     /// version/check results, storage identities and native-span capabilities
     /// for every page in that domain. Notify backing_changed() on changes too.
-    /// Unknown providers retain individual page checks; no Rc reaches workers.
+    /// Unknown providers retain individual page checks at mapping preparation.
     fn parallel_change_domain(&self) -> Option<(u64, u64)> {
         None
     }
@@ -126,7 +129,8 @@ pub trait PageBacking {
     }
     /// Invoke once on a coherent resident fragment, or return false without
     /// invoking. Implementations retain the backing borrow for the callback.
-    /// Called only at a joined coordinator checkpoint; no Rc reaches workers.
+    /// The caller holds original-mm custody; retained Views keep their existing
+    /// physical-byte protocol. This call does not transfer structural custody.
     fn with_read(
         &self,
         _offset: usize,
@@ -135,7 +139,7 @@ pub trait PageBacking {
     ) -> Result<bool, MemoryError> {
         Ok(false)
     }
-    /// As above, with write/version/dirty hooks before exposing mutable bytes.
+    /// As above, publishing version/dirty metadata when the write completes.
     fn with_write(
         &self,
         _offset: usize,
@@ -154,11 +158,11 @@ pub trait PageBacking {
     fn executable(&self) -> bool {
         true
     }
-    fn next_page(&self, pages: u64) -> Result<Rc<dyn PageBacking>, MemoryError>;
+    fn next_page(&self, pages: u64) -> Result<Arc<dyn PageBacking>, MemoryError>;
 }
 #[derive(Clone)]
 pub(super) struct Backed {
-    pub object: Rc<dyn PageBacking>,
+    pub object: Arc<dyn PageBacking>,
     pub shared: bool,
     pub private_copy: bool,
 }
@@ -218,7 +222,7 @@ impl Page {
         {
             let mut page = [0; PAGE_SIZE as usize];
             b.object.read(0, &mut page)?;
-            self.bytes = Rc::new(PageBytes::new(page));
+            self.bytes = Arc::new(PageBytes::new(page));
             b.private_copy = true;
         }
         Ok(())
@@ -244,7 +248,7 @@ impl Page {
             return b.object.write(offset, bytes);
         }
         self.detach_private()?;
-        Rc::make_mut(&mut self.bytes).copy_write(offset, bytes);
+        Arc::make_mut(&mut self.bytes).copy_write(offset, bytes);
         Ok(())
     }
 }
@@ -252,7 +256,7 @@ impl Memory {
     pub fn map_backed(
         &mut self,
         address: u64,
-        objects: Vec<Rc<dyn PageBacking>>,
+        objects: Vec<Arc<dyn PageBacking>>,
         shared_mapping: bool,
         permissions: Permissions,
         fixed: bool,
@@ -289,7 +293,7 @@ impl Memory {
             self.map(address, len, permissions)?;
         }
         self.materialize_descriptors(address, len as usize);
-        let zero = Rc::new(PageBytes::Zero);
+        let zero = Arc::new(PageBytes::Zero);
         for (i, (object, charge)) in objects.into_iter().zip(charges).enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
             let page = self.frames[frame].as_mut().expect("mapped page");
@@ -368,7 +372,7 @@ impl Memory {
         self.anonymous.remove(address, end);
         for (a, b, mut page) in ranges {
             page.instruction_revision = self.code_revision;
-            self.anonymous.insert(a, b, Rc::new(page), &self.account);
+            self.anonymous.insert(a, b, Arc::new(page), &self.account);
         }
         self.note_anonymous_change(address, end);
         for (&base, &frame) in self.pages.range(address..end) {
@@ -379,7 +383,7 @@ impl Memory {
             if self.parallel_cache.is_some() {
                 self.parallel_mappings.insert(base);
             }
-            page.bytes = Rc::new(PageBytes::Zero);
+            page.bytes = Arc::new(PageBytes::Zero);
             if page.backing.is_none() {
                 page.charge = Charge::new(&self.account);
             }
@@ -477,7 +481,7 @@ impl Memory {
                 .range_mut(new..new_end)
                 .map(|(_, r)| r)
             {
-                Rc::make_mut(&mut r.page).mapping = first.mapping;
+                Arc::make_mut(&mut r.page).mapping = first.mapping;
             }
             for (base, mut page) in pages {
                 page.instruction_revision = self.code_revision;
@@ -544,7 +548,7 @@ impl Memory {
             let original_count = pages.len();
             for i in original_count..count {
                 let mut page = last.clone();
-                page.bytes = Rc::new(PageBytes::Zero);
+                page.bytes = Arc::new(PageBytes::Zero);
                 page.charge = Charge::new(&self.account);
                 if let Some(b) = &mut page.backing {
                     b.object = last
@@ -582,14 +586,14 @@ impl Memory {
 
 struct AnonymousPage {
     bytes: std::sync::Arc<SharedPage>,
-    revision: Cell<u64>,
+    revision: AtomicU64,
     identity: u64,
 }
 impl AnonymousPage {
-    fn allocate() -> Rc<dyn PageBacking> {
-        Rc::new(Self {
+    fn allocate() -> Arc<dyn PageBacking> {
+        Arc::new(Self {
             bytes: std::sync::Arc::new(SharedPage::zero()),
-            revision: Cell::new(0),
+            revision: AtomicU64::new(0),
             identity: new_backing_identity(),
         })
     }
@@ -627,7 +631,7 @@ impl PageBacking for AnonymousPage {
         Some(self.bytes.clone())
     }
     fn publish_write(&self, _: usize, _: usize) -> Result<(), MemoryError> {
-        self.revision.set(self.revision.get().wrapping_add(1));
+        self.revision.fetch_add(1, Ordering::Relaxed);
         backing_changed();
         Ok(())
     }
@@ -642,7 +646,7 @@ impl PageBacking for AnonymousPage {
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         self.bytes
             .with_write(offset, bytes.len(), |out| out.copy_from_slice(bytes));
-        self.revision.set(self.revision.get().wrapping_add(1));
+        self.revision.fetch_add(1, Ordering::Relaxed);
         backing_changed();
         Ok(())
     }
@@ -661,7 +665,7 @@ impl PageBacking for AnonymousPage {
         len: usize,
         f: &mut dyn FnMut(&mut [u8]),
     ) -> Result<bool, MemoryError> {
-        self.revision.set(self.revision.get().wrapping_add(1));
+        self.revision.fetch_add(1, Ordering::Relaxed);
         backing_changed();
         self.bytes.with_write(offset, len, f);
         Ok(true)
@@ -671,13 +675,13 @@ impl PageBacking for AnonymousPage {
     }
     fn version(&self) -> u64 {
         self.revision
-            .get()
+            .load(Ordering::Relaxed)
             .wrapping_add(self.bytes.version.load(Ordering::Acquire))
     }
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Ok(Self::allocate())
     }
 }

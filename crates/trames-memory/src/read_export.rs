@@ -25,7 +25,7 @@ struct ReadLease {
     bytes: Option<ReadBuffer>,
     // Private file COW still obeys the original provider's EOF/check semantics.
     // A backing change requests revalidation at the original mm boundary; it
-    // never grants an Rc provider to a worker or adds a CPU load/store check.
+    // never grants an Arc provider to a worker or adds a CPU load/store check.
     backing_revision: Option<u64>,
 }
 impl ReadState {
@@ -336,11 +336,11 @@ mod tests {
     #[test]
     fn private_cow_reader_revalidates_truncate_and_regrowth_without_unmapping() {
         struct Backing {
-            valid: Cell<bool>,
+            valid: std::sync::atomic::AtomicBool,
         }
         impl PageBacking for Backing {
             fn check(&self, a: u64) -> Result<(), MemoryError> {
-                if self.valid.get() {
+                if self.valid.load(Ordering::Relaxed) {
                     Ok(())
                 } else {
                     Err(MemoryError::Bus(a))
@@ -362,13 +362,13 @@ mod tests {
             fn writable(&self) -> bool {
                 true
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 Err(MemoryError::InvalidRange)
             }
         }
         let mut memory = Memory::default();
-        let backing = Rc::new(Backing {
-            valid: Cell::new(true),
+        let backing = Arc::new(Backing {
+            valid: std::sync::atomic::AtomicBool::new(true),
         });
         memory
             .map_backed(0x1000, vec![backing.clone()], false, Permissions::RW, false)
@@ -379,12 +379,12 @@ mod tests {
         let mut out = [0];
         assert_eq!(read.read_chunk(0x1000, &mut out), Some(Ok(1)));
         assert_eq!(out, [7]);
-        backing.valid.set(false);
+        backing.valid.store(false, Ordering::Relaxed);
         backing_changed();
         assert_eq!(read.read_chunk(0x1000, &mut out), None);
         memory.activate_proc_reads();
         assert_eq!(read.read_chunk(0x1000, &mut out), Some(Ok(0)));
-        backing.valid.set(true);
+        backing.valid.store(true, Ordering::Relaxed);
         backing_changed();
         assert_eq!(read.read_chunk(0x1000, &mut out), None);
         memory.activate_proc_reads();

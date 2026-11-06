@@ -9,18 +9,12 @@ use trames_kernel::task_control::Group;
 pub(super) struct Retirements {
     groups: BTreeMap<usize, Arc<Group>>,
     waits: BTreeMap<u32, Wait>,
-    memory: BTreeMap<u64, MemoryWait>,
+    pub(super) memory: Arc<crate::retired_memory::RetiredMemory>,
 }
 impl Retirements {
     pub(super) fn waiting(&self, pid: u32) -> bool {
         self.waits.contains_key(&pid)
     }
-}
-struct MemoryWait {
-    memory: Memory,
-    signal: Arc<trames_vfs::IoSignal>,
-    _subscription: trames_vfs::IoSubscription,
-    _target: Arc<dyn trames_vfs::IoWake>,
 }
 struct Wait {
     task: Arc<trames_kernel::signal::IoTask>,
@@ -40,41 +34,20 @@ impl<C: Cpu> trames_vfs::IoWake for Wake<C> {
     }
 }
 impl<C: Cpu> Kernel<C> {
-    /// Detached exec mms outlive their task identity only when an actual guarded
-    /// borrower remains. Other live CLONE_VM owners already retain this root.
+    pub(super) fn memory_retirements(&self) -> Arc<crate::retired_memory::RetiredMemory> {
+        self.exits.memory.bind_owner(|| {
+            Arc::new(Wake {
+                events: self.workers.events(),
+                owner: std::thread::current(),
+            })
+        });
+        self.exits.memory.clone()
+    }
     pub(super) fn retire_detached_memory(
         &mut self,
-        mut memory: Memory,
+        memory: Memory,
     ) -> Result<(), trames_memory::MemoryError> {
-        if memory.coordinator_ownership().1 != 1 {
-            return Ok(());
-        }
-        memory.retire_memory_report();
-        if memory.parallel_views_quiescent() {
-            return memory.commit_parallel();
-        }
-        memory.commit_retired_parallel()?;
-        let id = memory.coordinator_ownership().0;
-        let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
-            events: self.workers.events(),
-            owner: std::thread::current(),
-        });
-        let signal = trames_vfs::IoSignal::new(0, Arc::downgrade(&target));
-        let subscription = memory.subscribe_parallel_idle(&signal);
-        self.exits.memory.insert(
-            id,
-            MemoryWait {
-                memory,
-                signal,
-                _subscription: subscription,
-                _target: target,
-            },
-        );
-        if self.exits.memory[&id].memory.parallel_views_quiescent() {
-            let mut wait = self.exits.memory.remove(&id).unwrap();
-            wait.memory.commit_parallel()?;
-        }
-        Ok(())
+        self.memory_retirements().retire(memory)
     }
     pub(super) fn queue_exit_group(&mut self, group: Arc<Group>) {
         self.exits
@@ -88,14 +61,26 @@ impl<C: Cpu> Kernel<C> {
             self.queue_exit_group(group);
         }
         let pid = done.pid;
+        let original = done.task.clone();
+        // Keep identity validation and original cleanup in the same object
+        // custody interval. Source exec admission must not interleave a rekey.
+        let _custody = original.as_ref().map(|task| task.collect_admission());
         self.restore_worker_return(done);
+        // Exec may have retired/rekeyed this exact task while its asynchronous
+        // statistics were in transit. Never apply old cleanup to a replacement.
+        if original
+            .as_ref()
+            .is_some_and(|task| !self.processes.directory().contains_original(pid, task))
+        {
+            return Ok(());
+        }
         self.begin_source_projection(pid, status)
     }
     fn wait_exit_memory(&mut self, pid: u32, status: i32) {
         if self.exits.waits.contains_key(&pid) {
             return;
         }
-        let p = &self.processes[&pid];
+        let p = &self.processes.read(&pid);
         let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
             events: self.workers.events(),
             owner: std::thread::current(),
@@ -114,48 +99,37 @@ impl<C: Cpu> Kernel<C> {
         );
     }
     fn begin_source_projection(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
-        let p = self.processes.get_mut(&pid).expect("returned task");
-        p.linux.vfs.set_lock_owner(p.tgid);
-        p.linux.vfs.collect_retired_descriptors();
-        Self::clear_exit_resources(p);
+        {
+            let p = &mut *self.processes.get_mut(&pid).expect("returned task");
+            {
+                let task = &mut *p;
+                task.linux.vfs.set_lock_owner(task.tgid);
+            }
+            p.linux.vfs.collect_retired_descriptors();
+            Self::clear_exit_resources(p);
+        }
         self.finish_source_memory(pid, status)
     }
     fn finish_source_memory(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
-        let p = &self.processes[&pid];
-        if p.memory.coordinator_ownership().1 == 1 {
-            p.memory.retire_memory_report();
-        }
-        let borrowed =
-            p.memory.coordinator_ownership().1 == 1 && !p.memory.parallel_views_quiescent();
+        let borrowed = {
+            let p = &self.processes.read(&pid);
+            if p.memory.coordinator_ownership().1 == 1 {
+                p.memory.retire_memory_report();
+            }
+            p.memory.coordinator_ownership().1 == 1 && !p.memory.parallel_views_quiescent()
+        };
         self.exits.waits.remove(&pid);
-        let p = self.processes.get_mut(&pid).unwrap();
+        let mut custody = self.processes.get_mut(&pid).unwrap();
+        let p = &mut *custody;
         if borrowed {
             // All actual task Views have returned. Publish their writes without
             // losing later guarded-borrower marks, then detach physical mm
             // custody from PID/group completion (like an external mm reference).
-            p.memory.commit_retired_parallel()?;
-            if pid != 1 && !p.memory.parallel_views_quiescent() {
+            if pid != 1 {
                 let memory = std::mem::take(&mut p.memory);
-                let id = memory.coordinator_ownership().0;
-                let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
-                    events: self.workers.events(),
-                    owner: std::thread::current(),
-                });
-                let signal = trames_vfs::IoSignal::new(pid, Arc::downgrade(&target));
-                let subscription = memory.subscribe_parallel_idle(&signal);
-                self.exits.memory.insert(
-                    id,
-                    MemoryWait {
-                        memory,
-                        signal,
-                        _subscription: subscription,
-                        _target: target,
-                    },
-                );
-                if self.exits.memory[&id].memory.parallel_views_quiescent() {
-                    let mut retired = self.exits.memory.remove(&id).unwrap();
-                    retired.memory.commit_parallel()?;
-                }
+                self.memory_retirements().retire(memory)?;
+            } else {
+                p.memory.commit_retired_parallel()?;
             }
         } else if p.memory.parallel_views_quiescent() {
             p.memory.commit_parallel()?;
@@ -170,16 +144,16 @@ impl<C: Cpu> Kernel<C> {
         if pid == p.tgid {
             p.signals.io.inbox.clear();
         }
+        let tgid = p.tgid;
+        let family = p.family.clone();
+        drop(custody);
         if let Some(status) = completed {
-            let tgid = p.tgid;
-            let family = p.family.clone();
             let reaped = self.families.complete(&family, status);
-            if let Some(leader) = self.processes.get_mut(&tgid) {
+            if let Some(mut leader) = self.processes.get_mut(&tgid) {
                 leader.state = State::Zombie(status);
                 leader.auto_reap = reaped;
             }
         }
-        self.children_dirty.set(true);
         Ok(())
     }
     fn retire_cold_task(
@@ -188,7 +162,7 @@ impl<C: Cpu> Kernel<C> {
         task: &Arc<trames_kernel::signal::IoTask>,
         status: i32,
     ) -> Result<(), RuntimeError> {
-        let Some(mut p) = self.processes.remove(&pid) else {
+        let Some(mut p) = self.processes.checkout(&pid) else {
             return Ok(());
         };
         if !Arc::ptr_eq(task, &p.signals.io) || !task.live() {
@@ -217,13 +191,19 @@ impl<C: Cpu> Kernel<C> {
             return Ok(());
         };
         p.linux.vfs.sync_task_namespaces();
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         if last {
             p.linux.vfs.release_process_locks();
             self.timers.clear_process(p.tgid, false);
         }
         Self::cancel_native_task(&p);
-        p.linux.cancel_uring(&mut p.memory, pid);
+        {
+            let task = &mut *p;
+            task.linux.cancel_uring(&mut task.memory, pid)
+        };
         let files = p.linux.vfs.file_table_owner();
         let context = p.linux.vfs.context_owner();
         let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
@@ -250,21 +230,7 @@ impl<C: Cpu> Kernel<C> {
         &mut self,
         epoch: Option<&crate::run_queue::Epoch<C>>,
     ) -> Result<(), RuntimeError> {
-        let memory: Vec<_> = self
-            .exits
-            .memory
-            .iter()
-            .filter_map(|(&id, wait)| wait.signal.ready().then_some(id))
-            .collect();
-        for id in memory {
-            let mut wait = self.exits.memory.remove(&id).unwrap();
-            wait.signal.reset();
-            if wait.memory.parallel_views_quiescent() {
-                wait.memory.commit_parallel()?;
-            } else {
-                self.exits.memory.insert(id, wait);
-            }
-        }
+        self.exits.memory.pump()?;
         let ready: Vec<_> = self
             .exits
             .waits
@@ -286,7 +252,7 @@ impl<C: Cpu> Kernel<C> {
                 continue;
             }
             if epoch.is_none_or(|epoch| {
-                epoch.memory_owned(self.processes[&pid].memory.coordinator_ownership().0)
+                epoch.memory_owned(self.processes.read(&pid).memory.coordinator_ownership().0)
             }) {
                 self.retire_cold_task(pid, &wait.task, wait.status)?;
             } else {
@@ -302,7 +268,7 @@ impl<C: Cpu> Kernel<C> {
                 if epoch.is_some_and(|epoch| epoch.contains(pid)) {
                     continue;
                 }
-                let Some(p) = self
+                let Some(mut p) = self
                     .processes
                     .get_mut(&pid)
                     .filter(|p| Arc::ptr_eq(&task, &p.signals.io))
@@ -315,16 +281,18 @@ impl<C: Cpu> Kernel<C> {
                 {
                     // A terminating cold peer is not runnable while its actual
                     // mm completes. Its IoTask stays live until resources retire.
-                    Self::cancel_native_task(p);
+                    Self::cancel_native_task(&p);
                     p.state = State::Zombie(status);
+                    drop(p);
                     self.wait_exit_memory(pid, status);
-                    if self.processes[&pid].memory.parallel_views_quiescent() {
+                    if self.processes.read(&pid).memory.parallel_views_quiescent() {
                         self.exits.waits.remove(&pid);
                         self.retire_cold_task(pid, &task, status)?;
                     } else if let Some(epoch) = epoch {
                         epoch.pause_memory(id);
                     }
                 } else {
+                    drop(p);
                     self.retire_cold_task(pid, &task, status)?;
                 }
             }
@@ -355,35 +323,37 @@ mod tests {
         k.syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
             .unwrap();
         k.publish_io_tasks(Some((1, &root)));
-        let child = k.processes.get_mut(&2).unwrap();
+        let mut custody = k.processes.get_mut(&2).unwrap();
+        let child = &mut *custody;
         let id = child.memory.coordinator_ownership().0;
         let family = child.family.clone();
         let group = child.signals.io.lifecycle().clone();
         let mut borrower = child.memory.parallel_view(&mut k.parallel_memory).unwrap();
         use trames_memory::CpuMemory;
         borrower.write_array(0x1300, 7u64.to_le_bytes()).unwrap();
+        drop(custody);
         group.request_exit(27 << 8);
         k.queue_exit_group(group);
         k.process_exits(None).unwrap();
         assert_eq!(family.status(), Some(27 << 8));
-        assert!(!k.processes[&2].signals.io.live());
-        assert!(k.exits.memory.contains_key(&id));
+        assert!(!k.processes.read(&2).signals.io.live());
+        assert!(k.exits.memory.contains(id));
         assert_eq!(k.wait(1, &mut root, [2, 0, 0, 0, 0, 0]), Ok(Some(2)));
         k.reap_waited();
         assert!(!k.processes.contains_key(&2));
         // Force actual PID reuse after reaping while the old physical mm is
         // retained. Completion must still use its original memory identity.
-        k.next_pid = 2;
+        k.task_ids = Default::default();
         k.syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
             .unwrap();
-        assert_ne!(k.processes[&2].memory.coordinator_ownership().0, id);
+        assert_ne!(k.processes.read(&2).memory.coordinator_ownership().0, id);
         borrower.write_array(0x1300, 9u64.to_le_bytes()).unwrap();
-        assert_eq!(k.exits.memory[&id].memory.read_u64(0x1300).unwrap(), 9);
+        assert_eq!(k.exits.memory.read_u64(id, 0x1300), 9);
         drop(borrower);
         k.process_exits(None).unwrap();
-        assert!(!k.exits.memory.contains_key(&id));
-        assert!(k.processes[&2].signals.io.live());
-        assert_eq!(k.processes[&2].memory.read_u64(0x1300).unwrap(), 0);
+        assert!(!k.exits.memory.contains(id));
+        assert!(k.processes.read(&2).signals.io.live());
+        assert_eq!(k.processes.read(&2).memory.read_u64(0x1300).unwrap(), 0);
     }
     #[test]
     fn process_completion_resumes_parent_without_stopping_foreign_cpus() {
@@ -507,9 +477,10 @@ mod tests {
                 publish.send((observed, task)).unwrap();
                 go.recv().unwrap();
                 let result = k.parallel_epoch(&mut output, u64::MAX / 2, true);
-                let status = u32::from_le_bytes(k.processes[&1].memory.read_array(0x1200).unwrap());
+                let status =
+                    u32::from_le_bytes(k.processes.read(&1).memory.read_array(0x1200).unwrap());
                 let clear = if mode == 7 {
-                    u32::from_le_bytes(k.processes[&5].memory.read_array(0x1300).unwrap())
+                    u32::from_le_bytes(k.processes.read(&5).memory.read_array(0x1300).unwrap())
                 } else {
                     0
                 };

@@ -702,9 +702,10 @@ mod tests {
         vfs.activate_child_pid(10).unwrap();
         let context = vfs.record_lock_context(10);
         assert_eq!(context.visible_pid(11), 0);
-        vfs.activate_child_pid(11).unwrap();
+        let mut child = vfs.clone();
+        child.activate_child_pid(11).unwrap();
         assert_eq!(context.visible_pid(11), 2);
-        vfs.pid_namespace().retain_ids(&[10].into());
+        drop(child);
         assert_eq!(context.visible_pid(11), 0);
     }
 }

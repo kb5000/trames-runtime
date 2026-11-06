@@ -129,29 +129,55 @@ struct OwnerEntry {
 }
 #[derive(Default)]
 pub(super) struct OwnerLedger {
-    entries: RefCell<BTreeMap<(usize, u64), OwnerEntry>>,
-    pub(super) uring: RefCell<BTreeMap<u64, (std::sync::Weak<()>, RetainedFd)>>,
+    // Only legacy control ownership edits this count. Empty ordinary socket
+    // views do not acquire either ledger lock just to release their projection.
+    // Publication/consumption still synchronize through the channel/ring and
+    // the original ledger guards; this scalar carries no payload visibility.
+    pending: std::sync::atomic::AtomicUsize,
+    entries: SharedCell<BTreeMap<(usize, u64), OwnerEntry>>,
+    pub(super) uring: SharedCell<BTreeMap<u64, (std::sync::Weak<()>, RetainedFd)>>,
 }
 impl OwnerLedger {
+    fn closed_entries(&self) -> Vec<((usize, u64), std::sync::Weak<Channel>)> {
+        let candidates: Vec<_> = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|(key, entry)| (*key, entry.channel.clone(), entry.side))
+            .collect();
+        // Socket operations acquire their channel before this ledger. Inspect
+        // liveness without ledger custody; closure of an endpoint is final.
+        candidates
+            .into_iter()
+            .filter_map(|(key, channel, side)| {
+                channel
+                    .upgrade()
+                    .is_none_or(|channel| !channel.resource.alive(side))
+                    .then_some((key, channel))
+            })
+            .collect()
+    }
     fn reap(&self) {
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         self.reap_uring();
         loop {
+            let closed = self.closed_entries();
             let removed: Vec<_> = {
                 let mut entries = self.entries.borrow_mut();
-                let closed: Vec<_> = entries
-                    .iter()
-                    .filter_map(|(key, entry)| {
-                        entry
-                            .channel
-                            .upgrade()
-                            .is_none_or(|channel| !channel.resource.alive(entry.side))
-                            .then_some(*key)
+                let removed: Vec<_> = closed
+                    .into_iter()
+                    .filter_map(|(key, channel)| {
+                        entries
+                            .get(&key)
+                            .is_some_and(|entry| entry.channel.ptr_eq(&channel))
+                            .then(|| entries.remove(&key))
+                            .flatten()
                     })
                     .collect();
-                closed
-                    .into_iter()
-                    .filter_map(|key| entries.remove(&key))
-                    .collect()
+                self.pending.fetch_sub(removed.len(), Ordering::Relaxed);
+                removed
             };
             if removed.is_empty() {
                 break;
@@ -161,22 +187,36 @@ impl OwnerLedger {
             drop(removed);
         }
     }
+    pub(super) fn retain_uring(&self, id: u64, token: &Arc<()>, file: RetainedFd) {
+        let mut entries = self.uring.borrow_mut();
+        assert!(entries.insert(id, (Arc::downgrade(token), file)).is_none());
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
     pub(super) fn reap_uring(&self) {
-        // Owner projections never cross threads. A worker drops only its Arc
-        // token; original Rc descriptions retire at the next owner boundary.
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        // A retained control retires on the thread collecting its original
+        // token. Destructors run after ledger custody, including nested closes.
         let removed: Vec<_> = {
             let mut entries = self.uring.borrow_mut();
             let dead: Vec<_> = entries
                 .iter()
                 .filter_map(|(id, (live, _))| (live.strong_count() == 0).then_some(*id))
                 .collect();
-            dead.into_iter()
+            let removed: Vec<_> = dead
+                .into_iter()
                 .filter_map(|id| entries.remove(&id))
-                .collect()
+                .collect();
+            self.pending.fetch_sub(removed.len(), Ordering::Relaxed);
+            removed
         };
         drop(removed);
     }
     fn needs_reap(&self) -> bool {
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
         if self
             .uring
             .borrow()
@@ -185,22 +225,25 @@ impl OwnerLedger {
         {
             return true;
         }
-        self.entries.borrow().values().any(|entry| {
-            entry
-                .channel
-                .upgrade()
-                .is_none_or(|channel| !channel.resource.alive(entry.side))
-        })
+        !self.closed_entries().is_empty()
     }
     fn insert(&self, channel: &Arc<Channel>, side: usize, id: u64, data: Ancillary) {
-        self.entries.borrow_mut().insert(
-            (Arc::as_ptr(channel) as usize, id),
-            OwnerEntry {
-                channel: Arc::downgrade(channel),
-                side,
-                data,
-            },
-        );
+        let previous = {
+            let mut entries = self.entries.borrow_mut();
+            let previous = entries.insert(
+                (Arc::as_ptr(channel) as usize, id),
+                OwnerEntry {
+                    channel: Arc::downgrade(channel),
+                    side,
+                    data,
+                },
+            );
+            if previous.is_none() {
+                self.pending.fetch_add(1, Ordering::Relaxed);
+            }
+            previous
+        };
+        drop(previous);
     }
     fn get(&self, channel: &Arc<Channel>, id: u64) -> Ancillary {
         self.entries
@@ -211,23 +254,25 @@ impl OwnerLedger {
             .clone()
     }
     fn remove(&self, channel: &Arc<Channel>, id: u64) -> Option<Ancillary> {
-        self.entries
-            .borrow_mut()
-            .remove(&(Arc::as_ptr(channel) as usize, id))
-            .map(|entry| entry.data)
+        let mut entries = self.entries.borrow_mut();
+        let removed = entries.remove(&(Arc::as_ptr(channel) as usize, id));
+        if removed.is_some() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed.map(|entry| entry.data)
     }
 }
-/// Owner-only ancillary access to the same actual shared socket resource.
+/// Ancillary access to the same actual shared socket resource.
 /// No mutable connection or address state is stored in this projection.
 pub struct LocalSocket {
     core: Arc<LocalResource>,
     // Fields drop in declaration order: release the core before reaping its
-    // legacy owner rights on this owner-only view's thread.
+    // legacy control rights on the releasing view's thread.
     owner: OwnerView,
     _ownership: Option<Arc<ownership::Ownership>>,
 }
 #[derive(Clone, Default)]
-pub(super) struct OwnerView(Rc<OwnerLedger>);
+pub(super) struct OwnerView(Arc<OwnerLedger>);
 impl std::ops::Deref for OwnerView {
     type Target = OwnerLedger;
     fn deref(&self) -> &Self::Target {

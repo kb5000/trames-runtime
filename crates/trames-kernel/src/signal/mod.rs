@@ -10,6 +10,8 @@ pub use frame::FrameState;
 mod info;
 mod io;
 mod pending;
+#[cfg(test)]
+mod pid_identity;
 mod reader;
 mod wait;
 pub use actions::{Action, Actions};
@@ -17,7 +19,7 @@ pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
 pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
-pub use pending::Pending;
+pub use pending::{Pending, RetainedInfo};
 pub use reader::TaskReader;
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::Errno;
@@ -74,13 +76,8 @@ impl Signals {
     pub fn next_signal(&self, mask: u64) -> Option<(u32, bool)> {
         self.io.next(mask)
     }
-    pub fn take_signal(&self, sig: u32, shared: bool) -> Info {
+    pub fn take_signal(&self, sig: u32, shared: bool) -> RetainedInfo {
         self.io.take(sig, shared).expect("selected pending signal")
-    }
-    pub fn signal_senders(&self) -> Vec<u32> {
-        let mut senders = self.io.inbox.senders();
-        senders.extend(self.io.process().senders());
-        senders
     }
     pub fn discard(&self, sig: u32) {
         self.io.inbox.discard(sig);

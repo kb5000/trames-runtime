@@ -26,7 +26,7 @@ impl<C: Cpu> Kernel<C> {
     ) {
         let plans = self.families.retire(family, parents);
         for victim in plans.victims {
-            let Some(mut child) = self.processes.remove(&victim.id) else {
+            let Some(mut child) = self.processes.checkout(&victim.id) else {
                 continue;
             };
             if !Arc::ptr_eq(&child.family, &victim.family) {
@@ -53,7 +53,6 @@ impl<C: Cpu> Kernel<C> {
         self.reap_waited();
     }
     pub(super) fn waitid(&mut self, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        self.publish_children(Some(p));
         let request = trames_kernel::children::Wait::prepare(95, a)?;
         let result = p
             .children
@@ -91,8 +90,8 @@ mod tests {
                 .unwrap();
             k.processes.insert(3, child);
             k.publish_io_tasks(None);
-            let original = k.processes[&3].family.clone();
-            let peer = k.processes[&4].signals.io.clone();
+            let original = k.processes.read(&3).family.clone();
+            let peer = k.processes.read(&4).signals.io.clone();
             if leader_exited {
                 let mut child = k.processes.remove(&3).unwrap();
                 k.exit_one(3, &mut child, 0);

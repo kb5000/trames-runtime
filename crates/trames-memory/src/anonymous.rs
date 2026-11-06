@@ -241,7 +241,7 @@ pub(super) const TOKEN: usize = 1usize << (usize::BITS - 1);
 #[derive(Clone)]
 pub(super) struct Range {
     pub end: u64,
-    pub page: Rc<Page>,
+    pub page: Arc<Page>,
     pub store: Arc<Store>,
 }
 #[derive(Clone, Default)]
@@ -297,14 +297,14 @@ impl Anonymous {
             }
         }
     }
-    pub fn insert(&mut self, start: u64, end: u64, page: Rc<Page>, account: &Arc<Account>) {
+    pub fn insert(&mut self, start: u64, end: u64, page: Arc<Page>, account: &Arc<Account>) {
         self.insert_store(start, end, page, Store::new(account.clone()));
     }
     pub fn insert_store(
         &mut self,
         mut start: u64,
         mut end: u64,
-        mut page: Rc<Page>,
+        mut page: Arc<Page>,
         store: Arc<Store>,
     ) {
         debug_assert!(start < end && !self.overlaps(start, end));
@@ -412,7 +412,7 @@ impl Anonymous {
                         a,
                         Range {
                             end: r.end,
-                            page: Rc::new(page),
+                            page: Arc::new(page),
                             store: Store::new(account.clone()),
                         },
                     )
@@ -502,9 +502,9 @@ impl Memory {
         }
         merged
     }
-    pub(super) fn anonymous_page(&self, permissions: Permissions) -> Rc<Page> {
-        Rc::new(Page {
-            bytes: Rc::new(PageBytes::Zero),
+    pub(super) fn anonymous_page(&self, permissions: Permissions) -> Arc<Page> {
+        Arc::new(Page {
+            bytes: Arc::new(PageBytes::Zero),
             charge: Charge::new(&self.account),
             permissions,
             instruction_revision: self.code_revision,
@@ -546,7 +546,7 @@ impl Memory {
                 let range = self.anonymous.containing(base).unwrap().1;
                 range.store.remove(base);
                 if !page.charge.resident() {
-                    page.bytes = Rc::new(PageBytes::Zero);
+                    page.bytes = Arc::new(PageBytes::Zero);
                 }
             }
 
@@ -586,14 +586,14 @@ impl Memory {
         let page = pages.entry(base).or_insert_with(|| {
             let resident = range.store.get(base);
             let mut page = (*range.page).clone();
-            page.bytes = Rc::new(PageBytes::Concurrent(resident.bytes.clone()));
+            page.bytes = Arc::new(PageBytes::Concurrent(resident.bytes.clone()));
             page.charge = resident.charge.clone();
-            Rc::new(page)
+            Arc::new(page)
         });
-        let pointer = Rc::as_ptr(page);
+        let pointer = Arc::as_ptr(page);
         drop(pages);
         // SAFETY: coordinator-local wrappers are retained until a VM mutation
-        // invalidates translations. Insertion never moves an Rc allocation.
+        // invalidates translations. Insertion never moves an Arc allocation.
         unsafe { &*pointer }
     }
     pub(super) fn retire_sparse(&mut self, start: u64, end: u64) {

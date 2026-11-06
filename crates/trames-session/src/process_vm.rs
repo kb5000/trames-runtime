@@ -11,6 +11,13 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
         proc_waits: &mut Vec<super::proc::ProcReadWait<C>>,
     ) -> Result<bool, RuntimeError> {
+        let _custody = match tasks::admit(&checkpoint.jobs, &epoch.io_target) {
+            Ok(custody) => custody,
+            Err(wait) => {
+                epoch.defer_checkpoint(checkpoint, wait.signal, wait.subscriptions);
+                return Ok(true);
+            }
+        };
         let began = Instant::now();
         let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(&checkpoint);
         let wait = checkpoint
@@ -26,7 +33,7 @@ impl<C: Cpu> Kernel<C> {
             .unwrap_or(7);
         self.vm_checkpoint_wait_bins[bucket] += 1;
         // Every CPU/service of these mm/backing domains has returned. Their
-        // coordinator Rc graphs stay here; no unrelated Memory is inspected.
+        // original task/mm custody is held here; no unrelated Memory is inspected.
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
             job.work.cpu.clear_exclusive();
@@ -42,7 +49,7 @@ impl<C: Cpu> Kernel<C> {
             let mut ids = std::collections::BTreeSet::new();
             let mut pending = false;
             for job in &checkpoint.jobs {
-                let memory = &self.processes[&job.work.pid].memory;
+                let memory = &self.processes.read(&job.work.pid).memory;
                 if ids.insert(memory.coordinator_ownership().0) {
                     wait.subscriptions
                         .push(memory.subscribe_parallel_idle(&wait.signal));
@@ -125,7 +132,7 @@ impl<C: Cpu> Kernel<C> {
                 };
                 assert!(matches!(outcome, SliceOutcome::Syscall { .. }));
                 let pid = job.work.pid;
-                let mut p = self.processes.remove(&pid).expect("paused task");
+                let mut p = self.processes.checkout(&pid).expect("paused task");
                 p.linux.vfs.sync_task_namespaces();
                 assert!(!p.linux.trace);
                 p.cpu = std::mem::take(&mut job.work.cpu);
@@ -220,14 +227,17 @@ impl<C: Cpu> Kernel<C> {
                         break;
                     }
                     let cpu_began = Instant::now();
-                    let Some(outcome) = p.cpu.run_quiesced(
-                        &mut self.engine,
-                        &mut p.memory,
-                        &mut self.parallel_memory,
-                        // Share one deadline across all requesters; guest
-                        // computation cannot extend the exclusive window.
-                        remaining,
-                    ) else {
+                    let Some(outcome) = ({
+                        let p = &mut *p;
+                        p.cpu.run_quiesced(
+                            &mut self.engine,
+                            &mut p.memory,
+                            &mut self.parallel_memory,
+                            // Share one deadline across all requesters; guest
+                            // computation cannot extend the exclusive window.
+                            remaining,
+                        )
+                    }) else {
                         break;
                     };
                     let elapsed = cpu_began.elapsed();
@@ -259,14 +269,13 @@ impl<C: Cpu> Kernel<C> {
                 }
                 self.processes.insert(pid, p);
             }
-            self.publish_children(None);
             // Prepare children before their creators. Freezing a writable COW
             // page materializes one private copy; put it in the new mm so the
             // existing parent keeps its physical storage and hardware mappings.
             // All affected actors remain paused until every View is installed.
             let mut members: Vec<_> = created
                 .iter()
-                .map(|&id| (id, self.processes[&id].last_cpu))
+                .map(|&id| (id, self.processes.read(&id).last_cpu))
                 .collect();
             members.extend(
                 checkpoint
@@ -280,7 +289,7 @@ impl<C: Cpu> Kernel<C> {
                     .iter()
                     .map(|&(pid, slot)| {
                         let mut view =
-                            Box::new(self.processes[&pid].memory.current_parallel_view()?);
+                            Box::new(self.processes.read(&pid).memory.current_parallel_view()?);
                         C::prepare_hardware_view(&mut view);
                         Some((pid, slot, view))
                     })
@@ -369,7 +378,7 @@ impl<C: Cpu> Kernel<C> {
         }
         let now = Instant::now();
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
-        Ok(self.processes.iter().any(|(&pid, p)| {
+        Ok(self.processes.iter().any(|(pid, p)| {
             if p.frozen(pid) {
                 return false;
             }
@@ -430,8 +439,8 @@ mod tests {
 
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Mutex,
     };
     use trames_memory::{MemoryError, PageBacking, Permissions, SharedPage, PAGE_SIZE};
 
@@ -464,7 +473,9 @@ mod tests {
             assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
         }
         assert_eq!(
-            kernel.processes[&1]
+            kernel
+                .processes
+                .read(&1)
                 .linux
                 .vfs
                 .epoll_wait(epoll, 1, |_, _| Ok(None))
@@ -474,23 +485,29 @@ mod tests {
         assert!(!kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
         kernel.processes.get_mut(&1).unwrap().poll_deadline = Some(Instant::now());
         assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
-        let owner = kernel.processes.get_mut(&1).unwrap();
+        let mut custody = kernel.processes.get_mut(&1).unwrap();
+        let owner = &mut *custody;
         owner.poll_deadline = None;
         Kernel::<Cpu>::queue_one(1, owner, 10, 0);
+        drop(custody);
         assert!(kernel.cohort_control(&[(2, 0)], &mut output).unwrap());
-        assert_eq!(kernel.processes[&1].signals.wait_mask, Some(0));
-        assert_eq!(kernel.processes[&1].signals.mask, 1 << 11);
+        assert_eq!(kernel.processes.read(&1).signals.wait_mask, Some(0));
+        assert_eq!(kernel.processes.read(&1).signals.mask, 1 << 11);
     }
 
     struct Page {
         bytes: Arc<SharedPage>,
-        gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+        gate: Option<(mpsc::SyncSender<()>, std::sync::Mutex<mpsc::Receiver<()>>)>,
     }
     impl Drop for Page {
         fn drop(&mut self) {
             if let Some((entered, release)) = &self.gate {
                 entered.send(()).unwrap();
-                release.recv_timeout(Duration::from_secs(3)).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
             }
         }
     }
@@ -526,15 +543,15 @@ mod tests {
         fn publish_write(&self, _: usize, _: usize) -> Result<(), MemoryError> {
             Ok(())
         }
-        fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+        fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
             Err(MemoryError::InvalidRange)
         }
     }
     #[test]
     fn source_exit_publishes_backing_when_only_an_undispatched_mm_owner_remains() {
         struct Legacy {
-            bytes: RefCell<[u8; PAGE_SIZE as usize]>,
-            version: Cell<u64>,
+            bytes: Mutex<[u8; PAGE_SIZE as usize]>,
+            version: AtomicU64,
             identity: u64,
         }
         impl PageBacking for Legacy {
@@ -545,12 +562,12 @@ mod tests {
                 Ok(())
             }
             fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-                out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+                out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
                 Ok(())
             }
             fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-                self.bytes.borrow_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
-                self.version.set(self.version.get() + 1);
+                self.bytes.lock().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
+                self.version.fetch_add(1, Ordering::Relaxed);
                 trames_memory::backing_changed();
                 Ok(())
             }
@@ -561,9 +578,9 @@ mod tests {
                 Ok(())
             }
             fn version(&self) -> u64 {
-                self.version.get()
+                self.version.load(Ordering::Relaxed)
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 Err(MemoryError::InvalidRange)
             }
         }
@@ -604,9 +621,9 @@ mod tests {
         k.processes.insert(1, parent);
         let mut child = k.processes.remove(&2).unwrap();
         child.memory.unmap(0x6000, PAGE_SIZE).unwrap();
-        let backing = Rc::new(Legacy {
-            bytes: RefCell::new([0; PAGE_SIZE as usize]),
-            version: Cell::new(0),
+        let backing = Arc::new(Legacy {
+            bytes: Mutex::new([0; PAGE_SIZE as usize]),
+            version: AtomicU64::new(0),
             identity: trames_memory::new_backing_identity(),
         });
         child
@@ -631,22 +648,23 @@ mod tests {
         child.cpu.pc = 0x4000;
         k.syscall(2, &mut child, 220, [0x10b00, 0, 0, 0, 0, 0], &mut output)
             .unwrap();
-        let peer = k.processes.get_mut(&3).unwrap();
+        let mut peer = k.processes.get_mut(&3).unwrap();
         peer.state = State::Suspend(0);
         peer.linux.trace = true; // real owner outside the admitted cohort
+        drop(peer);
         k.processes.insert(2, child);
         assert!(k.parallel_epoch(&mut output, 100000000, false).unwrap());
-        assert!(matches!(k.processes[&2].state, State::Zombie(status) if status == 23 << 8));
+        assert!(matches!(k.processes.read(&2).state, State::Zombie(status) if status == 23 << 8));
         assert!(
-            k.processes[&2].memory.read_array::<1>(0x6000).is_err(),
+            k.processes.read(&2).memory.read_array::<1>(0x6000).is_err(),
             "returned wrapper was not collected during the cohort"
         );
         assert_eq!(
-            u64::from_le_bytes(backing.bytes.borrow()[..8].try_into().unwrap()),
+            u64::from_le_bytes(backing.bytes.lock().unwrap()[..8].try_into().unwrap()),
             99
         );
         assert_eq!(
-            u64::from_le_bytes(k.processes[&3].memory.read_array(0x6000).unwrap()),
+            u64::from_le_bytes(k.processes.read(&3).memory.read_array(0x6000).unwrap()),
             99
         );
     }
@@ -660,7 +678,10 @@ mod tests {
         p.memory
             .map_backed(
                 base,
-                vec![Rc::new(Page { bytes, gate })],
+                vec![Arc::new(Page {
+                    bytes,
+                    gate: gate.map(|(entered, release)| (entered, std::sync::Mutex::new(release))),
+                })],
                 true,
                 Permissions::RW,
                 false,
@@ -754,7 +775,10 @@ mod tests {
             "a pure addition cannot pause same-mm peers"
         );
         assert_eq!(k.vm_local_syscalls, 1);
-        assert_eq!(k.service_requests, 1);
+        assert_eq!(
+            k.service_requests, 0,
+            "additive mmap runs on the original caller"
+        );
         assert_eq!(k.parallel_rounds, 1, "the cohort remains live");
     }
 
@@ -919,9 +943,11 @@ mod tests {
         assert_eq!(k.vm_local_syscalls, 1);
         assert_eq!(k.parallel_rounds, 1);
         if filtered {
-            assert_eq!(k.processes[&1].seccomp.evaluations(), 1);
+            assert_eq!(k.processes.read(&1).seccomp.evaluations(), 1);
         }
-        assert!(!k.processes[&1]
+        assert!(!k
+            .processes
+            .read(&1)
             .memory
             .regions()
             .iter()
@@ -957,7 +983,7 @@ mod tests {
         assert!(k
             .parallel_round(&mut trames_linux::CapturedOutput::default(), u64::MAX)
             .unwrap());
-        let p = &k.processes[&1];
+        let p = &k.processes.read(&1);
         assert_eq!(p.cpu.x(0), error(Errno(13)));
         assert!(p.memory.read_array::<1>(0x8000).is_ok());
         assert_eq!(p.seccomp.evaluations(), 1);
@@ -1159,7 +1185,7 @@ mod tests {
         assert_eq!(count(&completed), 24);
         assert_eq!(k.service_requests, 0);
         assert_eq!(
-            k.processes[&1].memory.read_array::<4>(0x1000).unwrap(),
+            k.processes.read(&1).memory.read_array::<4>(0x1000).unwrap(),
             2u32.to_ne_bytes()
         );
         assert_eq!(k.parallel_rounds, 1);
@@ -1252,7 +1278,7 @@ mod tests {
         assert_eq!(k.parallel_rounds, 1);
         assert_eq!(k.worker_direct_syscalls, 2);
         assert_eq!(k.service_requests, 0);
-        for p in k.processes.values_mut() {
+        for mut p in k.processes.values_mut() {
             assert!(p.retained_byte.is_none());
             assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
         }
@@ -1396,9 +1422,9 @@ mod creation_tests {
                 go.recv().unwrap();
                 let result = k.parallel_epoch(&mut output, u64::MAX / 2, true);
                 let value = if mode == 3 {
-                    k.processes[&1].memory.read_u64(0x1300).unwrap() as u32
+                    k.processes.read(&1).memory.read_u64(0x1300).unwrap() as u32
                 } else {
-                    k.processes[&1].memory.read_u64(0x1200).unwrap() as u32
+                    k.processes.read(&1).memory.read_u64(0x1200).unwrap() as u32
                 };
                 finished
                     .send((

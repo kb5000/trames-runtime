@@ -27,7 +27,7 @@ impl<C: Cpu> Kernel<C> {
         request: &mut crate::workers::Request<C>,
         io: &mut impl GuestOutput,
     ) -> Option<u64> {
-        let p = self.processes.get_mut(&request.pid)?;
+        let p = &mut *self.processes.get_mut(&request.pid)?;
         p.linux.vfs.sync_task_namespaces();
         // The worker already evaluated its immutable epoch filter. Recheck
         // here before any VFS effects, using the actual post-SVC PC/arguments.
@@ -105,7 +105,10 @@ impl<C: Cpu> Kernel<C> {
             _ => return None,
         }
         p.linux.vfs.set_process_context(request.pid);
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         let began = self.profile_syscalls.then(Instant::now);
         let number = request.number;
         let result = match number {
@@ -228,6 +231,7 @@ mod tests {
             .dispatch(
                 0,
                 Work {
+                    task: None,
                     audio: None,
                     gpu: None,
                     pid: 1,
@@ -280,11 +284,12 @@ mod tests {
             .protect(0x4000, PAGE_SIZE, Permissions::RW)
             .unwrap();
         p.memory.write_array(0x1000, 16u32.to_le_bytes()).unwrap();
-        let (mut k, mut request, control) = pending(p, 204, [3, 0x9000, 0x1000, 0, 0, 0]);
+        let (mut k, mut request, control) =
+            pending(p.into_inner(), 204, [3, 0x9000, 0x1000, 0, 0, 0]);
         let result = k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
         assert_eq!(result, Some(error(Errno(14))));
         finish(&mut k, request, control, result);
-        assert_eq!(k.processes[&1].linux.vfs.fd_snapshot().len(), 4);
+        assert_eq!(k.processes.read(&1).linux.vfs.fd_snapshot().len(), 4);
     }
     #[test]
     fn tcp_handoff_retains_lifetime_without_reusing_native_authority() {
@@ -378,7 +383,7 @@ mod tests {
                 k.service_request(&mut request, &mut trames_linux::CapturedOutput::default());
             assert_eq!(result, if busy { None } else { Some(0) });
             finish(&mut k, request, control, result);
-            assert_eq!(k.processes[&1].linux.vfs.socket_fd(fd).is_ok(), busy);
+            assert_eq!(k.processes.read(&1).linux.vfs.socket_fd(fd).is_ok(), busy);
             drop(accepted);
         }
     }
@@ -524,7 +529,7 @@ mod tests {
             let done = finish(&mut k, request, control, value);
             if mode == 0 {
                 assert_eq!(
-                    k.processes[&1].memory.read_array::<1>(0x2000).unwrap(),
+                    k.processes.read(&1).memory.read_array::<1>(0x2000).unwrap(),
                     *b"a"
                 );
             }
@@ -570,7 +575,7 @@ mod tests {
         assert_eq!(done.cpu.x(0), 1);
         assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
         assert_eq!(
-            k.processes[&1].memory.read_array::<1>(0x2000).unwrap(),
+            k.processes.read(&1).memory.read_array::<1>(0x2000).unwrap(),
             *b"a"
         );
     }

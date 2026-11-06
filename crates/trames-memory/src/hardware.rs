@@ -63,10 +63,10 @@ impl Memory {
                 .as_ref()
                 .filter(|b| !b.private_copy)
                 .map_or(0, |b| b.object.version()),
-            exclusive: Rc::strong_count(&page.bytes) == 1,
+            exclusive: Arc::strong_count(&page.bytes) == 1,
             writable: page.permissions.write
                 && page.charge.resident()
-                && Rc::strong_count(&page.bytes) == 1
+                && Arc::strong_count(&page.bytes) == 1
                 && page.backing.as_ref().is_none_or(|b| b.private_copy),
         })
     }
@@ -116,7 +116,7 @@ impl Memory {
             .bytes
             .shared()
             .is_some_and(|bytes| Arc::ptr_eq(bytes, &storage));
-        if write && same && Rc::strong_count(&page.bytes) != 1 {
+        if write && same && Arc::strong_count(&page.bytes) != 1 {
             return Err(MemoryError::InvalidRange);
         }
         if (!same || page.backing.as_ref().is_some_and(|b| !b.private_copy))
@@ -131,7 +131,7 @@ impl Memory {
                 backing.private_copy = true;
             }
         }
-        page.bytes = Rc::new(PageBytes::Concurrent(storage));
+        page.bytes = Arc::new(PageBytes::Concurrent(storage));
         self.parallel_cache = None;
         self.mmu.retire();
         self.revision = self.revision.wrapping_add(1);

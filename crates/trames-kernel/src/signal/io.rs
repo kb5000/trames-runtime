@@ -17,14 +17,34 @@ mod proc_views;
 #[path = "io_scheduling.rs"]
 mod scheduling;
 
-#[derive(Default)]
 pub struct Inbox {
     pending: Mutex<Pending>,
+    namespace: Arc<std::sync::OnceLock<PidNamespace>>,
     bits: AtomicU64,
     epoch: AtomicU64,
     readiness: Arc<trames_vfs::Readiness>,
 }
+impl Default for Inbox {
+    fn default() -> Self {
+        Self::with_namespace(Default::default())
+    }
+}
 impl Inbox {
+    fn with_namespace(namespace: Arc<std::sync::OnceLock<PidNamespace>>) -> Self {
+        Self {
+            pending: Default::default(),
+            namespace,
+            bits: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            readiness: Default::default(),
+        }
+    }
+    fn retain_sender(&self, info: Info) -> Option<trames_vfs::PidReference> {
+        if info.sender == 0 || info.timer.is_some() || info.fault.is_some() || info.poll.is_some() {
+            return None;
+        }
+        self.namespace.get()?.retain(info.sender)
+    }
     fn timer_quiet(&self, sig: u32, info: Info) -> (i32, bool) {
         let mut pending = self.pending.lock().unwrap();
         let mut queued = false;
@@ -35,12 +55,18 @@ impl Inbox {
                 *overrun
             } else {
                 let fresh = sig >= 32 || !pending.contains_key(&sig);
-                queued = pending.enqueue(sig, info).is_ok() && fresh;
+                queued = pending
+                    .enqueue_retained(sig, info, self.retain_sender(info))
+                    .is_ok()
+                    && fresh;
                 extra
             }
         } else {
             let fresh = sig >= 32 || !pending.contains_key(&sig);
-            queued = pending.enqueue(sig, info).is_ok() && fresh;
+            queued = pending
+                .enqueue_retained(sig, info, self.retain_sender(info))
+                .is_ok()
+                && fresh;
             0
         };
         self.bits.store(pending.bits(), Ordering::Relaxed);
@@ -68,7 +94,7 @@ impl Inbox {
         if sig < 32 && pending.contains_key(&sig) {
             return Ok(false);
         }
-        pending.enqueue(sig, info)?;
+        pending.enqueue_retained(sig, info, self.retain_sender(info))?;
         self.bits.store(pending.bits(), Ordering::Relaxed);
         drop(pending);
         Ok(true)
@@ -79,7 +105,7 @@ impl Inbox {
         }
         self.pending.lock().unwrap().next(mask)
     }
-    pub fn take(&self, sig: u32) -> Option<Info> {
+    pub fn take(&self, sig: u32) -> Option<RetainedInfo> {
         let mut pending = self.pending.lock().unwrap();
         let result = pending.remove(&sig);
         self.bits.store(pending.bits(), Ordering::Relaxed);
@@ -129,14 +155,6 @@ impl Inbox {
             .iter()
             .find_map(|(&sig, info)| info.fault.is_some().then_some(sig))
     }
-    pub fn senders(&self) -> Vec<u32> {
-        self.pending
-            .lock()
-            .unwrap()
-            .values()
-            .map(|i| i.sender)
-            .collect()
-    }
     pub fn clear(&self) {
         let mut p = self.pending.lock().unwrap();
         if p.is_empty() {
@@ -147,7 +165,7 @@ impl Inbox {
         drop(p);
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn dequeue(&self, mask: u64) -> Option<(u32, Info)> {
+    pub fn dequeue(&self, mask: u64) -> Option<(u32, RetainedInfo)> {
         if self.bits() & mask == 0 {
             return None;
         }
@@ -189,6 +207,7 @@ pub struct IoTask {
     pid: AtomicU32,
     tgid: AtomicU32,
     group: AtomicU32,
+    pid_references: Mutex<[Option<trames_vfs::PidReference>; 4]>,
     wake: Mutex<Weak<IoSignal>>,
 }
 impl Default for IoTask {
@@ -215,11 +234,29 @@ impl Default for IoTask {
             pid: AtomicU32::new(0),
             tgid: AtomicU32::new(0),
             group: AtomicU32::new(0),
+            pid_references: Mutex::new(Default::default()),
             wake: Mutex::new(Weak::new()),
         }
     }
 }
 impl IoTask {
+    /// Bind original task/TGID/PGID/SID translations before publishing new IDs.
+    /// The ordinary root namespace has no translation references to maintain.
+    pub fn retain_pid_references(&self, namespace: &PidNamespace, ids: [u32; 4]) {
+        if !namespace.is_nested()
+            || ids
+                == [
+                    self.pid.load(Ordering::Relaxed),
+                    self.tgid(),
+                    self.group(),
+                    self.session(),
+                ]
+        {
+            return;
+        }
+        let references = ids.map(|id| namespace.retain(id));
+        *self.pid_references.lock().unwrap() = references;
+    }
     pub fn credentials(&self) -> &Arc<trames_vfs::CredentialState> {
         self.scheduling.credentials()
     }
@@ -243,7 +280,8 @@ impl IoTask {
         self.live.load(Ordering::Relaxed) && self.identifies(kind, id)
     }
     pub fn process(&self) -> &Arc<Inbox> {
-        self.process.get_or_init(Arc::default)
+        self.process
+            .get_or_init(|| Arc::new(Inbox::with_namespace(self.inbox.namespace.clone())))
     }
     pub fn share_process(&self, parent: &Self) {
         assert!(self.process.set(parent.process().clone()).is_ok());
@@ -499,7 +537,7 @@ impl IoTask {
             .map(|s| (s, false))
             .or_else(|| self.process().next(mask).map(|s| (s, true)))
     }
-    pub fn take(&self, sig: u32, shared: bool) -> Option<Info> {
+    pub fn take(&self, sig: u32, shared: bool) -> Option<RetainedInfo> {
         if shared {
             self.process().take(sig)
         } else {

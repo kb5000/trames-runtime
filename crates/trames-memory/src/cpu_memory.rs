@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 pub enum CpuSlice<'a, M> {
     Direct(&'a mut M),
-    Shared(std::cell::RefMut<'a, M>),
+    Shared(crate::SharedMemoryWrite<'a, M>),
 }
 impl<M> std::ops::Deref for CpuSlice<'_, M> {
     type Target = M;
@@ -314,7 +314,7 @@ impl CpuMemory for Memory {
             .backing
             .as_ref()
             .is_none_or(|b| !b.shared && (b.private_copy || page.permissions.write))
-            && (page.bytes.shared().is_none() || std::rc::Rc::strong_count(&page.bytes) > 1)
+            && (page.bytes.shared().is_none() || std::sync::Arc::strong_count(&page.bytes) > 1)
         {
             // Give serial LL/SC the same 16-byte reservation domain as workers.
             // A global memory revision makes a compiler's unrelated stack spill
@@ -328,9 +328,9 @@ impl CpuMemory for Memory {
             page.detach_private()?;
             let old = std::mem::replace(
                 &mut page.bytes,
-                std::rc::Rc::new(crate::mmu::PageBytes::Zero),
+                std::sync::Arc::new(crate::mmu::PageBytes::Zero),
             );
-            let mut owned = std::rc::Rc::try_unwrap(old).unwrap_or_else(|old| {
+            let mut owned = std::sync::Arc::try_unwrap(old).unwrap_or_else(|old| {
                 if page.charge.resident() {
                     (*old).clone()
                 } else {
@@ -339,13 +339,13 @@ impl CpuMemory for Memory {
             });
             if owned.is_zero() {
                 if let Some(bytes) = self.mmu.page(base) {
-                    owned = std::rc::Rc::try_unwrap(bytes)
+                    owned = std::sync::Arc::try_unwrap(bytes)
                         .unwrap_or_else(|_| unreachable!("fresh MMU page"));
                 }
             }
             let storage = std::sync::Arc::new(crate::SharedPage::from_owned(owned, None));
             self.frames[frame].as_mut().unwrap().bytes =
-                std::rc::Rc::new(crate::mmu::PageBytes::Concurrent(storage));
+                std::sync::Arc::new(crate::mmu::PageBytes::Concurrent(storage));
             if self.parallel_cache.is_some() {
                 self.parallel_mappings.insert(base);
             }
@@ -445,10 +445,7 @@ pub(crate) fn c_string(
 mod tests {
     use super::*;
     use crate::{PageBacking, Permissions, PAGE_SIZE};
-    use std::{
-        cell::RefCell,
-        rc::{Rc, Weak},
-    };
+    use std::sync::{Arc, Weak};
     #[test]
     fn external_chunks_share_worker_reservations_permissions_and_dirty_publication() {
         let mut memory = Memory::default();
@@ -549,7 +546,7 @@ mod tests {
         memory.write(0x1000, &[8; 8]).unwrap();
 
         struct Reentrant {
-            owner: Weak<RefCell<Memory>>,
+            owner: Weak<crate::root::Root<Memory>>,
         }
         impl PageBacking for Reentrant {
             fn check(&self, _: u64) -> Result<(), MemoryError> {
@@ -577,12 +574,12 @@ mod tests {
             fn writable(&self) -> bool {
                 false
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 Err(MemoryError::InvalidRange)
             }
         }
-        let object = Rc::new(Reentrant {
-            owner: Rc::downgrade(memory.shared.as_ref().unwrap()),
+        let object = Arc::new(Reentrant {
+            owner: Arc::downgrade(memory.shared.as_ref().unwrap()),
         });
         memory
             .map_backed(0x3000, vec![object], false, Permissions::R, false)

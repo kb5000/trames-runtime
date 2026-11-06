@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Exercise warmed translations across architectural permission and lifetime changes.
-use std::{cell::Cell, rc::Rc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use trames_memory::{
     parallel::Registry, Access, CpuMemory, Memory, MemoryError, PageBacking, Permissions,
     ADDRESS_LIMIT, PAGE_SIZE,
@@ -122,16 +125,16 @@ fn tags_empty_entries_address_limit_and_cross_page_faults_preserve_effects() {
 }
 
 struct LiveBacking {
-    valid: Cell<bool>,
-    checks: Cell<usize>,
+    valid: AtomicBool,
+    checks: AtomicUsize,
 }
 impl PageBacking for LiveBacking {
     fn parallel_key(&self) -> Option<(u64, u64)> {
         Some((12345, 0))
     }
     fn check(&self, address: u64) -> Result<(), MemoryError> {
-        self.checks.set(self.checks.get() + 1);
-        if self.valid.get() {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        if self.valid.load(Ordering::Relaxed) {
             Ok(())
         } else {
             Err(MemoryError::Bus(address))
@@ -148,12 +151,12 @@ impl PageBacking for LiveBacking {
         Ok(())
     }
     fn version(&self) -> u64 {
-        u64::from(self.valid.get())
+        u64::from(self.valid.load(Ordering::Relaxed))
     }
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
 }
@@ -162,9 +165,9 @@ impl PageBacking for LiveBacking {
 fn warmed_backing_and_private_copy_still_fault_after_truncation() {
     for shared in [false, true] {
         let mut memory = Memory::default();
-        let backing = Rc::new(LiveBacking {
-            valid: Cell::new(true),
-            checks: Cell::new(0),
+        let backing = Arc::new(LiveBacking {
+            valid: AtomicBool::new(true),
+            checks: AtomicUsize::new(0),
         });
         memory
             .map_backed(
@@ -177,14 +180,14 @@ fn warmed_backing_and_private_copy_still_fault_after_truncation() {
             .unwrap();
         memory.read_array::<8>(0x1020).unwrap();
         memory.write_array(0x1020, [9; 8]).unwrap();
-        let checks = backing.checks.get();
+        let checks = backing.checks.load(Ordering::Relaxed);
         memory.read_array::<8>(0x1020).unwrap();
-        assert!(backing.checks.get() > checks);
+        assert!(backing.checks.load(Ordering::Relaxed) > checks);
         let mut registry = Registry::default();
         let view = memory.parallel_view(&mut registry).unwrap();
         view.read_array::<8>(0x1020).unwrap();
         drop(view); // Kernel/backing mutation only at a joined checkpoint.
-        backing.valid.set(false);
+        backing.valid.store(false, Ordering::Relaxed);
         trames_memory::backing_changed();
         for address in [0x1020, 0x1050] {
             assert_eq!(

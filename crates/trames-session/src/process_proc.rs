@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Structural process-view publication; live state stays on original resources.
 use super::*;
-use std::sync::atomic::Ordering;
 pub(super) struct ProcReadWait<C: Cpu> {
     pub checkpoint: Option<crate::run_queue::Checkpoint<C>>,
     pub report: Option<trames_memory::MemoryReport>,
@@ -28,11 +27,11 @@ impl<C: Cpu> Kernel<C> {
             if !report.alive() || !report.has_requested_reads() {
                 continue;
             }
-            let Some((&pid, _)) = self
+            let Some((pid, _)) = self
                 .processes
                 .iter()
                 .filter(|(_, p)| p.memory.has_memory_report(&report))
-                .min_by_key(|(pid, _)| epoch.is_none_or(|epoch| !epoch.contains(**pid)))
+                .min_by_key(|(pid, _)| epoch.is_none_or(|epoch| !epoch.contains(*pid)))
             else {
                 continue;
             };
@@ -40,7 +39,7 @@ impl<C: Cpu> Kernel<C> {
                 continue;
             }
             let mut wait = self.proc_read_wait();
-            let p = self.processes.get_mut(&pid).unwrap();
+            let p = &mut *self.processes.get_mut(&pid).unwrap();
             wait.subscriptions
                 .push(p.memory.subscribe_parallel_idle(&wait.signal));
             if !p.memory.parallel_views_quiescent() {
@@ -83,14 +82,14 @@ impl<C: Cpu> Kernel<C> {
         let source = Arc::new(crate::proc_views::Source {
             directory: root.signals.io_directory.clone(),
             counters: Arc::default(),
-            created: std::sync::atomic::AtomicU32::new(self.next_pid - 1),
+            created: std::sync::atomic::AtomicU32::new(self.task_ids.created()),
             idle: Default::default(),
             load: Default::default(),
             started: self.started,
             boot_time: self.boot_time,
             cpus: self.cpu_count,
             features: C::feature_names(),
-            task_limit: self.task_limit,
+            task_limit: self.task_capacity.limit(),
             limits: self.memory_limits,
             host,
             reads: Default::default(),
@@ -103,28 +102,7 @@ impl<C: Cpu> Kernel<C> {
         self.proc_source = Some(source);
     }
     pub(super) fn publish_proc_task(&self, pid: u32, p: &Process<C>) {
-        let Some(source) = &self.proc_source else {
-            return;
-        };
-        let mut info = self.process_info(pid, p, 0, trames_vfs::ProcRefresh::Metadata);
-        // These are the loaded image's host metadata, never live guest bytes.
-        // The actual argv memory reader is a separate resource.
-        info.arguments = p.linux.arguments.clone();
-        info.environment = p.linux.environment.clone();
-        info.auxiliary = p.linux.auxiliary.clone();
-        p.signals.io.bind_proc_limits(&p.limits);
-        p.signals.io.proc_view.bind_counters(&source.counters);
-        p.signals.io.proc_view.publish_time(p.cpu_time);
-        let memory = p.memory.memory_report();
-        source.bind_reads(&memory);
-        p.signals.io.proc_view.publish_with_memory(
-            &info,
-            p.linux.vfs.proc_resources(),
-            Some(memory),
-        );
-        source
-            .created
-            .fetch_max(self.next_pid - 1, Ordering::Relaxed);
+        super::birth::Birth::capture(self).publish_proc(pid, p);
     }
     pub(super) fn proc_after_call(&self, pid: u32, p: &Process<C>, number: u32, args: [u64; 6]) {
         if self.proc_source.is_none() {
@@ -145,6 +123,155 @@ impl<C: Cpu> Kernel<C> {
             || number == 167 && matches!(args[0], 15 | 22)
         {
             self.publish_proc_task(p.rekey.unwrap_or(pid), p);
+        }
+    }
+}
+
+impl<C: Cpu> Process<C> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn info(
+        &self,
+        pid: u32,
+        origin: Instant,
+        limits: super::super::MemoryLimits,
+        resident_bytes: usize,
+        demand: trames_vfs::ProcRefresh,
+        maps: Vec<u8>,
+    ) -> trames_vfs::ProcessInfo {
+        // Argument bytes are mutable guest memory, so read them live only for
+        // an actual cmdline observation. Unrelated proc files never consume
+        // this payload; their next cmdline lookup requests its own refresh.
+        let image = (demand.arguments() || demand.environment())
+            .then(|| self.memory.memory_report().image_ranges())
+            .flatten()
+            .map(trames_vfs::ProcImage);
+        let zombie = matches!(self.state, State::Zombie(_));
+        let arguments_bytes = if demand.arguments() && zombie {
+            Some(Vec::new())
+        } else {
+            image
+                .as_ref()
+                .filter(|_| demand.arguments())
+                .and_then(|image| {
+                    image.command_line(0, usize::MAX, |a, out| {
+                        trames_vfs::ProcImage::local_reader(&self.memory, a, out)
+                    })
+                })
+        };
+        let environment_bytes = if demand.environment() && zombie {
+            Some(Vec::new())
+        } else {
+            image
+                .as_ref()
+                .filter(|_| demand.environment())
+                .and_then(|image| {
+                    image.environment(0, usize::MAX, |a, out| {
+                        trames_vfs::ProcImage::local_reader(&self.memory, a, out)
+                    })
+                })
+        };
+        let arguments = if demand.arguments() && arguments_bytes.is_none() {
+            self.linux
+                .argument_pointers
+                .iter()
+                .enumerate()
+                .map(|(i, pointer)| {
+                    self.memory
+                        .read_c_string(
+                            *pointer,
+                            self.linux.arguments.get(i).map_or(65536, |a| a.len() + 1),
+                        )
+                        .unwrap_or_else(|_| {
+                            self.linux.arguments.get(i).cloned().unwrap_or_default()
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (ignored, caught) = self.signals.actions.masks();
+        let (cwd_directory, root_directory) = if demand.directories() {
+            self.linux.vfs.proc_directories()
+        } else {
+            (None, None)
+        };
+        trames_vfs::ProcessInfo {
+            identity: trames_vfs::ProcTask::identity(&*self.signals.io),
+            pid,
+            tgid: self.tgid,
+            parent: self.family.parent(),
+            group: self.group,
+            session: self.session,
+            state: if self.stopped() && !matches!(self.state, State::Zombie(_)) {
+                'T'
+            } else {
+                match self.state {
+                    State::Ready => 'R',
+                    State::Zombie(_) => 'Z',
+                    _ => 'S',
+                }
+            },
+            credentials: self.linux.vfs.credentials.clone(),
+            namespaces: self.linux.vfs.namespace_snapshot(),
+            namespace_projection: None,
+            namespace_ids: [self.tgid, pid, self.group, self.session]
+                .map(|id| self.linux.vfs.pid_namespace().hierarchy(id)),
+            command: self.linux.command_name.clone(),
+            cgroup: self.linux.vfs.cgroup_path(pid),
+            nondumpable: self.linux.vfs.dumpable() != 1,
+            seccomp: self.seccomp.mode(),
+            seccomp_filters: self.seccomp.count(),
+            arguments,
+            arguments_bytes,
+            environment: if demand.environment() && environment_bytes.is_none() {
+                self.linux.environment.clone()
+            } else {
+                Vec::new()
+            },
+            environment_bytes,
+            executable: self.linux.executable_file.as_ref().map_or_else(
+                || self.linux.executable_path.clone(),
+                |file| self.linux.vfs.executable_display(file),
+            ),
+            executable_file: self.linux.executable_file.as_ref().map(Arc::downgrade),
+            cwd: self.linux.vfs.cwd().unwrap_or_else(|_| b"/".to_vec()),
+            cwd_directory,
+            root_directory,
+            mapped_bytes: resident_bytes,
+            virtual_bytes: self.memory.virtual_bytes(),
+            maps,
+            affinity: self.signals.io.scheduling.affinity(),
+            processor: self.last_cpu as u32,
+            nice: self.signals.io.scheduling.nice(),
+            scheduler: self.signals.io.scheduling.policy(),
+            user_ticks: (self.cpu_time.as_millis() / 10) as u64,
+            start_ticks: (self.started.saturating_duration_since(origin).as_millis() / 10) as u64,
+            terminal: self.linux.vfs.controlling_terminal.is_some(),
+            terminal_number: self.linux.vfs.controlling_terminal.unwrap_or(0),
+            fds: if demand.descriptors() {
+                self.linux.vfs.fd_snapshot()
+            } else {
+                Vec::new()
+            },
+            auxiliary: if demand.auxiliary() {
+                self.linux.auxiliary.clone()
+            } else {
+                Vec::new()
+            },
+            file_size_limits: Some(self.limits.get(1)),
+            core_limits: Some(self.limits.get(4)),
+            nofile_limits: Some(self.limits.get(7)),
+            address_space_limit: Some(if limits.is_host_managed() {
+                u64::MAX
+            } else {
+                limits.per_process as u64
+            }),
+            oom: Arc::downgrade(&self.oom),
+            pending: self.signals.io.inbox.bits(),
+            shared_pending: self.signals.io.process().bits(),
+            blocked: self.signals.mask,
+            ignored,
+            caught,
         }
     }
 }
@@ -345,7 +472,7 @@ mod tests {
             kernel.cpu_count = cpus;
             kernel.per_cpu = vec![Duration::ZERO; cpus];
             kernel.workers = crate::workers::Pool::new(cpus);
-            kernel.next_pid = 3;
+            kernel.task_ids = Arc::new(trames_kernel::task::Ids::from_next(3));
             let mut root = super::super::tests::process();
             root.signals.io.scheduling.set_affinity((1 << cpus) - 1);
             image(&mut root.memory, b"one\0R=1\0");
@@ -417,7 +544,7 @@ mod tests {
                     .unwrap());
             }
             assert!(
-                matches!(kernel.processes[&1].state, State::Zombie(0)),
+                matches!(kernel.processes.read(&1).state, State::Zombie(0)),
                 "root must finish at {cpus} CPUs, not exhaust the instruction budget"
             );
             assert_eq!(observed.read_u64(0x7000).unwrap(), 4, "same-mm cmdline");
@@ -445,7 +572,7 @@ mod tests {
     fn proc_activation_waits_for_original_external_view_without_stopping_other_mms() {
         for clone_at_boundary in [false, true] {
             let mut kernel = super::super::tests::kernel();
-            kernel.next_pid = 3;
+            kernel.task_ids = Arc::new(trames_kernel::task::Ids::from_next(3));
             let mut root = super::super::tests::process();
             image(&mut root.memory, b"one\0R=1\0");
             kernel.install_proc_source(&root, None);
@@ -932,7 +1059,7 @@ mod tests {
         kernel.cpu_count = 2;
         kernel.per_cpu = vec![Duration::ZERO; 2];
         kernel.workers = crate::workers::Pool::new(2);
-        kernel.next_pid = 3;
+        kernel.task_ids = Arc::new(trames_kernel::task::Ids::from_next(3));
         let mut root = super::super::tests::process();
         root.signals.io.scheduling.set_affinity(3);
         root.linux
@@ -1039,13 +1166,13 @@ mod tests {
         kernel.processes.insert(2, peer);
         assert!(kernel.parallel_epoch(&mut Output, 1_000_000, true).unwrap());
         assert!(
-            matches!(kernel.processes[&1].state, State::Zombie(0)),
+            matches!(kernel.processes.read(&1).state, State::Zombie(0)),
             "states/PC/SVC/result: {:?}; cohort returns: {:?}",
             kernel
                 .processes
                 .iter()
                 .map(|(pid, p)| (
-                    *pid,
+                    pid,
                     matches!(p.state, State::Ready),
                     p.cpu.pc(),
                     p.cpu.x(8),

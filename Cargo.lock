@@ -760,6 +760,7 @@ name = "trames-memory"
 version = "1.3.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "trames-shared",
 ]
 
@@ -784,6 +785,7 @@ dependencies = [
 name = "trames-session"
 version = "1.3.0"
 dependencies = [
+ "parking_lot",
  "trames-accel",
  "trames-audio",
  "trames-elf",
@@ -794,6 +796,7 @@ dependencies = [
  "trames-linux",
  "trames-memory",
  "trames-net",
+ "trames-shared",
  "trames-vfs",
  "trames-video",
  "trames-vulkan",
@@ -805,6 +808,7 @@ name = "trames-shared"
 version = "1.3.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "rustix",
 ]
 

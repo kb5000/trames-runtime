@@ -127,7 +127,7 @@ impl<C: Cpu> Kernel<C> {
         self.futexes.take_ready(&mut ready);
         let mut progress = false;
         for ticket in ready.drain(..) {
-            let Some(p) = self.processes.get_mut(&ticket.pid) else {
+            let Some(mut p) = self.processes.get_mut(&ticket.pid) else {
                 continue;
             };
             // PID reuse or a preceding signal/exit cannot apply an old wake to

@@ -18,13 +18,57 @@ are in [AGENTS.md](../../AGENTS.md).
 
 ## Scoped ownership
 
-Coordinator `Memory` pages retain `Rc<PageBytes>` for fork ownership, while
+Original `Memory` pages retain `Arc<PageBytes>` for fork ownership, while
 published CPU/native views retain an `Arc<SharedPage>` **over the same physical
 bytes**. Moving an owned heap Box into UnsafeCell storage preserves its address;
 mapped pages transfer their existing physical owner/slot lease. Publishing more
-cores does not copy bytes or change the Rc fork count. No coordinator Rc, VFS
-provider, or unguarded borrowed slice crosses to workers. Immutable mapping
-snapshots and per-worker software TLBs still describe permissions and lifetimes.
+cores does not copy bytes or change the outer COW ownership count. Immutable
+mapping snapshots and per-worker software TLBs still describe permissions and
+lifetimes; no unguarded borrowed slice crosses to workers.
+
+Original `Memory` now derives `Send` from its fields, without an unsafe trait
+assertion. Fork owners, sparse descriptors and mapped providers use atomic
+ownership. `PageBacking: Send + Sync` retains the original synchronized OFD,
+inode, mount identity, write lease and page-in resources. The inner physical-page
+owner remains distinct: publishing or migrating CPU Views cannot inflate COW.
+
+CLONE_VM shares one original structural root. Its object-local reentrant mutex
+protects the root's RefCell while preserving existing same-thread read callback
+reentrance; conflicting mutable borrows remain rejected. A scoped guard retains
+both the Ref/RefMut and the mutex guard, dropping the former first. The narrow
+unsafe access only extends the stable RefCell pointer borrow to the root lifetime
+already protected by that guard. Guards cannot move to another executor. This
+protects structural access, not the whole guest instruction loop: the interpreter
+borrows once per CPU slice, and execution Views use their existing physical byte
+path with no new lock or scalar fence. Current lifecycle admission still owns the
+mm checkpoint; making Memory movable does not itself remove fork/exec dispatch.
+
+Task bodies and shared mm roots now use the same `trames-shared::Custody`
+implementation. An owned admission permit retains the stable object allocation
+and its mutex without holding a Ref/RefMut, so existing same-thread handlers can
+reenter it. The permit is not another guest Memory root: the outer root count
+continues to count actual Memory wrappers, while the internal custody allocation
+survives until the last permit/guard ends. No guard is Send, and a live RefCell
+borrow prevents a conflicting admission even on the same host thread.
+
+Checkpoint admission tries the original task/mm objects without waiting. On
+contention it subscribes, retries, and parks the original checkpoint in the
+existing queue. Release notifications happen after the object mutex unlocks.
+The Readiness release RMW pairs with subscription's retry handshake; a relaxed
+listener flag alone could lose a wake on ARM. This is structural/task unlock
+synchronization, never a CPU/native View byte fence. It adds approximately
+one nanosecond per unbatched shared-wrapper read/write pair in the measured
+microbenchmark; scoped CPU-slice access amortizes it. No new waiter/service
+thread or periodic polling is introduced.
+
+File providers no longer share a RefCell page cache or an unpublished byte-borrow
+capability. Warm accesses use the page's existing layout read guard and physical
+byte protocol; cold page-in alone takes the layout write guard. Concurrent first
+mappings recheck the original weak page cache before publication. A page-local
+writeback mutex orders persistence snapshots, and dirty state clears before the
+snapshot so later writers remain dirty; failed writes restore it. Mapping writes
+publish metadata after their byte callback. These are resource ownership rules,
+not an additional guest-wide synchronization model.
 
 Coordinator reads/writes, hardware CPU aliases, native fragments, atomic RMW and
 exclusive monitors share one physical ownership protocol. Mutable shared bytes
@@ -54,7 +98,7 @@ file mappings and custom providers without this opt-in retain bounded shadows
 and dirty-copy commit; their live EOF, fallible I/O and private-COW behavior are
 not bypassed. A private page that has detached rejoins the common shared path.
 
-A real fork retains Rc COW ownership, rather than treating CPU views as fork
+A real fork retains atomic COW ownership, rather than treating CPU views as fork
 owners. Its epoch invalidates the parent's cached mapping view even if no bytes
 changed. Before writable fork pages return to workers, they detach once into
 owned physical storage; read-only shared storage can stay shared. A safe fork
@@ -72,6 +116,17 @@ retired physical slots from being zeroed/reused under an older reader/writer.
 Normal joined runtime mapping paths reuse their existing windows. Remap/protect/
 truncate/discard and mapped writeback still use joined checkpoints. Eligible
 ordinary disk-file sync uses the bounded disk workers described below.
+
+Guest fork uses fallible `Memory::try_fork`, with rollback of every tentative child
+charge. An advisory `can_fork` result cannot authorize a later infallible allocation:
+unrelated address spaces remain live and can consume the shared budget meanwhile.
+The parent's translation/epoch commit follows successful child construction. A
+failed fork returns the existing quota errno without publishing a child, revoking
+the parent's CPU aliases or retaining partial charges. Fresh, unpublished charges
+start in their final state after budget reservation; they do not run the concurrent
+first-touch state machine. Read-only sparse zero pages remain uncharged in the child,
+including when an external View is retained. `Clone` remains an infallible embedding
+convenience; production guest task creation does not use it.
 
 Anonymous zeros remain unpaid and physically sparse in mapped storage. If the
 optional MMU arena is unavailable, a shared zero page's software allocation is
@@ -122,7 +177,7 @@ CPU. The scheduler now admits a lock-free private-page path for those epochs:
 3. Require the all-generations View user count to be one. An externally retained
    View, including one from a previous mapping generation, blocks admission.
 4. Each eligible frame must be anonymous or a detached private copy, with one
-   coordinate Rc owner and exactly the coordinate/ConcurrentPage physical Arc
+   original COW byte owner and exactly the original/ConcurrentPage physical Arc
    owners. This additional physical test rejects retained read-only fork Views
    after their coordinator has gone. Writable fork pages detach before dispatch.
    Shared mappings, live private file shadows and custom providers stay guarded.
@@ -752,7 +807,7 @@ addresses. The retirement backlog survives snapshot replacement while old Views
 remain live. The anonymous dirty bit is shared by
 those snapshot generations, so their late canonical writes remain publishable.
 Retirement releases the removed pages' quota.
-Fork copies a live writer's reached pages and otherwise uses Rc COW. Large remap
+Fork copies a live writer's reached pages and otherwise uses atomic COW ownership. Large remap
 and protection operations visit affected intervals plus explicit reached pages,
 rather than all virtual pages. Joined snapshots update their interval index in
 place, preserve unchanged frame caches and maintain an executable-range count.

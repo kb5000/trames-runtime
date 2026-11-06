@@ -335,7 +335,7 @@ impl Memory {
             if !b.shared && !b.private_copy {
                 let mut bytes = [0; PAGE_SIZE as usize];
                 b.object.read(0, &mut bytes)?;
-                page.bytes = Rc::new(PageBytes::new(bytes));
+                page.bytes = Arc::new(PageBytes::new(bytes));
                 b.private_copy = true;
             }
         }
@@ -363,7 +363,7 @@ impl Memory {
             return Ok((result, false));
         }
         Ok((
-            Rc::make_mut(&mut page.bytes).with_write(offset, len, operation),
+            Arc::make_mut(&mut page.bytes).with_write(offset, len, operation),
             true,
         ))
     }
@@ -501,7 +501,7 @@ impl Memory {
             let si = (src % PAGE_SIZE) as usize;
             if df == sf {
                 let page = self.frames[df].as_mut().expect("page");
-                let bytes = Rc::make_mut(&mut page.bytes);
+                let bytes = Arc::make_mut(&mut page.bytes);
                 if let Some(shared) = bytes.shared() {
                     let mut guard = shared.lock_pair(si, di, count);
                     shared.changed(&mut guard, di, count);
@@ -515,7 +515,7 @@ impl Memory {
                     destination.as_mut().expect("destination"),
                     source.as_ref().expect("source"),
                 );
-                let destination = Rc::make_mut(&mut d.bytes);
+                let destination = Arc::make_mut(&mut d.bytes);
                 // Distinct private source pages cannot alias: a fork detaches
                 // the destination before taking either byte guard.
                 if let (Some(dst), Some(src)) = (destination.shared(), s.bytes.shared()) {
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(&page[8..16], &42u64.to_le_bytes());
         let original = page.as_ptr();
         assert_eq!(
-            Rc::strong_count(&memory.frames[0].as_ref().unwrap().bytes),
+            Arc::strong_count(&memory.frames[0].as_ref().unwrap().bytes),
             1
         );
         assert!(memory.native_read_page(0x1ffc, 8).unwrap().is_none());

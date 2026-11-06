@@ -3,9 +3,8 @@
 use super::{Exit, Runtime, RuntimeError};
 use crate::terminal::Terminal;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::BTreeMap,
-    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -43,6 +42,8 @@ const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
 const TOTAL_MAPPED_LIMIT: usize = 1024 * 1024 * 1024;
 use trames_kernel::scheduling::assign_cpus;
 pub(crate) use trames_kernel::signal::UNBLOCKABLE;
+#[path = "process_birth.rs"]
+mod birth;
 #[path = "process_caps.rs"]
 mod caps;
 #[path = "process_compat.rs"]
@@ -52,15 +53,19 @@ mod dispatch;
 #[path = "process_events.rs"]
 mod events;
 #[path = "process_exec.rs"]
-mod exec;
+pub(crate) mod exec;
 #[path = "process_exit.rs"]
 mod exit;
+#[path = "process_lifecycle.rs"]
+pub(crate) mod lifecycle;
 #[path = "process_pid.rs"]
 mod pid_namespace;
 #[path = "process_proc.rs"]
 mod proc;
 #[path = "process_signals.rs"]
 mod signals;
+#[path = "process_tasks.rs"]
+pub(crate) mod tasks;
 use trames_kernel::signal::AltStack;
 #[path = "process_file_io.rs"]
 mod file_io;
@@ -134,6 +139,7 @@ pub(crate) struct Process<C: Cpu> {
     tcp_liveness: Option<trames_net::TcpLease>,
     retained_poll: Option<Arc<trames_linux::RetainedWait>>,
     pending_open: Option<u32>,
+    exec_pending: Option<exec::Preparation<C>>,
     auto_reap: bool,
     vfork: Option<Arc<trames_kernel::vfork::Release>>,
     tgid: u32,
@@ -142,7 +148,7 @@ pub(crate) struct Process<C: Cpu> {
     vm_id: u64,
     space: crate::space::Native,
     rekey: Option<u32>,
-    membarrier_registered: Rc<Cell<bool>>,
+    membarrier_registered: Arc<std::sync::atomic::AtomicBool>,
     limits: Arc<trames_kernel::limits::Limits>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
@@ -160,6 +166,7 @@ impl<C: Cpu> Process<C> {
             self.state,
             State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
+            || self.exec_pending.is_some()
             || self.file_checkpoint.is_some()
             || self
                 .retained_file
@@ -437,13 +444,13 @@ impl<C: Cpu> Process<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork(&self) -> Box<Self> {
-        let child = self.fork_state(self.memory.clone(), false, false, false);
+        let child = self.fork_state(self.memory.clone(), false, false, false, Default::default());
         child.bind_signals();
         child
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork_with_memory(&self, memory: Memory) -> Box<Self> {
-        let child = self.fork_state(memory, true, true, true);
+        let child = self.fork_state(memory, true, true, true, Default::default());
         child.bind_signals();
         child
     }
@@ -453,6 +460,7 @@ impl<C: Cpu> Process<C> {
         shared_files: bool,
         shared_fs: bool,
         shared_actions: bool,
+        presence: Arc<trames_kernel::task::Presence>,
     ) -> Box<Self> {
         // Bind allocation metadata to actual Memory identity, including test
         // and embedding clones; a copied address space must not share a cursor.
@@ -461,6 +469,8 @@ impl<C: Cpu> Process<C> {
             .linux
             .clone_with_resources(shared_files, shared_fs, shared_vm);
         let limits = self.limits.fork(&linux.vfs);
+        let mut signals = self.signals.fork(shared_actions);
+        signals.presence = presence;
         Box::new(Self {
             cpu: self.cpu.fork_cpu(shared_vm),
             last_cpu: self.last_cpu,
@@ -471,7 +481,7 @@ impl<C: Cpu> Process<C> {
             group: self.group,
             session: self.session,
             state: State::Ready,
-            signals: self.signals.fork(shared_actions),
+            signals,
             wait_event: Default::default(),
             children: Default::default(),
             poll_deadline: None,
@@ -491,6 +501,7 @@ impl<C: Cpu> Process<C> {
             tcp_liveness: None,
             retained_poll: None,
             pending_open: None,
+            exec_pending: None,
             auto_reap: false,
             vfork: None,
             tgid: self.tgid,
@@ -503,12 +514,52 @@ impl<C: Cpu> Process<C> {
                 Default::default()
             },
             rekey: None,
-            membarrier_registered: Rc::new(Cell::new(self.membarrier_registered.get())),
+            membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.membarrier_registered
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
             limits,
             oom: Arc::new(self.oom.fork()),
             seccomp: self.seccomp.clone(),
             seccomp_entry: None,
         })
+    }
+}
+impl<C: Cpu> Process<C> {
+    fn audio_context(&self) -> trames_audio::Context {
+        self.space
+            .audio(|| {
+                let caps = self
+                    .linux
+                    .auxiliary
+                    .chunks_exact(16)
+                    .find_map(|pair| {
+                        (pair[..8] == trames_audio::CAPS_KEY.to_le_bytes())
+                            .then(|| u64::from_le_bytes(pair[8..].try_into().unwrap()))
+                    })
+                    .unwrap_or(0);
+                trames_audio::Context::new(caps)
+            })
+            .expect("live native address space")
+    }
+    fn video_context(&self) -> trames_video::Context {
+        self.space.video().expect("live native address space")
+    }
+    fn gpu_context(
+        &self,
+        budget: &trames_vulkan::Budget,
+        display: &trames_vulkan::Display,
+    ) -> trames_vulkan::Context {
+        self.space
+            .gpu(|| {
+                trames_vulkan::Context::new(
+                    trames_vulkan::Backend::with_budget(budget.clone())
+                        .with_native_images()
+                        .with_display(display.clone())
+                        .with_wayland(self.linux.vfs.wayland_server()),
+                )
+            })
+            .expect("live native address space")
     }
 }
 struct ProcMaps {
@@ -530,10 +581,9 @@ pub(crate) struct Kernel<C: Cpu> {
     file_layouts: Vec<file_io::FileLayout>,
     families: Arc<trames_kernel::family::Families>,
     limit_directory: Arc<trames_kernel::limits::Directory>,
-    children_dirty: Cell<bool>,
     memory_limits: super::MemoryLimits,
     cpu_count: usize,
-    task_limit: usize,
+    task_capacity: Arc<trames_kernel::task::Capacity>,
     workers: crate::workers::Pool<C>,
     engine: C::Engine,
     backend_error: Option<String>,
@@ -586,8 +636,8 @@ pub(crate) struct Kernel<C: Cpu> {
     // Scheduler passes remove/reinsert tasks while invoking Kernel methods.
     // Keep the large CPU/Linux/VFS state stationary: B-tree node compaction
     // must move only pointers, including when most guest threads are asleep.
-    processes: BTreeMap<u32, Box<Process<C>>>,
-    next_pid: u32,
+    processes: tasks::Table<C>,
+    task_ids: Arc<trames_kernel::task::Ids>,
     terminal: Option<Terminal>,
     started: Instant,
     instructions: u64,
@@ -607,7 +657,7 @@ pub(crate) struct Kernel<C: Cpu> {
     idle: Duration,
     load: [f64; 3],
     load_sample: Instant,
-    next_resource: u64,
+    next_resource: Arc<std::sync::atomic::AtomicU64>,
     timers: Arc<trames_kernel::timers::Timers>,
     native: trames_accel::native::Registry,
     gpu_budget: trames_vulkan::Budget,
@@ -672,59 +722,33 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
 impl<C: Cpu> Kernel<C> {
     fn publish_task(&self, id: u32, p: &Process<C>) {
         self.publish_task_core(id, p);
+        birth::Birth::capture(self).publish_family(id, p);
         self.bind_task_cgroup(id, p);
     }
     fn bind_task_cgroup(&self, id: u32, p: &Process<C>) {
-        if !matches!(p.state, State::Zombie(_)) && p.signals.io.cgroup().is_none() {
-            if let Some(task) = p.linux.vfs.cgroup_task(id) {
-                p.signals.io.bind_cgroup(task);
-            }
-        }
+        birth::Birth::capture(self).bind_task_cgroup(id, p);
     }
     fn publish_task_core(&self, id: u32, p: &Process<C>) {
-        self.publish_proc_task(id, p);
-        self.children_dirty.set(true);
-        p.signals
-            .io
-            .scheduling
-            .publish_credentials(&p.linux.vfs.credentials);
-        self.limit_directory.publish(
-            id,
-            &p.signals.presence,
-            &p.limits,
-            p.signals.io.credentials(),
-        );
-        if matches!(p.state, State::Zombie(_)) {
-            return;
-        }
-        p.bind_signals();
-        p.signals.io.bind_family(&p.family);
-        p.signals
-            .io
-            .bind_thread_addresses(p.linux.thread_addresses());
-        p.signals
-            .io_directory
-            .parents
-            .publish(&p.signals.io, id, &p.parentage);
-        p.signals.io.set_session(p.session);
-        p.signals.io_directory.publish(
-            &p.signals.io,
-            id,
-            p.tgid,
-            p.group,
-            p.linux.vfs.credentials.uid,
-            p.linux.vfs.credentials.suid,
-        );
+        birth::Birth::capture(self).publish_task_core(id, p);
     }
     fn publish_io_tasks(&self, current: Option<(u32, &Process<C>)>) {
         self.limit_directory.prune();
-        for (&id, p) in &self.processes {
-            self.publish_task(id, p);
+        for (id, p) in self.processes.iter() {
+            self.publish_task(id, &p);
         }
         if let Some((id, p)) = current {
             self.publish_task(id, p);
         }
-        self.publish_children(current.map(|(_, p)| p));
+    }
+    fn admit_child(
+        &self,
+        parent: u32,
+        parent_control: &trames_kernel::task_control::Group,
+        id: u32,
+        child: &mut Process<C>,
+        threaded: bool,
+    ) -> Result<(), Errno> {
+        birth::Birth::capture(self).admit_child(parent, parent_control, id, child, threaded)
     }
     fn native_call(
         &mut self,
@@ -741,7 +765,7 @@ impl<C: Cpu> Kernel<C> {
             self.native
                 .authorize_stateful(&p.memory, pc, module, function)?;
             let value = crate::devices::audio(
-                &self.audio_context(p),
+                &p.audio_context(),
                 Some(&p.linux.vfs.native_events()),
                 &mut p.memory,
                 a[0],
@@ -762,7 +786,7 @@ impl<C: Cpu> Kernel<C> {
                 .authorize_stateful(&p.memory, pc, module, function)?;
             let images = p.linux.vfs.image_fds();
             let value = crate::devices::video(
-                &self.video_context(p),
+                &p.video_context(),
                 Some(&p.linux.vfs.native_events()),
                 Some(&images),
                 &mut p.memory,
@@ -873,36 +897,8 @@ impl<C: Cpu> Kernel<C> {
             fallback: false,
         }))
     }
-    fn audio_context(&self, p: &Process<C>) -> trames_audio::Context {
-        p.space
-            .audio(|| {
-                let caps = p
-                    .linux
-                    .auxiliary
-                    .chunks_exact(16)
-                    .find_map(|pair| {
-                        (pair[..8] == trames_audio::CAPS_KEY.to_le_bytes())
-                            .then(|| u64::from_le_bytes(pair[8..].try_into().unwrap()))
-                    })
-                    .unwrap_or(0);
-                trames_audio::Context::new(caps)
-            })
-            .expect("live native address space")
-    }
-    fn video_context(&self, p: &Process<C>) -> trames_video::Context {
-        p.space.video().expect("live native address space")
-    }
     fn gpu_context(&self, p: &Process<C>) -> trames_vulkan::Context {
-        p.space
-            .gpu(|| {
-                trames_vulkan::Context::new(
-                    trames_vulkan::Backend::with_budget(self.gpu_budget.clone())
-                        .with_native_images()
-                        .with_display(self.gpu_display.clone())
-                        .with_wayland(p.linux.vfs.wayland_server()),
-                )
-            })
-            .expect("live native address space")
+        p.gpu_context(&self.gpu_budget, &self.gpu_display)
     }
     fn existing_gpu(p: &Process<C>) -> Option<trames_vulkan::Context> {
         p.space.existing_gpu()
@@ -964,10 +960,14 @@ impl<C: Cpu> Kernel<C> {
         }
         true
     }
-    fn resource_id(&mut self) -> u64 {
-        let id = self.next_resource;
-        self.next_resource += 1;
-        id
+    fn resource_id(&self) -> u64 {
+        self.next_resource
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("resource identity overflow")
     }
     fn other_memory(&self, vm_id: u64) -> usize {
         let mut spaces = BTreeMap::new();
@@ -983,19 +983,20 @@ impl<C: Cpu> Kernel<C> {
         spaces.values().sum()
     }
     fn control(&mut self, io: &mut impl GuestOutput) -> Result<(), RuntimeError> {
-        let Some(root) = self.processes.get_mut(&1) else {
+        let Some(mut root) = self.processes.get_mut(&1) else {
             return Ok(());
         };
         let result = io.control(&mut root.linux.vfs);
         match result {
             Ok(true) => {
                 if let Some(signal @ 1..=64) = io.root_signal() {
-                    Self::queue_one(1, root, signal, 0);
+                    Self::queue_one(1, &mut root, signal, 0);
                 }
             }
             Ok(false) => return Err(RuntimeError::Cancelled),
             Err(_) => return Err(RuntimeError::Arguments("host session control failed")),
         }
+        drop(root);
         while let Some(request) = io.host_spawn() {
             let status = request.status.clone();
             let published_pid = request.pid.clone();
@@ -1005,9 +1006,9 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         while let Some((group, signal @ 1..=64)) = io.host_signal() {
-            for (&pid, task) in &mut self.processes {
+            for (pid, mut task) in self.processes.iter_mut() {
                 if task.group == group && !matches!(task.state, State::Zombie(_)) {
-                    Self::queue_one(pid, task, signal, 0);
+                    Self::queue_one(pid, &mut task, signal, 0);
                 }
             }
         }
@@ -1015,38 +1016,42 @@ impl<C: Cpu> Kernel<C> {
     }
     fn spawn_host(&mut self, request: trames_linux::HostSpawn) -> Result<u32, Errno> {
         self.reap_waited();
-        if self.processes.len() >= self.task_limit || request.argv.is_empty() {
+        if request.argv.is_empty() {
             return Err(Errno(11));
         }
-        let id = self.next_pid;
-        self.next_pid = id
-            .checked_add(1)
-            .filter(|v| *v < i32::MAX as u32)
-            .ok_or(Errno(11))?;
+        let slot = self.task_capacity.reserve().ok_or(Errno(11))?;
+        let id = self.task_ids.allocate().ok_or(Errno(11))?;
         let root = self.processes.get(&1).ok_or(Errno(3))?;
-        let mut child = root.fork_state(Memory::default(), false, false, false);
+        let parent_control = root.signals.io.lifecycle().clone();
+        self.publish_task(1, &root);
+        let mut child = root.fork_state(
+            Memory::default(),
+            false,
+            false,
+            false,
+            Arc::new(slot.into_presence()),
+        );
         child
             .memory
             .inherit_total_limit(&root.memory)
             .map_err(|_| Errno(12))?;
         child.linux.vfs = request.vfs;
         child.limits.bind(&mut child.linux.vfs);
-        child.linux.vfs.activate_child_pid(id)?;
-        child.bind_signals();
-        child.linux.vfs.set_process_context(id);
+        child.linux.vfs.prepare_child_context(id);
         child.linux.fork_tid(0);
         child.family.set_parent(1);
         child.parentage.set_parent_thread(1);
         child.tgid = id;
         child.session = id;
         child.group = id;
-        child.signals = Signals::default();
-        child.signals.io_directory = root.signals.io_directory.clone();
+        child.signals = Signals {
+            presence: child.signals.presence.clone(),
+            io_directory: root.signals.io_directory.clone(),
+            ..Signals::default()
+        };
         child.linux.vfs.set_controlling_terminal(None)?;
-        if let Some(end) = child.linux.vfs.pty(0)?.filter(|end| !end.master) {
-            let mut tty = end.pair.terminal.borrow_mut();
-            tty.session = id;
-            tty.foreground = id;
+        let terminal = child.linux.vfs.pty(0)?.filter(|end| !end.master);
+        if let Some(end) = &terminal {
             child
                 .linux
                 .vfs
@@ -1093,12 +1098,14 @@ impl<C: Cpu> Kernel<C> {
         )?;
         child.family.bind_host_status(request.status);
         child.vm_id = self.resource_id();
-        let birth = child.linux.vfs.cgroup_birth(1, id, id);
-        let admitted = birth.result();
-        birth.notify();
-        admitted?;
+        child.wait_event.bind_presence(&child.signals.presence);
+        self.admit_child(1, &parent_control, id, &mut child, false)?;
+        if let Some(end) = terminal {
+            let mut tty = end.pair.terminal.borrow_mut();
+            tty.session = id;
+            tty.foreground = id;
+        }
         self.processes.insert(id, child);
-        self.publish_io_tasks(None);
         Ok(id)
     }
     fn process_maps(&self, p: &Process<C>) -> Vec<u8> {
@@ -1148,143 +1155,14 @@ impl<C: Cpu> Kernel<C> {
         } else {
             Vec::new()
         };
-        // Argument bytes are mutable guest memory, so read them live only for
-        // an actual cmdline observation. Unrelated proc files never consume
-        // this payload; their next cmdline lookup requests its own refresh.
-        let image = (demand.arguments() || demand.environment())
-            .then(|| p.memory.memory_report().image_ranges())
-            .flatten()
-            .map(trames_vfs::ProcImage);
-        let zombie = matches!(p.state, State::Zombie(_));
-        let arguments_bytes = if demand.arguments() && zombie {
-            Some(Vec::new())
-        } else {
-            image
-                .as_ref()
-                .filter(|_| demand.arguments())
-                .and_then(|image| {
-                    image.command_line(0, usize::MAX, |a, out| {
-                        trames_vfs::ProcImage::local_reader(&p.memory, a, out)
-                    })
-                })
-        };
-        let environment_bytes = if demand.environment() && zombie {
-            Some(Vec::new())
-        } else {
-            image
-                .as_ref()
-                .filter(|_| demand.environment())
-                .and_then(|image| {
-                    image.environment(0, usize::MAX, |a, out| {
-                        trames_vfs::ProcImage::local_reader(&p.memory, a, out)
-                    })
-                })
-        };
-        let arguments = if demand.arguments() && arguments_bytes.is_none() {
-            p.linux
-                .argument_pointers
-                .iter()
-                .enumerate()
-                .map(|(i, pointer)| {
-                    p.memory
-                        .read_c_string(
-                            *pointer,
-                            p.linux.arguments.get(i).map_or(65536, |a| a.len() + 1),
-                        )
-                        .unwrap_or_else(|_| p.linux.arguments.get(i).cloned().unwrap_or_default())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let (ignored, caught) = p.signals.actions.masks();
-        let (cwd_directory, root_directory) = if demand.directories() {
-            p.linux.vfs.proc_directories()
-        } else {
-            (None, None)
-        };
-        trames_vfs::ProcessInfo {
-            identity: trames_vfs::ProcTask::identity(&*p.signals.io),
+        p.info(
             pid,
-            tgid: p.tgid,
-            parent: p.family.parent(),
-            group: p.group,
-            session: p.session,
-            state: if p.stopped() && !matches!(p.state, State::Zombie(_)) {
-                'T'
-            } else {
-                match p.state {
-                    State::Ready => 'R',
-                    State::Zombie(_) => 'Z',
-                    _ => 'S',
-                }
-            },
-            credentials: p.linux.vfs.credentials.clone(),
-            namespaces: p.linux.vfs.namespace_snapshot(),
-            namespace_projection: None,
-            namespace_ids: [p.tgid, pid, p.group, p.session]
-                .map(|id| p.linux.vfs.pid_namespace().hierarchy(id)),
-            command: p.linux.command_name.clone(),
-            cgroup: p.linux.vfs.cgroup_path(pid),
-            nondumpable: p.linux.vfs.dumpable() != 1,
-            seccomp: p.seccomp.mode(),
-            seccomp_filters: p.seccomp.count(),
-            arguments,
-            arguments_bytes,
-            environment: if demand.environment() && environment_bytes.is_none() {
-                p.linux.environment.clone()
-            } else {
-                Vec::new()
-            },
-            environment_bytes,
-            executable: p.linux.executable_file.as_ref().map_or_else(
-                || p.linux.executable_path.clone(),
-                |file| p.linux.vfs.executable_display(file),
-            ),
-            executable_file: p.linux.executable_file.as_ref().map(Arc::downgrade),
-            cwd: p.linux.vfs.cwd().unwrap_or_else(|_| b"/".to_vec()),
-            cwd_directory,
-            root_directory,
-            mapped_bytes: resident_bytes,
-            virtual_bytes: p.memory.virtual_bytes(),
+            self.started,
+            self.memory_limits,
+            resident_bytes,
+            demand,
             maps,
-            affinity: p.signals.io.scheduling.affinity(),
-            processor: p.last_cpu as u32,
-            nice: p.signals.io.scheduling.nice(),
-            scheduler: p.signals.io.scheduling.policy(),
-            user_ticks: (p.cpu_time.as_millis() / 10) as u64,
-            start_ticks: (p
-                .started
-                .saturating_duration_since(self.started)
-                .as_millis()
-                / 10) as u64,
-            terminal: p.linux.vfs.controlling_terminal.is_some(),
-            terminal_number: p.linux.vfs.controlling_terminal.unwrap_or(0),
-            fds: if demand.descriptors() {
-                p.linux.vfs.fd_snapshot()
-            } else {
-                Vec::new()
-            },
-            auxiliary: if demand.auxiliary() {
-                p.linux.auxiliary.clone()
-            } else {
-                Vec::new()
-            },
-            file_size_limits: Some(p.limits.get(1)),
-            core_limits: Some(p.limits.get(4)),
-            nofile_limits: Some(p.limits.get(7)),
-            address_space_limit: Some(if self.memory_limits.is_host_managed() {
-                u64::MAX
-            } else {
-                self.memory_limits.per_process as u64
-            }),
-            oom: Arc::downgrade(&p.oom),
-            pending: p.signals.io.inbox.bits(),
-            shared_pending: p.signals.io.process().bits(),
-            blocked: p.signals.mask,
-            ignored,
-            caught,
-        }
+        )
     }
     fn refresh_proc(
         &self,
@@ -1306,31 +1184,26 @@ impl<C: Cpu> Kernel<C> {
         // real owner and reuse it for both totals and every thread's proc row.
         // Do not cache across requests; hardware can populate/reclaim pages
         // without changing the guest mapping generation.
-        let tasks = || {
-            self.processes
-                .values()
-                .map(|p| p.as_ref())
-                .chain(std::iter::once(&*p))
-        };
         let mut resident = BTreeMap::new();
-        for task in tasks() {
-            resident
-                .entry(task.memory.instruction_identity().0)
-                .or_insert_with(|| {
-                    if demand.residency() {
-                        task.memory.resident_bytes()
-                    } else {
-                        0
-                    }
-                });
+        let mut live = std::collections::BTreeSet::new();
+        let mut observe = |task: &Process<C>| {
+            let owner = task.memory.instruction_identity().0;
+            resident.entry(owner).or_insert_with(|| {
+                if demand.residency() {
+                    task.memory.resident_bytes()
+                } else {
+                    0
+                }
+            });
+            if !matches!(task.state, State::Zombie(_)) {
+                live.insert(owner);
+            }
+        };
+        for task in self.processes.values() {
+            observe(&task);
         }
-        let used: usize = tasks()
-            .filter(|task| !matches!(task.state, State::Zombie(_)))
-            .map(|task| task.memory.instruction_identity().0)
-            .collect::<std::collections::BTreeSet<_>>()
-            .iter()
-            .map(|owner| resident[owner])
-            .sum();
+        observe(p);
+        let used: usize = live.iter().map(|owner| resident[owner]).sum();
         let memory = self.memory_limits.reported(used, host);
         // Bound cached bytes by the current memory-owner set, even after repeated
         // fork/exec. Never cache fd paths, credentials, names, argv bytes or
@@ -1348,10 +1221,10 @@ impl<C: Cpu> Kernel<C> {
             .processes
             .iter()
             .filter(|(_, other)| other.signals.presence.present())
-            .map(|(&id, other)| {
+            .map(|(id, other)| {
                 self.process_info(
                     id,
-                    other,
+                    &other,
                     resident[&other.memory.instruction_identity().0],
                     demand,
                 )
@@ -1367,7 +1240,7 @@ impl<C: Cpu> Kernel<C> {
             pid,
             trames_vfs::RuntimeInfo {
                 cpu_count: self.cpu_count,
-                task_limit: self.task_limit,
+                task_limit: self.task_capacity.limit(),
                 per_cpu_ticks: self
                     .per_cpu
                     .iter()
@@ -1383,7 +1256,7 @@ impl<C: Cpu> Kernel<C> {
                 memory_limit: memory.total,
                 available_memory: Some(memory.available),
                 load: self.load,
-                processes_created: self.next_pid - 1,
+                processes_created: self.task_ids.created(),
                 used_memory: memory.total.saturating_sub(memory.free),
             },
         );
@@ -1399,7 +1272,10 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.sync_task_namespaces();
         p.linux.executable_file = None;
         p.space.retire();
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         if !p.signals.io.lifecycle().has_live_members() {
             p.linux.vfs.release_process_locks();
         }
@@ -1407,12 +1283,14 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.retire_context();
     }
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
-        self.children_dirty.set(true);
         if p.family.registry().is_none() {
-            self.publish_children(Some(p));
+            birth::Birth::capture(self).publish_family(pid, p);
         }
         p.signals.io.begin_exit(pid, status);
-        p.linux.cancel_uring(&mut p.memory, pid);
+        {
+            let task = &mut *p;
+            task.linux.cancel_uring(&mut task.memory, pid)
+        };
         Self::parent_thread_exited(p, None);
         p.linux.vfs.cgroup_exit(pid);
         Self::cancel_native_task(p);
@@ -1422,7 +1300,10 @@ impl<C: Cpu> Kernel<C> {
         // Cancel the original wait before clear_tid can wake a successor.
         p.state = State::Zombie(status);
         let address = p.linux.clear_tid_address();
-        p.linux.exit_tid(&mut p.memory);
+        {
+            let task = &mut *p;
+            task.linux.exit_tid(&mut task.memory)
+        };
         self.wake_futex(p, address, 1, u32::MAX);
         self.close_exit_files(p);
         self.collect_exit_projection(pid, p, status);
@@ -1431,7 +1312,10 @@ impl<C: Cpu> Kernel<C> {
     /// CPU/Memory/VFS projections return here; never replay accepted effects.
     #[cfg(all(test, trames_interpreter_conformance))]
     fn collect_source_exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         p.linux.vfs.collect_retired_descriptors();
         self.collect_exit_projection(pid, p, status);
     }
@@ -1443,6 +1327,7 @@ impl<C: Cpu> Kernel<C> {
         p.retained_file = None;
         p.retained_aio = None;
         p.pending_open = None;
+        p.exec_pending = None;
         p.file_checkpoint = None;
         p.file_entry = None;
         p.retained_socket = None;
@@ -1453,7 +1338,6 @@ impl<C: Cpu> Kernel<C> {
         p.linux.executable_file = None;
     }
     fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
-        self.children_dirty.set(true);
         Self::clear_exit_resources(p);
         if p.memory.coordinator_ownership().1 == 1 {
             p.memory.retire_memory_report();
@@ -1486,13 +1370,14 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn finish_group(&mut self, tgid: u32) {
-        if let Some(leader) = self.processes.get_mut(&tgid) {
+        if let Some(mut leader) = self.processes.get_mut(&tgid) {
             if let Some(status) = leader.signals.io.lifecycle().exit_status() {
                 leader.state = State::Zombie(status);
                 self.timers.clear_process(tgid, false);
                 let family = leader.family.clone();
                 let directory = leader.signals.io_directory.clone();
                 let namespace = leader.linux.vfs.pid_namespace().clone();
+                drop(leader);
                 self.reap_namespace_children(tgid, &namespace, &family, &directory.parents);
                 if self.families.complete(&family, status) && tgid != 1 {
                     self.processes.remove(&tgid);
@@ -1508,17 +1393,23 @@ impl<C: Cpu> Kernel<C> {
             .processes
             .iter()
             .filter(|(_, t)| t.tgid == p.tgid)
-            .map(|(&id, _)| id)
+            .map(|(id, _)| id)
             .collect();
         for id in members.iter().copied().filter(|id| *id != p.tgid) {
             if let Some(mut thread) = self.processes.remove(&id) {
                 thread.signals.io.begin_exit(id, status);
                 Self::cancel_native_task(&thread);
-                thread.linux.cancel_uring(&mut thread.memory, id);
+                {
+                    let task = &mut *thread;
+                    task.linux.cancel_uring(&mut task.memory, id)
+                };
                 Self::parent_thread_exited(&thread, None);
                 thread.linux.vfs.cgroup_exit(id);
                 let address = thread.linux.clear_tid_address();
-                thread.linux.exit_tid(&mut thread.memory);
+                {
+                    let task = &mut *thread;
+                    task.linux.exit_tid(&mut task.memory)
+                };
                 self.wake_futex(&thread, address, 1, u32::MAX);
                 self.close_exit_files(&mut thread);
                 thread.memory = Memory::default();
@@ -1527,7 +1418,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         if pid != p.tgid {
-            if let Some(mut leader) = self.processes.remove(&p.tgid) {
+            if let Some(mut leader) = self.processes.checkout(&p.tgid) {
                 self.exit_one(p.tgid, &mut leader, status);
                 self.processes.insert(p.tgid, leader);
             }
@@ -1643,7 +1534,7 @@ impl<C: Cpu> Kernel<C> {
             if tgid.is_some_and(|id| id != target.tgid) {
                 return Err(Errno(3));
             }
-            Self::may_signal(p, target, sig)
+            Self::may_signal(p, &target, sig)
         };
         if !allowed {
             return Err(Errno(1));
@@ -1653,7 +1544,7 @@ impl<C: Cpu> Kernel<C> {
         let target = if tid == pid {
             p
         } else {
-            self.processes.get_mut(&tid).ok_or(Errno(3))?
+            &mut *self.processes.get_mut(&tid).ok_or(Errno(3))?
         };
         if Self::prepare_signal(target, sig, sender) {
             target.signals.io.inbox.enqueue(
@@ -1731,10 +1622,10 @@ impl<C: Cpu> Kernel<C> {
                 groups.push(p.tgid);
             }
         }
-        for (&id, other) in &self.processes {
+        for (id, other) in self.processes.iter() {
             if id == other.tgid && matches(other.tgid, other.group) {
                 found = true;
-                if Self::may_signal(p, other, sig) {
+                if Self::may_signal(p, &other, sig) {
                     groups.push(other.tgid);
                 }
             }
@@ -1767,8 +1658,8 @@ impl<C: Cpu> Kernel<C> {
             Ok(())
         };
         queue(p)?;
-        for other in self.processes.values_mut() {
-            queue(other)?;
+        for mut other in self.processes.values_mut() {
+            queue(&mut other)?;
         }
         Ok(0)
     }
@@ -1817,18 +1708,19 @@ impl<C: Cpu> Kernel<C> {
         // Caught signals wait for its accepted result/copyout, like ordinary
         // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
         if action.handler > 1
-            && (p.file_entry.is_some()
-                && !p
-                    .retained_file
-                    .as_ref()
-                    .map(trames_linux::FilePending::interruptible)
-                    .or_else(|| {
-                        p.byte_wait
-                            .as_ref()
-                            .and_then(trames_linux::PendingIo::file_pending)
-                            .map(|f| f.interruptible())
-                    })
-                    .unwrap_or(false)
+            && (p.exec_pending.is_some()
+                || p.file_entry.is_some()
+                    && !p
+                        .retained_file
+                        .as_ref()
+                        .map(trames_linux::FilePending::interruptible)
+                        .or_else(|| {
+                            p.byte_wait
+                                .as_ref()
+                                .and_then(trames_linux::PendingIo::file_pending)
+                                .map(|f| f.interruptible())
+                        })
+                        .unwrap_or(false)
                 || matches!(p.state, State::Blocked(2, _)))
             && matches!(p.state, State::Blocked(..))
         {
@@ -1994,57 +1886,11 @@ impl<C: Cpu> Kernel<C> {
         Ok(())
     }
     fn reap_waited(&mut self) {
+        self.families.prune();
         self.processes
             .retain(|id, p| *id != p.tgid || p.signals.presence.present());
     }
-    // Structural owner boundaries update the original relationships. Worker
-    // waits never scan Process, clone these records or ask the owner to retry.
-    fn publish_children(&self, current: Option<&Process<C>>) {
-        if !self.children_dirty.replace(false) {
-            return;
-        }
-        let tasks = || {
-            self.processes
-                .iter()
-                .map(|(&id, p)| (id, p.as_ref()))
-                .chain(current.map(|p| {
-                    (
-                        if self.processes.contains_key(&p.tgid) {
-                            u32::MAX
-                        } else {
-                            p.tgid
-                        },
-                        p,
-                    )
-                }))
-        };
-        self.families.prune();
-        let mut leaders: Vec<_> = tasks().filter(|(id, p)| *id == p.tgid).collect();
-        leaders.sort_by_key(|(id, _)| *id);
-        for (id, p) in leaders {
-            p.wait_event.bind_presence(&p.signals.presence);
-            self.families.publish(
-                &p.family,
-                trames_kernel::family::Binding {
-                    id,
-                    group: p.group,
-                    credentials: p.signals.io.credentials().clone(),
-                    namespace: p.linux.vfs.pid_namespace().clone(),
-                    child: p.wait_event.clone(),
-                    children: p.children.clone(),
-                    control: p.signals.io.lifecycle().clone(),
-                    presence: p.signals.presence.visibility(),
-                },
-            );
-            if matches!(p.state, State::Zombie(_)) {
-                if let Some(status) = p.signals.io.lifecycle().exit_status() {
-                    self.families.complete(&p.family, status);
-                }
-            }
-        }
-    }
     fn wait(&mut self, _pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        self.publish_children(Some(p));
         let request = trames_kernel::children::Wait::prepare(260, a)?;
         let result = p
             .children
@@ -2064,9 +1910,6 @@ impl<C: Cpu> Kernel<C> {
     ) -> Result<Option<u64>, Errno> {
         if trames_linux::credential_entry(number, a) {
             return self.credential_call(pid, p, number, a).map(Some);
-        }
-        if matches!(number, 93 | 94 | 142..=159 | 167 | 220 | 221 | 281) {
-            self.children_dirty.set(true);
         }
         match number {
             25 | 29
@@ -2248,196 +2091,21 @@ impl<C: Cpu> Kernel<C> {
             }
             220 => {
                 self.reap_waited();
-                self.publish_children(Some(p));
-                const ALLOWED: u64 = 0xff
-                    | 0xf00
-                    | 0x4000
-                    | 0x8000
-                    | 0x10000
-                    | 0xfc0000
-                    | 0x1000000
-                    | trames_vfs::CLONE_NEWUTS
-                    | trames_vfs::CLONE_NEWNS
-                    | trames_vfs::CLONE_NEWPID
-                    | trames_vfs::CLONE_NEWNET
-                    | trames_vfs::CLONE_NEWIPC
-                    | trames_vfs::CLONE_NEWCGROUP;
-                let threaded = a[0] & 0x10000 != 0;
-                let shared_vm = a[0] & 0x100 != 0;
-                if a[0] & !ALLOWED != 0
-                    || (a[0] & trames_vfs::CLONE_NEWPID != 0 && a[0] & (0x10000 | 0x8000) != 0)
-                    || (threaded
-                        && p.linux.vfs.pid_namespace().id()
-                            != p.linux.vfs.pid_children_namespace().id())
-                    || (a[0] & 0x8000 != 0 && p.linux.vfs.visible_pid(p.tgid) == 1)
-                    || (a[0] & trames_vfs::CLONE_NEWNS != 0 && a[0] & 0x200 != 0)
-                    || (a[0] & trames_vfs::CLONE_NEWIPC != 0 && a[0] & 0x40000 != 0)
-                    || (!threaded && a[0] & 255 != 17)
-                    || (threaded && (a[0] & 0x900 != 0x900 || a[0] & 255 != 0))
-                    || (a[0] & 0x800 != 0 && !shared_vm)
-                {
-                    return Err(Errno(22));
-                }
-                if self.processes.len() + 1 >= self.task_limit
-                    || (!shared_vm && !p.memory.can_fork())
-                {
-                    return Err(Errno(11));
-                }
-                let id = self.next_pid;
-                self.next_pid = self
-                    .next_pid
-                    .checked_add(1)
-                    .filter(|v| *v < i32::MAX as u32)
-                    .ok_or(Errno(11))?;
-                let live = self
-                    .processes
-                    .iter()
-                    .flat_map(|(&id, t)| {
-                        [id, t.tgid, t.group, t.session]
-                            .into_iter()
-                            .chain(t.signal_senders())
-                    })
-                    .chain([pid, p.tgid, p.group, p.session])
-                    .chain(p.signal_senders())
-                    .collect();
-                p.linux.vfs.pid_namespace().retain_ids(&live);
-                let memory = if shared_vm {
-                    p.memory.share()
-                } else {
-                    p.memory.clone()
-                };
-                let mut child = p.fork_state(
-                    memory,
-                    a[0] & 0x400 != 0,
-                    a[0] & 0x200 != 0,
-                    a[0] & 0x800 != 0,
-                );
-                if a[0] & trames_vfs::CLONE_NEWPID != 0 {
-                    child.linux.vfs.unshare_pid()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWUTS != 0 {
-                    child.linux.vfs.unshare_uts()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWNS != 0 {
-                    child.linux.vfs.unshare_mounts()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWNET != 0 {
-                    child.linux.vfs.unshare_net()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWIPC != 0 {
-                    child.linux.vfs.unshare_ipc()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWCGROUP != 0 {
-                    child.linux.vfs.unshare_cgroup()?;
-                }
-                // PID namespace init inherits its parent's PGID/SID/tty, as
-                // Linux copy_process does. Ancestor-only IDs appear as zero
-                // inside the new namespace; init can then establish setsid().
-                let resource = self.resource_id();
-                if shared_vm {
-                    child.membarrier_registered = p.membarrier_registered.clone();
-                    if a[0] & 0x4000 == 0 {
-                        child.signals.alt_stack = AltStack::default();
-                    }
-                } else {
-                    child.vm_id = resource;
-                    child.linux.vfs.unshare_dumpable();
-                }
-                child.tgid = if threaded { p.tgid } else { id };
-                if threaded {
-                    child.children = p.children.clone();
-                    child.wait_event = p.wait_event.clone();
-                    child.oom = Arc::new(p.oom.thread());
-                    child.signals.io.share_process(&p.signals.io);
-                    child.family = p.family.clone();
-                    child.limits = p.limits.clone();
-                    child.limits.bind(&mut child.linux.vfs);
-                }
-                child
-                    .linux
-                    .fork_tid(if a[0] & 0x200000 != 0 { a[4] } else { 0 });
-                if !threaded {
-                    child.family.set_parent(if a[0] & 0x8000 != 0 {
-                        p.family.parent()
-                    } else {
-                        p.tgid
-                    });
-                }
-                child
-                    .parentage
-                    .set_parent_thread(if threaded || a[0] & 0x8000 != 0 {
-                        p.parentage.parent_thread()
-                    } else {
-                        pid
-                    });
-                child.cpu.set_x(0, 0);
-                if a[1] != 0 {
-                    child.cpu.set_sp(a[1]);
-                }
-                if a[0] & 0x80000 != 0 {
-                    child.cpu.set_tls(a[3]);
-                }
-                child.wait_event.bind_presence(&child.signals.presence);
-                let families = self.families.clone();
-                let family = child.family.clone();
-                let mut cgroup_birth = None;
-                let result = families.birth(&family, || {
-                    if !p.signals.io.lifecycle().permits_birth() {
-                        return Err(Errno(4));
-                    }
-                    child.linux.vfs.activate_child_pid(id)?;
-                    child.bind_signals();
-                    child.linux.vfs.set_process_context(id);
-                    let birth = child.linux.vfs.cgroup_birth(pid, id, child.tgid);
-                    let admitted = birth.result();
-                    cgroup_birth = Some(birth);
-                    admitted?;
-                    self.publish_task_core(id, &child);
-                    let binding = (!threaded).then(|| trames_kernel::family::Binding {
-                        id,
-                        group: child.group,
-                        credentials: child.signals.io.credentials().clone(),
-                        namespace: child.linux.vfs.pid_namespace().clone(),
-                        child: child.wait_event.clone(),
-                        children: child.children.clone(),
-                        control: child.signals.io.lifecycle().clone(),
-                        presence: child.signals.presence.visibility(),
-                    });
-                    Ok((binding, ()))
-                });
-                if let Some(birth) = cgroup_birth {
-                    birth.notify();
-                }
-                result?;
-                self.bind_task_cgroup(id, &child);
-                // Linux stores these user TIDs after task birth and ignores
-                // copyout faults. CHILD_CLEARTID only records its address.
-                let parent_tid = p.linux.vfs.visible_pid(id);
-                let child_tid = child.linux.vfs.visible_pid(id);
-                if a[0] & 0x100000 != 0 {
-                    let _ = p.memory.write(a[2], &parent_tid.to_le_bytes());
-                }
-                if a[0] & 0x1000000 != 0 {
-                    let _ = child.memory.write(a[4], &child_tid.to_le_bytes());
-                }
-                self.processes.insert(id, child);
-                if a[0] & 0x4000 != 0 {
-                    let release = Arc::new(trames_kernel::vfork::Release::default());
-                    self.processes.get_mut(&id).unwrap().vfork = Some(release.clone());
-                    p.state = State::Completion(release);
-                    p.cpu.set_x(0, parent_tid as u64);
-                    return Ok(None);
-                }
-                Ok(Some(parent_tid as u64))
+                birth::Birth::capture(self).publish_family(pid, p);
+                let child = birth::Birth::capture(self).clone_task(pid, p, a)?;
+                Ok(child.publish(&self.processes.directory()))
             }
             221 | 281 => {
-                let image = Self::prepare_exec_request(
+                let Some(image) = Self::prepare_exec_request(
                     p,
                     number,
                     a,
                     self.memory_limits.per_process,
                     self.started,
-                )?;
+                )?
+                else {
+                    return Ok(None);
+                };
                 if let Err(error) = self.commit_exec_task(pid, p, image) {
                     // A post-commit backing failure is a host execution error,
                     // never a guest errno suggesting the old image survived.
@@ -2566,7 +2234,7 @@ impl<C: Cpu> Kernel<C> {
                 if target == p.tgid {
                     p.group = group;
                 }
-                for other in self.processes.values_mut().filter(|t| t.tgid == target) {
+                for mut other in self.processes.values_mut().filter(|t| t.tgid == target) {
                     other.group = group;
                 }
                 self.publish_io_tasks(Some((pid, p)));
@@ -2598,7 +2266,7 @@ impl<C: Cpu> Kernel<C> {
                 p.session = p.tgid;
                 p.group = p.tgid;
                 p.linux.vfs.set_controlling_terminal(None)?;
-                for t in self.processes.values_mut().filter(|t| t.tgid == p.tgid) {
+                for mut t in self.processes.values_mut().filter(|t| t.tgid == p.tgid) {
                     t.session = p.session;
                     t.group = p.group;
                     t.linux.vfs.set_controlling_terminal(None)?;
@@ -2688,8 +2356,7 @@ impl<C: Cpu> Kernel<C> {
                                 seen.push(id);
                                 holder = self.processes.values()
                                     .find(|other|other.tgid == id && matches!(other.state, State::Blocked(25,args) if args[1] == 7))
-                                    .and_then(|other|other.record_wait.as_ref())
-                                    .and_then(trames_vfs::RecordLockRequest::holder);
+                                    .and_then(|other|other.record_wait.as_ref().and_then(trames_vfs::RecordLockRequest::holder));
                             }
                         }
                         p.record_wait = Some(request);
@@ -2835,7 +2502,10 @@ impl<C: Cpu> Kernel<C> {
             return;
         }
         p.linux.vfs.set_process_context(pid);
-        p.linux.vfs.set_lock_owner(p.tgid);
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         let mut prepared_stat = (number == 79).then(|| p.linux.prepare_stat(a, &p.memory));
         // The installed provider resolves demand on the actual path walk. Only
         // legacy embeddings need this extra discovery walk and joined snapshot.
@@ -3270,8 +2940,8 @@ impl<C: Cpu> Kernel<C> {
         for target in p.linux.vfs.take_cgroup_kills() {
             if target == pid {
                 Self::queue_one(pid, p, 9, 0);
-            } else if let Some(task) = self.processes.get_mut(&target) {
-                Self::queue_one(target, task, 9, 0);
+            } else if let Some(mut task) = self.processes.get_mut(&target) {
+                Self::queue_one(target, &mut task, 9, 0);
             }
         }
         if p.linux.trace && !(raw.is_none() && matches!(p.state, State::Blocked(..)) && was_blocked)
@@ -3410,9 +3080,9 @@ impl<C: Cpu> Kernel<C> {
         if p.session == session && p.group == group {
             Self::queue_one(pid, p, signal, 0);
         }
-        for (&id, other) in self.processes.iter_mut() {
+        for (id, mut other) in self.processes.iter_mut() {
             if other.session == session && other.group == group {
-                Self::queue_one(id, other, signal, 0);
+                Self::queue_one(id, &mut other, signal, 0);
             }
         }
     }
@@ -3755,14 +3425,14 @@ impl<C: Cpu> Kernel<C> {
                 .swap(0, std::sync::atomic::Ordering::Relaxed);
             if signals != 0 {
                 let tty = pair.terminal.borrow();
-                for (&pid, process) in &mut self.processes {
+                for (pid, mut process) in self.processes.iter_mut() {
                     if tty.session != 0
                         && process.session == tty.session
                         && process.group == tty.foreground
                     {
                         for sig in 1..=64 {
                             if signals & (1 << (sig - 1)) != 0 {
-                                Self::queue_one(pid, process, sig, 0);
+                                Self::queue_one(pid, &mut process, sig, 0);
                             }
                         }
                     }
@@ -3782,7 +3452,7 @@ impl<C: Cpu> Kernel<C> {
             tty.session = 0;
             tty.foreground = 0;
             drop(tty);
-            for (&pid, process) in self.processes.iter_mut() {
+            for (pid, mut process) in self.processes.iter_mut() {
                 if process.linux.vfs.controlling_terminal == Some(pair.id) {
                     process
                         .linux
@@ -3794,8 +3464,8 @@ impl<C: Cpu> Kernel<C> {
                     && process.session == session
                     && (pid == session || process.group == group)
                 {
-                    Self::queue_one(pid, process, 1, 0);
-                    Self::queue_one(pid, process, 18, 0);
+                    Self::queue_one(pid, &mut process, 1, 0);
+                    Self::queue_one(pid, &mut process, 18, 0);
                 }
             }
         }
@@ -3869,9 +3539,9 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         for sig in signals {
-            for (&pid, p) in &mut self.processes {
+            for (pid, mut p) in self.processes.iter_mut() {
                 if p.group == group {
-                    Self::queue_one(pid, p, sig, 0);
+                    Self::queue_one(pid, &mut p, sig, 0);
                 }
             }
         }
@@ -3989,42 +3659,13 @@ impl<C: Cpu> Kernel<C> {
         chosen: &[(u32, usize)],
         reuse_retained: bool,
     ) -> Option<Vec<(u32, usize, Box<trames_memory::parallel::View>)>> {
-        let mut views: Vec<(u32, usize, Box<trames_memory::parallel::View>)> =
-            Vec::with_capacity(chosen.len());
-        let mut published = BTreeMap::<u64, usize>::new();
-        for &(id, slot) in chosen {
-            let p = self.processes.get_mut(&id).expect("selected process");
-            let (identity, _) = p.memory.coordinator_ownership();
-            let view = if let Some(&index) = published.get(&identity) {
-                // Freeze one VM once per epoch. Backing checks of another VM
-                // may advance a global epoch between selected CPU preparations;
-                // they must not give this VM's peers different snapshots.
-                self.parallel_memory.metrics.cache_hits += 1;
-                views[index].2.clone()
-            } else if reuse_retained && !p.memory.parallel_views_quiescent() {
-                // This is a task-lifecycle-only checkpoint. All private execution
-                // actors returned; retained guarded borrows still use exactly
-                // these parent bytes. Fork isolated its child, CLONE_VM introduced no parent mapping
-                // change, and exec installed a different mm without editing this one.
-                let mut view = Box::new(p.memory.current_parallel_view()?);
-                C::prepare_hardware_view(&mut view);
-                published.insert(identity, views.len());
-                view
-            } else {
-                if let Err(error) =
-                    C::prepare_hardware_memory(&mut p.memory, &mut self.parallel_memory)
-                {
-                    self.backend_error = Some(error.to_string());
-                    return None;
-                }
-                let mut view = Box::new(p.memory.parallel_view(&mut self.parallel_memory)?);
-                C::prepare_hardware_view(&mut view);
-                published.insert(identity, views.len());
-                view
-            };
-            views.push((id, slot, view));
-        }
-        Some(views)
+        dispatch::prepare_views(
+            &self.processes.directory(),
+            &mut self.parallel_memory,
+            chosen,
+            reuse_retained,
+            &mut self.backend_error,
+        )
     }
     fn admit_private_views(
         &mut self,
@@ -4041,7 +3682,7 @@ impl<C: Cpu> Kernel<C> {
         }
         let mut groups = BTreeMap::<u64, Vec<&mut trames_memory::parallel::View>>::new();
         for (id, _, view) in views {
-            let (identity, _) = self.processes[id].memory.coordinator_ownership();
+            let (identity, _) = self.processes.read(id).memory.coordinator_ownership();
             groups.entry(identity).or_default().push(view.as_mut());
         }
         for (identity, mut group) in groups {
@@ -4074,14 +3715,14 @@ impl<C: Cpu> Kernel<C> {
         if self
             .processes
             .iter()
-            .any(|(&id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
+            .any(|(id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
         {
             let runnable = self
                 .processes
                 .iter()
-                .any(|(&id, p)| !p.frozen(id) && (p.runnable() || p.worker_gpu_candidate()));
+                .any(|(id, p)| !p.frozen(id) && (p.runnable() || p.worker_gpu_candidate()));
             if runnable
-                || self.processes.iter().any(|(&id, p)| {
+                || self.processes.iter().any(|(id, p)| {
                     !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_event(&p.memory, id)
                 })
             {
@@ -4091,8 +3732,8 @@ impl<C: Cpu> Kernel<C> {
         let mut active = self
             .processes
             .iter()
-            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(**id));
-        let Some((&id, first)) = active.next() else {
+            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(*id));
+        let Some((id, first)) = active.next() else {
             // Interactive transports can wake retained I/O while every CPU is
             // parked. The solo-CPU admission branch below remains unchanged.
             if (self.terminal.is_some()
@@ -4104,7 +3745,7 @@ impl<C: Cpu> Kernel<C> {
                 && self
                     .processes
                     .iter()
-                    .filter(|(id, p)| !p.frozen(**id) && p.worker_io_candidate(**id))
+                    .filter(|(id, p)| !p.frozen(*id) && p.worker_io_candidate(*id))
                     .take(2)
                     .count()
                     == 2
@@ -4114,13 +3755,13 @@ impl<C: Cpu> Kernel<C> {
             // A retained socket/ring with an actual event source or deadline and a
             // related peer can retain event-driven execution with every CPU
             // asleep. Unrelated terminals/timers do not change the solo gate.
-            return self.processes.iter().any(|(&id, p)| {
+            return self.processes.iter().any(|(id, p)| {
                 if p.frozen(id) || !p.worker_io_candidate(id) || !p.worker_event_wait(id) {
                     return false;
                 }
                 let fds = p.linux.vfs.direct_descriptors();
                 let network = p.linux.vfs.direct_network();
-                self.processes.iter().any(|(&other, q)| {
+                self.processes.iter().any(|(other, q)| {
                     other != id
                         && !q.frozen(other)
                         && q.worker_io_candidate(other)
@@ -4139,7 +3780,7 @@ impl<C: Cpu> Kernel<C> {
         // execution strategy: unmatched waits still use the ordinary kernel.
         let fds = first.linux.vfs.direct_descriptors();
         let network = first.linux.vfs.direct_network();
-        self.processes.iter().any(|(&other, p)| {
+        self.processes.iter().any(|(other, p)| {
             other != id
                 && !p.frozen(other)
                 && (p.stopped()
@@ -4193,9 +3834,9 @@ impl<C: Cpu> Kernel<C> {
         }
         // Mapping/signal effects precede dispatch. Ready services may take a
         // parked CPU's own View; mapping mutation waits for every CPU to return.
-        let ids: Vec<_> = self.processes.keys().copied().collect();
+        let ids: Vec<_> = self.processes.keys().collect();
         for id in ids {
-            let Some(mut p) = self.processes.remove(&id) else {
+            let Some(mut p) = self.processes.checkout(&id) else {
                 continue;
             };
             p.linux.vfs.reap_local_rights();
@@ -4221,7 +3862,10 @@ impl<C: Cpu> Kernel<C> {
                 if p.linux.uring_requires_owner()
                     || !local_ring && (p.linux.trace || !p.linux.worker_uring_pending())
                 {
-                    p.linux.progress_uring(&mut p.memory, id);
+                    {
+                        let task = &mut *p;
+                        task.linux.progress_uring(&mut task.memory, id)
+                    };
                 }
                 self.resume_event(&mut p);
                 if self.deliver(id, &mut p).is_err() {
@@ -4254,17 +3898,19 @@ impl<C: Cpu> Kernel<C> {
         let mut ready: Vec<_> = self
             .processes
             .iter()
-            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(**id))
-            .map(|(&id, _)| id)
+            .filter(|(id, p)| (p.runnable() || p.worker_gpu_candidate()) && !p.frozen(*id))
+            .map(|(id, _)| id)
             .collect();
         let rotate = ready.partition_point(|id| *id <= self.next_parallel_pid);
         ready.rotate_left(rotate);
         // Freeze a complete execution cohort before launch. Retained blocked
         // Views may move to a worker on wake, but are never cloned mid-epoch.
-        let vms: std::collections::BTreeSet<_> =
-            ready.iter().map(|id| self.processes[id].vm_id).collect();
+        let vms: std::collections::BTreeSet<_> = ready
+            .iter()
+            .map(|id| self.processes.read(id).vm_id)
+            .collect();
         let mut members: Vec<_> = ready.iter().map(|&id| (id, 0)).collect();
-        members.extend(self.processes.iter().filter_map(|(&id, p)| {
+        members.extend(self.processes.iter().filter_map(|(id, p)| {
             if p.frozen(id) {
                 return None;
             }
@@ -4290,16 +3936,19 @@ impl<C: Cpu> Kernel<C> {
         }));
         if members.len() < 2
             && !members.iter().any(|(id, _)| {
-                self.processes[id].worker_gpu_candidate()
-                    || self.processes[id].linux.worker_uring_pending()
+                self.processes.read(id).worker_gpu_candidate()
+                    || self.processes.read(id).linux.worker_uring_pending()
             })
         {
             return Ok(false);
         }
         let chosen = assign_cpus(
-            members
-                .iter()
-                .map(|(id, _)| (*id, self.processes[id].signals.io.scheduling.affinity())),
+            members.iter().map(|(id, _)| {
+                (
+                    *id,
+                    self.processes.read(id).signals.io.scheduling.affinity(),
+                )
+            }),
             self.cpu_count,
         );
         if chosen.is_empty() {
@@ -4329,6 +3978,7 @@ impl<C: Cpu> Kernel<C> {
         );
         epoch.bind_timers(self.timers.clone());
         self.publish_io_tasks(None);
+        epoch.bind_lifecycle(lifecycle::Lifecycle::capture(self));
         let mut file_epoch = trames_vfs::FileEpoch::default();
         let mut uring_epoch = trames_linux::UringEpoch::default();
         let mut network_epoch = trames_vfs::NetworkEpoch::default();
@@ -4536,7 +4186,9 @@ impl<C: Cpu> Kernel<C> {
             if let Some(checkpoint) = wait.checkpoint {
                 for job in &checkpoint.jobs {
                     if let Some(source) = &self.proc_source {
-                        source.request_read(self.processes[&job.work.pid].memory.memory_report());
+                        source.request_read(
+                            self.processes.read(&job.work.pid).memory.memory_report(),
+                        );
                     }
                 }
                 epoch.restore_checkpoint(checkpoint, false);
@@ -4544,6 +4196,11 @@ impl<C: Cpu> Kernel<C> {
         }
         if epoch.activation_failed() {
             checkpoint_error = Some(RuntimeError::Arguments("cannot start CPU worker"));
+        }
+        // Source creation can extend membership without a VmReady round trip.
+        members = epoch.member_ids().into_iter().map(|id| (id, 0)).collect();
+        if let Some(error) = epoch.collect_lifecycle(self) {
+            checkpoint_error = Some(error);
         }
         let completed = epoch.drain();
         let _ = uring_epoch.finish();
@@ -4554,10 +4211,16 @@ impl<C: Cpu> Kernel<C> {
         }
         if completed.iter().any(|r| r.outcome.is_none()) {
             for done in completed {
-                self.processes
-                    .get_mut(&done.pid)
-                    .expect("dispatched process")
-                    .cpu = done.cpu;
+                let mut task = done
+                    .task
+                    .as_ref()
+                    .map(|task| task.write())
+                    .unwrap_or_else(|| {
+                        self.processes
+                            .get_mut(&done.pid)
+                            .expect("dispatched process")
+                    });
+                task.cpu = done.cpu;
             }
             return Err(RuntimeError::Arguments("CPU worker panicked"));
         }
@@ -4576,7 +4239,7 @@ impl<C: Cpu> Kernel<C> {
         // dependency. Live wrappers publish the remaining ordinary cohort work.
         let mut committed = std::collections::BTreeSet::new();
         for &(id, _) in &members {
-            let Some(p) = self.processes.get_mut(&id) else {
+            let Some(mut p) = self.processes.get_mut(&id) else {
                 continue;
             };
             if p.signals.io.live()
@@ -4587,7 +4250,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         self.parallel_memory_time += began.elapsed();
-        outcomes.retain(|(pid, _)| self.processes[pid].signals.io.live());
+        outcomes.retain(|(pid, _)| self.processes.read(pid).signals.io.live());
         self.parallel_rounds += 1;
         self.next_parallel_pid = chosen.last().expect("cohort task").0;
         // Successful worker wakes are already committed. Publish readiness
@@ -4608,7 +4271,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         for (id, outcome) in outcomes {
-            let Some(mut p) = self.processes.remove(&id) else {
+            let Some(mut p) = self.processes.checkout(&id) else {
                 continue;
             };
             // A preceding exit_group/exec may have killed this returned peer.
@@ -4638,11 +4301,20 @@ impl<C: Cpu> Kernel<C> {
     }
     fn adopt_worker_return(
         &mut self,
-        done: crate::workers::Done<C>,
+        mut done: crate::workers::Done<C>,
         joined: bool,
     ) -> (u32, Option<i32>, SliceOutcome) {
+        let mut custody = done
+            .task
+            .as_ref()
+            .map(|task| task.write())
+            .unwrap_or_else(|| {
+                self.processes
+                    .get_mut(&done.pid)
+                    .expect("dispatched process")
+            });
+        let p = &mut *custody;
         if let Some(fault) = &done.fatal_fault {
-            let p = &self.processes[&done.pid];
             p.linux.vfs.log(
                 4,
                 &format!(
@@ -4659,19 +4331,14 @@ impl<C: Cpu> Kernel<C> {
                 eprintln!("trames: {fault}");
             }
         }
-        let group = self.processes[&done.pid].signals.io.lifecycle().clone();
+        let group = p.signals.io.lifecycle().clone();
         if group.termination().is_some() {
             self.queue_exit_group(group);
         }
-        self.native.metrics.merge(done.native);
-        let p = self
-            .processes
-            .get_mut(&done.pid)
-            .expect("dispatched process");
         p.linux.vfs.sync_task_namespaces();
-        p.cpu = done.cpu;
+        p.cpu = std::mem::take(&mut done.cpu);
         p.signals.finish_io();
-        if let Some(entry) = done.seccomp_entry {
+        if let Some(entry) = done.seccomp_entry.take() {
             p.seccomp_entry = Some(entry);
         }
         p.retain_worker_flock(done.io.as_ref());
@@ -4694,7 +4361,7 @@ impl<C: Cpu> Kernel<C> {
             .as_ref()
             .filter(|call| call.file.is_some() || call.file_checkpoint.is_some())
             .map(|call| (p.cpu.pc(), call.number, call.args));
-        p.state = if let Some(compile) = done.gpu_pending {
+        p.state = if let Some(compile) = done.gpu_pending.take() {
             State::Gpu {
                 retired: true,
                 peer_instructions: compile.peer_instructions,
@@ -4704,7 +4371,7 @@ impl<C: Cpu> Kernel<C> {
                 began: compile.began,
                 instructions: self.instructions,
             }
-        } else if let Some(call) = done.io {
+        } else if let Some(call) = done.io.take() {
             if let Some(uring) = call.uring {
                 p.uring_wait = Some((uring.submitted, uring.ring, uring.deadline));
             }
@@ -4718,7 +4385,7 @@ impl<C: Cpu> Kernel<C> {
             if !matches!(done.waiting, Some(crate::run_queue::WaitState::OwnerEvent)) {
                 p.poll_deadline = None;
             }
-            done.waiting.map_or(State::Ready, |w| match w {
+            done.waiting.take().map_or(State::Ready, |w| match w {
                 crate::run_queue::WaitState::Futex { wait, deadline } => {
                     State::Futex { wait, deadline }
                 }
@@ -4744,6 +4411,7 @@ impl<C: Cpu> Kernel<C> {
                     State::Blocked(wait.request.number, wait.request.args)
                 }
                 crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
+                crate::run_queue::WaitState::Custody(_) => State::Ready,
                 crate::run_queue::WaitState::Completion(wait) => {
                     State::Completion(wait.release.clone())
                 }
@@ -4755,14 +4423,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.last_cpu = done.worker;
         p.cpu_time += done.elapsed;
-        self.cpu_total += done.elapsed;
-        for (slot, time) in done.cpu_times.iter().take(self.cpu_count).enumerate() {
-            self.per_cpu[slot] += *time;
-        }
-        self.decode_lookups += done.after.lookups - done.before.lookups;
-        self.decode_misses += done.after.misses - done.before.misses;
-        self.instructions_decoded += done.after.instructions - done.before.instructions;
-        let outcome = done.outcome.expect("checked worker completion");
+        let outcome = done.outcome.take().expect("checked worker completion");
         if joined && self.profile_syscalls && done.thread_exit.is_none() {
             match &outcome {
                 SliceOutcome::Syscall { .. } => {
@@ -4782,36 +4443,6 @@ impl<C: Cpu> Kernel<C> {
                 _ => {}
             }
         }
-        self.instructions += done.instructions;
-        self.worker_chunks += done.chunks;
-        self.worker_syscalls += done.syscalls;
-        self.worker_direct_syscalls += done.direct_syscalls;
-        self.worker_futex_wakes += done.futex_wakes;
-        self.worker_futex_woken += done.futex_woken;
-        self.worker_futex_requeues += done.futex_requeues;
-        self.serviced_syscalls += done.serviced_syscalls;
-        self.service_wait += done.service_wait;
-        self.syscalls += done.syscalls + done.serviced_syscalls;
-        self.syscall_total += done.syscall_time;
-        self.worker_slices += done.assignments;
-        self.context_switches += done.assignments;
-        self.worker_futex_waits += done.waits;
-        self.worker_task_resumes += done.resumes;
-        self.worker_task_yields += done.yields;
-        self.worker_io_waits += done.io_waits;
-        self.worker_service_waits += done.service_waits;
-        self.worker_file_syscalls += done.file_syscalls;
-        self.worker_socket_syscalls += done.socket_syscalls;
-        self.worker_timer_syscalls += done.timer_syscalls;
-        self.worker_poll_syscalls += done.poll_syscalls;
-        self.worker_uring_syscalls += done.uring_syscalls;
-        self.worker_fd_syscalls += done.fd_syscalls;
-        self.worker_gpu_calls += done.gpu.calls;
-        self.worker_gpu_waits += done.gpu.waits;
-        self.gpu_compiles += done.gpu.compiles;
-        self.gpu_wait_time += done.gpu.wait_time;
-        self.gpu_peer_instructions += done.gpu.peer_instructions;
-        self.gpu_transfers.merge(done.gpu.transfers);
         if let Some((pc, operation, value)) = done.gpu.last_error {
             p.linux.vfs.log(
                 4,
@@ -4827,7 +4458,50 @@ impl<C: Cpu> Kernel<C> {
         if let Some(status) = done.thread_exit {
             p.state = State::Zombie(status);
         }
+        self.account_worker_stats(done.take_stats());
         (done.pid, done.thread_exit, outcome)
+    }
+    fn account_worker_stats(&mut self, stats: crate::run_queue::Stats) {
+        self.native.metrics.merge(stats.native);
+        self.cpu_total += stats.elapsed;
+        for (slot, time) in stats.cpu_times.iter().take(self.cpu_count).enumerate() {
+            self.per_cpu[slot] += *time;
+        }
+        self.decode_lookups += stats.after.lookups - stats.before.lookups;
+        self.decode_misses += stats.after.misses - stats.before.misses;
+        self.instructions_decoded += stats.after.instructions - stats.before.instructions;
+        self.instructions += stats.instructions;
+        self.worker_chunks += stats.chunks;
+        self.worker_syscalls += stats.syscalls;
+        self.worker_direct_syscalls += stats.direct_syscalls;
+        self.worker_futex_wakes += stats.futex_wakes;
+        self.worker_futex_woken += stats.futex_woken;
+        self.worker_futex_requeues += stats.futex_requeues;
+        self.serviced_syscalls += stats.serviced_syscalls;
+        self.vm_local_syscalls += stats.additive_mmaps;
+        self.parallel_memory_time += stats.additive_time;
+        self.service_wait += stats.service_wait;
+        self.syscalls += stats.syscalls + stats.serviced_syscalls;
+        self.syscall_total += stats.syscall_time;
+        self.worker_slices += stats.assignments;
+        self.context_switches += stats.assignments;
+        self.worker_futex_waits += stats.waits;
+        self.worker_task_resumes += stats.resumes;
+        self.worker_task_yields += stats.yields;
+        self.worker_io_waits += stats.io_waits;
+        self.worker_service_waits += stats.service_waits;
+        self.worker_file_syscalls += stats.file_syscalls;
+        self.worker_socket_syscalls += stats.socket_syscalls;
+        self.worker_timer_syscalls += stats.timer_syscalls;
+        self.worker_poll_syscalls += stats.poll_syscalls;
+        self.worker_uring_syscalls += stats.uring_syscalls;
+        self.worker_fd_syscalls += stats.fd_syscalls;
+        self.worker_gpu_calls += stats.gpu.calls;
+        self.worker_gpu_waits += stats.gpu.waits;
+        self.gpu_compiles += stats.gpu.compiles;
+        self.gpu_wait_time += stats.gpu.wait_time;
+        self.gpu_peer_instructions += stats.gpu.peer_instructions;
+        self.gpu_transfers.merge(stats.gpu.transfers);
     }
     fn parallel_timeout(&self) -> Duration {
         let now = Instant::now();
@@ -4840,10 +4514,10 @@ impl<C: Cpu> Kernel<C> {
         let worker_vms: std::collections::BTreeSet<_> = self
             .processes
             .iter()
-            .filter(|(id, p)| !p.frozen(**id) && (p.runnable() || p.worker_gpu_candidate()))
+            .filter(|(id, p)| !p.frozen(*id) && (p.runnable() || p.worker_gpu_candidate()))
             .map(|(_, p)| p.vm_id)
             .collect();
-        for (&id, p) in &self.processes {
+        for (id, p) in self.processes.iter() {
             if p.frozen(id) {
                 continue;
             }
@@ -4919,7 +4593,7 @@ impl<C: Cpu> Kernel<C> {
         if self
             .processes
             .iter()
-            .any(|(&id, p)| p.runnable() && !p.frozen(id))
+            .any(|(id, p)| p.runnable() && !p.frozen(id))
         {
             4096
         } else {
@@ -4962,15 +4636,18 @@ impl<C: Cpu> Kernel<C> {
             if self.parallel_epoch(io, limit, true)? {
                 continue;
             }
-            let ids: Vec<u32> = self.processes.keys().copied().collect();
+            let ids: Vec<u32> = self.processes.keys().collect();
             for id in ids {
-                let Some(mut p) = self.processes.remove(&id) else {
+                let Some(mut p) = self.processes.checkout(&id) else {
                     continue;
                 };
                 if !matches!(p.state, State::Zombie(_)) && !p.frozen(id) {
                     let was_parked = matches!(p.state, State::Sleep(..) | State::Blocked(..));
                     progress |= self.resume_gpu(id, &mut p);
-                    progress |= p.linux.progress_uring(&mut p.memory, id);
+                    progress |= {
+                        let task = &mut *p;
+                        task.linux.progress_uring(&mut task.memory, id)
+                    };
                     progress |= self.resume_event(&mut p);
                     match self.deliver(id, &mut p) {
                         Ok(changed) => progress |= changed,
@@ -5009,7 +4686,7 @@ impl<C: Cpu> Kernel<C> {
                         if self.parallel_candidate() {
                             continue 'drive;
                         }
-                        p = self.processes.remove(&id).expect("same joined task");
+                        p = self.processes.checkout(&id).expect("same joined task");
                     }
                     // Immediate native returns and pure queries keep the quantum.
                     // No native borrow survives; blocking syscalls/faults still
@@ -5048,12 +4725,15 @@ impl<C: Cpu> Kernel<C> {
                         p.signals.io.proc_view.dispatched(
                             p.signals.io.scheduling.affinity().trailing_zeros() as usize,
                         );
-                        let outcome = p.cpu.run_coordinated(
-                            &mut self.engine,
-                            &mut p.memory,
-                            &mut self.parallel_memory,
-                            (limit - self.instructions).min(quantum),
-                        );
+                        let outcome = {
+                            let p = &mut *p;
+                            p.cpu.run_coordinated(
+                                &mut self.engine,
+                                &mut p.memory,
+                                &mut self.parallel_memory,
+                                (limit - self.instructions).min(quantum),
+                            )
+                        };
                         let elapsed = began.elapsed();
                         let decode_after = p.cpu.decode_stats();
                         self.decode_lookups += decode_after.lookups - decode_before.lookups;
@@ -5142,7 +4822,7 @@ impl<C: Cpu> Kernel<C> {
                         || p.uring_wait.as_ref().is_some_and(|(_, _, d)| d.is_some())
                         || matches!(p.state, State::Futex { deadline: Some(_), .. } | State::Sigwait { deadline: Some(_), .. })
                         || matches!(p.state, State::Sleep(..))
-                        || Self::waits_for_host_stdin(p)
+                        || Self::waits_for_host_stdin(&p)
                         || matches!(p.state, State::Blocked(number, a)
                         if matches!(number, 63 | 64 | 65 | 66 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269)
                         && p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Socket))
@@ -5179,7 +4859,7 @@ impl<C: Cpu> Kernel<C> {
         if let Some(d) = self.timers.next_deadline() {
             timeout = timeout.min(d.saturating_duration_since(now));
         }
-        for (&id, p) in &self.processes {
+        for (id, p) in self.processes.iter() {
             if p.frozen(id) {
                 continue;
             }
@@ -5372,6 +5052,13 @@ pub(super) fn run<C: Cpu>(
     super::clock::initialize::<C>(&mut runtime.memory, &runtime.linux.auxiliary, started)?;
     let linux = std::mem::replace(&mut runtime.linux, Linux::new(0));
     let limits = trames_kernel::limits::Limits::new(&linux.vfs);
+    let task_capacity = Arc::new(trames_kernel::task::Capacity::new(linux.task_limit.max(1)));
+    let root_presence = Arc::new(
+        task_capacity
+            .reserve()
+            .expect("initial task slot")
+            .into_presence(),
+    );
     let mut root = Process::<C> {
         cpu: std::mem::take(&mut runtime.cpu),
         last_cpu: 0,
@@ -5382,7 +5069,10 @@ pub(super) fn run<C: Cpu>(
         group: 1,
         session: 1,
         state: State::Ready,
-        signals: Signals::default(),
+        signals: Signals {
+            presence: root_presence,
+            ..Signals::default()
+        },
         wait_event: Default::default(),
         children: Default::default(),
         poll_deadline: None,
@@ -5402,6 +5092,7 @@ pub(super) fn run<C: Cpu>(
         tcp_liveness: None,
         retained_poll: None,
         pending_open: None,
+        exec_pending: None,
         auto_reap: false,
         vfork: None,
         tgid: 1,
@@ -5410,7 +5101,7 @@ pub(super) fn run<C: Cpu>(
         vm_id: 1,
         space: Default::default(),
         rekey: None,
-        membarrier_registered: Rc::new(Cell::new(false)),
+        membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         limits,
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: seccomp::Seccomp::default(),
@@ -5428,10 +5119,9 @@ pub(super) fn run<C: Cpu>(
         file_layouts: Vec::new(),
         families: Arc::default(),
         limit_directory: Default::default(),
-        children_dirty: Cell::new(true),
         memory_limits: runtime.memory_limits,
         cpu_count: count,
-        task_limit: root.linux.task_limit.max(1),
+        task_capacity,
         workers: crate::workers::Pool::<C>::with_profiling(count, runtime.profile_syscalls),
         engine: std::mem::take(&mut runtime.engine),
         backend_error: None,
@@ -5481,8 +5171,8 @@ pub(super) fn run<C: Cpu>(
         parallel_stop_time: Duration::ZERO,
         next_parallel_pid: 0,
         per_cpu: vec![Duration::ZERO; count],
-        processes: BTreeMap::new(),
-        next_pid: 2,
+        processes: tasks::Table::default(),
+        task_ids: Default::default(),
         terminal: runtime.terminal.take(),
         started,
         instructions: 0,
@@ -5505,7 +5195,7 @@ pub(super) fn run<C: Cpu>(
         idle: Duration::ZERO,
         load: [0.0; 3],
         load_sample: Instant::now(),
-        next_resource: 2,
+        next_resource: Arc::new(std::sync::atomic::AtomicU64::new(2)),
         timers: Default::default(),
         native: trames_accel::native::Registry::default(),
         gpu_budget: runtime.memory_limits.gpu_budget(),
@@ -5595,11 +5285,15 @@ pub(super) fn run<C: Cpu>(
     // Session teardown cancels forked children, including their process locks.
     // Root-thread locks are already released on normal group exit; preserve
     // the root's state when returning a resumable runtime error.
-    for p in kernel.processes.values_mut().filter(|p| p.tgid != 1) {
-        p.linux.vfs.set_lock_owner(p.tgid);
+    for mut p in kernel.processes.values_mut().filter(|p| p.tgid != 1) {
+        {
+            let task = &mut *p;
+            task.linux.vfs.set_lock_owner(task.tgid);
+        }
         p.linux.vfs.release_process_locks();
     }
     if let Some(p) = kernel.processes.remove(&1) {
+        let p = p.into_inner();
         runtime.cpu = p.cpu;
         runtime.memory = p.memory;
         runtime.linux = p.linux;
@@ -5673,7 +5367,8 @@ mod tests {
 
         k.call(1, &mut p, 25, [fd as u64, 2, 1, 0, 0, 0], &mut io);
         assert_eq!(
-            k.processes[&2]
+            k.processes
+                .read(&2)
                 .linux
                 .vfs
                 .fd_flags_snapshot()
@@ -5683,7 +5378,8 @@ mod tests {
             0x80000
         );
         assert_eq!(
-            k.processes[&3]
+            k.processes
+                .read(&3)
                 .linux
                 .vfs
                 .fd_flags_snapshot()
@@ -5694,35 +5390,43 @@ mod tests {
         );
         p.memory.write(0x1000, b"/dir\0").unwrap();
         k.call(1, &mut p, 49, [0x1000, 0, 0, 0, 0, 0], &mut io);
-        assert_eq!(k.processes[&2].linux.vfs.cwd().unwrap(), b"/dir");
-        assert_eq!(k.processes[&3].linux.vfs.cwd().unwrap(), b"/");
+        assert_eq!(k.processes.read(&2).linux.vfs.cwd().unwrap(), b"/dir");
+        assert_eq!(k.processes.read(&3).linux.vfs.cwd().unwrap(), b"/");
         k.call(1, &mut p, 166, [0o077, 0, 0, 0, 0, 0], &mut io);
-        assert_eq!(k.processes[&2].linux.vfs.umask(), 0o077);
-        assert_eq!(k.processes[&3].linux.vfs.umask(), 0o022);
+        assert_eq!(k.processes.read(&2).linux.vfs.umask(), 0o077);
+        assert_eq!(k.processes.read(&3).linux.vfs.umask(), 0o022);
         k.call(1, &mut p, 214, [0xb000, 0, 0, 0, 0, 0], &mut io);
-        assert_eq!(k.processes[&2].linux.heap_context(), p.linux.heap_context());
-        assert_ne!(k.processes[&3].linux.heap_context(), p.linux.heap_context());
+        assert_eq!(
+            k.processes.read(&2).linux.heap_context(),
+            p.linux.heap_context()
+        );
+        assert_ne!(
+            k.processes.read(&3).linux.heap_context(),
+            p.linux.heap_context()
+        );
         k.call(1, &mut p, 57, [fd as u64, 0, 0, 0, 0, 0], &mut io);
-        assert_eq!(k.processes[&2].linux.vfs.fd_kind(fd), Err(Errno(9)));
-        assert!(k.processes[&3].linux.vfs.fd_kind(fd).is_ok());
+        assert_eq!(k.processes.read(&2).linux.vfs.fd_kind(fd), Err(Errno(9)));
+        assert!(k.processes.read(&3).linux.vfs.fd_kind(fd).is_ok());
     }
 
     #[test]
     fn reset_hand_is_published_before_another_shared_thread_can_deliver_it() {
         let mut k = kernel();
         let mut p = process();
-        k.processes
-            .insert(2, p.fork_state(p.memory.clone(), false, false, true));
+        k.processes.insert(
+            2,
+            p.fork_state(p.memory.clone(), false, false, true, Default::default()),
+        );
         let mut io = trames_linux::CapturedOutput::default();
         for (offset, value) in [(0, 0x4000u64), (8, 0x80000000), (16, 0), (24, 0)] {
             write_u64(&mut p.memory, 0x2000 + offset, value).unwrap();
         }
         k.call(1, &mut p, 134, [10, 0x2000, 0, 8, 0, 0], &mut io);
-        assert_eq!(k.processes[&2].signals.actions.get(10).handler, 0x4000);
+        assert_eq!(k.processes.read(&2).signals.actions.get(10).handler, 0x4000);
         Kernel::queue_one(1, &mut p, 10, 0);
         assert_eq!(k.deliver(1, &mut p), Ok(true));
         assert_eq!(p.cpu.pc, 0x4000);
-        assert_eq!(k.processes[&2].signals.actions.get(10).handler, 0);
+        assert_eq!(k.processes.read(&2).signals.actions.get(10).handler, 0);
     }
 
     #[test]
@@ -5743,8 +5447,11 @@ mod tests {
             .insert(2, root.fork_with_memory(root.memory.clone()));
         k.processes.insert(1, root);
         k.control(&mut Control(Some(37))).unwrap();
-        assert_eq!(k.processes[&1].next_signal(u64::MAX).map(|s| s.0), Some(37));
-        assert!(k.processes[&2].next_signal(u64::MAX).is_none());
+        assert_eq!(
+            k.processes.read(&1).next_signal(u64::MAX).map(|s| s.0),
+            Some(37)
+        );
+        assert!(k.processes.read(&2).next_signal(u64::MAX).is_none());
         k.control(&mut Control(Some(65))).unwrap();
     }
 
@@ -5853,8 +5560,11 @@ mod tests {
         k.processes.insert(1, root);
         k.processes.insert(2, child);
         k.control(&mut Signal(true)).unwrap();
-        assert_eq!(k.processes[&2].next_signal(u64::MAX).map(|s| s.0), Some(2));
-        assert!(k.processes[&1].next_signal(u64::MAX).is_none());
+        assert_eq!(
+            k.processes.read(&2).next_signal(u64::MAX).map(|s| s.0),
+            Some(2)
+        );
+        assert!(k.processes.read(&1).next_signal(u64::MAX).is_none());
         k.control(&mut Control).unwrap();
     }
     #[test]
@@ -5877,12 +5587,14 @@ mod tests {
             .vfs
             .open_at(AT_FDCWD, b"/file", 0x42, 0o600)
             .unwrap();
-        k.processes
-            .insert(2, p.fork_state(p.memory.clone(), true, true, true));
+        k.processes.insert(
+            2,
+            p.fork_state(p.memory.clone(), true, true, true, Default::default()),
+        );
         k.processes.insert(1, p);
         assert!(k.control(&mut Control(fd)).is_err());
-        assert_eq!(k.processes[&2].linux.vfs.fd_kind(fd), Err(Errno(9)));
-        assert_eq!(k.processes[&2].linux.vfs.umask(), 0o077);
+        assert_eq!(k.processes.read(&2).linux.vfs.fd_kind(fd), Err(Errno(9)));
+        assert_eq!(k.processes.read(&2).linux.vfs.umask(), 0o077);
     }
 
     #[test]
@@ -6313,13 +6025,13 @@ mod tests {
         for _ in 0..4 {
             let limit = k.instructions + 1_000_000;
             assert!(k.parallel_round(&mut io, limit).unwrap());
-            if k.processes[&2].cpu.x(0) == error(Errno(32)) {
+            if k.processes.read(&2).cpu.x(0) == error(Errno(32)) {
                 break;
             }
         }
-        assert_eq!(k.processes[&2].cpu.x(0), error(Errno(32)));
+        assert_eq!(k.processes.read(&2).cpu.x(0), error(Errno(32)));
         assert!(k.worker_poll_syscalls > 0);
-        let p = k.processes.get_mut(&1).unwrap();
+        let p = &mut *k.processes.get_mut(&1).unwrap();
         assert!(p.retained_poll.is_none());
         assert_eq!(p.cpu.x(0), 1);
         assert_eq!(
@@ -6516,7 +6228,7 @@ mod tests {
         let result = k.drive(&mut io, 1000);
         producer.join().unwrap();
         assert_eq!(result.unwrap().code, 0);
-        assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 1);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x1000).unwrap(), 1);
         drop(event); // The native surface retains its producer through the wait.
     }
 
@@ -6563,9 +6275,9 @@ mod tests {
             .unwrap();
         k.processes.insert(1, p);
         assert_eq!(k.drive(&mut io, 1000).unwrap().code, 0);
-        assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 1);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x1000).unwrap(), 1);
         assert_eq!(replacement.read(8).unwrap(), 9u64.to_le_bytes());
-        assert!(k.processes[&1].byte_wait.is_none());
+        assert!(k.processes.read(&1).byte_wait.is_none());
     }
 
     #[test]
@@ -6689,13 +6401,13 @@ mod tests {
             assert!(
                 k.parallel_round(&mut io, limit).unwrap(),
                 "parent pc={:#x}/ready={}, producer pc={:#x}/ready={}, candidate={}",
-                k.processes[&1].cpu.pc,
-                matches!(k.processes[&1].state, State::Ready),
-                k.processes[&2].cpu.pc,
-                matches!(k.processes[&2].state, State::Ready),
+                k.processes.read(&1).cpu.pc,
+                matches!(k.processes.read(&1).state, State::Ready),
+                k.processes.read(&2).cpu.pc,
+                matches!(k.processes.read(&2).state, State::Ready),
                 k.parallel_candidate()
             );
-            if k.processes[&2].cpu.pc == 0x4030 {
+            if k.processes.read(&2).cpu.pc == 0x4030 {
                 break;
             }
             assert!(
@@ -6703,10 +6415,10 @@ mod tests {
                 "worker ACK/lock handshake timed out"
             );
         }
-        assert_eq!(k.processes[&2].cpu.pc, 0x4030);
-        assert_eq!(k.processes[&2].cpu.x(0), 0);
-        assert!(k.processes[&1].flock_wait.is_none());
-        assert_eq!(k.processes[&1].cpu.x(0), 1);
+        assert_eq!(k.processes.read(&2).cpu.pc, 0x4030);
+        assert_eq!(k.processes.read(&2).cpu.x(0), 0);
+        assert!(k.processes.read(&1).flock_wait.is_none());
+        assert_eq!(k.processes.read(&1).cpu.x(0), 1);
         assert_eq!(
             k.processes.get_mut(&1).unwrap().linux.vfs.flock(a, 6),
             Ok(())
@@ -6872,15 +6584,15 @@ mod tests {
                 assert!(kernel
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
                     .unwrap());
-                if kernel.processes[&1].cpu.x(19) == expected
-                    && kernel.processes[&1].cpu.x(0) == 0u64.wrapping_sub(3)
+                if kernel.processes.read(&1).cpu.x(19) == expected
+                    && kernel.processes.read(&1).cpu.x(0) == 0u64.wrapping_sub(3)
                 {
                     break;
                 }
             }
-            assert_eq!(kernel.processes[&1].cpu.x(19), expected);
+            assert_eq!(kernel.processes.read(&1).cpu.x(19), expected);
             assert_eq!(
-                kernel.processes[&1].cpu.x(0),
+                kernel.processes.read(&1).cpu.x(0),
                 0u64.wrapping_sub(3),
                 "owner getpgid must see reaping immediately"
             );
@@ -6889,7 +6601,56 @@ mod tests {
             assert!(!kernel.cohort_return_syscalls.contains_key(&number));
         }
     }
+    #[test]
+    fn complete_process_handoff_forks_original_memory_and_linux_resources() {
+        let mut parent = process();
+        parent
+            .memory
+            .write_array(0x1000, 17u64.to_le_bytes())
+            .unwrap();
+        let [reader, writer] = parent.linux.vfs.pipe(0).unwrap();
+        let original = parent
+            .linux
+            .vfs
+            .retain_uring_fd(writer)
+            .unwrap()
+            .ofd_identity();
+        let presence = parent.signals.presence.clone();
+        let mut parent = std::thread::spawn(move || {
+            assert_eq!(parent.cpu.pc, 0x4000);
+            let mut child = parent.fork();
+            child
+                .memory
+                .write_array(0x1000, 23u64.to_le_bytes())
+                .unwrap();
+            assert_eq!(parent.memory.read_u64(0x1000).unwrap(), 17);
+            assert!(
+                child
+                    .linux
+                    .vfs
+                    .retain_uring_fd(writer)
+                    .unwrap()
+                    .ofd_identity()
+                    == original
+            );
+            child.linux.vfs.write(writer, b"child").unwrap();
+            child.linux.vfs.close(writer).unwrap();
+            parent.linux.vfs.write(writer, b"parent").unwrap();
+            parent
+        })
+        .join()
+        .unwrap();
+        assert!(Arc::ptr_eq(&presence, &parent.signals.presence));
+        assert_eq!(parent.linux.vfs.read(reader, 32).unwrap(), b"childparent");
+        assert_eq!(parent.memory.read_u64(0x1000).unwrap(), 17);
+    }
     pub(super) fn process() -> Box<Process> {
+        process_with_presence(Default::default())
+    }
+    pub(super) fn admitted_process(k: &Kernel) -> Box<Process> {
+        process_with_presence(Arc::new(k.task_capacity.reserve().unwrap().into_presence()))
+    }
+    fn process_with_presence(presence: Arc<trames_kernel::task::Presence>) -> Box<Process> {
         let mut memory = Memory::default();
         memory.map(0x1000, 8 * PAGE_SIZE, Permissions::RW).unwrap();
         let linux = Linux::new(0xa000);
@@ -6904,7 +6665,10 @@ mod tests {
             group: 1,
             session: 1,
             state: State::Ready,
-            signals: Signals::default(),
+            signals: Signals {
+                presence,
+                ..Signals::default()
+            },
             wait_event: Default::default(),
             children: Default::default(),
             poll_deadline: None,
@@ -6924,6 +6688,7 @@ mod tests {
             tcp_liveness: None,
             retained_poll: None,
             pending_open: None,
+            exec_pending: None,
             auto_reap: false,
             vfork: None,
             tgid: 1,
@@ -6932,7 +6697,7 @@ mod tests {
             vm_id: 1,
             space: Default::default(),
             rekey: None,
-            membarrier_registered: Rc::new(Cell::new(false)),
+            membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             limits,
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),
@@ -7001,9 +6766,9 @@ mod tests {
         assert!(k
             .processes
             .iter()
-            .filter(|(id, _)| **id != 1)
+            .filter(|(id, _)| *id != 1)
             .all(|(_, p)| matches!(p.state, State::Futex { ref wait, .. } if !wait.woken())));
-        assert_eq!(k.processes[&1].memory.read_u64(0x1000).unwrap(), 0);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x1000).unwrap(), 0);
         println!(
             "cohort_preparation tasks={TASKS} rounds={ROUNDS} instructions={} seconds={seconds:.6}",
             k.instructions - before.0
@@ -7056,8 +6821,8 @@ mod tests {
         k.processes.insert(3, root_command);
         k.processes.insert(4, another_session);
         k.terminal_signal(1, &mut sender, 9, 3, 2);
-        assert!(k.processes[&3].signals.io.inbox.contains_key(&2));
-        assert!(!k.processes[&4].signals.io.inbox.contains_key(&2));
+        assert!(k.processes.read(&3).signals.io.inbox.contains_key(&2));
+        assert!(!k.processes.read(&4).signals.io.inbox.contains_key(&2));
         assert!(!sender.signals.io.inbox.contains_key(&2));
     }
     #[test]
@@ -7087,11 +6852,11 @@ mod tests {
         k.processes.insert(4, other);
         k.processes.insert(5, background);
         k.pump_guest_ptys();
-        assert!(k.processes[&3].signals.io.inbox.contains_key(&2));
-        assert!(k.processes[&3].signals.io.inbox.contains_key(&28));
+        assert!(k.processes.read(&3).signals.io.inbox.contains_key(&2));
+        assert!(k.processes.read(&3).signals.io.inbox.contains_key(&28));
         for id in [1, 4, 5] {
-            assert!(!k.processes[&id].signals.io.inbox.contains_key(&2));
-            assert!(!k.processes[&id].signals.io.inbox.contains_key(&28));
+            assert!(!k.processes.read(&id).signals.io.inbox.contains_key(&2));
+            assert!(!k.processes.read(&id).signals.io.inbox.contains_key(&28));
         }
         assert_eq!(
             pair.host_signals.load(std::sync::atomic::Ordering::Relaxed),
@@ -7108,10 +6873,9 @@ mod tests {
             file_layouts: Vec::new(),
             families: Arc::default(),
             limit_directory: Default::default(),
-            children_dirty: Cell::new(true),
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
-            task_limit: trames_vfs::MAX_TASKS,
+            task_capacity: Arc::new(trames_kernel::task::Capacity::new(trames_vfs::MAX_TASKS)),
             engine: Default::default(),
             backend_error: None,
             workers: crate::workers::Pool::new(1),
@@ -7161,8 +6925,8 @@ mod tests {
             parallel_stop_time: Duration::ZERO,
             next_parallel_pid: 0,
             per_cpu: vec![Duration::ZERO; 1],
-            processes: BTreeMap::new(),
-            next_pid: 2,
+            processes: tasks::Table::default(),
+            task_ids: Default::default(),
             terminal: None,
             started: Instant::now(),
             instructions: 0,
@@ -7185,7 +6949,7 @@ mod tests {
             idle: Duration::ZERO,
             load: [0.0; 3],
             load_sample: Instant::now(),
-            next_resource: 2,
+            next_resource: Arc::new(std::sync::atomic::AtomicU64::new(2)),
             timers: Default::default(),
             native: trames_accel::native::Registry::default(),
             gpu_budget: trames_vulkan::Budget::default(),
@@ -7816,7 +7580,7 @@ mod tests {
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
-        k.next_pid = 3;
+        k.task_ids = Arc::new(trames_kernel::task::Ids::from_next(3));
         k.processes.insert(1, p);
         k.processes.insert(2, peer);
         let mut output = trames_linux::CapturedOutput::default();
@@ -7827,7 +7591,7 @@ mod tests {
         for bytes in output.stdout.chunks_exact(8) {
             assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 50000);
         }
-        assert_eq!(k.processes[&1].memory.read_u64(0x8000).unwrap(), 50000);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x8000).unwrap(), 50000);
         assert!(k.parallel_memory.metrics.exclusive_private_views >= 2);
     }
     #[test]
@@ -7887,7 +7651,10 @@ mod tests {
             .drive(&mut trames_linux::CapturedOutput::default(), 400000)
             .unwrap();
         assert_eq!(exit.code, 0);
-        assert_eq!(k.processes[&1].memory.read_u64(0x8000).unwrap(), 100000);
+        assert_eq!(
+            k.processes.read(&1).memory.read_u64(0x8000).unwrap(),
+            100000
+        );
         assert_eq!(exit.instructions, 300006);
         assert!(k.parallel_rounds > 0);
         assert!(k.parallel_memory.metrics.readonly_private_views > 0);
@@ -7921,6 +7688,301 @@ mod tests {
         k.processes.insert(1, p);
         k.processes.insert(2, peer);
         k
+    }
+    fn captured_task(
+        k: &mut Kernel,
+        control: &Arc<crate::workers::Control>,
+    ) -> Box<crate::run_queue::Job<Cpu>> {
+        k.publish_io_tasks(None);
+        let (_, _, view) = k.prepare_parallel_views(&[(1, 0)]).unwrap().pop().unwrap();
+        k.capture_worker(
+            1,
+            view,
+            control,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+    }
+    #[test]
+    fn original_task_survives_projection_removal_without_locking_cpu_execution() {
+        let mut k = spinning_peers();
+        let original = k.processes.handle(&1).unwrap();
+        let memory = original.read().memory.coordinator_ownership();
+        let pointer = {
+            let task = original.read();
+            (&*task) as *const Process as usize
+        };
+        let control = Arc::new(crate::workers::Control::new(20_000));
+        let job = captured_task(&mut k, &control);
+        drop(k.processes.remove(&1));
+        assert_eq!(original.read().memory.coordinator_ownership(), memory);
+        // A real worker must finish its CPU/View budget while the original
+        // body is locked elsewhere. No scheduler wait or timing guess is used.
+        let custody = original.write();
+        k.workers.ensure(0).unwrap();
+        k.workers.dispatch(0, job.work).unwrap();
+        let done = k
+            .workers
+            .complete_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("CPU cannot wait for task-body custody");
+        assert_eq!(done.instructions, 20_000);
+        assert_eq!(done.cpu.x(0), 10_000);
+        drop(custody);
+        assert_eq!(
+            (&*done.task.as_ref().unwrap().read()) as *const Process as usize,
+            pointer
+        );
+        k.adopt_worker_return(done, true);
+        assert_eq!(original.read().cpu.x(0), 10_000);
+        assert_eq!(original.read().memory.coordinator_ownership(), memory);
+        // Reinsertion retains the same task, not an extracted/reboxed copy.
+        k.processes.insert(1, original.write());
+        assert_eq!((&*k.processes.read(&1)) as *const Process as usize, pointer);
+    }
+    #[test]
+    fn queued_task_retains_original_resources_through_checkpoint_and_cancellation() {
+        for parked in [false, true] {
+            let mut k = spinning_peers();
+            let original = k.processes.handle(&1).unwrap();
+            let memory = original.read().memory.coordinator_ownership();
+            let [reader, writer] = original.write().linux.vfs.pipe(0).unwrap();
+            let ofd = original
+                .read()
+                .linux
+                .vfs
+                .retain_uring_fd(writer)
+                .unwrap()
+                .ofd_identity();
+            let control = Arc::new(crate::workers::Control::new(100));
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            let mut job = captured_task(&mut k, &control);
+            if parked {
+                job.waiting = Some(crate::run_queue::WaitState::Sleep {
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    remaining: 0,
+                });
+            }
+            epoch.add(job);
+            drop(k.processes.remove(&1));
+            if !parked {
+                let mut job = epoch.take(0).unwrap();
+                job.work.cpu.set_x(8, 220);
+                epoch.checkpoint(job, SliceOutcome::Syscall { instructions: 1 });
+                let checkpoint = epoch.take_checkpoint().unwrap();
+                assert_eq!(checkpoint.jobs.len(), 1);
+                epoch.restore_checkpoint(checkpoint, false);
+            }
+            epoch.stop();
+            let mut done = epoch.drain();
+            assert_eq!(done.len(), 1);
+            let retained = done[0].task.as_ref().unwrap().clone();
+            drop(original);
+            // The queue owns the original body through both a parked wait and
+            // a VM checkpoint. Cancellation returns it after dropping the View.
+            assert!(retained.read().memory.parallel_views_quiescent());
+            assert_eq!(retained.read().memory.coordinator_ownership(), memory);
+            assert!(
+                retained
+                    .read()
+                    .linux
+                    .vfs
+                    .retain_uring_fd(writer)
+                    .unwrap()
+                    .ofd_identity()
+                    == ofd
+            );
+            retained
+                .write()
+                .linux
+                .vfs
+                .write(writer, b"retained")
+                .unwrap();
+            assert_eq!(
+                retained.write().linux.vfs.read(reader, 8).unwrap(),
+                b"retained"
+            );
+            k.adopt_worker_return(done.pop().unwrap(), true);
+        }
+    }
+    #[test]
+    fn original_birth_and_dispatch_feed_the_existing_queue_without_a_kernel() {
+        let mut k = spinning_peers();
+        k.publish_io_tasks(None);
+        let birth = birth::Birth::capture(&k);
+        let dispatch = dispatch::Dispatch::capture(&k);
+        let directory = k.processes.directory();
+        let parent = k.processes.handle(&1).unwrap();
+        let mut registry = k.parallel_memory.share();
+        // Keep the actual session executors alive while removing the Kernel
+        // and its entire task table. No replacement resource service is made.
+        let mut workers = std::mem::replace(&mut k.workers, crate::workers::Pool::new(0));
+        let control = Arc::new(crate::workers::Control::new(20_000));
+        let epoch = crate::run_queue::Epoch::with_events(control.clone(), workers.events(), true);
+        drop(k);
+        let (epoch, child_id, child) = std::thread::spawn(move || {
+            let child = birth
+                .clone_task(1, &mut parent.write(), [17, 0, 0, 0, 0, 0])
+                .unwrap();
+            let child_id = child.id;
+            assert_eq!(child.publish(&directory), Some(child_id as u64));
+            let child = directory.handle(&child_id).expect("source-published task");
+            let (_, _, view) = dispatch::prepare_views(
+                &directory,
+                &mut registry,
+                &[(child_id, 0)],
+                true,
+                &mut None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            let job = dispatch.job(
+                (child_id, child.clone()),
+                view,
+                &control,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+            );
+            epoch.add(job);
+            (epoch, child_id, child)
+        })
+        .join()
+        .unwrap();
+        workers.ensure(0).unwrap();
+        workers.launch(0, epoch.clone()).unwrap();
+        assert!(matches!(
+            workers.event_timeout(Duration::from_secs(2)).unwrap(),
+            Some(crate::workers::Event::EpochStopped(0))
+        ));
+        let mut results = epoch.drain();
+        assert_eq!(results.len(), 1);
+        let done = results.pop().unwrap();
+        assert_eq!(done.pid, child_id);
+        assert_eq!(done.instructions, 20_000);
+        assert_eq!(done.cpu.x(0), 10_000);
+        assert!(child.read().memory.parallel_views_quiescent());
+        assert_eq!(child.read().memory.coordinator_ownership().1, 1);
+        assert!(Arc::ptr_eq(
+            &child.read().signals.presence,
+            &done.task.as_ref().unwrap().read().signals.presence
+        ));
+    }
+    #[test]
+    fn lifecycle_custody_parks_original_checkpoint_and_leaves_other_jobs_dispatchable() {
+        for memory in [false, true] {
+            for cancel in [false, true] {
+                let mut k = spinning_peers();
+                let foreign = k.processes.read(&1).fork();
+                k.processes.insert(4, foreign);
+                k.task_ids = Arc::new(trames_kernel::task::Ids::from_next(5));
+                k.publish_io_tasks(None);
+                let control = Arc::new(crate::workers::Control::new(100_000));
+                let epoch =
+                    crate::run_queue::Epoch::with_events(control.clone(), k.workers.events(), true);
+                let views = k.prepare_parallel_views(&[(1, 0), (4, 0)]).unwrap();
+                for (id, _, view) in views {
+                    epoch.add(k.capture_worker(
+                        id,
+                        view,
+                        &control,
+                        &mut Default::default(),
+                        &mut Default::default(),
+                        &mut Default::default(),
+                    ));
+                }
+                let mut caller = epoch.take(0).unwrap();
+                assert_eq!(caller.work.pid, 1);
+                caller.work.cpu.set_x(8, 220);
+                for (index, value) in [17, 0, 0, 0, 0, 0].into_iter().enumerate() {
+                    caller.work.cpu.set_x(index, value);
+                }
+                let original = caller.work.task.as_ref().unwrap().clone();
+                let pointer = {
+                    let task = original.read();
+                    (&*task) as *const Process as usize
+                };
+                epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 0 });
+                let checkpoint = epoch.take_checkpoint().unwrap();
+                let blocker = k.processes.handle(&if memory { 2 } else { 1 }).unwrap();
+                let (started, held) = std::sync::mpsc::channel();
+                let (release, released) = std::sync::mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    if memory {
+                        let permit = blocker.read().memory.try_admit().unwrap();
+                        started.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        drop(permit);
+                    } else {
+                        let permit = blocker.write();
+                        started.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        drop(permit);
+                    }
+                });
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(k
+                    .vm_checkpoint(
+                        &epoch,
+                        checkpoint,
+                        &mut trames_linux::CapturedOutput::default(),
+                        &mut Vec::new()
+                    )
+                    .unwrap());
+                assert_eq!(
+                    k.vm_checkpoint_groups, 0,
+                    "busy custody performs no syscall effects"
+                );
+                assert!(
+                    epoch.take_checkpoint().is_none(),
+                    "no polling retry without a resource wake"
+                );
+                let foreign = epoch.take(0).unwrap();
+                assert_eq!(
+                    foreign.work.pid, 4,
+                    "the same executor slot can dispatch unrelated work"
+                );
+                epoch.park(foreign, Some(crate::run_queue::WaitState::OwnerEvent));
+                if cancel {
+                    epoch.stop();
+                    let done = epoch.drain();
+                    assert_eq!(done.len(), 2);
+                    assert!(done.iter().any(|done| done.pid == 1
+                        && matches!(done.outcome, Some(SliceOutcome::Syscall { .. }))));
+                }
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                if !cancel {
+                    let checkpoint = epoch
+                        .take_checkpoint()
+                        .expect("original resource release wakes checkpoint");
+                    assert_eq!(
+                        (&*checkpoint.jobs[0].work.task.as_ref().unwrap().read()) as *const Process
+                            as usize,
+                        pointer
+                    );
+                    assert!(k
+                        .vm_checkpoint(
+                            &epoch,
+                            checkpoint,
+                            &mut trames_linux::CapturedOutput::default(),
+                            &mut Vec::new()
+                        )
+                        .unwrap());
+                    assert_eq!(k.vm_checkpoint_groups, 1);
+                    assert_eq!(
+                        epoch.member_ids().len(),
+                        3,
+                        "one child, never a replayed clone"
+                    );
+                    epoch.stop();
+                    assert_eq!(epoch.drain().len(), 3);
+                }
+                assert!(original.read().memory.parallel_views_quiescent());
+            }
+        }
     }
     #[test]
     fn pure_queries_keep_a_bounded_serial_quantum_with_blocked_peers() {
@@ -7960,7 +8022,7 @@ mod tests {
             Err(RuntimeError::BudgetExceeded(1000))
         ));
         assert_eq!(k.instructions, 1000);
-        assert_eq!(k.processes[&1].cpu.x(0), 1);
+        assert_eq!(k.processes.read(&1).cpu.x(0), 1);
         assert_eq!(k.syscalls, 500);
         assert!(
             io.0 < 64,
@@ -7991,7 +8053,7 @@ mod tests {
             deadline: None,
         };
         assert!(!k.resume_futex_ready());
-        assert!(matches!(k.processes[&1].state, State::Futex { .. }));
+        assert!(matches!(k.processes.read(&1).state, State::Futex { .. }));
         assert!(!new.woken());
         assert_eq!(k.futexes.wake((0, 7, 0x1000), 1, 1), 1);
         let mut p = k.processes.remove(&1).unwrap();
@@ -8098,14 +8160,16 @@ mod tests {
     }
     #[test]
     fn continuous_deadlines_include_sleep_and_do_not_spin_on_unread_expired_timerfd() {
-        let mut k = spinning_peers();
-        let p = k.processes.get_mut(&1).unwrap();
+        let k = spinning_peers();
+        let mut custody = k.processes.get_mut(&1).unwrap();
+        let p = &mut *custody;
         let fd = p.linux.vfs.timerfd(1, 0).unwrap();
         p.linux
             .vfs
             .timerfd_set(fd, Duration::ZERO, Some(Instant::now()))
             .unwrap();
         p.poll_deadline = Some(Instant::now());
+        drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().state = State::Blocked(63, [0; 6]);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
@@ -8119,7 +8183,7 @@ mod tests {
     }
     #[test]
     fn retained_futex_deadline_does_not_spin_the_live_cohort_owner() {
-        let mut k = spinning_peers();
+        let k = spinning_peers();
         let wait = k
             .futexes
             .wait((0, 1, 0x1000), 1, 1, || Ok::<_, ()>(()))
@@ -8131,7 +8195,7 @@ mod tests {
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().vm_id = 999;
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
-        k.processes.get_mut(&1).unwrap().vm_id = k.processes[&2].vm_id;
+        k.processes.get_mut(&1).unwrap().vm_id = k.processes.read(&2).vm_id;
         k.processes.get_mut(&1).unwrap().state = State::Sigwait {
             mask: 0,
             info: 0,
@@ -8141,8 +8205,9 @@ mod tests {
     }
     #[test]
     fn worker_poll_deadlines_do_not_force_unrelated_cpus_to_checkpoint() {
-        let mut k = spinning_peers();
-        let p = k.processes.get_mut(&1).unwrap();
+        let k = spinning_peers();
+        let mut custody = k.processes.get_mut(&1).unwrap();
+        let p = &mut *custody;
         let fd = p.linux.vfs.timerfd(1, 0).unwrap();
         p.linux
             .vfs
@@ -8154,6 +8219,7 @@ mod tests {
             .unwrap();
         p.poll_deadline = Some(Instant::now());
         p.state = State::Blocked(73, [0, 0, 0, 0, 0, 0]);
+        drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         // An owner-side pselect still needs its saved timeout boundary.
         k.processes.get_mut(&1).unwrap().state = State::Blocked(72, [0; 6]);
@@ -8161,22 +8227,25 @@ mod tests {
     }
     #[test]
     fn socket_timeout_wakes_continuous_peers_but_not_stopped_or_runnable_tasks() {
-        let mut k = spinning_peers();
+        let k = spinning_peers();
         k.processes.get_mut(&1).unwrap().socket_deadline = Some(Instant::now());
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().state = State::Blocked(212, [0; 6]);
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
-        let p = k.processes.get_mut(&1).unwrap();
+        let mut custody = k.processes.get_mut(&1).unwrap();
+        let p = &mut *custody;
         p.signals.io.lifecycle().register(&p.signals.io, 1);
         p.signals.io.lifecycle().consume_stop(19, || true);
+        drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
     }
     #[test]
     fn worker_tcp_waits_do_not_keep_owner_socket_polling_or_reset_deadlines() {
         use std::net::{Ipv4Addr, TcpListener};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut k = spinning_peers();
-        let p = k.processes.get_mut(&1).unwrap();
+        let k = spinning_peers();
+        let mut custody = k.processes.get_mut(&1).unwrap();
+        let p = &mut *custody;
         p.linux
             .vfs
             .configure_network(trames_vfs::NetworkMode::Loopback)
@@ -8192,11 +8261,14 @@ mod tests {
         p.state = State::Blocked(63, [fd as u64, 0x1000, 1, 0, 0, 0]);
         p.socket_deadline = Some(Instant::now());
         assert!(p.worker_io_candidate(1));
+        drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         // Message ABI is still owner-side, including its timer/poll boundary.
-        let p = k.processes.get_mut(&1).unwrap();
+        let mut custody = k.processes.get_mut(&1).unwrap();
+        let p = &mut *custody;
         p.state = State::Blocked(207, [fd as u64, 0x1000, 1, 0, 0, 0]);
         assert!(!p.worker_io_candidate(1));
+        drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
         k.processes.get_mut(&1).unwrap().socket_deadline = None;
         assert_eq!(k.parallel_timeout(), Duration::from_millis(1));
@@ -8509,7 +8581,7 @@ mod tests {
                 finished
                     .send((
                         result.is_ok(),
-                        matches!(k.processes[&2].state, State::Zombie(status) if status == 23 << 8),
+                        matches!(k.processes.read(&2).state, State::Zombie(status) if status == 23 << 8),
                         k.cohort_return_syscalls.get(&93).copied().unwrap_or(0),
                     ))
                     .unwrap();
@@ -8585,7 +8657,7 @@ mod tests {
             let mut peer = k.processes.remove(&3).unwrap();
             // Owner custody temporarily removes a live caller from ProcessMap.
             // A structural refresh must consult the original group completion.
-            k.publish_children(None);
+            k.publish_task(2, &k.processes.read(&2));
             assert_eq!(event.pending(), None);
             if group_exit {
                 k.exit(3, &mut peer, 31 << 8);
@@ -8595,7 +8667,7 @@ mod tests {
             let expected = if group_exit { 31 } else { 37 } << 8;
             assert_eq!(event.pending(), Some(expected));
             assert_eq!(status.load(std::sync::atomic::Ordering::Relaxed), expected);
-            assert!(matches!(k.processes[&2].state, State::Zombie(s) if s == expected));
+            assert!(matches!(k.processes.read(&2).state, State::Zombie(s) if s == expected));
         }
     }
     #[test]
@@ -8667,7 +8739,7 @@ mod tests {
         assert!(k.resume_gpu(1, &mut p));
         assert_eq!(k.instructions, 123);
         assert_eq!(p.cpu.pc, 0x4004);
-        let mut k = spinning_peers();
+        let k = spinning_peers();
         k.processes.get_mut(&1).unwrap().state = State::Gpu {
             retired: true,
             peer_instructions: 0,
@@ -8863,8 +8935,10 @@ mod tests {
         let mut p = process();
         let mut io = trames_linux::CapturedOutput::default();
         let fd = p.linux.vfs.open_at(-100, b"/file", 0x42, 0o600).unwrap();
-        k.processes
-            .insert(2, p.fork_state(p.memory.clone(), true, true, true));
+        k.processes.insert(
+            2,
+            p.fork_state(p.memory.clone(), true, true, true, Default::default()),
+        );
         assert_eq!(
             k.syscall(
                 1,
@@ -8878,7 +8952,7 @@ mod tests {
         assert!(p
             .linux
             .vfs
-            .shares_descriptors_with(&k.processes[&2].linux.vfs));
+            .shares_descriptors_with(&k.processes.read(&2).linux.vfs));
         assert_eq!(
             k.syscall(
                 1,
@@ -8892,9 +8966,9 @@ mod tests {
         assert!(!p
             .linux
             .vfs
-            .shares_descriptors_with(&k.processes[&2].linux.vfs));
+            .shares_descriptors_with(&k.processes.read(&2).linux.vfs));
         assert_eq!(p.linux.vfs.fd_kind(fd), Err(Errno(9)));
-        assert!(k.processes[&2].linux.vfs.fd_kind(fd).is_ok());
+        assert!(k.processes.read(&2).linux.vfs.fd_kind(fd).is_ok());
         let fd = p.linux.vfs.open_at(-100, b"/file", 0, 0).unwrap();
         assert_eq!(
             k.syscall(1, &mut p, 436, [fd as u64, fd as u64, 4, 0, 0, 0], &mut io),
@@ -8922,7 +8996,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap() as u32;
-            let child = &k.processes[&id];
+            let child = &k.processes.read(&id);
             let bits = child.linux.vfs.fd_flags_snapshot();
             bits.fcntl(fd, 2, 1).unwrap();
             assert_eq!(
@@ -8946,13 +9020,16 @@ mod tests {
             k.syscall(1, &mut p, 97, [0x200, 0, 0, 0, 0, 0], &mut io),
             Ok(Some(0))
         );
-        assert!(!p.linux.vfs.shares_context_with(&k.processes[&2].linux.vfs));
+        assert!(!p
+            .linux
+            .vfs
+            .shares_context_with(&k.processes.read(&2).linux.vfs));
         p.linux.vfs.set_umask(0o077);
-        assert_eq!(k.processes[&2].linux.vfs.umask(), 0o022);
+        assert_eq!(k.processes.read(&2).linux.vfs.umask(), 0o022);
         old.fcntl(fd, 2, 1).unwrap();
         assert_ne!(p.linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC, 0);
         assert_ne!(
-            k.processes[&2].linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC,
+            k.processes.read(&2).linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC,
             0
         );
         old.fcntl(fd, 2, 0).unwrap();
@@ -8962,7 +9039,7 @@ mod tests {
         );
         assert_ne!(p.linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC, 0);
         assert_eq!(
-            k.processes[&2].linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC,
+            k.processes.read(&2).linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC,
             0
         );
     }
@@ -8994,16 +9071,16 @@ mod tests {
         Kernel::queue_one(2, &mut thread, 19, 1);
         assert!(k.deliver(2, &mut thread).unwrap());
         assert!(thread.stopped());
-        assert!(k.processes[&1].stopped());
+        assert!(k.processes.read(&1).stopped());
         k.processes.insert(2, thread);
         let mut caller = process();
         caller.tgid = 3;
-        caller.signals.io_directory = k.processes[&1].signals.io_directory.clone();
+        caller.signals.io_directory = k.processes.read(&1).signals.io_directory.clone();
         assert_eq!(k.thread_signal(3, &mut caller, 2, Some(1), 18), Ok(0));
-        assert!(!k.processes[&1].stopped() && !k.processes[&2].stopped());
-        assert!(matches!(k.processes[&1].state, State::Ready));
-        assert!(matches!(k.processes[&2].state, State::Ready));
-        assert_eq!(k.processes[&1].wait_event.pending(), Some(0xffff));
+        assert!(!k.processes.read(&1).stopped() && !k.processes.read(&2).stopped());
+        assert!(matches!(k.processes.read(&1).state, State::Ready));
+        assert!(matches!(k.processes.read(&2).state, State::Ready));
+        assert_eq!(k.processes.read(&1).wait_event.pending(), Some(0xffff));
     }
     #[test]
     fn process_signals_are_single_delivery_and_thread_signals_check_identity_and_permissions() {
@@ -9014,10 +9091,13 @@ mod tests {
         k.processes.insert(2, thread);
         assert_eq!(k.signal(1, &mut p, 0, 10), Ok(0));
         assert!(p.signals.io.process().contains_key(&10));
-        assert!(k.processes[&2].signals.io.inbox.is_empty());
+        assert!(k.processes.read(&2).signals.io.inbox.is_empty());
         assert_eq!(k.thread_signal(1, &mut p, 2, Some(3), 10), Err(Errno(3)));
         assert_eq!(k.thread_signal(1, &mut p, 2, Some(1), 10), Ok(0));
-        assert_eq!(k.processes[&2].signals.io.inbox.peek(10).unwrap().code, -6);
+        assert_eq!(
+            k.processes.read(&2).signals.io.inbox.peek(10).unwrap().code,
+            -6
+        );
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 0);
         assert_eq!(k.thread_signal(1, &mut p, 2, None, 0), Err(Errno(1)));
         assert_eq!(k.thread_signal(1, &mut p, 2, None, 18), Ok(0));
@@ -9141,7 +9221,7 @@ mod tests {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod boundary_tests {
-    use super::tests::{kernel, process};
+    use super::tests::{admitted_process, kernel, process};
     use super::*;
     use crate::PAGE_SIZE;
     use trames_linux::CapturedOutput;
@@ -9189,7 +9269,7 @@ mod boundary_tests {
             )
             .unwrap();
         let id = result.unwrap() as u32;
-        let child = k.processes.get_mut(&id).unwrap();
+        let child = &mut *k.processes.get_mut(&id).unwrap();
         child.memory.write_array(0x1000, [42u8]).unwrap();
         assert_eq!(p.memory.read_array::<1>(0x1000), Ok([42]));
         assert_eq!(p.memory.resident_bytes(), PAGE_SIZE as usize);
@@ -9208,9 +9288,9 @@ mod boundary_tests {
     }
     #[test]
     fn configured_task_capacity_admits_more_than_256_threads_and_reports_the_limit() {
-        let mut p = process();
         let mut k = kernel();
-        k.task_limit = 300;
+        k.task_capacity = Arc::new(trames_kernel::task::Capacity::new(300));
+        let mut p = admitted_process(&k);
         let before = p.memory.resident_bytes();
         for _ in 1..300 {
             k.syscall(
@@ -9255,11 +9335,118 @@ mod boundary_tests {
         }));
     }
     #[test]
-    fn process_limit_rejects_fork_without_changing_parent_memory() {
-        let mut p = process();
+    fn birth_capacity_rolls_back_failures_and_releases_at_source_wait() {
         let mut k = kernel();
+        k.task_capacity = Arc::new(trames_kernel::task::Capacity::new(2));
+        let mut parent = admitted_process(&k);
+        let mut output = CapturedOutput::default();
+        parent.memory.write_array(0x1000, [17u8]).unwrap();
+        parent
+            .memory
+            .set_total_limit(parent.memory.resident_bytes())
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                k.syscall(1, &mut parent, 220, [17, 0, 0, 0, 0, 0], &mut output),
+                Err(Errno(11))
+            );
+            assert_eq!(k.processes.len(), 0);
+            // The root still consumes one slot, failed construction consumes none.
+            let available = k.task_capacity.reserve().unwrap();
+            assert!(k.task_capacity.reserve().is_none());
+            drop(available);
+        }
+        let id = k
+            .syscall(1, &mut parent, 220, [0x111, 0, 0, 0, 0, 0], &mut output)
+            .unwrap()
+            .unwrap() as u32;
+        let mut child = k.processes.remove(&id).unwrap();
+        let retained_projection = child.signals.presence.clone();
+        k.exit_one(id, &mut child, 0);
+        k.processes.insert(id, child);
+        assert!(k.task_capacity.reserve().is_none()); // unreaped zombie
+        let request =
+            trames_kernel::children::Wait::prepare(260, [id as u64, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            parent.children.wait(
+                request,
+                parent.linux.vfs.pid_namespace(),
+                parent.group,
+                &mut parent.memory
+            ),
+            Ok(Some(id as u64))
+        );
+        // Original source wait refunds before the owner's Process is removed.
+        assert!(k.processes.contains_key(&id));
+        assert!(!retained_projection.present());
+        let slot = k.task_capacity.reserve().unwrap();
+        k.reap_waited();
+        drop(retained_projection);
+        assert!(k.task_capacity.reserve().is_none()); // never double-refund
+        drop(slot);
+        assert!(k.task_capacity.reserve().is_some());
+    }
+    #[test]
+    fn failed_host_image_does_not_consume_capacity_or_namespace_init() {
+        let mut k = kernel();
+        k.task_capacity = Arc::new(trames_kernel::task::Capacity::new(2));
+        let mut root = admitted_process(&k);
+        k.refresh_proc(1, &mut root, None);
+        let master = root.linux.vfs.open_at(-100, b"/dev/ptmx", 2, 0).unwrap();
+        let pair = root.linux.vfs.pty(master).unwrap().unwrap().pair.clone();
+        pair.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let slave = root.linux.vfs.open_pty_peer(master, 2).unwrap();
+        root.linux.vfs.dup3(slave, 0, 0).unwrap();
+        {
+            let mut terminal = pair.terminal.borrow_mut();
+            terminal.session = 9;
+            terminal.foreground = 7;
+        }
+        root.linux
+            .vfs
+            .import_executable(b"/bad", b"not ELF".to_vec())
+            .unwrap();
+        root.linux.vfs.unshare_pid().unwrap();
+        let namespace = root.linux.vfs.pid_children_namespace().clone();
+        k.processes.insert(1, root);
+        for _ in 0..3 {
+            let request = trames_linux::HostSpawn {
+                argv: vec![b"/bad".to_vec()],
+                environment: Vec::new(),
+                vfs: k.processes.read(&1).linux.vfs.clone(),
+                status: Arc::new(std::sync::atomic::AtomicI32::new(
+                    trames_linux::HOST_RUNNING,
+                )),
+                pid: Default::default(),
+            };
+            assert_eq!(k.spawn_host(request), Err(Errno(8)));
+            assert_eq!(namespace.global(1), None);
+            assert!(k.task_capacity.reserve().is_some());
+            let terminal = pair.terminal.borrow();
+            assert_eq!((terminal.session, terminal.foreground), (9, 7));
+        }
+        let mut root = k.processes.remove(&1).unwrap();
+        let id = k
+            .syscall(
+                1,
+                &mut root,
+                220,
+                [17, 0, 0, 0, 0, 0],
+                &mut CapturedOutput::default(),
+            )
+            .unwrap()
+            .unwrap() as u32;
+        assert_eq!(namespace.global(1), Some(id));
+        assert_eq!(namespace.init(), id);
+        assert!(k.task_capacity.reserve().is_none());
+    }
+    #[test]
+    fn process_limit_rejects_fork_without_changing_parent_memory() {
+        let mut k = kernel();
+        let mut p = admitted_process(&k);
         for id in 2..=MAX_PROCESSES as u32 {
-            k.processes.insert(id, process());
+            k.processes.insert(id, admitted_process(&k));
         }
         let before = p.memory.mapped_bytes();
         assert_eq!(
@@ -9273,6 +9460,32 @@ mod boundary_tests {
             Err(Errno(11))
         );
         assert_eq!(p.memory.mapped_bytes(), before);
+    }
+    #[test]
+    fn private_fork_quota_failure_returns_eagain_without_task_birth() {
+        let mut p = process();
+        let mut k = kernel();
+        p.memory = Memory::new(8 * PAGE_SIZE as usize);
+        p.memory.set_total_limit(3 * PAGE_SIZE as usize).unwrap();
+        p.memory
+            .map(0x10000, 4 * PAGE_SIZE, trames_memory::Permissions::RW)
+            .unwrap();
+        p.memory.write_array(0x10000, [17u8]).unwrap();
+        p.memory.write_array(0x11000, [23u8]).unwrap();
+        let identity = p.memory.instruction_identity();
+        let tasks = k.processes.len();
+        let mut output = CapturedOutput::default();
+        assert_eq!(
+            k.syscall(1, &mut p, 220, [17, 0, 0, 0, 0, 0], &mut output),
+            Err(Errno(11))
+        );
+        assert_eq!(k.processes.len(), tasks);
+        assert_eq!(p.memory.instruction_identity(), identity);
+        assert_eq!(p.memory.read_array::<1>(0x10000), Ok([17]));
+        assert_eq!(p.memory.read_array::<1>(0x11000), Ok([23]));
+        // One tentative child page must have been refunded on failure.
+        p.memory.write_array(0x12000, [29u8]).unwrap();
+        assert_eq!(p.memory.resident_bytes(), 3 * PAGE_SIZE as usize);
     }
     #[test]
     fn failed_exec_preserves_image_and_cloexec_descriptor() {
@@ -9324,7 +9537,7 @@ mod boundary_tests {
         assert!(!k.parallel_candidate());
         k.processes.get_mut(&1).unwrap().state = State::Ready;
         assert!(!k.parallel_candidate());
-        let p = k.processes.get_mut(&2).unwrap();
+        let p = &mut *k.processes.get_mut(&2).unwrap();
         p.linux.vfs.close(fd).unwrap();
         let (replacement, _) = p.linux.vfs.uring_create(2, 4).unwrap();
         assert_eq!(replacement, fd);
@@ -9427,8 +9640,8 @@ mod boundary_tests {
             })))
             .unwrap());
         assert_eq!(&k.terminal.as_ref().unwrap().window[..4], &[40, 0, 120, 0]);
-        assert!(k.processes[&1].signals.io.inbox.contains_key(&28));
-        assert!(!k.processes[&2].signals.io.inbox.contains_key(&28));
+        assert!(k.processes.read(&1).signals.io.inbox.contains_key(&28));
+        assert!(!k.processes.read(&2).signals.io.inbox.contains_key(&28));
     }
 }
 

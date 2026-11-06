@@ -137,6 +137,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
         };
         epoch.add(crate::run_queue::Job::new(
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 1,
@@ -157,6 +158,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
         let direct = trames_linux::DirectSyscalls::new(linux.vfs.direct_descriptors());
         epoch.add(crate::run_queue::Job::new(
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid: 2,

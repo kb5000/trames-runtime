@@ -32,7 +32,7 @@ const SOFTWARE: u8 = 16;
 const P: usize = PAGE_SIZE as usize;
 
 /// Kernel/native alias; never changes protection while a Rust slice exists.
-/// A clone copies bytes instead of aliasing writable pages: Rc::make_mut keeps
+/// A clone copies bytes instead of aliasing writable pages: Arc::make_mut keeps
 /// the existing fork-COW contract even when the physical storage is mapped.
 pub(super) enum PageBytes {
     Zero,
@@ -134,8 +134,9 @@ impl Deref for PageBytes {
             Self::Zero => &[0; P],
             Self::Heap(bytes) => bytes,
             // SAFETY: offset denotes one complete, initialized, 4KiB page of
-            // this live RW kernel mapping. Coordinator access is !Send/!Sync;
-            // no direct CPU write occurs while a shared byte borrow is live.
+            // this live RW kernel mapping. Original-mm access is exclusively
+            // borrowed (with root custody for CLONE_VM); no direct CPU write
+            // occurs while a shared byte borrow is live.
             Self::Mapped { owner, offset, .. } => unsafe {
                 &*owner.kernel.as_ptr().add(*offset).cast()
             },
@@ -151,7 +152,7 @@ impl DerefMut for PageBytes {
             Self::Concurrent(_) => panic!("shared bytes require a scoped region guard"),
             Self::Zero => unreachable!(),
             Self::Heap(bytes) => bytes,
-            // SAFETY: Rc::make_mut detached any fork peers. Different page
+            // SAFETY: Arc::make_mut detached any fork peers. Different page
             // objects cover disjoint subranges; this exclusive borrow excludes
             // CPU access, native callbacks and mapping mutation on the owner.
             Self::Mapped { owner, offset, .. } => unsafe {
@@ -211,7 +212,7 @@ impl Window {
             zeroed: (0..WINDOW / P).map(|_| AtomicBool::new(true)).collect(),
         }
     }
-    fn page(&self, offset: usize, zero: bool) -> Rc<PageBytes> {
+    fn page(&self, offset: usize, zero: bool) -> Arc<PageBytes> {
         let mapping = self.mapping.as_ref().expect("coordinator physical storage");
         let lease = Slot::new(mapping.clone(), offset, false);
         if zero
@@ -227,7 +228,7 @@ impl Window {
             self.initialized[offset / P].store(true, Ordering::Relaxed);
         }
         self.zeroed[offset / P].store(false, Ordering::Relaxed);
-        Rc::new(PageBytes::Mapped {
+        Arc::new(PageBytes::Mapped {
             owner: mapping.clone(),
             offset,
             _lease: Some(lease),
@@ -269,7 +270,7 @@ impl Window {
 }
 
 pub(super) struct Arena {
-    windows: RefCell<BTreeMap<u64, Rc<Window>>>,
+    windows: RefCell<BTreeMap<u64, Arc<Window>>>,
     unavailable: RefCell<BTreeSet<u64>>,
     cache: Cache,
     granule: usize,
@@ -307,7 +308,7 @@ impl Arena {
             Self::without_cpu_aliases()
         }
     }
-    fn window(&self, address: u64, create: bool) -> Option<Rc<Window>> {
+    fn window(&self, address: u64, create: bool) -> Option<Arc<Window>> {
         if self.granule == 0 {
             return None;
         }
@@ -324,7 +325,7 @@ impl Arena {
             return None;
         };
         self.unavailable.borrow_mut().remove(&base);
-        let window = Rc::new(window);
+        let window = Arc::new(window);
         self.windows.borrow_mut().insert(base, window.clone());
         self.cache.insert(base, NonNull::from(window.as_ref()));
         Some(window)
@@ -351,7 +352,7 @@ impl Arena {
         // borrow ends. No callback or map mutation occurs during this access.
         Some(unsafe { pointer.as_ref() })
     }
-    pub fn page(&self, base: u64) -> Option<Rc<PageBytes>> {
+    pub fn page(&self, base: u64) -> Option<Arc<PageBytes>> {
         if self
             .unavailable
             .borrow()
@@ -362,7 +363,7 @@ impl Arena {
         let window = self.window(base, true)?;
         Some(window.page((base - window.base) as usize, true))
     }
-    /// Fork stops using the old CPU aliases before sharing any Rc byte owner.
+    /// Fork stops using old CPU aliases before publishing another byte owner.
     /// Retired kernel aliases stay alive through their PageBytes. New mapping
     /// windows are populated lazily; fork does not eagerly copy guest RAM.
     pub fn retire(&self) {
@@ -665,7 +666,7 @@ impl Memory {
                     for (index, &frame) in frames.iter().enumerate() {
                         let page = self.frames[frame].as_mut().expect("mapped page");
                         if !page.charge.resident() && !page.bytes.is_zero() {
-                            page.bytes = Rc::new(PageBytes::Zero);
+                            page.bytes = Arc::new(PageBytes::Zero);
                             if self.parallel_cache.is_some() {
                                 self.parallel_mappings.insert(at + index as u64 * PAGE_SIZE);
                             }
@@ -675,7 +676,7 @@ impl Memory {
                     if frames.iter().enumerate().any(|(index, &frame)| {
                         let page = self.frames[frame].as_ref().expect("mapped page");
                         !page.bytes.is_zero()
-                            && (Rc::strong_count(&page.bytes) != 1
+                            && (Arc::strong_count(&page.bytes) != 1
                                 || !page.bytes.belongs(mapping, first + index * P))
                     }) {
                         changed = true;

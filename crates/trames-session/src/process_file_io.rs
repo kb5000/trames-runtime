@@ -40,7 +40,7 @@ impl<C: Cpu> Kernel<C> {
             // Publication joins only the original mapped address spaces. No
             // filesystem byte operation, host I/O or durability runs here.
             p.memory.commit_parallel().map_err(|_| Errno(5))?;
-            for process in self.processes.values_mut() {
+            for mut process in self.processes.values_mut() {
                 if spaces.contains(&process.memory.instruction_identity().0) {
                     process.memory.commit_parallel().map_err(|_| Errno(5))?;
                 }
@@ -64,7 +64,7 @@ impl<C: Cpu> Kernel<C> {
                 // Preserve all overlapping layout pauses, including a caller
                 // that maps no bytes from the file it is changing.
                 p.file_pauses += 1;
-                for process in self.processes.values_mut() {
+                for mut process in self.processes.values_mut() {
                     if spaces.contains(&process.memory.instruction_identity().0) {
                         process.file_pauses += 1;
                     }
@@ -116,7 +116,7 @@ impl<C: Cpu> Kernel<C> {
                     continue;
                 }
                 let mut failed = false;
-                for process in self
+                for mut process in self
                     .processes
                     .values_mut()
                     .filter(|p| spaces.contains(&p.memory.instruction_identity().0))
@@ -129,7 +129,7 @@ impl<C: Cpu> Kernel<C> {
                     layout.result.fail(5);
                     continue;
                 }
-                for process in self
+                for mut process in self
                     .processes
                     .values_mut()
                     .filter(|p| spaces.contains(&p.memory.instruction_identity().0))
@@ -152,7 +152,7 @@ impl<C: Cpu> Kernel<C> {
                 self.file_layouts.push(layout);
                 continue;
             }
-            for process in self.processes.values_mut() {
+            for mut process in self.processes.values_mut() {
                 if layout
                     .spaces
                     .contains(&process.memory.instruction_identity().0)
@@ -219,8 +219,8 @@ mod tests {
         drop(view);
         k.call(1, &mut p, 46, args, &mut io);
         assert_eq!(p.file_pauses, 1);
-        assert_eq!(k.processes[&2].file_pauses, 1);
-        assert_eq!(k.processes[&3].file_pauses, 0);
+        assert_eq!(k.processes.read(&2).file_pauses, 1);
+        assert_eq!(k.processes.read(&3).file_pauses, 0);
         k.processes.insert(1, p);
         let deadline = Instant::now() + Duration::from_secs(3);
         while !k.file_layouts.is_empty() {
@@ -230,7 +230,7 @@ mod tests {
         }
         let mut p = k.processes.remove(&1).unwrap();
         assert_eq!(p.file_pauses, 0);
-        assert_eq!(k.processes[&2].file_pauses, 0);
+        assert_eq!(k.processes.read(&2).file_pauses, 0);
         k.call(1, &mut p, 46, args, &mut io);
         assert!(matches!(p.state, State::Ready));
         assert_eq!(p.cpu.x(0), 0);

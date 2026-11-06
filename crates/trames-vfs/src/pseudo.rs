@@ -731,7 +731,7 @@ pub struct ProcessInfo {
     pub state: char,
     pub credentials: Credentials,
     pub namespaces: NamespaceSnapshot,
-    pub namespace_projection: Option<Rc<linux_namespace::NamespaceProjection>>,
+    pub namespace_projection: Option<Arc<linux_namespace::NamespaceProjection>>,
     pub namespace_ids: [Vec<u32>; 4],
     pub command: Vec<u8>,
     pub cgroup: Vec<u8>,
@@ -1115,6 +1115,9 @@ impl Vfs {
         pseudo.runtime = runtime;
     }
     pub fn set_process_context(&mut self, pid: u32) {
+        if self.pid != pid {
+            self.pid_identity = self.pid_ns.retain(pid);
+        }
         self.pid = pid;
         self.begin_proc_query();
     }
@@ -1615,7 +1618,7 @@ impl Vfs {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                if id == 0 && self.embedding_terminal.get()
+                if id == 0 && self.embedding_terminal.load(Ordering::Relaxed)
                     || self.pty_by_id(id).is_some_and(|p| {
                         !p.private() && p.master_alive.load(std::sync::atomic::Ordering::Relaxed)
                     })
@@ -2539,7 +2542,7 @@ impl Vfs {
             );
         }
         if path == b"/dev/pts" {
-            if self.embedding_terminal.get() {
+            if self.embedding_terminal.load(Ordering::Relaxed) {
                 names.push(b"0".to_vec());
             }
             names.extend(

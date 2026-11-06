@@ -538,9 +538,12 @@ impl Snapshot {
         cpu: &mut C,
         memory: &mut impl CpuMemory,
         sig: u32,
-        info: trames_kernel::signal::Info,
+        mut info: trames_kernel::signal::Info,
         action: trames_kernel::signal::Action,
     ) -> Result<(), Errno> {
+        if info.timer.is_none() && info.fault.is_none() && info.poll.is_none() {
+            info.sender = self.io_routes.namespace.local(info.sender);
+        }
         let mut frame = self.io_frame();
         let mut state = cpu.architectural_state();
         let sme = cpu

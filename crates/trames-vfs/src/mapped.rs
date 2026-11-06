@@ -6,6 +6,8 @@ use std::{
     ops::Range,
     sync::{atomic::AtomicBool, Arc, RwLock},
 };
+#[cfg(test)]
+mod concurrency;
 mod writers;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
@@ -14,7 +16,7 @@ pub(super) use writers::Writers;
 pub(super) struct FilePage {
     identity: u64,
     bytes: RwLock<PageStorage>,
-    layout: AtomicU64,
+    writeback: std::sync::Mutex<()>,
     dirty: AtomicBool,
     version: AtomicU64,
 }
@@ -25,13 +27,6 @@ enum PageStorage {
         offset: u64,
         state: std::sync::Weak<MappingState>,
     },
-    // Only the coordinator's Rc-backed FileMapping/MappedData APIs access this
-    // capability. Before first publication there is one actor; layout changes
-    // occur at joined checkpoints. No unpublished capability reaches a worker.
-    Unpublished {
-        bytes: Arc<SharedPage>,
-        shared: bool,
-    },
     Published {
         bytes: Arc<SharedPage>,
         shared: bool,
@@ -39,13 +34,13 @@ enum PageStorage {
 }
 impl PageStorage {
     fn zero() -> Self {
-        Self::Unpublished {
+        Self::Published {
             bytes: Arc::new(SharedPage::zero()),
             shared: false,
         }
     }
     fn heap(bytes: Box<[u8; PAGE_SIZE as usize]>) -> Self {
-        Self::Unpublished {
+        Self::Published {
             bytes: Arc::new(SharedPage::from_box(bytes)),
             shared: false,
         }
@@ -54,7 +49,7 @@ impl PageStorage {
         // SAFETY: the retained mapping covers one initialized guest page. CPU
         // access uses SharedPage guards; raw GPU access retains its existing
         // display-buffer ownership protocol.
-        Self::Unpublished {
+        Self::Published {
             bytes: Arc::new(unsafe {
                 SharedPage::from_shared_mapping(
                     map.allocation_pointer(),
@@ -67,31 +62,22 @@ impl PageStorage {
         }
     }
     fn is_shared(&self) -> bool {
-        matches!(
-            self,
-            Self::Unpublished { shared: true, .. } | Self::Published { shared: true, .. }
-        )
+        matches!(self, Self::Published { shared: true, .. })
     }
     fn version(&self) -> u64 {
         match self {
-            Self::Unpublished { .. } | Self::Deferred { .. } => 0,
+            Self::Deferred { .. } => 0,
             Self::Published { bytes, .. } => bytes.revision(),
         }
     }
     fn copy_read(&self, offset: usize, out: &mut [u8]) {
         match self {
-            Self::Unpublished { .. } => {
-                self.with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes))
-            }
             Self::Published { bytes, .. } => bytes.copy_read(offset, out),
             Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
     fn copy_write(&self, offset: usize, input: &[u8]) {
         match self {
-            Self::Unpublished { .. } => {
-                self.with_write(offset, input.len(), |bytes| bytes.copy_from_slice(input))
-            }
             Self::Published { bytes, .. } => bytes.copy_write(offset, input),
             // Only MappedData::write_at reaches an unloaded page here, after
             // writing the retained PlainFile. A later page-in reads that update.
@@ -100,50 +86,32 @@ impl PageStorage {
     }
     fn with_read<T>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> T) -> T {
         match self {
-            // SAFETY: this private tag cannot escape FileMapping/MappedData.
-            // Publication invalidates every local cache before any worker runs.
-            Self::Unpublished { bytes, .. } => unsafe {
-                bytes.with_unpublished_read(offset, len, f)
-            },
             Self::Published { bytes, .. } => bytes.with_read(offset, len, f),
             Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
     fn with_write<T>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> T) -> T {
         match self {
-            // SAFETY: same coordinator-only ownership; original provider dirty
-            // and generation hooks are applied by every caller after mutation.
-            Self::Unpublished { bytes, .. } => unsafe {
-                bytes.with_unpublished_write(offset, len, f)
-            },
             Self::Published { bytes, .. } => bytes.with_write(offset, len, f),
             Self::Deferred { .. } => unreachable!("page-in precedes byte access"),
         }
     }
-}
-struct CachedPage {
-    layout: u64,
-    bytes: PageStorage,
 }
 impl FilePage {
     fn new(bytes: PageStorage) -> Arc<Self> {
         Arc::new(Self {
             identity: trames_memory::new_backing_identity(),
             bytes: RwLock::new(bytes),
-            layout: AtomicU64::new(0),
+            writeback: std::sync::Mutex::new(()),
             dirty: AtomicBool::new(false),
             version: AtomicU64::new(0),
         })
     }
     fn changed(&self) {
-        self.version.store(
-            self.version.load(Ordering::Relaxed).wrapping_add(1),
-            Ordering::Relaxed,
-        );
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
     fn replace(&self, bytes: PageStorage) {
         *self.bytes.write().unwrap() = bytes;
-        self.layout.fetch_add(1, Ordering::Relaxed);
     }
     fn deferred(&self) -> bool {
         matches!(*self.bytes.read().unwrap(), PageStorage::Deferred { .. })
@@ -170,7 +138,6 @@ impl FilePage {
             bytes[..data.len()].copy_from_slice(&data);
             PageStorage::heap(bytes)
         };
-        self.layout.fetch_add(1, Ordering::Relaxed);
         self.changed();
         drop(storage);
         if let Some(state) = state {
@@ -179,27 +146,22 @@ impl FilePage {
         Ok(())
     }
     fn shared_page(&self) -> Arc<SharedPage> {
-        let mut layout = self.bytes.write().unwrap();
-        match &*layout {
-            PageStorage::Deferred { .. } => unreachable!("page-in precedes publication"),
+        match &*self.bytes.read().unwrap() {
             PageStorage::Published { bytes, .. } => bytes.clone(),
-            PageStorage::Unpublished { bytes, shared } => {
-                let bytes = bytes.clone();
-                let shared = *shared;
-                *layout = PageStorage::Published {
-                    bytes: bytes.clone(),
-                    shared,
-                };
-                self.layout.fetch_add(1, Ordering::Relaxed);
-                bytes
-            }
+            PageStorage::Deferred { .. } => unreachable!("page-in precedes publication"),
         }
     }
-    fn cached(&self) -> CachedPage {
-        CachedPage {
-            layout: self.layout.load(Ordering::Relaxed),
-            bytes: self.bytes.read().unwrap().clone(),
+    fn with_bytes<T>(
+        &self,
+        f: impl FnOnce(&PageStorage) -> T,
+    ) -> std::result::Result<T, MemoryError> {
+        let storage = self.bytes.read().unwrap();
+        if !matches!(*storage, PageStorage::Deferred { .. }) {
+            return Ok(f(&storage));
         }
+        drop(storage);
+        self.materialize()?;
+        Ok(f(&self.bytes.read().unwrap()))
     }
 }
 impl trames_memory::PageSource for FilePage {
@@ -275,6 +237,9 @@ impl MappingState {
         )
     }
     fn changed(&self, bytes: Option<Range<u64>>) {
+        // Generation and interval history form one metadata transaction. A
+        // second publisher must not attach its range to another writer's token.
+        let mut changes = self.changes.borrow_mut();
         if bytes.is_none() {
             self.metadata_generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -283,7 +248,6 @@ impl MappingState {
         let before = self.domain().1;
         self.generation.fetch_add(1, Ordering::Relaxed);
         let after = self.domain().1;
-        let mut changes = self.changes.borrow_mut();
         if let Some(bytes) = bytes.filter(|r| r.start < r.end) {
             if let Some(last) = changes
                 .back_mut()
@@ -463,6 +427,9 @@ impl MappedData {
         };
         let page = FilePage::new(bytes);
         let mut pages = self.pages.borrow_mut();
+        if let Some(existing) = pages.get(&offset).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
+        }
         pages.insert(offset, Arc::downgrade(&page));
         Ok(page)
     }
@@ -501,8 +468,13 @@ impl MappedData {
                         PageStorage::zero()
                     };
                     let page = FilePage::new(storage);
-                    self.pages.borrow_mut().insert(at, Arc::downgrade(&page));
-                    page
+                    let mut pages = self.pages.borrow_mut();
+                    if let Some(existing) = pages.get(&at).and_then(std::sync::Weak::upgrade) {
+                        existing
+                    } else {
+                        pages.insert(at, Arc::downgrade(&page));
+                        page
+                    }
                 };
                 result.push(page);
             }
@@ -550,8 +522,14 @@ impl MappedData {
         if !page.dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Serialize persistence of this page, not guest byte access. Otherwise
+        // two snapshots could reach disk in reverse order and lose the latest
+        // write. Clear before copying so later publications keep the page dirty.
+        let _writeback = page.writeback.lock().unwrap();
+        if !page.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
         if page.bytes.read().unwrap().is_shared() {
-            page.dirty.store(false, Ordering::Relaxed);
             return Ok(());
         }
         let count = self.len().saturating_sub(offset).min(PAGE_SIZE) as usize;
@@ -560,12 +538,18 @@ impl MappedData {
             // into concurrently executable guest RAM or a held byte guard.
             let mut bytes = [0; PAGE_SIZE as usize];
             page.bytes.read().unwrap().copy_read(0, &mut bytes[..count]);
-            let written = self.data.borrow_mut().write_at(offset, &bytes[..count])?;
+            let written = match self.data.borrow_mut().write_at(offset, &bytes[..count]) {
+                Ok(written) => written,
+                Err(error) => {
+                    page.dirty.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
             if written != count {
+                page.dirty.store(true, Ordering::Relaxed);
                 return Err(Errno(5));
             }
         }
-        page.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
     pub(super) fn layout_domains(&self) -> [u64; 2] {
@@ -605,78 +589,60 @@ impl MappedData {
                     let mut content = page.bytes.write().unwrap();
                     if bytes.is_empty() {
                         *content = PageStorage::zero();
-                        page.layout.fetch_add(1, Ordering::Relaxed);
                     } else {
                         content.with_write(0, PAGE_SIZE as usize, |out| {
                             out.fill(0);
                             out[..bytes.len()].copy_from_slice(&bytes);
                         });
                     }
+                    // Reset while holding the layout guard. A subsequent
+                    // mapping write marks dirty only after releasing that guard.
+                    page.dirty.store(false, Ordering::Relaxed);
                 }
                 page.changed();
-                page.dirty.store(false, Ordering::Relaxed);
             }
         }
         Ok(())
     }
 }
 #[derive(Clone)]
-enum MappingMount {
-    Shared(Arc<mounts::MountIdentity>),
-    Owner(Arc<Mount>),
-}
+struct MappingMount(Arc<mounts::MountIdentity>);
 impl MappingMount {
     fn new(mount: &OpenMount) -> Self {
-        match mount {
-            OpenMount::Owner(owner) if owner.shared_resources().is_none() => {
-                Self::Owner(owner.clone())
-            }
-            _ => Self::Shared(mount.identity.clone()),
-        }
+        Self(mount.identity.clone())
     }
     fn identity(&self) -> &Arc<mounts::MountIdentity> {
-        match self {
-            Self::Shared(identity) => identity,
-            Self::Owner(mount) => &mount.identity,
-        }
+        &self.0
     }
 }
 #[derive(Clone)]
 struct MappingWriter {
     _lease: WriteLease,
-    _owner: Option<Arc<SharedCell<OpenDescription>>>,
 }
 impl MappingWriter {
     fn new(
-        open: &OpenHandle,
+        open: &Arc<SharedOpenDescription>,
         node: &NodeRef,
         writers: &Arc<Writers>,
         mount: Option<&MappingMount>,
     ) -> Self {
-        let (shared, owner) = match open {
-            OpenHandle::Shared(open) => (Some(open), None),
-            OpenHandle::Owner(open) => (None, Some(open.clone())),
-        };
         Self {
-            _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity), shared),
-            _owner: owner,
+            _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity), Some(open)),
         }
     }
     #[cfg(test)]
     fn shared(&self) -> Option<WriteLease> {
-        self._owner.is_none().then(|| self._lease.clone())
+        Some(self._lease.clone())
     }
 }
 struct FileMapping {
     // The VMA pins its original OFD even after private COW. Page bytes alone
     // cannot preserve flock, close notification or owner-control lifetime.
-    open: OpenHandle,
-    // Normal mappings need resource/flag identity. Namespace-control ancestry
-    // stays explicitly owner-only rather than escaping in a shared byte lease.
+    open: Arc<SharedOpenDescription>,
+    // Retain the original mount identity/flags, not an owner topology projection.
     mount: Option<MappingMount>,
     node: NodeRef,
     page: Arc<FilePage>,
-    cached: RefCell<CachedPage>,
     state: Arc<MappingState>,
     offset: u64,
     writable: bool,
@@ -688,13 +654,9 @@ impl FileMapping {
         &self,
         f: impl FnOnce(&PageStorage) -> T,
     ) -> std::result::Result<T, MemoryError> {
-        self.page.materialize()?;
-        let mut cache = self.cached.borrow_mut();
-        if cache.layout != self.page.layout.load(Ordering::Relaxed) {
-            *cache = self.page.cached();
-        }
-        Ok(f(&cache.bytes))
+        self.page.with_bytes(f)
     }
+
     fn changed(&self) {
         // Like the first writable fault of a dirty mmap interval, update mtime
         // once until writeback/truncate cleans this page. Repeated CPU/native
@@ -716,7 +678,8 @@ impl FileMapping {
         offset: u64,
         writable: bool,
         executable: bool,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<Arc<Self>> {
+        let open = open.borrow().shared.clone();
         let (page, state, writers) =
             if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
                 (data.page(offset)?, data.state.clone(), data.writers.clone())
@@ -724,11 +687,10 @@ impl FileMapping {
                 return Err(Errno(19));
             };
         let writer = writable.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
-        Ok(Rc::new(Self {
+        Ok(Arc::new(Self {
             open,
             mount,
             node,
-            cached: RefCell::new(page.cached()),
             page,
             state,
             offset,
@@ -777,8 +739,8 @@ impl PageBacking for FileMapping {
         }
     }
     fn parallel_commit_isolated(&self) -> bool {
-        // No provider Rc crosses to workers. Published bytes retain SharedPage
-        // ownership and gates; writeback/drop use those same guards. Local VM
+        // Providers retain synchronized original resources. Published bytes use
+        // SharedPage ownership/gates; writeback/drop use the same guards. Local VM
         // calls cannot truncate/replace another View's allocation. Volatile
         // inode projections keep the conservative owner boundary.
         self.state.stable
@@ -860,8 +822,8 @@ impl PageBacking for FileMapping {
         if !self.writable {
             return Err(MemoryError::BackingIo(13));
         }
-        self.changed();
         self.with_bytes(|storage| storage.with_write(offset, len, f))?;
+        self.changed();
         Ok(true)
     }
     fn sync(&self) -> std::result::Result<(), MemoryError> {
@@ -886,7 +848,7 @@ impl PageBacking for FileMapping {
     fn writable(&self) -> bool {
         self.writable
     }
-    fn next_page(&self, pages: u64) -> std::result::Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, pages: u64) -> std::result::Result<Arc<dyn PageBacking>, MemoryError> {
         let offset = self
             .offset
             .checked_add(
@@ -896,14 +858,14 @@ impl PageBacking for FileMapping {
             )
             .ok_or(MemoryError::InvalidRange)?;
         Self::create(
-            self.open.clone(),
+            OpenHandle::Shared(self.open.clone()),
             self.node.clone(),
             self.mount.clone(),
             offset,
             self.writable,
             self.executable,
         )
-        .map(|page| page as Rc<dyn PageBacking>)
+        .map(|page| page as Arc<dyn PageBacking>)
         .map_err(|e| MemoryError::BackingIo(e.0))
     }
 }
@@ -912,8 +874,9 @@ impl Drop for FileMapping {
         // Closing the descriptor/unlinking the path never invalidates this inode.
         if let Content::File(FileData::Mapped(data)) = &self.node.borrow().content {
             let _ = data.flush(self.offset, &self.page);
+            let mut pages = data.pages.borrow_mut();
             if Arc::strong_count(&self.page) == 1 {
-                data.pages.borrow_mut().remove(&self.offset);
+                pages.remove(&self.offset);
             }
         }
         // Release only after the existing writeback/cleanup attempt.
@@ -953,7 +916,7 @@ impl Vfs {
         len: u64,
         shared: bool,
         writable: bool,
-    ) -> Result<Vec<Rc<dyn PageBacking>>> {
+    ) -> Result<Vec<Arc<dyn PageBacking>>> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
         let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
@@ -997,7 +960,7 @@ impl Vfs {
                 .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0);
             let host = node.host.get().ok_or(Errno(19))?.clone();
             return hostfs::private_pages(
-                o_descriptor.open.clone(),
+                o.shared.clone(),
                 file.clone(),
                 host,
                 offset,
@@ -1037,16 +1000,15 @@ impl Vfs {
             && mount
                 .as_ref()
                 .is_none_or(|m| m.identity().flags.get() & mounts::MS_NOEXEC == 0);
+        let open = o.shared.clone();
         drop(o);
-        let open = o_descriptor.open;
         let writer = may_write.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
-        let mut pages: Vec<Rc<dyn PageBacking>> = Vec::new();
+        let mut pages: Vec<Arc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
-            pages.push(Rc::new(FileMapping {
+            pages.push(Arc::new(FileMapping {
                 open: open.clone(),
                 mount: mount.clone(),
                 node: node.clone(),
-                cached: RefCell::new(page.cached()),
                 page,
                 state: state.clone(),
                 offset: offset + i as u64 * PAGE_SIZE,
@@ -1506,7 +1468,7 @@ mod tests {
         let mapping = FileMapping::create(
             v.descriptor(fd).unwrap().open,
             node,
-            Some(MappingMount::Shared(mount)),
+            Some(MappingMount(mount)),
             0,
             true,
             false,
@@ -1574,7 +1536,7 @@ mod tests {
                 MappingMount::new(open.mount.as_ref().unwrap()),
             )
         };
-        assert!(matches!(mount, MappingMount::Shared(_)));
+        assert!(matches!(mount, MappingMount(_)));
         let mapping = FileMapping::create(
             v.descriptor(fd).unwrap().open,
             node,
@@ -1936,7 +1898,7 @@ mod tests {
             .with_read(0, 10, |bytes| bytes.iter().all(|&b| b == 0)));
         assert!(pages[1..]
             .iter()
-            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
+            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Published { bytes, .. } if bytes.unmaterialized_zero())));
         data.truncate(4 * PAGE_SIZE).unwrap();
         data.write_at(3 * PAGE_SIZE + 8, b"grown").unwrap();
         pages[3].materialize().unwrap();
@@ -1950,12 +1912,12 @@ mod tests {
         );
         assert!(
             pages[31].deferred()
-                || matches!(&*pages[31].bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())
+                || matches!(&*pages[31].bytes.read().unwrap(), PageStorage::Published { bytes, .. } if bytes.unmaterialized_zero())
         );
         data.truncate(0).unwrap();
         assert!(pages
             .iter()
-            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Unpublished { bytes, .. } if bytes.unmaterialized_zero())));
+            .all(|p| p.deferred() || matches!(&*p.bytes.read().unwrap(), PageStorage::Published { bytes, .. } if bytes.unmaterialized_zero())));
 
         use trames_memory::{parallel::Registry, CpuMemory};
         let mut v = Vfs::default();

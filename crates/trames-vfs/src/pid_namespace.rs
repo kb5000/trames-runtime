@@ -20,7 +20,39 @@ pub(super) struct PidSpace {
 }
 struct Ids {
     next: u32,
-    ids: BTreeMap<u32, u32>,
+    ids: BTreeMap<u32, Id>,
+}
+struct Id {
+    local: u32,
+    owner: Weak<Identity>,
+}
+/// Original PID identity retained by tasks, process groups, sessions and queued
+/// signal senders. It owns only namespace translations, never an executing task.
+#[derive(Clone)]
+pub struct PidReference(Arc<Identity>);
+struct Identity {
+    global: u32,
+    namespaces: Vec<PidNamespace>,
+}
+impl std::fmt::Debug for PidReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PidReference").field(&self.0.global).finish()
+    }
+}
+impl Drop for Identity {
+    fn drop(&mut self) {
+        // Allocation takes root -> leaf locks. Retirement takes one at a time
+        // in the same order; no task directory or registry scan is involved.
+        for namespace in &self.namespaces {
+            let mut maps = namespace.0.maps.lock().unwrap();
+            if maps.ids.get(&self.global).is_some_and(|id| {
+                std::ptr::eq(id.owner.as_ptr(), self)
+                    && namespace.0.init.load(Ordering::Relaxed) != self.global as u64
+            }) {
+                maps.ids.remove(&self.global);
+            }
+        }
+    }
 }
 #[derive(Clone)]
 pub struct PidNamespace(pub(super) Arc<PidSpace>);
@@ -101,7 +133,7 @@ impl PidNamespace {
                 .unwrap()
                 .ids
                 .get(&global)
-                .copied()
+                .map(|id| id.local)
                 .unwrap_or(0)
         }
     }
@@ -118,7 +150,7 @@ impl PidNamespace {
                 .unwrap()
                 .ids
                 .iter()
-                .find(|(_, l)| **l == local)
+                .find(|(_, id)| id.local == local)
                 .map(|(g, _)| *g)
         }
     }
@@ -152,14 +184,46 @@ impl PidNamespace {
     pub fn parent(&self) -> Option<Self> {
         self.0.parent.clone()
     }
+    /// Retain the original identity, including an inherited PGID/SID outside
+    /// the caller's nested namespace. Root IDs need no translation allocation.
+    pub fn retain(&self, global: u32) -> Option<PidReference> {
+        let mut at = Some(self);
+        while let Some(namespace) = at.filter(|n| n.is_nested()) {
+            let identity = namespace
+                .0
+                .maps
+                .lock()
+                .unwrap()
+                .ids
+                .get(&global)
+                .and_then(|id| id.owner.upgrade());
+            if let Some(identity) = identity {
+                return Some(PidReference(identity));
+            }
+            at = namespace.0.parent.as_ref();
+        }
+        None
+    }
     /// Allocate in every ancestor before exposing a child. Allocation failure
     /// leaves all namespaces unchanged; IDs are not recycled during a session.
-    fn allocate(&self, global: u32) -> Result<()> {
+    fn allocate(&self, global: u32) -> Result<Option<PidReference>> {
+        self.allocate_with(global, || Ok(()))
+    }
+    /// Validate namespace allocation, then commit the caller's original birth
+    /// resource before publishing IDs. The caller must acquire cgroup custody
+    /// first (cgroup reads translate PIDs in that order). No callbacks, byte I/O
+    /// or notifications may run from this commit closure.
+    pub(super) fn allocate_with(
+        &self,
+        global: u32,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<PidReference>> {
         if !self.is_nested() {
             return if self.is_dead() {
                 Err(Errno(12))
             } else {
-                Ok(())
+                commit()?;
+                Ok(None)
             };
         }
         let mut chain = Vec::new();
@@ -179,35 +243,32 @@ impl PidNamespace {
         if maps.iter().any(|m| m.next >= i32::MAX as u32) {
             return Err(Errno(11));
         }
+        commit()?;
+        let identity = Arc::new(Identity {
+            global,
+            namespaces: chain
+                .iter()
+                .filter(|n| n.is_nested())
+                .map(|n| (*n).clone())
+                .collect(),
+        });
         for (n, map) in chain.iter().zip(&mut maps).filter(|(n, _)| n.is_nested()) {
             let local = map.next;
-            map.ids.insert(global, local);
+            map.ids.insert(
+                global,
+                Id {
+                    local,
+                    owner: Arc::downgrade(&identity),
+                },
+            );
             map.next = local + 1;
             if local == 1 {
                 n.0.init.store(global as u64, Ordering::Relaxed);
             }
         }
-        Ok(())
-    }
-    /// Only fork can grow the maps. Prune before it, retaining group/session
-    /// leader IDs even after their original task was reaped.
-    /// The caller still supplies `live` within the task lifecycle commit; a
-    /// stale snapshot must not prune IDs allocated by an unrelated fork.
-    pub fn retain_ids(&self, live: &std::collections::BTreeSet<u32>) {
-        for n in self
-            .0
-            .registry
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(Weak::upgrade)
-        {
-            n.maps
-                .lock()
-                .unwrap()
-                .ids
-                .retain(|id, _| live.contains(id) || n.init.load(Ordering::Relaxed) == *id as u64);
-        }
+        // Do not run final identity destruction while holding these map locks.
+        drop(maps);
+        Ok(Some(PidReference(identity)))
     }
     pub(super) fn label(&self) -> Vec<u8> {
         format!("pid:[{}]", self.id()).into_bytes()
@@ -232,9 +293,17 @@ impl Vfs {
         Ok(())
     }
     pub fn activate_child_pid(&mut self, global: u32) -> Result<()> {
-        self.pid_children.allocate(global)?;
+        self.pid_identity = self.pid_children.allocate(global)?;
         self.pid_ns = self.pid_children.clone();
         Ok(())
+    }
+    /// Host-spawn image preparation needs the child's namespace/path context,
+    /// but must not consume namespace init until image and birth admission pass.
+    /// This VFS is unpublished and owns no child PID identity yet.
+    pub fn prepare_child_context(&mut self, global: u32) {
+        self.pid_identity = None;
+        self.pid_ns = self.pid_children.clone();
+        self.set_process_context(global);
     }
     pub fn visible_pid(&self, global: u32) -> u32 {
         self.pid_ns.local(global)
@@ -288,7 +357,7 @@ mod tests {
             assert_eq!(worker.local(42), 42);
             assert_eq!(worker.global(42), Some(42));
             assert_eq!(worker.hierarchy(42), vec![42]);
-            assert_eq!(worker.allocate(42), Ok(()));
+            assert!(worker.allocate(42).unwrap().is_none());
             assert!(worker.namespace_alive(0));
         })
         .join()
@@ -300,22 +369,27 @@ mod tests {
         send_sync::<PidNamespace>();
         let root = PidNamespace::default();
         let parent = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-        parent.allocate(2).unwrap();
+        let _parent = parent.allocate(2).unwrap();
         let a = PidNamespace::new(Some(parent.clone()), root.0.registry.clone()).unwrap();
         let b = PidNamespace::new(Some(parent.clone()), root.0.registry.clone()).unwrap();
-        std::thread::scope(|scope| {
+        let references = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
             for writer in 0..8 {
                 let namespace = if writer % 2 == 0 {
                     a.clone()
                 } else {
                     b.clone()
                 };
-                scope.spawn(move || {
-                    for i in 0..12 {
-                        namespace.allocate(1000 + writer * 12 + i).unwrap();
-                    }
-                });
+                workers.push(scope.spawn(move || {
+                    (0..12)
+                        .map(|i| namespace.allocate(1000 + writer * 12 + i).unwrap())
+                        .collect::<Vec<_>>()
+                }));
             }
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
         });
         let mut ancestors = std::collections::BTreeSet::new();
         let mut children = [
@@ -340,7 +414,8 @@ mod tests {
         }
         let before = parent.0.maps.lock().unwrap().next;
         a.0.maps.lock().unwrap().next = i32::MAX as u32;
-        assert_eq!(a.allocate(9000), Err(Errno(11)));
+        assert!(matches!(a.allocate(9000), Err(Errno(11))));
+        drop(references);
         assert_eq!(parent.0.maps.lock().unwrap().next, before);
         assert_eq!(parent.local(9000), 0);
     }
@@ -349,7 +424,7 @@ mod tests {
         for _ in 0..16 {
             let root = PidNamespace::default();
             let parent = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-            parent.allocate(2).unwrap();
+            let _parent = parent.allocate(2).unwrap();
             let child = PidNamespace::new(Some(parent.clone()), root.0.registry.clone()).unwrap();
             let gate = Arc::new(std::sync::Barrier::new(2));
             let result = std::thread::scope(|scope| {
@@ -363,7 +438,7 @@ mod tests {
                 child.allocate(3)
             });
             match result {
-                Ok(()) => {
+                Ok(_identity) => {
                     assert_eq!(parent.local(3), 2);
                     assert_eq!(child.local(3), 1);
                 }
@@ -375,7 +450,7 @@ mod tests {
             }
             let before = parent.0.maps.lock().unwrap().next;
             assert!(child.is_dead());
-            assert_eq!(child.allocate(4), Err(Errno(12)));
+            assert!(matches!(child.allocate(4), Err(Errno(12))));
             assert_eq!(parent.0.maps.lock().unwrap().next, before);
         }
     }
@@ -383,12 +458,13 @@ mod tests {
     fn weak_namespace_identity_expires_after_last_worker_reference() {
         let root = PidNamespace::default();
         let child = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-        child.allocate(42).unwrap();
+        let identity = child.allocate(42).unwrap();
         let weak = Arc::downgrade(&child.0);
         let id = child.id();
         std::thread::spawn(move || {
             assert_eq!(child.init(), 42);
             assert_eq!(child.local(42), 1);
+            drop(identity);
             drop(child);
         })
         .join()
@@ -401,36 +477,35 @@ mod tests {
     fn ancestor_ids_survive_group_leaders_but_siblings_are_invisible() {
         let root = PidNamespace::default();
         let a = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-        a.allocate(8).unwrap();
-        a.allocate(9).unwrap();
+        let _init = a.allocate(8).unwrap();
+        let leader = a.allocate(9).unwrap();
         let b = PidNamespace::new(Some(a.clone()), root.0.registry.clone()).unwrap();
-        b.allocate(10).unwrap();
+        let _child = b.allocate(10).unwrap();
         let sibling = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-        sibling.allocate(11).unwrap();
+        let _sibling = sibling.allocate(11).unwrap();
         assert_eq!(b.hierarchy(10), vec![10, 3, 1]);
         assert_eq!(b.local(8), 0);
         assert_eq!(a.local(11), 0);
         assert_eq!(sibling.global(2), None);
-        // Retained group/session IDs are supplied by the coordinator even
-        // after a task is gone; unreferenced IDs can be reclaimed.
-        root.retain_ids(&[8, 9, 10, 11].into());
+        let group = b.retain(9).unwrap();
+        drop(leader);
         assert_eq!(a.global(2), Some(9));
-        root.retain_ids(&[8, 10, 11].into());
+        std::thread::spawn(move || drop(group)).join().unwrap();
         assert_eq!(a.global(2), None);
-        a.allocate(12).unwrap();
+        let _next = a.allocate(12).unwrap();
         assert_eq!(a.local(12), 4); // no ID reuse
     }
     #[test]
     fn dead_namespace_allocation_does_not_consume_ancestor_ids() {
         let root = PidNamespace::default();
         let a = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
-        a.allocate(2).unwrap();
+        let _a = a.allocate(2).unwrap();
         let b = PidNamespace::new(Some(a.clone()), root.0.registry.clone()).unwrap();
-        b.allocate(3).unwrap();
+        let _b = b.allocate(3).unwrap();
         b.terminate();
-        assert_eq!(b.allocate(4), Err(Errno(12)));
+        assert!(matches!(b.allocate(4), Err(Errno(12))));
         assert_eq!(a.global(3), None);
-        a.allocate(5).unwrap();
+        let _next = a.allocate(5).unwrap();
         assert_eq!(a.local(5), 3);
         a.terminate();
         assert!(b.is_dead());

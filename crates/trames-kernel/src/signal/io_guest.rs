@@ -4,6 +4,10 @@ use super::*;
 
 impl Signals {
     pub fn publish_policy(&self, namespace: &PidNamespace, can_kill: bool) {
+        self.io.inbox.namespace.get_or_init(|| namespace.clone());
+        if let Some(process) = self.io.process.get() {
+            process.namespace.get_or_init(|| namespace.clone());
+        }
         let _ = self.io.presence.set(self.presence.visibility());
         self.io.credentials().publish_kill_permission(can_kill);
         *self.io.policy.write().unwrap() = Some(Policy {

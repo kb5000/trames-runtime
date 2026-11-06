@@ -15,7 +15,7 @@ impl Writers {
 }
 
 /// A live mapping or an explicitly retained writable operation owns a lease.
-/// Sharing its PageBacking Rc does not create another lease. A retained lease
+/// Sharing its PageBacking Arc does not create another lease. A retained lease
 /// may be released on a worker without a page scan or owner cache invalidation.
 #[derive(Clone)]
 pub(super) struct WriteLease {

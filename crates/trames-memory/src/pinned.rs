@@ -176,7 +176,7 @@ impl Memory {
                 // partial unmap even while the arena itself remains alive.
                 // Move this private page into stable independent storage once
                 // at registration. Retaining an arena Arc alone is not a pin.
-                page.bytes = Rc::new(PageBytes::Concurrent(Arc::new(SharedPage::from_box(
+                page.bytes = Arc::new(PageBytes::Concurrent(Arc::new(SharedPage::from_box(
                     Box::new(storage.snapshot()),
                 ))));
             }

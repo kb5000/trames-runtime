@@ -304,7 +304,7 @@ impl<C: Cpu> Kernel<C> {
                     return Err(Errno(12));
                 }
                 if a[1] & 1 != 0 {
-                    if let Some((&id, _)) = self.processes.iter().find(|(_, t)| {
+                    if let Some((id, _)) = self.processes.iter().find(|(_, t)| {
                         t.tgid == p.tgid
                             && !matches!(t.state, State::Zombie(_))
                             && !t.seccomp.ancestor_of(&p.seccomp)
@@ -314,7 +314,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 p.seccomp.push(filter);
                 if a[1] & 1 != 0 {
-                    for t in self
+                    for mut t in self
                         .processes
                         .values_mut()
                         .filter(|t| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_)))
@@ -503,11 +503,11 @@ mod tests {
                             true
                         )
                         .unwrap());
-                    if k.processes[&1].cpu.x(28) == 1 {
+                    if k.processes.read(&1).cpu.x(28) == 1 {
                         break;
                     }
                 }
-                let p = &k.processes[&1];
+                let p = &k.processes.read(&1);
                 assert_eq!(p.cpu.x(28), 1, "slots={slots} filtered={filtered}");
                 for (index, (number, _, expected)) in calls.iter().enumerate() {
                     assert_eq!(
@@ -522,7 +522,7 @@ mod tests {
                 );
                 assert_eq!(p.memory.read_array::<4>(0x1910).unwrap(), [0; 4]);
                 assert_eq!(p.linux.vfs.credentials.uid, 1000);
-                assert_eq!(k.processes[&2].linux.vfs.credentials.uid, 0);
+                assert_eq!(k.processes.read(&2).linux.vfs.credentials.uid, 0);
                 assert_eq!(k.syscalls, calls.len() as u64);
                 assert_eq!(k.service_requests, 0);
                 assert!(
@@ -679,14 +679,17 @@ mod tests {
                             true
                         )
                         .unwrap());
-                    if [1, 2].into_iter().all(|id| k.processes[&id].cpu.x(9) == 0) {
+                    if [1, 2]
+                        .into_iter()
+                        .all(|id| k.processes.read(&id).cpu.x(9) == 0)
+                    {
                         break;
                     }
                 }
                 for id in [1, 2] {
-                    assert_eq!(k.processes[&id].cpu.x(9), 0);
+                    assert_eq!(k.processes.read(&id).cpu.x(9), 0);
                     assert_eq!(
-                        k.processes[&id].cpu.x(0),
+                        k.processes.read(&id).cpu.x(0),
                         if decision == ALLOW {
                             0
                         } else {
@@ -866,7 +869,7 @@ mod tests {
                         .unwrap());
                     if decision.is_some() {
                         assert_eq!(
-                            k.processes[&1].seccomp.evaluations(),
+                            k.processes.read(&1).seccomp.evaluations(),
                             k.syscalls,
                             "{virtual_socket} {number}"
                         );
@@ -1085,6 +1088,7 @@ mod tests {
                 let epoch = crate::run_queue::Epoch::new(control.clone());
                 epoch.add(crate::run_queue::Job::new(
                     crate::workers::Work {
+                        task: None,
                         pid: 1,
                         cpu: std::mem::take(&mut p.cpu),
                         memory: Some(Box::new(
@@ -1217,6 +1221,7 @@ mod tests {
                 let epoch = crate::run_queue::Epoch::new(control.clone());
                 epoch.add(crate::run_queue::Job::new(
                     crate::workers::Work {
+                        task: None,
                         pid: 1,
                         cpu: std::mem::take(&mut p.cpu),
                         memory: Some(Box::new(
@@ -1338,6 +1343,7 @@ mod tests {
                 let epoch = crate::run_queue::Epoch::new(control.clone());
                 epoch.add(crate::run_queue::Job::new(
                     crate::workers::Work {
+                        task: None,
                         audio: None,
                         gpu: None,
                         pid: 1,
@@ -1466,6 +1472,7 @@ mod tests {
                 futex: Default::default(),
             };
             let work = crate::workers::Work {
+                task: None,
                 audio: None,
                 pid: 1,
                 cpu: std::mem::take(&mut p.cpu),
@@ -1572,7 +1579,10 @@ mod tests {
             assert!(kernel
                 .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                 .unwrap());
-            assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+            assert_eq!(
+                kernel.processes.read(&1).seccomp.evaluations(),
+                kernel.syscalls
+            );
             assert_eq!(kernel.service_requests, 0);
             let direct = decision == ALLOW && !nested;
             if number == 21 {
@@ -1651,8 +1661,8 @@ mod tests {
                 assert!(k
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                     .unwrap());
-                let p = &k.processes[&1];
-                let peer = &k.processes[&2];
+                let p = &k.processes.read(&1);
+                let peer = &k.processes.read(&2);
                 let expected = if !allowed {
                     error(Errno(123))
                 } else if number == 268 {
@@ -1724,8 +1734,8 @@ mod tests {
                 assert!(k
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                     .unwrap());
-                let p = &k.processes[&1];
-                let peer = &k.processes[&2];
+                let p = &k.processes.read(&1);
+                let peer = &k.processes.read(&2);
                 let expected = if !allowed {
                     error(Errno(123))
                 } else if number == 268 {
@@ -1858,12 +1868,12 @@ mod tests {
                             true
                         )
                         .unwrap());
-                    if k.processes[&1].cpu.x(28) == 1 {
+                    if k.processes.read(&1).cpu.x(28) == 1 {
                         break;
                     }
                 }
-                let p = &k.processes[&1];
-                let peer = &k.processes[&2];
+                let p = &k.processes.read(&1);
+                let peer = &k.processes.read(&2);
                 assert_eq!(p.cpu.x(28), 1, "slots={slots} filtered={filtered}");
                 for index in [0, 1, 3, 5, 6, 7, 8] {
                     assert_eq!(
@@ -1964,7 +1974,10 @@ mod tests {
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                     .unwrap());
                 assert!(kernel.syscalls > 0);
-                assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+                assert_eq!(
+                    kernel.processes.read(&1).seccomp.evaluations(),
+                    kernel.syscalls
+                );
                 assert_eq!(kernel.service_requests, 0);
                 if decision == ALLOW {
                     assert!(
@@ -1979,7 +1992,9 @@ mod tests {
                 } else {
                     assert_eq!(kernel.worker_file_syscalls, 0);
                     assert_eq!(
-                        kernel.processes[&1]
+                        kernel
+                            .processes
+                            .read(&1)
                             .linux
                             .vfs
                             .stat_at(AT_FDCWD, b"/worker-namespace"),
@@ -2045,7 +2060,10 @@ mod tests {
                     .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                     .unwrap());
                 assert!(kernel.syscalls > 0);
-                assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+                assert_eq!(
+                    kernel.processes.read(&1).seccomp.evaluations(),
+                    kernel.syscalls
+                );
                 assert_eq!(kernel.service_requests, 0);
                 if decision == ALLOW {
                     assert!(
@@ -2059,7 +2077,7 @@ mod tests {
                     );
                 } else {
                     assert_eq!(kernel.worker_file_syscalls, 0);
-                    let vfs = &kernel.processes[&1].linux.vfs;
+                    let vfs = &kernel.processes.read(&1).linux.vfs;
                     assert_eq!(
                         vfs.stat_at(AT_FDCWD, b"/worker-mount").unwrap()[..8],
                         vfs.stat_at(AT_FDCWD, b"/").unwrap()[..8]
@@ -2120,7 +2138,7 @@ mod tests {
                 .unwrap());
             assert!(kernel.syscalls > 0);
             assert_eq!(
-                kernel.processes[&1].seccomp.evaluations(),
+                kernel.processes.read(&1).seccomp.evaluations(),
                 kernel.syscalls,
                 "{path:?}"
             );
@@ -2195,11 +2213,16 @@ mod tests {
                 .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
                 .unwrap());
             assert!(kernel.syscalls > 0);
-            assert_eq!(kernel.processes[&1].seccomp.evaluations(), kernel.syscalls);
+            assert_eq!(
+                kernel.processes.read(&1).seccomp.evaluations(),
+                kernel.syscalls
+            );
             if direct {
                 assert!(kernel.worker_file_syscalls > 100);
                 assert_eq!(kernel.service_requests, 0);
-                assert!(kernel.processes[&1]
+                assert!(kernel
+                    .processes
+                    .read(&1)
                     .linux
                     .vfs
                     .stat_at(trames_vfs::AT_FDCWD, b"/worker-open")
@@ -2208,7 +2231,9 @@ mod tests {
                 assert_eq!(kernel.worker_file_syscalls, 0);
             }
             if decision != ALLOW {
-                assert!(kernel.processes[&1]
+                assert!(kernel
+                    .processes
+                    .read(&1)
                     .linux
                     .vfs
                     .stat_at(trames_vfs::AT_FDCWD, b"/worker-open")
@@ -2291,7 +2316,7 @@ mod tests {
                 assert!(kernel.syscalls > 0);
                 if decision.is_some() {
                     assert_eq!(
-                        kernel.processes[&1].seccomp.evaluations(),
+                        kernel.processes.read(&1).seccomp.evaluations(),
                         kernel.syscalls,
                         "syscall {number}"
                     );
@@ -2492,7 +2517,7 @@ mod tests {
             kernel.worker_syscalls > 100,
             "allowed calls must stay on their workers: worker={} owner={} instructions={} tasks={:?}",
             kernel.worker_syscalls, kernel.syscalls, kernel.instructions,
-            kernel.processes.iter().map(|(id,p)| (*id,p.cpu.pc,p.cpu.x(8),p.cpu.x(0))).collect::<Vec<_>>()
+            kernel.processes.iter().map(|(id,p)| (id,p.cpu.pc,p.cpu.x(8),p.cpu.x(0))).collect::<Vec<_>>()
         );
             assert_eq!(
                 kernel.syscalls, kernel.worker_syscalls,

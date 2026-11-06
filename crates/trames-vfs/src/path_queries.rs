@@ -12,10 +12,10 @@ pub(super) struct Authority {
     pub(super) retained: Option<(u32, SharedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
     pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
-    deferred: Rc<Cell<bool>>,
+    deferred: Arc<std::sync::atomic::AtomicBool>,
     pub(super) file_layout_exclusive: bool,
     pub(super) capture_open: bool,
-    pub(super) open_work: Rc<RefCell<Option<file_work::PreparedOpen>>>,
+    pub(super) open_work: Arc<SharedCell<Option<file_work::PreparedOpen>>>,
     pub(super) namespace_uses: ActiveMounts,
 }
 #[derive(Default)]
@@ -62,7 +62,7 @@ impl Authority {
             retained: None,
             peer: None,
             accepted: None,
-            deferred: Rc::new(Cell::new(false)),
+            deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
@@ -77,7 +77,7 @@ impl Authority {
             retained: None,
             peer: None,
             accepted: None,
-            deferred: Rc::new(Cell::new(false)),
+            deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
@@ -85,13 +85,13 @@ impl Authority {
         }
     }
     pub(super) fn clear_deferred(&self) {
-        self.deferred.set(false);
+        self.deferred.store(false, Ordering::Relaxed);
     }
     pub(super) fn take_deferred(&self) -> bool {
-        self.deferred.replace(false)
+        self.deferred.swap(false, Ordering::Relaxed)
     }
     pub(super) fn defer<T>(&self) -> Result<T> {
-        self.deferred.set(true);
+        self.deferred.store(true, Ordering::Relaxed);
         Err(Errno(95)) // internal only; PathQueries returns None, not this errno
     }
     pub(super) fn descriptor(&self, fd: u32) -> Result<Descriptor> {
@@ -168,30 +168,13 @@ fn host_mount(_: &Mount) -> bool {
 }
 
 /// One exclusively owned control island, movable with a retained execution job.
-/// No &Vfs, Rc or mutable control handle can escape this type's sealed API.
+/// No mutable resolver or task-local cache escapes this type's sealed API.
 pub struct PathQueries {
     pub(super) view: RefCell<Vfs>,
 }
-// SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
-// afresh, including pseudo state and descriptor-cache facades. Mount lookup/retirement
-// registries contain only synchronized original resources.
-// Mount topology and namespace authority are original synchronized Arc resources.
-// Canonical cwd/root resources cross through their original Arc fs_struct.
-// Source resources cross only as their existing Send+Sync Arc capabilities,
-// including the actual pseudo inode cache and synchronized cgroup resource
-// graph. No owner Process/CPU/Memory or unsynchronized task projection crosses.
-// Query-local clones never escape a method. Send moves the entire private island
-// exclusively between workers; PathQueries is deliberately NOT Sync or Clone.
-// Methods return owned bytes/results, numeric FDs and original shared socket
-// capabilities. No returned capability reaches private island control state. Inotify registration
-// mutates only the original Arc-backed instance/inode marks, never query-local Rc.
-// Ordinary opens publish
-// Arc-backed descriptions; no Rc-backed owner control enters shared membership.
-// Task namespace transactions may install an observation-only descriptor facade
-// over complete synchronized membership. Its cache Rc remains private, and its
-// inactive owner does not retire another task. Adding an API that
-// leaks/retains a local Rc outside this island requires revisiting this proof.
-unsafe impl Send for PathQueries {}
+// Send is derived from the complete VFS graph. This private mutable resolver is
+// still deliberately not Sync: one accepted operation owns its query/caches.
+// Returned file/namespace capabilities refer to original shared resources.
 
 impl Vfs {
     pub fn path_queries(&self) -> PathQueries {
@@ -212,7 +195,10 @@ impl Vfs {
         view.root_network = self.root_network.clone();
         view.ipc_namespace = self.ipc_namespace.clone();
         view.pid_children = self.pid_children.clone();
-        view.embedding_terminal.set(self.embedding_terminal.get());
+        view.embedding_terminal.store(
+            self.embedding_terminal.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         view.cgroups = self.cgroups.clone();
         view.pid = self.pid;
         view.pid_ns = self.pid_ns.clone();
@@ -246,7 +232,7 @@ impl Vfs {
                 .query
                 .as_ref()
                 .map_or_else(|| self.device_access(), |q| q.devices.clone()),
-            deferred: Rc::new(Cell::new(false)),
+            deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
@@ -259,7 +245,7 @@ impl Vfs {
 }
 impl PathQueries {
     /// Fresh private control graph; only the original shared Files/resources
-    /// are retained. No Rc from this query island escapes to the new one.
+    /// are retained. No mutable query-local cache escapes to the new one.
     pub fn retain_context(&self) -> Self {
         self.view.borrow().path_queries()
     }
@@ -326,9 +312,9 @@ impl PathQueries {
     fn uring_query<T>(&self, operation: impl FnOnce(&mut Vfs) -> Result<T>) -> Option<Result<T>> {
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
-        deferred.set(false);
+        deferred.store(false, Ordering::Relaxed);
         let result = operation(&mut view);
-        (!deferred.replace(false)).then_some(result)
+        (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
     /// Anonymous kernel resources use the original filesystem/budget and live
     /// Files domain, with no pathname lookup or owner control projection.
@@ -354,9 +340,9 @@ impl PathQueries {
     pub fn local_bind(&self, socket: &LocalOperation, address: &[u8]) -> Option<Result<()>> {
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
-        deferred.set(false);
+        deferred.store(false, Ordering::Relaxed);
         let result = view.local_bind_core(socket.core(), address);
-        (!deferred.replace(false)).then_some(result)
+        (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
     pub fn local_connection(
         &self,
@@ -407,16 +393,16 @@ impl PathQueries {
         // Truncation can change mapped backing lifetimes and remains joined.
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
-        deferred.set(false);
+        deferred.store(false, Ordering::Relaxed);
         let result = view.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files));
-        (!deferred.replace(false)).then_some(result)
+        (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
     fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
         let view = self.view.borrow();
         let deferred = &view.query.as_ref().unwrap().deferred;
-        deferred.set(false);
+        deferred.store(false, Ordering::Relaxed);
         let result = operation(&view);
-        (!deferred.replace(false)).then_some(result)
+        (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
     pub fn stat_at_with_mount(
         &self,

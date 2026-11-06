@@ -1,27 +1,32 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 56, original task credentials
-and complete permission consumers, reviewed on 2026-11-06.
-The prior executable baseline is `a5c3b6510e69c5c491411318695a6c4ef24157c7`.
+This is the consolidated implementation audit through stage 57, original task/image
+lifecycle and its memory, file, identity and dispatch dependencies, reviewed on
+2026-11-06. The prior runtime baseline is
+`cb2b6209446be2b032c8c9ec759df0226e66ee0b`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-06
 
 The Kernel owner still exists. Ordinary admitted resource operations no longer
-need to be sent to it. Task/image construction and mapping publication still use
-its original Rc graphs under scoped custody; actual unhandled/control work can
-still end the current execution cohort. No completion percentage is implied by
-this table or by the number of migration stages.
+need to be sent to it. Stage 57 constructs children on existing
+workers for fork/clone/vfork/exec and supported mixed mapping scopes. Nonleader
+replacement and detached old-mm retirement use original resources. Supported
+structural mapping publication is source-owned, and native image loading yields
+its CPU slot to the existing disk pool. Actual unhandled/control work can still
+end the current execution cohort. The table records the completed supported
+lifecycle subsystem and the explicit remaining boundaries; it is not a claim that
+all coordinator work is removed.
 
 | Area | Normal scope now | Remaining owner dependency / actual escalation |
 | --- | --- | --- |
 | Admitted file/path/FD, Unix/TCP I/O, transfers, AIO and io_uring operations | Calling worker and original shared resources; resource waits return the execution slot | Excluded descriptor/path/SQE kinds, owner controls, missing pumps/subscriptions and mapped-layout effects retain explicit boundaries |
 | Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes | Legacy nonmember waiter adoption, excluded wait resources, tracing and lifecycle policy effects can still require the owner |
 | Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Tracing and actual seccomp lifecycle effects keep their task-policy boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
-| Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold Rc destruction are adopted asynchronously on their existing owner; a cold peer sharing a live mm needs that mm's byte checkpoint, not an unrelated-mm join |
-| fork/clone/vfork and execve/execveat | Creator-mm checkpoint; unrelated mms continue and children/replacements enter the live queue | The original owner still constructs or replaces the Rc task/VFS/image graph. It has not moved onto the calling worker |
-| Structural VM edits, pins and mapped-file layout changes | Affected mm/backing users quiesce; original owner publishes or runs the accepted layout operation | Actual unsupported backing/generation/lifetime or policy cases can escalate to a full cohort return; pure additive private-anonymous mmap uses in-cohort publication |
+| Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task destruction are adopted asynchronously on their existing owner; a cold peer sharing a live mm needs that mm's byte checkpoint, not an unrelated-mm join |
+| fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Actual tracing/policy, solo and host invocation remain separate |
+| Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm-only checkpoints, mapped-file layout transactions and unsupported backing/lifetime/policy cases retain explicit owner boundaries |
 | Residual generic FD/network compatibility | In-cohort owner service when the actual resource is admitted; only the caller waits | Refusal before effects uses the joined owner path. Candidate syscall numbers do not mean ordinary admitted calls take this route |
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export or actual mapping invalidation needs only the original mm admission boundary. Legacy embeddings without a provider keep joined snapshots; task namespace membership mutations and policy remain separate |
@@ -47,7 +52,7 @@ The multi-CPU namespace compatibility fixture requests no owner service and has
 no unshare/setns/close_range cohort returns; its final console ioctl still returns.
 These are fixture-specific results, not prevalence in Firefox or all containers.
 
-Task/image construction, structural mapping publication,
+Proc/cold-mm-only checkpoints, mapped-file layout transactions,
 actual excluded control bodies, tracing/security and generic unhandled dispatch
 remain separate boundaries. Source-owned control lifetime does not imply that
 every control operation itself has moved to a worker.
@@ -65,7 +70,9 @@ flowchart LR
     Entry --> Scope[Affected mm or backing checkpoint]
     Entry --> Service[Admitted in-cohort compatibility service]
     Entry --> Join[Unhandled or explicit joined task/control exit]
-    Scope --> Owner[Existing Kernel owner]
+    Scope --> Lifecycle[Existing worker: lifecycle and supported mapping]
+    Lifecycle --> Entry
+    Scope --> Owner[Existing Kernel owner: remaining scopes]
     Service --> Owner
     Join --> Owner
     Owner --> Entry
@@ -75,8 +82,9 @@ Only the `Join` edge requires the current cohort to return its Views. `Scope`
 quiesces its actual mm/backing dependencies; `Service` loans the caller's View
 while peer CPUs continue, unless admission rejects it before effects.
 
-The Kernel owner admits and collects execution cohorts, manages processes and
-publishes structural changes. An admitted short operation runs on its calling
+The Kernel owner admits and collects execution cohorts and handles the remaining
+joined scopes. Original task membership and supported structural publication are
+shared with existing executors. An admitted short operation runs on its calling
 worker. A blocked resource operation can return its execution slot and resume
 from original readiness without a syscall RPC to that owner. Native disk jobs own
 copied inputs and original resources, and publish results directly to the source.
@@ -148,7 +156,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
-| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec prepares and commits on the original owner at creator-mm custody, including nonleader identity replacement and failed-image recovery. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
+| Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. The complete task and original-resource child builder are movable; pure lifecycle scopes claim nonblocking original task/mm/group custody on existing workers without VmReady/Service requests. Exec preparation/commit, nonleader identity replacement, failed-image recovery and detached old-mm retirement use original resources. Supported mixed mapping/lifecycle scopes now use the same source authority. Native image loading retains accepted resources on the original task and uses the existing disk pool; waiting releases task/mm permits and the CPU slot. Resident private-store namespace lookup/errors remain local. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. BPF administration retains its original owner boundary. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
@@ -1105,3 +1113,515 @@ These are credential-administration measurements, not Firefox, Geekbench or
 whole-container performance. The first Docker acceptance had an isolated round-6
 cleanup timeout; subsequent baseline/candidate runs passed. Its root cause is
 unattributed and remains tracked separately from the source-credential guarantees.
+
+## 57. Original task/image lifecycle and mapping dependencies — 2026-11-06
+
+The supported fork/clone/vfork/exec subsystem now constructs, admits and replaces
+original tasks on existing workers, including mixed mapping scopes and disk-backed
+image preparation. Its memory, VFS, PID/family, membership, queue and retirement
+dependencies move with it. No global Kernel lock or new coordinator thread is used.
+
+The following paragraphs retain intermediate implementation and validation history.
+Statements about pending work or unchanged pins inside those milestones describe
+that milestone, not the current status. The final acceptance below supersedes them;
+remaining proc/cold-mm, mapped-file layout and actual policy/host boundaries stay
+explicit in the current inventory.
+
+The ownership prerequisite now covers the complete original Memory graph. Its
+outer fork-byte Arc is separate from the inner physical SharedPage retained by
+execution Views, so migration cannot inflate COW counts. Memory is automatically
+Send through its fields; no whole-Kernel/Memory unsafe Send assertion is used.
+CLONE_VM structural roots use one object-local reentrant mutex plus the existing
+RefCell borrow rules. Interpreter slices borrow once; worker View accesses keep
+their original byte path. The movable root is not yet admitted to lifecycle
+workers: actual mm quiescence and executor-slot release remain admission work.
+
+PageBacking is Send + Sync and uses Arc handles. File mappings retain the original
+shared OFD, inode, mount identity, writable lease and cold page source, including
+private COW mappings after descriptor close. Their local RefCell byte cache and
+unpublished-borrow state are removed. Concurrent first mappings converge on one
+physical cache page. A per-page writeback lock orders persistence snapshots;
+dirty state is cleared before copying, preserved for later writes, and restored
+on I/O error. Ordinary guest bytes retain their existing access protocol.
+
+Guest fork uses fallible child accounting. Another mm's allocation can defeat an
+earlier quota query, so a failed fork rolls back tentative charges and leaves the
+parent's translation/epoch state unchanged. Fresh child charges skip the shared
+first-touch state machine. Reached but unwritten sparse zeros remain uncharged,
+including through retained Views. These changes resolve concrete dependencies;
+they do not remove original-owner task/image construction.
+
+Original task-number allocation now uses a session-owned atomic resource, shared
+by guest clone and host-spawn entry points. It preserves monotonic IDs and the
+existing overflow/error accounting; it is not a new task-capacity policy. Nested
+PID translations use retained identity objects owned by actual tasks, TGID/PGID/
+SID references and pending signal senders. Final release removes only that
+identity's own ancestor entries. The clone-time global Process/signal-sender scan
+and namespace-wide retain_ids sweep are removed. Root namespace translation and
+reference acquisition still avoid map/registry locks.
+
+Signal dequeue retains the sender through ABI translation, including signalfd,
+sigtimedwait and source-thread handler frames. Standard-signal coalescing keeps
+only the first sender; discards and rejected queue admission release their own
+references. A process inbox remains lazy so binding policy cannot prevent a new
+thread from adopting the original shared queue. Source handler delivery also now
+converts si_pid through the receiver's namespace, as the owner delivery path did.
+Nonleader exec retains the original leader identity while a pending signal can
+independently retain its retired TID. These objects retain translations, not the
+sender's task, Files, memory or execution slot.
+
+Task capacity now belongs to one original atomic admission resource. Both guest
+clone and host launch reserve before construction; a dropped reservation refunds
+failure automatically. Published slots move into the task's original Presence.
+Unreaped zombies retain their slot, while source wait/automatic reaping releases
+it exactly once even if an owner projection or directory still retains visibility.
+Task-table length and owner collection no longer decide capacity. Reaping uses a
+relaxed atomic exchange and counter decrement; ordinary visibility reads remain
+relaxed loads, with no new CPU-byte or native-function synchronization.
+
+Both creation paths use the same family/PID/cgroup publication transaction.
+Cgroup custody precedes ancestor PID maps, matching cgroup PID queries; all
+validation precedes committing membership and namespace init. A rejected first
+child leaves PID 1 available. Notifications and cgroup binding follow the family
+guard. Host launch prepares its executable before committing namespace identity,
+and updates the shared terminal session/foreground group only after admission.
+Failed image loading therefore changes neither that terminal nor task capacity.
+Host launch no longer republishes every unrelated task after insertion.
+The common builder now accepts only the original task and retained session resources:
+capacity, task/resource IDs, Families, limits and proc publication. It no longer
+requires a Kernel reference or task-table access. Production clone calls this same
+entry, then installs the child in the existing owner table; host admission uses
+the same original birth transaction. Resource IDs and the transitional family
+refresh marker are relaxed atomics. Per-task proc metadata construction no longer
+requires Kernel, while live mapping/payload observations keep their actual memory
+custody. This removes construction's dependency on the complete Kernel type; it
+does not yet remove owner admission or dispatch.
+
+Complete Vfs, Linux and Process now derive Send through their actual fields. No
+unsafe Send is asserted for these types, and PathQueries no longer needs its old
+manual Send assertion. Files membership and OFDs remain original shared resources.
+Descriptor memoization is private to each task; only immutable identity markers
+and immutable capability arrays use Arc. CLONE_FILES retains the same membership,
+not a copied table or a cache mutex. Fork captures the membership revision under
+its existing lock and retains cached results only if they match that exact copied
+revision, avoiding a cache-versus-fork race with a concurrent shared-Files writer.
+Original pseudo-filesystem metadata and the legacy ancillary ledger have their
+own object guards; namespace projections are immutable Arc values. Heap cursors,
+embedding-terminal state and shared membarrier registration use relaxed atomics.
+Heap topology edits still require mm custody; scalar atomics do not replace it.
+
+Legacy ancillary reaping never holds the ledger while checking channel liveness,
+because send/receive acquire the channel first. Weak channel identities survive
+until removal to prevent address reuse, and recursive OFD destruction follows the
+ledger guard. An original pending-control count lets empty ordinary socket views
+skip both ledger locks. Only actual legacy-control insert/remove operations edit
+that scalar; byte I/O acquires no new lock or fence.
+
+New regressions move the complete VFS after the parent drops, retain queued epoll
+rights and namespace FDs, race CLONE_FILES edits against forked caches, and move
+a complete Process with private COW memory and original pipe ownership. Two
+independent builders create and publish 32 children after the Kernel is dropped,
+with immediate original proc/family observations. A remote vfork case checks the
+actual shared bytes, TLS/stack, parent release and failed birth after group
+termination. These are construction/custody tests, not proof that a production
+SVC already stays on a worker.
+
+The new birth fixture exposed a native-oracle version difference: the local
+Linux 7.0.0-38-generic returns EAGAIN on the first cgroup-rejected init attempt and
+ENOMEM thereafter. The upstream [sub-init retry change, merged in April 2026](https://kernel.googlesource.com/pub/scm/linux/kernel/git/hid/hid/+/440d6635b20037bc9ad46b20817d7b61cef0fc1b)
+removes that historical limitation. Trames deliberately keeps the retryable
+behavior; the new guest fixture requires it and also verifies that an init which
+actually ran and exited still makes later creation fail with ENOMEM. Its explicit
+old-kernel oracle mode reports `legacy-init-disabled` and exits 77, never a pass.
+The current upstream behavior was source-checked, not executed on a newer native
+kernel. Failed native diagnostic runs and their empty temporary cgroups were
+recorded and cleaned up.
+
+The previous admission milestone included 189 unchanged memory checks on macOS and ARM64 Linux
+(one ignored each). This admission change passes 522 macOS VFS checks plus 73
+kernel checks; 13 VFS local-network/clock tests initially hit sandbox permissions
+and pass on the permitted retry. The 30 hostfs-only cases from the prior milestone
+are unchanged and reused. ARM64 Linux passes 551 all-feature VFS checks (one
+ignored) and 73 kernel checks. Final process validation passes 225 cases (two
+ignored); the unchanged worker/queue/session remainder contributes 122 passes
+(one ignored). Both iPad compile targets and strict affected-crate checks pass.
+Sixty-six checked guest runs across HVF/interpreter at 1/4/12 CPUs cover exec
+variants, vfork, PID identities/namespaces, birth rejection/retry, cgroup lifecycle,
+quota competition, freezer and subtree termination. The earlier PID-identity
+fixture passed native ARM64 Linux; the new first-init fixture's old-kernel result
+is the explicit difference above, not an oracle pass. Fixtures are wired into
+namespace/cgroup CI. Installed Dev/stable and product pins are unchanged; the
+whole lifecycle batch is still unintegrated.
+
+After the complete-task and builder change, macOS passes 554 all-feature VFS
+checks (one ignored), ARM64 Linux passes 553 (one ignored), and both hosts pass
+350 process checks (three ignored). The 243 Linux ABI checks pass on ARM64 Linux;
+unchanged memory/kernel checks above are reused. Both iPad compile targets, strict
+VFS/Linux/session checks, isolated Mac/interpreter release builds and another 66
+lifecycle guest cases at 1/4/12 CPUs pass. No installed Dev/stable application or
+published product pin changed.
+
+Nine alternating before/after pairs compare VFS ownership against the previous
+birth milestone, using reconstructed source verified against its saved hashes.
+Medians in ns/op: warm descriptor masks/flags 18.17 -> 14.75, private VFS fork/drop
+683.29 -> 638.80, shared-Files clone/drop 131.51 -> 130.67, Unix byte round trip
+177.67 -> 149.84, pipe round trip 80.60 -> 76.40, and legacy epoll-right transfer
+409.73 -> 401.89. The initial movable-ledger implementation regressed Unix byte
+I/O by about 8%; skipping empty control ledgers removed that cost. These local
+measurements include VFS entry/projection overhead and do not establish Firefox
+or whole-application speedup.
+
+Nine counterbalanced ownership microbenchmark pairs compare the candidate with
+the published baseline. Hot CPU, worker bytes, shared CPU slices, software stores,
+native fills and fork operations remain within approximately 3% of baseline.
+Unbatched scalar read/write through a shared wrapper costs 6.30 -> 11.05 ns per
+pair; the structural lock is not free. CPU-slice borrowing amortizes it, and
+source syscall integration should likewise retain scoped custody instead of
+reacquiring it for each scalar. This is an ownership measurement, not an
+application speedup. Raw logs, binaries and source hashes are in the product's
+ignored `target/task-lifecycle` checkpoint until whole-batch integration. No
+application-level performance improvement is claimed for the PID change yet.
+
+The original complete task now has one retained handle through Work, Job,
+ready/parked queues, VM checkpoints, and Done. The owner table stores that same
+handle; removing/reinserting a table entry neither copies Process nor adds a
+Memory or Files owner. CPU/View execution takes no task-body guard. CPU return,
+including fatal diagnostics and group-exit detection, uses the retained original
+task rather than resolving an old PID projection. Checkpoint accounting retains
+the same handle while a failed exec can continue its original job.
+
+Task-body custody uses an object-local reentrant mutex and RefCell. Owned guards
+retain the stable Arc allocation; the private Ref/RefMut drops before the lock,
+and extraction releases the borrow before returning the Arc. The lifetime
+extension is limited to that owned allocation, guards remain non-Send, and no
+unsafe Send assertion is needed. Reentrant conflicting access still fails at the
+borrow boundary. Observer scans now release task custody before family
+publication or reacquiring a leader, instead of relying on a reference's implicit
+last use. This first custody milestone retained blocking access; the later
+nonblocking admission below supersedes that limitation for checkpoint entry.
+
+Dispatch preparation also accepts retained original session resources and one
+original task, without Kernel or a task-table reference. Initial production
+dispatch calls this same builder. Native contexts are owned by the task's original
+address space; there is no duplicate device/resource registry. New tests remove
+the owner projection before CPU completion, hold task custody while a real worker
+executes, and retain original Memory/FD identities through cancellation and a VM
+checkpoint. Another test drops Kernel and its whole table, builds a child on a
+separate executor, prepares its job, and runs it on the original CPU pool. These
+verify the construction-to-queue components; production clone/exec SVC admission
+still uses owner custody.
+
+After original-task custody and dispatch extraction, macOS and ARM64 Linux each
+pass 353 process/worker/queue checks (three ignored). Both iPad compile targets,
+strict session/conformance checks, isolated Mac/interpreter release builds and
+66 lifecycle guest cases at 1/4/12 CPUs pass. Unchanged VFS, Linux ABI and memory
+checks above are reused. Installed Dev/stable binaries still match the previous
+hashes; nothing in this in-progress batch has been deployed or integrated.
+
+Five alternating before/after pairs compare against the preceding builder
+milestone, with both retained runner hashes recorded. The exec measurements below
+cover 64 checked replacements or failures; vfork measures each release over 24
+rounds. Times are medians in milliseconds.
+
+| CPUs | Case | Before | After |
+| --- | --- | ---: | ---: |
+| 4 | exec | 11.502 | 11.255 |
+| 4 | nonleader-thread exec | 19.856 | 20.150 |
+| 4 | failed exec | 1.324 | 1.315 |
+| 4 | vfork, plain / legacy-owner resources | 0.0963 / 0.1038 | 0.0967 / 0.1060 |
+| 12 | exec | 11.362 | 11.155 |
+| 12 | nonleader-thread exec | 19.767 | 19.724 |
+| 12 | failed exec | 1.367 | 1.294 |
+| 12 | vfork, plain / legacy-owner resources | 0.0953 / 0.1056 | 0.0951 / 0.1069 |
+
+The single-CPU cases remain within 0.02% of their preceding medians. These paths
+show no material regression from retained task custody; they do not establish a
+Firefox/Geekbench speedup or measure future source-lifecycle admission. Complete
+samples and fixture/binary hashes are in `target/task-lifecycle/custody-bench.json`
+in the product workspace until whole-batch integration.
+
+Original task membership now lives in one shared Directory of IDs to retained
+task handles. Its mutex covers membership edits and cached immutable iteration
+snapshots, never task-body acquisition, guest execution, callbacks or final
+resource destruction. Snapshots retain original handles, not extra Memory/Files
+owners. Joined handlers keep a local set of temporarily excluded IDs; checking
+out a task no longer removes it from global membership. Source lookup and child
+publication can proceed while another thread holds that task's body.
+
+Checkout completion preserves the original handle. Rekey updates old/new ID
+membership atomically before releasing task custody. Removal and reinsertion
+compare original handle identity, so an older handler cannot overwrite a newer
+replacement or resurrect a retired task. Snapshot invalidation and retired
+handles drop after the directory mutex. A completed Child now publishes itself
+straight into this original Directory; production clone no longer asks Kernel's
+local table to insert its completed body. Lifecycle SVC admission still runs on
+the original owner, pending the next dependencies below.
+
+New regressions check cross-thread lookup/publication during checkout, identity
+preservation across rekey, replacement and retirement races, concurrent publishers,
+and Memory owner counts under retained snapshots. The existing no-Kernel birth/
+dispatch test now publishes the child into the shared directory before queueing it.
+
+The final shared-directory change passes 357 process/worker/queue checks on each
+of macOS and ARM64 Linux (three ignored), both iPad compile targets, strict
+session/conformance checks, isolated release builds and 66 HVF/interpreter
+lifecycle guest cases at 1/4/12 CPUs. Previous unchanged memory/VFS/Linux ABI
+checks are reused. Five alternating timing pairs against the preceding custody
+milestone keep the tested exec/vfork medians within 1.8%; single-CPU medians are
+within 0.2%. The 120 measured runs, source baseline and binary/fixture hashes are
+recorded in `target/task-lifecycle/directory-bench.json`. This is compatibility
+and overhead evidence, not proof of source-thread lifecycle admission or an
+application speedup. Installed applications and published pins remain unchanged.
+
+The mapping Registry now provides executor-local preparation cursors over the
+same original shared-frame identities, code epoch and physical-window pool.
+Metrics remain caller-local. Canonical frame publication checks both before and
+after candidate construction; losing candidates and byte refresh/page-in run
+outside table custody. Existing cached snapshots remain usable across cursors.
+The physical pool locks individual address-space windows for allocation, with a
+short directory lookup; pruning cannot wait for another window's allocation or
+remove a pending slot request. A live slot is never reused for a replacement.
+CPU/native View byte paths do not enter any of these new resource locks.
+
+Production cohort view preparation now accepts the original Directory and Registry
+without Kernel. The no-Kernel birth/queue test shares the original registry rather
+than moving it out of Kernel, then uses the production view builder. New concurrent
+regressions cover resident and deferred backing identity, code invalidation,
+cache reuse, allocation races, retained physical generations and independent
+window progress. Deferred source preparation reads no guest file bytes.
+
+After the shared-registry change, macOS and ARM64 Linux each pass 194 memory
+checks (188 unit cases plus six integration cases; one ignored) and 357 process
+checks (three ignored). Strict affected checks, both iPad compile targets,
+isolated release builds and 66 HVF/interpreter guest cases pass. Five alternating
+pairs against the retained directory milestone cover 120 timed exec/vfork runs;
+medians remain within 2.1%, and single-CPU medians within 0.2%. This does not
+measure parallel source checkpoint throughput or establish an application
+speedup. Evidence and binary hashes are in `target/task-lifecycle/registry-bench.json`.
+Installed applications, published commits and product pins remain unchanged.
+
+Task bodies and shared mm roots now use one original-object Custody primitive.
+Owned permits retain the stable mutex/cell allocation without retaining a
+Ref/RefMut; ordinary methods reenter on the admitted host thread. Conflicting
+RefCell borrows are still refused. The original outer mm root count does not
+include admission permits, and CPU/native Views never enter the custody lock.
+Guard/permit unlock publishes a resource notification after releasing its mutex;
+the Readiness subscription/retry handshake prevents lost wakeups on ARM.
+
+The production checkpoint entry now tries actual retained task and mm custody.
+If busy, it subscribes and retries before parking the complete original
+checkpoint in the existing execution queue. No CPU slot or unrelated domain is
+held waiting, and there is no polling retry. Release before queue publication is
+latched; release after publication wakes the existing queue. Cancellation restores
+owned domains and returns the original jobs once, dropping subscriptions outside
+the queue mutex. Successful first admission creates no wait signal/subscription,
+and all permits use one cohort allocation. The source executor still needs to
+claim and execute these checkpoints: the current production consumer of the new
+admission API remains the owner, using its existing VmReady notification.
+
+New regressions cover held task versus held mm custody, dispatch of unrelated
+jobs during the wait, source identity and exactly-once clone after wake,
+cancellation, both unlock/publication orders, concurrent subscribe/unlock,
+RefCell exclusion, retired allocation lifetime, unchanged mm root counts and
+View execution while structural custody is held on another thread. macOS and
+ARM64 Linux each pass 195 memory, 19 shared-resource and 359 process checks;
+strict affected checks, both iPad compile targets, isolated release builds and
+66 lifecycle guest cases pass. Unchanged VFS and Linux ABI checks are reused.
+Installed applications and published pins remain unchanged.
+
+Fixed-work timing retains the initial admission variant and its focused retry:
+four-CPU nonleader exec measured +5.2% initially and +1.4% on nine focused pairs.
+After removing successful-admission wait allocations, five final alternating
+pairs (120 runs) put measured exec/vfork medians between -3.4% and +2.7% against
+the retained registry milestone; four-CPU nonleader exec is +0.1%, twelve-CPU
+nonleader exec +2.7%, and single-CPU cases stay within 0.4%. This small workload
+variation is not proof of application speedup or zero overhead.
+
+A separate seven-pair memory microbenchmark retains the earlier verified root
+custody binary. Warmed View/CPU-slice paths show no comparable increase, while
+unbatched shared-wrapper read/write pairs rise from 10.99 to 11.94 ns (+8.6%).
+That cost is the structural release notification handshake, not an additional
+View byte lock. The original raw label `shared_structural` refers to these
+scalar pairs, not mmap topology. Reports and binary hashes are retained as
+`admission-bench.json`, `admission-focused-bench.json`,
+`admission-final-bench.json` and `admission-memory-bench.json` under the local
+whole-batch evidence directory. Source checkpoint throughput remains unmeasured
+until those checkpoints execute on existing workers.
+
+The existing executor's queue take path now claims fork/clone/vfork-only
+checkpoints and executes the production Birth/Directory/Registry/Dispatch path.
+Ready and resource-deferred source checkpoints cannot be taken by the owner.
+These scopes suppress VmReady requests, retain their actual Box<Job>, and run
+outside the queue mutex. If task/mm custody is busy, the existing slot dispatches
+other work and retries only after the original notification. New child bodies
+hold custody before Directory publication, and their initial Views join the same
+checkpoint before any CPU resumes. Additional CPUs start through the existing
+pool. Source ownership is distinguished from owner custody so cold cleanup cannot
+mistake a worker's structural transaction for its own access permission.
+
+Family publication now updates the corresponding original leader at bootstrap,
+group/credential/image changes and the existing birth transaction. There is no
+children_dirty flag or family refresh scan at clone/wait boundaries. Initial
+legacy IO publication and cold collection still have their separate table walks;
+they are not called by source clone. Family pruning accompanies cold reaping.
+
+Accepted policy tokens are consumed once. Parent signal state, vfork completion,
+COW ordering, original PID/cgroup/family admission, CPU return and asynchronous
+statistics remain intact. Snapshot metrics use local preparation cursors and one
+short accounting merge after execution. Private-View admission counts actual
+root owners in the admitted set; an outside/cold root retains guarded byte access
+instead of consulting unrelated task bodies. The original CPU/native byte model
+and custody-release handshake are unchanged.
+
+Mac and ARM64 Linux each pass 361 process cases (three ignored); two new tests
+cover fork/vfork/failed creation at one/four slots without owner events, accepted
+policy exactly once, unstealable source retries, busy task/mm admission,
+unrelated same-slot work and cancellation. Both iPad compile targets, strict
+affected checks and 66 HVF/interpreter guest cases pass. A test-only accepted-policy
+assertion was added after the release runners were built; it passes on both hosts
+without changing their production source. Unchanged memory/shared/VFS/ABI checks
+are reused. No product installation, commit or pin is updated.
+
+Five alternating timing pairs against the nonblocking-admission milestone retain
+120 runs: four/twelve-CPU thread/exec chains improve 13.3%/15.6%; single-CPU cases
+remain within 0.3%. Four-CPU plain vfork regresses 4.9%, confirmed at 5.2% on nine
+focused pairs (about 5 microseconds); the additional-control-object vfork case
+improves about 9–11%. Twelve-CPU failed exec changes +7.8% initially and -5.7% in
+the focused repeat, so its direction is not established. Both reports remain in
+`target/task-lifecycle/source-bench.json` and `source-focused-bench.json`; no
+application speedup or whole-subsystem completion is claimed.
+
+Pure execve/execveat checkpoints now use that same existing-executor path. An
+original group index in Directory selects complete live/cold peers; task/mm
+admission remains nonblocking and all-or-release before effects. Image failure
+returns its errno through the original Job, with accepted background state and
+policy intact. Success preserves leader age, original proc identity and accumulated
+CPU time, releases peers/clear-tid/Files/context/vfork resources, publishes through
+original Parents/family/cgroup resources, and atomically rekeys the original task.
+The legacy exec parent-thread refresh scan is removed as well.
+
+A completed peer's queued Done can be claimed by exact original handle. If legacy
+collection already took it, cleanup holds original object custody through identity
+validation; a stale exit cannot clear the new PID's memory/resources. Local source
+metrics merge asynchronously once, with no Kernel reference during replacement.
+
+Detached original mms belong to one shared retirement resource. Late borrower
+writes commit on existing executors; subscriptions survive epoch replacement and
+registration after release. A busy mm subscribes and releases the CPU slot; its
+cached identity avoids reacquiring custody merely to republish the wait. Membership
+locks cover no commits, callbacks or destruction. The outside-epoch owner remains
+an observer/driver of the same resource, not a required in-epoch completion hop.
+
+Mac and ARM64 Linux each pass 366 process cases (three ignored), plus 20 shared
+cases. New direct-epoch tests reject VmReady/Service requests and cover exec/execat,
+failed image, live/queued/already-dequeued leader exit, stale cleanup, original age,
+proc identity, CPU accounting and exactly one policy evaluation. Additional tests
+cover group indexing, retained late backed writes without Kernel, subscriber
+changes, repeated retirement wakes and busy-mm slot release. Both iPad compile
+targets, strict checks and 66 HVF/interpreter lifecycle guest cases pass. The last
+policy assertion is test-only and was rerun on both hosts after release builds;
+production source is unchanged. No product installation, commit or pin is updated.
+
+Five alternating pairs against the retained source-fork milestone (120 runs)
+measure multi-CPU exec chains -0.6% to -2.9%, failed exec -4.5% to -9.9%, and
+single-CPU cases within 0.2%. Vfork initially measures +2.7% to +3.8%; nine focused
+pairs give plain four/twelve-CPU +1.1%/-0.9% and control-object +0.2%/-1.4%.
+Both `exec-source-bench.json` and `exec-source-focused-bench.json` are retained.
+This does not establish whole-application speedup or a stable incremental vfork
+regression. The earlier source-fork plain-vfork cost remains an open question.
+
+Supported mapping-only and mixed mapping/lifecycle scopes now run on existing
+CPU workers. brk/mmap/munmap/mremap/mprotect/msync/madvise and accepted io_uring
+buffer registration share the original Linux implementation. Original outside
+borrowers use idle subscriptions; task/mm contention releases all permits and the
+execution slot. The same worker engine retains the bounded 250us quiesced batching
+rule. Additive anonymous mmap needs neither owner RPC nor a VM checkpoint; its
+original pending entry and separate readiness survive contention/cancellation.
+
+Native executable, shebang and ELF-interpreter preparation now uses the existing
+bounded disk pool. Requests contain accepted guest strings, filesystem context
+and original file authority; results contain movable CPU/Memory/Linux state,
+never a thread-affine execution engine. No Kernel/Process or old mm is sent to a
+disk worker. Completion wakes the original checkpoint, and install/rekey/cleanup
+still run on an admitted CPU worker. Failed loading preserves the old image;
+epoch cancellation retains the result on the original task. Exit discards that
+pending authority, so late completion cannot resurrect it. The affected group/mm
+stays paused during this I/O; unrelated jobs remain dispatchable on the same slot.
+
+Private-store namespace metadata is resident: accepted inode lookup and errors
+complete before disk submission, and accepted inodes are not resolved twice.
+Host/overlay namespaces and foreign native handles defer lookup. This restores
+fast failure without placing native file-byte reads back on a CPU executor. The
+existing disk pool handles both ordinary file requests and image work; only the
+cold image request is boxed, preserving ordinary file-job allocation behavior.
+Resident lookup errors stay inline: no disk job, completion allocation or owner
+wakeup is manufactured for an operation that already completed on the source.
+
+Mac/Linux process acceptance is 369 passed, three ignored. Source exec's six
+identity/policy modes now cover actual private stores as well as memory at one/four
+CPUs. Held-image tests cover close/argument overwrite, same-slot unrelated work,
+cancel/resume and late completion after kill. Both hosts pass six executable-inode
+tests, strict checks and both iPad targets compile. HVF/interpreter coverage is 66
+lifecycle, 24 mapping and 24 private-store exec cases at 1/4/12 CPUs; final corrections
+rerun only affected exec cases. Unchanged memory/shared/VFS/ABI checks are reused.
+A test initially bypassed the required Table checkout before joined exit; its
+retained failure logs are followed by corrected passes on both hosts.
+
+Five paired mapping runs improve four/twelve-CPU total time 9.1%/24.8%; longer
+fixed compute work improves 18.5%/43.7%. Short peer wall-latency sums increase while
+longer ones decrease, so actual shared-mm pauses remain a cost. Native Mac/Linux
+references and all samples are retained. Nine focused pairs against the pre-source
+lifecycle milestone put plain vfork at -11.0%/-14.3% and the control-object variant
+at -22.9%/-24.4%, resolving the earlier approximately five-microsecond cost for that
+specific comparison. These are fixture results, not whole-application speedups.
+
+
+A longer private-disk nonleader-exec loop exposed an epoch-cancellation bug: an
+unfinished image returned Ok(None), which joined exec dispatch normally interprets
+as an already-installed replacement. The original guest could run past exec before
+I/O completed. Pending image preparation now explicitly retains Blocked(number,
+accepted_args); completion resumes the same request once, and termination still
+discards it. The real failure and a deterministic before-fix failing test are
+retained. The deterministic regression passes after the fix on both hosts; 40 hardware
+runs complete 512 nonleader execs each (20,480 total) in the previously failing
+private store. Final integration checks below pass on the same production source.
+
+### Final local integration acceptance
+
+Both macOS and native ARM64 Linux pass every step of the runtime CI workflow:
+formatting, execution boundaries, strict all-target checks, all workspace tests,
+release build and memory-reclaim footprint. The interpreter product workspace
+also passes its full Rust test suite, including 369 process tests (three ignored).
+Mac product/HVF checks, both iPad compile targets, 66 lifecycle cases, 24 mapping
+cases and 24 private-store exec cases pass. The dedicated Docker store completes
+eight startup/exec/health/stop rounds; the Go GC fixture completes thirty rounds.
+Unchanged guest inputs and unrelated graphics acceptance are reused.
+
+The Wayland test entry initially triggered a pinned-nightly monomorphization ICE.
+Disabling incremental compilation did not change it. Matching the existing product
+entry points' recursion limit (512) fixes this test-only configuration; no unsafe
+Send assertion, production notification change or toolchain upgrade is involved.
+The four real Wayland fixture tests remain explicitly ignored by the default suite;
+this compile fix does not claim a new graphical acceptance run. Linux's initial
+offline metadata cache miss was resolved by fetching locked dependencies, after
+which the complete workflow ran offline.
+
+Private-disk image preparation has residual costs: failed exec is +10.5%/+6.3%
+(about 2.8/1.8 microseconds per call at 4/12 CPUs) against the retained mapping
+milestone. Short four-CPU control-vfork mean includes a large tail; nine alternating
+256-round pairs give plain +0.5% and control +6.3%. These are retained alongside
+mapping and end-to-end vfork improvements, not hidden behind a throughput claim.
+The prior stage-56 intermittent Docker cleanup timeout remains unattributed;
+this passing run does not establish its cause or a fix.
+
+Product integration uses paired runtime pins on each main branch. Only Mac Dev is
+in deployment scope; stable applications and business environments are unchanged.
+Both iPad compile targets pass; physical iPad acceptance remains skipped.
+The product's stage-57 validation records exact sources, runners, timings and logs.
+
+Remaining architectural boundaries after this batch:
+
+- Proc/cold-mm-only checkpoints and mapped-file layout transactions.
+- Actual tracing/security policy, excluded resource controls and generic fallback.
+- Solo execution and host/embedding administration; asynchronous owner projections
+  remain separate from source task execution and do not imply a lifecycle RPC.

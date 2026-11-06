@@ -220,7 +220,7 @@ fn retained_readonly_fork_storage_is_not_mistaken_for_unique_bytes() {
     let mut child = parent.clone();
     let parent_view = parent.parallel_view(&mut registry).unwrap();
     drop(parent);
-    // The coordinate Rc now has only one owner, but the other VM's View still
+    // The COW byte Arc now has only one owner, but the other VM's View still
     // owns this physical page. The Arc check must reject its unlocked guard.
     let mut child_view = child.parallel_view(&mut registry).unwrap();
     admit(&mut child_view);

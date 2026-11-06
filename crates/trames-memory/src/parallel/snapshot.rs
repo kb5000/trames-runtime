@@ -8,7 +8,7 @@ pub(super) struct BackingIndex {
     unscoped: BTreeSet<u64>,
     coupled: BTreeMap<(u8, u64), BTreeSet<u64>>,
     /// Only MAP_SHARED pages need entries. No larger per-page CPU descriptor,
-    /// backing Rc, or work on ordinary instruction/data translations.
+    /// backing Arc, or work on ordinary instruction/data translations.
     pub(super) futex: BTreeMap<u64, (u64, u64)>,
 }
 struct BackingDomain {
@@ -295,7 +295,7 @@ impl Memory {
         if cache.source_backing_revision != backing_revision {
             registry.metrics.backing_invalidations += 1;
             // Query one live representative per file, not every ELF page after
-            // an unrelated SHM write. No provider ownership or Rc is retained
+            // an unrelated SHM write. No provider ownership or Arc is retained
             // here; dropping/unmapping a file keeps its original lifetime.
             let mut candidates = snapshot.backings.unscoped.clone();
             for (&identity, group) in &mut snapshot.backings.domains {
@@ -506,7 +506,7 @@ impl Memory {
         cache.source_revision = self.revision;
         cache.source_backing_revision = backing_revision;
         if registry.metrics.incremental_updates.is_multiple_of(256) {
-            registry.shared.retain(|_, page| page.strong_count() != 0);
+            registry.shared.prune();
         }
         let view = View::new(cache.snapshot.clone());
         self.parallel_cache = Some(cache);
@@ -616,20 +616,21 @@ mod tests {
 
     #[test]
     fn unversioned_provider_storage_replacement_keeps_the_conservative_refresh() {
-        struct Backing(RefCell<Arc<SharedPage>>);
+        struct Backing(std::sync::Mutex<Arc<SharedPage>>);
         impl PageBacking for Backing {
             fn parallel_key(&self) -> Option<(u64, u64)> {
                 Some((987654, 0))
             }
             fn shared_page(&self) -> Option<Arc<SharedPage>> {
-                Some(self.0.borrow().clone())
+                Some(self.0.lock().unwrap().clone())
             }
             fn check(&self, _: u64) -> Result<(), MemoryError> {
                 Ok(())
             }
             fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
                 self.0
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .with_read(offset, out.len(), |bytes| out.copy_from_slice(bytes));
                 Ok(())
             }
@@ -645,11 +646,11 @@ mod tests {
             fn writable(&self) -> bool {
                 false
             }
-            fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+            fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
                 unreachable!()
             }
         }
-        let backing = Rc::new(Backing(RefCell::new(Arc::new(SharedPage::new(
+        let backing = Arc::new(Backing(std::sync::Mutex::new(Arc::new(SharedPage::new(
             [1; PAGE_SIZE as usize],
         )))));
         let mut m = Memory::default();
@@ -659,7 +660,7 @@ mod tests {
         let view = m.parallel_view(&mut registry).unwrap();
         assert_eq!(view.read_array::<1>(0x1000).unwrap(), [1]);
         drop(view);
-        *backing.0.borrow_mut() = Arc::new(SharedPage::new([2; PAGE_SIZE as usize]));
+        *backing.0.lock().unwrap() = Arc::new(SharedPage::new([2; PAGE_SIZE as usize]));
         backing_changed();
         let view = m.parallel_view(&mut registry).unwrap();
         assert_eq!(view.read_array::<1>(0x1000).unwrap(), [2]);

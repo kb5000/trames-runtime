@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Retired address spaces may still have external guarded byte borrowers.
 use super::*;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 
 struct Backing {
     identity: u64,
-    bytes: RefCell<[u8; PAGE_SIZE as usize]>,
-    gate: RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    bytes: Mutex<[u8; PAGE_SIZE as usize]>,
+    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 impl PageBacking for Backing {
     fn parallel_key(&self) -> Option<(u64, u64)> {
@@ -16,19 +16,19 @@ impl PageBacking for Backing {
         Ok(())
     }
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
-        out.copy_from_slice(&self.bytes.borrow()[offset..offset + out.len()]);
+        out.copy_from_slice(&self.bytes.lock().unwrap()[offset..offset + out.len()]);
         Ok(())
     }
     fn write(&self, offset: usize, input: &[u8]) -> Result<(), MemoryError> {
         // Emulate a provider blocked on I/O. It never re-enters Memory; an
         // independent guarded borrower writes a different physical frame.
-        if let Some((start, wrote)) = self.gate.borrow_mut().take() {
+        if let Some((start, wrote)) = self.gate.lock().unwrap().take() {
             start.send(()).unwrap();
             wrote
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
         }
-        self.bytes.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
+        self.bytes.lock().unwrap()[offset..offset + input.len()].copy_from_slice(input);
         Ok(())
     }
     fn sync(&self) -> Result<(), MemoryError> {
@@ -40,7 +40,7 @@ impl PageBacking for Backing {
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Rc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
 }
@@ -50,15 +50,15 @@ fn retired_publication_keeps_new_dirty_bits_until_the_last_borrow_returns() {
     let (start, ready) = mpsc::channel();
     let (wrote, written) = mpsc::channel();
     let (finish, finished) = mpsc::channel();
-    let first = Rc::new(Backing {
+    let first = Arc::new(Backing {
         identity: new_backing_identity(),
-        bytes: RefCell::new([0; PAGE_SIZE as usize]),
-        gate: RefCell::new(Some((start, written))),
+        bytes: Mutex::new([0; PAGE_SIZE as usize]),
+        gate: Mutex::new(Some((start, written))),
     });
-    let second = Rc::new(Backing {
+    let second = Arc::new(Backing {
         identity: new_backing_identity(),
-        bytes: RefCell::new([0; PAGE_SIZE as usize]),
-        gate: RefCell::new(None),
+        bytes: Mutex::new([0; PAGE_SIZE as usize]),
+        gate: Mutex::new(None),
     });
     let mut memory = Memory::default();
     memory
@@ -84,22 +84,22 @@ fn retired_publication_keeps_new_dirty_bits_until_the_last_borrow_returns() {
         drop(view);
     });
     memory.commit_retired_parallel().unwrap();
-    assert_eq!(first.bytes.borrow()[0], 7);
-    assert_eq!(second.bytes.borrow()[0], 0);
+    assert_eq!(first.bytes.lock().unwrap()[0], 7);
+    assert_eq!(second.bytes.lock().unwrap()[0], 0);
     assert!(!memory.parallel_views_quiescent());
     finish.send(()).unwrap();
     borrower.join().unwrap();
     assert!(memory.parallel_views_quiescent());
     memory.commit_parallel().unwrap();
-    assert_eq!(second.bytes.borrow()[0], 9);
+    assert_eq!(second.bytes.lock().unwrap()[0], 9);
 }
 
 #[test]
 fn fork_with_a_retained_borrow_keeps_late_parent_backing_writes() {
-    let backing = Rc::new(Backing {
+    let backing = Arc::new(Backing {
         identity: new_backing_identity(),
-        bytes: RefCell::new([0; PAGE_SIZE as usize]),
-        gate: RefCell::new(None),
+        bytes: Mutex::new([0; PAGE_SIZE as usize]),
+        gate: Mutex::new(None),
     });
     let mut memory = Memory::default();
     memory
@@ -109,14 +109,14 @@ fn fork_with_a_retained_borrow_keeps_late_parent_backing_writes() {
     let mut borrowed = memory.parallel_view(&mut registry).unwrap();
     borrowed.write_array(0x1000, [7]).unwrap();
     memory.commit_retired_parallel().unwrap();
-    assert_eq!(backing.bytes.borrow()[0], 7);
+    assert_eq!(backing.bytes.lock().unwrap()[0], 7);
     let _child = memory.clone();
     let resumed = memory.parallel_view(&mut registry).unwrap();
     borrowed.write_array(0x1000, [9]).unwrap();
     assert_eq!(resumed.read_array::<1>(0x1000).unwrap(), [9]);
     drop((borrowed, resumed));
     memory.commit_parallel().unwrap();
-    assert_eq!(backing.bytes.borrow()[0], 9);
+    assert_eq!(backing.bytes.lock().unwrap()[0], 9);
 }
 
 #[test]

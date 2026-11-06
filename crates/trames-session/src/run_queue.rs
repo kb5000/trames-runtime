@@ -25,6 +25,9 @@ pub(super) enum WaitState {
     Child(Arc<ChildWait>),
     Completion(Arc<CompletionWait>),
     Namespace(Arc<NamespaceWait>),
+    /// Retry the retained pending CPU syscall after original task/mm custody.
+    /// This is not a completed guest wait and must not overwrite its arguments.
+    Custody(Arc<crate::process::tasks::AdmissionWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -136,7 +139,11 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
-            Self::OwnerEvent | Self::Child(_) | Self::Completion(_) | Self::Namespace(_) => None,
+            Self::OwnerEvent
+            | Self::Child(_)
+            | Self::Completion(_)
+            | Self::Namespace(_)
+            | Self::Custody(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
@@ -277,6 +284,8 @@ pub(super) struct Stats {
     pub futex_woken: u64,
     pub futex_requeues: u64,
     pub serviced_syscalls: u64,
+    pub additive_mmaps: u64,
+    pub additive_time: Duration,
     pub service_wait: Duration,
     pub syscall_time: Duration,
     pub native: trames_accel::native::Metrics,
@@ -296,6 +305,83 @@ pub(super) struct Stats {
     pub fd_syscalls: u64,
     pub gpu: crate::workers::GpuStats,
 }
+impl<C: Cpu> Done<C> {
+    pub fn take_stats(&mut self) -> Stats {
+        Stats {
+            elapsed: std::mem::take(&mut self.elapsed),
+            before: std::mem::take(&mut self.before),
+            after: std::mem::take(&mut self.after),
+            worker: std::mem::take(&mut self.worker),
+            instructions: std::mem::take(&mut self.instructions),
+            chunks: std::mem::take(&mut self.chunks),
+            syscalls: std::mem::take(&mut self.syscalls),
+            direct_syscalls: std::mem::take(&mut self.direct_syscalls),
+            futex_wakes: std::mem::take(&mut self.futex_wakes),
+            futex_woken: std::mem::take(&mut self.futex_woken),
+            futex_requeues: std::mem::take(&mut self.futex_requeues),
+            serviced_syscalls: std::mem::take(&mut self.serviced_syscalls),
+            additive_mmaps: std::mem::take(&mut self.additive_mmaps),
+            additive_time: std::mem::take(&mut self.additive_time),
+            service_wait: std::mem::take(&mut self.service_wait),
+            syscall_time: std::mem::take(&mut self.syscall_time),
+            native: std::mem::take(&mut self.native),
+            rejected_native: std::mem::take(&mut self.rejected_native),
+            cpu_times: std::mem::take(&mut self.cpu_times),
+            assignments: std::mem::take(&mut self.assignments),
+            waits: std::mem::take(&mut self.waits),
+            resumes: std::mem::take(&mut self.resumes),
+            yields: std::mem::take(&mut self.yields),
+            io_waits: std::mem::take(&mut self.io_waits),
+            service_waits: std::mem::take(&mut self.service_waits),
+            file_syscalls: std::mem::take(&mut self.file_syscalls),
+            socket_syscalls: std::mem::take(&mut self.socket_syscalls),
+            timer_syscalls: std::mem::take(&mut self.timer_syscalls),
+            poll_syscalls: std::mem::take(&mut self.poll_syscalls),
+            uring_syscalls: std::mem::take(&mut self.uring_syscalls),
+            fd_syscalls: std::mem::take(&mut self.fd_syscalls),
+            gpu: std::mem::take(&mut self.gpu),
+        }
+    }
+}
+impl Stats {
+    pub fn merge(&mut self, other: Self) {
+        self.after.lookups += other.after.lookups - other.before.lookups;
+        self.after.misses += other.after.misses - other.before.misses;
+        self.after.instructions += other.after.instructions - other.before.instructions;
+        for (target, value) in self.cpu_times.iter_mut().zip(other.cpu_times) {
+            *target += value;
+        }
+        self.native.merge(other.native);
+        self.gpu.merge(other.gpu);
+        self.rejected_native = self.rejected_native.or(other.rejected_native);
+        self.elapsed += other.elapsed;
+        self.instructions += other.instructions;
+        self.chunks += other.chunks;
+        self.syscalls += other.syscalls;
+        self.direct_syscalls += other.direct_syscalls;
+        self.futex_wakes += other.futex_wakes;
+        self.futex_woken += other.futex_woken;
+        self.futex_requeues += other.futex_requeues;
+        self.serviced_syscalls += other.serviced_syscalls;
+        self.additive_mmaps += other.additive_mmaps;
+        self.additive_time += other.additive_time;
+        self.service_wait += other.service_wait;
+        self.syscall_time += other.syscall_time;
+        self.assignments += other.assignments;
+        self.waits += other.waits;
+        self.resumes += other.resumes;
+        self.yields += other.yields;
+        self.io_waits += other.io_waits;
+        self.service_waits += other.service_waits;
+        self.file_syscalls += other.file_syscalls;
+        self.socket_syscalls += other.socket_syscalls;
+        self.timer_syscalls += other.timer_syscalls;
+        self.poll_syscalls += other.poll_syscalls;
+        self.uring_syscalls += other.uring_syscalls;
+        self.fd_syscalls += other.fd_syscalls;
+    }
+}
+
 pub(super) struct Job<C: Cpu> {
     pub work: Work<C>,
     pub stats: Stats,
@@ -429,6 +515,9 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if matches!(&self.waiting, Some(WaitState::Custody(wait)) if wait.signal.ready()) {
+            return true;
+        }
         if self
             .work
             .syscalls
@@ -518,6 +607,7 @@ impl<C: Cpu> Job<C> {
         let mut done =
             self.stats
                 .finish(work.pid, work.cpu, outcome, self.waiting, io, gpu_pending);
+        done.task = work.task;
         done.seccomp_entry = self.seccomp_entry;
         done
     }
@@ -557,6 +647,7 @@ impl Stats {
         gpu_pending: Option<crate::gpu::Compile>,
     ) -> Done<C> {
         Done::<C> {
+            task: None,
             thread_exit: None,
             fatal_fault: None,
             exit_groups: Vec::new(),
@@ -577,6 +668,8 @@ impl Stats {
             futex_woken: self.futex_woken,
             futex_requeues: self.futex_requeues,
             serviced_syscalls: self.serviced_syscalls,
+            additive_mmaps: self.additive_mmaps,
+            additive_time: self.additive_time,
             service_wait: self.service_wait,
             syscall_time: self.syscall_time,
             native: self.native,
@@ -614,9 +707,15 @@ struct Queues<C: Cpu> {
     gpu_peak_pending: usize,
     host_waiting: bool,
     domains: domains::Domains<C>,
+    custody_waits: Vec<CustodyWait<C>>,
     retired: Vec<(Box<Job<C>>, Option<SliceOutcome>)>,
     idle_notified: bool,
     sleeping_slots: u64,
+}
+struct CustodyWait<C: Cpu> {
+    checkpoint: Checkpoint<C>,
+    signal: Arc<trames_vfs::IoSignal>,
+    _subscriptions: Vec<trames_vfs::IoSubscription>,
 }
 pub(super) struct Epoch<C: Cpu> {
     pub control: Arc<Control>,
@@ -628,6 +727,7 @@ pub(super) struct Epoch<C: Cpu> {
     me: Weak<Self>,
     timers: OnceLock<Arc<trames_kernel::timers::Timers>>,
     starter: OnceLock<crate::workers::Starter<C>>,
+    lifecycle: OnceLock<crate::process::lifecycle::Lifecycle<C>>,
     active_slots: AtomicU64,
     activation_failed: std::sync::atomic::AtomicBool,
     deadline_origin: Instant,
@@ -662,6 +762,7 @@ impl<C: Cpu> Epoch<C> {
             me: me.clone(),
             timers: OnceLock::new(),
             starter: OnceLock::new(),
+            lifecycle: OnceLock::new(),
             active_slots: AtomicU64::new(0),
             activation_failed: std::sync::atomic::AtomicBool::new(false),
             deadline_origin: Instant::now(),
@@ -680,6 +781,19 @@ impl<C: Cpu> Epoch<C> {
         persistent: bool,
     ) -> Arc<Self> {
         Self::configured(control, Some(events), persistent)
+    }
+    pub fn bind_lifecycle(&self, lifecycle: crate::process::lifecycle::Lifecycle<C>) {
+        lifecycle.bind_memory(self.io_target.clone());
+        assert!(self.lifecycle.set(lifecycle).is_ok());
+        self.queues.lock().unwrap().domains.source_lifecycle = true;
+    }
+    pub fn collect_lifecycle(
+        &self,
+        kernel: &mut crate::process::Kernel<C>,
+    ) -> Option<crate::RuntimeError> {
+        self.lifecycle
+            .get()
+            .and_then(|lifecycle| lifecycle.collect(kernel))
     }
     pub fn bind_starter(&self, starter: crate::workers::Starter<C>) {
         self.starter.get_or_init(|| starter);
@@ -965,6 +1079,23 @@ impl<C: Cpu> Epoch<C> {
         q.domains.register(&mut job);
         q.domains.admit(checkpoint, job);
     }
+    /// A completed peer can still be queued for asynchronous accounting when
+    /// exec replaces its group. Claim that exact return, never a reused PID.
+    pub fn take_replaced_return(
+        &self,
+        pid: u32,
+        task: &crate::process::tasks::Handle<C>,
+    ) -> Option<Done<C>> {
+        let mut q = self.queues.lock().unwrap();
+        let index = q.finished.iter().position(|done| {
+            done.pid == pid && done.task.as_ref().is_some_and(|old| old.same(task))
+        })?;
+        let done = q.finished.swap_remove(index);
+        assert!(q.members.remove(&pid));
+        q.initial_slots.remove(&pid);
+        q.domains.retire(pid);
+        Some(done)
+    }
     pub fn forget_checkpoint_member(&self, pid: u32) {
         let mut q = self.queues.lock().unwrap();
         assert!(q.members.remove(&pid));
@@ -999,8 +1130,54 @@ impl<C: Cpu> Epoch<C> {
             .filter(|slot| (selected & !active) & (1 << slot) != 0)
             .collect()
     }
+    fn claim_checkpoint(
+        q: &mut Queues<C>,
+        source: bool,
+    ) -> Option<(Checkpoint<C>, Vec<trames_vfs::IoSubscription>)> {
+        if let Some(index) = q.custody_waits.iter().position(|wait| {
+            wait.signal.ready()
+                && (q.domains.source_lifecycle
+                    && crate::process::lifecycle::eligible(
+                        wait.checkpoint.jobs.iter().map(Box::as_ref),
+                    ))
+                    == source
+        }) {
+            let wait = q.custody_waits.swap_remove(index);
+            Some((wait.checkpoint, wait._subscriptions))
+        } else {
+            q.domains
+                .take(source)
+                .map(|checkpoint| (checkpoint, Vec::new()))
+        }
+    }
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
-        self.queues.lock().unwrap().domains.take()
+        let claimed = Self::claim_checkpoint(&mut self.queues.lock().unwrap(), false);
+        // Subscription destruction stays outside the queue mutex.
+        claimed.map(|(checkpoint, _subscriptions)| checkpoint)
+    }
+    pub fn defer_checkpoint(
+        &self,
+        checkpoint: Checkpoint<C>,
+        signal: Arc<trames_vfs::IoSignal>,
+        subscriptions: Vec<trames_vfs::IoSubscription>,
+    ) {
+        let mut q = self.queues.lock().unwrap();
+        let ready = signal.ready();
+        let source = q.domains.source_lifecycle
+            && crate::process::lifecycle::eligible(checkpoint.jobs.iter().map(Box::as_ref));
+        q.custody_waits.push(CustodyWait {
+            checkpoint,
+            signal,
+            _subscriptions: subscriptions,
+        });
+        // Publication and wake share this mutex. A release before publication
+        // is latched in the signal; a later release finds the published wait.
+        if ready {
+            if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
+                let _ = events.send(crate::workers::Event::VmReady);
+            }
+            self.notify(&mut q);
+        }
     }
     /// Locate the scheduler's current domain through an actual original task.
     /// The owner selected that task by MemoryReport resource identity, never a
@@ -1047,6 +1224,12 @@ impl<C: Cpu> Epoch<C> {
         }
         self.capture_paused(&mut q);
         self.notify(&mut q);
+        drop(q);
+        if let Some(starter) = self.starter.get() {
+            for slot in self.additional_slots(self.active_slots(), starter.capacity()) {
+                let _ = self.activate(slot);
+            }
+        }
     }
     pub fn wake(&self, ticket: &Arc<Ticket>) -> bool {
         let mut q = self.queues.lock().unwrap();
@@ -1068,12 +1251,33 @@ impl<C: Cpu> Epoch<C> {
         // Wake may precede park. The ticket CAS is then consumed by park below.
         true
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn take(&self, slot: usize) -> Option<Box<Job<C>>> {
+        self.take_with_engine(slot, &mut C::Engine::default())
+    }
+    pub fn take_with_engine(&self, slot: usize, engine: &mut C::Engine) -> Option<Box<Job<C>>> {
         let mut q = self.queues.lock().unwrap();
         let mut dispatched = false;
         loop {
             if self.control.stopped() {
                 return None;
+            }
+            if let Some(lifecycle) = self.lifecycle.get() {
+                if lifecycle.memory_ready() {
+                    drop(q);
+                    lifecycle.reclaim(self);
+                    q = self.queues.lock().unwrap();
+                    continue;
+                }
+                if let Some((checkpoint, subscriptions)) = Self::claim_checkpoint(&mut q, true) {
+                    // The existing executor owns only this quiescent scope.
+                    // No task/mm acquisition or operation holds the queue lock.
+                    drop(q);
+                    drop(subscriptions);
+                    lifecycle.run(self, checkpoint, slot, engine);
+                    q = self.queues.lock().unwrap();
+                    continue;
+                }
             }
             if let Some(timers) = self.timers.get().filter(|t| t.due()) {
                 // Signal callbacks may acquire this queue. Timer maintenance
@@ -1544,9 +1748,16 @@ impl<C: Cpu> Epoch<C> {
         q.retirement_notified = false;
         let mut jobs: Vec<_> = q.ready.drain(..).collect();
         jobs.extend(std::mem::take(&mut q.parked).into_values());
+        let waits = std::mem::take(&mut q.custody_waits);
+        let mut subscriptions = Vec::new();
+        for wait in waits {
+            q.domains.restore(wait.checkpoint, false);
+            subscriptions.extend(wait._subscriptions);
+        }
         jobs.extend(q.domains.drain());
         let retired = std::mem::take(&mut q.retired);
         drop(q);
+        drop(subscriptions);
         // Final OFD release can notify another job in this same queue.
         done.extend(jobs.into_iter().map(|mut job| {
             let outcome = job
@@ -1584,8 +1795,31 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
         if self.control.stopped() {
             return;
         }
+        if self
+            .lifecycle
+            .get()
+            .is_some_and(|lifecycle| lifecycle.memory_signal(signal))
+        {
+            self.notify(&mut q);
+            return;
+        }
+        if let Some(wait) = q
+            .custody_waits
+            .iter()
+            .find(|wait| Arc::ptr_eq(&wait.signal, signal))
+        {
+            let source = q.domains.source_lifecycle
+                && crate::process::lifecycle::eligible(
+                    wait.checkpoint.jobs.iter().map(Box::as_ref),
+                );
+            if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
+                let _ = events.send(crate::workers::Event::VmReady);
+            }
+            self.notify(&mut q);
+            return;
+        }
         if q.parked.get(&signal.pid).is_some_and(|job| {
-            job.work
+            matches!(&job.waiting, Some(WaitState::Custody(wait)) if Arc::ptr_eq(&wait.signal, signal)) || job.work
                 .syscalls
                 .as_ref()
                 .and_then(|s| s.io_wake.as_ref())
@@ -1795,6 +2029,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         Job::new(
             Work {
+                task: None,
                 audio: None,
                 gpu: None,
                 pid,

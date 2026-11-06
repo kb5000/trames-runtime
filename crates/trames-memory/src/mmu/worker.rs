@@ -2,6 +2,7 @@
 //! Physical slots are shared only inside a frozen worker epoch. Replacing a
 //! still-owned slot advances its physical window, preserving retained views.
 use super::*;
+use parking_lot::Mutex;
 use std::sync::Weak;
 
 pub(crate) struct Slot {
@@ -39,31 +40,42 @@ impl Drop for Slot {
         self.owner.release_slot(self.offset);
     }
 }
+#[derive(Default)]
 struct PhysicalWindow {
     owner: Weak<host::Mapping>,
     slots: Box<[Weak<Slot>]>,
     used: Box<[bool]>,
 }
-#[derive(Default)]
+type Windows = BTreeMap<(u64, u64), Arc<Mutex<PhysicalWindow>>>;
+#[derive(Clone, Default)]
 pub(crate) struct Pool {
-    windows: BTreeMap<(u64, u64), PhysicalWindow>,
+    windows: Arc<Mutex<Windows>>,
 }
 impl Pool {
-    pub fn prune(&mut self) {
-        self.windows
-            .retain(|_, window| window.owner.strong_count() != 0);
+    pub fn prune(&self) {
+        self.windows.lock().retain(|_, window| {
+            // A pending slot request keeps its window registered even before
+            // allocation. Never wait for host mapping while holding membership.
+            Arc::strong_count(window) != 1
+                || window
+                    .try_lock()
+                    .is_none_or(|window| window.owner.strong_count() != 0)
+        });
     }
-    pub fn slot(&mut self, space: u64, address: u64) -> Option<Arc<Slot>> {
+    pub fn slot(&self, space: u64, address: u64) -> Option<Arc<Slot>> {
         let base = address & !(WINDOW as u64 - 1);
         let offset = (address - base) as usize;
-        let entry = self
+        let window = self
             .windows
+            .lock()
             .entry((space, base))
-            .or_insert_with(|| PhysicalWindow {
-                owner: Weak::new(),
-                slots: (0..WINDOW / P).map(|_| Weak::new()).collect(),
-                used: vec![false; WINDOW / P].into_boxed_slice(),
-            });
+            .or_default()
+            .clone();
+        let mut entry = window.lock();
+        if entry.slots.is_empty() {
+            entry.slots = (0..WINDOW / P).map(|_| Weak::new()).collect();
+            entry.used = vec![false; WINDOW / P].into_boxed_slice();
+        }
         let owner = match entry
             .owner
             .upgrade()
@@ -201,8 +213,64 @@ impl Frozen {
 mod tests {
     use super::*;
     #[test]
+    fn executor_pools_share_windows_without_reusing_live_slots() {
+        let pool = Pool::default();
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let joins: Vec<_> = (0..4)
+            .map(|index| {
+                let pool = pool.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let slot = pool.slot(1, (index * P) as u64).unwrap();
+                    slot.initialize(&[index as u8 + 1; P]);
+                    slot
+                })
+            })
+            .collect();
+        let slots: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        for (index, slot) in slots.iter().enumerate() {
+            assert!(Arc::ptr_eq(&slot.owner, &slots[0].owner));
+            // SAFETY: retained test slots have disjoint initialized storage.
+            assert_eq!(unsafe { slot.pointer().read() }, index as u8 + 1);
+        }
+        let replacement = pool.clone().slot(1, 0).unwrap();
+        assert!(!Arc::ptr_eq(&replacement.owner, &slots[0].owner));
+        replacement.initialize(&[42; P]);
+        // SAFETY: both live generations retain their own initialized storage.
+        assert_eq!(unsafe { slots[0].pointer().read() }, 1);
+        assert_eq!(unsafe { replacement.pointer().read() }, 42);
+    }
+
+    #[test]
+    fn pruning_and_other_spaces_do_not_wait_for_an_allocating_window() {
+        let pool = Pool::default();
+        let window = Arc::new(Mutex::new(PhysicalWindow::default()));
+        pool.windows.lock().insert((1, 0), window.clone());
+        let held = window.lock();
+        let remote = pool.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            remote.prune();
+            let slot = remote.slot(2, 0).unwrap();
+            tx.send(slot).unwrap();
+        });
+        let slot = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        join.join().unwrap();
+        assert!(Arc::ptr_eq(&pool.windows.lock()[&(1, 0)], &window));
+        drop(held);
+        drop(window);
+        pool.prune();
+        assert!(!pool.windows.lock().contains_key(&(1, 0)));
+        assert!(pool.windows.lock().contains_key(&(2, 0)));
+        drop(slot);
+        pool.prune();
+        assert!(pool.windows.lock().is_empty());
+    }
+
+    #[test]
     fn a_reused_worker_slot_zeroes_retired_data() {
-        let mut pool = Pool::default();
+        let pool = Pool::default();
         let first = pool.slot(1, 0x40000).unwrap();
         first.initialize(&[42; P]);
         let peer = pool.slot(1, 0x41000).unwrap();

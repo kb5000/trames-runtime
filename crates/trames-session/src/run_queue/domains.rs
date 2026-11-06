@@ -65,6 +65,7 @@ struct Entry<C: Cpu> {
     members: usize,
     notified: bool,
     owned: bool,
+    source_owned: bool,
     mm_only: bool,
     proc_reads: bool,
     requested: Option<Instant>,
@@ -75,6 +76,7 @@ pub(super) struct Domains<C: Cpu> {
     entries: BTreeMap<u64, Entry<C>>,
     tasks: BTreeMap<u32, u64>,
     pub events: Option<Sender<crate::workers::Event<C>>>,
+    pub source_lifecycle: bool,
 }
 pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
@@ -84,6 +86,7 @@ pub(crate) struct Checkpoint<C: Cpu> {
     pub requested: Instant,
     pub quiescent: Instant,
     pub taken: Instant,
+    source_owned: bool,
     requesters: BTreeSet<u32>,
 }
 impl<C: Cpu> Domains<C> {
@@ -109,6 +112,7 @@ impl<C: Cpu> Domains<C> {
             members: 0,
             notified: false,
             owned: false,
+            source_owned: false,
             mm_only: false,
             proc_reads: false,
             requested: None,
@@ -145,7 +149,9 @@ impl<C: Cpu> Domains<C> {
         self.entries.contains_key(&id)
     }
     pub fn memory_owned(&self, id: u64) -> bool {
-        self.entries.get(&id).is_none_or(|entry| entry.owned)
+        self.entries
+            .get(&id)
+            .is_none_or(|entry| entry.owned && !entry.source_owned)
     }
     pub fn pause_bytes(&mut self, id: u64) {
         let entry = self.entries.get_mut(&id).unwrap();
@@ -226,22 +232,42 @@ impl<C: Cpu> Domains<C> {
         self.entries.values().any(|entry| entry.domain.paused())
     }
     pub fn notify_ready(&mut self) {
-        for entry in self.entries.values_mut() {
-            if entry.domain.paused()
-                && entry.running == 0
-                && entry.services == 0
-                && !entry.owned
-                && !entry.notified
-            {
-                entry.notified = true;
-                entry.quiescent = Some(Instant::now());
+        let ready: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(&id, entry)| {
+                (entry.domain.paused()
+                    && entry.running == 0
+                    && entry.services == 0
+                    && !entry.owned
+                    && !entry.notified)
+                    .then_some(id)
+            })
+            .collect();
+        for id in ready {
+            let entry = self.entries.get_mut(&id).unwrap();
+            entry.notified = true;
+            entry.quiescent = Some(Instant::now());
+            let ids = if entry.mm_only {
+                BTreeSet::from([id])
+            } else {
+                self.closure(BTreeSet::from([id]))
+            };
+            if !self.source_group(&ids) {
                 if let Some(events) = &self.events {
                     let _ = events.send(crate::workers::Event::<C>::VmReady);
                 }
             }
         }
     }
-    pub fn take(&mut self) -> Option<Checkpoint<C>> {
+    fn source_group(&self, ids: &BTreeSet<u64>) -> bool {
+        self.source_lifecycle
+            && crate::process::lifecycle::eligible(
+                ids.iter()
+                    .flat_map(|id| self.entries[id].jobs.iter().map(Box::as_ref)),
+            )
+    }
+    pub fn take(&mut self, source: bool) -> Option<Checkpoint<C>> {
         let mut seen = BTreeSet::new();
         for (&id, entry) in &self.entries {
             if !entry.domain.paused() || entry.owned || seen.contains(&id) {
@@ -259,6 +285,9 @@ impl<C: Cpu> Domains<C> {
             }) {
                 continue;
             }
+            if self.source_group(&ids) != source {
+                continue;
+            }
             let taken = Instant::now();
             let requested = ids
                 .iter()
@@ -274,6 +303,7 @@ impl<C: Cpu> Domains<C> {
             for id in &ids {
                 let entry = self.entries.get_mut(id).unwrap();
                 entry.owned = true;
+                entry.source_owned = source;
                 jobs.append(&mut entry.jobs);
             }
             let requesters = jobs
@@ -290,6 +320,7 @@ impl<C: Cpu> Domains<C> {
                 quiescent,
                 taken,
                 requesters,
+                source_owned: source,
             });
         }
         None
@@ -304,6 +335,7 @@ impl<C: Cpu> Domains<C> {
             assert!(entry.jobs.is_empty());
             entry.domain.pause();
             entry.owned = true;
+            entry.source_owned = checkpoint.source_owned;
             entry.mm_only = checkpoint.mm_only;
             entry.proc_reads = checkpoint.proc_reads;
             entry.requested = Some(checkpoint.requested);
@@ -338,6 +370,7 @@ impl<C: Cpu> Domains<C> {
             let entry = self.entries.get_mut(id).unwrap();
             assert!(entry.owned);
             entry.owned = false;
+            entry.source_owned = false;
             entry.notified = false;
         }
         ids.retain(|id| {
@@ -407,6 +440,48 @@ mod tests {
     impl trames_engine::ExecutionInterrupt for Interrupt {
         fn request_exit(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn custody_release_before_or_after_queue_publication_preserves_the_original_checkpoint() {
+        for early in [false, true] {
+            let epoch = Epoch::new(Arc::new(Control::new(10000)));
+            let mut memory = memory();
+            epoch.add(job(
+                1,
+                Box::new(memory.parallel_view(&mut Default::default()).unwrap()),
+                &epoch,
+            ));
+            let caller = epoch.take(0).unwrap();
+            let original = (&*caller) as *const Job as usize;
+            epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 1 });
+            let checkpoint = epoch.take_checkpoint().unwrap();
+            let object = trames_shared::Custody::new(0);
+            let held = object.borrow_mut();
+            let signal = trames_vfs::IoSignal::new(0, epoch.io_target.clone());
+            let subscription = object.subscribe(&signal);
+            let held = if early {
+                drop(held);
+                None
+            } else {
+                Some(held)
+            };
+            epoch.defer_checkpoint(checkpoint, signal, vec![subscription]);
+            if !early {
+                assert!(epoch.take_checkpoint().is_none());
+            }
+            drop(held);
+            let checkpoint = epoch.take_checkpoint().expect("latched resource release");
+            assert_eq!((&*checkpoint.jobs[0]) as *const Job as usize, original);
+            assert!(epoch.take_checkpoint().is_none(), "one claim per wake");
+            epoch.restore_checkpoint(checkpoint, false);
+            epoch.stop();
+            let done = epoch.drain();
+            assert_eq!(done.len(), 1);
+            assert!(matches!(
+                done[0].outcome,
+                Some(SliceOutcome::Syscall { instructions: 1 })
+            ));
         }
     }
     #[test]
@@ -559,7 +634,7 @@ mod tests {
         fn writable(&self) -> bool {
             true
         }
-        fn next_page(&self, _: u64) -> Result<std::rc::Rc<dyn PageBacking>, MemoryError> {
+        fn next_page(&self, _: u64) -> Result<std::sync::Arc<dyn PageBacking>, MemoryError> {
             Err(MemoryError::InvalidRange)
         }
     }
@@ -571,7 +646,7 @@ mod tests {
     fn map(m: &mut Memory, address: u64, page: Arc<SharedPage>) {
         m.map_backed(
             address,
-            vec![std::rc::Rc::new(Backing(page))],
+            vec![Arc::new(Backing(page))],
             true,
             Permissions::RW,
             false,
@@ -581,6 +656,7 @@ mod tests {
     fn job(pid: u32, view: Box<trames_memory::parallel::View>, epoch: &Arc<Epoch>) -> Box<Job> {
         Job::new(
             Work {
+                task: None,
                 audio: None,
                 pid,
                 cpu: Default::default(),

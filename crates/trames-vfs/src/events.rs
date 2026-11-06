@@ -317,8 +317,8 @@ impl Vfs {
         // Membership changes invalidate this object index. Rearm/disarm/read
         // stay on the original shared timer, so no FD snapshot or stale copied
         // deadline is needed on the scheduler's ordinary polling path.
-        let version = self.fds.identity();
-        version
+        let cache = self.fds.cache();
+        cache
             .timers
             .get_or_init(|| {
                 let mut timers = BTreeMap::new();
@@ -329,7 +329,7 @@ impl Vfs {
                             .or_insert_with(|| Arc::downgrade(timer));
                     }
                 }
-                timers.into_values().collect()
+                timers.into_values().collect::<Vec<_>>().into()
             })
             .iter()
             .filter_map(std::sync::Weak::upgrade)
@@ -809,14 +809,14 @@ mod timer_index_tests {
             .unwrap();
         assert_eq!(parent.next_timerfd_deadline(), Some(first));
         let cached = parent.fds.identity();
-        assert_eq!(cached.timers.get().unwrap().len(), 1);
+        assert_eq!(parent.fds.cache().timers.get().unwrap().len(), 1);
         let mut child = parent.clone();
         let mut shared = parent.clone_with_files(true);
         let second = first + Duration::from_secs(10);
         resource.update(Some((Duration::ZERO, Some(second))));
         assert_eq!(parent.next_timerfd_deadline(), Some(second));
         assert!(
-            Rc::ptr_eq(&cached, &parent.fds.identity()),
+            Arc::ptr_eq(&cached, &parent.fds.identity()),
             "timer updates cannot rebuild the FD index"
         );
         child.close(timer).unwrap();
@@ -841,11 +841,11 @@ mod timer_index_tests {
         }
         assert_eq!(v.next_timerfd_deadline(), None);
         let version = v.fds.identity();
-        assert!(version.timers.get().unwrap().is_empty());
+        assert!(v.fds.cache().timers.get().unwrap().is_empty());
         for _ in 0..128 {
             assert_eq!(v.next_timerfd_deadline(), None);
         }
-        assert!(Rc::ptr_eq(&version, &v.fds.identity()));
+        assert!(Arc::ptr_eq(&version, &v.fds.identity()));
         let timer = v.timerfd(1, 0).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         v.timerfd_set(timer, Duration::ZERO, Some(deadline))

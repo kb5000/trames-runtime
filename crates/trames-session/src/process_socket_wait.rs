@@ -118,7 +118,7 @@ fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services(
             (1, vec![0, carried as u64, 1, 1, 0], 42u64),
             (2, vec![1, 0, carried as u64], 99u64),
         ] {
-            let task = k.processes.get_mut(&pid).unwrap();
+            let task = &mut *k.processes.get_mut(&pid).unwrap();
             for (index, value) in expected.into_iter().enumerate() {
                 assert_eq!(
                     task.memory.read_u64(0x1c00 + index as u64 * 8).unwrap(),
@@ -268,7 +268,7 @@ fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
                 .unwrap());
             assert!(Instant::now() < until);
         }
-        let p = &k.processes[&1];
+        let p = &k.processes.read(&1);
         for (index, expected) in [
             publish.len() as u64,
             (-13i64) as u64,
@@ -284,7 +284,7 @@ fn netfilter_publication_updates_captured_tcp_without_joining_other_workers() {
                 "slots={slots} index={index}"
             );
         }
-        assert_eq!(k.processes[&2].memory.read_u64(0x1c00).unwrap(), 8);
+        assert_eq!(k.processes.read(&2).memory.read_u64(0x1c00).unwrap(), 8);
         let mut bytes = [0; 1];
         std::io::Read::read_exact(&mut host, &mut bytes).unwrap();
         assert_eq!(bytes, *b"x");
@@ -431,8 +431,8 @@ fn netlink_link_changes_wake_poll_and_message_receivers_on_one_or_two_workers() 
             );
             assert!(Instant::now() < until);
         }
-        let p = &k.processes[&1];
-        let peer = &k.processes[&2];
+        let p = &k.processes.read(&1);
+        let peer = &k.processes.read(&2);
         assert_eq!(p.memory.read_u64(0x1c00).unwrap(), 1);
         assert!(p.memory.read_u64(0x1c08).unwrap() >= 32);
         assert_eq!(
@@ -612,7 +612,7 @@ fn raw_ip_scalar_vector_pairs_run_without_owner_on_native_and_packet_stack_trans
                         assert!(Instant::now() < until);
                     }
                     for (pid, first, second) in [(1, b"abc", b"xyz"), (2, b"def", b"ghi")] {
-                        let p = &k.processes[&pid];
+                        let p = &k.processes.read(&pid);
                         for i in 0..4 {
                             assert_eq!(p.memory.read_u64(0x1800+i*8).unwrap(),3,"virtual={virtual_network} family={family} stream={stream} slots={slots} pid={pid} call={i}");
                         }
@@ -766,7 +766,7 @@ fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
                     k.processes
                         .iter()
                         .map(|(id, p)| (
-                            *id,
+                            id,
                             matches!(p.state, State::Ready),
                             matches!(p.state, State::Blocked(..)),
                             p.cpu.pc,
@@ -788,7 +788,7 @@ fn native_ip_messages_and_batches_release_slots_and_keep_one_filter_decision() {
                 (1, vec![3, 3, 3, 3], b"abc", b"xyz"),
                 (2, vec![2, 3, 3], b"def", b"ghi"),
             ] {
-                let p = &k.processes[&pid];
+                let p = &k.processes.read(&pid);
                 for (index, value) in results.into_iter().enumerate() {
                     assert_eq!(
                         p.memory.read_u64(0x1800 + index as u64 * 8).unwrap(),
@@ -892,12 +892,12 @@ fn native_message_epipe_hands_only_saved_task_effects_to_owner() {
                 assert!(Instant::now() < until);
             }
             assert_eq!(
-                k.processes[&1].memory.read_u64(0x1800).unwrap(),
+                k.processes.read(&1).memory.read_u64(0x1800).unwrap(),
                 0u64.wrapping_sub(32)
             );
-            assert_eq!(k.processes[&1].seccomp.evaluations(), 3);
+            assert_eq!(k.processes.read(&1).seccomp.evaluations(), 3);
             assert_eq!(
-                k.processes[&1].signals.io.inbox.contains_key(&13),
+                k.processes.read(&1).signals.io.inbox.contains_key(&13),
                 !no_signal
             );
             if no_signal {
@@ -1026,10 +1026,10 @@ fn blocking_accept_returns_the_only_slot_for_a_connecting_peer_without_service()
             assert!(k
                 .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
                 .unwrap(), "cohort refused: instructions={} rounds={} states={:?} accepted={:?} connected={:?}", k.instructions, k.parallel_rounds,
-                k.processes.iter().map(|(id,p)| (*id,matches!(p.state,State::Ready),matches!(p.state,State::Blocked(..)),matches!(p.state,State::Zombie(_)))).collect::<Vec<_>>(),
-                k.processes[&1].memory.read_u64(0x1800), k.processes[&2].memory.read_u64(0x1810));
-            let accepted = k.processes[&1].memory.read_u64(0x1800).unwrap();
-            let connected = k.processes[&2].memory.read_u64(0x1810).unwrap();
+                k.processes.iter().map(|(id,p)| (id,matches!(p.state,State::Ready),matches!(p.state,State::Blocked(..)),matches!(p.state,State::Zombie(_)))).collect::<Vec<_>>(),
+                k.processes.read(&1).memory.read_u64(0x1800), k.processes.read(&2).memory.read_u64(0x1810));
+            let accepted = k.processes.read(&1).memory.read_u64(0x1800).unwrap();
+            let connected = k.processes.read(&2).memory.read_u64(0x1810).unwrap();
             if accepted != u64::MAX && connected != u64::MAX {
                 assert!(accepted >= 4 && accepted < trames_vfs::MAX_FDS as u64);
                 assert_eq!(connected, 0);
@@ -1041,7 +1041,7 @@ fn blocking_accept_returns_the_only_slot_for_a_connecting_peer_without_service()
         assert!(k.worker_io_waits > 0, "blocking accept never parked");
         assert!(k.worker_socket_syscalls >= 2);
         if filtered {
-            assert_eq!(k.processes[&1].seccomp.evaluations(), k.syscalls);
+            assert_eq!(k.processes.read(&1).seccomp.evaluations(), k.syscalls);
         }
     }
 }
@@ -1200,7 +1200,7 @@ fn all_blocked_related_accepts_are_adopted_without_an_interactive_service() {
         .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
         .unwrap());
     // A budget boundary may join before the second pinned task runs.
-    if k.processes[&2].memory.read_u64(0x1800).unwrap() == u64::MAX {
+    if k.processes.read(&2).memory.read_u64(0x1800).unwrap() == u64::MAX {
         assert!(k
             .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 200_000, true)
             .unwrap());
@@ -1296,12 +1296,13 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
         p.linux.vfs.close(replacement).unwrap();
     }
     assert!(
-        k.processes[&2].linux.vfs.poll(tx, 16) & 16 == 0,
+        k.processes.read(&2).linux.vfs.poll(tx, 16) & 16 == 0,
         "accepted call retains its original local OFD"
     );
     filter(&mut k, &mut p, 0x5000d);
     k.processes.insert(1, p);
-    let peer = k.processes.get_mut(&2).unwrap();
+    let mut custody = k.processes.get_mut(&2).unwrap();
+    let peer = &mut *custody;
     peer.memory
         .protect(0x4000, PAGE_SIZE, Permissions::RW)
         .unwrap();
@@ -1318,13 +1319,14 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
             0x14000000,
         ],
     );
+    drop(custody);
     let until = Instant::now() + Duration::from_secs(3);
     loop {
         let limit = k.instructions + 100_000;
         assert!(k
             .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
             .unwrap());
-        if k.processes[&1].memory.read_u64(0x1808).unwrap() == error(Errno(13)) {
+        if k.processes.read(&1).memory.read_u64(0x1808).unwrap() == error(Errno(13)) {
             break;
         }
         assert!(
@@ -1332,8 +1334,8 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
             "retained filtered message did not progress"
         );
     }
-    let peer_hangup = k.processes[&2].linux.vfs.poll(tx, 16);
-    let p = k.processes.get_mut(&1).unwrap();
+    let peer_hangup = k.processes.read(&2).linux.vfs.poll(tx, 16);
+    let p = &mut *k.processes.get_mut(&1).unwrap();
     assert_eq!(p.memory.read_u64(0x1800).unwrap(), 4);
     let imported = u32::from_le_bytes(p.memory.read_array(0x1310).unwrap());
     assert_eq!(p.linux.vfs.read(imported, 8).unwrap(), 19u64.to_le_bytes());
@@ -2158,17 +2160,17 @@ fn unix_blocking_accept_returns_its_slot_for_a_connecting_peer_without_services(
                     "filtered={filtered} slots={slots}: Unix accept/connect did not progress"
                 );
             }
-            assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 4);
-            assert_eq!(k.processes[&1].memory.read_u64(0x1808).unwrap(), 1);
+            assert_eq!(k.processes.read(&1).memory.read_u64(0x1800).unwrap(), 4);
+            assert_eq!(k.processes.read(&1).memory.read_u64(0x1808).unwrap(), 1);
             assert_eq!(
-                k.processes[&1].memory.read_array::<1>(0x1100).unwrap(),
+                k.processes.read(&1).memory.read_array::<1>(0x1100).unwrap(),
                 *b"x"
             );
-            assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 0);
+            assert_eq!(k.processes.read(&2).memory.read_u64(0x1800).unwrap(), 0);
             assert_eq!(k.service_requests, 0);
             assert_eq!(k.syscalls, 9);
             if filtered {
-                assert_eq!(k.processes[&1].seccomp.evaluations(), 9);
+                assert_eq!(k.processes.read(&1).seccomp.evaluations(), 9);
             }
             assert!(k.worker_io_waits > 0);
         }
@@ -2358,10 +2360,10 @@ fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
                 "slots={slots}: backlog wait did not progress"
             );
         }
-        assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 0);
-        assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 6);
-        assert_eq!(k.processes[&2].memory.read_u64(0x1808).unwrap(), 7);
-        assert_eq!(k.processes[&1].seccomp.evaluations(), 7);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x1800).unwrap(), 0);
+        assert_eq!(k.processes.read(&2).memory.read_u64(0x1800).unwrap(), 6);
+        assert_eq!(k.processes.read(&2).memory.read_u64(0x1808).unwrap(), 7);
+        assert_eq!(k.processes.read(&1).seccomp.evaluations(), 7);
         assert_eq!(k.service_requests, 0);
         if slots == 1 {
             assert!(k.worker_io_waits > 0);
@@ -2483,18 +2485,18 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                         let limit = k.instructions + 100_000;
                         assert!(k
                         .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
-                        .unwrap(), "send={send} filtered={filtered} slots={slots} syscalls={} services={} states={:?}", k.syscalls, k.service_requests, k.processes.iter().map(|(id,p)| (*id, match p.state { State::Blocked(n,_) => n, State::Futex{..} => 98, State::Ready=>0, _=>999 }, p.cpu.x(0), p.cpu.x(8), p.byte_wait.as_ref().map(|w| (w.signal.ready(),w.retained_byte.as_ref().and_then(|f|f.local_message_entry()).map(|e|e.0))), p.linux.vfs.readable_bytes(rx), p.retained_byte.as_ref().map(|f| f.local_message_entry()))).collect::<Vec<_>>());
+                        .unwrap(), "send={send} filtered={filtered} slots={slots} syscalls={} services={} states={:?}", k.syscalls, k.service_requests, k.processes.iter().map(|(id,p)| (id, match p.state { State::Blocked(n,_) => n, State::Futex{..} => 98, State::Ready=>0, _=>999 }, p.cpu.x(0), p.cpu.x(8), p.byte_wait.as_ref().map(|w| (w.signal.ready(),w.retained_byte.as_ref().and_then(|f|f.local_message_entry()).map(|e|e.0))), p.linux.vfs.readable_bytes(rx), p.retained_byte.as_ref().map(|f| f.local_message_entry()))).collect::<Vec<_>>());
                         assert!(Instant::now()<until,"send={send} filtered={filtered} slots={slots}: datagram wait did not progress");
                     }
                     assert_eq!(
-                        k.processes[&1].memory.read_u64(0x1800).unwrap(),
+                        k.processes.read(&1).memory.read_u64(0x1800).unwrap(),
                         4,
                         "send={send}"
                     );
-                    assert_eq!(k.processes[&2].memory.read_u64(0x1800).unwrap(), 512);
-                    assert_eq!(k.processes[&2].memory.read_u64(0x1808).unwrap(), 4);
+                    assert_eq!(k.processes.read(&2).memory.read_u64(0x1800).unwrap(), 512);
+                    assert_eq!(k.processes.read(&2).memory.read_u64(0x1808).unwrap(), 4);
                     assert_eq!(
-                        k.processes[&2].memory.read_array::<4>(0x1400).unwrap(),
+                        k.processes.read(&2).memory.read_array::<4>(0x1400).unwrap(),
                         *b"data"
                     );
                     assert_eq!(
@@ -2503,7 +2505,7 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                     );
                     assert_eq!(k.syscalls, 5);
                     if filtered {
-                        assert_eq!(k.processes[&1].seccomp.evaluations(), 5);
+                        assert_eq!(k.processes.read(&1).seccomp.evaluations(), 5);
                     }
                     if slots == 1 {
                         assert!(k.worker_io_waits > 0);
@@ -2616,25 +2618,29 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                         "batch capacity wait did not progress"
                     );
                 }
-                assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 2);
+                assert_eq!(k.processes.read(&1).memory.read_u64(0x1800).unwrap(), 2);
                 for (offset, count) in [(0, 512), (8, 4), (16, 4)] {
                     assert_eq!(
-                        k.processes[&2].memory.read_u64(0x1800 + offset).unwrap(),
+                        k.processes
+                            .read(&2)
+                            .memory
+                            .read_u64(0x1800 + offset)
+                            .unwrap(),
                         count
                     );
                 }
                 assert_eq!(
-                    k.processes[&2].memory.read_array::<4>(0x1400).unwrap(),
+                    k.processes.read(&2).memory.read_array::<4>(0x1400).unwrap(),
                     *b"data"
                 );
                 assert_eq!(
-                    k.processes[&2].memory.read_array::<4>(0x1410).unwrap(),
+                    k.processes.read(&2).memory.read_array::<4>(0x1410).unwrap(),
                     *b"data"
                 );
                 assert_eq!(k.service_requests, 0);
                 assert_eq!(k.syscalls, 6);
                 if filtered {
-                    assert_eq!(k.processes[&1].seccomp.evaluations(), 6);
+                    assert_eq!(k.processes.read(&1).seccomp.evaluations(), 6);
                 }
                 if slots == 1 {
                     assert!(k.worker_io_waits > 0);
@@ -2725,13 +2731,13 @@ fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filt
                 .unwrap());
             assert!(Instant::now() < until);
         }
-        assert_eq!(k.processes[&1].memory.read_u64(0x1800).unwrap(), 1);
-        assert_eq!(k.processes[&1].seccomp.evaluations(), 3);
+        assert_eq!(k.processes.read(&1).memory.read_u64(0x1800).unwrap(), 1);
+        assert_eq!(k.processes.read(&1).seccomp.evaluations(), 3);
         assert_eq!(
-            k.processes[&1].signals.io.inbox.contains_key(&13),
+            k.processes.read(&1).signals.io.inbox.contains_key(&13),
             !no_signal
         );
-        let p = k.processes.get_mut(&1).unwrap();
+        let p = &mut *k.processes.get_mut(&1).unwrap();
         assert_eq!(p.linux.vfs.read(rx, 4).unwrap(), b"data");
         assert_eq!(p.linux.vfs.read(rx, 4), Err(Errno(11)));
     }

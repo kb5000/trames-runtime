@@ -12,6 +12,7 @@ mod futex;
 mod gpu;
 mod proc_views;
 mod process;
+mod retired_memory;
 mod run_queue;
 mod signal_actions;
 mod space;

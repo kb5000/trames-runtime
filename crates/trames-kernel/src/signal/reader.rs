@@ -21,7 +21,7 @@ impl trames_vfs::SignalReader for TaskReader {
         if info.fault.is_none() && info.poll.is_none() {
             info.sender = self.namespace.local(info.sender);
         }
-        Some(write_signalfd(sig, info))
+        Some(write_signalfd(sig, *info))
     }
     fn subscribe(&self, signal: &Arc<trames_vfs::IoSignal>) -> Vec<trames_vfs::IoSubscription> {
         self.task.subscribe(signal)
