@@ -1192,7 +1192,10 @@ mod tests {
         assert!(k
             .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
             .unwrap());
-        assert!(matches!(k.processes.read(&1).state, State::Policy(_)));
+        assert!(matches!(
+            k.processes.read(&1).state,
+            State::Policy(_) | State::Barrier(_)
+        ));
         assert_eq!(k.processes.read(&2).cpu.x(28), 77);
         assert_eq!(k.worker_syscalls, 1);
         {
@@ -1986,6 +1989,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -2218,6 +2222,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -2327,6 +2332,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
                     diagnostics: None,
+                    membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2461,6 +2467,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
                     diagnostics: None,
+                    membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2581,6 +2588,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
                     diagnostics: None,
+                    membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2710,6 +2718,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -3702,6 +3711,7 @@ mod tests {
         let mut snapshot = crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -4007,6 +4017,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
                     diagnostics: None,
+                    membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -4059,6 +4070,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4120,6 +4132,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4174,6 +4187,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4238,6 +4252,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4302,6 +4317,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4368,6 +4384,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
                 diagnostics: None,
+                membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4429,6 +4446,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
                     diagnostics: None,
+                    membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,

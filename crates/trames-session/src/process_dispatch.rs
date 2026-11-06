@@ -133,6 +133,8 @@ impl Dispatch {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(trames_kernel::children::Wait { number, args }),
             ))
+        } else if let State::Barrier(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Barrier(wait.clone()))
         } else if let State::Policy(wait) = &p.state {
             Some(crate::run_queue::WaitState::Policy(wait.clone()))
         } else if let State::Namespace(wait) = &p.state {
@@ -173,6 +175,7 @@ impl Dispatch {
             syscalls: Some(crate::worker_syscalls::Snapshot {
                 owner_syscalls: p.linux.trace,
                 diagnostics: Some(p.linux.syscall_diagnostics(id)),
+                membarrier_registered: Some(p.membarrier_registered.clone()),
                 vfork_release: p.vfork.clone(),
                 native_space: Some(p.space.clone()),
                 namespaces: Some(namespaces),

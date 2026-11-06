@@ -26,6 +26,7 @@ pub(super) enum WaitState {
     Completion(Arc<CompletionWait>),
     Namespace(Arc<NamespaceWait>),
     Policy(Arc<PolicyWait>),
+    Barrier(Arc<crate::barrier::Wait>),
     /// Retry the retained pending CPU syscall after original task/mm custody.
     /// This is not a completed guest wait and must not overwrite its arguments.
     Custody(Arc<crate::process::tasks::AdmissionWait>),
@@ -186,6 +187,7 @@ impl WaitState {
             | Self::Completion(_)
             | Self::Namespace(_)
             | Self::Policy(_)
+            | Self::Barrier(_)
             | Self::Custody(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
@@ -515,7 +517,7 @@ impl<C: Cpu> Job<C> {
         Some(
             matches!(
                 self.waiting,
-                Some(WaitState::Namespace(_) | WaitState::Policy(_))
+                Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_))
             ) || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
@@ -585,7 +587,8 @@ impl<C: Cpu> Job<C> {
                     .as_ref()
                     .is_some_and(|g| g.compile.is_some() && !g.waiting())
                 || (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
-                    || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready()))
+                    || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
+                    || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
                 || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished())
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
@@ -593,7 +596,8 @@ impl<C: Cpu> Job<C> {
                 });
         }
         if (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
-            || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready()))
+            || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
+            || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
         {
             return true;
         }
@@ -625,7 +629,7 @@ impl<C: Cpu> Job<C> {
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_)))
+                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_)))
                             || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
@@ -788,6 +792,26 @@ pub(super) struct Epoch<C: Cpu> {
     persistent: bool,
 }
 impl<C: Cpu> Epoch<C> {
+    pub fn memory_barrier(
+        &self,
+        original: u64,
+        global: bool,
+        caller: usize,
+    ) -> Arc<crate::barrier::Request> {
+        let request = crate::barrier::Request::new();
+        let domains = self
+            .queues
+            .lock()
+            .unwrap()
+            .domains
+            .barrier_domains(original, global);
+        // Do not notify/drop acknowledgement resources under the queue lock.
+        for domain in domains {
+            domain.barrier(&request, caller);
+        }
+        request.acknowledge();
+        request
+    }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub fn new(control: Arc<Control>) -> Arc<Self> {
         Self::configured(control, None, false)
@@ -1044,6 +1068,9 @@ impl<C: Cpu> Epoch<C> {
                 wait.bind(&snapshot.io_signals, &signal);
             }
             if let Some(WaitState::Namespace(wait)) = &job.waiting {
+                wait.bind(&signal);
+            }
+            if let Some(WaitState::Barrier(wait)) = &job.waiting {
                 wait.bind(&signal);
             }
             if let Some(WaitState::Policy(wait)) = &job.waiting {

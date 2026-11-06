@@ -1,14 +1,23 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 61, generated syscall
-dispatch recognition and source completion of unimplemented entries, reviewed on 2026-11-07.
-The prior runtime baseline is `a1b8759dff09e2b8e1fa85607cde25e73b71544c`.
+This is the consolidated implementation audit through stage 62, original execution-lease
+memory barriers and their complete waiting/lifecycle consumers, reviewed on 2026-11-07.
+The prior runtime baseline is `c2d8643c924def8ff813b2d31de3dfc54cd64c26`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 61 generates entry recognition from the actual
+The Kernel owner still exists. Stage 62 moves the supported membarrier subsystem
+to original execution leases: query/registration and errors complete locally;
+private barriers visit the original mm, global barriers visit this Linux instance's
+current execution domains. Requested actors acknowledge hardware fences before the
+caller completes. Busy requests return the CPU slot; no View export, mm pause or
+page-table publication is introduced. Native bodies and scoped mapping execution
+participate in the same lease protocol. Fork/CLONE_VM/exec retain their original
+registration semantics.
+
+Stage 61 generates entry recognition from the actual
 Linux and session dispatch arms. Truly unimplemented syscall numbers now complete
 with the original ENOSYS diagnostic on the calling worker, after one seccomp
 decision. Known handlers, explicit tracing and legacy diagnostic-less embeddings
@@ -48,6 +57,7 @@ is not a claim that all coordinator work is removed.
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
 | Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
+| Memory barriers | Supported membarrier query/register/private/global/get-registrations run on source workers; original active execution leases acknowledge requested fences | Tracing and capability-less/solo embeddings keep their joined path. Unsupported sync-core/rseq/global-expedited commands remain unsupported. Ordinary memory accesses acquire no new synchronization |
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
@@ -1918,3 +1928,67 @@ zero overhead or identify the fixed-latency cause. No extra policy check was add
 to the early denial path, but scheduling/initial memory publication and generated
 code layout remain possible contributors requiring separate evidence. Do not
 translate the unknown-call gains into Firefox/Geekbench scores.
+
+
+## 62. Original execution-lease memory barriers — 2026-11-07
+
+The existing membarrier commands 0/1/8/16/512 share one ABI implementation. Query,
+registration, missing-registration and invalid-command/flag results execute on the
+calling worker. Cmd/flags consume their Linux 32-bit arguments, including register
+high bits; native Linux validates that correction. The advertised command mask is
+unchanged. Registration is the original per-mm atomic: CLONE_VM shares it, fork
+copies it, and exec resets the replacement mm. No owner collection is needed for
+queries or publication.
+
+An actual barrier performs a full host fence before visiting execution domains.
+A private request visits only its original mm; global visits the current domains
+of this userspace Linux instance. Under each original domain's existing mutex,
+the request retains acknowledgement tokens for active execution leases and asks
+their existing CPU interrupt handles to return. Leases are published before any
+CPU or synchronous native work, including the pre-entry window. One host fence on
+retirement acknowledges all requests accepted by that lease. The caller's own
+lease is excluded because it is already executing the pre-barrier fence. A seeded
+counter prevents early completion while other domains are being visited. Acquire
+completion followed by the caller's full fence orders the return. The request is
+not a substitute for the actual CPU fences.
+
+Quiescent lease withdrawal and new admission use the same original domain mutex;
+publication/withdrawal and the request's observation cannot pass each other without
+that synchronization. New entrants after a domain visit observe its publication.
+The proof assumes the supported coherent AArch64 host and backends that do not mark
+guest/native execution as pure or readonly to the compiler. Existing shared-byte
+access, permissions, atomic operations and guest weak ordering stay unchanged.
+Only actual barriers add full fences; ordinary lease retirement does not. The
+worker reuses its existing exit-state check for pause or requested acknowledgement,
+with a reusable per-worker flag rather than another per-SVC polling mechanism.
+
+A scoped mapping batch can execute guest instructions with root-mm custody, so its
+actual execution also publishes a scoped lease, even though its queue domain is
+structurally paused. Existing workers and interrupts serve it; there is no new
+thread. Synchronous native bodies remain registered until they really return.
+A blocked/native executor cannot be counted as acknowledged just because another
+worker observed a metadata flag. No syscall/native body holds the domain mutex.
+
+One retained barrier wait owns readiness and acknowledgement resources only. The
+caller releases its CPU slot and keeps the same View, accepted operation and policy
+decision. Caught signals/STOP defer completion without replaying the SVC; fatal
+exit/cancel can discard the waiter while original leases finish their tokens.
+Cohort handoff retains and rebinds the original wait; no numeric PID/mm relookup
+redirects an accepted request. Legacy/solo/traced callers use the same ABI with
+their existing joined execution boundary.
+
+The ordering design follows the entry/remote/return roles described in
+[Linux's implementation](https://github.com/torvalds/linux/blob/master/kernel/sched/membarrier.c)
+and the [membarrier ABI manual](https://man7.org/linux/man-pages/man2/membarrier.2.html).
+Tests inspect original lease participation, native pre-entry, cancellation,
+concurrent requests, scoped execution, single-slot progress and retained Views.
+Both local runtime workflows, 400 process tests per host, iPad compile targets and
+30 real HVF/interpreter cases pass. The real cases cover private/global, ALLOW,
+1/4/12 CPUs, native Linux argument checks and the full fork/exec compatibility
+fixture. The fixture is not a probabilistic weak-memory proof.
+
+See [raw validation and timing controls](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-membarrier-20261107.json).
+The coordinator, actual host lifecycle, explicit tracing, unsupported operations,
+excluded resource bodies and exceptional native/memory publication remain in the
+current inventory. Global here does not synchronize other host applications or
+GPU DMA; native device API synchronization retains its own contract.

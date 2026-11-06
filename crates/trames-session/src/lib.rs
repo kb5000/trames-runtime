@@ -6,6 +6,7 @@ use std::fmt;
 use trames_elf::{ElfError, LoadedElf};
 use trames_engine::{Cpu, CpuFault};
 use trames_linux::{GuestOutput, Linux};
+mod barrier;
 mod clock;
 mod devices;
 mod exit_groups;

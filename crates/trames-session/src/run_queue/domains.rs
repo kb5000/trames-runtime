@@ -10,7 +10,12 @@ use std::sync::{atomic::AtomicBool, mpsc::Sender};
 pub(crate) struct Domain {
     pub id: u64,
     paused: AtomicBool,
-    interrupts: Mutex<BTreeMap<usize, Arc<dyn trames_engine::ExecutionInterrupt>>>,
+    interrupts: Mutex<BTreeMap<usize, Active>>,
+}
+struct Active {
+    interrupt: Option<Arc<dyn trames_engine::ExecutionInterrupt>>,
+    pending: Arc<AtomicBool>,
+    barriers: Vec<Arc<crate::barrier::Request>>,
 }
 
 /// Bound once per running job, not per instruction, syscall or CPU slice.
@@ -19,37 +24,116 @@ pub(crate) struct Domain {
 pub(crate) struct ExecutionGuard {
     domain: Arc<Domain>,
     slot: usize,
+    pending: Arc<AtomicBool>,
+    scoped: bool,
 }
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
-        self.domain.interrupts.lock().unwrap().remove(&self.slot);
+        let active = self
+            .domain
+            .interrupts
+            .lock()
+            .unwrap()
+            .remove(&self.slot)
+            .expect("original execution lease");
+        // Actual barrier requests order both guest CPU and synchronous native
+        // accesses on this host executor. Ordinary lease retirement adds no fence.
+        if !active.barriers.is_empty() {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            for barrier in active.barriers {
+                barrier.acknowledge();
+            }
+        }
+    }
+}
+impl ExecutionGuard {
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+    pub fn bind_interrupt(&self, interrupt: Arc<dyn trames_engine::ExecutionInterrupt>) -> bool {
+        let mut active = self.domain.interrupts.lock().unwrap();
+        let running = active
+            .get_mut(&self.slot)
+            .expect("original execution lease");
+        running.interrupt = Some(interrupt);
+        (self.scoped || !self.domain.paused()) && !self.pending()
     }
 }
 impl Domain {
-    pub fn bind_interrupt(
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn bind_interrupt(
         self: &Arc<Self>,
         slot: usize,
         interrupt: Arc<dyn trames_engine::ExecutionInterrupt>,
     ) -> Option<ExecutionGuard> {
+        let guard = self.enter(slot, Arc::new(AtomicBool::new(false)))?;
+        guard.bind_interrupt(interrupt).then_some(guard)
+    }
+    pub fn enter(
+        self: &Arc<Self>,
+        slot: usize,
+        pending: Arc<AtomicBool>,
+    ) -> Option<ExecutionGuard> {
+        self.enter_inner(slot, pending, false)
+    }
+    pub fn enter_scoped(self: &Arc<Self>, slot: usize) -> ExecutionGuard {
+        self.enter_inner(slot, Arc::new(AtomicBool::new(false)), true)
+            .expect("owned mapping execution")
+    }
+    fn enter_inner(
+        self: &Arc<Self>,
+        slot: usize,
+        pending: Arc<AtomicBool>,
+        scoped: bool,
+    ) -> Option<ExecutionGuard> {
         let mut active = self.interrupts.lock().unwrap();
-        if self.paused() {
+        if self.paused() && !scoped {
             return None;
         }
+        pending.store(false, Ordering::Relaxed);
         assert!(
-            active.insert(slot, interrupt).is_none(),
+            active
+                .insert(
+                    slot,
+                    Active {
+                        interrupt: None,
+                        pending: pending.clone(),
+                        barriers: Vec::new()
+                    }
+                )
+                .is_none(),
             "one running job per worker"
         );
         Some(ExecutionGuard {
             domain: self.clone(),
             slot,
+            pending,
+            scoped,
         })
+    }
+    pub fn barrier(&self, request: &Arc<crate::barrier::Request>, caller: usize) {
+        let mut active = self.interrupts.lock().unwrap();
+        for (&slot, running) in active.iter_mut() {
+            if slot == caller {
+                continue;
+            }
+            request.add();
+            running.barriers.push(request.clone());
+            running.pending.store(true, Ordering::Relaxed);
+            if let Some(interrupt) = &running.interrupt {
+                interrupt.request_exit();
+            }
+        }
     }
     fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
         // A CPU published before pause is kicked, including a not-yet-entered
         // CPU (the backend must latch the request). A later binder cannot enter.
-        for interrupt in self.interrupts.lock().unwrap().values() {
-            interrupt.request_exit();
+        for active in self.interrupts.lock().unwrap().values() {
+            active.pending.store(true, Ordering::Relaxed);
+            if let Some(interrupt) = &active.interrupt {
+                interrupt.request_exit();
+            }
         }
     }
     pub fn paused(&self) -> bool {
@@ -96,6 +180,16 @@ pub(crate) struct Checkpoint<C: Cpu> {
     requesters: BTreeSet<u32>,
 }
 impl<C: Cpu> Domains<C> {
+    pub fn barrier_domains(&self, original: u64, global: bool) -> Vec<Arc<Domain>> {
+        if global {
+            self.entries
+                .values()
+                .map(|entry| entry.domain.clone())
+                .collect()
+        } else {
+            vec![self.entries[&original].domain.clone()]
+        }
+    }
     pub fn new(events: Option<Sender<crate::workers::Event<C>>>) -> Self {
         Self {
             events,
@@ -546,6 +640,125 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
+    fn domain(id: u64) -> Arc<Domain> {
+        Arc::new(Domain {
+            id,
+            paused: AtomicBool::new(false),
+            interrupts: Mutex::default(),
+        })
+    }
+    #[test]
+    fn a_pending_barrier_returns_the_only_slot_and_keeps_its_original_view() {
+        let epoch = Epoch::new(Arc::new(Control::new(10000)));
+        let mut first = memory();
+        let mut second = memory();
+        for (pid, m) in [(1, &mut first), (2, &mut second)] {
+            epoch.add(job(
+                pid,
+                Box::new(m.parallel_view(&mut Default::default()).unwrap()),
+                &epoch,
+            ));
+        }
+        let mut caller = epoch.take(0).unwrap();
+        assert_eq!(caller.work.pid, 1);
+        let identity = caller.work.memory.as_deref().unwrap() as *const _ as usize;
+        let domain = caller.domain.as_ref().unwrap().clone();
+        let native = domain.enter(3, Arc::new(AtomicBool::new(false))).unwrap();
+        let request = epoch.memory_barrier(domain.id, false, 0);
+        let wait = crate::barrier::Wait::new(request.clone());
+        let wake = trames_vfs::IoSignal::new(1, epoch.io_target.clone());
+        wait.bind(&wake);
+        caller.waiting = Some(WaitState::Barrier(wait.clone()));
+        epoch.park(caller, None);
+        let foreign = epoch.take(0).unwrap();
+        assert_eq!(foreign.work.pid, 2);
+        assert!(!wait.ready());
+        epoch.park(foreign, None);
+        drop(native);
+        let mut found = None;
+        for _ in 0..2 {
+            let next = epoch.take(0).unwrap();
+            if next.work.pid == 1 {
+                found = Some(next);
+                break;
+            }
+            epoch.park(next, None);
+        }
+        let mut caller = found.expect("original barrier readiness woke its caller");
+        assert_eq!(
+            caller.work.memory.as_deref().unwrap() as *const _ as usize,
+            identity
+        );
+        assert_eq!(wait.finish(), Some(0));
+        caller.waiting = None;
+        epoch.park(caller, None);
+        epoch.stop();
+        assert_eq!(epoch.drain().len(), 2);
+    }
+    #[test]
+    fn barriers_cover_native_preentry_scopes_and_original_leases_without_pausing_domains() {
+        let original = domain(1);
+        let unrelated = domain(2);
+        let first = original.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+        let native = original.enter(1, Arc::new(AtomicBool::new(false))).unwrap();
+        let other = unrelated
+            .enter(2, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        let request = crate::barrier::Request::new();
+        original.barrier(&request, 0);
+        request.acknowledge();
+        assert!(native.pending() && !first.pending() && !other.pending());
+        assert!(!request.ready() && !original.paused());
+        let interrupt = Arc::new(Interrupt(Default::default()));
+        assert!(!native.bind_interrupt(interrupt)); // request before CPU binding
+        let late = original.enter(3, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(!late.pending()); // admitted after the barrier publication
+        drop(native);
+        assert_eq!(request.finish(), Some(0));
+        drop((late, first, other));
+        original.pause();
+        let scope = original.enter_scoped(0);
+        let request = crate::barrier::Request::new();
+        original.barrier(&request, 1);
+        request.acknowledge();
+        assert!(scope.pending() && !request.ready());
+        drop(scope);
+        assert_eq!(request.finish(), Some(0));
+    }
+    #[test]
+    fn concurrent_barriers_keep_native_acknowledgements_after_waiter_cancellation() {
+        let original = domain(1);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let value = Arc::new(AtomicU64::new(0));
+        let thread = {
+            let original = original.clone();
+            let value = value.clone();
+            std::thread::spawn(move || {
+                let guard = original.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                value.store(77, Ordering::Relaxed);
+                drop(guard);
+            })
+        };
+        ready.recv().unwrap();
+        let requests: Vec<_> = (0..16)
+            .map(|_| {
+                let r = crate::barrier::Request::new();
+                original.barrier(&r, 1);
+                r.acknowledge();
+                r
+            })
+            .collect();
+        assert!(requests.iter().all(|r| !r.ready()));
+        let cancelled = crate::barrier::Wait::new(requests[0].clone());
+        drop(cancelled);
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(requests.iter().all(|r| r.finish() == Some(0)));
+        assert_eq!(value.load(Ordering::Relaxed), 77);
+    }
     #[test]
     fn custody_release_before_or_after_queue_publication_preserves_the_original_checkpoint() {
         for early in [false, true] {
@@ -596,13 +809,16 @@ mod tests {
             interrupts: Mutex::new(BTreeMap::new()),
         });
         let interrupt = Arc::new(Interrupt(Default::default()));
-        let guard = domain.bind_interrupt(0, interrupt.clone()).unwrap();
+        let guard = domain.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(guard.bind_interrupt(interrupt.clone()));
         domain.pause();
         assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
-        assert!(domain.bind_interrupt(1, interrupt.clone()).is_none());
+        assert!(domain.enter(1, Arc::new(AtomicBool::new(false))).is_none());
         drop(guard);
         domain.paused.store(false, Ordering::Relaxed);
-        drop(domain.bind_interrupt(0, interrupt.clone()).unwrap());
+        let guard = domain.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(guard.bind_interrupt(interrupt.clone()));
+        drop(guard);
         domain.pause();
         assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
     }

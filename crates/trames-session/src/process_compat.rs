@@ -52,38 +52,13 @@ impl<C: Cpu> Kernel<C> {
             .call(p.cpu.sp(), new, old, &mut p.memory)
     }
     pub(super) fn membarrier(p: &Process<C>, command: u64, flags: u64) -> Result<u64, Errno> {
-        if flags != 0 {
-            return Err(Errno(22));
-        }
-        // Every CPU has returned before coordinator syscalls. The joined
-        // checkpoint and host fence order guest, backing and native accesses.
-        match command {
-            0 => Ok(1 | 8 | 16 | 512),
-            16 => {
-                p.membarrier_registered
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(0)
-            }
-            512 => Ok(
-                if p.membarrier_registered
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    16
-                } else {
-                    0
-                },
-            ),
-            8 if !p
-                .membarrier_registered
-                .load(std::sync::atomic::Ordering::Relaxed) =>
-            {
-                Err(Errno(1))
-            }
-            1 | 8 => {
+        match crate::barrier::prepare(&p.membarrier_registered, command, flags)? {
+            crate::barrier::Action::Complete(value) => Ok(value),
+            crate::barrier::Action::Fence(_) => {
+                // Joined/solo callers already own all guest execution actors.
                 std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 Ok(0)
             }
-            _ => Err(Errno(22)),
         }
     }
     pub(super) fn ioprio_get(
@@ -173,6 +148,68 @@ mod tests {
 
     use super::super::tests::{kernel, process};
     use super::*;
+    #[test]
+    fn complete_membarrier_abi_runs_on_sources_without_owner_or_mm_checkpoints() {
+        for (command, flags, registered, expected) in [
+            (0, 0, false, 537i64),
+            (16, 0, false, 0),
+            (512, 0, true, 16),
+            (8, 0, false, -1),
+            (8, 0, true, 0),
+            (1, 0, false, 0),
+            (32, 0, true, -22),
+            (8, 1, true, -22),
+        ] {
+            let mut p = process();
+            p.membarrier_registered
+                .store(registered, std::sync::atomic::Ordering::Relaxed);
+            let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
+            let code = [
+                mov(0, command),
+                mov(1, flags),
+                0xd4000001,
+                0xaa0003f3,
+                0x17fffffc,
+            ];
+            for (n, word) in code.iter().enumerate() {
+                p.memory
+                    .write_array(0x4000 + n as u64 * 4, word.to_le_bytes())
+                    .unwrap();
+            }
+            p.memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            p.cpu.set_x(8, 283);
+            p.signals.io.scheduling.set_affinity(3);
+            let peer = p.fork();
+            peer.family.set_parent(1);
+            let mut k = kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(2);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            assert!(k
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 50_000, true)
+                .unwrap());
+            assert!(k.syscalls > 100);
+            assert!(
+                k.processes.values().all(|p| p.cpu.x(19) == expected as u64),
+                "command {command}"
+            );
+            assert_eq!(k.service_requests, 0);
+            assert!(
+                k.cohort_return_syscalls.is_empty(),
+                "{:?}",
+                k.cohort_return_syscalls
+            );
+            assert_eq!(k.vm_checkpoint_groups, 0);
+        }
+    }
     #[test]
     fn joined_credential_change_publishes_the_resource_signal_origin() {
         let mut k = kernel();

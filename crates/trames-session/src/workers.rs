@@ -627,6 +627,7 @@ impl<C: Cpu> Starter<C> {
                 let mut registry = trames_accel::native::Registry::default();
                 let mut direct_scratch = Vec::new();
                 let mut file_cache = trames_vfs::DiskReadCache::default();
+                let barrier_pending = Arc::new(AtomicBool::new(false));
                 #[cfg(all(test, trames_interpreter_conformance))] let (reply, response) = mpsc::channel();
                 #[cfg(all(test, trames_interpreter_conformance))] let mut reply = Some(reply);
                 while let Ok(command) = receive.recv() {
@@ -650,7 +651,7 @@ impl<C: Cpu> Starter<C> {
                     let mut service = false;
                     let mut vm_checkpoint = false;
                     let mut interrupt_prepared = false;
-                    let mut execution_guard = None;
+                    let execution_guard = domain.as_ref().and_then(|domain| domain.enter(index, barrier_pending.clone()));
                     let control_lease = work.syscalls.as_ref().map(|s|s.io_signals.lifecycle().enter(&s.io_signals,work.pid));
 
                     if let Some(snapshot) = &work.syscalls {
@@ -673,7 +674,7 @@ impl<C: Cpu> Starter<C> {
                             if work.control.stop.load(Ordering::Acquire) {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
-                            if domain.as_ref().is_some_and(|domain| domain.paused()) {
+                            if execution_guard.as_ref().map_or_else(|| domain.as_ref().is_some_and(|domain|domain.paused()), |guard|guard.pending()) {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
@@ -729,7 +730,7 @@ impl<C: Cpu> Starter<C> {
                                         snapshot.io_signals.lifecycle().request_exit(sig as i32);
                                         continue;
                                     }
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -742,7 +743,7 @@ impl<C: Cpu> Starter<C> {
                                         }
                                         continue;
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -784,6 +785,10 @@ impl<C: Cpu> Starter<C> {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(crate::run_queue::WaitState::Barrier(wait)) = &job.waiting {
+                                if let Some(value) = wait.finish() { work.cpu.set_x(0,value); job.waiting=None; continue; }
+                                maintenance=true; break SliceOutcome::Yield { instructions:0 };
                             }
                             if let Some(crate::run_queue::WaitState::Policy(wait)) = &job.waiting {
                                 if wait.ready() {
@@ -984,12 +989,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     };
                                     if let Some(interrupt) = interrupt {
                                         if control_lease.as_ref().is_some_and(|lease|!lease.bind_interrupt(interrupt.clone()) || work.syscalls.as_ref().is_some_and(|s|s.frozen())) {maintenance=true;break SliceOutcome::Yield {instructions:0};}
-                                        if let Some(domain)=&domain {
-                                        let Some(guard) = domain.bind_interrupt(index, interrupt) else {
-                                            yielded = true;
-                                            break SliceOutcome::Yield { instructions: 0 };
-                                        };
-                                        execution_guard = Some(guard);
+                                        if execution_guard.as_ref().is_some_and(|guard| !guard.bind_interrupt(interrupt)) {
+                                            yielded = true; break SliceOutcome::Yield { instructions: 0 };
                                         }
                                     }
                                     interrupt_prepared = true;
@@ -1057,6 +1058,32 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         }
                                         snapshot.io_signals.lifecycle().request_exit(31);
                                         continue;
+                                    }
+                                }
+                                if work.cpu.x(8) as u32 == 283 {
+                                    if let (Some(snapshot),Some(epoch),Some(domain)) = (work.syscalls.as_ref(),epoch.as_ref(),domain.as_ref()) {
+                                        if let Some(registered) = &snapshot.membarrier_registered {
+                                            let began=snapshot.profile.then(Instant::now);
+                                            let result=crate::barrier::prepare(registered,work.cpu.x(0),work.cpu.x(1));
+                                            syscalls+=1;
+                                            match result {
+                                                Ok(crate::barrier::Action::Complete(value)) => work.cpu.set_x(0,value),
+                                                Err(error) => work.cpu.set_x(0,0u64.wrapping_sub(error.0 as u64)),
+                                                Ok(crate::barrier::Action::Fence(scope)) => {
+                                                    let request=epoch.memory_barrier(domain.id,matches!(scope,crate::barrier::Scope::Global),index);
+                                                    if let Some(value)=request.finish() {work.cpu.set_x(0,value);}
+                                                    else {
+                                                        let wait=crate::barrier::Wait::new(request);
+                                                        if let Some(signal)=&snapshot.io_wake {wait.bind(signal);}
+                                                        parked=Some(crate::run_queue::WaitState::Barrier(wait));
+                                                        if let Some(began)=began {syscall_time+=began.elapsed();}
+                                                        break SliceOutcome::Yield {instructions:0};
+                                                    }
+                                                }
+                                            }
+                                            if let Some(began)=began {syscall_time+=began.elapsed();}
+                                            continue;
+                                        }
                                     }
                                 }
                                 if work.syscalls.as_ref().is_some_and(|s| s.namespaces.is_some())
@@ -1793,7 +1820,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     }
                     // Withdraw before requesting a checkpoint: this worker is
                     // already out of guest code and must not kick its next job.
-                    drop(execution_guard.take());
+                    drop(execution_guard);
                     // Reuse credits across native returns. Refund only when this
                     // assignment ends, avoiding a global RMW pair per libc call.
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
@@ -2192,6 +2219,7 @@ mod tests {
         crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,

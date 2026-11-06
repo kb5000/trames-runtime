@@ -108,6 +108,15 @@ impl<C: Cpu> Lifecycle<C> {
             p.cpu = std::mem::take(&mut job.work.cpu);
             p.state = State::Ready;
             let control = p.signals.io.lifecycle().enter(&p.signals.io, pid);
+            // A metadata scope can briefly execute guest code with its root mm.
+            // It participates in global barriers even while its queue domain is
+            // structurally paused; retaining Views is not the execution lease.
+            let execution = batch.then(|| {
+                job.domain
+                    .as_ref()
+                    .expect("mapping domain")
+                    .enter_scoped(slot)
+            });
             let mut extra = false;
             let mut used_window = false;
             loop {
@@ -149,8 +158,25 @@ impl<C: Cpu> Lifecycle<C> {
                     || p.seccomp.mode() != 0
                     || remaining.is_zero()
                     || epoch.control.stopped()
+                    || execution.as_ref().is_some_and(|guard| guard.pending())
                 {
                     break;
+                }
+                match C::execution_interrupt(engine) {
+                    Ok(Some(interrupt)) => {
+                        if execution
+                            .as_ref()
+                            .is_some_and(|guard| !guard.bind_interrupt(interrupt))
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.backend_error = Some(error.to_string());
+                        job.pending_cpu = Some(SliceOutcome::Fault(error));
+                        break;
+                    }
                 }
                 let began = Instant::now();
                 let Some(outcome) = p

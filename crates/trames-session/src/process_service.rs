@@ -190,6 +190,7 @@ mod tests {
         let snapshot = crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,

@@ -99,6 +99,7 @@ enum State {
     Completion(Arc<trames_kernel::completion::Completion>),
     Namespace(Arc<crate::run_queue::NamespaceWait>),
     Policy(Arc<crate::run_queue::PolicyWait>),
+    Barrier(Arc<crate::barrier::Wait>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -165,7 +166,11 @@ impl<C: Cpu> Process<C> {
     fn stop_held(&self) -> bool {
         matches!(
             self.state,
-            State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_) | State::Policy(_)
+            State::Gpu { .. }
+                | State::Blocked(2, _)
+                | State::Namespace(_)
+                | State::Policy(_)
+                | State::Barrier(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.exec_pending.is_some()
             || self.linux.has_pending_mmap()
@@ -192,6 +197,7 @@ impl<C: Cpu> Process<C> {
                     | State::Completion(_)
                     | State::Namespace(_)
                     | State::Policy(_)
+                    | State::Barrier(_)
                     | State::Blocked(95 | 260, _)
             ) || self.worker_io_candidate(id)
                 || self.worker_gpu_candidate())
@@ -284,7 +290,10 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
-        if matches!(self.state, State::Namespace(_) | State::Policy(_)) {
+        if matches!(
+            self.state,
+            State::Namespace(_) | State::Policy(_) | State::Barrier(_)
+        ) {
             return !self.linux.trace;
         }
         if !matches!(self.state, State::Blocked(..)) {
@@ -1710,7 +1719,12 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         }
         let action = p.signals.actions.get(sig as usize);
-        if action.handler > 1 && matches!(p.state, State::Namespace(_) | State::Policy(_)) {
+        if action.handler > 1
+            && matches!(
+                p.state,
+                State::Namespace(_) | State::Policy(_) | State::Barrier(_)
+            )
+        {
             return Ok(false);
         }
         // Submitted regular-file work is not restarted from a guest pointer.
@@ -3740,11 +3754,11 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn parallel_candidate(&self) -> bool {
-        if self
-            .processes
-            .iter()
-            .any(|(id, p)| !p.frozen(id) && !p.linux.trace && matches!(p.state, State::Policy(_)))
-        {
+        if self.processes.iter().any(|(id, p)| {
+            !p.frozen(id)
+                && !p.linux.trace
+                && matches!(p.state, State::Policy(_) | State::Barrier(_))
+        }) {
             return true;
         }
         if self
@@ -3905,7 +3919,7 @@ impl<C: Cpu> Kernel<C> {
                         task.linux.progress_uring(&mut task.memory, id)
                     };
                 }
-                if p.linux.trace || !matches!(p.state, State::Policy(_)) {
+                if p.linux.trace || !matches!(p.state, State::Policy(_) | State::Barrier(_)) {
                     self.resume_event(&mut p);
                 }
                 if self.deliver(id, &mut p).is_err() {
@@ -3971,6 +3985,7 @@ impl<C: Cpu> Kernel<C> {
                         | State::Completion(_)
                         | State::Namespace(_)
                         | State::Policy(_)
+                        | State::Barrier(_)
                 ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
@@ -3979,7 +3994,10 @@ impl<C: Cpu> Kernel<C> {
             && !members.iter().any(|(id, _)| {
                 self.processes.read(id).worker_gpu_candidate()
                     || self.processes.read(id).linux.worker_uring_pending()
-                    || matches!(self.processes.read(id).state, State::Policy(_))
+                    || matches!(
+                        self.processes.read(id).state,
+                        State::Policy(_) | State::Barrier(_)
+                    )
             })
         {
             return Ok(false);
@@ -4472,6 +4490,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
                 crate::run_queue::WaitState::Policy(wait) => State::Policy(wait),
+                crate::run_queue::WaitState::Barrier(wait) => State::Barrier(wait),
                 crate::run_queue::WaitState::Custody(_) => State::Ready,
                 crate::run_queue::WaitState::Completion(wait) => {
                     State::Completion(wait.release.clone())

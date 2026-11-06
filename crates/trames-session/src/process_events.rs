@@ -144,6 +144,14 @@ impl<C: Cpu> Kernel<C> {
         progress
     }
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
+        if let State::Barrier(wait) = &p.state {
+            if let Some(value) = wait.finish() {
+                p.cpu.set_x(0, value);
+                p.state = State::Ready;
+                return true;
+            }
+            return false;
+        }
         if let State::Policy(wait) = &p.state {
             if wait.ready() {
                 if let Some(result) = wait.run() {

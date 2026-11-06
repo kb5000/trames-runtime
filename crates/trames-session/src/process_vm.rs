@@ -1064,7 +1064,8 @@ mod tests {
             (false, 0xff00, false, false),
             (true, 172, false, false),
             (true, 0xff00, false, false),
-            (true, 283, true, false),
+            (true, 283, false, false),
+            (true, 179, true, false),
             (true, 0xff00, true, true),
         ] {
             let mut k = super::super::tests::kernel();

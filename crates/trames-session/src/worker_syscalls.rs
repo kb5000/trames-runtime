@@ -83,6 +83,7 @@ impl ExitResources<'_> {
 pub(super) struct Snapshot {
     pub owner_syscalls: bool,
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
+    pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
     pub namespaces: Option<trames_vfs::TaskNamespaces>,
@@ -1159,6 +1160,7 @@ mod tests {
         let snapshot = Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1299,6 +1301,7 @@ mod tests {
         let snapshot = Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1366,6 +1369,7 @@ mod tests {
         let mut snapshot = Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1477,6 +1481,7 @@ mod tests {
         let snapshot = Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1552,6 +1557,7 @@ mod tests {
         let snapshot = Snapshot {
             owner_syscalls: false,
             diagnostics: None,
+            membarrier_registered: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
