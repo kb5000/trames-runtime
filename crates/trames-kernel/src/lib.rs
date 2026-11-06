@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Execution-independent Linux task state and scheduling policy.
 //! Backend transports, decoders and product integration belong to their callers.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 pub mod children;
 pub mod completion;
 pub mod family;

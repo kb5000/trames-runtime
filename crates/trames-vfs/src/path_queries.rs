@@ -205,6 +205,8 @@ impl Vfs {
         view.detached_mounts = self.detached_mounts.clone();
         view.context.paths.registry = view.mount_registry.clone();
         view.credentials = self.credentials.clone();
+        view.dumpable = self.dumpable.clone();
+        view.kernel_log = self.kernel_log.clone();
         view.uts = self.uts.clone();
         view.network = self.network.clone();
         view.root_network = self.root_network.clone();

@@ -684,8 +684,16 @@ impl<C: Cpu> Kernel<C> {
     fn publish_task_core(&self, id: u32, p: &Process<C>) {
         self.publish_proc_task(id, p);
         self.children_dirty.set(true);
-        self.limit_directory
-            .publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
+        p.signals
+            .io
+            .scheduling
+            .publish_credentials(&p.linux.vfs.credentials);
+        self.limit_directory.publish(
+            id,
+            &p.signals.presence,
+            &p.limits,
+            p.signals.io.credentials(),
+        );
         if matches!(p.state, State::Zombie(_)) {
             return;
         }
@@ -2020,7 +2028,7 @@ impl<C: Cpu> Kernel<C> {
                 trames_kernel::family::Binding {
                     id,
                     group: p.group,
-                    uid: p.linux.vfs.credentials.uid,
+                    credentials: p.signals.io.credentials().clone(),
                     namespace: p.linux.vfs.pid_namespace().clone(),
                     child: p.wait_event.clone(),
                     children: p.children.clone(),
@@ -2054,6 +2062,9 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
         io: &mut impl GuestOutput,
     ) -> Result<Option<u64>, Errno> {
+        if trames_linux::credential_entry(number, a) {
+            return self.credential_call(pid, p, number, a).map(Some);
+        }
         if matches!(number, 93 | 94 | 142..=159 | 167 | 220 | 221 | 281) {
             self.children_dirty.set(true);
         }
@@ -2171,7 +2182,6 @@ impl<C: Cpu> Kernel<C> {
                 self.scheduling(p, number, a).map(Some)
             }
             236 => Self::mempolicy(p, a),
-            90 | 91 => self.capcall(pid, p, number == 91, a).map(Some),
             142 => self.reboot_guest(pid, p, a),
             93 | 94 => {
                 if number == 93 {
@@ -2386,7 +2396,7 @@ impl<C: Cpu> Kernel<C> {
                     let binding = (!threaded).then(|| trames_kernel::family::Binding {
                         id,
                         group: child.group,
-                        uid: child.linux.vfs.credentials.uid,
+                        credentials: child.signals.io.credentials().clone(),
                         namespace: child.linux.vfs.pid_namespace().clone(),
                         child: child.wait_event.clone(),
                         children: child.children.clone(),
@@ -2449,8 +2459,6 @@ impl<C: Cpu> Kernel<C> {
                 write_u32(&mut p.memory, a[1], p.parentage.death_signal())?;
                 Ok(Some(0))
             }
-            167 if a[0] == 3 => Ok(Some(p.linux.vfs.dumpable())),
-            167 if a[0] == 4 => p.linux.vfs.set_dumpable(a[1]).map(|()| Some(0)),
             167 if matches!(a[0], 36 | 37) => match a[0] {
                 36 => {
                     p.family.set_subreaper(a[1] != 0);
@@ -2462,9 +2470,6 @@ impl<C: Cpu> Kernel<C> {
                 }
                 _ => Err(Errno(22)),
             },
-            167 if matches!(a[0], 7 | 8 | 23 | 24 | 27 | 28 | 38 | 39 | 47) => {
-                p.linux.vfs.credentials.caps.prctl(a).map(Some)
-            }
             167 if matches!(a[0], 63 | 64) => {
                 let mut config = p.cpu.sme_config().ok_or(Errno(22))?;
                 if a[0] == 64 {
@@ -2940,7 +2945,8 @@ impl<C: Cpu> Kernel<C> {
                 c.euid, c.egid, c.fsuid, c.fsgid, c.uid, c.gid, c.suid, c.sgid,
             ]
         };
-        let before_ids = ids(&p.linux.vfs.credentials);
+        let before_ids =
+            (!trames_linux::credential_entry(number, a)).then(|| ids(&p.linux.vfs.credentials));
         let socket = p
             .byte_wait
             .as_ref()
@@ -3187,7 +3193,7 @@ impl<C: Cpu> Kernel<C> {
             p.retained_message_owner = None;
         }
         let after_ids = ids(&p.linux.vfs.credentials);
-        if after_ids != before_ids {
+        if let Some(before_ids) = before_ids.filter(|before| *before != after_ids) {
             if after_ids[..4] != before_ids[..4] {
                 p.parentage.set_death_signal(0);
             }

@@ -1,8 +1,8 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 55, original task namespace membership
-and complete Files/fs lifetime, reviewed on 2026-11-06.
-The prior executable baseline is `b06c97a3e83e4ed81a08400cfe2991f224810dae`.
+This is the consolidated implementation audit through stage 56, original task credentials
+and complete permission consumers, reviewed on 2026-11-06.
+The prior executable baseline is `a5c3b6510e69c5c491411318695a6c4ef24157c7`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
@@ -26,7 +26,8 @@ this table or by the number of migration stages.
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export or actual mapping invalidation needs only the original mm admission boundary. Legacy embeddings without a provider keep joined snapshots; task namespace membership mutations and policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
-| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and actual seccomp lifecycle effects remain. Clone namespace creation retains creator-mm custody; credentials and unsupported user/time namespace semantics remain separate |
+| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and actual seccomp lifecycle effects remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
+| Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and seccomp installation/TSYNC or lifecycle decisions retain their boundary; unsupported user namespaces and file capabilities are unchanged |
 | Tracing and mutable security policy | Joined task-policy boundary where required | Installation/TSYNC and signal/termination effects remain. Untraced continuous-worker custody entries finish pure ERRNO/unsupported TRACE/USER_NOTIF decisions before mm quiescence; accepted decisions travel once |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
@@ -46,7 +47,7 @@ The multi-CPU namespace compatibility fixture requests no owner service and has
 no unshare/setns/close_range cohort returns; its final console ioctl still returns.
 These are fixture-specific results, not prevalence in Firefox or all containers.
 
-Credentials/capabilities, task/image construction, structural mapping publication,
+Task/image construction, structural mapping publication,
 actual excluded control bodies, tracing/security and generic unhandled dispatch
 remain separate boundaries. Source-owned control lifetime does not imply that
 every control operation itself has moved to a worker.
@@ -149,7 +150,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec prepares and commits on the original owner at creator-mm custody, including nonleader identity replacement and failed-image recovery. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Unshare/setns task membership, credentials/capabilities and BPF administration still enter the original owner. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. BPF administration retains its original owner boundary. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, legacy epoll creation admission, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
@@ -1042,3 +1043,65 @@ Unsupported user/time namespaces, credentials/capabilities, clone's task graph
 construction, tracing/security effects, excluded control bodies and generic
 unhandled dispatch remain explicit. This completes the supported task namespace
 membership batch, not global coordinator removal.
+
+
+## Original credentials and complete permission consumers — 2026-11-06
+
+Stage 56 moves the supported credential subsystem together: UID/GID/res-ID/fs-ID
+and supplementary groups, capget/capset, keepcaps, bounding/ambient capabilities,
+securebits, no_new_privs and dumpability. The source worker and serial executor
+use one Linux ABI implementation. A prepared mutation commits only after all
+input and permission checks succeed. Queries do not clone the groups vector;
+ordinary worker getuid/geteuid/getgid/getegid retain their direct identity reads.
+
+Each original IoTask owns one coherent CredentialState, shared by scheduling,
+signal-target permission checks, remote prlimit/capget, proc observations and
+family/SIGCHLD/waitid identity. A credential change does not republish the PID or
+family graph. One task-local publication updates its cold VFS at collection or
+before owner service/clone/exec custody. The source refreshes future path, file,
+network, descriptor factory, UTS, kernel-log, Unix sender, limit and native/async
+contexts together. Accepted io_uring/AIO work keeps the credentials and resources
+accepted with the operation; later SQEs use the new authority. No extra ordinary
+file-access lock, syscall version check, service thread or polling bus is added.
+
+Dumpability is an original mm atomic shared by CLONE_VM and live proc resources;
+fork and exec create the corresponding independent state. Sensitive credential
+commits clear it and parent-death signaling before publishing objective credentials.
+Proc reads the credential record before mm dumpability through the existing
+credential lock publication. This follows the ordering purpose of Linux
+[commit_creds](https://github.com/torvalds/linux/blob/master/kernel/cred.c), without
+adding a guest-memory fence. Raw Linux set-ID remains per-task; libc is responsible
+for its own thread-wide setxid protocol.
+
+The shared ABI also fixes invalid setfsuid/setfsgid queries, setre-ID permissions
+and saved-ID rules, setres-ID no-op behavior, transactional sorted group imports,
+getgroups/setgroups count and privilege ordering, and remote capget error ordering.
+Native ARM Linux fixtures cover those cases, per-thread authority, live remote
+permissions, parent-death clearing and waitid identity. Source conformance tests
+check original observers before owner collection, future permission refresh,
+accepted SQE authority, and exactly one filter decision. The detailed
+[stage 56 evidence](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-credentials-20261106.json)
+records the final product checks and all observed failures or retries.
+
+This completes supported credentials and their consumers, not coordinator removal.
+Original-owner task/image construction, structural mapping publication, tracing
+and security lifecycle, excluded control bodies and generic unhandled dispatch
+remain. Unsupported user/time namespaces and executable file capabilities are not
+introduced by this change.
+
+
+Five counterbalanced unprofiled pairs use 256 checked credential rounds per
+worker (fs-ID changes, capability drops/restores/queries, denied setgid and identity
+queries). Timing is the longest worker loop, excluding creation and final joins.
+
+| CPUs | Previous median | Current median | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 4.443 ms | 3.552 ms | 1.25x |
+| 2 | 137.874 ms | 19.107 ms | 7.22x |
+| 4 | 323.613 ms | 37.179 ms | 8.70x |
+| 12 | 1977.995 ms | 92.936 ms | 21.28x |
+
+These are credential-administration measurements, not Firefox, Geekbench or
+whole-container performance. The first Docker acceptance had an isolated round-6
+cleanup timeout; subsequent baseline/candidate runs passed. Its root cause is
+unattributed and remains tracked separately from the source-credential guarantees.

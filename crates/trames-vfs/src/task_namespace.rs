@@ -13,6 +13,7 @@ pub(super) struct Publication {
     dirty: AtomicBool,
 }
 struct Bindings {
+    credentials: Credentials,
     files: SharedFiles,
     file_owner: FileTableOwner,
     context: fs_context::ContextPublication,
@@ -27,6 +28,7 @@ struct Bindings {
 impl Bindings {
     fn capture(view: &Vfs, files: FileTableOwner, context: Option<FsOwner>) -> Self {
         Self {
+            credentials: view.credentials.clone(),
             files: view.shared_files(),
             file_owner: files,
             context: view.context.publication(context),
@@ -40,6 +42,7 @@ impl Bindings {
         }
     }
     fn install(self, target: &mut Vfs) {
+        target.credentials = self.credentials;
         if !self.file_owner.same(&target.file_table_owner()) {
             target.fds = DescriptorTable::adopt(self.files, self.file_owner);
         }
@@ -88,6 +91,8 @@ const ALLOWED: u64 = CLONE_NEWUTS
 
 /// Owned new-call capabilities. No reference to a private VFS cache escapes.
 pub struct TaskNamespaceResources {
+    pub credentials: Credentials,
+    pub kernel_log: KernelLogAccess,
     pub files: SharedFiles,
     pub descriptors: DirectFds,
     pub direct_files: DirectFiles,
@@ -194,6 +199,27 @@ impl Vfs {
     }
 }
 impl TaskNamespaces {
+    /// Only owned credential data is exposed; the private VFS/RC island cannot
+    /// escape through this callback. The caller publishes after a real commit.
+    pub fn with_credentials<T>(
+        &mut self,
+        call: impl FnOnce(&mut Credentials, &Dumpable) -> T,
+    ) -> T {
+        self.refresh = false;
+        let mut view = self.view.view.borrow_mut();
+        let dumpable = view.dumpable.clone();
+        call(&mut view.credentials, &dumpable)
+    }
+    pub fn publish_credentials(&mut self) -> Credentials {
+        let view = self.view.view.borrow();
+        self.publication.publish(Bindings::capture(
+            &view,
+            self.files.clone(),
+            self.context.clone(),
+        ));
+        self.refresh = true;
+        view.credentials.clone()
+    }
     pub fn changed(&self) -> bool {
         self.refresh
     }
@@ -201,6 +227,8 @@ impl TaskNamespaces {
         let view = self.view.view.borrow();
         let mut epoch = FileEpoch::default();
         TaskNamespaceResources {
+            credentials: view.credentials.clone(),
+            kernel_log: view.kernel_log_capability(),
             files: view.shared_files(),
             descriptors: view.direct_descriptors(),
             direct_files: epoch.capture(&view, true),

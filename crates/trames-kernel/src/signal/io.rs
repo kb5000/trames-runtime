@@ -189,8 +189,6 @@ pub struct IoTask {
     pid: AtomicU32,
     tgid: AtomicU32,
     group: AtomicU32,
-    uid: AtomicU32,
-    suid: AtomicU32,
     wake: Mutex<Weak<IoSignal>>,
 }
 impl Default for IoTask {
@@ -217,13 +215,14 @@ impl Default for IoTask {
             pid: AtomicU32::new(0),
             tgid: AtomicU32::new(0),
             group: AtomicU32::new(0),
-            uid: AtomicU32::new(0),
-            suid: AtomicU32::new(0),
             wake: Mutex::new(Weak::new()),
         }
     }
 }
 impl IoTask {
+    pub fn credentials(&self) -> &Arc<trames_vfs::CredentialState> {
+        self.scheduling.credentials()
+    }
     fn identifies(&self, kind: u32, id: u32) -> bool {
         self.presence.get().map_or_else(
             || self.live.load(Ordering::Relaxed),
@@ -511,7 +510,6 @@ impl IoTask {
 struct Policy {
     actions: Actions,
     namespace: PidNamespace,
-    can_kill: bool,
 }
 impl trames_vfs::TaskSignal for IoTask {
     fn terminate_process(&self) {
@@ -544,7 +542,7 @@ impl trames_vfs::TaskSignal for IoTask {
             Info {
                 code: 0,
                 sender: self.tgid(),
-                uid: self.uid.load(Ordering::Relaxed),
+                uid: self.credentials().read().uid,
                 ..Info::default()
             }
         } else {
@@ -708,8 +706,7 @@ impl IoDirectory {
         euid: u32,
     ) {
         task.lifecycle().register(task, pid);
-        task.uid.store(uid, Ordering::Relaxed);
-        task.suid.store(euid, Ordering::Relaxed);
+        task.credentials().publish_signal_ids(uid, euid);
         if task.pid.load(Ordering::Relaxed) == pid
             && task.tgid.load(Ordering::Relaxed) == tgid
             && task.group.load(Ordering::Relaxed) == group
@@ -854,11 +851,11 @@ impl AsyncOwner for Owner {
             .filter_map(Weak::upgrade)
             .filter(|t| t.belongs(self.kind, self.id))
             .filter(|t| {
+                let c = t.credentials().read();
                 self.euid == 0
-                    || self.uid == t.uid.load(Ordering::Relaxed)
-                    || self.euid == t.uid.load(Ordering::Relaxed)
-                    || self.uid == t.suid.load(Ordering::Relaxed)
-                    || self.euid == t.suid.load(Ordering::Relaxed)
+                    || [self.uid, self.euid]
+                        .iter()
+                        .any(|id| *id == c.uid || *id == c.suid)
             })
             .collect();
         let mut delivered = BTreeSet::new();

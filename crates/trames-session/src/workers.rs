@@ -1001,6 +1001,20 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         }
                                     }
                                 }
+                                if !matches!(work.cpu.x(8) as u32, 174..=177)
+                                    && work.syscalls.as_ref().is_some_and(|s| !s.owner_syscalls && s.namespaces.is_some())
+                                    && trames_linux::credential_entry(work.cpu.x(8) as u32, std::array::from_fn(|i| work.cpu.x(i))) {
+                                    let number = work.cpu.x(8) as u32;
+                                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                                    let snapshot = work.syscalls.as_ref().unwrap();
+                                    let began = snapshot.profile.then(Instant::now);
+                                    let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
+                                    if !entry.allowed() { job.seccomp_entry = Some(entry); break result; }
+                                    work.credential_call(number, args);
+                                    if let Some(began) = began { syscall_time += began.elapsed(); }
+                                    syscalls += 1;
+                                    continue;
+                                }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
                                     if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { syscalls += 1; continue; }
                                     let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());

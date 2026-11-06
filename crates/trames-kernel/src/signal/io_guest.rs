@@ -5,10 +5,10 @@ use super::*;
 impl Signals {
     pub fn publish_policy(&self, namespace: &PidNamespace, can_kill: bool) {
         let _ = self.io.presence.set(self.presence.visibility());
+        self.io.credentials().publish_kill_permission(can_kill);
         *self.io.policy.write().unwrap() = Some(Policy {
             actions: self.actions.shared(),
             namespace: namespace.clone(),
-            can_kill,
         });
     }
 }
@@ -49,12 +49,9 @@ impl IoRoutes {
                 return Err(Errno(22));
             }
             let can_kill = source
-                .policy
+                .credentials()
                 .read()
-                .unwrap()
-                .as_ref()
-                .expect("published sender policy")
-                .can_kill;
+                .has_cap(trames_vfs::capabilities::KILL);
             let mut groups = Vec::new();
             let thread = number != 129;
             if thread {
@@ -125,10 +122,12 @@ impl IoRoutes {
                 found = true;
                 if !can_kill
                     && !(sig == 18 && source.session() == target.session())
-                    && ![self.uid, self.euid].iter().any(|id| {
-                        *id == target.uid.load(Ordering::Relaxed)
-                            || *id == target.suid.load(Ordering::Relaxed)
-                    })
+                    && !{
+                        let c = target.credentials().read();
+                        [self.uid, self.euid]
+                            .iter()
+                            .any(|id| *id == c.uid || *id == c.suid)
+                    }
                 {
                     continue;
                 }

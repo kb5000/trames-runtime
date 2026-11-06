@@ -2,6 +2,59 @@
 //! Guest identities only. They never change the containing app's host identity.
 use super::*;
 
+/// One original task's objective credentials. Observers take one coherent
+/// record; ordinary caller-side file/network checks use their retained value.
+#[derive(Default)]
+pub struct CredentialState(std::sync::RwLock<Credentials>);
+impl CredentialState {
+    pub fn new(credentials: Credentials) -> Self {
+        Self(std::sync::RwLock::new(credentials))
+    }
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Credentials> {
+        self.0.read().unwrap()
+    }
+    pub fn publish(&self, credentials: &Credentials) {
+        self.0.write().unwrap().clone_from(credentials);
+    }
+    /// Directory/bootstrap compatibility; both signal target IDs change together.
+    pub fn publish_signal_ids(&self, uid: u32, suid: u32) {
+        let mut credentials = self.0.write().unwrap();
+        credentials.uid = uid;
+        credentials.suid = suid;
+    }
+    pub fn publish_kill_permission(&self, allowed: bool) {
+        let mut credentials = self.0.write().unwrap();
+        let bit = 1 << capabilities::KILL;
+        if allowed {
+            credentials.caps.effective |= bit;
+        } else {
+            credentials.caps.effective &= !bit;
+        }
+    }
+}
+
+/// Original mm dumpability, shared by CLONE_VM tasks and retained proc views.
+#[derive(Clone)]
+pub struct Dumpable(Arc<std::sync::atomic::AtomicBool>);
+impl Default for Dumpable {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+    }
+}
+impl Dumpable {
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+    pub fn fork(&self) -> Self {
+        let copy = Self::default();
+        copy.set(self.get());
+        copy
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Credentials {
     pub uid: u32,
@@ -16,6 +69,9 @@ pub struct Credentials {
     pub caps: capabilities::Capabilities,
 }
 impl Credentials {
+    pub fn fs_identity(&self) -> [u32; 4] {
+        [self.euid, self.egid, self.fsuid, self.fsgid]
+    }
     pub(super) fn allows_node(&self, node: &Node, bits: u32) -> bool {
         let c = self;
         let shift = if c.fsuid == node.uid {
@@ -61,6 +117,15 @@ impl Credentials {
         } else {
             [self.uid, self.euid, self.suid]
         };
+        let fs = if group { self.fsgid } else { self.fsuid };
+        if values
+            .iter()
+            .zip(current)
+            .enumerate()
+            .all(|(i, (new, old))| *new == u32::MAX || *new == old && (i != 1 || *new == fs))
+        {
+            return Ok(());
+        }
         if !self.has_cap(if group {
             capabilities::SETGID
         } else {
@@ -98,8 +163,74 @@ impl Credentials {
         }) {
             self.set_res_ids(group, [value; 3])
         } else {
+            let allowed = if group {
+                [self.gid, self.sgid]
+            } else {
+                [self.uid, self.suid]
+            };
+            if !allowed.contains(&value) {
+                return Err(Errno(1));
+            }
             self.set_res_ids(group, [u32::MAX, value, u32::MAX])
         }
+    }
+    pub fn set_re_ids(&mut self, group: bool, real: u32, effective: u32) -> Result<()> {
+        let ids = if group {
+            [self.gid, self.egid, self.sgid]
+        } else {
+            [self.uid, self.euid, self.suid]
+        };
+        if !self.has_cap(if group {
+            capabilities::SETGID
+        } else {
+            capabilities::SETUID
+        }) && (real != u32::MAX && !ids[..2].contains(&real)
+            || effective != u32::MAX && !ids.contains(&effective))
+        {
+            return Err(Errno(1));
+        }
+        let next = if effective == u32::MAX {
+            ids[1]
+        } else {
+            effective
+        };
+        let saved = if real != u32::MAX || effective != u32::MAX && effective != ids[0] {
+            next
+        } else {
+            u32::MAX
+        };
+        self.set_res_ids(group, [real, effective, saved])?;
+        // Unlike the setres* no-op rule, setre* always resets the filesystem ID.
+        if group {
+            self.fsgid = self.egid;
+        } else {
+            self.fsuid = self.euid;
+        }
+        Ok(())
+    }
+    pub fn set_fs_id(&mut self, group: bool, value: u32) -> u32 {
+        let old = if group { self.fsgid } else { self.fsuid };
+        let ids = if group {
+            [self.gid, self.egid, self.sgid, old]
+        } else {
+            [self.uid, self.euid, self.suid, old]
+        };
+        if value != u32::MAX
+            && (ids.contains(&value)
+                || self.has_cap(if group {
+                    capabilities::SETGID
+                } else {
+                    capabilities::SETUID
+                }))
+        {
+            if group {
+                self.fsgid = value;
+            } else {
+                self.caps.fsuid_changed(old, value);
+                self.fsuid = value;
+            }
+        }
+        old
     }
 }
 impl Vfs {
@@ -146,6 +277,9 @@ impl Vfs {
     pub fn dumpable(&self) -> u64 {
         u64::from(self.dumpable.get())
     }
+    pub fn dumpable_state(&self) -> Dumpable {
+        self.dumpable.clone()
+    }
     pub fn set_dumpable(&self, value: u64) -> Result<()> {
         if value > 1 {
             return Err(Errno(22));
@@ -154,7 +288,7 @@ impl Vfs {
         Ok(())
     }
     pub fn unshare_dumpable(&mut self) {
-        self.dumpable = Rc::new(Cell::new(self.dumpable.get()));
+        self.dumpable = self.dumpable.fork();
     }
     pub fn fs_identity(&self) -> [u32; 4] {
         let c = &self.credentials;
@@ -222,12 +356,13 @@ impl Vfs {
             c.euid = c.uid;
             c.egid = c.gid;
         }
-        self.dumpable = Rc::new(Cell::new(
+        self.dumpable = Dumpable::default();
+        self.dumpable.set(
             readable
                 && c.uid == c.euid
                 && c.gid == c.egid
                 && c.caps.permitted & !old_permitted == 0,
-        ));
+        );
         c.fsuid = c.euid;
         c.fsgid = c.egid;
         self.credentials.suid = self.credentials.euid;

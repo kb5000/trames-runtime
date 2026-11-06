@@ -145,23 +145,10 @@ impl Fixed {
         })
     }
 }
-#[derive(Clone)]
-struct Identity {
-    uid: [u32; 3],
-    gid: [u32; 3],
-}
-impl From<&Credentials> for Identity {
-    fn from(c: &Credentials) -> Self {
-        Self {
-            uid: [c.uid, c.euid, c.suid],
-            gid: [c.gid, c.egid, c.sgid],
-        }
-    }
-}
 struct Target {
     presence: crate::task::Visibility,
     limits: Weak<Limits>,
-    identity: Identity,
+    identity: Arc<trames_vfs::CredentialState>,
 }
 #[derive(Default)]
 pub struct Directory(RwLock<BTreeMap<u32, Target>>);
@@ -174,7 +161,7 @@ impl Directory {
         pid: u32,
         presence: &Arc<crate::task::Presence>,
         limits: &Arc<Limits>,
-        credentials: &Credentials,
+        credentials: &Arc<trames_vfs::CredentialState>,
     ) {
         let mut entries = self.0.write().unwrap();
         // Publication is a lifecycle/authority boundary, never a syscall hot path.
@@ -183,7 +170,7 @@ impl Directory {
             Target {
                 presence: presence.visibility(),
                 limits: Arc::downgrade(limits),
-                identity: credentials.into(),
+                identity: credentials.clone(),
             },
         );
     }
@@ -229,15 +216,12 @@ impl Authority {
                 .get(&pid)
                 .filter(|t| t.presence.present())
                 .ok_or(Errno(3))?;
+            let credentials = target.identity.read();
             if !privileged
-                && !(target
-                    .identity
-                    .uid
+                && !([credentials.uid, credentials.euid, credentials.suid]
                     .iter()
                     .all(|id| *id == self.credentials.uid)
-                    && target
-                        .identity
-                        .gid
+                    && [credentials.gid, credentials.egid, credentials.sgid]
                         .iter()
                         .all(|id| *id == self.credentials.gid))
             {
@@ -323,7 +307,7 @@ mod tests {
         let own = Limits::new(&v);
         let old = Limits::new(&v);
         let life = Arc::new(crate::task::Presence::default());
-        directory.publish(42, &life, &old, &Credentials::default());
+        directory.publish(42, &life, &old, &Arc::default());
         let a = Authority {
             directory: directory.clone(),
             limits: own,
@@ -338,7 +322,7 @@ mod tests {
         assert_eq!(a.call(261, [42, 7, 0, 0x1000, 0, 0], &mut m), Err(Errno(3)));
         let replacement = Limits::new(&v);
         let life = Arc::new(crate::task::Presence::default());
-        directory.publish(42, &life, &replacement, &Credentials::default());
+        directory.publish(42, &life, &replacement, &Arc::default());
         pair(&mut m, (8, 16));
         assert_eq!(a.call(261, [42, 7, 0x1000, 0, 0, 0], &mut m), Ok(0));
         assert_eq!(replacement.get(7), (8, 16));

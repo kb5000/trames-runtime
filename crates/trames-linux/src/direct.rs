@@ -245,6 +245,11 @@ impl DirectSyscalls {
     /// Change only future syscall/SQE acceptance. Accepted async work owns its
     /// old paths, descriptors and execution context until it completes.
     pub fn refresh_namespaces(&mut self, resources: trames_vfs::TaskNamespaceResources) {
+        if let Some(identity) = &mut self.local_identity {
+            identity[1] = resources.credentials.uid;
+            identity[2] = resources.credentials.gid;
+        }
+        self.kernel_log = Some(resources.kernel_log);
         self.descriptors = resources
             .descriptors
             .with_signal_reader(self.signal_reader.clone());

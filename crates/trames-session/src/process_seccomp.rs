@@ -404,6 +404,140 @@ impl<C: Cpu> Kernel<C> {
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
     #[test]
+    fn credential_subsystem_refreshes_future_calls_without_owner_returns() {
+        use super::super::tests::{kernel, process};
+        for slots in [1, 2] {
+            for filtered in [false, true] {
+                let mut p = process();
+                p.linux
+                    .vfs
+                    .open_at(AT_FDCWD, b"/root-only", 0x42, 0o600)
+                    .unwrap();
+                p.memory.write(0x1800, b"/root-only\0").unwrap();
+                p.memory
+                    .write_array(0x1900, 0x20080522u32.to_le_bytes())
+                    .unwrap();
+                p.memory.write_array(0x1904, 0u32.to_le_bytes()).unwrap();
+                p.memory.write_array(0x1a00, 17u32.to_le_bytes()).unwrap();
+                let calls: Vec<(u64, [u64; 6], u64)> = vec![
+                    (144, [1001, 0, 0, 0, 0, 0], 0),
+                    (159, [1, 0x1a00, 0, 0, 0, 0], 0),
+                    (167, [8, 1, 0, 0, 0, 0], 0),
+                    (146, [1000, 0, 0, 0, 0, 0], 0),
+                    (174, [0; 6], 1000),
+                    (175, [0; 6], 1000),
+                    (176, [0; 6], 1001),
+                    (177, [0; 6], 1001),
+                    (151, [u32::MAX as u64, 0, 0, 0, 0, 0], 1000),
+                    (152, [u32::MAX as u64, 0, 0, 0, 0, 0], 1001),
+                    (158, [1, 0x1a10, 0, 0, 0, 0], 1),
+                    (90, [0x1900, 0x1910, 0, 0, 0, 0], 0),
+                    (56, [(-100i64) as u64, 0x1800, 0, 0, 0, 0], (-13i64) as u64),
+                    (161, [0x1800, 4, 0, 0, 0, 0], (-1i64) as u64),
+                    (116, [10, 0, 0, 0, 0, 0], (-1i64) as u64),
+                    (129, [2, 0, 0, 0, 0, 0], (-1i64) as u64),
+                    (261, [2, 7, 0, 0x1b00, 0, 0], (-1i64) as u64),
+                    (
+                        97,
+                        [trames_vfs::CLONE_NEWUTS, 0, 0, 0, 0, 0],
+                        (-1i64) as u64,
+                    ),
+                    (146, [0; 6], (-1i64) as u64),
+                    (167, [3, 0, 0, 0, 0, 0], 0),
+                    (167, [38, 1, 0, 0, 0, 0], 0),
+                    (167, [39, 0, 0, 0, 0, 0], 1),
+                ];
+                let mov = |r: u32, value: u64| {
+                    [0xd2800000, 0xf2a00000, 0xf2c00000, 0xf2e00000]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, op)| op | (((value >> (16 * i)) as u32 & 0xffff) << 5) | r)
+                        .collect::<Vec<_>>()
+                };
+                let mut code = mov(20, 0x1000);
+                for (index, (number, args, _)) in calls.iter().enumerate() {
+                    for (r, arg) in args.iter().enumerate() {
+                        code.extend(mov(r as u32, *arg));
+                    }
+                    code.extend(mov(8, *number));
+                    code.extend([0xd4000001, 0xf9000000 | ((index as u32) << 10) | (20 << 5)]);
+                }
+                code.extend(mov(28, 1));
+                code.push(0x14000000);
+                assert!(code.len() * 4 < 0xf00);
+                for (i, word) in code.iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .write_array(0x4f00, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                if filtered {
+                    p.seccomp
+                        .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+                }
+                let mut peer = p.fork();
+                peer.tgid = 2;
+                peer.family.set_parent(1);
+                peer.cpu = Cpu::new(0x4f00, 0x9000);
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                for _ in 0..16 {
+                    assert!(k
+                        .parallel_epoch(
+                            &mut trames_linux::CapturedOutput::default(),
+                            k.instructions + 100_000,
+                            true
+                        )
+                        .unwrap());
+                    if k.processes[&1].cpu.x(28) == 1 {
+                        break;
+                    }
+                }
+                let p = &k.processes[&1];
+                assert_eq!(p.cpu.x(28), 1, "slots={slots} filtered={filtered}");
+                for (index, (number, _, expected)) in calls.iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1000 + index as u64 * 8).unwrap(),
+                        *expected,
+                        "call {index}: {number} slots={slots} filtered={filtered}"
+                    );
+                }
+                assert_eq!(
+                    p.memory.read_array::<4>(0x1a10).unwrap(),
+                    17u32.to_le_bytes()
+                );
+                assert_eq!(p.memory.read_array::<4>(0x1910).unwrap(), [0; 4]);
+                assert_eq!(p.linux.vfs.credentials.uid, 1000);
+                assert_eq!(k.processes[&2].linux.vfs.credentials.uid, 0);
+                assert_eq!(k.syscalls, calls.len() as u64);
+                assert_eq!(k.service_requests, 0);
+                assert!(
+                    k.cohort_return_syscalls.is_empty(),
+                    "{:?}",
+                    k.cohort_return_syscalls
+                );
+                if filtered {
+                    assert_eq!(p.seccomp.evaluations(), calls.len() as u64);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn resource_limit_loops_and_seccomp_denials_retire_on_workers_without_owner_returns() {
         use super::super::tests::{kernel, process};
         for decision in [0x7fff0000, 0x5007b] {
@@ -1459,6 +1593,84 @@ mod tests {
                 } else {
                     assert_eq!(v.read(notify, 4096), Err(Errno(11)));
                 }
+            }
+        }
+    }
+    #[test]
+    fn credential_entries_apply_one_policy_decision_before_identity_effects() {
+        use super::super::tests::{kernel, process};
+        for allowed in [false, true] {
+            for (number, args) in [
+                (143, [1000, 1000, 0]),
+                (144, [1000, 0, 0]),
+                (145, [1000, 1000, 0]),
+                (146, [1000, 0, 0]),
+                (147, [1000, 1000, 1000]),
+                (149, [1000, 1000, 1000]),
+                (151, [1000, 0, 0]),
+                (152, [1000, 0, 0]),
+                (159, [0, 0, 0]),
+                (167, [38, 1, 0]),
+            ] {
+                let mut p = process();
+                let original = p.linux.vfs.credentials.clone();
+                p.memory
+                    .write_array(0x4000, 0xd4000001u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .write_array(0x4004, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .write_array(0x4500, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu.set_x(8, number);
+                for (i, arg) in args.iter().enumerate() {
+                    p.cpu.set_x(i, *arg);
+                }
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })])
+                        .unwrap(),
+                ));
+                let memory = p.memory.share();
+                let mut peer = p.fork_with_memory(memory);
+                peer.tgid = 2;
+                peer.cpu = Cpu::new(0x4500, 0x9000);
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                assert!(k
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                    .unwrap());
+                let p = &k.processes[&1];
+                let peer = &k.processes[&2];
+                let expected = if !allowed {
+                    error(Errno(123))
+                } else if number == 268 {
+                    error(Errno(9))
+                } else {
+                    0
+                };
+                assert_eq!(p.cpu.x(0), expected);
+                assert_eq!(p.seccomp.evaluations(), 1);
+                assert_eq!(k.service_requests, 0);
+                if allowed {
+                    assert!(!k.cohort_return_syscalls.contains_key(&(number as u32)));
+                    assert_eq!(*p.signals.io.credentials().read(), p.linux.vfs.credentials);
+                } else {
+                    assert_eq!(p.linux.vfs.credentials, original);
+                    assert!(p.linux.vfs.dumpable() != 0);
+                }
+                assert_eq!(peer.linux.vfs.credentials, original);
             }
         }
     }

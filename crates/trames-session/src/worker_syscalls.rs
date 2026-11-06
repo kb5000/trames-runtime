@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Worker syscalls over retained policy and actual shared resource ownership.
 //! No VFS/Process Rc crosses the boundary. Only seccomp-allowed calls execute;
-//! filter installation, tracing and mutable authority changes still checkpoint.
+//! filter installation and tracing still checkpoint; credential commits refresh
+//! future calls while accepted operations retain their original authority.
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -112,6 +113,54 @@ pub(super) struct Snapshot {
 }
 
 impl<C: Cpu> crate::workers::Work<C> {
+    pub fn credential_call(&mut self, number: u32, args: [u64; 6]) {
+        let snapshot = self.syscalls.as_mut().expect("credential task");
+        let mut state = snapshot.namespaces.take().expect("original task authority");
+        let directory = snapshot.io_routes.directory.clone();
+        let namespace = snapshot.io_routes.namespace.clone();
+        let local = namespace.local(self.pid);
+        let result = state.with_credentials(|credentials, dumpable| {
+            trames_linux::credential_call(
+                credentials,
+                dumpable,
+                local,
+                number,
+                args,
+                self.memory
+                    .as_deref_mut()
+                    .expect("credential caller memory"),
+                |target| {
+                    let global = namespace.global(target).ok_or(Errno(3))?;
+                    let task = directory.proc_task(global).ok_or(Errno(3))?;
+                    let caps = task.credentials().read().caps.clone();
+                    Ok(caps)
+                },
+            )
+        });
+        if let Ok(result) = &result {
+            if result.changed {
+                let credentials = state.publish_credentials();
+                if result.sensitive {
+                    if let Some(parentage) = snapshot.io_signals.parentage() {
+                        parentage.set_death_signal(0);
+                    }
+                }
+                snapshot.io_signals.credentials().publish(&credentials);
+                snapshot.io_routes.uid = credentials.uid;
+                snapshot.io_routes.euid = credentials.euid;
+                snapshot.identities[2..6].copy_from_slice(&[
+                    credentials.uid as u64,
+                    credentials.euid as u64,
+                    credentials.gid as u64,
+                    credentials.egid as u64,
+                ]);
+                if let Some(limits) = &mut snapshot.limits {
+                    limits.credentials = credentials;
+                }
+            }
+        }
+        self.finish_namespaces(state, result.map(|result| result.value));
+    }
     pub fn namespace_work(&mut self, number: u32, args: [u64; 6]) -> trames_vfs::TaskNamespaceWork {
         let snapshot = self.syscalls.as_mut().expect("namespace task");
         let state = snapshot.namespaces.take().expect("current namespace state");

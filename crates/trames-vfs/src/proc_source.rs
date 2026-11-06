@@ -322,6 +322,7 @@ impl Vfs {
 
 #[derive(Clone)]
 pub struct ProcResources {
+    dumpable: Dumpable,
     fs: FsHandle,
     paths: fs_context::PathSource,
     files: SharedFiles,
@@ -331,6 +332,7 @@ pub struct ProcResources {
 impl Vfs {
     pub fn proc_resources(&self) -> ProcResources {
         ProcResources {
+            dumpable: self.dumpable.clone(),
             fs: self.fs.clone(),
             paths: self.path_source(),
             files: self.shared_files(),
@@ -361,6 +363,7 @@ impl ProcResources {
         view
     }
     pub fn observe(&self, info: &mut ProcessInfo, demand: ProcRefresh) {
+        info.nondumpable = !self.dumpable.get();
         if demand.directories() {
             (info.cwd_directory, info.root_directory) = self.paths.directories();
         }

@@ -801,3 +801,50 @@ fn namespace_switch_preserves_accepted_sqe_context_and_refreshes_new_submissions
     assert!(l.vfs.stat_at(-100, b"/new/fresh").is_ok());
     assert!(peer.stat_at(-100, b"/old/fresh").is_err());
 }
+
+#[test]
+fn credential_drop_keeps_accepted_sqe_authority_but_rejects_future_opens() {
+    let (mut l, mut m, fd, r) = setup(16);
+    let secret = l.vfs.open_at(-100, b"/root-only", 0x42, 0o600).unwrap();
+    l.vfs.close(secret).unwrap();
+    let [reader, writer] = l.vfs.pipe(0).unwrap();
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut d = direct(&l, &m, &mut UringEpoch::default(), &caps);
+    let t = target();
+    m.write(0x2100, b"/root-only\0").unwrap();
+    add(&mut m, &r, scalar(22, reader, 0x2200, 1, 1));
+    let mut open = scalar(18, (-100i32) as u32, 0x2100, 0, 2);
+    open[1] = 2; // Drain keeps this imported operation behind the pipe read.
+    add(&mut m, &r, open);
+    assert!(matches!(
+        enter(&d, fd, 2, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(2))
+    ));
+    let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+    assert!(background.progress(&mut m));
+    let mut state = l.vfs.task_namespaces();
+    state.with_credentials(|c, dumpable| {
+        let result =
+            crate::credential_call(c, dumpable, 7, 146, [1000, 0, 0, 0, 0, 0], &mut m, |_| {
+                Err(Errno(3))
+            })
+            .unwrap();
+        assert!(result.changed);
+    });
+    state.publish_credentials();
+    d.refresh_namespaces(state.resources());
+    l.vfs.adopt_task_namespaces(state);
+    l.vfs.write(writer, b"x").unwrap();
+    assert!(background.progress(&mut m));
+    assert_eq!(cq(&mut m, &r), (1, 1));
+    let (tag, old_fd) = cq(&mut m, &r);
+    assert_eq!(tag, 2);
+    assert!(
+        old_fd >= 0,
+        "accepted open lost its original credentials: {old_fd}"
+    );
+    open[1] = 0;
+    open[32..40].copy_from_slice(&3u64.to_le_bytes());
+    assert_eq!(submit(&d, &mut m, fd, &r, open, &t), -13);
+}

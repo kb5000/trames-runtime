@@ -140,9 +140,9 @@ impl<C: Cpu> Kernel<C> {
         if p.cpu.x(0) > u64::MAX - 4095 {
             return;
         }
-        if matches!(number, 91 | 97 | 159 | 268 | 277)
+        if matches!(number, 97 | 268 | 277)
             || number == 436 && args[2] & 2 != 0
-            || number == 167 && matches!(args[0], 4 | 8 | 15 | 22 | 24 | 28 | 38 | 47)
+            || number == 167 && matches!(args[0], 15 | 22)
         {
             self.publish_proc_task(p.rekey.unwrap_or(pid), p);
         }

@@ -22,6 +22,7 @@ pub struct Family {
     subreaper: AtomicBool,
     live: AtomicBool,
     metadata: AtomicU64,
+    credential_identity: AtomicUsize,
     presence: AtomicUsize,
     parent_changed: AtomicBool,
     registry: std::sync::OnceLock<Weak<Families>>,
@@ -36,6 +37,7 @@ impl Default for Family {
             subreaper: AtomicBool::new(false),
             live: AtomicBool::new(true),
             metadata: AtomicU64::new(u64::MAX),
+            credential_identity: AtomicUsize::new(0),
             presence: AtomicUsize::new(0),
             parent_changed: AtomicBool::new(false),
             registry: Default::default(),
@@ -75,7 +77,7 @@ impl Family {
 pub struct Binding {
     pub id: u32,
     pub group: u32,
-    pub uid: u32,
+    pub credentials: Arc<trames_vfs::CredentialState>,
     pub namespace: PidNamespace,
     pub child: Arc<Child>,
     pub children: Arc<Children>,
@@ -97,9 +99,10 @@ struct State {
 }
 impl State {
     fn publish(&mut self, family: &Arc<Family>, binding: Binding) -> Vec<crate::children::Notice> {
-        let metadata = ((binding.group as u64) << 32) | binding.uid as u64;
+        let metadata = binding.group as u64;
         let id = binding.id;
         let presence = binding.presence.identity();
+        let credential_identity = Arc::as_ptr(&binding.credentials) as usize;
         family.id.store(id, Ordering::Relaxed);
         let parent = self.entries.get(&family.parent()).map(|e| e.family.clone());
         match self.entries.entry(id) {
@@ -133,6 +136,9 @@ impl State {
         }
         let notices = self.attach(id, parent);
         family.metadata.store(metadata, Ordering::Relaxed);
+        family
+            .credential_identity
+            .store(credential_identity, Ordering::Relaxed);
         family.presence.store(presence, Ordering::Relaxed);
         notices
     }
@@ -175,13 +181,13 @@ impl State {
         entry
             .binding
             .control
-            .bind_metadata(&entry.binding.child, id, entry.binding.uid);
+            .bind_metadata(&entry.binding.child, id);
         entry.binding.child.attach_quiet(
             resources.as_ref().map(|r| &r.0),
             resources.as_ref().map(|r| &r.1),
             id,
             entry.binding.group,
-            entry.binding.uid,
+            &entry.binding.credentials,
         )
     }
 }
@@ -201,9 +207,11 @@ impl Families {
     /// Refresh also preserves this original family across nonleader exec.
     pub fn publish(self: &Arc<Self>, family: &Arc<Family>, binding: Binding) {
         family.registry.get_or_init(|| Arc::downgrade(self));
-        let metadata = ((binding.group as u64) << 32) | binding.uid as u64;
+        let metadata = binding.group as u64;
         if family.id.load(Ordering::Relaxed) == binding.id
             && family.metadata.load(Ordering::Relaxed) == metadata
+            && family.credential_identity.load(Ordering::Relaxed)
+                == Arc::as_ptr(&binding.credentials) as usize
             && family.presence.load(Ordering::Relaxed) == binding.presence.identity()
             && !family.parent_changed.load(Ordering::Relaxed)
         {
@@ -354,7 +362,10 @@ impl Families {
                         .and_then(|f| state.original(f))
                         .is_some_and(|e| e.binding.control.auto_reap_children()),
                 ) {
-                    exits.push((notice, exit_info(child_id, child_entry.binding.uid, status)));
+                    exits.push((
+                        notice,
+                        exit_info(child_id, child_entry.binding.credentials.read().uid, status),
+                    ));
                 }
             }
             (Retirement::default(), notices, exits)
@@ -410,7 +421,11 @@ impl Families {
                 {
                     exits.push((
                         notice,
-                        exit_info(entry.binding.id, entry.binding.uid, status),
+                        exit_info(
+                            entry.binding.id,
+                            entry.binding.credentials.read().uid,
+                            status,
+                        ),
                     ));
                 }
                 let id = current.id.load(Ordering::Relaxed);
@@ -498,7 +513,9 @@ mod tests {
                 Binding {
                     id,
                     group: id,
-                    uid: 1000,
+                    credentials: Arc::new(trames_vfs::CredentialState::new(
+                        trames_vfs::Credentials::user(1000, 0),
+                    )),
                     namespace: ns.clone(),
                     child: p.child.clone(),
                     children: p.children.clone(),
@@ -723,7 +740,9 @@ mod tests {
             Binding {
                 id: 10,
                 group: 10,
-                uid: 1000,
+                credentials: Arc::new(trames_vfs::CredentialState::new(
+                    trames_vfs::Credentials::user(1000, 0),
+                )),
                 namespace: ns.clone(),
                 child: parent.child.clone(),
                 children: parent.children.clone(),
@@ -792,7 +811,9 @@ mod tests {
                     Some(Binding {
                         id: 11,
                         group: 11,
-                        uid: 1000,
+                        credentials: Arc::new(trames_vfs::CredentialState::new(
+                            trames_vfs::Credentials::user(1000, 0),
+                        )),
                         namespace: ns.clone(),
                         child: child.child.clone(),
                         children: child.children.clone(),

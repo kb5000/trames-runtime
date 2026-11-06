@@ -131,7 +131,7 @@ pub use pty::{Pty, PtyEnd, PtyIo, PtySlaveEndpoint, TerminalAccess};
 mod storage;
 #[cfg(test)]
 mod storage_tests;
-pub use credentials::Credentials;
+pub use credentials::{CredentialState, Credentials, Dumpable};
 pub use linux_namespace::{NamespaceProjection, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
@@ -742,7 +742,7 @@ pub struct Vfs {
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
     cgroups: Arc<SharedCell<cgroup::Cgroups>>,
-    dumpable: Rc<Cell<bool>>,
+    dumpable: Dumpable,
     pid: u32,
     lock_owner: u32,
     record_locks: Arc<locks::Registry>,
@@ -878,7 +878,7 @@ impl Vfs {
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),
             cgroups: Arc::default(),
-            dumpable: Rc::new(Cell::new(true)),
+            dumpable: Dumpable::default(),
             pid: 1,
             ptys: Arc::default(),
             embedding_terminal: Rc::default(),

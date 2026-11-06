@@ -40,7 +40,7 @@ impl Notice {
 struct State {
     id: u32,
     group: u32,
-    uid: u32,
+    credentials: Arc<trames_vfs::CredentialState>,
     parent: Weak<Children>,
     parent_group: Weak<crate::task_control::Group>,
     event: Option<i32>,
@@ -50,6 +50,12 @@ struct State {
     presence: crate::task::Visibility,
 }
 impl Child {
+    pub fn uid(&self) -> u32 {
+        self.0.lock().unwrap().credentials.read().uid
+    }
+    pub fn bind_credentials(&self, credentials: Arc<trames_vfs::CredentialState>) {
+        self.0.lock().unwrap().credentials = credentials;
+    }
     pub(crate) fn parent_group(&self) -> Option<Arc<crate::task_control::Group>> {
         self.0.lock().unwrap().parent_group.upgrade()
     }
@@ -63,7 +69,10 @@ impl Child {
     /// child lock while acquiring a parent's membership lock or calling wakes.
     pub fn attach(self: &Arc<Self>, parent: Option<&Arc<Children>>, id: u32, group: u32, uid: u32) {
         let signal_parent = self.parent_group();
-        for notice in self.attach_quiet(parent, signal_parent.as_ref(), id, group, uid) {
+        let credentials = Arc::new(trames_vfs::CredentialState::new(
+            trames_vfs::Credentials::user(uid, 0),
+        ));
+        for notice in self.attach_quiet(parent, signal_parent.as_ref(), id, group, &credentials) {
             notice.notify();
         }
     }
@@ -73,7 +82,7 @@ impl Child {
         signal_parent: Option<&Arc<crate::task_control::Group>>,
         id: u32,
         group: u32,
-        uid: u32,
+        credentials: &Arc<trames_vfs::CredentialState>,
     ) -> Vec<Notice> {
         let mut notices = Vec::new();
         let (previous, previous_id) = {
@@ -82,7 +91,7 @@ impl Child {
             let group_changed = state.group != group;
             state.id = id;
             state.group = group;
-            state.uid = uid;
+            state.credentials = credentials.clone();
             state.parent_group = signal_parent.map_or_else(Weak::new, Arc::downgrade);
             let next = parent.map_or_else(Weak::new, Arc::downgrade);
             if Weak::ptr_eq(&state.parent, &next) {
@@ -301,7 +310,7 @@ impl Children {
                 continue;
             };
             let local = namespace.local(state.id);
-            let uid = state.uid;
+            let uid = state.credentials.read().uid;
             if options & 0x01000000 == 0 {
                 state.reaped = state.exited;
                 state.event = None;
@@ -683,7 +692,8 @@ mod tests {
         let vfs = trames_vfs::Vfs::default();
         let limits = Limits::new(&vfs);
         let limit_directory = Arc::new(Directory::default());
-        limit_directory.publish(42, &target.presence, &limits, &vfs.credentials);
+        target.io.credentials().publish(&vfs.credentials);
+        limit_directory.publish(42, &target.presence, &limits, target.io.credentials());
         let authority = Authority {
             directory: limit_directory,
             limits: Limits::new(&vfs),

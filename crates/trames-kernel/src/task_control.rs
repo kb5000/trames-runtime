@@ -25,7 +25,6 @@ struct State {
     live: usize,
     child: Weak<Child>,
     tgid: u32,
-    uid: u32,
     killed: bool,
     stop: Option<(u32, bool)>, // signo, fully acknowledged
     exit_status: Option<i32>,
@@ -99,7 +98,7 @@ impl State {
             event: self.child.upgrade().map(|c| c.stopped_quiet(signal)),
             info: Info {
                 sender: self.tgid,
-                uid: self.uid,
+                uid: self.child.upgrade().map_or(0, |child| child.uid()),
                 status: signal as i32,
                 code: 5,
                 ..Default::default()
@@ -290,14 +289,16 @@ impl Group {
         self.stopped.load(Ordering::Relaxed)
     }
     pub fn bind(&self, child: &Arc<Child>, parent: Option<&Arc<Group>>, tgid: u32, uid: u32) {
-        self.bind_metadata(child, tgid, uid);
+        child.bind_credentials(Arc::new(trames_vfs::CredentialState::new(
+            trames_vfs::Credentials::user(uid, 0),
+        )));
+        self.bind_metadata(child, tgid);
         child.bind_parent_group(parent);
     }
-    pub(crate) fn bind_metadata(&self, child: &Arc<Child>, tgid: u32, uid: u32) {
+    pub(crate) fn bind_metadata(&self, child: &Arc<Child>, tgid: u32) {
         let mut state = self.state.lock().unwrap();
         state.child = Arc::downgrade(child);
         state.tgid = tgid;
-        state.uid = uid;
     }
     pub fn register(&self, task: &Arc<IoTask>, pid: u32) {
         let mut state = self.state.lock().unwrap();
@@ -452,7 +453,7 @@ impl Group {
                         event,
                         info: Info {
                             sender: state.tgid,
-                            uid: state.uid,
+                            uid: state.child.upgrade().map_or(0, |child| child.uid()),
                             status: if announced { 18 } else { sig } as i32,
                             code: if announced { 6 } else { 5 },
                             ..Default::default()

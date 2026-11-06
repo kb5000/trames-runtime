@@ -4,7 +4,6 @@ use trames_execution::Registers;
 use trames_memory::{
     Access, CpuMemory, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE,
 };
-use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, Vfs, MAX_PATH};
 
 type Result<T> = std::result::Result<T, Errno>;
@@ -1285,15 +1284,6 @@ impl Linux {
             }
             172 => Ok(1),
             173 => Ok(0),
-            174..=177 => {
-                let c = &self.vfs.credentials;
-                Ok(match number {
-                    174 => c.uid,
-                    175 => c.euid,
-                    176 => c.gid,
-                    _ => c.egid,
-                } as u64)
-            }
             167 if matches!(a[0], 15 | 16) => {
                 if a[0] == 15 {
                     let mut name = Vec::new();
@@ -1338,117 +1328,18 @@ impl Linux {
                 }
                 Ok(0)
             }
-            144 | 146 => {
-                self.vfs.credentials.set_id(number == 144, a[0] as u32)?;
-                Ok(0)
-            }
-            143 | 145 | 147 | 149 => {
-                let group = matches!(number, 143 | 149);
-                let values = if matches!(number, 143 | 145) {
-                    let c = &self.vfs.credentials;
-                    let old_real = if group { c.gid } else { c.uid };
-                    [
-                        a[0] as u32,
-                        a[1] as u32,
-                        if a[0] as u32 != u32::MAX
-                            || (a[1] as u32 != u32::MAX && a[1] as u32 != old_real)
-                        {
-                            if a[1] as u32 == u32::MAX {
-                                if group {
-                                    c.egid
-                                } else {
-                                    c.euid
-                                }
-                            } else {
-                                a[1] as u32
-                            }
-                        } else {
-                            u32::MAX
-                        },
-                    ]
-                } else {
-                    [a[0] as u32, a[1] as u32, a[2] as u32]
-                };
-                self.vfs.credentials.set_res_ids(group, values)?;
-                Ok(0)
-            }
-            148 | 150 => {
-                for pointer in a[..3].iter() {
-                    Self::check(memory, *pointer, 4, Access::Write)?;
-                }
-                let c = &self.vfs.credentials;
-                let values = if number == 148 {
-                    [c.uid, c.euid, c.suid]
-                } else {
-                    [c.gid, c.egid, c.sgid]
-                };
-                for i in 0..3 {
-                    memory
-                        .write(a[i], &values[i].to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                Ok(0)
-            }
-            151 | 152 => {
-                let c = &mut self.vfs.credentials;
-                let group = number == 152;
-                let old = if group { c.fsgid } else { c.fsuid };
-                let ids = if group {
-                    [c.gid, c.egid, c.sgid, old]
-                } else {
-                    [c.uid, c.euid, c.suid, old]
-                };
-                if c.has_cap(if group {
-                    capabilities::SETGID
-                } else {
-                    capabilities::SETUID
-                }) || ids.contains(&(a[0] as u32))
-                {
-                    if group {
-                        c.fsgid = a[0] as u32;
-                    } else {
-                        c.caps.fsuid_changed(c.fsuid, a[0] as u32);
-                        c.fsuid = a[0] as u32;
-                    }
-                }
-                Ok(old as u64)
-            }
-            158 | 159 => {
-                let count = a[0] as usize;
-                if count > 65536 {
-                    return Err(Errno(22));
-                }
-                if number == 158 {
-                    let groups = &self.vfs.credentials.groups;
-                    if count == 0 {
-                        return Ok(groups.len() as u64);
-                    }
-                    if count < groups.len() {
-                        return Err(Errno(22));
-                    }
-                    Self::check(memory, a[1], groups.len() * 4, Access::Write)?;
-                    for (i, value) in groups.iter().enumerate() {
-                        memory
-                            .write(a[1] + (i * 4) as u64, &value.to_le_bytes())
-                            .map_err(|_| Errno(14))?;
-                    }
-                    Ok(groups.len() as u64)
-                } else {
-                    if !self.vfs.credentials.has_cap(capabilities::SETGID) {
-                        return Err(Errno(1));
-                    }
-                    Self::check(memory, a[1], count * 4, Access::Read)?;
-                    let mut groups = Vec::with_capacity(count);
-                    for i in 0..count {
-                        let mut value = [0; 4];
-                        memory
-                            .read(a[1] + (i * 4) as u64, &mut value)
-                            .map_err(|_| Errno(14))?;
-                        groups.push(u32::from_le_bytes(value));
-                    }
-                    self.vfs.credentials.groups = groups;
-                    Ok(0)
-                }
+            number if crate::credential_entry(number as u32, a) => {
+                let dumpable = self.vfs.dumpable_state();
+                crate::credential_call(
+                    &mut self.vfs.credentials,
+                    &dumpable,
+                    1,
+                    number as u32,
+                    a,
+                    memory,
+                    |_| Err(Errno(3)),
+                )
+                .map(|result| result.value)
             }
             166 => {
                 let previous = self.vfs.set_umask(a[0] as u32);

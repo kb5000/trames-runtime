@@ -115,7 +115,11 @@ impl trames_vfs::ProcTask for IoTask {
         if !self.identifies(0, pid) {
             return None;
         }
+        // Observe credential publication before mm dumpability; a committed
+        // identity drop cannot be paired with the former dumpable state.
+        let credentials = self.credentials().read().clone();
         let mut info = self.proc_view.observe_with_residency(demand, residency)?;
+        info.credentials = credentials;
         info.identity = trames_vfs::ProcTask::identity(self);
         if info.pid != pid {
             return None;

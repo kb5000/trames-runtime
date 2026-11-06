@@ -2,7 +2,7 @@
 //! Guest affinity and ready-queue policy; no execution engine or host threads.
 use std::sync::{
     atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
-    RwLock,
+    Arc,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -18,7 +18,7 @@ pub struct Attributes {
     affinity: AtomicU64,
     nice: AtomicI32,
     policy: AtomicU32,
-    authority: RwLock<Authority>,
+    credentials: Arc<trames_vfs::CredentialState>,
 }
 impl Default for Attributes {
     fn default() -> Self {
@@ -26,7 +26,7 @@ impl Default for Attributes {
             affinity: AtomicU64::new(u64::MAX),
             nice: AtomicI32::new(0),
             policy: AtomicU32::new(0),
-            authority: RwLock::default(),
+            credentials: Arc::default(),
         }
     }
 }
@@ -57,18 +57,20 @@ impl Attributes {
         self.set_nice(parent.nice());
         self.set_policy(parent.policy());
     }
-    /// Credential mutation retains its existing custody boundary. Readers use
-    /// one coherent authority tuple, without publishing scheduling values back.
+    pub fn credentials(&self) -> &Arc<trames_vfs::CredentialState> {
+        &self.credentials
+    }
     pub fn publish_credentials(&self, credentials: &trames_vfs::Credentials) {
-        *self.authority.write().unwrap() = Authority {
+        self.credentials.publish(credentials);
+    }
+    pub(crate) fn authority(&self) -> Authority {
+        let credentials = self.credentials.read();
+        Authority {
             uid: credentials.uid,
             euid: credentials.euid,
             permitted: credentials.caps.permitted,
             privileged: credentials.has_cap(trames_vfs::capabilities::SYS_NICE),
-        };
-    }
-    pub(crate) fn authority(&self) -> Authority {
-        *self.authority.read().unwrap()
+        }
     }
 }
 
