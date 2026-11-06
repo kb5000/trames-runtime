@@ -729,9 +729,9 @@ pub struct Vfs {
     pid_ns: PidNamespace,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
-    mount_registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>>,
-    mount_resources: Rc<RefCell<Vec<std::sync::Weak<mounts::MountIdentity>>>>,
-    detached_mounts: Rc<RefCell<Vec<Vec<Arc<Mount>>>>>,
+    mount_registry: mounts::Registry,
+    mount_resources: Arc<SharedCell<Vec<std::sync::Weak<mounts::MountIdentity>>>>,
+    detached_mounts: Arc<SharedCell<Vec<Vec<Arc<Mount>>>>>,
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
@@ -841,9 +841,7 @@ impl Vfs {
         let pid_ns = PidNamespace::default();
         let root_network = Arc::new(linux_namespace::RootNetwork::default());
         let network = root_network.network.borrow().clone();
-        let mount_registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>> = Rc::default();
-        // Only this owner/control view uses this Rc registry. Query islands
-        // construct a fresh one before sharing canonical fs_struct resources.
+        let mount_registry = mounts::Registry::default();
         let mut context = FsContext::default();
         context.paths.registry = mount_registry.clone();
         Self {
@@ -864,8 +862,8 @@ impl Vfs {
             pid_children: pid_ns,
             mounts: None,
             mount_registry,
-            mount_resources: Rc::default(),
-            detached_mounts: Rc::default(),
+            mount_resources: Arc::default(),
+            detached_mounts: Arc::default(),
             credentials: Credentials::default(),
             pseudo: Rc::new(RefCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),

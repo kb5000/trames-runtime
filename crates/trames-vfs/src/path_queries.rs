@@ -17,8 +17,6 @@ pub(super) struct Authority {
     pub(super) capture_open: bool,
     pub(super) open_work: Rc<RefCell<Option<file_work::PreparedOpen>>>,
     pub(super) namespace_uses: ActiveMounts,
-    // Keep the private weak mount registry alive, including detached mounts.
-    _mounts: Vec<Arc<Mount>>,
 }
 #[derive(Default)]
 pub(super) struct ActiveMounts {
@@ -69,7 +67,6 @@ impl Authority {
             capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
-            _mounts: Vec::new(),
         }
     }
     pub(super) fn file_projection(source: &Self) -> Self {
@@ -85,7 +82,6 @@ impl Authority {
             capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
-            _mounts: Vec::new(),
         }
     }
     pub(super) fn clear_deferred(&self) {
@@ -177,7 +173,8 @@ pub struct PathQueries {
     pub(super) view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
-// afresh, including pseudo state, dummy FD table and private registry containers.
+// afresh, including pseudo state and the dummy FD table. Mount lookup/retirement
+// registries contain only synchronized original resources.
 // Mount topology and namespace authority are original synchronized Arc resources.
 // Canonical cwd/root resources cross through their original Arc fs_struct.
 // Source resources cross only as their existing Send+Sync Arc capabilities,
@@ -198,24 +195,13 @@ impl Vfs {
     pub fn path_queries(&self) -> PathQueries {
         let mut view = Vfs::empty(self.fs.clone());
         view.context.share_paths(&self.context);
-        view.mounts = self
-            .mounts
-            .as_ref()
-            .map(|n| MountNamespace(Arc::new(SharedCell::new(mounts::Table::project(&n.0)))));
-        let mut mounts = BTreeMap::new();
-        if let Some(namespace) = &view.mounts {
-            for mount in &namespace.0.borrow().mounts {
-                mounts.insert(Arc::as_ptr(&mount.shared) as usize, mount.clone());
-            }
-        }
-        let registry: Vec<_> = self
-            .mount_registry
-            .borrow()
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .map(|mount| Mount::query_projection(mount.shared.clone(), &mut mounts))
-            .collect();
-        *view.mount_registry.borrow_mut() = registry.iter().map(Arc::downgrade).collect();
+        // Namespace topology is the original synchronized resource. Taking a
+        // static graph here would hide mounts made by another live executor.
+        view.mounts = self.mounts.clone();
+        view.mount_registry = self.mount_registry.clone();
+        view.mount_resources = self.mount_resources.clone();
+        view.detached_mounts = self.detached_mounts.clone();
+        view.context.paths.registry = view.mount_registry.clone();
         view.credentials = self.credentials.clone();
         view.uts = self.uts.clone();
         view.network = self.network.clone();
@@ -230,7 +216,6 @@ impl Vfs {
         view.file_size_limit = self.file_size_limit.clone();
         view.context.share_mask(&self.context);
         view.lock_owner = self.lock_owner;
-        *view.mount_resources.borrow_mut() = self.mount_resources.borrow().clone();
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
         view.ptys = self.ptys.clone();
@@ -262,7 +247,6 @@ impl Vfs {
             capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
-            _mounts: registry,
         });
         PathQueries {
             view: RefCell::new(view),

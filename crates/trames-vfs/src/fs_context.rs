@@ -99,14 +99,41 @@ impl SharedPaths {
         }
     }
 }
-#[derive(Default)]
 pub(super) struct PathStore {
     shared: Arc<SharedCell<SharedPaths>>,
-    // Only this control view owns these Rc projections. Keep current mounts
-    // alive for owner-only weak namespace snapshots, without retaining every
-    // directory the process has ever visited.
+    // Cache only the current cwd/root mount handles, never the complete table.
     projections: RefCell<Vec<Arc<Mount>>>,
-    pub(super) registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>>,
+    pub(super) registry: mounts::Registry,
+    contexts: Arc<std::sync::Mutex<Contexts>>,
+}
+struct Contexts {
+    paths: Vec<std::sync::Weak<SharedCell<SharedPaths>>>,
+    prune_at: usize,
+}
+impl Contexts {
+    fn insert(&mut self, paths: &Arc<SharedCell<SharedPaths>>) {
+        // Amortize weak-entry retirement; a live task population must not turn
+        // every fork into another all-task scan. This is not a task quota.
+        if self.paths.len() >= self.prune_at {
+            self.paths.retain(|context| context.strong_count() != 0);
+            self.prune_at = self.paths.len().saturating_mul(2).max(64);
+        }
+        self.paths.push(Arc::downgrade(paths));
+    }
+}
+impl Default for PathStore {
+    fn default() -> Self {
+        let shared = Arc::new(SharedCell::default());
+        Self {
+            contexts: Arc::new(std::sync::Mutex::new(Contexts {
+                paths: vec![Arc::downgrade(&shared)],
+                prune_at: 64,
+            })),
+            shared,
+            projections: RefCell::default(),
+            registry: mounts::Registry::default(),
+        }
+    }
 }
 impl PathStore {
     pub(super) fn directories(&self) -> (Option<ProcDirectory>, Option<ProcDirectory>) {
@@ -193,17 +220,55 @@ impl PathStore {
             shared: self.shared.clone(),
             projections: RefCell::default(),
             registry: self.registry.clone(),
+            contexts: self.contexts.clone(),
         }
     }
     fn fork(&self) -> Self {
+        // Serialize only fs_struct creation with pivot's reference replacement;
+        // a copied old root must not be registered after pivot has visited it.
+        let mut contexts = self.contexts.lock().unwrap();
         let paths = self.borrow();
         let result = Self {
             shared: Arc::new(SharedCell::new(SharedPaths::from_paths(&paths))),
             projections: RefCell::default(),
             registry: self.registry.clone(),
+            contexts: self.contexts.clone(),
         };
         result.remember(&paths);
+        contexts.insert(&result.shared);
         result
+    }
+    pub(super) fn pivot(&self, previous: &Arc<mounts::MountData>, new: &Arc<mounts::MountData>) {
+        // Like Linux chroot_fs_refs: match the exact original mount+inode,
+        // including independent fs_structs, never rewrite an open directory FD.
+        let mut contexts = self.contexts.lock().unwrap();
+        contexts.paths.retain(|weak| {
+            let Some(context) = weak.upgrade() else {
+                return false;
+            };
+            let mut paths = context.borrow_mut();
+            let matches = |mount: &Option<Arc<mounts::MountData>>, node: &Option<NodeRef>| {
+                mount.as_ref().is_some_and(|m| Arc::ptr_eq(m, previous))
+                    && node.as_ref().is_none_or(|n| Arc::ptr_eq(n, &previous.root))
+            };
+            if matches(&paths.cwd_mount, &paths.cwd_node) {
+                paths.cwd_mount = Some(new.clone());
+                paths.cwd_node = Some(new.root.clone());
+                paths._cwd_pin = Some(mounts::DirectoryPin::new(new.clone()));
+                paths._cwd_use = Some(mounts::MountUse::new(new.identity.clone()));
+                #[cfg(all(feature = "hostfs", unix))]
+                {
+                    paths.host_cwd = None;
+                }
+            }
+            if matches(&paths.root_mount, &paths.root_node) {
+                paths.root_mount = Some(new.clone());
+                paths.root_node = Some(new.root.clone());
+                paths._root_pin = Some(mounts::DirectoryPin::new(new.clone()));
+                paths._root_use = Some(mounts::MountUse::new(new.identity.clone()));
+            }
+            true
+        });
     }
     pub fn is_shared(&self) -> bool {
         Arc::strong_count(&self.shared) > 1
@@ -246,6 +311,7 @@ impl FsContext {
             shared: other.paths.shared.clone(),
             projections: RefCell::default(),
             registry: self.paths.registry.clone(),
+            contexts: other.paths.contexts.clone(),
         };
         self.mask = other.mask.clone();
     }

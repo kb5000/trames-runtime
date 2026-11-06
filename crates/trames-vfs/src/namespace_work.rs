@@ -3,6 +3,21 @@
 use super::*;
 
 pub enum NamespaceCall {
+    Mount {
+        source: Option<Vec<u8>>,
+        target: Vec<u8>,
+        kind: Option<Vec<u8>>,
+        flags: u64,
+        data: Option<Vec<u8>>,
+    },
+    Umount {
+        target: Vec<u8>,
+        flags: u64,
+    },
+    PivotRoot {
+        new_root: Vec<u8>,
+        put_old: Vec<u8>,
+    },
     Mkdir {
         fd: i32,
         path: Vec<u8>,
@@ -84,6 +99,25 @@ pub enum NamespaceCall {
 impl NamespaceCall {
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
+            Self::Mount {
+                source,
+                target,
+                flags,
+                ..
+            } => {
+                let mut paths = vec![(AT_FDCWD, Some(target.as_slice()), true)];
+                if flags & (4096 | 8192) != 0 {
+                    if let Some(source) = source {
+                        paths.push((AT_FDCWD, Some(source.as_slice()), true));
+                    }
+                }
+                paths
+            }
+            Self::Umount { target, flags } => vec![(AT_FDCWD, Some(target), flags & 8 == 0)],
+            Self::PivotRoot { new_root, put_old } => vec![
+                (AT_FDCWD, Some(new_root), true),
+                (AT_FDCWD, Some(put_old), true),
+            ],
             Self::Mkdir { fd, path, .. }
             | Self::Mknod { fd, path, .. }
             | Self::Symlink { fd, path, .. }
@@ -122,8 +156,50 @@ impl NamespaceCall {
             Self::Cwd => vec![(AT_FDCWD, Some(b"."), true)],
         }
     }
+    fn topology(&self) -> bool {
+        matches!(
+            self,
+            Self::Mount { .. } | Self::Umount { .. } | Self::PivotRoot { .. }
+        )
+    }
+    fn execute_locked(&self, v: &mut Vfs) -> Result<FileValue> {
+        match self {
+            Self::Mount {
+                source,
+                target,
+                kind,
+                flags,
+                data,
+            } => v.mount_locked(
+                source.as_deref(),
+                target,
+                kind.as_deref(),
+                *flags,
+                data.as_deref(),
+            )?,
+            Self::Umount { target, flags } => v.umount_locked(target, *flags)?,
+            Self::PivotRoot { new_root, put_old } => v.pivot_root_locked(new_root, put_old)?,
+            _ => return self.execute(v),
+        }
+        Ok(FileValue::Count(0))
+    }
     pub fn execute(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
+            Self::Mount {
+                source,
+                target,
+                kind,
+                flags,
+                data,
+            } => v.mount(
+                source.as_deref(),
+                target,
+                kind.as_deref(),
+                *flags,
+                data.as_deref(),
+            )?,
+            Self::Umount { target, flags } => v.umount(target, *flags)?,
+            Self::PivotRoot { new_root, put_old } => v.pivot_root(new_root, put_old)?,
             Self::Mkdir { fd, path, mode } => v.mkdir_at(*fd, path, *mode)?,
             Self::Mknod {
                 fd,
@@ -229,6 +305,12 @@ impl NamespaceCall {
 pub(super) struct NamespaceWork {
     call: NamespaceCall,
     host_work: bool,
+    waiting: Option<Arc<mounts::admin::Admin>>,
+}
+pub(super) enum NamespaceRun {
+    Complete(Result<FileValue>),
+    Waiting,
+    Owner,
 }
 pub enum NamespaceAttempt {
     Complete(Result<FileValue>),
@@ -307,7 +389,7 @@ impl PathQueries {
                 self.view.query.as_mut().unwrap().accepted = self.accepted.take();
             }
         }
-        let (host_work, accepted, reply) = {
+        let (work, accepted, reply) = {
             let mut view = self.view.borrow_mut();
             let accepted = view.query.as_mut().unwrap().accepted.take();
             let scope = Restore {
@@ -315,51 +397,91 @@ impl PathQueries {
                 accepted,
             };
             let host_work = prepare_namespace(scope.view, &call);
-            scope.view.query.as_ref().unwrap().clear_deferred();
+            let mut work = NamespaceWork {
+                call,
+                host_work,
+                waiting: None,
+            };
             let reply = if host_work {
-                None
+                NamespaceRun::Owner
             } else {
-                let result = call.execute(scope.view);
-                (!scope.view.query.as_ref().unwrap().take_deferred()).then_some(result)
+                work.execute(scope.view)
             };
             let accepted = scope.view.query.as_mut().unwrap().accepted.take();
-            (host_work, accepted, reply)
+            (work, accepted, reply)
         };
-        if let Some(reply) = reply {
+        if let NamespaceRun::Complete(reply) = reply {
             return NamespaceAttempt::Complete(reply);
         }
         let paths = self.retain_context();
         paths.view.borrow_mut().query.as_mut().unwrap().accepted = accepted;
-        NamespaceAttempt::Retained(FileWork::namespace(
-            paths,
-            NamespaceWork { call, host_work },
-        ))
+        NamespaceAttempt::Retained(FileWork::namespace(paths, work))
     }
     pub fn namespace_work(&self, call: NamespaceCall) -> FileWork {
         let paths = self.retain_context();
         let host_work = prepare_namespace(&mut paths.view.borrow_mut(), &call);
         paths.view.borrow().query.as_ref().unwrap().clear_deferred();
-        FileWork::namespace(paths, NamespaceWork { call, host_work })
+        FileWork::namespace(
+            paths,
+            NamespaceWork {
+                call,
+                host_work,
+                waiting: None,
+            },
+        )
     }
 }
 impl NamespaceWork {
     pub(super) fn host_work(&self) -> bool {
         self.host_work
     }
-    pub(super) fn run(&self, paths: &PathQueries) -> Option<Result<FileValue>> {
-        let mut view = paths.view.borrow_mut();
+    pub(super) fn waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+    pub(super) fn ready(&self) -> bool {
+        self.waiting.as_ref().is_none_or(|admin| admin.ready())
+    }
+    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
+        self.waiting.as_ref().map(|admin| admin.subscribe(signal))
+    }
+    pub(super) fn run(&mut self, paths: &PathQueries) -> NamespaceRun {
+        self.execute(&mut paths.view.borrow_mut())
+    }
+    fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
+        self.waiting = None;
+        let admin = if self.call.topology() {
+            match view.mount_admin() {
+                Ok(admin) => Some(admin),
+                Err(error) => return NamespaceRun::Complete(Err(error)),
+            }
+        } else {
+            None
+        };
+        let _lease = if let Some(admin) = &admin {
+            let Some(lease) = admin.try_enter() else {
+                self.waiting = Some(admin.clone());
+                return NamespaceRun::Waiting;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         view.query.as_ref().unwrap().clear_deferred();
-        // A background namespace operation owns the mounts it actually walks,
-        // not every mount in its private metadata projection. Keep these uses
-        // through host I/O, then release them outside the lookup algorithms.
-        view.query.as_ref().unwrap().namespace_uses.begin();
-        let result = self.call.execute(&mut view);
+        // A topology transaction already retains its namespace. Its own path
+        // lookup is not an external fs/file user that makes umount EBUSY.
+        if !self.call.topology() {
+            view.query.as_ref().unwrap().namespace_uses.begin();
+        }
+        let result = self.call.execute_locked(view);
         let query = view.query.as_ref().unwrap();
         let uses = query.namespace_uses.finish();
         let deferred = query.take_deferred();
-        drop(view);
         drop(uses);
-        (!deferred).then_some(result)
+        if deferred {
+            NamespaceRun::Owner
+        } else {
+            NamespaceRun::Complete(result)
+        }
     }
     pub(super) fn run_owner(&self, paths: &PathQueries, owner: &mut Vfs) -> Result<FileValue> {
         // Rare owner-only proc/task/mount descriptions retain the original

@@ -2169,42 +2169,6 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(None)
             }
-            39 => {
-                p.linux.vfs.umount(&Linux::path(&p.memory, a[0])?, a[1])?;
-                Ok(Some(0))
-            }
-            40 => {
-                let optional = |ptr| {
-                    if ptr == 0 {
-                        Ok(None)
-                    } else {
-                        Linux::path(&p.memory, ptr).map(Some)
-                    }
-                };
-                let source = optional(a[0])?;
-                let target = Linux::path(&p.memory, a[1])?;
-                let kind = optional(a[2])?;
-                let data = optional(a[4])?;
-                p.linux.vfs.mount(
-                    source.as_deref(),
-                    &target,
-                    kind.as_deref(),
-                    a[3],
-                    data.as_deref(),
-                )?;
-                Ok(Some(0))
-            }
-            41 => {
-                let before = p.linux.vfs.clone();
-                p.linux.vfs.pivot_root(
-                    &Linux::path(&p.memory, a[0])?,
-                    &Linux::path(&p.memory, a[1])?,
-                )?;
-                for other in self.processes.values_mut() {
-                    other.linux.vfs.sync_pivot_from(&before, &p.linux.vfs);
-                }
-                Ok(Some(0))
-            }
             97 => {
                 const ALLOWED: u64 = trames_vfs::CLONE_NEWUTS
                     | trames_vfs::CLONE_NEWNS

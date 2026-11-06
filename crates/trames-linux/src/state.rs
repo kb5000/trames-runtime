@@ -992,7 +992,7 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
-            5..=17 | 33..=38 | 43 | 44 | 49..=55 | 88 | 276 | 452 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             }
             92 => match a[0] as u32 {

@@ -1,8 +1,8 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 53, original dynamic
-proc/sys views and their pathname/descriptor consumers, reviewed on 2026-11-06.
-The prior executable baseline is `e6d700c3147a4fb5a2a772dfcbb28eb636ac53fc`.
+This is the consolidated implementation audit through stage 54, original mount topology
+transactions and fs_struct root replacement, reviewed on 2026-11-06.
+The prior executable baseline is `b26b2ad732663e6aedb665a3e3bc61b676b9746e`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
@@ -24,7 +24,8 @@ this table or by the number of migration stages.
 | Structural VM edits, pins and mapped-file layout changes | Affected mm/backing users quiesce; original owner publishes or runs the accepted layout operation | Actual unsupported backing/generation/lifetime or policy cases can escalate to a full cohort return; pure additive private-anonymous mmap uses in-cohort publication |
 | Residual generic FD/network compatibility | In-cohort owner service when the actual resource is admitted; only the caller waits | Refusal before effects uses the joined owner path. Candidate syscall numbers do not mean ordinary admitted calls take this route |
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
-| Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export or actual mapping invalidation needs only the original mm admission boundary. Legacy embeddings without a provider keep joined snapshots; namespace mutations and task policy remain separate |
+| Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export or actual mapping invalidation needs only the original mm admission boundary. Legacy embeddings without a provider keep joined snapshots; task namespace membership mutations and policy remain separate |
+| Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Task namespace membership (unshare/setns), tracing and genuinely excluded path controls keep separate boundaries |
 | Tracing and mutable security policy | Joined task-policy boundary where required | Installation/TSYNC and signal/termination effects remain. Untraced continuous-worker custody entries finish pure ERRNO/unsupported TRACE/USER_NOTIF decisions before mm quiescence; accepted decisions travel once |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
@@ -38,18 +39,19 @@ or prestart every configured CPU. Scheduler, resource processing,
 communication and full-stop costs must be measured separately. UI-thread affinity
 and the native disk/device pools are not additional Linux coordinators.
 
-The latest measured 12-CPU, 32-operation exec workload has **zero Service
-requests in both versions**. Ordinary exec and nonleader exec nevertheless change
-from 33 full-cohort rounds to one. The execveat variant changes from 65 to 33:
-all 32 execveat returns disappear, but all 32 openat calls on `/proc/self/exe`
-remain. The final control ioctl is also retained. These are the specific fixture
-results in [stage 51 evidence](https://github.com/kb5000/trames-ipad/blob/c4ea2d7/docs/validation/exec-custody-20261105.json),
-not a measurement of their prevalence in Firefox or every server workload.
+Stage 53 removed the `/proc/self/exe` opens left by the historical stage 51
+execveat fixture. Stage 54 removes admitted mount/umount/pivot_root topology work
+from joined dispatch. In the new multi-CPU mount compatibility fixture, only the
+final console ioctl and the explicit unshare administration return the cohort;
+mount operations request no owner service. These are fixture-specific results,
+not their prevalence in Firefox or every container workload.
 
-The next data-supported subsystem target is dynamic process/resource views and
-path resolution, followed by owner-only task/namespace administration and actual
-compatibility admissions. This is a prioritization note, not an implementation
-change or a new pathname whitelist.
+The next task-namespace subsystem must replace the remaining epoch-frozen
+membership captures together: Files/fs, UTS, network/IPC/cgroup namespaces,
+pid-for-children, descriptor factories, signal/readiness and proc observers.
+Moving just unshare/setns entry points would leave those consumers on old
+resources. Credentials, actual owner-control graphs and structural mapping
+publication also remain separate boundaries.
 
 ## Execution model
 
@@ -149,7 +151,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold Rc projections are collected while peer CPUs continue; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. Rc construction still runs on its original owner during that scoped custody, rather than transferring the Rc graph to a worker. Exec prepares and commits on the original owner at creator-mm custody, including nonleader identity replacement and failed-image recovery. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Administrative mutations still enter the original owner. Mount tables and namespace descriptor authority are now shared original objects; metadata query projections do not grant mutation authority or pin all mounted filesystems. This does not move task namespace membership changes onto workers. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Unshare/setns task membership, credentials/capabilities and BPF administration still enter the original owner. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, legacy epoll creation admission, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
@@ -931,3 +933,46 @@ limits. It does not claim all namespace administration, owner-only epoll graphs,
 tracing/security or generic dispatch fallbacks are removed. Product fixture and
 counterbalanced timing evidence is recorded in
 [stage 53 validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-proc-20261106.json).
+
+## Original mount transactions and root replacement — 2026-11-06
+
+The supported mount topology subsystem (mount, remount, bind/recursive bind,
+move, private/slave flags, umount/lazy detach and pivot_root) uses the original
+namespace Table, Mount graph and lookup/retirement registries from source workers.
+A pathname executor no longer freezes a topology snapshot or retains every mount
+through an auxiliary strong registry. Each private resolver caches an immutable
+weak lookup index; only actual registry edits publish a new revision. Cache hits
+do not take the shared index lock, and cached entries cannot retain a detached
+mount or its overlay layers. A serial writer reuses its index allocation when
+there are no other readers. Ordinary path/FD consumers observe changes
+without returning their CPUs or rebuilding a coordinator snapshot. Metadata-only
+proc snapshots remain read-only projections and do not become mutation authority.
+
+One transaction mutex per original namespace protects structural invariants.
+An uncontended in-memory call executes on its source worker. Native filesystem
+work retains owned operands in the existing disk pool. A contending FileWork
+subscribes to that namespace's original readiness and releases its execution
+slot; retries and cancellation retain the accepted operation. The real unlock
+uses the existing atomic readiness protocol because a failed try_lock does not
+acquire the mutex. No ordinary guest-memory barrier, polling bus, coordinator
+request or new service thread is added. Mutation error ordering and permissions
+remain in the common VFS algorithms, shared by owner and source entries.
+
+Pivot_root replaces exact old mount/inode root and cwd references directly in
+original fs_structs, including independent contexts. Open directory FDs and cwd
+below the old root retain their original paths. A weak context registry serializes
+only context creation and this reference replacement, preventing a concurrent
+fork from publishing a missed old-root copy. Weak-entry pruning is amortized;
+ordinary chdir/open/read operations do not acquire that registry lock. This follows
+Linux [chroot_fs_refs](https://github.com/torvalds/linux/blob/master/fs/fs_struct.c).
+A detached or foreign mount can remain readable through its directory FD, but
+cannot become the caller's namespace root; this preserves the namespace membership
+check in Linux [path_pivot_root](https://github.com/torvalds/linux/blob/master/fs/namespace.c).
+
+This batch does not claim worker-side task namespace membership changes.
+Unshare/setns and CLONE_NEW* still update captured task resources at their existing
+lifecycle/owner boundary; unshare copies the original table under its transaction.
+Credentials, unsupported newer mount APIs/propagation modes, tracing/security,
+excluded pathname controls and generic unhandled dispatch remain explicit limits.
+The native Linux, interpreter/HVF, timing and local regression evidence is in
+[stage 54 validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-mount-20261106.json).

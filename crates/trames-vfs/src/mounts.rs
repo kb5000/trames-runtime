@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
+pub(super) mod admin;
+mod registry;
+pub(super) use registry::Registry;
 pub(super) mod watch;
+#[cfg(test)]
+mod worker_tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -88,8 +93,8 @@ pub(super) struct MountData {
     directory_users: std::sync::atomic::AtomicUsize,
     pub identity: Arc<MountIdentity>,
     parent: Arc<SharedCell<Option<SharedAttachment>>>,
-    // Namespace descriptors remain owner controls; their topology must not be
-    // projected as a complete shared mount capability.
+    // Complete original namespace authority; metadata projections normalize
+    // this handle before a namespace descriptor is opened.
     namespace: Option<linux_namespace::NamespaceHandle>,
 }
 // One lease per actual shared directory OFD, independent of FD aliases.
@@ -394,6 +399,7 @@ pub(super) struct Table {
     pub root: Arc<Mount>,
     pub mounts: Vec<Arc<Mount>>,
     pub events: Arc<watch::MountEvents>,
+    pub(super) admin: Arc<admin::Admin>,
     // A query-local topology snapshot is observation, never mutable authority.
     // Accepted nsfs opens upgrade this original resource instead.
     original: Option<std::sync::Weak<SharedCell<Table>>>,
@@ -405,6 +411,7 @@ impl Table {
             root,
             mounts,
             events: Arc::default(),
+            admin: Arc::default(),
             original: None,
         }
     }
@@ -418,6 +425,7 @@ impl Table {
             root: project(&table.root),
             mounts: table.mounts.iter().map(&mut project).collect(),
             events: table.events.clone(),
+            admin: table.admin.clone(),
             original: Some(
                 table
                     .original
@@ -825,6 +833,8 @@ impl Vfs {
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
+        let admin = self.mount_admin()?;
+        let _lease = admin.enter();
         let old = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
         // Linux copy_mnt_ns omits mount-namespace nsfs bindings and everything
         // mounted on them. Retaining an older namespace here would defeat the
@@ -987,6 +997,18 @@ impl Vfs {
     }
     /// Mounts belong entirely to the guest. No host mount or pathname is used.
     pub fn mount(
+        &mut self,
+        source: Option<&[u8]>,
+        target: &[u8],
+        kind: Option<&[u8]>,
+        flags: u64,
+        data: Option<&[u8]>,
+    ) -> Result<()> {
+        let admin = self.mount_admin()?;
+        let _lease = admin.enter();
+        self.mount_locked(source, target, kind, flags, data)
+    }
+    pub(super) fn mount_locked(
         &mut self,
         source: Option<&[u8]>,
         target: &[u8],
@@ -1405,6 +1427,11 @@ impl Vfs {
         Ok(())
     }
     pub fn umount(&mut self, target: &[u8], flags: u64) -> Result<()> {
+        let admin = self.mount_admin()?;
+        let _lease = admin.enter();
+        self.umount_locked(target, flags)
+    }
+    pub(super) fn umount_locked(&mut self, target: &[u8], flags: u64) -> Result<()> {
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
@@ -1462,6 +1489,11 @@ impl Vfs {
         Ok(())
     }
     pub fn pivot_root(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
+        let admin = self.mount_admin()?;
+        let _lease = admin.enter();
+        self.pivot_root_locked(new_root, put_old)
+    }
+    pub(super) fn pivot_root_locked(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
@@ -1485,6 +1517,15 @@ impl Vfs {
             return Err(Errno(22));
         }
         let mut table = ns.0.borrow_mut();
+        // A retained directory can name a detached or foreign namespace mount.
+        // It remains traversable, but cannot become this namespace's root.
+        if !table
+            .mounts
+            .iter()
+            .any(|mount| Arc::ptr_eq(mount, &new_mount))
+        {
+            return Err(Errno(22));
+        }
         if Arc::ptr_eq(&new_mount, &table.root)
             || current_root
                 .mount
@@ -1504,46 +1545,20 @@ impl Vfs {
         let events = table.events.clone();
         drop(table);
         events.changed();
-        self.rebase_pivot_context(&previous, &new_mount);
+        self.context
+            .paths
+            .pivot(&previous.shared, &new_mount.shared);
         Ok(())
     }
-    fn rebase_pivot_context(&mut self, previous: &Arc<Mount>, new: &Arc<Mount>) {
-        let mut paths = self.context.paths.borrow_mut();
-        if paths
-            .cwd_mount
+    pub(super) fn mount_admin(&self) -> Result<Arc<admin::Admin>> {
+        Ok(self
+            .mounts
             .as_ref()
-            .is_some_and(|m| Arc::ptr_eq(m, previous))
-            && paths
-                .cwd_node
-                .as_ref()
-                .is_some_and(|n| Arc::ptr_eq(n, &previous.root))
-        {
-            paths.cwd_mount = Some(new.clone());
-            paths.cwd_node = Some(new.root.clone());
-        }
-        if paths.root_node.is_none()
-            || paths
-                .root_mount
-                .as_ref()
-                .is_some_and(|m| Arc::ptr_eq(m, previous))
-                && paths
-                    .root_node
-                    .as_ref()
-                    .is_some_and(|n| Arc::ptr_eq(n, &previous.root))
-        {
-            paths.root_mount = Some(new.clone());
-            paths.root_node = Some(new.root.clone());
-        }
-    }
-    pub fn sync_pivot_from(&mut self, before: &Vfs, after: &Vfs) {
-        let previous = before.context.paths.borrow().root_mount.clone();
-        if let (Some(ours), Some(theirs), Some(previous)) = (&self.mounts, &after.mounts, &previous)
-        {
-            if Arc::ptr_eq(&ours.0, &theirs.0) {
-                let new = theirs.0.borrow().root.clone();
-                self.rebase_pivot_context(previous, &new);
-            }
-        }
+            .ok_or(Errno(22))?
+            .0
+            .borrow()
+            .admin
+            .clone())
     }
     pub fn mount_id_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<u64> {
         let (path, target) =

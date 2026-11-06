@@ -271,16 +271,27 @@ impl PreparedOpen {
 }
 impl FileWork {
     pub fn waiting(&self) -> bool {
-        !self.proc_wait.is_empty()
+        self.namespace.as_ref().is_some_and(|work| work.waiting())
+            || !self.proc_wait.is_empty()
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
+        if let Some(work) = &self.namespace {
+            return work.ready();
+        }
         match &self.command {
             FileCommand::Transfer(t) => t.borrow().ready(),
             _ => self.proc_wait.iter().all(|page| page.ready()),
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some(work) = &self.namespace {
+            return Ok(TransferWait {
+                subscriptions: work.subscribe(signal).into_iter().collect(),
+                native: Vec::new(),
+                deadline: None,
+            });
+        }
         match &self.command {
             FileCommand::Transfer(t) => t.borrow().wait_sources(signal),
             _ => Ok(TransferWait {
@@ -501,14 +512,17 @@ impl FileWork {
         {
             return Self::proc_outcome(result, || self);
         }
-        if let Some(namespace) = &self.namespace {
+        if let Some(namespace) = &mut self.namespace {
             return match namespace.run(&self.paths) {
-                Some(result) => FileOutcome::Complete(FileReply {
-                    result,
-                    file_size_signal: false,
-                    scratch: None,
-                }),
-                None => FileOutcome::Owner(self),
+                namespace_work::NamespaceRun::Complete(result) => {
+                    FileOutcome::Complete(FileReply {
+                        result,
+                        file_size_signal: false,
+                        scratch: None,
+                    })
+                }
+                namespace_work::NamespaceRun::Owner => FileOutcome::Owner(self),
+                namespace_work::NamespaceRun::Waiting => FileOutcome::Waiting(self),
             };
         }
         let reply = if let Some(targets) = &self.sync_targets {
