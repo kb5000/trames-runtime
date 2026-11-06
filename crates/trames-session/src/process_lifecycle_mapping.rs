@@ -64,7 +64,7 @@ impl<C: Cpu> Lifecycle<C> {
         report: &mut Report,
         slot: usize,
         engine: &mut C::Engine,
-    ) {
+    ) -> Option<tasks::AdmissionWait> {
         // Retain the existing bounded batching rule: this CPU can execute
         // quiesced guest instructions only when there is no unrelated job to
         // claim. It reuses this worker's engine and adds no execution slot.
@@ -84,6 +84,20 @@ impl<C: Cpu> Lifecycle<C> {
             if p.signals.io.lifecycle().termination().is_some() {
                 job.checkpoint = None;
                 continue;
+            }
+            if job.work.cpu.x(8) == 222 {
+                let args = args(&job.work.cpu);
+                if let Err(layout) = p.linux.admit_mmap(args, &p.memory) {
+                    let signal =
+                        trames_shared::IoSignal::new(job.work.pid, epoch.io_target.clone());
+                    let subscription = layout.subscribe(&signal);
+                    if p.linux.admit_mmap(args, &p.memory).is_err() {
+                        return Some(tasks::AdmissionWait {
+                            signal,
+                            subscriptions: vec![subscription],
+                        });
+                    }
+                }
             }
             job.checkpoint = None;
             job.seccomp_entry.take();
@@ -155,6 +169,7 @@ impl<C: Cpu> Lifecycle<C> {
                 used_window = true;
                 if matches!(outcome, SliceOutcome::Syscall { .. })
                     && crate::worker_syscalls::vm_entry(&p.cpu)
+                    && p.cpu.x(8) != 222
                 {
                     p.cpu.clear_exclusive();
                     extra = true;
@@ -172,5 +187,6 @@ impl<C: Cpu> Lifecycle<C> {
                 cgroup.acknowledge();
             }
         }
+        None
     }
 }

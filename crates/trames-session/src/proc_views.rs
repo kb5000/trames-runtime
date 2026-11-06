@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::Instant,
 };
@@ -23,18 +23,56 @@ pub(super) struct Source {
     pub task_limit: usize,
     pub limits: crate::MemoryLimits,
     pub host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
-    pub reads: Mutex<Vec<trames_memory::MemoryReport>>,
+    pub reads: Mutex<Reads>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
+}
+#[derive(Default)]
+pub(super) struct Reads {
+    pending: Vec<trames_memory::MemoryReport>,
+    waiting: Vec<ReadWait>,
+    executor: Option<Weak<trames_vfs::IoSignal>>,
+}
+struct ReadWait {
+    report: trames_memory::MemoryReport,
+    signal: Arc<trames_vfs::IoSignal>,
+    _subscriptions: Vec<trames_vfs::IoSubscription>,
+}
+pub(super) struct ReadDriver {
+    source: Arc<Source>,
+    pub signal: Arc<trames_vfs::IoSignal>,
+}
+impl Drop for ReadDriver {
+    fn drop(&mut self) {
+        let mut reads = self.source.reads.lock().unwrap();
+        if reads
+            .executor
+            .as_ref()
+            .is_some_and(|old| old.ptr_eq(&Arc::downgrade(&self.signal)))
+        {
+            reads.executor = None;
+            let pending =
+                !reads.pending.is_empty() || reads.waiting.iter().any(|wait| wait.signal.ready());
+            drop(reads);
+            if pending {
+                (self.source.wake)();
+            }
+        }
+    }
 }
 impl Source {
     pub fn request_read(&self, report: trames_memory::MemoryReport) {
         let mut reads = self.reads.lock().unwrap();
-        if reads.iter().any(|old| old.same_resource(&report)) {
+        if reads.pending.iter().any(|old| old.same_resource(&report))
+            || reads
+                .waiting
+                .iter()
+                .any(|old| old.report.same_resource(&report))
+        {
             return;
         }
-        reads.push(report);
+        reads.pending.push(report);
         drop(reads);
-        (self.wake)();
+        self.notify_reads();
     }
     pub fn bind_reads(self: &Arc<Self>, report: &trames_memory::MemoryReport) {
         let source = Arc::downgrade(self);
@@ -45,7 +83,81 @@ impl Source {
         }));
     }
     pub fn take_reads(&self) -> Vec<trames_memory::MemoryReport> {
-        std::mem::take(&mut *self.reads.lock().unwrap())
+        self.take_for(None)
+    }
+    pub fn bind_reader(self: &Arc<Self>, signal: Arc<trames_vfs::IoSignal>) -> ReadDriver {
+        self.reads.lock().unwrap().executor = Some(Arc::downgrade(&signal));
+        // Subscribe before the retry. Marking a ready request is harmless even
+        // before the epoch begins; its first existing executor consumes it.
+        signal.notify();
+        ReadDriver {
+            source: self.clone(),
+            signal,
+        }
+    }
+    pub fn take_worker_reads(
+        &self,
+        signal: &Arc<trames_vfs::IoSignal>,
+    ) -> Vec<trames_memory::MemoryReport> {
+        self.take_for(Some(signal))
+    }
+    fn take_for(
+        &self,
+        executor: Option<&Arc<trames_vfs::IoSignal>>,
+    ) -> Vec<trames_memory::MemoryReport> {
+        let mut reads = self.reads.lock().unwrap();
+        let current = reads.executor.as_ref().and_then(Weak::upgrade);
+        if match (executor, current.as_ref()) {
+            (Some(requested), Some(current)) => !Arc::ptr_eq(requested, current),
+            (None, None) => false,
+            _ => true,
+        } {
+            return Vec::new();
+        }
+        let mut reports = std::mem::take(&mut reads.pending);
+        let mut retired = Vec::new();
+        let mut i = 0;
+        while i < reads.waiting.len() {
+            if reads.waiting[i].signal.ready() {
+                let wait = reads.waiting.swap_remove(i);
+                reports.push(wait.report.clone());
+                retired.push(wait);
+            } else {
+                i += 1;
+            }
+        }
+        drop(reads);
+        drop(retired);
+        reports
+    }
+    pub fn defer_read(
+        &self,
+        report: trames_memory::MemoryReport,
+        signal: Arc<trames_vfs::IoSignal>,
+        subscriptions: Vec<trames_vfs::IoSubscription>,
+    ) {
+        self.reads.lock().unwrap().waiting.push(ReadWait {
+            report,
+            signal: signal.clone(),
+            _subscriptions: subscriptions,
+        });
+        if signal.ready() {
+            self.notify_reads();
+        }
+    }
+    fn notify_reads(&self) {
+        let executor = self
+            .reads
+            .lock()
+            .unwrap()
+            .executor
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(signal) = executor {
+            signal.notify();
+        } else {
+            (self.wake)();
+        }
     }
     fn target(path: &[u8], namespace: &PidNamespace) -> Option<u32> {
         let parts: Vec<_> = path
@@ -62,7 +174,7 @@ impl Source {
 }
 impl trames_vfs::IoWake for Source {
     fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
-        (self.wake)();
+        self.notify_reads();
     }
 }
 impl ProcSource for Source {

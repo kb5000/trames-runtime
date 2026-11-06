@@ -18,6 +18,155 @@ impl IoWake for Target {
 fn t() -> Arc<dyn IoWake> {
     Arc::new(Target::default())
 }
+#[test]
+fn mmap_plan_waits_before_page_preparation_and_retains_original_fd() {
+    let mut linux = Linux::new(0x100000);
+    linux
+        .vfs
+        .import_file(b"/original", b"original bytes".to_vec())
+        .unwrap();
+    linux
+        .vfs
+        .import_file(b"/other", b"replacement".to_vec())
+        .unwrap();
+    let fd = linux.vfs.open_at(-100, b"/original", 2, 0).unwrap();
+    let mut memory = Memory::default();
+    let args = [0x4000, PAGE_SIZE, 3, 0x12, fd as u64, 0];
+    let mut plan = linux.prepare_mmap(args, &memory).unwrap();
+    let layout = plan.layout().unwrap().clone();
+    let exclusive = layout.write().try_enter().ok().unwrap();
+    assert!(!plan.try_admit(memory.memory_report()));
+    assert!(memory.is_free(0x4000, PAGE_SIZE));
+    linux.vfs.close(fd).unwrap();
+    assert_eq!(linux.vfs.open_at(-100, b"/other", 2, 0).unwrap(), fd);
+    drop(exclusive);
+    assert!(plan.try_admit(memory.memory_report()));
+    let writer = layout.write();
+    assert!(
+        !writer.ready(),
+        "admitted page preparation owns its backing"
+    );
+    assert_eq!(linux.apply_mmap(plan, &mut memory), Ok(0x4000));
+    assert!(writer.ready());
+    assert!(
+        memory.parallel_view(&mut Default::default()).is_none(),
+        "a writer accepted after mmap admission excludes CPU publication"
+    );
+    drop(writer);
+    let view = memory.parallel_view(&mut Default::default()).unwrap();
+    assert_eq!(view.read_array::<14>(0x4000).unwrap(), *b"original bytes");
+    assert_eq!(linux.vfs.pread(fd, 32, 0).unwrap(), b"replacement");
+}
+#[test]
+fn mapped_file_layout_keeps_the_original_call_through_driver_replacement_and_fd_reuse() {
+    for replace in [false, true] {
+        let mut v = trames_vfs::Vfs::default();
+        v.import_file(b"/original", vec![0xa5; PAGE_SIZE as usize])
+            .unwrap();
+        v.import_file(b"/other", b"untouched".to_vec()).unwrap();
+        let fd = v.open_at(-100, b"/original", 2, 0).unwrap();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(
+                0x1000,
+                v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap(),
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        let mut registry = trames_memory::parallel::Registry::default();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.write_array(0x1000, [0x42]).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let disk: Arc<dyn FileExecutor> = Arc::new(Queue(send));
+        let layouts = crate::FileLayouts::new(disk.clone());
+        let target = t();
+        let owner_signal = IoSignal::new(0, Arc::downgrade(&target));
+        layouts.bind_owner(owner_signal.clone());
+        let first_signal = IoSignal::new(0, Arc::downgrade(&target));
+        let first = layouts.bind_reader(first_signal.clone());
+        let mut epoch = trames_vfs::FileEpoch::default();
+        let direct = DirectSyscalls::default()
+            .with_files(epoch.capture(&v, true))
+            .with_membership(v.shared_files())
+            .with_paths(v.path_queries())
+            .with_file_executor(disk)
+            .with_file_layouts(layouts.clone());
+        let args = [fd as u64, 1, 0, 0, 0, 0];
+        let Some(IoAttempt::Blocked(wait)) =
+            direct.start_file_call(46, args, &mut view, 1, &Arc::downgrade(&target))
+        else {
+            panic!("file layout must park directly, with no owner checkpoint");
+        };
+        let pending = wait.file_pending().unwrap();
+        drop(wait);
+        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        result.complete(work.run());
+        let IoAttempt::Blocked(wait) =
+            direct.start_retained_file(pending, 46, args, &mut view, 1, &Arc::downgrade(&target))
+        else {
+            panic!("accepted layout parks on original backing");
+        };
+        let pending = wait.file_pending().unwrap();
+        drop((wait, direct));
+        assert!(layouts.pending());
+        let request = first.take_ready().pop().unwrap();
+        let layout = request.layout().clone();
+        let request = layouts.try_submit(request).err().unwrap();
+        // Publish a resource wake before parking: it must survive the transfer.
+        request.signal.notify();
+        layouts.restore(request);
+        let request = first.take_ready().pop().unwrap();
+        layouts.restore(request);
+        assert!(
+            first.take_ready().is_empty(),
+            "no polling while Views remain"
+        );
+        v.close(fd).unwrap();
+        assert_eq!(v.open_at(-100, b"/other", 2, 0).unwrap(), fd);
+        let replacement_signal = IoSignal::new(0, Arc::downgrade(&target));
+        let replacement = replace.then(|| layouts.bind_reader(replacement_signal.clone()));
+        drop(first);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        let request = if let Some(replacement) = &replacement {
+            assert!(replacement_signal.ready());
+            assert!(
+                !owner_signal.ready(),
+                "replaced source remains the only reader"
+            );
+            assert!(layouts.take_owner().is_empty());
+            replacement.take_ready().pop().unwrap()
+        } else {
+            assert!(owner_signal.ready());
+            layouts.take_owner().pop().unwrap()
+        };
+        assert!(layouts.try_submit(request).is_ok());
+        assert!(!layouts.pending());
+        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            layout.pending(),
+            "native executor still owns publication exclusion"
+        );
+        assert!(memory.parallel_view(&mut registry).is_none());
+        result.complete(work.run());
+        assert!(!layout.pending());
+        let direct = DirectSyscalls::default();
+        assert!(matches!(
+            direct.start_retained_file(pending, 46, args, &mut memory, 1, &Arc::downgrade(&target)),
+            IoAttempt::Complete(Ok(0))
+        ));
+        let original = v.open_at(-100, b"/original", 0, 0).unwrap();
+        assert_eq!(v.read(original, 32).unwrap(), [0x42]);
+        assert_eq!(v.pread(fd, 32, 0).unwrap(), b"untouched");
+        assert!(
+            receive.try_recv().is_err(),
+            "accepted mutation executes exactly once"
+        );
+        epoch.finish();
+    }
+}
 fn disk() -> (std::path::PathBuf, trames_vfs::Vfs) {
     let path = std::env::temp_dir().join(format!(
         "trames-accepted-file-{}-{}",

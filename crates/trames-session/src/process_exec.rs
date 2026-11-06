@@ -815,29 +815,43 @@ mod tests {
                     k.workers.launch(0, epoch.clone()).unwrap();
                     let mut stopped = 0;
                     let mut released = mode < 4;
-                    let mut late = Vec::new();
+                    // Model a completion accepted by the outside driver before
+                    // rekey. Production source completion now consumes its own
+                    // returned CPU without an owner Retired notification.
+                    let late = (mode == 5).then(|| {
+                        let mut done = crate::run_queue::Stats::default().finish(
+                            1,
+                            trames_cpu::Cpu::default(),
+                            Some(SliceOutcome::Syscall { instructions: 0 }),
+                            None,
+                            None,
+                            None,
+                        );
+                        done.task = Some(original.clone());
+                        done.thread_exit = Some(0);
+                        done
+                    });
                     let deadline = Instant::now() + Duration::from_secs(5);
                     loop {
                         match k
                             .workers
-                            .event_timeout(deadline.saturating_duration_since(Instant::now()))
+                            .event_timeout(
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(10)),
+                            )
                             .unwrap()
                         {
-                            Some(Event::Retired) if !released => {
-                                if mode == 5 {
-                                    late = epoch.take_retired();
-                                }
-                                assert_eq!(release.write(b"x"), Ok(1));
-                                released = true;
-                            }
                             Some(Event::Retired | Event::Idle) => {}
+                            None => assert!(Instant::now() < deadline, "source exec timed out"),
                             Some(Event::EpochStopped(_)) => stopped += 1,
                             _ => {
                                 panic!("exec required owner: cpus={cpus} mode={mode}")
                             }
                         }
-                        if !replacement_io.live() {
-                            epoch.stop();
+                        if !released && !original.read().signals.io.live() {
+                            assert_eq!(release.write(b"x"), Ok(1));
+                            released = true;
                         }
                         if stopped == epoch.active_slots().count_ones() {
                             break;
@@ -847,11 +861,11 @@ mod tests {
                         epoch.collect_lifecycle(&mut k).is_none(),
                         "cpus={cpus} mode={mode}"
                     );
-                    assert_eq!(epoch.member_ids(), vec![1], "cpus={cpus} mode={mode}");
-                    let mut done = epoch.drain();
-                    assert_eq!(done.len(), 1);
+                    assert!(epoch.member_ids().is_empty(), "cpus={cpus} mode={mode}");
+                    assert!(epoch.drain().is_empty());
+                    assert!(!replacement_io.live());
                     assert_eq!(
-                        done[0].thread_exit,
+                        replacement.read().family.status(),
                         Some(if mode == 2 { 123 << 8 } else { 42 << 8 }),
                         "cpus={cpus} mode={mode}"
                     );
@@ -863,10 +877,7 @@ mod tests {
                     assert!(epoch.collect_lifecycle(&mut k).is_none());
                     assert_eq!(k.vm_checkpoint_groups, 1);
                     let before = replacement.read().memory.coordinator_ownership();
-                    if mode == 5 {
-                        assert_eq!(late.len(), 1);
-                    }
-                    for old in late {
+                    if let Some(old) = late {
                         k.accept_source_return(old).unwrap();
                     }
                     assert_eq!(replacement.read().memory.coordinator_ownership(), before);
@@ -877,7 +888,6 @@ mod tests {
                             replacement.read().signals.io.identity()
                         );
                     }
-                    k.accept_source_return(done.pop().unwrap()).unwrap();
                     assert_eq!(k.syscalls, if mode >= 4 { 4 } else { 2 });
                     if cpus == 4 {
                         assert_eq!(

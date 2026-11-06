@@ -7,16 +7,21 @@ use trames_shared::{Custody, OwnedRead, OwnedWrite};
 type Slot<C> = Option<Box<Process<C>>>;
 type Cell<C> = Custody<Slot<C>>;
 
-pub(crate) struct Handle<C: Cpu>(Cell<C>, Arc<trames_kernel::task_control::Group>);
+pub(crate) struct Handle<C: Cpu>(
+    Cell<C>,
+    Arc<trames_kernel::task_control::Group>,
+    trames_memory::MemoryReport,
+);
 impl<C: Cpu> Clone for Handle<C> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), self.1.clone())
+        Self(self.0.clone(), self.1.clone(), self.2.clone())
     }
 }
 impl<C: Cpu> Handle<C> {
     fn new(process: Box<Process<C>>) -> Self {
         let group = process.signals.io.lifecycle().clone();
-        Self(Custody::new(Some(process)), group)
+        let memory = process.memory.memory_report();
+        Self(Custody::new(Some(process)), group, memory)
     }
     pub fn same(&self, other: &Self) -> bool {
         self.0.same(&other.0)
@@ -135,6 +140,46 @@ pub(crate) fn admit_one<C: Cpu>(
     )?;
     Ok(Some((memory, permit)))
 }
+
+/// Nonblocking admission on an already accepted resource's own notification.
+/// Successful task admission removes its temporary subscription before trying
+/// mm custody, so releasing our task permit cannot wake our own unrelated wait.
+pub(crate) fn admit_on<C: Cpu>(
+    task: &Handle<C>,
+    signal: &Arc<trames_shared::IoSignal>,
+) -> Result<
+    Option<(trames_memory::MemoryAdmission, Admission<C>)>,
+    Vec<trames_shared::IoSubscription>,
+> {
+    let permit = if let Some(permit) = task.try_admit() {
+        permit
+    } else {
+        let subscription = task.subscribe(signal);
+        match task.try_admit() {
+            Some(permit) => {
+                drop(subscription);
+                permit
+            }
+            None => return Err(vec![subscription]),
+        }
+    };
+    let Some(task) = task.try_read_body() else {
+        return Ok(None);
+    };
+    let memory = if let Some(memory) = task.memory.try_admit() {
+        memory
+    } else {
+        let subscription = task.memory.subscribe_custody(signal);
+        match task.memory.try_admit() {
+            Some(memory) => {
+                drop(subscription);
+                memory
+            }
+            None => return Err(subscription.into_iter().collect()),
+        }
+    };
+    Ok(Some((memory, permit)))
+}
 pub(crate) struct Read<C: Cpu> {
     value: OwnedRead<Slot<C>>,
 }
@@ -166,7 +211,8 @@ impl<C: Cpu> DerefMut for Write<C> {
 impl<C: Cpu> Write<C> {
     fn into_handle(self) -> Handle<C> {
         let group = self.signals.io.lifecycle().clone();
-        Handle(self.value.into_custody(), group)
+        let memory = self.memory.memory_report();
+        Handle(self.value.into_custody(), group, memory)
     }
     pub fn into_inner(mut self) -> Box<Process<C>> {
         self.value.take().expect("retired task body")
@@ -191,22 +237,31 @@ struct Members<C: Cpu> {
     snapshot: Option<Entries<C>>,
     groups: BTreeMap<usize, std::collections::BTreeSet<u32>>,
 }
-pub(super) struct Directory<C: Cpu>(Arc<parking_lot::Mutex<Members<C>>>);
+pub(super) struct Directory<C: Cpu>(
+    Arc<parking_lot::Mutex<Members<C>>>,
+    Arc<crate::exit_groups::ExitGroups>,
+);
 impl<C: Cpu> Default for Directory<C> {
     fn default() -> Self {
-        Self(Arc::new(parking_lot::Mutex::new(Members {
-            tasks: BTreeMap::new(),
-            snapshot: None,
-            groups: BTreeMap::new(),
-        })))
+        Self(
+            Arc::new(parking_lot::Mutex::new(Members {
+                tasks: BTreeMap::new(),
+                snapshot: None,
+                groups: BTreeMap::new(),
+            })),
+            Arc::default(),
+        )
     }
 }
 impl<C: Cpu> Clone for Directory<C> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
     }
 }
 impl<C: Cpu> Directory<C> {
+    pub fn exits(&self) -> Arc<crate::exit_groups::ExitGroups> {
+        self.1.clone()
+    }
     pub fn handle(&self, id: &u32) -> Option<Handle<C>> {
         self.0.lock().tasks.get(id).cloned()
     }
@@ -222,6 +277,15 @@ impl<C: Cpu> Directory<C> {
             .collect();
         members.snapshot = Some(snapshot.clone());
         snapshot
+    }
+    /// Cold lookup uses original mm identity without taking unrelated task or
+    /// memory custody. The selected body is revalidated after its admission.
+    pub fn memory(&self, memory: &trames_memory::MemoryReport) -> Vec<(u32, Handle<C>)> {
+        self.entries()
+            .iter()
+            .filter(|(_, task)| task.2.same_resource(memory))
+            .cloned()
+            .collect()
     }
     /// Original group membership includes cold/retiring tasks until their
     /// identity is actually removed. No unrelated task bodies are inspected.
@@ -243,6 +307,8 @@ impl<C: Cpu> Directory<C> {
             .is_some_and(|old| old.0.same(&task.0))
     }
     pub fn publish(&self, id: u32, task: Handle<C>) -> Option<Handle<C>> {
+        let memory = task.2.clone();
+        let group = task.1.clone();
         let (old, snapshot) = {
             let mut members = self.0.lock();
             let old = members.remove(id);
@@ -255,6 +321,10 @@ impl<C: Cpu> Directory<C> {
             (old, members.snapshot.take())
         };
         drop(snapshot);
+        self.1.watch(&group);
+        // A proc observer can request this image after its public identity but
+        // before task membership. Publication closes that original-resource race.
+        memory.wake_requested_reads();
         old
     }
     fn remove(&self, id: &u32) -> Option<Handle<C>> {
@@ -280,6 +350,7 @@ impl<C: Cpu> Directory<C> {
         self.remove_original(id, &task.0);
     }
     pub fn restore(&self, from: u32, id: u32, task: &Write<C>) -> Option<Handle<C>> {
+        let memory = task.memory.memory_report();
         let (replaced, snapshot) = {
             let mut members = self.0.lock();
             if !members
@@ -289,10 +360,11 @@ impl<C: Cpu> Directory<C> {
             {
                 return None;
             }
-            if from == id {
+            if from == id && members.tasks[&id].2.same_resource(&memory) {
                 return None;
             }
-            let task = members.remove(from).expect("original member");
+            let mut task = members.remove(from).expect("original member");
+            task.2 = memory.clone();
             let replaced = members.remove(id);
             members
                 .groups
@@ -303,6 +375,7 @@ impl<C: Cpu> Directory<C> {
             (replaced, members.snapshot.take())
         };
         drop(snapshot);
+        memory.wake_requested_reads();
         replaced
     }
 }

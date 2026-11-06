@@ -8,6 +8,7 @@ use trames_engine::{Cpu, CpuFault};
 use trames_linux::{GuestOutput, Linux};
 mod clock;
 mod devices;
+mod exit_groups;
 mod futex;
 mod gpu;
 mod proc_views;

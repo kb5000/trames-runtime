@@ -56,6 +56,13 @@ impl MemoryReport {
             )
         })
     }
+    /// Retry an already requested read when its original task becomes visible.
+    /// This neither creates a new request nor retains a guest byte actor.
+    pub fn wake_requested_reads(&self) {
+        if self.has_requested_reads() {
+            self.wake_reads();
+        }
+    }
     /// Resource identity, including a renewed lifetime of the same image.
     pub fn same_resource(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)

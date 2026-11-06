@@ -35,6 +35,7 @@ pub(super) struct Dispatch {
     timers: Arc<trames_kernel::timers::Timers>,
     futexes: crate::futex::Futexes,
     files: Arc<dyn trames_linux::FileExecutor>,
+    layouts: Arc<trames_linux::FileLayouts>,
     gpu_budget: trames_vulkan::Budget,
     gpu_display: trames_vulkan::Display,
     started: Instant,
@@ -50,6 +51,7 @@ impl Dispatch {
             timers: k.timers.clone(),
             futexes: k.futexes.clone(),
             files: k.workers.file_executor(),
+            layouts: k.file_layout_work(),
             gpu_budget: k.gpu_budget.clone(),
             gpu_display: k.gpu_display.clone(),
             started: k.started,
@@ -61,7 +63,7 @@ impl Dispatch {
     pub(super) fn job<C: Cpu>(
         &self,
         task: (u32, tasks::Handle<C>),
-        view: Box<trames_memory::parallel::View>,
+        view: impl Into<Option<Box<trames_memory::parallel::View>>>,
         control: &Arc<crate::workers::Control>,
         file_epoch: &mut trames_vfs::FileEpoch,
         uring_epoch: &mut trames_linux::UringEpoch,
@@ -164,7 +166,7 @@ impl Dispatch {
             audio,
             pid: id,
             cpu: std::mem::take(&mut p.cpu),
-            memory: Some(view),
+            memory: view.into(),
             control: control.clone(),
             syscalls: Some(crate::worker_syscalls::Snapshot {
                 owner_syscalls: p.linux.trace,
@@ -218,6 +220,7 @@ impl Dispatch {
                     .with_paths(p.linux.vfs.path_queries())
                     .with_resources(p.linux.vfs.descriptor_factory())
                     .with_file_executor(self.files.clone())
+                    .with_file_layouts(self.layouts.clone())
                     .with_kernel_log(p.linux.vfs.kernel_log_capability())
                     .with_urings(
                         uring_epoch
@@ -360,6 +363,9 @@ pub(super) fn prepare_views<C: Cpu>(
         let task = tasks.handle(&id).expect("selected process");
         let p = &mut *task.write();
         let (identity, _) = p.memory.coordinator_ownership();
+        if !p.memory.admit_parallel_layouts() {
+            return None;
+        }
         let view = if let Some(&index) = published.get(&identity) {
             // Freeze one VM once per epoch. Backing checks of another VM
             // may advance a global epoch between selected CPU preparations;

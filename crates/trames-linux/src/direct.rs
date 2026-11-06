@@ -222,6 +222,7 @@ pub struct DirectSyscalls {
     resources: Option<trames_vfs::DescriptorFactory>,
     urings: UringSnapshot,
     file_executor: Option<Arc<dyn FileExecutor>>,
+    file_layouts: Option<Arc<crate::FileLayouts>>,
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
     terminal: Option<trames_vfs::TerminalAccess>,
@@ -307,6 +308,7 @@ impl DirectSyscalls {
             resources: None,
             urings: Default::default(),
             file_executor: None,
+            file_layouts: None,
             descriptors,
             network: Default::default(),
             terminal: None,
@@ -592,6 +594,10 @@ impl DirectSyscalls {
     }
     pub fn with_file_executor(mut self, disk: Arc<dyn FileExecutor>) -> Self {
         self.file_executor = Some(disk);
+        self
+    }
+    pub fn with_file_layouts(mut self, layouts: Arc<crate::FileLayouts>) -> Self {
+        self.file_layouts = Some(layouts);
         self
     }
     pub fn with_urings(mut self, snapshot: UringSnapshot) -> Self {
@@ -1168,6 +1174,7 @@ impl DirectSyscalls {
                 self.resources.as_ref(),
                 &self.files,
                 self.file_executor.as_ref(),
+                self.file_layouts.as_ref(),
                 self.task_signal.as_ref(),
             );
             let attempt = self.urings.start(args, memory, pid, target)?;

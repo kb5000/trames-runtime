@@ -4,6 +4,8 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct BackingIndex {
+    layouts: BTreeMap<u64, (Arc<layout::Layout>, usize)>,
+    layout_pages: BTreeMap<u64, u64>,
     domains: BTreeMap<u64, BackingDomain>,
     unscoped: BTreeSet<u64>,
     coupled: BTreeMap<(u8, u64), BTreeSet<u64>>,
@@ -18,6 +20,9 @@ struct BackingDomain {
     unindexed: BTreeSet<u64>,
 }
 impl BackingIndex {
+    pub(super) fn has_layouts(&self) -> bool {
+        !self.layouts.is_empty()
+    }
     pub(super) fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
         // Content-change domains are not necessarily quiescence dependencies.
         // Stable retained providers permit local mapping commits independently;
@@ -32,6 +37,11 @@ impl BackingIndex {
         physical: u64,
         futex: Option<(u64, u64)>,
     ) {
+        if let Some(layout) = object.layout() {
+            let identity = layout.identity();
+            self.layout_pages.insert(base, identity);
+            self.layouts.entry(identity).or_insert((layout, 0)).1 += 1;
+        }
         if !object.parallel_commit_isolated() {
             let key = domain.map_or((0, physical), |(id, _)| (1, id));
             self.coupled.entry(key).or_default().insert(base);
@@ -63,6 +73,13 @@ impl BackingIndex {
         }
     }
     fn remove(&mut self, base: u64, domain: Option<(u64, u64)>, physical: u64) {
+        if let Some(identity) = self.layout_pages.remove(&base) {
+            let entry = self.layouts.get_mut(&identity).expect("indexed layout");
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                self.layouts.remove(&identity);
+            }
+        }
         self.futex.remove(&base);
         let key = domain.map_or((0, physical), |(id, _)| (1, id));
         if let Some(pages) = self.coupled.get_mut(&key) {
@@ -84,6 +101,113 @@ impl BackingIndex {
         } else {
             self.unscoped.remove(&base);
         }
+    }
+}
+
+impl Memory {
+    /// Cold preflight before backend mapping preparation can consult providers.
+    /// The root publication remains held until this mm's quiescent commit.
+    pub fn admit_parallel_layouts(&mut self) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().admit_parallel_layouts();
+        }
+        self.prepare_parallel_layouts().is_some()
+    }
+    pub(super) fn prepare_parallel_layouts(&mut self) -> Option<Option<Arc<layout::Publication>>> {
+        self.layout_wait.clear();
+        if !self.has_backings {
+            return Some(None);
+        }
+        if self.parallel_cache.is_none()
+            && self.layout_cold_revision == Some(self.revision)
+            && self
+                .layout_publication
+                .as_ref()
+                .is_none_or(|p| !p.pending())
+        {
+            return Some(self.layout_publication.clone());
+        }
+        if let Some(cache) = self
+            .parallel_cache
+            .as_ref()
+            .filter(|_| self.parallel_mappings.is_empty())
+        {
+            if let Some(publication) = &self.layout_publication {
+                if !publication.pending() {
+                    return Some(Some(publication.clone()));
+                }
+            } else if !cache.snapshot.backings.has_layouts() {
+                return Some(None);
+            }
+        }
+        // Warm checkpoints visit backing objects, not pages. A mapping edit
+        // adjusts only its changed virtual pages against the existing index.
+        let mut layouts = if let Some(cache) = &self.parallel_cache {
+            let mut layouts = cache.snapshot.backings.layouts.clone();
+            for base in &self.parallel_mappings {
+                if let Some(identity) = cache.snapshot.backings.layout_pages.get(base) {
+                    let entry = layouts.get_mut(identity).expect("indexed old layout");
+                    entry.1 -= 1;
+                    if entry.1 == 0 {
+                        layouts.remove(identity);
+                    }
+                }
+                if let Some(layout) = self
+                    .pages
+                    .get(base)
+                    .and_then(|index| self.frames[*index].as_ref())
+                    .and_then(|page| page.backing.as_ref())
+                    .and_then(|backing| backing.object.layout())
+                {
+                    layouts.entry(layout.identity()).or_insert((layout, 0)).1 += 1;
+                }
+            }
+            layouts
+        } else {
+            let mut layouts = BTreeMap::new();
+            for page in self.frames.iter().flatten() {
+                if let Some(layout) = page.backing.as_ref().and_then(|b| b.object.layout()) {
+                    layouts.entry(layout.identity()).or_insert((layout, 0)).1 += 1;
+                }
+            }
+            layouts
+        };
+        if layouts.is_empty() {
+            self.layout_publication = None;
+            self.layout_cold_revision = Some(self.revision);
+            return Some(None);
+        }
+        let owner = self.memory_report();
+        let mut publication = layout::Publication::default();
+        for (identity, (layout, _)) in std::mem::take(&mut layouts) {
+            if layout.pending() {
+                self.layout_wait.push(layout);
+                return None;
+            }
+            let lease = self
+                .layout_publication
+                .as_ref()
+                .and_then(|old| old.leases.get(&identity))
+                .cloned()
+                .or_else(|| layout.try_read(owner.clone()));
+            let Some(lease) = lease else {
+                self.layout_wait.push(layout);
+                return None;
+            };
+            publication.leases.insert(identity, lease);
+        }
+        let publication = Arc::new(publication);
+        self.layout_publication = Some(publication.clone());
+        self.layout_cold_revision = Some(self.revision);
+        Some(Some(publication))
+    }
+    /// Present only after publication admission yielded to a backing writer.
+    /// Subscribe before retrying parallel_view, which rechecks admission.
+    pub fn parallel_layout_waits(&self) -> Vec<Arc<layout::Layout>> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().parallel_layout_waits();
+        }
+        self.layout_wait.clone()
     }
 }
 
@@ -273,6 +397,7 @@ impl Memory {
         &mut self,
         registry: &mut Registry,
         backing_revision: u64,
+        publication: Option<Arc<layout::Publication>>,
     ) -> Option<View> {
         let mut cache = self.parallel_cache.take().expect("checked cache");
         // Workers release views before publishing Done. A retained external
@@ -508,7 +633,7 @@ impl Memory {
         if registry.metrics.incremental_updates.is_multiple_of(256) {
             registry.shared.prune();
         }
-        let view = View::new(cache.snapshot.clone());
+        let view = View::new(cache.snapshot.clone(), publication);
         self.parallel_cache = Some(cache);
         Some(view)
     }

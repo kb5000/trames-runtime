@@ -1008,6 +1008,12 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         assert!(q.members.insert(pid), "duplicate cohort task");
         q.domains.register(&mut job);
+        if q.domains.paused(pid) {
+            q.domains.hold(job);
+            self.capture_paused(&mut q);
+            self.notify(&mut q);
+            return;
+        }
         if let Some(waiting) = &job.waiting {
             waiting.bind(self);
             if waiting.woken() {
@@ -1079,6 +1085,21 @@ impl<C: Cpu> Epoch<C> {
         q.domains.register(&mut job);
         q.domains.admit(checkpoint, job);
     }
+    /// Publish an already-created task into the owned scope before rebuilding
+    /// Views. A pending file layout can now defer the scope without losing the
+    /// child or replaying its creator's syscall, including epoch cancellation.
+    pub fn admit_waiting_checkpoint(
+        &self,
+        checkpoint: &mut Checkpoint<C>,
+        mut job: Box<Job<C>>,
+        memory: u64,
+    ) {
+        self.bind_job(&mut job);
+        let mut q = self.queues.lock().unwrap();
+        assert!(q.members.insert(job.work.pid), "duplicate created task");
+        q.domains.register_waiting(&mut job, memory);
+        q.domains.admit(checkpoint, job);
+    }
     /// A completed peer can still be queued for asynchronous accounting when
     /// exec replaces its group. Claim that exact return, never a reused PID.
     pub fn take_replaced_return(
@@ -1139,6 +1160,10 @@ impl<C: Cpu> Epoch<C> {
                 && (q.domains.source_lifecycle
                     && crate::process::lifecycle::eligible(
                         wait.checkpoint.jobs.iter().map(Box::as_ref),
+                        wait.checkpoint.proc_reads,
+                        wait.checkpoint.mm_only,
+                        wait.checkpoint.source_retry,
+                        wait.checkpoint.layout_only,
                     ))
                     == source
         }) {
@@ -1164,7 +1189,13 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         let ready = signal.ready();
         let source = q.domains.source_lifecycle
-            && crate::process::lifecycle::eligible(checkpoint.jobs.iter().map(Box::as_ref));
+            && crate::process::lifecycle::eligible(
+                checkpoint.jobs.iter().map(Box::as_ref),
+                checkpoint.proc_reads,
+                checkpoint.mm_only,
+                checkpoint.source_retry,
+                checkpoint.layout_only,
+            );
         q.custody_waits.push(CustodyWait {
             checkpoint,
             signal,
@@ -1191,6 +1222,15 @@ impl<C: Cpu> Epoch<C> {
         self.notify(&mut q);
         true
     }
+    pub fn request_file_layouts(&self, pid: u32) -> bool {
+        let mut q = self.queues.lock().unwrap();
+        if !q.domains.pause_layouts(pid) {
+            return false;
+        }
+        self.capture_paused(&mut q);
+        self.notify(&mut q);
+        true
+    }
     /// The existing owner may briefly execute guest code only when no worker
     /// can claim an unrelated job. This reserves logical CPU capacity without
     /// adding an execution slot or pausing unrelated address spaces.
@@ -1199,7 +1239,13 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn idle(&self) -> bool {
         let q = self.queues.lock().unwrap();
-        q.running == 0 && q.services == 0 && q.ready.is_empty() && !q.domains.any_paused()
+        q.running == 0
+            && q.services == 0
+            && q.ready.is_empty()
+            && !q.domains.any_paused()
+            && self.lifecycle.get().is_none_or(|lifecycle| {
+                !lifecycle.retirements_pending() && !lifecycle.layouts_pending()
+            })
     }
     pub fn restore_checkpoint(&self, checkpoint: Checkpoint<C>, resume: bool) {
         let mut q = self.queues.lock().unwrap();
@@ -1263,10 +1309,45 @@ impl<C: Cpu> Epoch<C> {
                 return None;
             }
             if let Some(lifecycle) = self.lifecycle.get() {
+                let retired = q.domains.take_retired();
+                if !retired.is_empty() {
+                    q.services += 1;
+                    drop(q);
+                    lifecycle.retire_memory_domains(retired);
+                    q = self.queues.lock().unwrap();
+                    q.services -= 1;
+                    continue;
+                }
+                if lifecycle.layouts_ready() {
+                    q.services += 1;
+                    drop(q);
+                    lifecycle.pump_layouts(self);
+                    q = self.queues.lock().unwrap();
+                    q.services -= 1;
+                    continue;
+                }
+                if lifecycle.retirement_ready() || q.retirement_notified {
+                    q.services += 1;
+                    drop(q);
+                    lifecycle.retire_ready(self);
+                    q = self.queues.lock().unwrap();
+                    q.services -= 1;
+                    continue;
+                }
+                if lifecycle.proc_ready() {
+                    q.services += 1;
+                    drop(q);
+                    lifecycle.activate_reads(self);
+                    q = self.queues.lock().unwrap();
+                    q.services -= 1;
+                    continue;
+                }
                 if lifecycle.memory_ready() {
+                    q.services += 1;
                     drop(q);
                     lifecycle.reclaim(self);
                     q = self.queues.lock().unwrap();
+                    q.services -= 1;
                     continue;
                 }
                 if let Some((checkpoint, subscriptions)) = Self::claim_checkpoint(&mut q, true) {
@@ -1400,6 +1481,9 @@ impl<C: Cpu> Epoch<C> {
                 && !q.parked.values().any(|j| j.gpu_pending.is_some())
                 && !external
                 && !q.domains.any_paused()
+                && self.lifecycle.get().is_none_or(|lifecycle| {
+                    !lifecycle.retirements_pending() && !lifecycle.layouts_pending()
+                })
             {
                 if self.persistent {
                     if !q.idle_notified {
@@ -1686,18 +1770,35 @@ impl<C: Cpu> Epoch<C> {
         let exited = done.thread_exit.is_some();
         q.finished.push(done);
         if exited && !q.retirement_notified {
-            if let Some(events) = &q.domains.events {
+            q.retirement_notified = true;
+            if let Some(events) = q
+                .domains
+                .events
+                .as_ref()
+                .filter(|_| self.lifecycle.get().is_none())
+            {
                 let _ = events.send(crate::workers::Event::<C>::Retired);
-                q.retirement_notified = true;
             }
         }
         if !exited {
             self.control.stop();
         }
         self.notify(&mut q);
+        drop(q);
+        if exited {
+            if let Some(lifecycle) = self.lifecycle.get() {
+                lifecycle.notify_retirement();
+            }
+        }
     }
     /// The complete CPU/metrics return once, without waiting for unrelated Views.
     pub fn take_retired(&self) -> Vec<Done<C>> {
+        if self.lifecycle.get().is_some() {
+            return Vec::new();
+        }
+        self.take_source_retired()
+    }
+    pub fn take_source_retired(&self) -> Vec<Done<C>> {
         let mut q = self.queues.lock().unwrap();
         let mut retired = Vec::new();
         let mut i = 0;
@@ -1728,6 +1829,15 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn memory_owned(&self, id: u64) -> bool {
         self.queues.lock().unwrap().domains.memory_owned(id)
+    }
+    pub fn contains_memory(&self, id: u64) -> bool {
+        self.queues.lock().unwrap().domains.contains(id)
+    }
+    pub fn suspended_memory(&self, id: u64) -> bool {
+        self.queues.lock().unwrap().domains.suspended(id)
+    }
+    pub fn source_lifecycle(&self) -> bool {
+        self.lifecycle.get().is_some()
     }
     pub fn pause_memory(&self, id: u64) -> bool {
         let mut q = self.queues.lock().unwrap();
@@ -1800,6 +1910,10 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             .get()
             .is_some_and(|lifecycle| lifecycle.memory_signal(signal))
         {
+            // Reuse the existing scheduling hint when every slot is running.
+            // One bounded CPU slice yields for resource maintenance; no new
+            // instruction-path check, timer or polling task is introduced.
+            self.next_deadline.store(0, Ordering::Relaxed);
             self.notify(&mut q);
             return;
         }
@@ -1811,6 +1925,10 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             let source = q.domains.source_lifecycle
                 && crate::process::lifecycle::eligible(
                     wait.checkpoint.jobs.iter().map(Box::as_ref),
+                    wait.checkpoint.proc_reads,
+                    wait.checkpoint.mm_only,
+                    wait.checkpoint.source_retry,
+                    wait.checkpoint.layout_only,
                 );
             if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
                 let _ = events.send(crate::workers::Event::VmReady);

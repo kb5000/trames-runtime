@@ -7,6 +7,7 @@ mod hardware;
 pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
 mod imported;
+pub mod layout;
 pub use hardware_shared::{HardwareRange, HardwareStorage, HardwareWait, SharedMapping};
 pub fn host_mapping_granule() -> usize {
     mmu::host_mapping_granule()
@@ -260,6 +261,9 @@ pub struct Memory {
     has_external_code: bool,
     cpu_borrow_safe: bool,
     parallel_cache: Option<parallel::SnapshotCache>,
+    layout_publication: Option<Arc<layout::Publication>>,
+    layout_cold_revision: Option<u64>,
+    layout_wait: Vec<Arc<layout::Layout>>,
     pinned: BTreeMap<u64, std::sync::Weak<pinned::PinnedPage>>,
     fork_epoch: Cell<u64>,
     parallel_users: std::sync::Arc<parallel::Users>,
@@ -334,6 +338,9 @@ impl Memory {
             has_external_code: self.has_external_code,
             cpu_borrow_safe: self.cpu_borrow_safe,
             parallel_cache: None,
+            layout_publication: None,
+            layout_cold_revision: None,
+            layout_wait: Vec::new(),
             pinned: BTreeMap::new(),
             fork_epoch: Cell::new(0),
             parallel_users: Default::default(),
@@ -470,6 +477,9 @@ impl Memory {
             has_external_code: false,
             cpu_borrow_safe: true,
             parallel_cache: None,
+            layout_publication: None,
+            layout_cold_revision: None,
+            layout_wait: Vec::new(),
             pinned: BTreeMap::new(),
             fork_epoch: Cell::new(0),
             parallel_users: Default::default(),

@@ -18,6 +18,7 @@ pub struct Group {
     stopped: AtomicBool,
     termination: AtomicU32,
     state: Mutex<State>,
+    exit_ready: Arc<trames_shared::Readiness>,
 }
 #[derive(Default)]
 struct State {
@@ -182,7 +183,20 @@ impl Group {
         for task in tasks {
             task.wake_control();
         }
+        self.exit_ready.notify_atomic();
         status
+    }
+    /// Original terminal state also wakes dormant members' existing executor.
+    /// Registration precedes the state check, so neither ordering loses a kill.
+    pub fn subscribe_exit(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        let subscription = self.exit_ready.subscribe(signal);
+        if self.termination().is_some() {
+            signal.notify();
+        }
+        subscription
     }
     pub fn termination(&self) -> Option<i32> {
         self.termination

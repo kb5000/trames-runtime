@@ -55,6 +55,9 @@ impl Linux {
     pub fn set_file_executor(&mut self, executor: Arc<dyn crate::FileExecutor>) {
         self.file_executor = Some(executor);
     }
+    pub fn set_file_layouts(&mut self, layouts: Arc<crate::FileLayouts>) {
+        self.file_layouts = Some(layouts);
+    }
     pub fn boot_clock(&self) -> trames_shared::boottime::Boottime {
         self.boot_clock
     }
@@ -143,6 +146,7 @@ impl Linux {
                 &self.vfs.descriptor_factory(),
                 &Default::default(),
                 Some(disk.clone()),
+                self.file_layouts.clone(),
                 self.vfs.task_signal(),
             ))
         });

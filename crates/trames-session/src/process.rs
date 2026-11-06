@@ -129,7 +129,7 @@ pub(crate) struct Process<C: Cpu> {
     retained_aio: Option<trames_linux::RetainedAio>,
     file_checkpoint: Option<trames_linux::FileCheckpoint>,
     file_entry: Option<(u64, u32, [u64; 6])>,
-    file_pauses: u32,
+    layout_wait: Option<tasks::AdmissionWait>,
     flock_wait: Option<(trames_vfs::FlockRequest, Option<trames_vfs::RetainedFd>)>,
     record_wait: Option<trames_vfs::RecordLockRequest>,
     byte_wait: Option<trames_linux::PendingIo>,
@@ -167,6 +167,7 @@ impl<C: Cpu> Process<C> {
             State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.exec_pending.is_some()
+            || self.linux.has_pending_mmap()
             || self.file_checkpoint.is_some()
             || self
                 .retained_file
@@ -436,7 +437,9 @@ impl<C: Cpu> Process<C> {
     }
 
     fn frozen(&self, pid: u32) -> bool {
-        self.file_pauses != 0
+        self.layout_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.signal.ready())
             || self.signals.io.cgroup().map_or_else(
                 || self.linux.vfs.cgroup_frozen(pid),
                 trames_vfs::CgroupTask::frozen,
@@ -491,7 +494,7 @@ impl<C: Cpu> Process<C> {
             retained_aio: None,
             file_checkpoint: None,
             file_entry: None,
-            file_pauses: 0,
+            layout_wait: None,
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
@@ -578,7 +581,7 @@ impl trames_vfs::IoWake for JoinedByteWake {
 pub(crate) struct Kernel<C: Cpu> {
     byte_target: Arc<dyn trames_vfs::IoWake>,
     exits: exit::Retirements,
-    file_layouts: Vec<file_io::FileLayout>,
+    layout_work: std::sync::OnceLock<Arc<trames_linux::FileLayouts>>,
     families: Arc<trames_kernel::family::Families>,
     limit_directory: Arc<trames_kernel::limits::Directory>,
     memory_limits: super::MemoryLimits,
@@ -1320,6 +1323,8 @@ impl<C: Cpu> Kernel<C> {
         self.collect_exit_projection(pid, p, status);
     }
     fn clear_exit_resources(p: &mut Process<C>) {
+        p.linux.cancel_pending_mmap();
+        p.layout_wait = None;
         p.uring_wait = None;
         p.flock_wait = None;
         p.record_wait = None;
@@ -1988,6 +1993,7 @@ impl<C: Cpu> Kernel<C> {
             426 => {
                 p.linux.set_uring_clock(self.started);
                 p.linux.set_file_executor(self.workers.file_executor());
+                p.linux.set_file_layouts(self.file_layout_work());
                 let (saved, ring, deadline) = match p.uring_wait.take() {
                     Some((submitted, ring, deadline)) => (Some(submitted), ring, deadline),
                     None => (
@@ -2381,6 +2387,19 @@ impl<C: Cpu> Kernel<C> {
                         return Ok(None);
                     }
                 }
+                if number == 222 {
+                    if let Err(layout) = p.linux.admit_mmap(a, &p.memory) {
+                        let signal =
+                            trames_shared::IoSignal::new(pid, Arc::downgrade(&self.byte_target));
+                        let mut subscriptions = vec![layout.subscribe(&signal)];
+                        subscriptions.push(p.memory.subscribe_parallel_idle(&signal));
+                        p.memory.commit_retired_parallel().map_err(|_| Errno(5))?;
+                        if p.linux.admit_mmap(a, &p.memory).is_err() {
+                            p.linux.retain_mmap_wait(signal, subscriptions);
+                            return Ok(None);
+                        }
+                    }
+                }
                 let trace = p.linux.trace;
                 p.linux.trace = false;
                 let outcome = p.linux.dispatch(&mut p.cpu, &mut p.memory, io);
@@ -2646,6 +2665,7 @@ impl<C: Cpu> Kernel<C> {
         let owned_file = if !accepted_file {
             trames_linux::DirectSyscalls::default()
                 .with_file_executor(self.workers.file_executor())
+                .with_file_layouts(self.file_layout_work())
                 .start_owned_file(
                     &mut p.linux.vfs,
                     number,
@@ -2669,6 +2689,7 @@ impl<C: Cpu> Kernel<C> {
             Some(
                 trames_linux::DirectSyscalls::default()
                     .with_file_executor(self.workers.file_executor())
+                    .with_file_layouts(self.file_layout_work())
                     .start_retained_file(
                         file,
                         number,
@@ -2711,7 +2732,8 @@ impl<C: Cpu> Kernel<C> {
                 .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
                 .with_task_signal(p.signals.io.clone())
                 .with_paths(p.linux.vfs.path_queries())
-                .with_file_executor(self.workers.file_executor());
+                .with_file_executor(self.workers.file_executor())
+                .with_file_layouts(self.file_layout_work());
             if let Some(wait) = p.byte_wait.take() {
                 Some(direct.resume(wait, &mut p.memory))
             } else if let Some(call) = p.retained_aio.take() {
@@ -3840,7 +3862,10 @@ impl<C: Cpu> Kernel<C> {
                 continue;
             };
             p.linux.vfs.reap_local_rights();
-            if !matches!(p.state, State::Zombie(_)) && !p.frozen(id) {
+            if !matches!(p.state, State::Zombie(_))
+                && !p.frozen(id)
+                && self.admit_owner_layouts(id, &mut p)?
+            {
                 if !p.worker_gpu_candidate() {
                     self.resume_gpu(id, &mut p);
                 }
@@ -4293,6 +4318,40 @@ impl<C: Cpu> Kernel<C> {
             .retain(|&pid, p| pid == 1 || !p.auto_reap || self.exits.waiting(pid));
         Ok(true)
     }
+    fn log_worker_diagnostics(p: &Process<C>, done: &crate::workers::Done<C>) {
+        if let Some(fault) = &done.fatal_fault {
+            p.linux.vfs.log(
+                4,
+                &format!(
+                    "pid={} tgid={} {fault} comm={:?}",
+                    done.pid,
+                    p.tgid,
+                    String::from_utf8_lossy(&p.linux.command_name)
+                ),
+            );
+            if p.linux.trace {
+                eprintln!("trames pid {}: {fault}", done.pid);
+            }
+            if done.pid == 1 {
+                eprintln!("trames: {fault}");
+            }
+        }
+        if let Some((pc, module, function)) = done.rejected_native {
+            p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name)));
+        }
+        if let Some((pc, operation, value)) = done.gpu.last_error {
+            p.linux.vfs.log(
+                4,
+                &format!(
+                    "pid={} Vulkan op={operation} result={} pc={pc:#x} errors={} comm={:?}",
+                    done.pid,
+                    value as i64,
+                    done.gpu.errors,
+                    String::from_utf8_lossy(&p.linux.command_name)
+                ),
+            );
+        }
+    }
     fn restore_worker_return(
         &mut self,
         done: crate::workers::Done<C>,
@@ -4314,23 +4373,7 @@ impl<C: Cpu> Kernel<C> {
                     .expect("dispatched process")
             });
         let p = &mut *custody;
-        if let Some(fault) = &done.fatal_fault {
-            p.linux.vfs.log(
-                4,
-                &format!(
-                    "pid={} tgid={} {fault} comm={:?}",
-                    done.pid,
-                    p.tgid,
-                    String::from_utf8_lossy(&p.linux.command_name)
-                ),
-            );
-            if p.linux.trace {
-                eprintln!("trames pid {}: {fault}", done.pid);
-            }
-            if done.pid == 1 {
-                eprintln!("trames: {fault}");
-            }
-        }
+        Self::log_worker_diagnostics(p, &done);
         let group = p.signals.io.lifecycle().clone();
         if group.termination().is_some() {
             self.queue_exit_group(group);
@@ -4418,9 +4461,6 @@ impl<C: Cpu> Kernel<C> {
                 crate::run_queue::WaitState::OwnerEvent => p.state.clone(),
             })
         };
-        if let Some((pc, module, function)) = done.rejected_native {
-            p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name)));
-        }
         p.last_cpu = done.worker;
         p.cpu_time += done.elapsed;
         let outcome = done.outcome.take().expect("checked worker completion");
@@ -4442,18 +4482,6 @@ impl<C: Cpu> Kernel<C> {
                 }
                 _ => {}
             }
-        }
-        if let Some((pc, operation, value)) = done.gpu.last_error {
-            p.linux.vfs.log(
-                4,
-                &format!(
-                    "pid={} Vulkan op={operation} result={} pc={pc:#x} errors={} comm={:?}",
-                    done.pid,
-                    value as i64,
-                    done.gpu.errors,
-                    String::from_utf8_lossy(&p.linux.command_name)
-                ),
-            );
         }
         if let Some(status) = done.thread_exit {
             p.state = State::Zombie(status);
@@ -4641,7 +4669,10 @@ impl<C: Cpu> Kernel<C> {
                 let Some(mut p) = self.processes.checkout(&id) else {
                     continue;
                 };
-                if !matches!(p.state, State::Zombie(_)) && !p.frozen(id) {
+                if !matches!(p.state, State::Zombie(_))
+                    && !p.frozen(id)
+                    && self.admit_owner_layouts(id, &mut p)?
+                {
                     let was_parked = matches!(p.state, State::Sleep(..) | State::Blocked(..));
                     progress |= self.resume_gpu(id, &mut p);
                     progress |= {
@@ -4714,7 +4745,11 @@ impl<C: Cpu> Kernel<C> {
                             }
                         }
                     }
-                    while p.runnable() && !p.frozen(id) && quantum != 0 {
+                    while p.runnable()
+                        && !p.frozen(id)
+                        && quantum != 0
+                        && self.admit_owner_layouts(id, &mut p)?
+                    {
                         if self.instructions >= limit {
                             self.processes.insert(id, p);
                             return Err(RuntimeError::BudgetExceeded(limit));
@@ -4812,8 +4847,8 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if !progress {
-                let external = self.exit_memory_pending() || !self.file_layouts.is_empty() || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
-                    p.retained_file.is_some() || p.file_checkpoint.is_some() ||
+                let external = self.exit_memory_pending() || self.layout_work.get().is_some_and(|l| l.pending()) || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
+                    p.retained_file.is_some() || p.file_checkpoint.is_some() || p.linux.has_pending_mmap() || p.layout_wait.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
                         || matches!(p.state, State::Gpu { .. })
@@ -5082,7 +5117,7 @@ pub(super) fn run<C: Cpu>(
         retained_aio: None,
         file_checkpoint: None,
         file_entry: None,
-        file_pauses: 0,
+        layout_wait: None,
         flock_wait: None,
         record_wait: None,
         byte_wait: None,
@@ -5116,7 +5151,7 @@ pub(super) fn run<C: Cpu>(
     let mut kernel = Kernel::<C> {
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         exits: Default::default(),
-        file_layouts: Vec::new(),
+        layout_work: Default::default(),
         families: Arc::default(),
         limit_directory: Default::default(),
         memory_limits: runtime.memory_limits,
@@ -6678,7 +6713,7 @@ mod tests {
             retained_aio: None,
             file_checkpoint: None,
             file_entry: None,
-            file_pauses: 0,
+            layout_wait: None,
             flock_wait: None,
             record_wait: None,
             byte_wait: None,
@@ -6870,7 +6905,7 @@ mod tests {
         Kernel {
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             exits: Default::default(),
-            file_layouts: Vec::new(),
+            layout_work: Default::default(),
             families: Arc::default(),
             limit_directory: Default::default(),
             memory_limits: super::super::MemoryLimits::default(),

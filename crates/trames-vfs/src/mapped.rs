@@ -701,6 +701,9 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        Some(self.node.layout.get_or_init(Default::default).clone())
+    }
     fn parallel_versioned(&self) -> bool {
         true
     }
@@ -908,17 +911,31 @@ pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> 
     let bytes = pages.iter().map(|p| p.shared_page()).collect();
     Ok((pages, bytes))
 }
-impl Vfs {
-    pub fn mapping_pages(
+/// Original mmap open description. Retain before yielding for file layout
+/// admission; descriptor close/reuse cannot redirect the accepted mapping.
+#[derive(Clone)]
+pub struct MappingFile(Descriptor);
+impl MappingFile {
+    pub fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        let node = self.0.open.borrow().data_node()?;
+        Some(node.layout.get_or_init(Default::default).clone())
+    }
+    pub fn executable(&self) -> bool {
+        let open = self.0.open.borrow();
+        !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
+            && open
+                .mount
+                .as_ref()
+                .is_none_or(|m| m.flags.get() & mounts::MS_NOEXEC == 0)
+    }
+    pub fn pages(
         &self,
-        fd: u32,
         offset: u64,
         len: u64,
         shared: bool,
         writable: bool,
     ) -> Result<Vec<Arc<dyn PageBacking>>> {
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
+        let o = self.0.open.borrow();
         let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
             ring.mapping_offset(offset, len, shared)?
         } else {
@@ -1018,6 +1035,21 @@ impl Vfs {
             }));
         }
         Ok(pages)
+    }
+}
+impl Vfs {
+    pub fn mapping_file(&self, fd: u32) -> Result<MappingFile> {
+        self.descriptor(fd).map(MappingFile)
+    }
+    pub fn mapping_pages(
+        &self,
+        fd: u32,
+        offset: u64,
+        len: u64,
+        shared: bool,
+        writable: bool,
+    ) -> Result<Vec<Arc<dyn PageBacking>>> {
+        self.mapping_file(fd)?.pages(offset, len, shared, writable)
     }
 }
 

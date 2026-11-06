@@ -6,8 +6,14 @@ use crate::run_queue::{Checkpoint, Epoch, Job};
 use std::sync::Mutex;
 #[path = "process_lifecycle_exec.rs"]
 mod image;
+#[path = "process_lifecycle_layouts.rs"]
+pub(super) mod layouts;
+#[path = "process_lifecycle_memory.rs"]
+mod maintenance;
 #[path = "process_lifecycle_mapping.rs"]
 pub(crate) mod mapping;
+#[path = "process_lifecycle_retirement.rs"]
+mod retirement;
 type Groups<C> = BTreeMap<usize, Vec<(u32, tasks::Handle<C>)>>;
 
 pub(crate) struct Lifecycle<C: Cpu> {
@@ -17,7 +23,14 @@ pub(crate) struct Lifecycle<C: Cpu> {
     registry: trames_memory::parallel::Registry,
     report: Mutex<Report>,
     memory: Arc<crate::retired_memory::RetiredMemory>,
-    memory_wake: std::sync::OnceLock<MemoryWake>,
+    memory_wake: std::sync::OnceLock<crate::retired_memory::Driver>,
+    layouts: Arc<trames_linux::FileLayouts>,
+    layout_driver: std::sync::OnceLock<trames_linux::FileLayoutDriver>,
+    proc_source: Option<Arc<crate::proc_views::Source>>,
+    proc_driver: std::sync::OnceLock<crate::proc_views::ReadDriver>,
+    exit_groups: Arc<crate::exit_groups::ExitGroups>,
+    exit_wake: std::sync::OnceLock<MemoryWake>,
+    retiring: Mutex<Vec<retirement::Retiring<C>>>,
     timers: Arc<trames_kernel::timers::Timers>,
     futexes: crate::futex::Futexes,
     images: Arc<dyn exec::Executor<C>>,
@@ -45,8 +58,17 @@ struct Report {
 }
 /// Selection inspects already-accepted job metadata, never task-body locks.
 /// Mixed mapping/lifecycle requests use the same original affected resources.
-pub(crate) fn eligible<'a, C: Cpu>(jobs: impl Iterator<Item = &'a Job<C>>) -> bool {
-    let mut requested = false;
+pub(crate) fn eligible<'a, C: Cpu>(
+    jobs: impl Iterator<Item = &'a Job<C>>,
+    proc_reads: bool,
+    mm_only: bool,
+    continuation: bool,
+    layout_only: bool,
+) -> bool {
+    if layout_only {
+        return jobs.into_iter().all(|job| job.work.task.is_some());
+    }
+    let mut requested = proc_reads || mm_only || continuation;
     for job in jobs {
         if job.work.task.is_none() {
             return false;
@@ -76,6 +98,13 @@ impl<C: Cpu> Lifecycle<C> {
             report: Mutex::default(),
             memory: kernel.memory_retirements(),
             memory_wake: Default::default(),
+            layouts: kernel.file_layout_work(),
+            layout_driver: Default::default(),
+            proc_source: kernel.proc_source.clone(),
+            proc_driver: Default::default(),
+            exit_groups: kernel.processes.directory().exits(),
+            exit_wake: Default::default(),
+            retiring: Default::default(),
             timers: kernel.timers.clone(),
             futexes: kernel.futexes.clone(),
             images: kernel.workers.image_executor(),
@@ -83,14 +112,28 @@ impl<C: Cpu> Lifecycle<C> {
         }
     }
     pub(crate) fn bind_memory(&self, target: std::sync::Weak<dyn trames_shared::IoWake>) {
-        let signal = trames_shared::IoSignal::new(0, target);
-        let subscription = self.memory.subscribe(&signal);
+        let signal = trames_shared::IoSignal::new(0, target.clone());
         assert!(self
-            .memory_wake
+            .layout_driver
+            .set(self.layouts.bind_reader(signal))
+            .is_ok());
+        let signal = trames_shared::IoSignal::new(0, target.clone());
+        let subscription = self.exit_groups.subscribe(&signal);
+        assert!(self
+            .exit_wake
             .set(MemoryWake {
                 signal,
                 _subscription: subscription
             })
+            .is_ok());
+        if let Some(source) = &self.proc_source {
+            let signal = trames_shared::IoSignal::new(0, target.clone());
+            assert!(self.proc_driver.set(source.bind_reader(signal)).is_ok());
+        }
+        let signal = trames_shared::IoSignal::new(0, target);
+        assert!(self
+            .memory_wake
+            .set(self.memory.bind_reader(signal))
             .is_ok());
     }
     pub(crate) fn memory_ready(&self) -> bool {
@@ -102,6 +145,18 @@ impl<C: Cpu> Lifecycle<C> {
         self.memory_wake
             .get()
             .is_some_and(|wake| Arc::ptr_eq(signal, &wake.signal))
+            || self
+                .layout_driver
+                .get()
+                .is_some_and(|driver| Arc::ptr_eq(signal, &driver.signal))
+            || self
+                .proc_driver
+                .get()
+                .is_some_and(|driver| Arc::ptr_eq(signal, &driver.signal))
+            || self
+                .exit_wake
+                .get()
+                .is_some_and(|wake| Arc::ptr_eq(signal, &wake.signal))
     }
     pub(crate) fn reclaim(&self, epoch: &Epoch<C>) {
         self.memory_wake
@@ -115,6 +170,7 @@ impl<C: Cpu> Lifecycle<C> {
         }
     }
     pub(crate) fn collect(&self, kernel: &mut Kernel<C>) -> Option<RuntimeError> {
+        self.collect_retirements(kernel);
         let report = std::mem::take(&mut *self.report.lock().unwrap());
         kernel.account_worker_stats(report.workers);
         for group in report.exit_groups {
@@ -169,6 +225,10 @@ impl<C: Cpu> Lifecycle<C> {
                 return;
             }
         };
+        if checkpoint.layout_only {
+            self.release_layout_bytes(epoch, checkpoint);
+            return;
+        }
         let groups = match self.admit_groups(&checkpoint, &mut custody, &epoch.io_target) {
             Ok(groups) => groups,
             Err(wait) => {
@@ -176,16 +236,25 @@ impl<C: Cpu> Lifecycle<C> {
                 return;
             }
         };
-        let lifecycle_only = checkpoint
-            .jobs
-            .iter()
-            .filter(|j| j.checkpoint.is_some())
-            .all(|j| matches!(j.work.cpu.x(8) as u32, 220 | 221 | 281));
+        let lifecycle_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
+            && checkpoint
+                .jobs
+                .iter()
+                .filter(|j| j.checkpoint.is_some())
+                .all(|j| matches!(j.work.cpu.x(8) as u32, 220 | 221 | 281));
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
             job.work.cpu.clear_exclusive();
         }
-        if !lifecycle_only {
+        if let Some(wait) = self.retire_checkpoint(epoch, &checkpoint.ids) {
+            epoch.defer_checkpoint(checkpoint, wait.signal, wait.subscriptions);
+            return;
+        }
+        let metadata = checkpoint.proc_reads
+            || checkpoint.layouts
+            || !checkpoint.mm_only
+            || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
+        if metadata && !lifecycle_only {
             if let Some(wait) = self.wait_mapping_borrowers(&checkpoint, &epoch.io_target) {
                 epoch.defer_checkpoint(checkpoint, wait.signal, wait.subscriptions);
                 return;
@@ -280,7 +349,11 @@ impl<C: Cpu> Lifecycle<C> {
     ) -> Result<bool, RuntimeError> {
         let began = Instant::now();
         let mut committed = std::collections::BTreeSet::new();
-        for job in &checkpoint.jobs {
+        let metadata = checkpoint.proc_reads
+            || checkpoint.layouts
+            || !checkpoint.mm_only
+            || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
+        for job in checkpoint.jobs.iter().filter(|_| metadata) {
             let task = job.work.task.as_ref().expect("original lifecycle task");
             let p = &mut *task.write();
             if committed.insert(p.memory.coordinator_ownership().0) {
@@ -305,10 +378,26 @@ impl<C: Cpu> Lifecycle<C> {
             report.waits = [0; 8];
             return Ok(true);
         }
+        *pending_image = self.admit_layouts(checkpoint, &epoch.io_target)?;
+        if pending_image.is_some() {
+            checkpoint.source_retry = true;
+            return Ok(true);
+        }
         report.groups = 1;
-        report.spaces = committed.len() as u64;
-        let mut created = self.replace_images(epoch, checkpoint, groups, report)?;
-        self.edit_mappings(epoch, checkpoint, registry, report, slot, engine);
+        report.spaces = if checkpoint.mm_only {
+            checkpoint.ids.len()
+        } else {
+            committed.len()
+        } as u64;
+        let replaced = self.replace_images(epoch, checkpoint, groups, report)?;
+        self.capture_created(epoch, checkpoint, replaced);
+        *pending_image = self.edit_mappings(epoch, checkpoint, registry, report, slot, engine);
+        if let Some(wait) = pending_image {
+            self.commit_layout_roots(checkpoint, &wait.signal, &mut wait.subscriptions)?;
+            checkpoint.source_retry = true;
+            return Ok(true);
+        }
+        let mut created = Vec::new();
         // New bodies are admitted before publication, so a concurrent observer
         // cannot make this executor block while preparing a child's first View.
         let mut child_custody = Vec::new();
@@ -380,41 +469,70 @@ impl<C: Cpu> Lifecycle<C> {
             }
             report.time[3] += elapsed;
         }
-        // Children first preserve the parent's physical storage on COW fork.
-        let mut members = created;
-        members.extend(checkpoint.jobs.iter().map(|j| (j.work.pid, j.stats.worker)));
         let began = Instant::now();
+        // Capture new CPUs before preparing any View. The owned checkpoint now
+        // survives a backing-layout wait or cancellation with every child/image
+        // already represented; no completed structural syscall can be replayed.
+        self.capture_created(epoch, checkpoint, created);
+        let members: Vec<_> = checkpoint
+            .jobs
+            .iter()
+            .map(|j| (j.work.pid, j.stats.worker))
+            .collect();
         let Some(mut views) = dispatch::prepare_views(
             &self.tasks,
             registry,
             &members,
-            lifecycle_only,
+            lifecycle_only || !metadata,
             &mut report.backend_error,
         ) else {
+            *pending_image = self.wait_layout_publication(checkpoint, &epoch.io_target)?;
+            if pending_image.is_some() {
+                checkpoint.source_retry = true;
+                return Ok(true);
+            }
             return Ok(false);
         };
         self.admit_private_views(&mut views, registry);
-        let mut files = trames_vfs::FileEpoch::default();
-        let mut urings = trames_linux::UringEpoch::default();
-        let mut network = trames_vfs::NetworkEpoch::default();
         for (pid, _, view) in views {
-            if let Some(job) = checkpoint.jobs.iter_mut().find(|j| j.work.pid == pid) {
-                job.work.memory = Some(view);
-            } else {
-                let task = self.tasks.handle(&pid).expect("published child");
-                let job = self.dispatch.job(
-                    (pid, task),
-                    view,
-                    &epoch.control,
-                    &mut files,
-                    &mut urings,
-                    &mut network,
-                );
-                epoch.admit_checkpoint(checkpoint, job);
-            }
+            checkpoint
+                .jobs
+                .iter_mut()
+                .find(|j| j.work.pid == pid)
+                .expect("captured original CPU")
+                .work
+                .memory = Some(view);
         }
         report.time[4] += began.elapsed();
         Ok(true)
+    }
+    fn capture_created(
+        &self,
+        epoch: &Epoch<C>,
+        checkpoint: &mut Checkpoint<C>,
+        created: Vec<(u32, usize)>,
+    ) {
+        let mut files = trames_vfs::FileEpoch::default();
+        let mut urings = trames_linux::UringEpoch::default();
+        let mut network = trames_vfs::NetworkEpoch::default();
+        let count = created.len();
+        for (pid, slot) in created {
+            let task = self.tasks.handle(&pid).expect("published child/image");
+            let identity = task.read().memory.instruction_identity().0;
+            let mut job = self.dispatch.job(
+                (pid, task),
+                None,
+                &epoch.control,
+                &mut files,
+                &mut urings,
+                &mut network,
+            );
+            job.stats.worker = slot;
+            epoch.admit_waiting_checkpoint(checkpoint, job, identity);
+        }
+        // Child-first COW publication preserves the parent's existing physical
+        // allocation. Keep that order in the retained scope on every retry.
+        checkpoint.jobs.rotate_right(count);
     }
     fn admit_private_views(
         &self,
@@ -678,16 +796,16 @@ mod tests {
                     }
                 }
                 assert_eq!(owner_events, 0, "cpus={cpus} flags={flags:#x}");
-                assert_eq!(epoch.member_ids().len(), children + 1);
                 assert!(epoch.collect_lifecycle(&mut kernel).is_none());
                 assert_eq!(kernel.vm_checkpoint_groups, 1);
                 let done = epoch.drain();
-                assert_eq!(done.len(), children + 1);
+                assert_eq!(kernel.processes.len(), children + 1);
                 assert_eq!(
-                    done.iter().map(|d| d.syscalls).sum::<u64>(),
+                    kernel.worker_syscalls + done.iter().map(|d| d.syscalls).sum::<u64>(),
                     children as u64 + 2
                 );
                 assert!(done.iter().all(|done| done.thread_exit.is_some()));
+                assert!(kernel.processes.values().all(|p| !p.signals.io.live()));
                 if cpus == 4 {
                     assert_eq!(
                         policy.evaluations(),
@@ -740,6 +858,9 @@ mod tests {
                 foreign.cpu = Cpu::new(0x4000, 0);
                 foreign.cpu.set_x(8, 93);
                 foreign.cpu.set_x(0, 7);
+                foreign.tgid = 4;
+                foreign.group = 4;
+                let foreign_family = foreign.family.clone();
                 k.processes.insert(1, root);
                 k.processes.insert(4, foreign);
                 k.publish_io_tasks(None);
@@ -771,21 +892,17 @@ mod tests {
                 held.recv_timeout(Duration::from_secs(2)).unwrap();
                 k.workers.launch(0, epoch.clone()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(3);
-                let mut returned = Vec::new();
-                while returned.is_empty() {
+                while foreign_family.status().is_none() {
                     match k
                         .workers
                         .event_timeout(deadline.saturating_duration_since(Instant::now()))
                         .unwrap()
                     {
-                        Some(Event::Retired) => returned.extend(epoch.take_retired()),
                         Some(Event::Idle) => {}
                         _ => panic!("busy original custody occupied the only CPU slot"),
                     }
                 }
-                assert_eq!(returned.len(), 1);
-                assert_eq!(returned[0].pid, 4);
-                assert_eq!(returned[0].thread_exit, Some(7 << 8));
+                assert_eq!(foreign_family.status(), Some(7 << 8));
                 if cancel {
                     epoch.stop();
                 }
@@ -797,32 +914,27 @@ mod tests {
                         .event_timeout(deadline.saturating_duration_since(Instant::now()))
                         .unwrap()
                     {
-                        Some(Event::Retired) => {
-                            returned.extend(epoch.take_retired());
-                            if returned.iter().any(|d| d.pid == 1) {
-                                epoch.stop();
-                            }
-                        }
                         Some(Event::Idle) => {}
                         Some(Event::EpochStopped(_)) => break,
                         _ => panic!("additive mapping required owner processing"),
                     }
                 }
-                returned.extend(epoch.drain());
-                assert_eq!(returned.len(), 2);
-                let result = returned.into_iter().find(|d| d.pid == 1).unwrap();
-                assert_eq!(result.additive_mmaps, u64::from(!cancel));
-                assert_eq!(result.serviced_syscalls, 0);
+                let mut returned = epoch.drain();
+                assert!(epoch.collect_lifecycle(&mut k).is_none());
+                assert_eq!(k.vm_local_syscalls, u64::from(!cancel));
+                assert_eq!(k.serviced_syscalls, 0);
                 if cancel {
+                    assert_eq!(returned.len(), 1);
+                    let result = returned.pop().unwrap();
                     assert!(matches!(result.outcome, Some(SliceOutcome::Syscall { .. })));
                     assert_eq!(result.cpu.x(8), 222);
                     for (i, a) in args.into_iter().enumerate() {
                         assert_eq!(result.cpu.x(i), a);
                     }
                 } else {
-                    assert_eq!(result.thread_exit, Some(42 << 8));
-                    k.accept_source_return(result).unwrap();
+                    assert!(returned.is_empty());
                     let root = k.processes.read(&1);
+                    assert!(matches!(root.state, State::Zombie(status) if status == 42 << 8));
                     let address = root.memory.read_u64(0x1000).unwrap();
                     assert!(address > 0 && address < u64::MAX - 4095);
                     assert!(root
@@ -834,7 +946,6 @@ mod tests {
                         )
                         .is_ok());
                 }
-                assert!(epoch.collect_lifecycle(&mut k).is_none());
                 assert_eq!(k.vm_checkpoint_groups, 0);
             }
         }

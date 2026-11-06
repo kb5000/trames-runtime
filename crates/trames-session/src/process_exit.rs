@@ -20,7 +20,7 @@ struct Wait {
     task: Arc<trames_kernel::signal::IoTask>,
     status: i32,
     signal: Arc<trames_vfs::IoSignal>,
-    _subscription: trames_vfs::IoSubscription,
+    _subscriptions: Vec<trames_vfs::IoSubscription>,
     _target: Arc<dyn trames_vfs::IoWake>,
 }
 struct Wake<C: Cpu> {
@@ -86,14 +86,14 @@ impl<C: Cpu> Kernel<C> {
             owner: std::thread::current(),
         });
         let signal = trames_vfs::IoSignal::new(pid, Arc::downgrade(&target));
-        let subscription = p.memory.subscribe_parallel_idle(&signal);
+        let subscriptions = lifecycle::layouts::wait_view(&p.memory, &signal);
         self.exits.waits.insert(
             pid,
             Wait {
                 task: p.signals.io.clone(),
                 status,
                 signal,
-                _subscription: subscription,
+                _subscriptions: subscriptions,
                 _target: target,
             },
         );
@@ -146,8 +146,10 @@ impl<C: Cpu> Kernel<C> {
         }
         let tgid = p.tgid;
         let family = p.family.clone();
+        let group = p.signals.io.lifecycle().clone();
         drop(custody);
         if let Some(status) = completed {
+            self.processes.directory().exits().retire(&group);
             let reaped = self.families.complete(&family, status);
             if let Some(mut leader) = self.processes.get_mut(&tgid) {
                 leader.state = State::Zombie(status);
@@ -230,6 +232,12 @@ impl<C: Cpu> Kernel<C> {
         &mut self,
         epoch: Option<&crate::run_queue::Epoch<C>>,
     ) -> Result<(), RuntimeError> {
+        if epoch.is_some_and(|epoch| epoch.source_lifecycle()) {
+            // Active executors own both returned CPUs and dormant group
+            // members. These owner-local queues are only the outside-epoch
+            // driver; never race their task/mm projections against a source.
+            return Ok(());
+        }
         self.exits.memory.pump()?;
         let ready: Vec<_> = self
             .exits

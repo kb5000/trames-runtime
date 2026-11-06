@@ -742,6 +742,7 @@ impl UringSnapshot {
         factory: Option<&trames_vfs::DescriptorFactory>,
         files: &trames_vfs::DirectFiles,
         disk: Option<&Arc<dyn FileExecutor>>,
+        layouts: Option<&Arc<crate::FileLayouts>>,
         signal: Option<&Arc<dyn trames_vfs::TaskSignal>>,
     ) {
         if self.context.get().is_none() {
@@ -751,6 +752,7 @@ impl UringSnapshot {
                     factory,
                     files,
                     disk.cloned(),
+                    layouts.cloned(),
                     signal.cloned(),
                 )));
             }
@@ -1259,6 +1261,7 @@ impl DirectSyscalls {
             self.resources.as_ref(),
             &self.files,
             self.file_executor.as_ref(),
+            self.file_layouts.as_ref(),
             self.task_signal.as_ref(),
         );
         call.ring

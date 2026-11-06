@@ -434,10 +434,10 @@ impl DirectSyscalls {
         let accepted = self.file_prepared.borrow_mut().take().unwrap();
         Some(match accepted.action {
             PreparedAction::Layout { work, output } => {
-                IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
-                    work,
-                    output,
-                }))
+                let pending = FilePending::new(Arc::default(), output, work.target().cloned());
+                let signal = IoSignal::new(pid, target.clone());
+                let subscriptions = vec![pending.result.subscribe(&signal)];
+                self.queue_layout(work, pending, number, args, signal, subscriptions, target)
             }
             PreparedAction::Reply { reply, output } => {
                 self.complete_file_attempt(reply, output, memory)
@@ -672,33 +672,64 @@ impl DirectSyscalls {
                 }))
             }
             Some(trames_vfs::FileOutcome::Layout(work)) => {
-                IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
-                    work,
-                    output: pending.output,
-                }))
+                self.queue_layout(work, pending, number, args, signal, subscriptions, target)
             }
-            None => IoAttempt::Blocked(PendingIo {
-                aio: None,
-                number,
-                args,
-                deadline: None,
-                signal,
-                flock: None,
-                retained_byte: None,
-                retained_socket: None,
-                native_tcp: None,
-                resource_deadline: None,
-                retained_poll: None,
-                epoll_revision: None,
-                _subscriptions: subscriptions,
-                host_subscription: None,
-                socket_subscriptions: Vec::new(),
-                uring: None,
-                poll_uring: None,
-                file: Some(pending),
-                target: target.clone(),
-            }),
+            None => Self::wait_file(pending, number, args, signal, subscriptions, target),
         }
+    }
+    #[allow(clippy::too_many_arguments)] // Accepted file and original result/wake context.
+    fn queue_layout(
+        &self,
+        work: trames_vfs::FileWork,
+        pending: FilePending,
+        number: u32,
+        args: [u64; 6],
+        signal: Arc<IoSignal>,
+        subscriptions: Vec<IoSubscription>,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        signal.reset();
+        let fallback = match &self.file_layouts {
+            Some(layouts) => layouts.submit(work, pending.result.clone()),
+            None => Err(work),
+        };
+        match fallback {
+            Ok(()) => Self::wait_file(pending, number, args, signal, subscriptions, target),
+            Err(work) => IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Layout {
+                work,
+                output: pending.output,
+            })),
+        }
+    }
+    fn wait_file(
+        pending: FilePending,
+        number: u32,
+        args: [u64; 6],
+        signal: Arc<IoSignal>,
+        subscriptions: Vec<IoSubscription>,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        IoAttempt::Blocked(PendingIo {
+            aio: None,
+            number,
+            args,
+            deadline: None,
+            signal,
+            flock: None,
+            retained_byte: None,
+            retained_socket: None,
+            native_tcp: None,
+            resource_deadline: None,
+            retained_poll: None,
+            epoll_revision: None,
+            _subscriptions: subscriptions,
+            host_subscription: None,
+            socket_subscriptions: Vec::new(),
+            uring: None,
+            poll_uring: None,
+            file: Some(pending),
+            target: target.clone(),
+        })
     }
     #[allow(clippy::too_many_arguments)]
     fn park_file(

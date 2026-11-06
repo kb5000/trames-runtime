@@ -66,8 +66,10 @@ struct Entry<C: Cpu> {
     notified: bool,
     owned: bool,
     source_owned: bool,
+    repeat_bytes: bool,
     mm_only: bool,
     proc_reads: bool,
+    layouts: bool,
     requested: Option<Instant>,
     quiescent: Option<Instant>,
 }
@@ -75,6 +77,7 @@ struct Entry<C: Cpu> {
 pub(super) struct Domains<C: Cpu> {
     entries: BTreeMap<u64, Entry<C>>,
     tasks: BTreeMap<u32, u64>,
+    retired: Vec<u64>,
     pub events: Option<Sender<crate::workers::Event<C>>>,
     pub source_lifecycle: bool,
 }
@@ -82,6 +85,9 @@ pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
     pub mm_only: bool,
     pub proc_reads: bool,
+    pub layouts: bool,
+    pub layout_only: bool,
+    pub source_retry: bool,
     pub jobs: Vec<Box<Job<C>>>,
     pub requested: Instant,
     pub quiescent: Instant,
@@ -99,13 +105,23 @@ impl<C: Cpu> Domains<C> {
     pub fn register(&mut self, job: &mut Job<C>) {
         let view = job.work.memory.as_deref().expect("cohort view");
         let id = trames_memory::CpuMemory::instruction_identity(view).0;
+        let pending = view.layout_requested();
+        self.register_metadata(job, id, view.commit_domains());
+        if pending {
+            self.pause_layouts(job.work.pid);
+        }
+    }
+    pub fn register_waiting(&mut self, job: &mut Job<C>, id: u64) {
+        self.register_metadata(job, id, BTreeSet::new());
+    }
+    fn register_metadata(&mut self, job: &mut Job<C>, id: u64, keys: BTreeSet<(u8, u64)>) {
         let entry = self.entries.entry(id).or_insert_with(|| Entry::<C> {
             domain: Arc::new(Domain {
                 id,
                 paused: AtomicBool::new(false),
                 interrupts: Mutex::new(BTreeMap::new()),
             }),
-            keys: view.commit_domains(),
+            keys,
             jobs: Vec::new(),
             running: 0,
             services: 0,
@@ -113,8 +129,10 @@ impl<C: Cpu> Domains<C> {
             notified: false,
             owned: false,
             source_owned: false,
+            repeat_bytes: false,
             mm_only: false,
             proc_reads: false,
+            layouts: false,
             requested: None,
             quiescent: None,
         });
@@ -132,6 +150,9 @@ impl<C: Cpu> Domains<C> {
             assert!(entry.jobs.is_empty());
             if !entry.owned {
                 self.entries.remove(&id);
+                if self.source_lifecycle {
+                    self.retired.push(id);
+                }
             }
         }
     }
@@ -148,6 +169,14 @@ impl<C: Cpu> Domains<C> {
     pub fn contains(&self, id: u64) -> bool {
         self.entries.contains_key(&id)
     }
+    pub fn take_retired(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.retired)
+    }
+    pub fn suspended(&self, id: u64) -> bool {
+        self.entries
+            .get(&id)
+            .is_some_and(|entry| entry.domain.paused() && entry.running == 0 && entry.services == 0)
+    }
     pub fn memory_owned(&self, id: u64) -> bool {
         self.entries
             .get(&id)
@@ -155,6 +184,11 @@ impl<C: Cpu> Domains<C> {
     }
     pub fn pause_bytes(&mut self, id: u64) {
         let entry = self.entries.get_mut(&id).unwrap();
+        if entry.owned {
+            // A request published after this executor took its work belongs to
+            // a subsequent scope. Keep the pause across its eventual restore.
+            entry.repeat_bytes = true;
+        }
         if !entry.domain.paused() {
             entry.mm_only = true;
             entry.requested = Some(Instant::now());
@@ -168,6 +202,14 @@ impl<C: Cpu> Domains<C> {
         };
         self.pause_bytes(id);
         self.entries.get_mut(&id).unwrap().proc_reads = true;
+        true
+    }
+    pub fn pause_layouts(&mut self, pid: u32) -> bool {
+        let Some(&id) = self.tasks.get(&pid) else {
+            return false;
+        };
+        self.pause_bytes(id);
+        self.entries.get_mut(&id).unwrap().layouts = true;
         true
     }
     pub fn running(&mut self, pid: u32) {
@@ -265,9 +307,56 @@ impl<C: Cpu> Domains<C> {
             && crate::process::lifecycle::eligible(
                 ids.iter()
                     .flat_map(|id| self.entries[id].jobs.iter().map(Box::as_ref)),
+                ids.iter().any(|id| self.entries[id].proc_reads),
+                ids.iter().all(|id| self.entries[id].mm_only),
+                false,
+                ids.iter().any(|id| self.entries[id].layouts),
             )
     }
+    /// A file writer needs returned bytes, not admission to another mm's
+    /// structural operation. Drain this original domain independently even
+    /// when its pending mmap closure intersects an already-owned scope.
+    fn take_layout(&mut self) -> Option<Checkpoint<C>> {
+        let id = self.entries.iter().find_map(|(&id, entry)| {
+            (entry.layouts
+                && entry.domain.paused()
+                && !entry.owned
+                && entry.running == 0
+                && entry.services == 0
+                && entry.jobs.iter().all(|job| job.work.task.is_some()))
+            .then_some(id)
+        })?;
+        let entry = self.entries.get_mut(&id).unwrap();
+        entry.owned = true;
+        entry.source_owned = true;
+        entry.layouts = false;
+        let jobs = std::mem::take(&mut entry.jobs);
+        let now = Instant::now();
+        Some(Checkpoint {
+            ids: BTreeSet::from([id]),
+            mm_only: entry.mm_only,
+            proc_reads: false,
+            layouts: true,
+            layout_only: true,
+            source_retry: true,
+            requesters: jobs
+                .iter()
+                .filter(|job| job.checkpoint.is_some())
+                .map(|job| job.work.pid)
+                .collect(),
+            jobs,
+            requested: entry.requested.unwrap_or(now),
+            quiescent: entry.quiescent.unwrap_or(now),
+            taken: now,
+            source_owned: true,
+        })
+    }
     pub fn take(&mut self, source: bool) -> Option<Checkpoint<C>> {
+        if source && self.source_lifecycle {
+            if let Some(checkpoint) = self.take_layout() {
+                return Some(checkpoint);
+            }
+        }
         let mut seen = BTreeSet::new();
         for (&id, entry) in &self.entries {
             if !entry.domain.paused() || entry.owned || seen.contains(&id) {
@@ -314,6 +403,9 @@ impl<C: Cpu> Domains<C> {
             return Some(Checkpoint::<C> {
                 mm_only: ids.iter().all(|id| self.entries[id].mm_only),
                 proc_reads: ids.iter().any(|id| self.entries[id].proc_reads),
+                layouts: ids.iter().any(|id| self.entries[id].layouts),
+                layout_only: false,
+                source_retry: false,
                 ids,
                 jobs,
                 requested,
@@ -338,6 +430,7 @@ impl<C: Cpu> Domains<C> {
             entry.source_owned = checkpoint.source_owned;
             entry.mm_only = checkpoint.mm_only;
             entry.proc_reads = checkpoint.proc_reads;
+            entry.layouts = checkpoint.layouts;
             entry.requested = Some(checkpoint.requested);
             entry.quiescent = Some(checkpoint.quiescent);
         } else {
@@ -379,9 +472,19 @@ impl<C: Cpu> Domains<C> {
             }
             let entry = self.entries.remove(id).unwrap();
             assert!(entry.jobs.is_empty());
+            if self.source_lifecycle {
+                self.retired.push(*id);
+            }
             false
         });
         if !resume {
+            return Vec::new();
+        }
+        if ids.iter().any(|id| self.entries[id].repeat_bytes) {
+            for id in &ids {
+                let entry = self.entries.get_mut(id).unwrap();
+                entry.repeat_bytes = false;
+            }
             return Vec::new();
         }
         let closure = if mm_only && ids.iter().all(|id| self.entries[id].mm_only) {
@@ -403,6 +506,7 @@ impl<C: Cpu> Domains<C> {
             entry.requested = None;
             entry.quiescent = None;
             entry.proc_reads = false;
+            entry.layouts = false;
             ready.append(&mut entry.jobs);
         }
         // Give preempted peers their first claim before the mapping callers.
@@ -600,6 +704,27 @@ mod tests {
         epoch.restore_checkpoint(checkpoint, false);
         epoch.stop();
         assert_eq!(epoch.drain().len(), 2);
+    }
+    #[test]
+    fn byte_request_during_an_owned_scope_is_not_lost_on_restore() {
+        let epoch = Epoch::new(Arc::new(Control::new(10000)));
+        let mut memory = memory();
+        let view = memory.parallel_view(&mut Default::default()).unwrap();
+        let id = memory.coordinator_ownership().0;
+        epoch.add(job(1, Box::new(view), &epoch));
+        assert!(epoch.pause_memory(id));
+        let checkpoint = epoch.take_checkpoint().unwrap();
+        assert!(epoch.pause_memory(id), "late original mm request");
+        epoch.restore_checkpoint(checkpoint, true);
+        let checkpoint = epoch
+            .take_checkpoint()
+            .expect("late request keeps its pause");
+        epoch.restore_checkpoint(checkpoint, true);
+        let job = epoch.take(0).unwrap();
+        assert_eq!(job.work.pid, 1);
+        epoch.park(job, None);
+        epoch.stop();
+        assert_eq!(epoch.drain().len(), 1);
     }
     struct Backing(Arc<SharedPage>);
     impl PageBacking for Backing {

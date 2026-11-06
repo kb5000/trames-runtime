@@ -69,6 +69,89 @@ fn scalar(op: u8, fd: u32, address: u64, length: u32, tag: u64) -> [u8; 64] {
     s
 }
 #[test]
+fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancellation() {
+    struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
+    impl FileExecutor for Queue {
+        fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
+            result.begin();
+            assert!(self.0.send((work.queued(), result)).is_ok());
+        }
+    }
+    for cancel in [false, true] {
+        let (mut l, mut m, ring_fd, ring) = setup(8);
+        l.vfs
+            .import_file(b"/mapped", vec![7; trames_memory::PAGE_SIZE as usize])
+            .unwrap();
+        let fd = l.vfs.open_at(-100, b"/mapped", 2, 0).unwrap();
+        m.map_backed(
+            0x30000,
+            l.vfs
+                .mapping_pages(fd, 0, trames_memory::PAGE_SIZE, true, true)
+                .unwrap(),
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+        let mut files = trames_vfs::FileEpoch::default();
+        let caps = files.capture(&l.vfs, true);
+        let mut epoch = UringEpoch::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        let disk: Arc<dyn FileExecutor> = Arc::new(Queue(send));
+        let layouts = crate::FileLayouts::new(disk.clone());
+        let t = target();
+        let driver = layouts.bind_reader(IoSignal::new(0, Arc::downgrade(&t)));
+        let d = direct(&l, &m, &mut epoch, &caps)
+            .with_file_executor(disk)
+            .with_file_layouts(layouts.clone());
+        let mut truncate = sqe(55, fd, 991);
+        truncate[8..16].copy_from_slice(&1u64.to_le_bytes());
+        add(&mut m, &ring, truncate);
+        let view = m.parallel_view(&mut Default::default()).unwrap();
+        assert!(matches!(
+            enter(&d, ring_fd, 1, 0, &mut m, &t),
+            IoAttempt::Complete(Ok(1))
+        ));
+        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        result.complete(work.run());
+        assert!(matches!(
+            enter(&d, ring_fd, 0, 0, &mut m, &t),
+            IoAttempt::Complete(Ok(0))
+        ));
+        assert!(!d.urings.actor().owner_required());
+        assert!(d.urings.actor().take_file_layouts().is_empty());
+        let request = driver.take_ready().pop().unwrap();
+        let request = layouts.try_submit(request).err().unwrap();
+        layouts.restore(request);
+        l.vfs.close(fd).unwrap();
+        assert_eq!(l.vfs.eventfd(0, 0).unwrap(), fd);
+        if cancel {
+            d.urings.actor().cancel_task(m.instruction_identity().0, 7);
+        }
+        drop(view);
+        m.commit_parallel().unwrap();
+        let request = driver.take_ready().pop().unwrap();
+        assert!(layouts.try_submit(request).is_ok());
+        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        result.complete(work.run());
+        if !cancel {
+            assert!(matches!(
+                enter(&d, ring_fd, 0, 0, &mut m, &t),
+                IoAttempt::Complete(Ok(0))
+            ));
+            assert_eq!(cq(&mut m, &ring), (991, 0));
+        }
+        let original = l.vfs.open_at(-100, b"/mapped", 0, 0).unwrap();
+        assert_eq!(l.vfs.read(original, 32).unwrap(), [7]);
+        assert!(!layouts.pending());
+        assert!(receive.try_recv().is_err());
+        assert!(!d.urings.actor().owner_required());
+        drop(d);
+        assert!(epoch.finish().is_empty());
+        files.finish();
+    }
+}
+#[test]
 fn worker_path_and_socket_controls_publish_live_ofds_and_share_the_original_engine() {
     let (l, mut m, fd, r) = setup(32);
     let mut files = trames_vfs::FileEpoch::default();

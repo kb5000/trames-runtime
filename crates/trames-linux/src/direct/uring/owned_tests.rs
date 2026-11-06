@@ -179,6 +179,7 @@ fn proc_image_reads_use_original_mm_for_fixed_fds_vectors_and_registered_buffers
                         &trames_vfs::DirectFiles::default(),
                         None,
                         None,
+                        None,
                     );
                     let mut attempt = start(&snapshot, ring_fd, 1, 1, &mut m);
                     let mut rounds = 0;

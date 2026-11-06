@@ -85,6 +85,7 @@ mod kernel_log;
 pub use kernel_log::KernelLogAccess;
 mod locks;
 mod mapped;
+pub use mapped::MappingFile;
 mod memfd;
 mod mounts;
 use mounts::{Mount, PathArg};
@@ -338,6 +339,7 @@ struct Inode {
     proc_node: std::sync::OnceLock<proc_source::ProcNode>,
     regular_file: bool,
     active_file_work: std::sync::atomic::AtomicUsize,
+    layout: std::sync::OnceLock<Arc<trames_memory::layout::Layout>>,
     metadata: std::sync::Mutex<()>,
     // Immutable device behavior belongs to inode identity, not its pathname.
     simple_device: Option<simple_device::Kind>,
@@ -365,6 +367,7 @@ impl Inode {
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             proc_node: Default::default(),
             active_file_work: std::sync::atomic::AtomicUsize::new(0),
+            layout: Default::default(),
             metadata: std::sync::Mutex::new(()),
             simple_device: simple_device::Kind::content(&node.content),
             #[cfg(all(feature = "hostfs", unix))]

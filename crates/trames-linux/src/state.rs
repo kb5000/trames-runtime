@@ -19,10 +19,51 @@ pub(crate) struct VectorImport {
 // Memory's sparse reservation table finds/reuses holes without committing RAM.
 const RESERVATION_BASE: u64 = 0x4000_0000_0000;
 
+/// ABI preflight and the original file selected for one mmap. A source worker
+/// retains this while its byte scope is paused; resuming never looks up the FD
+/// again. Address-space custody must cover prepare through final application.
+pub struct MmapPlan {
+    address: u64,
+    length: u64,
+    offset: u64,
+    flags: u64,
+    permissions: Permissions,
+    reservation: bool,
+    advance_cursor: bool,
+    file: Option<trames_vfs::MappingFile>,
+    layout: Option<std::sync::Arc<trames_memory::layout::Layout>>,
+    lease: Option<trames_memory::layout::LayoutRead>,
+}
+struct PendingMmap {
+    args: [u64; 6],
+    plan: Result<MmapPlan>,
+    waited: bool,
+    wake: Option<(
+        std::sync::Arc<trames_shared::IoSignal>,
+        Vec<trames_shared::IoSubscription>,
+    )>,
+}
+impl MmapPlan {
+    pub fn layout(&self) -> Option<&std::sync::Arc<trames_memory::layout::Layout>> {
+        self.layout.as_ref()
+    }
+    pub fn try_admit(&mut self, owner: trames_memory::MemoryReport) -> bool {
+        let Some(layout) = &self.layout else {
+            return true;
+        };
+        if self.lease.is_none() {
+            self.lease = layout.try_read(owner);
+        }
+        self.lease.is_some()
+    }
+}
+
 pub struct Linux {
     pub aio: crate::Aio,
     pub(crate) batch_pipe_signal: bool,
     pub(crate) file_executor: Option<std::sync::Arc<dyn crate::FileExecutor>>,
+    pub(crate) file_layouts: Option<std::sync::Arc<crate::FileLayouts>>,
+    mmap_pending: Option<PendingMmap>,
     pub(crate) uring_clock: std::time::Instant,
     pub(crate) boot_clock: trames_shared::boottime::Boottime,
     pub(crate) uring_actor: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::UringActor>>>,
@@ -68,6 +109,8 @@ impl Linux {
             uring_clock: self.uring_clock,
             boot_clock: self.boot_clock,
             file_executor: self.file_executor.clone(),
+            file_layouts: self.file_layouts.clone(),
+            mmap_pending: None,
             uring_actor: Default::default(),
             vfs: self.vfs.clone_with_resources(shared_files, shared_fs),
             trace: self.trace,
@@ -125,6 +168,8 @@ impl Linux {
             uring_clock: std::time::Instant::now(),
             boot_clock: Default::default(),
             file_executor: None,
+            file_layouts: None,
+            mmap_pending: None,
             uring_actor: Default::default(),
             vfs: Vfs::default(),
             trace: false,
@@ -797,6 +842,89 @@ impl Linux {
         self.mmap_impl(a, memory, false)
     }
     fn mmap_impl(&mut self, a: [u64; 6], memory: &mut Memory, live: bool) -> Result<u64> {
+        let plan = if let Some(pending) = self.mmap_pending.take() {
+            assert_eq!(pending.args, a, "original accepted mmap");
+            let mut plan = pending.plan?;
+            // Epoch cancellation can let another thread edit this mm before
+            // the original call resumes. Keep its file capability but select
+            // an available address again, with ordinary MAP_FIXED semantics.
+            if pending.waited {
+                self.revalidate_mmap(a, &mut plan, memory)?;
+            }
+            plan
+        } else {
+            self.prepare_mmap(a, memory)?
+        };
+        self.apply_mmap_inner(plan, memory, live)
+    }
+    /// Retain the accepted file and validation result before yielding a source
+    /// slot. The eventual dispatch consumes them exactly once, also after an
+    /// epoch cancellation returns this task to the joined driver.
+    pub fn admit_mmap(
+        &mut self,
+        a: [u64; 6],
+        memory: &Memory,
+    ) -> std::result::Result<(), std::sync::Arc<trames_memory::layout::Layout>> {
+        if self.mmap_pending.is_none() {
+            self.mmap_pending = Some(PendingMmap {
+                args: a,
+                plan: self.prepare_mmap(a, memory),
+                waited: false,
+                wake: None,
+            });
+        }
+        let pending = self.mmap_pending.as_mut().unwrap();
+        assert_eq!(pending.args, a, "original accepted mmap");
+        let Ok(plan) = &mut pending.plan else {
+            return Ok(());
+        };
+        if plan.layout().is_none() || plan.try_admit(memory.memory_report()) {
+            pending.wake = None;
+            Ok(())
+        } else {
+            pending.waited = true;
+            Err(plan.layout().expect("pending original layout").clone())
+        }
+    }
+    pub fn retain_mmap_wait(
+        &mut self,
+        signal: std::sync::Arc<trames_shared::IoSignal>,
+        subscriptions: Vec<trames_shared::IoSubscription>,
+    ) {
+        self.mmap_pending.as_mut().expect("accepted mmap").wake = Some((signal, subscriptions));
+    }
+    pub fn has_pending_mmap(&self) -> bool {
+        self.mmap_pending.is_some()
+    }
+    pub fn cancel_pending_mmap(&mut self) {
+        self.mmap_pending = None;
+    }
+    fn revalidate_mmap(&self, a: [u64; 6], plan: &mut MmapPlan, memory: &Memory) -> Result<()> {
+        let fixed = plan.flags & (0x10 | 0x100000) != 0;
+        if !fixed && !memory.is_free(plan.address, plan.length) {
+            plan.address = memory
+                .find_free(
+                    if plan.reservation {
+                        RESERVATION_BASE
+                    } else {
+                        self.heap.cursor()
+                    },
+                    plan.length,
+                )
+                .ok_or(Errno(12))?;
+            plan.advance_cursor = !plan.reservation;
+        }
+        if plan.flags & 0x100000 != 0 && !memory.is_free(plan.address, plan.length) {
+            return Err(Errno(17));
+        }
+        if plan.flags & 0x20 == 0 || plan.flags & 3 != 2 {
+            memory
+                .check_backed_mapping(plan.address, plan.length, a[3] & 0x10 != 0)
+                .map_err(Self::memory_errno)?;
+        }
+        Ok(())
+    }
+    pub fn prepare_mmap(&self, a: [u64; 6], memory: &Memory) -> Result<MmapPlan> {
         let len = Self::page_length(a[1])?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
         if a[3] & 0x23 != 0x22 && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
@@ -848,16 +976,53 @@ impl Linux {
                 .check_backed_mapping(address, len, flags & 0x10 != 0)
                 .map_err(Self::memory_errno)?;
         }
-        if flags & 0x20 == 0 {
+        let file = if flags & 0x20 == 0 {
             a[5].checked_add(len)
                 .filter(|n| *n <= i64::MAX as u64)
                 .ok_or(Errno(75))?;
-            if permissions.execute && !self.vfs.mapping_executable(a[4] as u32)? {
+            let file = self.vfs.mapping_file(a[4] as u32)?;
+            if permissions.execute && !file.executable() {
                 return Err(Errno(1));
             }
-            let objects =
-                self.vfs
-                    .mapping_pages(a[4] as u32, a[5], len, shared, permissions.write)?;
+            Some(file)
+        } else {
+            None
+        };
+        let layout = file.as_ref().and_then(trames_vfs::MappingFile::layout);
+        Ok(MmapPlan {
+            address,
+            length: len,
+            offset: a[5],
+            flags,
+            permissions,
+            reservation,
+            advance_cursor: !fixed && !hinted && !reservation,
+            file,
+            layout,
+            lease: None,
+        })
+    }
+    /// Source callers first admit the retained plan. The joined serial caller
+    /// already owns file-layout exclusion and uses this same implementation.
+    pub fn apply_mmap(&mut self, plan: MmapPlan, memory: &mut Memory) -> Result<u64> {
+        self.apply_mmap_inner(plan, memory, false)
+    }
+    fn apply_mmap_inner(&mut self, plan: MmapPlan, memory: &mut Memory, live: bool) -> Result<u64> {
+        let MmapPlan {
+            address,
+            length: len,
+            offset,
+            flags,
+            permissions,
+            reservation,
+            advance_cursor,
+            file,
+            layout: _,
+            lease: _lease,
+        } = plan;
+        let shared = flags & 3 != 2;
+        if let Some(file) = file {
+            let objects = file.pages(offset, len, shared, permissions.write)?;
             memory
                 .map_backed(address, objects, shared, permissions, flags & 0x10 != 0)
                 .map_err(Self::memory_errno)?;
@@ -887,7 +1052,7 @@ impl Linux {
         // A successful caller-chosen hint must not move the ordinary search
         // cursor. Scudo deliberately probes randomized high addresses; moving
         // every later allocation there creates enormous sparse region spans.
-        if !fixed && !hinted && !reservation {
+        if advance_cursor {
             self.heap.set_cursor(address + len);
         }
         Ok(address)

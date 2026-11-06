@@ -26,6 +26,11 @@ pub trait PageSource: Send + Sync {
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
 pub trait PageBacking: Send + Sync {
+    /// Publication admission for an original file's physical layout. Only
+    /// mapping/snapshot construction consults this; CPU byte access does not.
+    fn layout(&self) -> Option<Arc<crate::layout::Layout>> {
+        None
+    }
     /// Device publications can change executable bytes outside CPU write hooks.
     /// Only address spaces that map such storage executable watch its code epoch.
     fn external_code_updates(&self) -> bool {

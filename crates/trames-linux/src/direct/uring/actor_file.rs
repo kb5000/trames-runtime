@@ -73,7 +73,7 @@ impl FileIo {
         request: &Request,
         memory: &mut impl CpuMemory,
         actor: &UringActor,
-        signal: Option<&Arc<dyn trames_vfs::TaskSignal>>,
+        execution: &Execution,
     ) -> Result<(i32, bool)> {
         match outcome {
             FileOutcome::Waiting(work) => {
@@ -83,6 +83,13 @@ impl FileIo {
             }
             FileOutcome::Owner(_) => unreachable!("io_uring data work has no namespace command"),
             FileOutcome::Layout(work) => {
+                let fallback = match &execution.layouts {
+                    Some(layouts) => layouts.submit(work, self.result.clone()),
+                    None => Err(work),
+                };
+                let Err(work) = fallback else {
+                    return Err(Errno(11));
+                };
                 actor.layouts.lock().unwrap().push(UringFileLayout {
                     work,
                     result: self.result.clone(),
@@ -94,7 +101,7 @@ impl FileIo {
             }
             FileOutcome::Complete(reply) => {
                 if reply.file_size_signal {
-                    if let Some(task) = signal {
+                    if let Some(task) = &execution.signal {
                         task.raise(25);
                     } else {
                         actor
@@ -203,7 +210,7 @@ pub(super) fn execute(
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &mut call.file {
         return Some(match io.take_outcome() {
-            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
         });
     }
@@ -230,7 +237,7 @@ pub(super) fn execute(
             request,
             memory,
             actor,
-            execution.signal.as_ref(),
+            execution,
         ));
     }
     let native = file.host_work(&command);
@@ -290,19 +297,13 @@ pub(super) fn execute(
         )
     {
         let result = match outcome {
-            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
         };
         call.file = Some(io);
         Some(result)
     } else {
-        Some(io.finish(
-            outcome.unwrap(),
-            request,
-            memory,
-            actor,
-            execution.signal.as_ref(),
-        ))
+        Some(io.finish(outcome.unwrap(), request, memory, actor, execution))
     }
 }
 
@@ -319,7 +320,7 @@ pub(super) fn open(
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &mut call.file {
         return Some(match io.take_outcome() {
-            Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
+            Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
         });
     }
@@ -353,7 +354,7 @@ pub(super) fn open(
     }
     let outcome = work.run();
     let layout = matches!(outcome, FileOutcome::Layout(_));
-    let result = io.finish(outcome, request, memory, actor, execution.signal.as_ref());
+    let result = io.finish(outcome, request, memory, actor, execution);
     if layout {
         call.file = Some(io);
     }

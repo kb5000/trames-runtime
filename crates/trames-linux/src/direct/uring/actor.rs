@@ -15,6 +15,7 @@ pub(crate) struct Execution {
     factory: trames_vfs::DescriptorFactory,
     files: trames_vfs::DirectFiles,
     disk: Option<Arc<dyn FileExecutor>>,
+    layouts: Option<Arc<crate::FileLayouts>>,
     signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
 }
 struct Accepted {
@@ -52,6 +53,7 @@ impl Execution {
         factory: &trames_vfs::DescriptorFactory,
         files: &trames_vfs::DirectFiles,
         disk: Option<Arc<dyn FileExecutor>>,
+        layouts: Option<Arc<crate::FileLayouts>>,
         signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
     ) -> Self {
         Self {
@@ -59,6 +61,7 @@ impl Execution {
             factory: factory.clone(),
             files: files.clone(),
             disk,
+            layouts,
             signal,
         }
     }

@@ -19,6 +19,8 @@ pub use direct::{
     UringFileLayout, UringSnapshot,
 };
 mod file_calls;
+mod file_layouts;
+pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
 mod heap;
 mod path_queries;
 mod render;
@@ -39,7 +41,7 @@ pub use uts::uts_call;
 mod timer;
 pub use syslog::syslog;
 mod uring;
-pub use state::Linux;
+pub use state::{Linux, MmapPlan};
 pub use timer::{timerfd_control, timerfd_control_with_boot};
 pub use trames_shared::boottime::Boottime;
 

@@ -85,6 +85,15 @@ impl FileTarget {
     pub fn shared_file(&self) -> SharedFd {
         self.0.clone()
     }
+    /// Original inode admission is available without waiting for native I/O's
+    /// node borrow, and is shared by every open description of that inode.
+    pub fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+        self.0
+            .open
+            .node
+            .as_ref()
+            .map(|node| node.layout.get_or_init(Default::default).clone())
+    }
     pub fn host_work_owned(&self, command: &FileCommand) -> bool {
         if self
             .0
@@ -238,6 +247,7 @@ pub struct FileWork {
     target: Option<FileTarget>,
     command: FileCommand,
     exclusive: bool,
+    layout_exclusive: Option<trames_memory::layout::LayoutExclusive>,
     active: Option<FileActive>,
     input_active: Option<FileActive>,
     open: Option<Box<PreparedOpen>>,
@@ -354,6 +364,7 @@ impl FileWork {
             target: None,
             command: FileCommand::SyncAll,
             exclusive: false,
+            layout_exclusive: None,
             active: None,
             input_active: None,
             open: None,
@@ -376,6 +387,7 @@ impl FileWork {
             target: Some(target),
             command,
             exclusive: false,
+            layout_exclusive: None,
             active: None,
             input_active: None,
             open: None,
@@ -390,6 +402,7 @@ impl FileWork {
             target: Some(target),
             command,
             exclusive: false,
+            layout_exclusive: None,
             active: None,
             input_active: None,
             open: None,
@@ -502,6 +515,23 @@ impl FileWork {
     }
     pub fn exclusive(mut self) -> Self {
         self.exclusive = true;
+        self
+    }
+    pub fn begin_layout(&self) -> Option<trames_memory::layout::LayoutWrite> {
+        self.target.as_ref()?.layout().map(|layout| layout.write())
+    }
+    pub fn enter_layout(mut self, exclusive: trames_memory::layout::LayoutExclusive) -> Self {
+        let original = self
+            .target
+            .as_ref()
+            .and_then(FileTarget::layout)
+            .expect("mapped original inode");
+        assert!(
+            Arc::ptr_eq(&original, exclusive.layout()),
+            "original layout admission"
+        );
+        self.exclusive = true;
+        self.layout_exclusive = Some(exclusive);
         self
     }
     pub fn run(mut self) -> FileOutcome {

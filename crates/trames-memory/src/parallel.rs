@@ -6,6 +6,8 @@ pub(super) mod anonymous;
 #[cfg(test)]
 mod exclusive;
 mod hardware;
+#[cfg(test)]
+mod layout_tests;
 mod native;
 pub(super) mod page;
 #[cfg(test)]
@@ -653,6 +655,7 @@ pub(super) struct Users {
 /// Send, with worker-local translations; never Sync and never retains Arc data.
 pub struct View {
     snapshot: Arc<Snapshot>,
+    publication: Option<Arc<layout::Publication>>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     mmu_cache: mmu::Cache,
     hardware_chunks: [Cell<(u64, u64)>; 16],
@@ -663,7 +666,7 @@ pub struct View {
 /// translation cells. This is a shared-VM view, not a process fork.
 impl Clone for View {
     fn clone(&self) -> Self {
-        let mut view = Self::new(self.snapshot.clone());
+        let mut view = Self::new(self.snapshot.clone(), self.publication.clone());
         view.hardware_mode = self.hardware_mode;
         view
     }
@@ -684,16 +687,30 @@ impl View {
     pub fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
         self.snapshot.backings.commit_domains()
     }
-    fn new(snapshot: Arc<Snapshot>) -> Self {
+    fn new(snapshot: Arc<Snapshot>, publication: Option<Arc<layout::Publication>>) -> Self {
         snapshot.users.count.fetch_add(1, Ordering::Relaxed);
         Self {
             snapshot,
+            publication,
             mmu_cache: mmu::Cache::default(),
             hardware_chunks: std::array::from_fn(|_| Cell::new((u64::MAX, 0))),
             private_mode: PrivateMode::Guarded,
             hardware_mode: false,
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
         }
+    }
+    /// Bind layout-stop readiness before publishing this execution actor.
+    /// A writer already accepted before subscription latches this signal too.
+    pub fn subscribe_layouts(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Vec<trames_shared::IoSubscription> {
+        self.publication
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.subscribe(signal))
+    }
+    pub fn layout_requested(&self) -> bool {
+        self.publication.as_ref().is_some_and(|p| p.pending())
     }
     /// Admit the private-page fast path for one joined runtime epoch.
     /// Returns false if any other View of this VM survives, across generations.
@@ -1311,9 +1328,14 @@ impl Memory {
         if let Some(memory) = &self.shared {
             return memory.borrow().current_parallel_view();
         }
-        self.parallel_cache
-            .as_ref()
-            .map(|cache| View::new(cache.snapshot.clone()))
+        let cache = self.parallel_cache.as_ref()?;
+        if self.layout_publication.is_none() && cache.snapshot.backings.has_layouts() {
+            return None;
+        }
+        Some(View::new(
+            cache.snapshot.clone(),
+            self.layout_publication.clone(),
+        ))
     }
     /// Subscribe before checking quiescence. This covers external retained
     /// generations as well as jobs in the current execution queue.
@@ -1408,6 +1430,10 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().parallel_view(registry);
         }
+        // Acquire before any provider read or metadata refresh. A failed
+        // admission retains the original mm and lets its caller park on the
+        // original backing; no page access is used to probe a native mutation.
+        let publication = self.prepare_parallel_layouts()?;
         if self
             .parallel_cache
             .as_ref()
@@ -1437,7 +1463,7 @@ impl Memory {
                 && !self.parallel_anonymous_dirty
             {
                 registry.metrics.cache_hits += 1;
-                return Some(View::new(c.snapshot.clone()));
+                return Some(View::new(c.snapshot.clone(), publication));
             }
         }
         // Data-only coordinator writes reuse the immutable mapping table and
@@ -1479,7 +1505,7 @@ impl Memory {
                 frame.refresh_content_metadata(page);
             }
             cache.source_revision = self.revision;
-            let view = View::new(cache.snapshot.clone());
+            let view = View::new(cache.snapshot.clone(), publication);
             self.parallel_cache = Some(cache);
             return Some(view);
         }
@@ -1487,7 +1513,7 @@ impl Memory {
             Arc::strong_count(&cache.snapshot) == 1
                 && Arc::strong_count(&cache.snapshot.dirty_pages) == 1
         }) {
-            return self.update_parallel_snapshot(registry, backing_revision);
+            return self.update_parallel_snapshot(registry, backing_revision, publication);
         }
         // Unknown mutable backings retain the existing serial path.
         if self.frames.iter().flatten().any(|p| {
@@ -1631,7 +1657,7 @@ impl Memory {
                 page.parallel_dirty = false;
             }
         }
-        Some(View::new(snapshot))
+        Some(View::new(snapshot, publication))
     }
     /// This mm's joined CPUs publish dirty metadata and persistence/code hooks.
     /// Isolated providers may retain live other-mm users of canonical storage.
@@ -1658,6 +1684,7 @@ impl Memory {
             return shared.borrow_mut().commit_parallel_state(retain_dirty);
         }
         let Some(mut cache) = self.parallel_cache.take() else {
+            self.release_layout_publication();
             return Ok(());
         };
         let result = (|| {
@@ -1811,7 +1838,24 @@ impl Memory {
             cache.source_revision = self.revision.wrapping_sub(1);
         }
         self.parallel_cache = Some(cache);
+        // Do not unblock the writer before publishing every dirty fragment.
+        // Retained guarded generations can write again until their last View
+        // returns; their root publication survives a partial retirement commit.
+        if result.is_ok() {
+            self.release_layout_publication();
+        }
         result
+    }
+    fn release_layout_publication(&mut self) {
+        if !self.has_parallel_users()
+            && self
+                .layout_publication
+                .as_ref()
+                .is_some_and(|p| p.pending())
+        {
+            self.layout_publication = None;
+            self.layout_cold_revision = None;
+        }
     }
 }
 

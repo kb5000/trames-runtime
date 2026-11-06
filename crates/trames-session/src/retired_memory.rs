@@ -2,15 +2,34 @@
 //! Detached original mms finish on existing executors after their last borrower.
 //! Membership never covers memory commits, notifications or final destruction.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use trames_memory::{Memory, MemoryError};
-use trames_shared::{IoSignal, IoSubscription, IoWake, Readiness};
+use trames_shared::{IoSignal, IoSubscription, IoWake};
 
 #[derive(Default)]
 pub(crate) struct RetiredMemory {
     pending: Mutex<BTreeMap<u64, Pending>>,
-    ready: Arc<Readiness>,
-    owner: OnceLock<(Arc<dyn IoWake>, Arc<IoSignal>, IoSubscription)>,
+    owner: OnceLock<(Arc<dyn IoWake>, Arc<IoSignal>)>,
+    executor: Mutex<Option<Weak<IoSignal>>>,
+}
+pub(crate) struct Driver {
+    memory: Arc<RetiredMemory>,
+    pub signal: Arc<IoSignal>,
+}
+impl Drop for Driver {
+    fn drop(&mut self) {
+        let mut executor = self.memory.executor.lock().unwrap();
+        if executor
+            .as_ref()
+            .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&self.signal)))
+        {
+            *executor = None;
+            drop(executor);
+            if self.memory.has_ready() {
+                self.memory.notify();
+            }
+        }
+    }
 }
 
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -48,7 +67,7 @@ mod tests {
             let (memory, mut view) = memory();
             let id = memory.coordinator_ownership().0;
             let (_, old_signal, _) = wake();
-            let old_subscription = retired.subscribe(&old_signal);
+            let old_subscription = retired.bind_reader(old_signal.clone());
             retired.retire(memory).unwrap();
             view.write_array(0x1000, 9u64.to_le_bytes()).unwrap();
             assert_eq!(retired.read_u64(id, 0x1000), 9);
@@ -59,12 +78,19 @@ mod tests {
                 drop(view.take());
             }
             let (_target, signal, notified) = wake();
-            let _subscription = retired.subscribe(&signal);
+            let _subscription = retired.bind_reader(signal.clone());
             if !release_first {
                 drop(view.take());
             }
             notified.recv_timeout(Duration::from_secs(2)).unwrap();
-            events.recv_timeout(Duration::from_secs(2)).unwrap();
+            if release_first {
+                events.recv_timeout(Duration::from_secs(2)).unwrap();
+            } else {
+                assert!(
+                    events.try_recv().is_err(),
+                    "active source needs no owner notification"
+                );
+            }
             retired.pump().unwrap();
             assert!(retired.is_empty());
         }
@@ -95,7 +121,7 @@ mod tests {
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(view);
         let (_wake, signal, _) = wake();
-        let _subscription = retired.subscribe(&signal);
+        let _subscription = retired.bind_reader(signal.clone());
         signal.reset();
         let pump = retired.clone();
         let (done, completed) = mpsc::channel();
@@ -113,6 +139,31 @@ mod tests {
         retired.pump().unwrap();
         assert!(retired.is_empty());
     }
+    #[test]
+    fn cancelling_a_ready_source_hands_original_memory_back_without_stealing_a_new_driver() {
+        let retired = Arc::new(RetiredMemory::default());
+        let (owner, _, events) = wake();
+        retired.bind_owner(|| owner.clone());
+        let (memory, view) = memory();
+        let (_first, first, _) = wake();
+        let first = retired.bind_reader(first);
+        retired.retire(memory).unwrap();
+        drop(view);
+        assert!(first.signal.ready());
+        assert!(events.try_recv().is_err());
+        let (_next, next, _) = wake();
+        let next = retired.bind_reader(next);
+        drop(first);
+        assert!(
+            events.try_recv().is_err(),
+            "old driver cannot unbind its replacement"
+        );
+        assert!(next.signal.ready());
+        drop(next);
+        events.recv_timeout(Duration::from_secs(2)).unwrap();
+        retired.pump().unwrap();
+        assert!(retired.is_empty());
+    }
 }
 struct Pending {
     id: u64,
@@ -123,7 +174,7 @@ struct Pending {
 }
 impl IoWake for RetiredMemory {
     fn wake_io(&self, _: &Arc<IoSignal>) {
-        self.ready.notify_atomic();
+        self.notify();
     }
 }
 impl RetiredMemory {
@@ -133,22 +184,38 @@ impl RetiredMemory {
         self.owner.get_or_init(|| {
             let target = target();
             let signal = IoSignal::new(0, Arc::downgrade(&target));
-            let subscription = self.ready.subscribe(&signal);
-            (target, signal, subscription)
+            (target, signal)
         });
     }
-    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
-        let subscription = self.ready.subscribe(signal);
-        if self
-            .pending
+    fn has_ready(&self) -> bool {
+        self.pending
             .lock()
             .unwrap()
             .values()
             .any(|p| p.signal.ready())
-        {
+    }
+    fn notify(&self) {
+        let executor = self
+            .executor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(executor) = executor {
+            executor.notify();
+        } else if let Some((_, signal)) = self.owner.get() {
             signal.notify();
         }
-        subscription
+    }
+    pub fn bind_reader(self: &Arc<Self>, signal: Arc<IoSignal>) -> Driver {
+        *self.executor.lock().unwrap() = Some(Arc::downgrade(&signal));
+        if self.has_ready() {
+            signal.notify();
+        }
+        Driver {
+            memory: self.clone(),
+            signal,
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.pending.lock().unwrap().is_empty()
@@ -186,11 +253,11 @@ impl RetiredMemory {
         let old = self.pending.lock().unwrap().insert(id, pending);
         assert!(old.is_none(), "one detached original mm owner");
         if signal.ready() {
-            self.ready.notify_atomic();
+            self.notify();
         }
     }
     pub fn pump(&self) -> Result<(), MemoryError> {
-        if let Some((_, signal, _)) = self.owner.get() {
+        if let Some((_, signal)) = self.owner.get() {
             signal.reset();
         }
         let ready: Vec<_> = self
