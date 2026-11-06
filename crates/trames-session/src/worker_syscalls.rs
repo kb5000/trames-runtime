@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Worker syscalls over retained policy and actual shared resource ownership.
 //! No VFS/Process Rc crosses the boundary. Only seccomp-allowed calls execute;
-//! filter installation and tracing still checkpoint; credential commits refresh
+//! policy installation uses original task/group resources; credential commits refresh
 //! future calls while accepted operations retain their original authority.
 use std::{
     sync::Arc,
@@ -113,6 +113,23 @@ pub(super) struct Snapshot {
 }
 
 impl<C: Cpu> crate::workers::Work<C> {
+    pub fn policy_call(&mut self, number: u32, args: [u64; 6]) -> crate::process::seccomp::Attempt {
+        let snapshot = self.syscalls.as_mut().expect("policy task");
+        let namespace = snapshot.io_routes.namespace.clone();
+        snapshot
+            .namespaces
+            .as_mut()
+            .expect("original task authority")
+            .with_credentials(|credentials, _| {
+                snapshot.seccomp.start(
+                    number,
+                    args,
+                    self.memory.as_deref().expect("policy View"),
+                    credentials,
+                    namespace,
+                )
+            })
+    }
     pub fn credential_call(&mut self, number: u32, args: [u64; 6]) {
         let snapshot = self.syscalls.as_mut().expect("credential task");
         let mut state = snapshot.namespaces.take().expect("original task authority");

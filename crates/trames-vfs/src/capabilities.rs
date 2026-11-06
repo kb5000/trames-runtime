@@ -2,6 +2,32 @@
 //! Linux task capabilities in the guest's initial user namespace.
 //! These masks never confer authority over host objects or credentials.
 use crate::{Errno, Result};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+/// Monotonic task flag shared by retained views of the same original task.
+/// Task birth explicitly forks it; ordinary credential snapshots keep its identity.
+#[derive(Clone, Debug, Default)]
+pub struct NoNewPrivs(Arc<AtomicBool>);
+impl NoNewPrivs {
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    pub fn fork(&self) -> Self {
+        Self(Arc::new(AtomicBool::new(self.get())))
+    }
+}
+impl PartialEq for NoNewPrivs {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+impl Eq for NoNewPrivs {}
 
 pub const CHOWN: u32 = 0;
 pub const DAC_OVERRIDE: u32 = 1;
@@ -46,7 +72,7 @@ pub struct Capabilities {
     pub bounding: u64,
     pub ambient: u64,
     pub securebits: u32,
-    pub no_new_privs: bool,
+    pub no_new_privs: NoNewPrivs,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -62,7 +88,7 @@ impl Capabilities {
             bounding: ALL,
             ambient: 0,
             securebits: 0,
-            no_new_privs: false,
+            no_new_privs: NoNewPrivs::default(),
         }
     }
     pub fn has(&self, cap: u32) -> bool {
@@ -115,6 +141,15 @@ impl Capabilities {
     }
     /// File capabilities are not yet supported. Apply ordinary/set-ID ELF rules.
     pub fn exec(&mut self, uid: u32, euid: u32, privileged: bool) {
+        self.exec_with_nnp(uid, euid, privileged, self.no_new_privs.get());
+    }
+    pub(crate) fn exec_with_nnp(
+        &mut self,
+        uid: u32,
+        euid: u32,
+        privileged: bool,
+        no_new_privs: bool,
+    ) {
         if privileged {
             self.ambient = 0;
         }
@@ -123,7 +158,7 @@ impl Capabilities {
         if root {
             permitted |= self.inheritable | self.bounding;
         }
-        if self.no_new_privs {
+        if no_new_privs {
             permitted &= self.permitted;
         }
         self.permitted = permitted;
@@ -181,10 +216,10 @@ impl Capabilities {
                     return Err(Errno(22));
                 }
                 if a[0] == 38 {
-                    self.no_new_privs = true;
+                    self.no_new_privs.set();
                     Ok(0)
                 } else {
-                    Ok(u64::from(self.no_new_privs))
+                    Ok(u64::from(self.no_new_privs.get()))
                 }
             }
             47 => {

@@ -85,6 +85,7 @@ impl Birth {
         }
     }
     pub(super) fn publish_task_core<C: Cpu>(&self, id: u32, p: &Process<C>) {
+        p.seccomp.bind(&p.signals.io, id);
         self.publish_proc(id, p);
         p.signals
             .io
@@ -310,6 +311,26 @@ impl Birth {
             child.cpu.set_tls(a[3]);
         }
         child.wait_event.bind_presence(&child.signals.presence);
+        // Source callers already admitted this resource without blocking their
+        // executor. Joined/bootstrap callers use the same short transaction.
+        let policy_group = p.seccomp.birth_group();
+        let _policy = policy_group.write_owned().into_admission();
+        // Publish credentials only: a new PID namespace is activated inside
+        // admit_child; binding signal translations before that would retain
+        // the parent's namespace in the child's immutable inbox authority.
+        child
+            .signals
+            .io
+            .scheduling
+            .publish_credentials(&child.linux.vfs.credentials);
+        child.seccomp.inherit(
+            &p.seccomp,
+            threaded,
+            &child.signals.io,
+            id,
+            &child.linux.vfs.credentials.caps.no_new_privs,
+            &p.linux.vfs.credentials.caps.no_new_privs,
+        );
         self.admit_child(pid, p.signals.io.lifecycle(), id, &mut child, threaded)?;
         // Linux stores these user TIDs after task birth and ignores
         // copyout faults. CHILD_CLEARTID only records its address.

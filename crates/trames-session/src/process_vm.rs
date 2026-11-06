@@ -790,7 +790,7 @@ mod tests {
         instruction[..2].copy_from_slice(&6u16.to_le_bytes());
         instruction[4..].copy_from_slice(&action.to_le_bytes());
         p.memory.write_array(0x1100, instruction).unwrap();
-        p.linux.vfs.credentials.caps.no_new_privs = true;
+        p.linux.vfs.credentials.caps.no_new_privs.set();
         assert_eq!(k.seccomp(p, [1, 0, 0x1000, 0, 0, 0]), Ok(0));
     }
     fn commit_while_peer_runs(relation: u8) {

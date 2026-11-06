@@ -25,6 +25,7 @@ pub(super) enum WaitState {
     Child(Arc<ChildWait>),
     Completion(Arc<CompletionWait>),
     Namespace(Arc<NamespaceWait>),
+    Policy(Arc<PolicyWait>),
     /// Retry the retained pending CPU syscall after original task/mm custody.
     /// This is not a completed guest wait and must not overwrite its arguments.
     Custody(Arc<crate::process::tasks::AdmissionWait>),
@@ -75,6 +76,47 @@ impl NamespaceWait {
             }
             trames_vfs::TaskNamespaceAttempt::Waiting(work) => {
                 *self.work.lock().unwrap() = Some(work);
+                None
+            }
+        }
+    }
+}
+/// One accepted installation, retained across slot release and cancellation.
+pub(super) struct PolicyWait {
+    work: Mutex<Option<crate::process::seccomp::Install>>,
+    subscription: Mutex<Option<trames_vfs::IoSubscription>>,
+}
+impl PolicyWait {
+    pub fn new(work: crate::process::seccomp::Install) -> Arc<Self> {
+        Arc::new(Self {
+            work: Mutex::new(Some(work)),
+            subscription: Mutex::default(),
+        })
+    }
+    pub fn ready(&self) -> bool {
+        self.work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|w| w.ready())
+    }
+    pub fn bind(&self, signal: &Arc<trames_vfs::IoSignal>) {
+        *self.subscription.lock().unwrap() = self
+            .work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|w| w.subscribe(signal));
+    }
+    pub fn run(&self) -> Option<Result<u64, trames_vfs::Errno>> {
+        let work = self.work.lock().unwrap().take()?;
+        match work.run() {
+            crate::process::seccomp::Attempt::Complete(result) => {
+                self.subscription.lock().unwrap().take();
+                Some(result)
+            }
+            crate::process::seccomp::Attempt::Waiting(work) => {
+                *self.work.lock().unwrap() = Some(*work);
                 None
             }
         }
@@ -143,6 +185,7 @@ impl WaitState {
             | Self::Child(_)
             | Self::Completion(_)
             | Self::Namespace(_)
+            | Self::Policy(_)
             | Self::Custody(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
@@ -470,8 +513,10 @@ impl<C: Cpu> Job<C> {
             return None;
         }
         Some(
-            matches!(self.waiting, Some(WaitState::Namespace(_)))
-                || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
+            matches!(
+                self.waiting,
+                Some(WaitState::Namespace(_) | WaitState::Policy(_))
+            ) || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
                 || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -539,14 +584,17 @@ impl<C: Cpu> Job<C> {
                     .gpu_pending
                     .as_ref()
                     .is_some_and(|g| g.compile.is_some() && !g.waiting())
-                || matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
+                || (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
+                    || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready()))
                 || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished())
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
                         && io.signal.ready()
                 });
         }
-        if matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready()) {
+        if (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
+            || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready()))
+        {
             return true;
         }
         if let Some(WaitState::Completion(wait)) = &self.waiting {
@@ -577,7 +625,7 @@ impl<C: Cpu> Job<C> {
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_)))
+                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_)))
                             || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
@@ -996,6 +1044,9 @@ impl<C: Cpu> Epoch<C> {
                 wait.bind(&snapshot.io_signals, &signal);
             }
             if let Some(WaitState::Namespace(wait)) = &job.waiting {
+                wait.bind(&signal);
+            }
+            if let Some(WaitState::Policy(wait)) = &job.waiting {
                 wait.bind(&signal);
             }
             snapshot.io_wake = Some(signal);

@@ -729,7 +729,7 @@ impl<C: Cpu> Starter<C> {
                                         snapshot.io_signals.lifecycle().request_exit(sig as i32);
                                         continue;
                                     }
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -742,7 +742,7 @@ impl<C: Cpu> Starter<C> {
                                         }
                                         continue;
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -784,6 +784,15 @@ impl<C: Cpu> Starter<C> {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(crate::run_queue::WaitState::Policy(wait)) = &job.waiting {
+                                if wait.ready() {
+                                    if let Some(result)=wait.run() {
+                                        work.cpu.set_x(0,result.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                        job.waiting=None;continue;
+                                    }
+                                }
+                                maintenance=true;break SliceOutcome::Yield {instructions:0};
                             }
                             if let Some(crate::run_queue::WaitState::Namespace(wait)) = &job.waiting {
                                 if wait.ready() {
@@ -964,6 +973,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 }
                                 running = true;
                             }
+                            let resumed_policy = matches!(job.pending_cpu,Some(SliceOutcome::Syscall {..})) && job.seccomp_entry.is_some();
                             let result = if let Some(pending) = job.pending_cpu.take() {
                                 pending
                             } else {
@@ -1020,6 +1030,60 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
                                 if work.syscalls.as_ref().is_some_and(|s| s.owner_syscalls) { break result; }
+                                if let Some(snapshot) = &mut work.syscalls {
+                                    let number=work.cpu.x(8) as u32;
+                                    let args=std::array::from_fn(|i|work.cpu.x(i));
+                                    let began=snapshot.profile.then(Instant::now);
+                                    if !resumed_policy {
+                                        job.seccomp_entry=None;
+                                        snapshot.seccomp.begin_entry(number,work.cpu.pc(),args);
+                                    }
+                                    if let Some(began)=began {syscall_time+=began.elapsed();}
+                                    if let Some(entry)=snapshot.seccomp.denied_entry(number,work.cpu.pc(),args) {
+                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        if epoch.is_none() || snapshot.exit_files.is_none() {job.seccomp_entry=Some(entry);break result;}
+                                        syscalls+=1;
+                                        if entry.action()==0 {
+                                            if let Some(exit)=snapshot.exit_thread(work.pid,entry.fatal_signal(),work.memory.as_deref_mut().expect("seccomp exit View")) {
+                                                thread_exit=Some(exit);
+                                                if snapshot.futex.take_readied(){work.control.stop();}
+                                            } else {job.seccomp_entry=Some(entry);syscalls-=1;}
+                                            break result;
+                                        }
+                                        if entry.action()==0x0003_0000 && snapshot.io_signals.mask()&(1<<30)==0 && snapshot.actions.get(31).handler>1 {
+                                            snapshot.io_signals.inbox.discard(31);
+                                            let info=trames_kernel::signal::Info{sender:entry.data(),uid:0xc000_00b7,status:number as i32,code:1,timer:None,fault:Some(work.cpu.pc()),poll:None};
+                                            if snapshot.io_signals.inbox.enqueue(31,info).is_ok(){continue;}
+                                        }
+                                        snapshot.io_signals.lifecycle().request_exit(31);
+                                        continue;
+                                    }
+                                }
+                                if work.syscalls.as_ref().is_some_and(|s| s.namespaces.is_some())
+                                    && crate::process::seccomp::local_entry(work.cpu.x(8) as u32, std::array::from_fn(|i|work.cpu.x(i))) {
+                                    let number=work.cpu.x(8) as u32;
+                                    let args=std::array::from_fn(|i|work.cpu.x(i));
+                                    let snapshot=work.syscalls.as_ref().unwrap();
+                                    let entry=snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
+                                    if !entry.allowed() {
+                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        job.seccomp_entry=Some(entry);break result;
+                                    }
+                                    let began=snapshot.profile.then(Instant::now);
+                                    let attempt=work.policy_call(number,args);
+                                    if let Some(began)=began {syscall_time+=began.elapsed();}
+                                    syscalls+=1;
+                                    match attempt {
+                                        crate::process::seccomp::Attempt::Complete(value)=>work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))),
+                                        crate::process::seccomp::Attempt::Waiting(pending)=>{
+                                            let wait=crate::run_queue::PolicyWait::new(*pending);
+                                            if let Some(wake)=work.syscalls.as_ref().and_then(|s|s.io_wake.as_ref()) {wait.bind(wake);}
+                                            parked=Some(crate::run_queue::WaitState::Policy(wait));
+                                            break SliceOutcome::Yield {instructions:0};
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if (matches!(work.cpu.x(8) as u32, 97 | 268) || work.cpu.x(8) as u32 == 436 && work.cpu.x(2) as u32 & 2 != 0)
                                     && work.syscalls.as_ref().is_some_and(|s| s.namespaces.is_some()) {
                                     let number = work.cpu.x(8) as u32;
@@ -1534,6 +1598,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                     work.cpu.set_x(0,value);syscalls+=1;continue;
                                                 },
                                                 Err(wait)=>{
+                                                    job.seccomp_entry=Some(snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i))));
                                                     job.pending_cpu=Some(result);
                                                     parked=Some(crate::run_queue::WaitState::Custody(Arc::new(wait)));
                                                     break SliceOutcome::Yield {instructions:0};
@@ -1719,6 +1784,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(ring) = &mut job.uring {
                             if !ring.progress(work.memory.as_deref_mut().expect("source task View")) { work.control.stop(); }
                             if !ring.active() { job.uring = None; }
+                        }
+                    }
+                    if matches!(outcome, Some(SliceOutcome::Syscall { .. })) && job.seccomp_entry.is_none() && job.retry.is_none() && thread_exit.is_none() {
+                        if let Some(snapshot)=work.syscalls.as_ref().filter(|s| !s.owner_syscalls) {
+                            job.seccomp_entry=Some(snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i))));
                         }
                     }
                     // Withdraw before requesting a checkpoint: this worker is

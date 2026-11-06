@@ -347,6 +347,30 @@ impl<C: Cpu> Lifecycle<C> {
         lifecycle_only: bool,
         pending_image: &mut Option<tasks::AdmissionWait>,
     ) -> Result<bool, RuntimeError> {
+        // Birth and exec credential publication share policy group admission.
+        // Resource contention parks before any structural effects. Image I/O
+        // drops these permits while pending and reacquires them before commit.
+        let mut policy_permits = Vec::new();
+        for job in checkpoint
+            .jobs
+            .iter()
+            .filter(|job| job.checkpoint.is_some() && matches!(job.work.cpu.x(8), 220 | 221 | 281))
+        {
+            let task = job
+                .work
+                .task
+                .as_ref()
+                .expect("original lifecycle policy")
+                .read();
+            match task.seccomp.admit_birth(&epoch.io_target, job.work.pid) {
+                Ok(permit) => policy_permits.push(permit),
+                Err(wait) => {
+                    *pending_image = Some(wait);
+                    checkpoint.source_retry = true;
+                    return Ok(true);
+                }
+            }
+        }
         let began = Instant::now();
         let mut committed = std::collections::BTreeSet::new();
         let metadata = checkpoint.proc_reads
@@ -469,6 +493,7 @@ impl<C: Cpu> Lifecycle<C> {
             }
             report.time[3] += elapsed;
         }
+        drop(policy_permits);
         let began = Instant::now();
         // Capture new CPUs before preparing any View. The owned checkpoint now
         // survives a backing-layout wait or cancellation with every child/image
@@ -742,7 +767,7 @@ mod tests {
                     .protect(0x4000, trames_memory::PAGE_SIZE, Permissions::RX)
                     .unwrap();
                 if cpus == 4 {
-                    root.linux.vfs.credentials.caps.no_new_privs = true;
+                    root.linux.vfs.credentials.caps.no_new_privs.set();
                     root.memory
                         .write(0x1000, &[6, 0, 0, 0, 0, 0, 0xff, 0x7f])
                         .unwrap();

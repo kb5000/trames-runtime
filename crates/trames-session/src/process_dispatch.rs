@@ -133,6 +133,8 @@ impl Dispatch {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(trames_kernel::children::Wait { number, args }),
             ))
+        } else if let State::Policy(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Policy(wait.clone()))
         } else if let State::Namespace(wait) = &p.state {
             Some(crate::run_queue::WaitState::Namespace(wait.clone()))
         } else if let State::Completion(release) = &p.state {

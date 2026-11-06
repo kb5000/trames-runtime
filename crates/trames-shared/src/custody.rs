@@ -28,6 +28,12 @@ impl<T> Custody<T> {
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    /// Readiness hint only; the caller must still try_admit after subscription.
+    /// Observing readiness must not acquire/release custody and notify its own
+    /// waiter while a run-queue lock is held.
+    pub fn available(&self) -> bool {
+        !self.0.value.is_locked()
+    }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.0.ready.subscribe(signal)
     }
@@ -316,10 +322,13 @@ mod tests {
                 };
                 drop(subscription);
                 *permit.write() += 1;
+                // The original holder may have copied the callback before
+                // unsubscribe. Keep its receiver alive through that unlock.
+                event
             });
             gate.wait();
             drop(held);
-            join.join().unwrap();
+            let _event = join.join().unwrap();
         }
         assert_eq!(*object.borrow(), 256);
     }

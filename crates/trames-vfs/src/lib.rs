@@ -125,6 +125,7 @@ mod pseudo;
 pub use oom::OomTask;
 pub use proc_source::{
     ProcCounters, ProcDirectory, ProcQuery, ProcResources, ProcSource, ProcTask, ProcessView,
+    SeccompView,
 };
 mod pty;
 pub mod terminal;
@@ -132,7 +133,7 @@ pub use pty::{Pty, PtyEnd, PtyIo, PtySlaveEndpoint, TerminalAccess};
 mod storage;
 #[cfg(test)]
 mod storage_tests;
-pub use credentials::{CredentialState, Credentials, Dumpable};
+pub use credentials::{CredentialState, Credentials, Dumpable, ExecCredentials};
 pub use linux_namespace::{NamespaceProjection, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{

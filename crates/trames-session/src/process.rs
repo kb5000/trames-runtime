@@ -98,6 +98,7 @@ enum State {
     Suspend(u64),
     Completion(Arc<trames_kernel::completion::Completion>),
     Namespace(Arc<crate::run_queue::NamespaceWait>),
+    Policy(Arc<crate::run_queue::PolicyWait>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -164,7 +165,7 @@ impl<C: Cpu> Process<C> {
     fn stop_held(&self) -> bool {
         matches!(
             self.state,
-            State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_)
+            State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_) | State::Policy(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.exec_pending.is_some()
             || self.linux.has_pending_mmap()
@@ -190,6 +191,7 @@ impl<C: Cpu> Process<C> {
                     | State::Suspend(_)
                     | State::Completion(_)
                     | State::Namespace(_)
+                    | State::Policy(_)
                     | State::Blocked(95 | 260, _)
             ) || self.worker_io_candidate(id)
                 || self.worker_gpu_candidate())
@@ -282,7 +284,7 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
-        if matches!(self.state, State::Namespace(_)) {
+        if matches!(self.state, State::Namespace(_) | State::Policy(_)) {
             return !self.linux.trace;
         }
         if !matches!(self.state, State::Blocked(..)) {
@@ -468,9 +470,11 @@ impl<C: Cpu> Process<C> {
         // Bind allocation metadata to actual Memory identity, including test
         // and embedding clones; a copied address space must not share a cursor.
         let shared_vm = memory.coordinator_ownership().0 == self.memory.coordinator_ownership().0;
-        let linux = self
+        let mut linux = self
             .linux
             .clone_with_resources(shared_files, shared_fs, shared_vm);
+        linux.vfs.credentials.caps.no_new_privs =
+            self.linux.vfs.credentials.caps.no_new_privs.fork();
         let limits = self.limits.fork(&linux.vfs);
         let mut signals = self.signals.fork(shared_actions);
         signals.presence = presence;
@@ -523,7 +527,7 @@ impl<C: Cpu> Process<C> {
             )),
             limits,
             oom: Arc::new(self.oom.fork()),
-            seccomp: self.seccomp.clone(),
+            seccomp: self.seccomp.fork(),
             seccomp_entry: None,
         })
     }
@@ -1706,7 +1710,7 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         }
         let action = p.signals.actions.get(sig as usize);
-        if action.handler > 1 && matches!(p.state, State::Namespace(_)) {
+        if action.handler > 1 && matches!(p.state, State::Namespace(_) | State::Policy(_)) {
             return Ok(false);
         }
         // Submitted regular-file work is not restarted from a guest pointer.
@@ -3737,6 +3741,13 @@ impl<C: Cpu> Kernel<C> {
         if self
             .processes
             .iter()
+            .any(|(id, p)| !p.frozen(id) && !p.linux.trace && matches!(p.state, State::Policy(_)))
+        {
+            return true;
+        }
+        if self
+            .processes
+            .iter()
             .any(|(id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
         {
             let runnable = self
@@ -3892,7 +3903,9 @@ impl<C: Cpu> Kernel<C> {
                         task.linux.progress_uring(&mut task.memory, id)
                     };
                 }
-                self.resume_event(&mut p);
+                if p.linux.trace || !matches!(p.state, State::Policy(_)) {
+                    self.resume_event(&mut p);
+                }
                 if self.deliver(id, &mut p).is_err() {
                     self.exit(id, &mut p, 11);
                 }
@@ -3955,6 +3968,7 @@ impl<C: Cpu> Kernel<C> {
                         | State::Blocked(95 | 260, _)
                         | State::Completion(_)
                         | State::Namespace(_)
+                        | State::Policy(_)
                 ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
@@ -3963,6 +3977,7 @@ impl<C: Cpu> Kernel<C> {
             && !members.iter().any(|(id, _)| {
                 self.processes.read(id).worker_gpu_candidate()
                     || self.processes.read(id).linux.worker_uring_pending()
+                    || matches!(self.processes.read(id).state, State::Policy(_))
             })
         {
             return Ok(false);
@@ -4454,6 +4469,7 @@ impl<C: Cpu> Kernel<C> {
                     State::Blocked(wait.request.number, wait.request.args)
                 }
                 crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
+                crate::run_queue::WaitState::Policy(wait) => State::Policy(wait),
                 crate::run_queue::WaitState::Custody(_) => State::Ready,
                 crate::run_queue::WaitState::Completion(wait) => {
                     State::Completion(wait.release.clone())

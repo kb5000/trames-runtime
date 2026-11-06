@@ -1901,7 +1901,7 @@ impl Vfs {
                             }
                             name.push_str(&format!(
                                 "\nNoNewPrivs:\t{}",
-                                u32::from(c.caps.no_new_privs)
+                                u32::from(c.caps.no_new_privs.get())
                             ));
                             name.push_str(&format!(
                                 "\nSeccomp:\t{}\nSeccomp_filters:\t{}",

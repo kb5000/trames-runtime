@@ -7,36 +7,36 @@ activation, completion and mapped-file layout transactions, reviewed on
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
-## Current status at a glance — 2026-11-06
+## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Ordinary admitted resource operations no longer
-need to be sent to it. Stage 58 also activates original proc byte views, completes
-returned CPUs and cold tasks, and drives mapped-file layout changes on existing
-workers. Pending original resources survive cancellation and executor replacement.
-Stage 57 constructs children on existing
-workers for fork/clone/vfork/exec and supported mixed mapping scopes. Nonleader
-replacement and detached old-mm retirement use original resources. Supported
-structural mapping publication is source-owned, and native image loading yields
-its CPU slot to the existing disk pool. Actual unhandled/control work can still
-end the current execution cohort. The table records the completed supported
-lifecycle subsystem and the explicit remaining boundaries; it is not a claim that
-all coordinator work is removed.
+The Kernel owner still exists. Stage 59 moves the complete supported seccomp
+policy subsystem to original task/group resources: strict/filter installation,
+TSYNC, prctl queries, all supported entry decisions, SIGSYS and termination effects,
+proc visibility, birth/exec inheritance and accepted-call cancellation. Policy
+publication never pauses the cohort. Only actual policy installation and birth/
+exec credential publication synchronize on the original group; ordinary entry
+reads one immutable version without a lock or allocation.
+
+Stage 58's scoped memory and stage 57's task/image lifecycle remain source-owned.
+Actual unhandled/control work can still end the current execution cohort. The
+table records supported source execution and explicit remaining boundaries; this
+is not a claim that all coordinator work is removed.
 
 | Area | Normal scope now | Remaining owner dependency / actual escalation |
 | --- | --- | --- |
 | Admitted file/path/FD, Unix/TCP I/O, transfers, AIO and io_uring operations | Calling worker and original shared resources; resource waits return the execution slot | Excluded descriptor/path/SQE kinds, owner controls, missing pumps/subscriptions retain explicit boundaries; production mapped-layout effects now use original backing admission |
-| Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes | Legacy nonmember waiter adoption, excluded wait resources, tracing and lifecycle policy effects can still require the owner |
-| Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Tracing and actual seccomp lifecycle effects keep their task-policy boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
-| Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and actual tracing/policy retain their boundary |
-| fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Actual tracing/policy, solo and host invocation remain separate |
+| Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes | Legacy nonmember waiter adoption, excluded wait resources, tracing and capability-less lifecycle embeddings can still require the owner |
+| Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Tracing and capability-less embeddings keep their boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
+| Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and tracing/capability-less embeddings retain their boundary |
+| fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Tracing/capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Residual generic FD/network compatibility | In-cohort owner service when the actual resource is admitted; only the caller waits | Refusal before effects uses the joined owner path. Candidate syscall numbers do not mean ordinary admitted calls take this route |
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
-| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and actual seccomp lifecycle effects remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
-| Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and seccomp installation/TSYNC or lifecycle decisions retain their boundary; unsupported user namespaces and file capabilities are unchanged |
-| Tracing and mutable security policy | Joined task-policy boundary where required | Installation/TSYNC and signal/termination effects remain. Untraced continuous-worker custody entries finish pure ERRNO/unsupported TRACE/USER_NOTIF decisions before mm quiescence; accepted decisions travel once |
+| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
+| Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
+| Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
@@ -159,7 +159,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Area | Actual trigger / examples | Current scope and status | Authoritative implementation |
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold task projections now complete on source workers; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. The complete task and original-resource child builder are movable; pure lifecycle scopes claim nonblocking original task/mm/group custody on existing workers without VmReady/Service requests. Exec preparation/commit, nonleader identity replacement, failed-image recovery and detached old-mm retirement use original resources. Supported mixed mapping/lifecycle scopes now use the same source authority. Native image loading retains accepted resources on the original task and uses the existing disk pool; waiting releases task/mm permits and the CPU slot. Resident private-store namespace lookup/errors remain local. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
-| Signals and mutable security/task policy | Default termination, credentials/capabilities, affinity, seccomp installation/TSYNC and non-ALLOW actions | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. Signal-control seccomp ERRNO/unsupported TRACE/USER_NOTIF complete locally; TRAP/KILL and tracing retain their explicit task-policy boundary. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
+| Signals and mutable security/task policy | Supported signals, credentials/capabilities, affinity and seccomp installation/TSYNC/result effects are source-owned; explicit tracing and capability-less embeddings remain | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. ERRNO/unsupported TRACE/USER_NOTIF, TRAP and KILL use original source resources. Tracing retains its explicit boundary; accepted ALLOW calls can still encounter an excluded underlying resource. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. BPF administration retains its original owner boundary. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, legacy epoll creation admission, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
@@ -1734,3 +1734,76 @@ by this batch. Actual tracing/security controls, excluded resource graphs, nativ
 mapping imports, host administration and last-resort joined dispatch still need
 separate subsystem work. The earlier stage-56 Docker cleanup timeout remains
 unattributed; no fix is claimed here.
+
+
+## 59. Original seccomp policy, TSYNC and lifecycle consumers — 2026-11-07
+
+The entire supported policy subsystem uses the calling executor and original
+resources. Classic BPF is evaluated once per architectural entry; pure denial,
+TRAP with the original ARM64 frame, KILL_THREAD and KILL_PROCESS use existing
+signal/exit authority. Strict-mode violations terminate with SIGKILL; filter
+termination uses SIGSYS. Debug tracing retains its explicit joined path.
+
+Each task owns a stable policy allocation. Release publication selects an
+immutable boxed version; syscall entry acquires its pointer and only refreshes
+its cached chain when the version changes. Boxes remain allocated until all
+original-task consumers retire. Persistent chain tails keep storage linear in
+the Linux filter-path bound, and iterative release prevents a long inherited
+chain overflowing a host stack. This controlled raw-pointer access requires
+stable boxes, immutable payloads and a retained original Arc; it does not permit
+an old pointer to outlive its owner. It adds no ordinary guest-byte lock, check
+or memory barrier.
+
+TSYNC validates every live original group policy before publishing any change.
+Conflicts report the original thread's PID translated in the caller's namespace;
+exited/reused identities cannot redirect the update. The original group mutex
+serializes installation and final birth/exec publication, without borrowing peer
+Process bodies or stopping their CPUs. Source contention subscribes, retries
+admission and returns its execution slot. Accepted filter bytes and credentials
+survive cancellation and resume without guest-pointer rereads. No coordinator,
+resource thread or polling bus is added.
+
+`no_new_privs` is a monotonic original-task atomic shared by retained credential
+views; fork creates a distinct flag. Thread birth recopies policy and NNP under
+the same group transaction. Proc observes the original immutable policy directly,
+so an older image publication cannot overwrite a newer filter count. Accepted
+syscalls retain their old decision across policy publication, mapping admission
+and cancellation.
+
+Exec preparation retains original credentials and accepted executable metadata.
+If TSYNC enables NNP while image I/O is pending, final publication recomputes the
+image's credentials and UID/GID/secure auxiliary values under policy-group custody.
+It does not reopen the executable or reread guest arguments. The existing disk
+pool still loads images while no CPU slot or policy lock is held. Tests cover a
+prepared set-ID image, late TSYNC, changed file permissions and both retained and
+initial-stack auxv. New PID namespaces bind signal translations only after birth
+activates the namespace; otherwise queued old-TID references would be lost.
+
+Local validation includes 394 process cases (three ignored) on each host, the
+runtime CI checks with affected-only retries, Mac product and signed hardware
+tests, both iPad compile targets, and native Linux/HVF/interpreter fixtures at
+1/4/12 CPUs. A receiver-lifetime race in an existing custody test was fixed without
+weakening its wake assertion; passing unrelated suites were reused. Physical
+iPad, Firefox and Docker performance are not claimed for this batch.
+
+Five alternating unprofiled before/after pairs initially measured the following
+steady-entry medians (5,000 calls per thread):
+
+| CPUs / threads | Work | Stage 58 | Stage 59 candidate |
+| --- | --- | ---: | ---: |
+| 1 | Unfiltered / ALLOW / ERRNO | 6.609 / 6.674 / 5.988 ms | 6.666 / 6.739 / 6.023 ms |
+| 4 | Unfiltered / ALLOW / ERRNO | 6.127 / 6.464 / 932.887 ms | 6.301 / 6.246 / 6.124 ms |
+| 12 | Unfiltered / ALLOW / ERRNO | 12.675 / 14.782 / 5775.095 ms | 12.667 / 13.997 / 12.548 ms |
+
+The large ERRNO improvement removes repeated whole-cohort returns, not BPF work.
+Ordinary and ALLOW controls range approximately -5.3% to +2.8%, with single-CPU
+controls within 1%; these small differences are not a universal throughput claim.
+One-CPU/solo dispatch remains the existing direct caller strategy. Native macOS
+unfiltered and ARM64 Linux policy references, exact source/binary hashes, final
+checks and samples are retained in [stage 59 validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-seccomp-20261107.json).
+
+Remaining owner work includes explicit tracing, excluded descriptor/ancillary/
+ring resources, exceptional native imports, host/embedding administration and
+last-resort SVC/HLT/fault dispatch. Supported policy no longer supplies a reason
+for those dependencies; an ALLOW result does not make an excluded resource safe
+to run locally. The stage-56 Docker cleanup timeout remains unattributed.

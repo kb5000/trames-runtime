@@ -18,25 +18,259 @@ struct Instruction {
     value: u32,
 }
 struct Filter(Vec<Instruction>);
-#[derive(Default, Clone)]
+/// Original per-task policy. Readers retain this allocation and dereference an
+/// immutable published version; installing a filter never locks syscall entry.
+#[derive(Clone)]
 pub(crate) struct Seccomp {
-    strict: bool,
-    // Immutable across a CPU epoch. Cloning a process/worker snapshot is O(1);
-    // installation copies only the small chain of program handles after join.
-    filters: Arc<Vec<Arc<Filter>>>,
+    original: Arc<Policy>,
+    group: trames_shared::Custody<Vec<std::sync::Weak<Policy>>>,
+    captured: Option<(usize, Version)>,
+    entry_value: Option<u32>,
     #[cfg(all(test, trames_interpreter_conformance))]
     evaluations: Arc<std::sync::atomic::AtomicU64>,
 }
+struct Binding {
+    task: std::sync::Weak<trames_kernel::signal::IoTask>,
+    pid: std::sync::atomic::AtomicU32,
+}
+pub(super) struct Policy {
+    binding: std::sync::OnceLock<Binding>,
+    current: std::sync::atomic::AtomicPtr<Version>,
+    // Stable allocations are retained until the original task and all captured
+    // consumers retire. Filter chains share tails, so retained versions consume
+    // O(installed filters), not O(chain length squared). Successful installation
+    // is bounded by Linux's MAX_PATH; ordinary reads allocate nothing.
+    #[allow(clippy::vec_box)] // Stable addresses are the publication contract.
+    versions: std::sync::Mutex<Vec<Box<Version>>>,
+}
+impl trames_vfs::SeccompView for Policy {
+    fn seccomp(&self) -> (u32, usize) {
+        // SAFETY: same stable immutable publication contract as Seccomp::version.
+        let version = unsafe { &*self.current.load(std::sync::atomic::Ordering::Acquire) };
+        (
+            if version.strict {
+                1
+            } else if version.filters.is_some() {
+                2
+            } else {
+                0
+            },
+            version.filters.as_ref().map_or(0, |chain| chain.count),
+        )
+    }
+}
+#[derive(Default, Clone)]
+struct Version {
+    strict: bool,
+    filters: Option<Arc<Chain>>,
+}
+struct Chain {
+    filter: Arc<Filter>,
+    parent: Option<Arc<Chain>>,
+    count: usize,
+    path: usize,
+}
+impl Drop for Chain {
+    fn drop(&mut self) {
+        // A long inherited chain can have no intermediate version owners.
+        // Release its unique suffix iteratively rather than on the host stack.
+        let mut parent = self.parent.take();
+        while let Some(node) = parent {
+            match Arc::try_unwrap(node) {
+                Ok(mut node) => parent = node.parent.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+impl Default for Seccomp {
+    fn default() -> Self {
+        Self::from_version(Version::default())
+    }
+}
+impl Seccomp {
+    fn from_version(version: Version) -> Self {
+        let mut version = Box::new(version);
+        let current = std::sync::atomic::AtomicPtr::new(&mut *version);
+        let original = Arc::new(Policy {
+            binding: Default::default(),
+            current,
+            versions: std::sync::Mutex::new(vec![version]),
+        });
+        Self {
+            group: trames_shared::Custody::new(vec![Arc::downgrade(&original)]),
+            original,
+            captured: None,
+            entry_value: None,
+            #[cfg(all(test, trames_interpreter_conformance))]
+            evaluations: Arc::default(),
+        }
+    }
+    fn uncaptured(&self) -> Self {
+        let mut current = self.clone();
+        current.captured = None;
+        current.entry_value = None;
+        current
+    }
+    pub(super) fn bind(&self, task: &Arc<trames_kernel::signal::IoTask>, pid: u32) {
+        let binding = self.original.binding.get_or_init(|| Binding {
+            task: Arc::downgrade(task),
+            pid: std::sync::atomic::AtomicU32::new(pid),
+        });
+        binding.pid.store(pid, std::sync::atomic::Ordering::Relaxed);
+        self.publish_status(&task.proc_view);
+    }
+    /// Birth and filter synchronization serialize only original policy membership.
+    /// Call with parent group admission held; no task body is borrowed by TSYNC.
+    pub(super) fn inherit(
+        &mut self,
+        parent: &Self,
+        threaded: bool,
+        task: &Arc<trames_kernel::signal::IoTask>,
+        pid: u32,
+        child_privs: &trames_vfs::capabilities::NoNewPrivs,
+        parent_privs: &trames_vfs::capabilities::NoNewPrivs,
+    ) {
+        let mut members = parent.group.borrow_mut();
+        self.replace(&parent.uncaptured());
+        if parent_privs.get() {
+            child_privs.set();
+        }
+        self.bind(task, pid);
+        if threaded {
+            self.group = parent.group.clone();
+            members.retain(|p| p.strong_count() != 0);
+            members.push(Arc::downgrade(&self.original));
+        }
+    }
+    pub(super) fn birth_group(&self) -> trames_shared::Custody<Vec<std::sync::Weak<Policy>>> {
+        self.group.clone()
+    }
+    pub(super) fn admit_birth(
+        &self,
+        target: &std::sync::Weak<dyn trames_shared::IoWake>,
+        pid: u32,
+    ) -> Result<trames_shared::Admission<Vec<std::sync::Weak<Policy>>>, super::tasks::AdmissionWait>
+    {
+        if let Some(permit) = self.group.try_admit() {
+            return Ok(permit);
+        }
+        let signal = trames_shared::IoSignal::new(pid, target.clone());
+        let subscriptions = vec![self.group.subscribe(&signal)];
+        self.group.try_admit().ok_or(super::tasks::AdmissionWait {
+            signal,
+            subscriptions,
+        })
+    }
+    /// One immutable policy per architectural entry. Unchanged entries perform
+    /// one acquire load and no lock, allocation or filter-chain refcount update.
+    pub(crate) fn capture_entry(&mut self) {
+        self.entry_value = None;
+        let pointer = self
+            .original
+            .current
+            .load(std::sync::atomic::Ordering::Acquire);
+        if self
+            .captured
+            .as_ref()
+            .is_none_or(|(id, _)| *id != pointer as usize)
+        {
+            // SAFETY: same stable immutable allocation contract as version().
+            self.captured = Some((pointer as usize, unsafe { (&*pointer).clone() }));
+        }
+    }
+    pub(crate) fn begin_entry(&mut self, number: u32, pc: u64, args: [u64; 6]) {
+        self.capture_entry();
+        if self.mode() != 0 {
+            self.entry_value = Some(self.decide(self.version(), number, pc, args));
+        }
+    }
+    pub(crate) fn denied_entry(
+        &self,
+        number: u32,
+        pc: u64,
+        args: [u64; 6],
+    ) -> Option<EntryDecision> {
+        self.entry_value
+            .filter(|value| value & 0xffff_0000 != ALLOW)
+            .map(|_| self.entry_decision(number, pc, args))
+    }
+    fn version(&self) -> &Version {
+        if let Some((_, version)) = &self.captured {
+            return version;
+        }
+        // SAFETY: publication points only to an immutable Box in versions.
+        // Boxes never move or retire while this original Arc is alive. Acquire
+        // pairs with the install release; this is policy publication, not a
+        // guest-byte barrier or a lock around a native/syscall body.
+        unsafe {
+            &*self
+                .original
+                .current
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+    fn publish(&self, change: impl FnOnce(&Version) -> Version) {
+        let mut versions = self.original.versions.lock().unwrap();
+        let mut next = Box::new(change(versions.last().unwrap()));
+        let pointer = &mut *next as *mut Version;
+        versions.push(next);
+        self.original
+            .current
+            .store(pointer, std::sync::atomic::Ordering::Release);
+    }
+    pub(super) fn fork(&self) -> Self {
+        let child = Self::from_version(self.version().clone());
+        #[cfg(all(test, trames_interpreter_conformance))]
+        let child = Self {
+            evaluations: self.evaluations.clone(),
+            ..child
+        };
+        child
+    }
+    fn replace(&self, other: &Self) {
+        let version = other.version().clone();
+        self.publish(|_| version);
+    }
+    fn set_strict(&mut self) {
+        self.captured = None;
+        self.entry_value = None;
+        self.publish(|old| Version {
+            strict: true,
+            filters: old.filters.clone(),
+        });
+    }
+    fn path(&self) -> usize {
+        self.version()
+            .filters
+            .as_ref()
+            .map_or(0, |chain| chain.path)
+    }
+}
 /// A single immutable BPF result, bound to its exact architectural entry and
-/// filter chain. A deferred denial must not rerun BPF or apply actions locally.
+/// original policy. Accepted calls retain this decision across later installations.
 pub(crate) struct EntryDecision {
-    policy: Seccomp,
+    policy: Arc<Policy>,
     number: u32,
     pc: u64,
     args: [u64; 6],
     value: u32,
+    strict: bool,
 }
 impl EntryDecision {
+    pub(crate) fn fatal_signal(&self) -> i32 {
+        if self.strict {
+            9
+        } else {
+            31
+        }
+    }
+    pub(crate) fn action(&self) -> u32 {
+        self.value & 0xffff_0000
+    }
+    pub(crate) fn data(&self) -> u32 {
+        self.value & 0xffff
+    }
     pub(crate) fn allowed(&self) -> bool {
         self.value & 0xffff_0000 == ALLOW
     }
@@ -52,46 +286,67 @@ impl EntryDecision {
         (self.number == number
             && self.pc == pc
             && self.args == args
-            && self.policy.strict == policy.strict
-            && Arc::ptr_eq(&self.policy.filters, &policy.filters))
+            && Arc::ptr_eq(&self.policy, &policy.original))
         .then_some(self.value)
     }
 }
 impl Seccomp {
     fn push(&mut self, filter: Arc<Filter>) {
-        Arc::make_mut(&mut self.filters).push(filter);
+        self.captured = None;
+        self.entry_value = None;
+        self.publish(|old| Version {
+            strict: old.strict,
+            filters: Some(Arc::new(Chain {
+                count: old.filters.as_ref().map_or(0, |chain| chain.count) + 1,
+                path: old.filters.as_ref().map_or(0, |chain| chain.path) + filter.0.len() + 4,
+                parent: old.filters.clone(),
+                filter,
+            })),
+        });
     }
     pub fn allows(&self, number: u32, pc: u64, args: [u64; 6]) -> bool {
         self.decision(number, pc, args) & 0xffff_0000 == ALLOW
     }
     pub fn mode(&self) -> u32 {
-        if self.strict {
+        let version = self.version();
+        if version.strict {
             1
-        } else if self.filters.is_empty() {
+        } else if version.filters.is_none() {
             0
         } else {
             2
         }
     }
     pub fn count(&self) -> usize {
-        self.filters.len()
+        self.version()
+            .filters
+            .as_ref()
+            .map_or(0, |chain| chain.count)
     }
     fn ancestor_of(&self, other: &Self) -> bool {
-        !self.strict
-            && self.filters.len() <= other.filters.len()
-            && self
-                .filters
-                .iter()
-                .zip(other.filters.iter())
-                .all(|(a, b)| Arc::ptr_eq(a, b))
+        let ancestor = self.version();
+        if ancestor.strict {
+            return false;
+        }
+        let mut node = other.version().filters.as_ref();
+        let count = ancestor.filters.as_ref().map_or(0, |chain| chain.count);
+        while node.is_some_and(|chain| chain.count > count) {
+            node = node.unwrap().parent.as_ref();
+        }
+        match (&ancestor.filters, node) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
     pub(crate) fn entry_decision(&self, number: u32, pc: u64, args: [u64; 6]) -> EntryDecision {
         EntryDecision {
-            policy: self.clone(),
+            policy: self.original.clone(),
             number,
             pc,
             args,
             value: self.decision(number, pc, args),
+            strict: self.version().strict,
         }
     }
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -99,17 +354,23 @@ impl Seccomp {
         self.evaluations.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn decision(&self, number: u32, pc: u64, args: [u64; 6]) -> u32 {
+        // capture_entry owns the architectural entry. Internal helpers reuse
+        // its decision; a parked operation carries its accepted token separately.
+        self.entry_value
+            .unwrap_or_else(|| self.decide(self.version(), number, pc, args))
+    }
+    fn decide(&self, version: &Version, number: u32, pc: u64, args: [u64; 6]) -> u32 {
         #[cfg(all(test, trames_interpreter_conformance))]
         self.evaluations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.strict {
+        if version.strict {
             return if matches!(number, 63 | 64 | 93 | 139) {
                 ALLOW
             } else {
                 0
             };
         }
-        if self.filters.is_empty() {
+        if version.filters.is_none() {
             return ALLOW;
         }
         let mut input = [0u32; 16];
@@ -121,18 +382,232 @@ impl Seccomp {
             input[4 + i * 2] = a as u32;
             input[5 + i * 2] = (a >> 32) as u32;
         }
-        self.filters.iter().rev().fold(ALLOW, |old, filter| {
-            let new = filter.run(&input);
-            if ((new & 0xffff_0000) as i32) < ((old & 0xffff_0000) as i32) {
-                new
-            } else {
-                old
+        let mut decision = ALLOW;
+        let mut chain = version.filters.as_ref();
+        while let Some(node) = chain {
+            let new = node.filter.run(&input);
+            if ((new & 0xffff_0000) as i32) < ((decision & 0xffff_0000) as i32) {
+                decision = new;
             }
-        })
+            chain = node.parent.as_ref();
+        }
+        decision
+    }
+}
+/// All supported policy controls run on the calling executor.
+pub(crate) fn local_entry(number: u32, a: [u64; 6]) -> bool {
+    number == 277 || number == 167 && matches!(a[0], 21 | 22)
+}
+pub(crate) enum Attempt {
+    Complete(Result<u64, Errno>),
+    Waiting(Box<Install>),
+}
+enum Change {
+    Strict,
+    Filter {
+        filter: Arc<Filter>,
+        sync: bool,
+        no_new_privs: bool,
+    },
+}
+/// Guest bytes and caller authority are accepted once before waiting. A retry
+/// never reads an overwritten fprog, re-evaluates BPF or resolves a reused PID.
+pub(crate) struct Install {
+    policy: Seccomp,
+    change: Change,
+    namespace: trames_vfs::PidNamespace,
+}
+impl Install {
+    pub(crate) fn ready(&self) -> bool {
+        self.policy.group.available()
+    }
+    pub(crate) fn subscribe(
+        &self,
+        signal: &Arc<trames_vfs::IoSignal>,
+    ) -> trames_vfs::IoSubscription {
+        self.policy.group.subscribe(signal)
+    }
+    pub(crate) fn run(mut self) -> Attempt {
+        let Some(permit) = self.policy.group.try_admit() else {
+            return Attempt::Waiting(Box::new(self));
+        };
+        let result = self.commit(&mut permit.write());
+        Attempt::Complete(result)
+    }
+    fn commit(&mut self, members: &mut Vec<std::sync::Weak<Policy>>) -> Result<u64, Errno> {
+        match &self.change {
+            Change::Strict => {
+                if self.policy.mode() != 0 {
+                    return Err(Errno(22));
+                }
+                self.policy.set_strict();
+            }
+            Change::Filter {
+                filter,
+                sync,
+                no_new_privs,
+            } => {
+                if self.policy.version().strict {
+                    return Err(Errno(22));
+                }
+                if self.policy.path() + filter.0.len() > MAX_PATH {
+                    return Err(Errno(12));
+                }
+                let mut peers = Vec::new();
+                if *sync {
+                    members.retain(|p| p.strong_count() != 0);
+                    for original in members.iter().filter_map(std::sync::Weak::upgrade) {
+                        if Arc::ptr_eq(&original, &self.policy.original) {
+                            continue;
+                        }
+                        let Some(binding) = original.binding.get() else {
+                            continue;
+                        };
+                        let Some(task) = binding.task.upgrade().filter(|t| t.live()) else {
+                            continue;
+                        };
+                        let mut peer = self.policy.uncaptured();
+                        peer.original = original.clone();
+                        if !peer.ancestor_of(&self.policy) {
+                            return Ok(self
+                                .namespace
+                                .local(binding.pid.load(std::sync::atomic::Ordering::Relaxed))
+                                as u64);
+                        }
+                        peers.push((peer, task));
+                    }
+                }
+                self.policy.push(filter.clone());
+                for (peer, task) in peers {
+                    // Publish the monotonic flag before the filter release so
+                    // a task observing the new policy also observes its NNP.
+                    if *no_new_privs {
+                        task.credentials().read().caps.no_new_privs.set();
+                    }
+                    peer.replace(&self.policy);
+                    peer.publish_status(&task.proc_view);
+                }
+            }
+        }
+        if let Some(task) = self
+            .policy
+            .original
+            .binding
+            .get()
+            .and_then(|b| b.task.upgrade())
+        {
+            self.policy.publish_status(&task.proc_view);
+        }
+        Ok(0)
+    }
+}
+impl Seccomp {
+    fn prepare(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl trames_memory::CpuMemory,
+        credentials: &trames_vfs::Credentials,
+        namespace: trames_vfs::PidNamespace,
+    ) -> Result<Result<u64, Install>, Errno> {
+        let policy = self.uncaptured();
+        let a = if number == 167 {
+            match a[0] {
+                21 => return Ok(Ok(policy.mode() as u64)),
+                22 => match a[1] {
+                    1 => [0; 6],
+                    2 => [1, 0, a[2], 0, 0, 0],
+                    _ => return Err(Errno(22)),
+                },
+                _ => return Err(Errno(22)),
+            }
+        } else {
+            a
+        };
+        let change = match a[0] {
+            0 => {
+                if a[1] != 0 || a[2] != 0 {
+                    return Err(Errno(22));
+                }
+                Change::Strict
+            }
+            1 => {
+                if a[1] & !1 != 0 || policy.version().strict {
+                    return Err(Errno(22));
+                }
+                let no_new_privs = credentials.caps.no_new_privs.get();
+                if !no_new_privs && !credentials.has_cap(capabilities::SYS_ADMIN) {
+                    return Err(Errno(13));
+                }
+                Change::Filter {
+                    filter: Arc::new(Filter::load(memory, a[2])?),
+                    sync: a[1] & 1 != 0,
+                    no_new_privs,
+                }
+            }
+            2 => {
+                if a[1] != 0 {
+                    return Err(Errno(22));
+                }
+                Linux::check(memory, a[2], 4, Access::Read)?;
+                let action = u32::from_le_bytes(memory.read_array(a[2]).map_err(|_| Errno(14))?);
+                return if matches!(
+                    action,
+                    0 | KILL_PROCESS | 0x0003_0000 | 0x0005_0000 | 0x7ff0_0000 | ALLOW
+                ) {
+                    Ok(Ok(0))
+                } else {
+                    Err(Errno(95))
+                };
+            }
+            _ => return Err(Errno(22)),
+        };
+        Ok(Err(Install {
+            policy,
+            change,
+            namespace,
+        }))
+    }
+    pub(crate) fn start(
+        &self,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl trames_memory::CpuMemory,
+        credentials: &trames_vfs::Credentials,
+        namespace: trames_vfs::PidNamespace,
+    ) -> Attempt {
+        match self.prepare(number, a, memory, credentials, namespace) {
+            Ok(Err(install)) => install.run(),
+            Ok(Ok(value)) => Attempt::Complete(Ok(value)),
+            Err(e) => Attempt::Complete(Err(e)),
+        }
+    }
+    // Explicit joined/debug embedding path uses the same resource implementation.
+    pub(crate) fn local_call(
+        &mut self,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl trames_memory::CpuMemory,
+        credentials: &trames_vfs::Credentials,
+        namespace: trames_vfs::PidNamespace,
+    ) -> Result<u64, Errno> {
+        match self.prepare(number, a, memory, credentials, namespace)? {
+            Ok(value) => Ok(value),
+            Err(mut install) => {
+                let group = install.policy.group.clone();
+                let result = install.commit(&mut group.borrow_mut());
+                self.captured = None;
+                self.entry_value = None;
+                result
+            }
+        }
+    }
+    pub(crate) fn publish_status(&self, view: &trames_vfs::ProcessView) {
+        view.bind_seccomp(self.original.clone());
     }
 }
 impl Filter {
-    fn load(memory: &Memory, address: u64) -> Result<Self, Errno> {
+    fn load(memory: &impl trames_memory::CpuMemory, address: u64) -> Result<Self, Errno> {
         Linux::check(memory, address, 16, Access::Read)?;
         let mut header = [0; 16];
         memory.read(address, &mut header).map_err(|_| Errno(14))?;
@@ -273,75 +748,13 @@ impl Filter {
 }
 impl<C: Cpu> Kernel<C> {
     pub(super) fn seccomp(&mut self, p: &mut Process<C>, a: [u64; 6]) -> Result<u64, Errno> {
-        match a[0] {
-            0 => {
-                if a[1] != 0 || a[2] != 0 || p.seccomp.mode() != 0 {
-                    return Err(Errno(22));
-                }
-                p.seccomp.strict = true;
-                Ok(0)
-            }
-            1 => {
-                // TSYNC supported. Other installation modes fail explicitly;
-                // in particular no fake notification listener FD is returned.
-                if a[1] & !1 != 0 || p.seccomp.strict {
-                    return Err(Errno(22));
-                }
-                if !p.linux.vfs.credentials.caps.no_new_privs
-                    && !p.linux.vfs.credentials.has_cap(capabilities::SYS_ADMIN)
-                {
-                    return Err(Errno(13));
-                }
-                let filter = Arc::new(Filter::load(&p.memory, a[2])?);
-                if p.seccomp
-                    .filters
-                    .iter()
-                    .map(|f| f.0.len() + 4)
-                    .sum::<usize>()
-                    + filter.0.len()
-                    > MAX_PATH
-                {
-                    return Err(Errno(12));
-                }
-                if a[1] & 1 != 0 {
-                    if let Some((id, _)) = self.processes.iter().find(|(_, t)| {
-                        t.tgid == p.tgid
-                            && !matches!(t.state, State::Zombie(_))
-                            && !t.seccomp.ancestor_of(&p.seccomp)
-                    }) {
-                        return Ok(p.linux.vfs.visible_pid(id) as u64);
-                    }
-                }
-                p.seccomp.push(filter);
-                if a[1] & 1 != 0 {
-                    for mut t in self
-                        .processes
-                        .values_mut()
-                        .filter(|t| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_)))
-                    {
-                        t.seccomp = p.seccomp.clone();
-                        t.linux.vfs.credentials.caps.no_new_privs |=
-                            p.linux.vfs.credentials.caps.no_new_privs;
-                    }
-                }
-                Ok(0)
-            }
-            2 => {
-                if a[1] != 0 {
-                    return Err(Errno(22));
-                }
-                let action = read_u32(&p.memory, a[2])?;
-                if matches!(
-                    action,
-                    0 | KILL_PROCESS | 0x0003_0000 | 0x0005_0000 | 0x7ff0_0000 | ALLOW
-                ) {
-                    Ok(0)
-                } else {
-                    Err(Errno(95))
-                }
-            }
-            _ => Err(Errno(22)),
-        }
+        p.seccomp.local_call(
+            277,
+            a,
+            &p.memory,
+            &p.linux.vfs.credentials,
+            p.linux.vfs.pid_namespace().clone(),
+        )
     }
     /// True means the syscall was consumed without executing its implementation.
     pub(super) fn filter_syscall(
@@ -394,7 +807,10 @@ impl<C: Cpu> Kernel<C> {
                     self.exit(pid, p, 31);
                 }
             }
-            0 => self.exit_one(pid, p, 31),
+            0 => {
+                let signal = if p.seccomp.version().strict { 9 } else { 31 };
+                self.exit_one(pid, p, signal);
+            }
             _ => self.exit(pid, p, 31), // Unknown actions fail closed, as Linux does.
         }
         true
@@ -403,6 +819,772 @@ impl<C: Cpu> Kernel<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    fn program(memory: &mut Memory, decision: u32) {
+        memory.write_array(0x1800, 4u16.to_le_bytes()).unwrap();
+        memory.write_array(0x1808, 0x1900u64.to_le_bytes()).unwrap();
+        for (n, i) in [
+            i(0x20, 0, 0, 0),
+            i(0x15, 0, 1, 172),
+            i(6, 0, 0, decision),
+            i(6, 0, 0, ALLOW),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut bytes = [0; 8];
+            bytes[..2].copy_from_slice(&i.code.to_le_bytes());
+            bytes[2] = i.yes;
+            bytes[3] = i.no;
+            bytes[4..].copy_from_slice(&i.value.to_le_bytes());
+            memory.write_array(0x1900 + n as u64 * 8, bytes).unwrap();
+        }
+    }
+    fn join(parent: &Process<Cpu>, child: &mut Process<Cpu>, id: u32) {
+        child.tgid = parent.tgid;
+        child.signals.io.share_process(&parent.signals.io);
+        child.bind_signals();
+        child.seccomp.inherit(
+            &parent.seccomp,
+            true,
+            &child.signals.io,
+            id,
+            &child.linux.vfs.credentials.caps.no_new_privs,
+            &parent.linux.vfs.credentials.caps.no_new_privs,
+        );
+    }
+    #[test]
+    fn source_tsync_updates_running_peers_and_privilege_views_without_join() {
+        use super::super::tests::{kernel, process};
+        for slots in [1, 2, 4] {
+            let mut p = process();
+            program(&mut p.memory, 0x5002a);
+            let mut peer = p.fork();
+            join(&p, &mut peer, 2);
+            let credentials = peer.linux.vfs.credentials.clone();
+            let paths = peer.linux.vfs.clone();
+            let mut foreign = p.fork();
+            foreign.tgid = 3;
+            p.linux.vfs.credentials.caps.no_new_privs.set();
+            p.bind_signals();
+            p.cpu.set_x(8, 277);
+            put_args(&mut p.cpu, [1, 1, 0x1800, 0, 0, 0]);
+            for (n, w) in [0xd4000001u32, 0xaa0003f9, 0x14000000].iter().enumerate() {
+                p.memory
+                    .write_array(0x4000 + n as u64 * 4, w.to_le_bytes())
+                    .unwrap();
+            }
+            // Repeated getpid, GET_NO_NEW_PRIVS, GET_SECCOMP on the same live CPU.
+            let code = [
+                0xd2801588u32,
+                0xd4000001,
+                0xaa0003f5,
+                0xd28004e0,
+                0xd2800001,
+                0xd2800002,
+                0xd2800003,
+                0xd2800004,
+                0xd28014e8,
+                0xd4000001,
+                0xaa0003f6,
+                0xd28002a0,
+                0xd4000001,
+                0xaa0003f7,
+                0x17fffff2,
+            ];
+            for (n, w) in code.iter().enumerate() {
+                peer.memory
+                    .write_array(0x4000 + n as u64 * 4, w.to_le_bytes())
+                    .unwrap();
+            }
+            foreign
+                .memory
+                .write_array(0x4000, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            for task in [&mut p, &mut peer, &mut foreign] {
+                task.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                task.signals.io.scheduling.set_affinity((1 << slots) - 1);
+            }
+            let mut k = kernel();
+            k.cpu_count = slots.max(2);
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; slots.max(2)];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            k.processes.insert(3, foreign);
+            for _ in 0..4 {
+                assert!(k
+                    .parallel_epoch(
+                        &mut trames_linux::CapturedOutput::default(),
+                        k.instructions + 100_000,
+                        true
+                    )
+                    .unwrap());
+                if k.processes.read(&2).cpu.x(21) == (-42i64) as u64 {
+                    break;
+                }
+            }
+            let p = k.processes.read(&1);
+            let peer = k.processes.read(&2);
+            assert_eq!(p.cpu.x(25), 0);
+            assert_eq!(
+                (peer.cpu.x(21), peer.cpu.x(22), peer.cpu.x(23)),
+                ((-42i64) as u64, 1, 2)
+            );
+            assert_eq!(peer.seccomp.count(), 1);
+            assert!(credentials.caps.no_new_privs.get());
+            assert!(paths.credentials.caps.no_new_privs.get());
+            assert!(!k
+                .processes
+                .read(&3)
+                .linux
+                .vfs
+                .credentials
+                .caps
+                .no_new_privs
+                .get());
+            assert_eq!(k.processes.read(&3).seccomp.mode(), 0);
+            assert_eq!(k.service_requests, 0);
+            assert!(
+                k.cohort_return_syscalls.is_empty(),
+                "{:?}",
+                k.cohort_return_syscalls
+            );
+            // Publishing an older image cannot overwrite the live policy view.
+            let mut stale = peer.info(
+                2,
+                k.started,
+                k.memory_limits,
+                0,
+                trames_vfs::ProcRefresh::Metadata,
+                Vec::new(),
+            );
+            stale.seccomp = 0;
+            stale.seccomp_filters = 0;
+            peer.signals
+                .io
+                .proc_view
+                .publish(&stale, peer.linux.vfs.proc_resources());
+            let info = peer
+                .signals
+                .io
+                .proc_view
+                .observe(trames_vfs::ProcRefresh::Metadata)
+                .unwrap();
+            assert_eq!((info.seccomp, info.seccomp_filters), (2, 1));
+        }
+    }
+    #[test]
+    fn tsync_conflicting_peer_is_all_or_nothing_and_dead_peer_is_excluded() {
+        let mut p = super::super::tests::process();
+        program(&mut p.memory, 0x5002a);
+        p.seccomp.bind(&p.signals.io, 1);
+        let mut first = p.fork();
+        join(&p, &mut first, 2);
+        let mut conflict = p.fork();
+        join(&p, &mut conflict, 3);
+        conflict
+            .seccomp
+            .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+        p.linux.vfs.credentials.caps.no_new_privs.set();
+        let call = |p: &mut Process<Cpu>| {
+            p.seccomp.local_call(
+                277,
+                [1, 1, 0x1800, 0, 0, 0],
+                &p.memory,
+                &p.linux.vfs.credentials,
+                p.linux.vfs.pid_namespace().clone(),
+            )
+        };
+        assert_eq!(call(&mut p), Ok(3));
+        assert_eq!(
+            (
+                p.seccomp.mode(),
+                first.seccomp.mode(),
+                conflict.seccomp.count()
+            ),
+            (0, 0, 1)
+        );
+        assert!(!first.linux.vfs.credentials.caps.no_new_privs.get());
+        conflict.signals.io.exit();
+        assert_eq!(call(&mut p), Ok(0));
+        assert_eq!(
+            (
+                p.seccomp.count(),
+                first.seccomp.count(),
+                conflict.seccomp.count()
+            ),
+            (1, 1, 1)
+        );
+        assert!(first.linux.vfs.credentials.caps.no_new_privs.get());
+        assert!(!first.seccomp.allows(172, 0, [0; 6]));
+        assert!(conflict.seccomp.allows(172, 0, [0; 6]));
+    }
+    #[test]
+    fn parked_install_keeps_guest_bytes_and_original_group_across_cancellation() {
+        let mut p = super::super::tests::process();
+        program(&mut p.memory, 0x5002a);
+        p.seccomp.bind(&p.signals.io, 1);
+        let mut peer = p.fork();
+        join(&p, &mut peer, 2);
+        let group = p.seccomp.birth_group();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let _guard = group.borrow_mut();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let Attempt::Waiting(work) = p.seccomp.start(
+            277,
+            [1, 1, 0x1800, 0, 0, 0],
+            &p.memory,
+            &p.linux.vfs.credentials,
+            p.linux.vfs.pid_namespace().clone(),
+        ) else {
+            panic!("must park")
+        };
+        let wait = crate::run_queue::PolicyWait::new(*work);
+        let wake =
+            trames_shared::IoSignal::new(1, std::sync::Weak::<crate::run_queue::Epoch<Cpu>>::new());
+        wait.bind(&wake);
+        assert!(!wait.ready());
+        // Guest overwrites the accepted program while the executor is released.
+        program(&mut p.memory, KILL_PROCESS);
+        release_tx.send(()).unwrap();
+        locker.join().unwrap();
+        assert!(wake.ready());
+        assert!(wait.ready());
+        // A joined/cancelled epoch consumes the same accepted object once.
+        assert_eq!(wait.run(), Some(Ok(0)));
+        assert_eq!(wait.run(), None);
+        assert_eq!(p.seccomp.decision(172, 0, [0; 6]), 0x5002a);
+        assert_eq!(peer.seccomp.decision(172, 0, [0; 6]), 0x5002a);
+    }
+    #[test]
+    fn policy_contention_releases_the_only_slot_and_resumes_after_epoch_cancellation() {
+        use super::super::tests::{kernel, process};
+        let mut p = process();
+        program(&mut p.memory, 0x5002a);
+        for (n, w) in [0xd4000001u32, 0xaa0003f9, 0x14000000].iter().enumerate() {
+            p.memory
+                .write_array(0x4000 + n as u64 * 4, w.to_le_bytes())
+                .unwrap();
+        }
+        p.memory
+            .write_array(0x4f00, 0xd28009bcu32.to_le_bytes())
+            .unwrap();
+        p.memory
+            .write_array(0x4f04, 0x14000000u32.to_le_bytes())
+            .unwrap();
+        p.memory
+            .protect(
+                0x4000,
+                trames_memory::PAGE_SIZE,
+                trames_memory::Permissions::RX,
+            )
+            .unwrap();
+        p.cpu.set_x(8, 277);
+        put_args(&mut p.cpu, [1, 1, 0x1800, 0, 0, 0]);
+        p.signals.io.scheduling.set_affinity(1);
+        let mut peer = p.fork();
+        peer.tgid = 2;
+        peer.cpu = Cpu::new(0x4f00, 0x9000);
+        let group = p.seccomp.birth_group();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let _guard = group.borrow_mut();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut k = kernel();
+        k.cpu_count = 2;
+        k.workers = crate::workers::Pool::new(1);
+        k.per_cpu = vec![Duration::ZERO; 2];
+        k.processes.insert(1, p);
+        k.processes.insert(2, peer);
+        assert!(k
+            .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+            .unwrap());
+        assert!(matches!(k.processes.read(&1).state, State::Policy(_)));
+        assert_eq!(k.processes.read(&2).cpu.x(28), 77);
+        assert_eq!(k.worker_syscalls, 1);
+        {
+            let mut p = k.processes.get_mut(&1).unwrap();
+            program(&mut p.memory, KILL_PROCESS);
+        }
+        release_tx.send(()).unwrap();
+        locker.join().unwrap();
+        assert!(k
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                k.instructions + 100_000,
+                true
+            )
+            .unwrap());
+        let p = k.processes.read(&1);
+        assert_eq!(p.cpu.x(25), 0);
+        assert_eq!(p.seccomp.decision(172, 0, [0; 6]), 0x5002a);
+        assert_eq!(k.syscalls, 1);
+        assert_eq!(k.service_requests, 0);
+        assert!(k.cohort_return_syscalls.is_empty());
+    }
+    #[test]
+    fn birth_recopies_synchronized_policy_and_keeps_nonthread_privileges_independent() {
+        let mut k = super::super::tests::kernel();
+        let mut p = super::super::tests::admitted_process(&k);
+        k.publish_task(1, &p);
+        program(&mut p.memory, 0x5002a);
+        let mut before = p.fork();
+        p.linux.vfs.credentials.caps.no_new_privs.set();
+        assert_eq!(k.seccomp(&mut p, [1, 1, 0x1800, 0, 0, 0]), Ok(0));
+        assert_eq!(before.seccomp.mode(), 0);
+        join(&p, &mut before, 99);
+        assert_eq!(before.seccomp.count(), 1);
+        assert!(before.linux.vfs.credentials.caps.no_new_privs.get());
+        let birth = super::super::birth::Birth::capture(&k);
+        let threaded = birth
+            .clone_task(1, &mut p, [0x100 | 0x800 | 0x10000, 0x8000, 0, 0, 0, 0])
+            .unwrap();
+        let child = birth
+            .clone_task(1, &mut p, [17, 0x8000, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(threaded.process.seccomp.count(), 1);
+        assert_eq!(child.process.seccomp.count(), 1);
+        program(&mut p.memory, 0x5000d);
+        assert_eq!(k.seccomp(&mut p, [1, 1, 0x1800, 0, 0, 0]), Ok(0));
+        assert_eq!(threaded.process.seccomp.decision(172, 0, [0; 6]), 0x5000d);
+        assert_eq!(child.process.seccomp.decision(172, 0, [0; 6]), 0x5002a);
+    }
+    #[test]
+    fn tsync_conflict_reports_the_original_tid_in_the_callers_pid_namespace() {
+        let mut k = super::super::tests::kernel();
+        let mut root = super::super::tests::process();
+        let mut output = trames_linux::CapturedOutput::default();
+        k.syscall(
+            1,
+            &mut root,
+            220,
+            [trames_vfs::CLONE_NEWPID | 17, 0, 0, 0, 0, 0],
+            &mut output,
+        )
+        .unwrap();
+        k.processes.insert(1, root);
+        let mut init = k.processes.remove(&2).unwrap();
+        k.syscall(2, &mut init, 220, [0x10f00, 0, 0, 0, 0, 0], &mut output)
+            .unwrap();
+        k.processes
+            .get_mut(&3)
+            .unwrap()
+            .seccomp
+            .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+        program(&mut init.memory, 0x5002a);
+        assert_eq!(init.linux.vfs.visible_pid(3), 2);
+        assert_eq!(k.seccomp(&mut init, [1, 1, 0x1800, 0, 0, 0]), Ok(2));
+        assert_eq!(init.seccomp.count(), 0);
+        assert_eq!(k.processes.read(&3).seccomp.count(), 1);
+    }
+    #[test]
+    fn concurrent_tsync_installers_append_to_the_same_original_chain_without_lost_updates() {
+        let mut p = super::super::tests::process();
+        program(&mut p.memory, 0x5002a);
+        p.seccomp.bind(&p.signals.io, 1);
+        let mut peer = p.fork();
+        join(&p, &mut peer, 2);
+        let policy = p.seccomp.clone();
+        let other = peer.seccomp.clone();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for mut task in [p, peer] {
+            let gate = gate.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..64 {
+                    gate.wait();
+                    assert_eq!(
+                        task.seccomp.local_call(
+                            277,
+                            [1, 1, 0x1800, 0, 0, 0],
+                            &task.memory,
+                            &task.linux.vfs.credentials,
+                            task.linux.vfs.pid_namespace().clone()
+                        ),
+                        Ok(0)
+                    );
+                }
+                task
+            }));
+        }
+        let tasks: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!((policy.count(), other.count()), (128, 128));
+        assert!(policy.ancestor_of(&other) && other.ancestor_of(&policy));
+        assert_eq!(policy.decision(172, 0, [0; 6]), 0x5002a);
+        drop(tasks);
+    }
+    #[test]
+    fn source_local_installation_refreshes_policy_and_proc_without_owner_returns() {
+        use super::super::tests::{kernel, process};
+        for slots in [1, 2] {
+            for prctl in [false, true] {
+                let mut p = process();
+                let words = [
+                    i(0x20, 0, 0, 0),
+                    i(0x15, 0, 1, 172),
+                    i(6, 0, 0, 0x5000d),
+                    i(6, 0, 0, ALLOW),
+                ];
+                p.memory.write_array(0x1800, 4u16.to_le_bytes()).unwrap();
+                p.memory
+                    .write_array(0x1808, 0x1900u64.to_le_bytes())
+                    .unwrap();
+                for (n, i) in words.iter().enumerate() {
+                    let mut bytes = [0; 8];
+                    bytes[..2].copy_from_slice(&i.code.to_le_bytes());
+                    bytes[2] = i.yes;
+                    bytes[3] = i.no;
+                    bytes[4..].copy_from_slice(&i.value.to_le_bytes());
+                    p.memory.write_array(0x1900 + n as u64 * 8, bytes).unwrap();
+                }
+                p.memory.write_array(0x1a00, ALLOW.to_le_bytes()).unwrap();
+                let mut calls = vec![(167, [21, 0, 0, 0, 0, 0], 0), (167, [38, 1, 0, 0, 0, 0], 0)];
+                calls.push(if prctl {
+                    (167, [22, 2, 0x1800, 0, 0, 0], 0)
+                } else {
+                    (277, [1, 0, 0x1800, 0, 0, 0], 0)
+                });
+                calls.extend([
+                    (172, [0; 6], (-13i64) as u64),
+                    (167, [21, 0, 0, 0, 0, 0], 2),
+                    (277, [2, 0, 0x1a00, 0, 0, 0], 0),
+                    (277, [1, 2, 0x1800, 0, 0, 0], (-22i64) as u64),
+                    (277, [1, 0, 0, 0, 0, 0], (-14i64) as u64),
+                    (277, [0; 6], (-22i64) as u64),
+                ]);
+                let mov = |r: u32, value: u64| {
+                    [0xd2800000, 0xf2a00000, 0xf2c00000, 0xf2e00000]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, op)| op | (((value >> (16 * i)) as u32 & 0xffff) << 5) | r)
+                        .collect::<Vec<_>>()
+                };
+                let mut code = mov(20, 0x1000);
+                for (index, (number, args, _)) in calls.iter().enumerate() {
+                    for (r, arg) in args.iter().enumerate() {
+                        code.extend(mov(r as u32, *arg));
+                    }
+                    code.extend(mov(8, *number));
+                    code.extend([0xd4000001, 0xf9000000 | ((index as u32) << 10) | (20 << 5)]);
+                }
+                code.extend(mov(28, 1));
+                code.push(0x14000000);
+                for (n, word) in code.iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + n as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .write_array(0x4f00, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                let mut peer = p.fork();
+                peer.tgid = 2;
+                peer.family.set_parent(1);
+                peer.cpu = Cpu::new(0x4f00, 0x9000);
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(slots);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                p.signals.io.proc_view.publish(
+                    &p.info(
+                        1,
+                        k.started,
+                        k.memory_limits,
+                        0,
+                        trames_vfs::ProcRefresh::Metadata,
+                        Vec::new(),
+                    ),
+                    p.linux.vfs.proc_resources(),
+                );
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                for _ in 0..16 {
+                    assert!(k
+                        .parallel_epoch(
+                            &mut trames_linux::CapturedOutput::default(),
+                            k.instructions + 100_000,
+                            true
+                        )
+                        .unwrap());
+                    if k.processes.read(&1).cpu.x(28) == 1 {
+                        break;
+                    }
+                }
+                let p = k.processes.read(&1);
+                assert_eq!(p.cpu.x(28), 1);
+                for (index, (_, _, expected)) in calls.iter().enumerate() {
+                    assert_eq!(
+                        p.memory.read_u64(0x1000 + index as u64 * 8).unwrap(),
+                        *expected,
+                        "call={index} slots={slots} prctl={prctl}"
+                    );
+                }
+                assert_eq!(p.seccomp.count(), 1);
+                assert_eq!(k.processes.read(&2).seccomp.mode(), 0);
+                let info = p
+                    .signals
+                    .io
+                    .proc_view
+                    .observe(trames_vfs::ProcRefresh::Metadata)
+                    .unwrap();
+                assert_eq!((info.seccomp, info.seccomp_filters), (2, 1));
+                assert_eq!(k.syscalls, calls.len() as u64);
+                assert_eq!(k.syscalls, k.worker_syscalls);
+                assert_eq!(k.service_requests, 0);
+                assert!(
+                    k.cohort_return_syscalls.is_empty(),
+                    "{:?}",
+                    k.cohort_return_syscalls
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_seccomp_trap_enters_original_arm64_frame_without_owner_return() {
+        use super::super::tests::{kernel, process};
+        for slots in [1, 2] {
+            let mut p = process();
+            p.memory
+                .write_array(0x4000, 0xd4000001u32.to_le_bytes())
+                .unwrap();
+            p.memory
+                .write_array(0x4004, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            p.memory
+                .write_array(0x5000, 0xd28009bcu32.to_le_bytes())
+                .unwrap(); // mov x28,77
+            p.memory
+                .write_array(0x5004, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            p.memory
+                .protect(
+                    0x4000,
+                    2 * trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            let args = [0x1234, 2, 3, 4, 5, 6];
+            put_args(&mut p.cpu, args);
+            p.cpu.set_x(8, 56);
+            p.seccomp.push(Arc::new(
+                Filter::validate(vec![i(6, 0, 0, 0x30055)]).unwrap(),
+            ));
+            p.signals.actions.set(
+                31,
+                Action {
+                    handler: 0x5000,
+                    flags: 4,
+                    ..Default::default()
+                },
+            );
+            p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+            let mut peer = p.fork();
+            peer.tgid = 2;
+            peer.family.set_parent(1);
+            peer.cpu = Cpu::new(0x4004, 0x9000);
+            let mut k = kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, p);
+            k.processes.insert(2, peer);
+            assert!(k
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                .unwrap());
+            let p = k.processes.read(&1);
+            assert_eq!(p.cpu.x(28), 77);
+            assert_eq!(p.cpu.x(0), 31);
+            let sp = p.cpu.sp;
+            for (index, arg) in args.iter().enumerate() {
+                assert_eq!(
+                    p.memory.read_u64(sp + 312 + index as u64 * 8).unwrap(),
+                    *arg
+                );
+            }
+            assert_eq!(p.memory.read_u64(sp + 312 + 8 * 8).unwrap(), 56);
+            assert_eq!(
+                u32::from_le_bytes(p.memory.read_array(sp + 24).unwrap()),
+                56
+            );
+            assert_eq!(
+                u32::from_le_bytes(p.memory.read_array(sp + 28).unwrap()),
+                ARCH
+            );
+            assert_eq!(
+                u32::from_le_bytes(p.memory.read_array(sp + 4).unwrap()),
+                0x55
+            );
+            assert_eq!(k.worker_syscalls, 1);
+            assert_eq!(k.service_requests, 0);
+            assert!(k.cohort_return_syscalls.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_seccomp_fatal_actions_use_original_thread_or_group_without_owner_return() {
+        use super::super::tests::{kernel, process};
+        for (action, handler, mask, strict) in [
+            (0, 0, 0, false),
+            (KILL_PROCESS, 0, 0, false),
+            (0x1234_0000, 0, 0, false),
+            (0x30055, 1, 0, false),
+            (0x30055, 0x5000, 1 << 30, false),
+            (0, 0, 0, true),
+        ] {
+            let mut subject = process();
+            subject.tgid = 2;
+            subject.family.set_parent(1);
+            subject
+                .memory
+                .write_array(0x4000, 0xd4000001u32.to_le_bytes())
+                .unwrap();
+            subject
+                .memory
+                .write_array(0x4004, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            subject
+                .memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            subject.cpu.set_x(8, 172);
+            subject.signals.actions.set_handler(31, handler);
+            subject.signals.mask = mask;
+            if strict {
+                subject.seccomp.set_strict();
+            } else {
+                subject.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, action)]).unwrap(),
+                ));
+            }
+            subject.signals.io.scheduling.set_affinity(3);
+            let peer_memory = subject.memory.share();
+            let mut peer = subject.fork_with_memory(peer_memory);
+            peer.tgid = 2;
+            peer.family = subject.family.clone();
+            peer.children = subject.children.clone();
+            peer.wait_event = subject.wait_event.clone();
+            peer.signals.io.share_process(&subject.signals.io);
+            peer.cpu = Cpu::new(0x4004, 0x9000);
+            let mut foreign = process();
+            foreign
+                .memory
+                .write_array(0x4000, 0x14000000u32.to_le_bytes())
+                .unwrap();
+            foreign
+                .memory
+                .protect(
+                    0x4000,
+                    trames_memory::PAGE_SIZE,
+                    trames_memory::Permissions::RX,
+                )
+                .unwrap();
+            foreign.signals.io.scheduling.set_affinity(3);
+            let mut k = kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(2);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            k.processes.insert(1, foreign);
+            k.processes.insert(2, subject);
+            k.processes.insert(3, peer);
+            for _ in 0..4 {
+                assert!(k
+                    .parallel_epoch(
+                        &mut trames_linux::CapturedOutput::default(),
+                        k.instructions + 100_000,
+                        true
+                    )
+                    .unwrap());
+                if matches!(k.processes.read(&2).state, State::Zombie(_)) {
+                    break;
+                }
+            }
+            let signal = if strict { 9 } else { 31 };
+            assert!(
+                matches!(k.processes.read(&2).state,State::Zombie(s) if s==signal),
+                "action={action:x} strict={strict}"
+            );
+            assert_eq!(
+                k.processes
+                    .get(&3)
+                    .is_none_or(|p| matches!(p.state, State::Zombie(_))),
+                action != 0,
+                "action={action:x}"
+            );
+            assert!(matches!(k.processes.read(&1).state, State::Ready));
+            assert_eq!(k.service_requests, 0);
+            assert!(
+                k.cohort_return_syscalls.is_empty(),
+                "{:?}",
+                k.cohort_return_syscalls
+            );
+        }
+    }
+
+    #[test]
+    fn original_policy_readers_do_not_wait_for_the_publication_mutex() {
+        let policy = Seccomp::default();
+        let mut reader = policy.clone();
+        let publication = policy.original.versions.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            reader.capture_entry();
+            send.send(reader.allows(172, 0, [0; 6])).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        drop(publication);
+        thread.join().unwrap();
+        assert_eq!(result, Ok(true));
+    }
+
+    #[test]
+    fn inherited_long_policy_chain_drops_without_recursive_host_stack_use() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut parent = Seccomp::default();
+                let filter = Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap());
+                for _ in 0..6500 {
+                    parent.push(filter.clone());
+                }
+                let child = parent.fork();
+                drop(parent);
+                assert_eq!(child.count(), 6500);
+                assert!(child.allows(172, 0, [0; 6]));
+                drop(child);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn credential_subsystem_refreshes_future_calls_without_owner_returns() {
         use super::super::tests::{kernel, process};
@@ -891,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_mapping_decision_is_bound_to_entry_and_filter_identity() {
+    fn accepted_mapping_decision_retains_original_entry_across_policy_publication() {
         let mut policy = Seccomp::default();
         policy.push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
         let args = [0x8000, trames_memory::PAGE_SIZE, 0, 0, 0, 0];
@@ -930,9 +2112,21 @@ mod tests {
             args,
             &mut trames_linux::CapturedOutput::default(),
         );
-        assert_eq!(p.cpu.x(0), error(Errno(13)));
-        assert!(p.memory.read_array::<1>(0x8000).is_ok());
+        assert_eq!(
+            p.cpu.x(0),
+            0,
+            "accepted entry is not evaluated against a later policy"
+        );
+        assert!(p.memory.read_array::<1>(0x8000).is_err());
         assert!(p.seccomp_entry.is_none());
+        let other = policy.fork();
+        assert!(
+            policy
+                .entry_decision(215, 0x4004, args)
+                .value_for(&other, 215, 0x4004, args)
+                .is_none(),
+            "same filter does not confer original task identity"
+        );
     }
     #[test]
     fn general_admission_does_not_evaluate_filtered_membership_entries() {
@@ -996,7 +2190,7 @@ mod tests {
         for number in [102, 103, 107, 108, 109, 110, 111] {
             for decision in [ALLOW, 0x5007b] {
                 let mut p = super::super::tests::process();
-                for (i, word) in [0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001]
+                for (i, word) in [0xd4000001u32, 0xaa0003f3, 0x14000000]
                     .into_iter()
                     .enumerate()
                 {
@@ -1121,16 +2315,13 @@ mod tests {
                     assert_eq!(task.context.lock().unwrap().wait_mask, None);
                     assert_eq!(task.mask(), 0);
                 } else {
-                    p.seccomp_entry = done.seccomp_entry;
-                    assert!(p.seccomp_entry.is_some());
-                    super::super::tests::kernel().call(
-                        1,
-                        &mut p,
-                        number as u32,
-                        args,
-                        &mut trames_linux::CapturedOutput::default(),
+                    assert!(
+                        done.seccomp_entry.is_none(),
+                        "pure denial completes on its worker"
                     );
-                    assert_eq!(p.cpu.x(0), error(Errno(123)));
+                    assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
+                    assert_eq!(done.syscalls, 1);
+                    assert_eq!(p.cpu.x(19), error(Errno(123)));
                     assert_eq!(p.seccomp.evaluations(), 1);
                     assert_eq!(task.mask(), 0);
                 }
@@ -1143,7 +2334,7 @@ mod tests {
             for decision in [ALLOW, 0x5007b] {
                 let mut p = super::super::tests::process();
                 let ep = p.linux.vfs.epoll_create(0).unwrap();
-                for (i, word) in [0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001]
+                for (i, word) in [0xd4000001u32, 0xaa0003f3, 0x14000000]
                     .into_iter()
                     .enumerate()
                 {
@@ -1257,16 +2448,13 @@ mod tests {
                     assert_eq!(task.context.lock().unwrap().wait_mask, None);
                     assert_eq!(task.mask(), 0);
                 } else {
-                    p.seccomp_entry = done.seccomp_entry;
-                    assert!(p.seccomp_entry.is_some());
-                    super::super::tests::kernel().call(
-                        1,
-                        &mut p,
-                        number as u32,
-                        args,
-                        &mut trames_linux::CapturedOutput::default(),
+                    assert!(
+                        done.seccomp_entry.is_none(),
+                        "pure denial completes on its worker"
                     );
-                    assert_eq!(p.cpu.x(0), error(Errno(123)));
+                    assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
+                    assert_eq!(done.syscalls, 1);
+                    assert_eq!(p.cpu.x(19), error(Errno(123)));
                     assert_eq!(p.seccomp.evaluations(), 1);
                     assert_eq!(task.mask(), 0);
                 }
@@ -1278,7 +2466,7 @@ mod tests {
         for number in [101, 115] {
             for decision in [ALLOW, 0x5007b] {
                 let mut p = super::super::tests::process();
-                for (offset, word) in [0xd4000001u32, 0xaa0003f3, 0xd2800ba8, 0xd4000001]
+                for (offset, word) in [0xd4000001u32, 0xaa0003f3, 0x14000000]
                     .into_iter()
                     .enumerate()
                 {
@@ -1371,19 +2559,17 @@ mod tests {
                 p.cpu = done.cpu;
                 if decision == ALLOW {
                     assert_eq!((done.waits, done.resumes, done.syscalls), (1, 1, 1));
-                    assert_eq!((p.cpu.x(19), p.cpu.x(8)), (0, 93));
+                    assert_eq!((p.cpu.x(19), p.cpu.x(8)), (0, number));
                     assert!(done.seccomp_entry.is_none());
                 } else {
                     assert_eq!(done.waits, 0);
-                    p.seccomp_entry = done.seccomp_entry;
-                    assert!(p.seccomp_entry.is_some());
-                    super::super::tests::kernel().call(
-                        1,
-                        &mut p,
-                        number as u32,
-                        args,
-                        &mut trames_linux::CapturedOutput::default(),
+                    assert!(
+                        done.seccomp_entry.is_none(),
+                        "pure denial completes on its worker"
                     );
+                    assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
+                    assert_eq!(done.syscalls, 1);
+                    assert_eq!(p.cpu.x(19), error(Errno(123)));
                     assert_eq!(p.seccomp.evaluations(), 1);
                     assert_eq!(p.cpu.x(0), error(Errno(123)));
                     assert!(matches!(p.state, State::Ready));
@@ -1490,7 +2676,7 @@ mod tests {
             assert_eq!(p.seccomp.evaluations(), 1, "one entry decision");
             p.memory.commit_parallel().unwrap();
             p.cpu = done.cpu;
-            if owner || decision != ALLOW {
+            if owner && decision == ALLOW {
                 assert!(matches!(done.outcome, Some(SliceOutcome::Syscall { .. })));
                 assert!(p.linux.vfs.flags(fd).is_ok(), "no deferred FD effect");
                 p.seccomp_entry = Some(done.seccomp_entry.expect("exact deferred entry"));
@@ -1507,7 +2693,7 @@ mod tests {
                 assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
                 assert!(done.seccomp_entry.is_none());
                 assert_eq!(done.syscalls, 1);
-                assert_eq!(done.fd_syscalls, 1);
+                assert_eq!(done.fd_syscalls, u64::from(decision == ALLOW));
             }
             if decision != ALLOW {
                 assert_eq!(p.cpu.x(0), error(Errno(123)));
@@ -1623,7 +2809,8 @@ mod tests {
                 (167, [38, 1, 0]),
             ] {
                 let mut p = process();
-                let original = p.linux.vfs.credentials.clone();
+                let mut original = p.linux.vfs.credentials.clone();
+                original.caps.no_new_privs = original.caps.no_new_privs.fork();
                 p.memory
                     .write_array(0x4000, 0xd4000001u32.to_le_bytes())
                     .unwrap();
@@ -2446,7 +3633,7 @@ mod tests {
                 assert_eq!(snapshot.admit(&cpu), decision == ALLOW);
                 assert!(!wait.woken());
             }
-            snapshot.seccomp.strict = true;
+            snapshot.seccomp.set_strict();
             assert!(!snapshot.admit(&cpu));
         }
     }
@@ -2556,24 +3743,30 @@ mod tests {
             .unwrap(),
         ));
         let args = [1, 2, 3, 4, 5, 7 << 32];
-        let worker = current.clone();
+        let mut worker = current.clone();
+        worker.capture_entry();
+        let forked = current.fork();
         current.push(Arc::new(
             Filter::validate(vec![i(6, 0, 0, 0x50009)]).unwrap(),
         ));
-        // A worker owns only immutable, Send+Sync programs. Later installation
-        // does not mutate a snapshot; the next joined epoch gets the new chain.
+        // Installation cannot alter an already captured entry. The same worker
+        // observes publication at its next entry without joining an epoch.
         std::thread::spawn(move || {
             assert!(worker.allows(113, 0x4004, args));
             assert!(!worker.allows(113, 0x4008, args));
             assert!(!worker.allows(113, 0x4004, [0; 6]));
+            worker.capture_entry();
+            assert!(!worker.allows(113, 0x4004, args));
+            assert!(
+                forked.allows(113, 0x4004, args),
+                "fork has its own policy slot"
+            );
         })
         .join()
         .unwrap();
         assert!(!current.allows(113, 0x4004, args));
-        let strict = Seccomp {
-            strict: true,
-            ..Default::default()
-        };
+        let mut strict = Seccomp::default();
+        strict.set_strict();
         assert!(strict.allows(63, 0, [0; 6]));
         assert!(!strict.allows(113, 0, [0; 6]));
     }
@@ -2599,7 +3792,7 @@ mod tests {
         p.cpu.set_x(8, 63);
         put_args(&mut p.cpu, [read as u64, 0x1000, 4, 0, 0, 0]);
         p.signals.io.scheduling.set_affinity(3);
-        p.seccomp.strict = true;
+        p.seccomp.set_strict();
         let peer = p.fork();
         peer.family.set_parent(1);
         let mut kernel = super::super::tests::kernel();
@@ -3175,7 +4368,7 @@ mod tests {
         }
     }
     #[test]
-    fn filtered_identity_syscalls_still_checkpoint_and_apply_errno_in_parallel() {
+    fn filtered_identity_denials_complete_on_workers_without_owner_returns() {
         let mut p = super::super::tests::process();
         for (index, word) in [0xd2801588u32, 0xd4000001, 0x17ffffff]
             .into_iter()
@@ -3208,7 +4401,9 @@ mod tests {
         assert!(kernel
             .parallel_round(&mut trames_linux::CapturedOutput::default(), 100_000)
             .unwrap());
-        assert_eq!(kernel.worker_syscalls, 0);
+        assert_eq!(kernel.worker_syscalls, kernel.syscalls);
+        assert_eq!(kernel.service_requests, 0);
+        assert!(kernel.cohort_return_syscalls.is_empty());
         assert!(kernel.syscalls > 0);
         for p in kernel.processes.values().filter(|p| p.cpu.pc == 0x4008) {
             assert_eq!(p.cpu.x(0), error(Errno(123)));
@@ -3331,16 +4526,10 @@ mod tests {
     fn stacked_filters_keep_restrictions_and_newest_equal_action_data() {
         let a = Arc::new(Filter::validate(vec![i(6, 0, 0, 0x50001)]).unwrap());
         let b = Arc::new(Filter::validate(vec![i(6, 0, 0, 0x50002)]).unwrap());
-        let ancestor = Seccomp {
-            strict: false,
-            evaluations: Arc::default(),
-            filters: Arc::new(vec![a.clone()]),
-        };
-        let current = Seccomp {
-            strict: false,
-            evaluations: Arc::default(),
-            filters: Arc::new(vec![a, b]),
-        };
+        let mut ancestor = Seccomp::default();
+        ancestor.push(a);
+        let mut current = ancestor.fork();
+        current.push(b);
         assert!(ancestor.ancestor_of(&current));
         assert!(!current.ancestor_of(&ancestor));
         assert_eq!(current.decision(172, 0, [0; 6]), 0x50002);

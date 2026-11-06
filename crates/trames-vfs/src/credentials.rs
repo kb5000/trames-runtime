@@ -55,6 +55,58 @@ impl Dumpable {
     }
 }
 
+/// Accepted executable metadata and original credentials. A late TSYNC may
+/// change only the task's monotonic NNP flag, without re-looking-up the file.
+pub struct ExecCredentials {
+    original: Credentials,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    nosuid: bool,
+    readable: bool,
+}
+impl ExecCredentials {
+    pub fn no_new_privs(&self) -> bool {
+        self.original.caps.no_new_privs.get()
+    }
+    pub fn apply(&self, view: &mut Vfs) -> bool {
+        let no_new_privs = self.no_new_privs();
+        let old_permitted = self.original.caps.permitted;
+        let mut c = self.original.clone();
+        if !self.nosuid && !no_new_privs {
+            if self.mode & 0o4000 != 0 {
+                c.euid = self.uid;
+            }
+            if self.mode & 0o2010 == 0o2010 {
+                c.egid = self.gid;
+            }
+        }
+        c.caps.exec_with_nnp(
+            c.uid,
+            c.euid,
+            c.uid != c.euid || c.gid != c.egid,
+            no_new_privs,
+        );
+        // Preserve the established pre-existing effective-ID downgrade rule.
+        if no_new_privs && (c.uid != c.euid || c.gid != c.egid) {
+            c.euid = c.uid;
+            c.egid = c.gid;
+        }
+        view.dumpable = Dumpable::default();
+        view.dumpable.set(
+            self.readable
+                && c.uid == c.euid
+                && c.gid == c.egid
+                && c.caps.permitted & !old_permitted == 0,
+        );
+        c.fsuid = c.euid;
+        c.fsgid = c.egid;
+        c.suid = c.euid;
+        c.sgid = c.egid;
+        view.credentials = c;
+        no_new_privs
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Credentials {
     pub uid: u32,
@@ -328,45 +380,22 @@ impl Vfs {
         let file = self.executable_file_at(AT_FDCWD, path, 0)?;
         self.apply_exec_file_credentials(&file)
     }
+    pub fn exec_credentials(&self, file: &ExecutableFile) -> ExecCredentials {
+        let node = file.node.borrow();
+        ExecCredentials {
+            original: self.credentials.clone(),
+            readable: self.allowed(&node, 4),
+            uid: node.uid,
+            gid: node.gid,
+            mode: node.file_metadata().mode,
+            nosuid: file
+                .mount
+                .as_ref()
+                .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0),
+        }
+    }
     pub fn apply_exec_file_credentials(&mut self, file: &ExecutableFile) -> Result<()> {
-        let n = file.node.borrow();
-        let readable = self.allowed(&n, 4);
-        let old_permitted = self.credentials.caps.permitted;
-        let nosuid = file
-            .mount
-            .as_ref()
-            .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0);
-        if !nosuid && !self.credentials.caps.no_new_privs && n.file_metadata().mode & 0o4000 != 0 {
-            self.credentials.euid = n.uid;
-            self.credentials.fsuid = n.uid;
-        }
-        if !nosuid
-            && !self.credentials.caps.no_new_privs
-            && n.file_metadata().mode & 0o2010 == 0o2010
-        {
-            self.credentials.egid = n.gid;
-            self.credentials.fsgid = n.gid;
-        }
-        let c = &mut self.credentials;
-        c.caps
-            .exec(c.uid, c.euid, c.uid != c.euid || c.gid != c.egid);
-        // NNP also prevents a pre-existing effective-ID mismatch from
-        // surviving exec. Capability computation uses the pre-downgrade IDs.
-        if c.caps.no_new_privs && (c.uid != c.euid || c.gid != c.egid) {
-            c.euid = c.uid;
-            c.egid = c.gid;
-        }
-        self.dumpable = Dumpable::default();
-        self.dumpable.set(
-            readable
-                && c.uid == c.euid
-                && c.gid == c.egid
-                && c.caps.permitted & !old_permitted == 0,
-        );
-        c.fsuid = c.euid;
-        c.fsgid = c.egid;
-        self.credentials.suid = self.credentials.euid;
-        self.credentials.sgid = self.credentials.egid;
+        self.exec_credentials(file).apply(self);
         Ok(())
     }
     pub fn access_at(

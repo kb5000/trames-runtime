@@ -582,9 +582,14 @@ struct ProcessImage {
     maps: Vec<u8>,
     memory: Option<trames_memory::MemoryReport>,
 }
+/// Live original task policy; observations never borrow its CPU or task body.
+pub trait SeccompView: Send + Sync {
+    fn seccomp(&self) -> (u32, usize);
+}
 /// Stable original process-view identity. It contains no owner-local weak Rc,
 /// and swapping an image cannot redirect a retained view to a reused PID.
 pub struct ProcessView {
+    seccomp: std::sync::OnceLock<Arc<dyn SeccompView>>,
     image: std::sync::RwLock<Option<Arc<ProcessImage>>>,
     identity: u64,
     cpu: AtomicU32,
@@ -597,6 +602,7 @@ impl Default for ProcessView {
         Self {
             image: Default::default(),
             identity: NEXT_VIEW.fetch_add(1, Ordering::Relaxed),
+            seccomp: Default::default(),
             cpu: Default::default(),
             time: Default::default(),
             state: Default::default(),
@@ -651,6 +657,9 @@ impl ProcessView {
     pub fn publish(&self, info: &ProcessInfo, resources: ProcResources) {
         self.publish_with_memory(info, resources, None);
     }
+    pub fn bind_seccomp(&self, policy: Arc<dyn SeccompView>) {
+        let _ = self.seccomp.set(policy);
+    }
     /// Task namespace/Files replacement preserves the loaded image and its mm.
     /// Only an overlapping observer requires a cold copy; ordinary reads keep
     /// their existing single image observation and no extra synchronization.
@@ -686,6 +695,9 @@ impl ProcessView {
     ) -> Option<ProcessInfo> {
         let image = self.image.read().unwrap().clone()?;
         let mut info = image.metadata.project();
+        if let Some(policy) = self.seccomp.get() {
+            (info.seccomp, info.seccomp_filters) = policy.seccomp();
+        }
         info.identity = self.identity;
         let time = self.time.load(Ordering::Relaxed);
         if time != 0 {

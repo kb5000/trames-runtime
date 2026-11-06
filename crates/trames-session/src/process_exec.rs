@@ -108,6 +108,11 @@ impl<C: Cpu> Kernel<C> {
         mut runtime: Image<C>,
         clock_origin: Instant,
     ) -> Memory {
+        // Source execution has already admitted this group without blocking a
+        // slot. Serialize the final credentials/auxv image with TSYNC publication.
+        let policy = p.seccomp.birth_group();
+        let _permit = policy.write_owned().into_admission();
+        runtime.refresh_credentials();
         let task = p.linux.vfs.process_context();
         {
             let body = &mut *p;
@@ -412,6 +417,81 @@ mod tests {
             _: u64,
         ) -> Result<Arc<dyn trames_memory::PageBacking>, trames_memory::MemoryError> {
             Err(trames_memory::MemoryError::InvalidRange)
+        }
+    }
+    #[test]
+    fn prepared_exec_rechecks_late_tsync_privileges_and_initial_auxv_without_file_relookup() {
+        let mut k = super::super::tests::kernel();
+        let mut p = super::super::tests::process();
+        p.linux
+            .vfs
+            .import_executable(b"/image", elf(&[0x14000000]))
+            .unwrap();
+        p.linux.vfs.chmod_at(AT_FDCWD, b"/image", 0o4755).unwrap();
+        let mut admin = p.linux.vfs.clone();
+        p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        k.publish_task(1, &p);
+        let mut peer = p.fork();
+        peer.signals.io.share_process(&p.signals.io);
+        peer.bind_signals();
+        peer.seccomp.inherit(
+            &p.seccomp,
+            true,
+            &peer.signals.io,
+            2,
+            &peer.linux.vfs.credentials.caps.no_new_privs,
+            &p.linux.vfs.credentials.caps.no_new_privs,
+        );
+        let image = Kernel::prepare_exec_strings(
+            &p,
+            AT_FDCWD,
+            b"/image".to_vec(),
+            vec![b"/image".to_vec()],
+            vec![],
+            0,
+            32 * 1024 * 1024,
+            k.started,
+        )
+        .unwrap();
+        assert_eq!(image.linux.vfs.credentials.euid, 0);
+        assert_ne!(image.linux.vfs.credentials.caps.permitted, 0);
+        peer.memory.write_array(0x1800, 1u16.to_le_bytes()).unwrap();
+        peer.memory
+            .write_array(0x1808, 0x1900u64.to_le_bytes())
+            .unwrap();
+        peer.memory
+            .write_array(0x1900, [6, 0, 0, 0, 0, 0, 0xff, 0x7f])
+            .unwrap();
+        peer.linux.vfs.credentials.caps.no_new_privs.set();
+        peer.bind_signals();
+        assert_eq!(k.seccomp(&mut peer, [1, 1, 0x1800, 0, 0, 0]), Ok(0));
+        // The prepared image keeps accepted readability/metadata. A late NNP
+        // must not cause a second path/permission lookup or new guest bytes.
+        admin.chmod_at(AT_FDCWD, b"/image", 0o4000).unwrap();
+        drop(Kernel::install_exec(&mut p, image, k.started));
+        let c = &p.linux.vfs.credentials;
+        assert_eq!(
+            (c.euid, c.suid, c.fsuid, c.egid, c.sgid, c.fsgid),
+            (1000, 1000, 1000, 1000, 1000, 1000)
+        );
+        assert_eq!(c.caps.permitted, 0);
+        assert_eq!(p.linux.vfs.dumpable(), 1);
+        assert!(c.caps.no_new_privs.get());
+        let base =
+            p.cpu.sp() + 8 * (3 + p.linux.arguments.len() + p.linux.environment.len()) as u64;
+        for (index, pair) in p.linux.auxiliary.chunks_exact(16).enumerate() {
+            let key = u64::from_le_bytes(pair[..8].try_into().unwrap());
+            if let Some(expected) = match key {
+                11..=14 => Some(1000),
+                23 => Some(0),
+                _ => None,
+            } {
+                assert_eq!(u64::from_le_bytes(pair[8..].try_into().unwrap()), expected);
+                assert_eq!(
+                    p.memory.read_u64(base + index as u64 * 16 + 8).unwrap(),
+                    expected
+                );
+            }
         }
     }
     #[test]
@@ -759,7 +839,7 @@ mod tests {
                         .unwrap();
                     root.cpu = trames_cpu::Cpu::new(0x4000, 0);
                     if cpus == 4 {
-                        root.linux.vfs.credentials.caps.no_new_privs = true;
+                        root.linux.vfs.credentials.caps.no_new_privs.set();
                         root.memory
                             .write(0x2000, &[6, 0, 0, 0, 0, 0, 0xff, 0x7f])
                             .unwrap();
@@ -1041,7 +1121,7 @@ mod tests {
                         ins[4..].copy_from_slice(&value.to_le_bytes());
                         root.memory.write_array(0x2100 + i as u64 * 8, ins).unwrap();
                     }
-                    root.linux.vfs.credentials.caps.no_new_privs = true;
+                    root.linux.vfs.credentials.caps.no_new_privs.set();
                     assert_eq!(k.seccomp(&mut root, [1, 0, 0x2000, 0, 0, 0]), Ok(0));
                 }
                 let mut output = trames_linux::CapturedOutput::default();
@@ -1142,6 +1222,33 @@ pub(crate) struct Image<C: Cpu> {
     pub(super) cpu: C,
     pub(super) memory: Memory,
     pub(super) linux: Linux,
+    credentials: trames_vfs::ExecCredentials,
+    no_new_privs: bool,
+}
+impl<C: Cpu> Image<C> {
+    fn refresh_credentials(&mut self) {
+        if self.credentials.no_new_privs() == self.no_new_privs {
+            return;
+        }
+        self.no_new_privs = self.credentials.apply(&mut self.linux.vfs);
+        let c = &self.linux.vfs.credentials;
+        let base = self.cpu.sp()
+            + 8 * (3 + self.linux.arguments.len() + self.linux.environment.len()) as u64;
+        for (index, pair) in self.linux.auxiliary.chunks_exact_mut(16).enumerate() {
+            let value = match u64::from_le_bytes(pair[..8].try_into().unwrap()) {
+                11 => c.uid as u64,
+                12 => c.euid as u64,
+                13 => c.gid as u64,
+                14 => c.egid as u64,
+                23 => u64::from(c.uid != c.euid || c.gid != c.egid),
+                _ => continue,
+            };
+            pair[8..].copy_from_slice(&value.to_le_bytes());
+            self.memory
+                .write_array(base + index as u64 * 16 + 8, value.to_le_bytes())
+                .expect("unpublished initial stack");
+        }
+    }
 }
 /// Guest strings, filesystem context and capabilities are accepted before I/O.
 /// Filesystem objects remain the originals; no Process/Kernel or mm is sent.
@@ -1294,7 +1401,8 @@ impl Request {
                 continue;
             }
             let mut execute_vfs = vfs;
-            execute_vfs.apply_exec_file_credentials(&file)?;
+            let credentials = execute_vfs.exec_credentials(&file);
+            let no_new_privs = credentials.apply(&mut execute_vfs);
             let mut runtime = Runtime::<C>::load_guest_execfn(
                 &bytes,
                 &argv,
@@ -1335,6 +1443,8 @@ impl Request {
                 cpu: runtime.cpu,
                 memory: runtime.memory,
                 linux: runtime.linux,
+                credentials,
+                no_new_privs,
             });
         }
         Err(Errno(40))
