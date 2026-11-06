@@ -3,11 +3,12 @@
 use super::*;
 
 pub struct ExecutableFile {
+    _mount_use: Option<mounts::MountUse>,
     #[cfg(all(feature = "hostfs", unix))]
     _host_file: Option<Arc<hostfs::OpenFile>>,
     pub(super) node: NodeRef,
     pub(super) label: Vec<u8>,
-    pub(super) mount: Option<Rc<Mount>>,
+    pub(super) mount: Option<Arc<mounts::MountData>>,
 }
 
 impl Vfs {
@@ -16,14 +17,14 @@ impl Vfs {
         dirfd: i32,
         path: &[u8],
         flags: u32,
-    ) -> Result<Rc<ExecutableFile>> {
+    ) -> Result<Arc<ExecutableFile>> {
         if path.is_empty() && flags & 0x1000 == 0 {
             return Err(Errno(2));
         }
         if flags & !0x1100 != 0 {
             return Err(Errno(22));
         }
-        let (node, label, mount) = if path.is_empty() {
+        let accepted = if path.is_empty() {
             if flags & 0x1000 == 0 {
                 return Err(Errno(2));
             }
@@ -37,19 +38,32 @@ impl Vfs {
                 FdKind::Node(path) => path.clone(),
                 _ => Vec::new(),
             };
-            (node, label, self.mount_for_path(open.mount.as_ref()))
+            ResolvedInode {
+                node,
+                label,
+                mount: self.mount_for_path(open.mount.as_ref()),
+                file: Some(open.shared.clone()),
+                _image: None,
+                _directory: None,
+            }
         } else {
             let (resolved, magic) = self.resolve_entry(dirfd, path, flags & 0x100 == 0, true)?;
             match magic {
-                Some(file) => file,
-                None => (
-                    self.node(&resolved)?,
-                    self.path_visible(&resolved)
+                Some(ResolvedTarget::Inode(file)) => file,
+                Some(ResolvedTarget::Descriptor(open)) => self.proc_open_node(&open, &resolved)?,
+                None => ResolvedInode {
+                    node: self.node(&resolved)?,
+                    label: self
+                        .path_visible(&resolved)
                         .unwrap_or_else(|_| resolved.key.clone()),
-                    resolved.mount,
-                ),
+                    mount: resolved.mount,
+                    file: None,
+                    _image: None,
+                    _directory: None,
+                },
             }
         };
+        let (node, label, mount) = (&accepted.node, &accepted.label, &accepted.mount);
         let n = node.borrow();
         if matches!(n.content, Content::Symlink(_)) {
             return Err(Errno(40));
@@ -66,16 +80,24 @@ impl Vfs {
         drop(n);
         #[cfg(all(feature = "hostfs", unix))]
         let host_file = node.host.get().map(|file| file.file(false)).transpose()?;
-        Ok(Rc::new(ExecutableFile {
+        let mount_use = mount
+            .as_ref()
+            .map(|mount| mounts::MountUse::new(mount.identity.clone()));
+        Ok(Arc::new(ExecutableFile {
+            _mount_use: mount_use,
             #[cfg(all(feature = "hostfs", unix))]
             _host_file: host_file,
-            node,
-            label,
-            mount,
+            node: node.clone(),
+            label: label.clone(),
+            mount: mount.as_ref().map(|mount| mount.shared.clone()),
         }))
     }
     pub fn executable_display(&self, file: &ExecutableFile) -> Vec<u8> {
-        self.location(&file.node, &file.mount)
+        let mount = file.mount.as_ref().map(|mount| {
+            self.mount_for_path(Some(&OpenMount::Shared(mount.clone())))
+                .expect("retained executable mount")
+        });
+        self.location(&file.node, &mount)
             .map(|p| self.path_visible(&p).unwrap_or(p.key))
             .unwrap_or_else(|_| {
                 let mut label = file.label.clone();
@@ -215,7 +237,7 @@ mod tests {
                     pid: 1,
                     tgid: 1,
                     executable: v.executable_display(&file),
-                    executable_file: Some(Rc::downgrade(&file)),
+                    executable_file: Some(Arc::downgrade(&file)),
                     ..Default::default()
                 }],
                 ..Default::default()

@@ -57,6 +57,8 @@ mod exec;
 mod exit;
 #[path = "process_pid.rs"]
 mod pid_namespace;
+#[path = "process_proc.rs"]
+mod proc;
 #[path = "process_signals.rs"]
 mod signals;
 use trames_kernel::signal::AltStack;
@@ -592,6 +594,8 @@ pub(crate) struct Kernel<C: Cpu> {
     syscalls: u64,
     proc_refreshes: u64,
     proc_maps: RefCell<BTreeMap<u64, ProcMaps>>,
+    proc_source: Option<Arc<crate::proc_views::Source>>,
+    proc_owner_waits: Vec<proc::ProcReadWait<C>>,
     profile_syscalls: bool,
     idle: Duration,
     load: [f64; 3],
@@ -671,6 +675,7 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn publish_task_core(&self, id: u32, p: &Process<C>) {
+        self.publish_proc_task(id, p);
         self.children_dirty.set(true);
         self.limit_directory
             .publish(id, &p.signals.presence, &p.limits, &p.linux.vfs.credentials);
@@ -1131,7 +1136,36 @@ impl<C: Cpu> Kernel<C> {
         // Argument bytes are mutable guest memory, so read them live only for
         // an actual cmdline observation. Unrelated proc files never consume
         // this payload; their next cmdline lookup requests its own refresh.
-        let arguments = if demand.arguments() {
+        let image = (demand.arguments() || demand.environment())
+            .then(|| p.memory.memory_report().image_ranges())
+            .flatten()
+            .map(trames_vfs::ProcImage);
+        let zombie = matches!(p.state, State::Zombie(_));
+        let arguments_bytes = if demand.arguments() && zombie {
+            Some(Vec::new())
+        } else {
+            image
+                .as_ref()
+                .filter(|_| demand.arguments())
+                .and_then(|image| {
+                    image.command_line(0, usize::MAX, |a, out| {
+                        trames_vfs::ProcImage::local_reader(&p.memory, a, out)
+                    })
+                })
+        };
+        let environment_bytes = if demand.environment() && zombie {
+            Some(Vec::new())
+        } else {
+            image
+                .as_ref()
+                .filter(|_| demand.environment())
+                .and_then(|image| {
+                    image.environment(0, usize::MAX, |a, out| {
+                        trames_vfs::ProcImage::local_reader(&p.memory, a, out)
+                    })
+                })
+        };
+        let arguments = if demand.arguments() && arguments_bytes.is_none() {
             p.linux
                 .argument_pointers
                 .iter()
@@ -1149,7 +1183,13 @@ impl<C: Cpu> Kernel<C> {
             Vec::new()
         };
         let (ignored, caught) = p.signals.actions.masks();
+        let (cwd_directory, root_directory) = if demand.directories() {
+            p.linux.vfs.proc_directories()
+        } else {
+            (None, None)
+        };
         trames_vfs::ProcessInfo {
+            identity: trames_vfs::ProcTask::identity(&*p.signals.io),
             pid,
             tgid: p.tgid,
             parent: p.family.parent(),
@@ -1166,6 +1206,7 @@ impl<C: Cpu> Kernel<C> {
             },
             credentials: p.linux.vfs.credentials.clone(),
             namespaces: p.linux.vfs.namespace_snapshot(),
+            namespace_projection: None,
             namespace_ids: [p.tgid, pid, p.group, p.session]
                 .map(|id| p.linux.vfs.pid_namespace().hierarchy(id)),
             command: p.linux.command_name.clone(),
@@ -1174,17 +1215,21 @@ impl<C: Cpu> Kernel<C> {
             seccomp: p.seccomp.mode(),
             seccomp_filters: p.seccomp.count(),
             arguments,
-            environment: if demand.environment() {
+            arguments_bytes,
+            environment: if demand.environment() && environment_bytes.is_none() {
                 p.linux.environment.clone()
             } else {
                 Vec::new()
             },
+            environment_bytes,
             executable: p.linux.executable_file.as_ref().map_or_else(
                 || p.linux.executable_path.clone(),
                 |file| p.linux.vfs.executable_display(file),
             ),
-            executable_file: p.linux.executable_file.as_ref().map(Rc::downgrade),
+            executable_file: p.linux.executable_file.as_ref().map(Arc::downgrade),
             cwd: p.linux.vfs.cwd().unwrap_or_else(|_| b"/".to_vec()),
+            cwd_directory,
+            root_directory,
             mapped_bytes: resident_bytes,
             virtual_bytes: p.memory.virtual_bytes(),
             maps,
@@ -1393,6 +1438,9 @@ impl<C: Cpu> Kernel<C> {
     fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         self.children_dirty.set(true);
         Self::clear_exit_resources(p);
+        if p.memory.coordinator_ownership().1 == 1 {
+            p.memory.retire_memory_report();
+        }
         if pid != 1 {
             p.memory = Memory::default();
         }
@@ -2818,6 +2866,7 @@ impl<C: Cpu> Kernel<C> {
         self.call_with(pid, p, number, a, io, |kernel, pid, p, io| {
             kernel.syscall(pid, p, number, a, io)
         });
+        self.proc_after_call(pid, p, number, a);
     }
     fn call_with<I: GuestOutput>(
         &mut self,
@@ -2846,17 +2895,28 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.set_process_context(pid);
         p.linux.vfs.set_lock_owner(p.tgid);
         let mut prepared_stat = (number == 79).then(|| p.linux.prepare_stat(a, &p.memory));
-        let proc_path = match number {
-            27 => Some((trames_vfs::AT_FDCWD, a[1])),
-            39 | 41 | 43 | 45 | 221 => Some((trames_vfs::AT_FDCWD, a[0])),
-            40 => Some((trames_vfs::AT_FDCWD, a[1])),
-            48 | 53 | 54 | 56 | 78 | 79 | 88 | 281 | 291 | 437 | 439 | 452 => {
-                Some((a[0] as i32, a[1]))
+        // The installed provider resolves demand on the actual path walk. Only
+        // legacy embeddings need this extra discovery walk and joined snapshot.
+        let legacy_proc = self.proc_source.as_ref().is_none_or(|source| {
+            !trames_vfs::ProcSource::available(&**source, trames_vfs::ProcRefresh::Full)
+        });
+        let proc_path = if legacy_proc {
+            match number {
+                27 => Some((trames_vfs::AT_FDCWD, a[1])),
+                39 | 41 | 43 | 45 | 221 => Some((trames_vfs::AT_FDCWD, a[0])),
+                40 => Some((trames_vfs::AT_FDCWD, a[1])),
+                48 | 53 | 54 | 56 | 78 | 79 | 88 | 281 | 291 | 437 | 439 | 452 => {
+                    Some((a[0] as i32, a[1]))
+                }
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         use trames_vfs::ProcRefresh;
-        let mut proc_observation = if number == 79 {
+        let mut proc_observation = if !legacy_proc {
+            None
+        } else if number == 79 {
             prepared_stat.as_ref().and_then(|(_, demand)| *demand)
         } else {
             matches!(number, 39..=41).then_some(ProcRefresh::Metadata)
@@ -2874,7 +2934,9 @@ impl<C: Cpu> Kernel<C> {
                 proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
         }
-        let second_mount_path = if number == 40 && a[3] & (4096 | 8192) != 0 {
+        let second_mount_path = if !legacy_proc {
+            None
+        } else if number == 40 && a[3] & (4096 | 8192) != 0 {
             Some(a[0])
         } else if number == 41 {
             Some(a[1])
@@ -2888,7 +2950,7 @@ impl<C: Cpu> Kernel<C> {
                 proc_observation = Some(proc_observation.map_or(demand, |old| old.merge(demand)));
             }
         }
-        if matches!(number, 44 | 61 | 63 | 65 | 67 | 69 | 78 | 80) {
+        if legacy_proc && matches!(number, 44 | 61 | 63 | 65 | 67 | 69 | 78 | 80) {
             if let Ok(FdKind::Node(path)) = p.linux.vfs.fd_kind(a[0] as u32) {
                 if path == b"/proc" || path.starts_with(b"/proc/") {
                     let demand = ProcRefresh::for_path(&path);
@@ -2897,7 +2959,13 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
         }
-        if let Some(demand) = proc_observation.filter(|d| *d != ProcRefresh::Independent) {
+        if let Some(demand) = proc_observation.filter(|d| {
+            *d != ProcRefresh::Independent
+                && self
+                    .proc_source
+                    .as_ref()
+                    .is_none_or(|source| !trames_vfs::ProcSource::available(&**source, *d))
+        }) {
             prepared_stat = None;
             self.proc_refreshes += 1;
             self.refresh_proc_observed(
@@ -3942,6 +4010,7 @@ impl<C: Cpu> Kernel<C> {
                 p.cpu_time += elapsed;
                 self.cpu_total += elapsed;
                 self.per_cpu[p.last_cpu] += elapsed;
+                p.signals.io.proc_view.account(elapsed, p.last_cpu);
             }
             SliceOutcome::Syscall { instructions } => {
                 p.cpu.clear_exclusive();
@@ -4342,7 +4411,17 @@ impl<C: Cpu> Kernel<C> {
         let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
         let mut checkpoint_error = None;
+        let mut proc_waits = std::mem::take(&mut self.proc_owner_waits);
+        if let Some(source) = &self.proc_source {
+            let reads = source.take_reads();
+            checkpoint_error = self
+                .activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
+                .err();
+        }
         loop {
+            if checkpoint_error.is_some() {
+                break;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 if !persistent {
@@ -4387,11 +4466,40 @@ impl<C: Cpu> Kernel<C> {
                     }
                 }
                 Some(crate::workers::Event::<C>::VmReady) => {
+                    let mut reads = self
+                        .proc_source
+                        .as_ref()
+                        .map_or_else(Vec::new, |s| s.take_reads());
+                    let mut retries = Vec::new();
+                    let mut index = 0;
+                    while index < proc_waits.len() {
+                        if proc_waits[index].signal.ready() {
+                            let wait = proc_waits.swap_remove(index);
+                            if let Some(checkpoint) = wait.checkpoint {
+                                retries.push(checkpoint);
+                            }
+                            if let Some(report) = wait.report {
+                                reads.push(report);
+                            }
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    if let Err(error) =
+                        self.activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
+                    {
+                        for checkpoint in retries {
+                            epoch.restore_checkpoint(checkpoint, false);
+                        }
+                        checkpoint_error = Some(error);
+                        break;
+                    }
                     while !control.stopped() {
-                        let Some(checkpoint) = epoch.take_checkpoint() else {
+                        let Some(checkpoint) = retries.pop().or_else(|| epoch.take_checkpoint())
+                        else {
                             break;
                         };
-                        match self.vm_checkpoint(&epoch, checkpoint, io) {
+                        match self.vm_checkpoint(&epoch, checkpoint, io, &mut proc_waits) {
                             Ok(true) => {
                                 members =
                                     epoch.member_ids().into_iter().map(|pid| (pid, 0)).collect();
@@ -4420,6 +4528,9 @@ impl<C: Cpu> Kernel<C> {
                                 break;
                             }
                         }
+                    }
+                    for checkpoint in retries {
+                        epoch.restore_checkpoint(checkpoint, false);
                     }
                 }
                 Some(crate::workers::Event::<C>::Idle) => {
@@ -4472,6 +4583,21 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         self.parallel_stop_time += began.elapsed();
+        for wait in proc_waits {
+            if let Some(report) = wait.report {
+                if let Some(source) = &self.proc_source {
+                    source.request_read(report);
+                }
+            }
+            if let Some(checkpoint) = wait.checkpoint {
+                for job in &checkpoint.jobs {
+                    if let Some(source) = &self.proc_source {
+                        source.request_read(self.processes[&job.work.pid].memory.memory_report());
+                    }
+                }
+                epoch.restore_checkpoint(checkpoint, false);
+            }
+        }
         if epoch.activation_failed() {
             checkpoint_error = Some(RuntimeError::Arguments("cannot start CPU worker"));
         }
@@ -4857,6 +4983,7 @@ impl<C: Cpu> Kernel<C> {
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
         'drive: loop {
             self.process_exits(None)?;
+            self.progress_proc_reads()?;
             if let Some(error) = self.backend_error.take() {
                 return Err(RuntimeError::Backend(error));
             }
@@ -4870,6 +4997,15 @@ impl<C: Cpu> Kernel<C> {
                     *load = *load * decay + running * (1.0 - decay);
                 }
                 self.load_sample = Instant::now();
+                if let Some(source) = &self.proc_source {
+                    *source.load.lock().unwrap() = self.load;
+                }
+            }
+            if let Some(source) = &self.proc_source {
+                source.idle.store(
+                    self.idle.as_nanos().min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             self.control(io)?;
             self.poll_file_layouts();
@@ -4963,6 +5099,9 @@ impl<C: Cpu> Kernel<C> {
                         let instructions_before = self.instructions;
                         let began = Instant::now();
                         let decode_before = p.cpu.decode_stats();
+                        p.signals.io.proc_view.dispatched(
+                            p.signals.io.scheduling.affinity().trailing_zeros() as usize,
+                        );
                         let outcome = p.cpu.run_coordinated(
                             &mut self.engine,
                             &mut p.memory,
@@ -4979,6 +5118,7 @@ impl<C: Cpu> Kernel<C> {
                         self.cpu_total += elapsed;
                         p.last_cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
                         self.per_cpu[p.last_cpu] += elapsed;
+                        p.signals.io.proc_view.account(elapsed, p.last_cpu);
                         self.context_switches += 1;
                         let immediate_return = self.finish_slice(id, &mut p, outcome, io, true);
                         if let Some(error) = self.backend_error.take() {
@@ -5046,7 +5186,7 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if !progress {
-                let external = self.exit_memory_pending() || !self.file_layouts.is_empty() || self.processes.values().any(|p| {
+                let external = self.exit_memory_pending() || !self.file_layouts.is_empty() || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
                     p.retained_file.is_some() || p.file_checkpoint.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
@@ -5232,12 +5372,13 @@ impl<C: Cpu> Kernel<C> {
         }
         if sockets.is_empty()
             && native_fds.is_empty()
-            && self.processes.values().any(|p| {
-                p.linux.vfs.has_native_event_sources()
-                    || p.byte_wait
-                        .as_ref()
-                        .is_some_and(|wait| wait.notification_external())
-            })
+            && (!self.proc_owner_waits.is_empty()
+                || self.processes.values().any(|p| {
+                    p.linux.vfs.has_native_event_sources()
+                        || p.byte_wait
+                            .as_ref()
+                            .is_some_and(|wait| wait.notification_external())
+                }))
         {
             // Native completion retains an unpark token, including when it
             // arrives after the last ready check but before this park.
@@ -5412,6 +5553,8 @@ pub(super) fn run<C: Cpu>(
         syscalls: 0,
         proc_refreshes: 0,
         proc_maps: RefCell::new(BTreeMap::new()),
+        proc_source: None,
+        proc_owner_waits: Vec::new(),
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
         load: [0.0; 3],
@@ -5431,6 +5574,7 @@ pub(super) fn run<C: Cpu>(
     // that never touch /proc. Subsequent full snapshots are demand-driven.
     kernel.refresh_proc(1, &mut root, host_memory);
     kernel.proc_refreshes += 1;
+    kernel.install_proc_source(&root, io.host_memory_source());
     kernel.publish_task(1, &root);
     kernel.processes.insert(1, Box::new(root));
     let result = kernel.drive(io, limit);
@@ -7089,6 +7233,8 @@ mod tests {
             syscalls: 0,
             proc_refreshes: 0,
             proc_maps: RefCell::new(BTreeMap::new()),
+            proc_source: None,
+            proc_owner_waits: Vec::new(),
             profile_syscalls: false,
             idle: Duration::ZERO,
             load: [0.0; 3],
@@ -7486,6 +7632,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proc_image_bodies_read_original_live_spans_and_updated_environment() {
+        let mut k = kernel();
+        let mut p = process();
+        p.memory.set_image_ranges(trames_memory::ImageRanges {
+            arguments: (0x2000, 0x2008),
+            environment: (0x2008, 0x200e),
+        });
+        p.memory.write(0x2000, b"one\0two\0X=old\0").unwrap();
+        p.linux.arguments = vec![b"stale host argv".to_vec()];
+        p.linux.environment = vec![b"STALE=host vector".to_vec()];
+        p.linux.argument_pointers = vec![0x3000];
+        let mut io = trames_linux::CapturedOutput::default();
+        let mut read = |p: &mut Process, path: &[u8], mutate: Option<(u64, &[u8])>| {
+            let mut name = path.to_vec();
+            name.push(0);
+            p.memory.write(0x1000, &name).unwrap();
+            k.call(1, p, 56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0], &mut io);
+            let fd = p.cpu.x(0);
+            assert!(fd < 256);
+            if let Some((at, bytes)) = mutate {
+                p.memory.write(at, bytes).unwrap();
+            }
+            k.call(1, p, 63, [fd, 0x1100, 128, 0, 0, 0], &mut io);
+            let count = p.cpu.x(0) as usize;
+            assert!(count <= 128);
+            let mut bytes = vec![0; count];
+            p.memory.read(0x1100, &mut bytes).unwrap();
+            k.call(1, p, 57, [fd, 0, 0, 0, 0, 0], &mut io);
+            bytes
+        };
+        assert_eq!(read(&mut p, b"/proc/self/cmdline", None), b"one\0two\0");
+        assert_eq!(
+            read(&mut p, b"/proc/self/environ", Some((0x2008, b"X=new\0"))),
+            b"X=new\0"
+        );
+        assert_eq!(
+            read(
+                &mut p,
+                b"/proc/self/cmdline",
+                Some((0x2000, b"long title\0"))
+            ),
+            b"long title\0"
+        );
+    }
     #[test]
     fn cmdline_observations_keep_live_bytes_through_aliases_and_unseen_pids() {
         fn read(

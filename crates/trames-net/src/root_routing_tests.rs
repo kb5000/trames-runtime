@@ -79,7 +79,19 @@ fn large_native_tcp_send_is_a_short_byte_write_while_udp_stays_atomic() {
     server.listen(1).unwrap();
     let mut peer = TcpStream::connect(server.local_addr().unwrap()).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let (accepted, _) = server.accept().unwrap();
+    // A completed client connect need not have reached the nonblocking listener
+    // yet on macOS. This setup wait is outside the short-write assertion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let accepted = loop {
+        match server.accept() {
+            Ok((socket, _)) => break socket,
+            Err(NetError(11)) => {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
     assert!(accepted.is_stream());
     let payload = vec![0x6b; MAX_TRANSFER * 3 + 17];
     let sent = accepted.send(&payload, 0, None).unwrap();

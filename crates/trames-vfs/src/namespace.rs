@@ -186,7 +186,7 @@ impl Vfs {
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
-        let (path, node) = self.metadata_target(dirfd, path, true)?;
+        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, true)?;
         path.writable()?;
         self.chmod_node(node, mode, true)
     }
@@ -197,7 +197,7 @@ impl Vfs {
         mode: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let (path, node) = self.metadata_target(dirfd, path, !nofollow)?;
+        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, !nofollow)?;
         path.writable()?;
         if matches!(node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));

@@ -340,6 +340,7 @@ impl Anonymous {
                 native_retryable: std::sync::atomic::AtomicBool::new(r.permissions.write),
                 native_one_shot: std::sync::atomic::AtomicBool::new(true),
                 native_live_private: std::sync::atomic::AtomicBool::new(false),
+                proc_anonymous: std::sync::atomic::AtomicBool::new(true),
                 error: None,
                 bytes,
                 charge: resident.charge.clone(),

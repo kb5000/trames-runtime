@@ -111,8 +111,15 @@ mod network_io;
 pub use network_io::{DirectNetwork, DirectTcpFd, NetworkEpoch};
 mod oom;
 mod overlay;
+mod proc_file;
+mod proc_image;
+pub use proc_image::ProcImage;
+mod proc_source;
 mod pseudo;
 pub use oom::OomTask;
+pub use proc_source::{
+    ProcCounters, ProcDirectory, ProcQuery, ProcResources, ProcSource, ProcTask, ProcessView,
+};
 mod pty;
 pub mod terminal;
 pub use pty::{Pty, PtyEnd, PtyIo, PtySlaveEndpoint, TerminalAccess};
@@ -120,6 +127,7 @@ mod storage;
 #[cfg(test)]
 mod storage_tests;
 pub use credentials::Credentials;
+pub use linux_namespace::{NamespaceProjection, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -206,23 +214,24 @@ pub enum FdKind {
 }
 struct OpenDescription {
     shared: Arc<SharedOpenDescription>,
-    position: u64,
     anonymous: Option<events::Anonymous>,
     namespace: Option<linux_namespace::NamespaceHandle>,
-    oom: Option<std::sync::Weak<OomTask>>,
-    network_control: Option<network::Control>,
-    mount_file: Option<Rc<mounts::watch::MountFile>>,
     mount: Option<OpenMount>,
 }
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Legacy ancillary, task and mount control projections retain owner ownership.
 struct SharedOpenDescription {
+    oom: Option<std::sync::Weak<OomTask>>,
+    network_control: Option<network::Control>,
+    mount_file: Option<Arc<mounts::watch::MountFile>>,
+    runtime_file: Option<Arc<proc_file::ProcFile>>,
     socket: Option<Arc<NetSocket>>,
     _disk_file: Option<Arc<std::fs::File>>,
     #[cfg(all(feature = "hostfs", unix))]
     host_file: Option<Arc<hostfs::OpenFile>>,
     native_image: Option<Arc<dyn trames_graphics::Image>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
+    mount_use: std::sync::OnceLock<mounts::MountUse>,
     directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
     namespace_resource: Option<linux_namespace::SharedNamespace>,
     file_authority: std::sync::OnceLock<file_io::PublishedFile>,
@@ -245,6 +254,14 @@ struct SharedOpenDescription {
     bridge: Option<std::sync::Arc<trames_bridge::Connection>>,
     kernel_log: Option<Arc<kernel_log::Kmsg>>,
     notification: Option<Arc<FileClose>>,
+}
+impl SharedOpenDescription {
+    fn proc_control(&self) -> bool {
+        self.oom.is_some()
+            || self.network_control.is_some()
+            || self.mount_file.is_some()
+            || self.runtime_file.is_some()
+    }
 }
 impl std::ops::Deref for OpenDescription {
     type Target = SharedOpenDescription;
@@ -290,15 +307,7 @@ impl OpenDescription {
         if let Some(log) = &self.kernel_log {
             return log.position();
         }
-        if self.data_node().is_some_and(|n| {
-            let n = n.borrow();
-            matches!(n.content, Content::Directory)
-                || !n.volatile && matches!(n.content, Content::File(_))
-        }) {
-            self.file_position.lock().unwrap().value
-        } else {
-            self.position
-        }
+        self.file_position.lock().unwrap().value
     }
     fn data_node(&self) -> Option<NodeRef> {
         self.read_node.clone().or_else(|| self.node.clone())
@@ -321,6 +330,7 @@ enum Content {
 }
 type NodeRef = Arc<Inode>;
 struct Inode {
+    proc_node: std::sync::OnceLock<proc_source::ProcNode>,
     regular_file: bool,
     active_file_work: std::sync::atomic::AtomicUsize,
     metadata: std::sync::Mutex<()>,
@@ -348,6 +358,7 @@ impl Inode {
         node.identity = trames_memory::new_backing_identity();
         Self {
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
+            proc_node: Default::default(),
             active_file_work: std::sync::atomic::AtomicUsize::new(0),
             metadata: std::sync::Mutex::new(()),
             simple_device: simple_device::Kind::content(&node.content),
@@ -516,8 +527,26 @@ impl Node {
         path
     }
 }
-type ResolvedInode = (NodeRef, Vec<u8>, Option<Rc<Mount>>);
-type ResolvedEntry = (ResolvedPath, Option<ResolvedInode>);
+struct ResolvedInode {
+    node: NodeRef,
+    label: Vec<u8>,
+    mount: Option<Arc<Mount>>,
+    // Acceptance retains the original resource until its operation finishes.
+    // Neither the inode cache nor a long-lived query view owns these leases.
+    file: Option<Arc<SharedOpenDescription>>,
+    _image: Option<Arc<ExecutableFile>>,
+    _directory: Option<mounts::MountUse>,
+}
+struct MetadataTarget {
+    path: ResolvedPath,
+    node: NodeRef,
+    _magic: Option<ResolvedInode>,
+}
+enum ResolvedTarget {
+    Inode(ResolvedInode),
+    Descriptor(OpenHandle),
+}
+type ResolvedEntry = (ResolvedPath, Option<ResolvedTarget>);
 struct Filesystem {
     shared_budget: trames_shared::SharedBudget,
     paths: BTreeMap<Vec<u8>, NodeRef>,
@@ -543,7 +572,7 @@ impl Filesystem {
 /// Process snapshot fields actually consumed by a proc lookup. Unknown paths
 /// stay conservative; independent kernel endpoints never enumerate tasks/RSS.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProcRefresh(u8);
+pub struct ProcRefresh(u16);
 #[allow(non_upper_case_globals)]
 impl ProcRefresh {
     pub const Independent: Self = Self(0);
@@ -554,12 +583,31 @@ impl ProcRefresh {
     pub const Arguments: Self = Self(1 | 1 << 4);
     pub const Descriptors: Self = Self(1 | 1 << 5);
     pub const Residency: Self = Self(1 | 1 << 6);
-    pub const Full: Self = Self((1 << 7) - 1);
+    pub const Paths: Self = Self(1 | 1 << 7);
+    pub const Namespaces: Self = Self(1 | 1 << 8);
+    pub const Directories: Self = Self(1 | 1 << 10);
+    const Content: Self = Self(1 << 9);
+    pub const Full: Self = Self((1 << 11) - 1);
 
     fn includes(self, fields: Self) -> bool {
         self.0 & fields.0 == fields.0
     }
     pub fn for_path(path: &[u8]) -> Self {
+        if [b"/cwd".as_slice(), b"/root"]
+            .iter()
+            .any(|tail| path.ends_with(tail))
+        {
+            return Self::Directories;
+        }
+        if path.ends_with(b"/exe") {
+            return Self::Paths;
+        }
+        if path.split(|&c| c == b'/').any(|part| part == b"ns")
+            || path.ends_with(b"/mounts")
+            || path.ends_with(b"/mountinfo")
+        {
+            return Self::Namespaces;
+        }
         if path == b"/proc/sys/fs/file-nr" {
             return Self::Descriptors;
         }
@@ -644,6 +692,24 @@ impl ProcRefresh {
     pub fn residency(self) -> bool {
         self.includes(Self::Residency)
     }
+    pub fn paths(self) -> bool {
+        self.includes(Self::Paths)
+    }
+    pub fn namespaces(self) -> bool {
+        self.includes(Self::Namespaces)
+    }
+    pub fn directories(self) -> bool {
+        self.includes(Self::Directories)
+    }
+    pub fn content(self) -> bool {
+        self.includes(Self::Content)
+    }
+    pub fn with_content(self) -> Self {
+        self.merge(Self::Content)
+    }
+    pub fn lookup(self) -> Self {
+        Self(self.0 & (1 | 1 << 5 | 1 << 7 | 1 << 8 | 1 << 10))
+    }
 }
 
 pub struct Vfs {
@@ -663,9 +729,9 @@ pub struct Vfs {
     pid_ns: PidNamespace,
     pid_children: PidNamespace,
     mounts: Option<MountNamespace>,
-    mount_registry: Rc<RefCell<Vec<Weak<Mount>>>>,
+    mount_registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>>,
     mount_resources: Rc<RefCell<Vec<std::sync::Weak<mounts::MountIdentity>>>>,
-    detached_mounts: Rc<RefCell<Vec<Vec<Rc<Mount>>>>>,
+    detached_mounts: Rc<RefCell<Vec<Vec<Arc<Mount>>>>>,
     pub credentials: Credentials,
     pseudo: Rc<RefCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
@@ -679,6 +745,7 @@ pub struct Vfs {
     next_open: Arc<AtomicU64>,
     proc_accessed: Cell<bool>,
     proc_refresh: Cell<ProcRefresh>,
+    source_observed: Cell<Option<proc_source::Observation>>,
     ptys: Arc<std::sync::Mutex<BTreeMap<u32, std::sync::Weak<Pty>>>>,
     embedding_terminal: Rc<Cell<bool>>,
     pub controlling_terminal: Option<u32>,
@@ -759,6 +826,7 @@ impl Vfs {
             next_open: self.next_open.clone(),
             proc_accessed: self.proc_accessed.clone(),
             proc_refresh: self.proc_refresh.clone(),
+            source_observed: Cell::new(None),
             ptys: self.ptys.clone(),
             embedding_terminal: self.embedding_terminal.clone(),
             controlling_terminal: self.controlling_terminal,
@@ -773,7 +841,7 @@ impl Vfs {
         let pid_ns = PidNamespace::default();
         let root_network = Arc::new(linux_namespace::RootNetwork::default());
         let network = root_network.network.borrow().clone();
-        let mount_registry: Rc<RefCell<Vec<Weak<Mount>>>> = Rc::default();
+        let mount_registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>> = Rc::default();
         // Only this owner/control view uses this Rc registry. Query islands
         // construct a fresh one before sharing canonical fs_struct resources.
         let mut context = FsContext::default();
@@ -815,6 +883,7 @@ impl Vfs {
             next_open: Arc::new(AtomicU64::new(1)),
             proc_accessed: Cell::new(false),
             proc_refresh: Cell::new(ProcRefresh::Independent),
+            source_observed: Cell::new(None),
             bridge: None,
         }
     }
@@ -848,12 +917,17 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            oom: None,
+                            network_control: None,
+                            mount_file: None,
+                            runtime_file: None,
                             socket: None,
                             _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
                             file_authority: Default::default(),
@@ -876,12 +950,8 @@ impl Default for Vfs {
                             kernel_log: None,
                             notification: None,
                         }),
-                        position: 0,
                         anonymous: None,
                         namespace: None,
-                        network_control: None,
-                        mount_file: None,
-                        oom: None,
                         mount: None,
                     }),
                     cloexec: (false).into(),
@@ -1198,12 +1268,17 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            oom: None,
+                            network_control: None,
+                            mount_file: None,
+                            runtime_file: None,
                             socket: None,
                             _disk_file: None,
                             #[cfg(all(feature = "hostfs", unix))]
                             host_file: None,
                             native_image: None,
                             mount_resource: std::sync::OnceLock::new(),
+                            mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
                             file_authority: Default::default(),
@@ -1226,12 +1301,8 @@ impl Vfs {
                             kernel_log: None,
                             notification: None,
                         }),
-                        position: 0,
                         anonymous: None,
                         namespace: None,
-                        network_control: None,
-                        mount_file: None,
-                        oom: None,
                         mount: None,
                     }),
                     cloexec: (false).into(),
@@ -1269,6 +1340,7 @@ impl Vfs {
         } else {
             let i = path.iter().rposition(|b| *b == b'/').ok_or(Errno(2))?;
             let parent = self.node(&ResolvedPath {
+                proc_binding: None,
                 key: path[..i.max(1)].to_vec(),
                 mount: path.mount.clone(),
             })?;
@@ -1357,6 +1429,7 @@ impl Vfs {
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<NodeRef> {
         let key = path.key();
         if let Some(query) = &self.query {
+            query.pin_mount(path.mount());
             if path
                 .mount()
                 .is_some_and(|m| !path_queries::ordinary_mount(m))
@@ -1440,17 +1513,27 @@ impl Vfs {
             .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
     }
     fn base(&self, dirfd: i32) -> Result<ResolvedPath> {
-        if dirfd == AT_FDCWD {
+        let path = if dirfd == AT_FDCWD {
             let paths = self.context.paths.borrow();
-            return self.location(paths.cwd_node.as_ref().ok_or(Errno(2))?, &paths.cwd_mount);
+            self.location(paths.cwd_node.as_ref().ok_or(Errno(2))?, &paths.cwd_mount)?
+        } else {
+            let o_descriptor = self.descriptor(dirfd as u32)?;
+            let o = o_descriptor.open.borrow();
+            let n = o.node.as_ref().ok_or(Errno(20))?;
+            if !matches!(n.borrow().content, Content::Directory) {
+                return Err(Errno(20));
+            }
+            self.location(n, &self.mount_for_path(o.mount.as_ref()))?
+        };
+        if path
+            .proc_binding
+            .as_ref()
+            .and_then(|p| p.at(&path, self.proc_namespace(&path).id()))
+            .is_some_and(|p| !p.target.present())
+        {
+            return Err(Errno(3));
         }
-        let o_descriptor = self.descriptor(dirfd as u32)?;
-        let o = o_descriptor.open.borrow();
-        let n = o.node.as_ref().ok_or(Errno(20))?;
-        if !matches!(n.borrow().content, Content::Directory) {
-            return Err(Errno(20));
-        }
-        self.location(n, &self.mount_for_path(o.mount.as_ref()))
+        Ok(path)
     }
     pub fn resolve(&self, dirfd: i32, path: &[u8]) -> Result<ResolvedPath> {
         self.resolve_final(dirfd, path, true)
@@ -1514,18 +1597,30 @@ impl Vfs {
         self.resolve_entry(dirfd, path, follow_final, false)
             .map(|entry| entry.0)
     }
-    fn metadata_target(
-        &self,
-        dirfd: i32,
-        path: &[u8],
-        follow: bool,
-    ) -> Result<(ResolvedPath, NodeRef)> {
+    fn metadata_target(&self, dirfd: i32, path: &[u8], follow: bool) -> Result<MetadataTarget> {
         let (path, magic) = self.resolve_entry(dirfd, path, follow, true)?;
-        if let Some((node, label, mount)) = magic {
-            Ok((ResolvedPath { key: label, mount }, node))
+        let magic = match magic {
+            Some(ResolvedTarget::Inode(file)) => Some(file),
+            Some(ResolvedTarget::Descriptor(open)) => Some(self.proc_open_node(&open, &path)?),
+            None => None,
+        };
+        if let Some(file) = &magic {
+            Ok(MetadataTarget {
+                path: ResolvedPath {
+                    proc_binding: None,
+                    key: file.label.clone(),
+                    mount: file.mount.clone(),
+                },
+                node: file.node.clone(),
+                _magic: magic,
+            })
         } else {
             let node = self.node(&path)?;
-            Ok((path, node))
+            Ok(MetadataTarget {
+                path,
+                node,
+                _magic: None,
+            })
         }
     }
     fn resolve_entry(
@@ -1546,6 +1641,7 @@ impl Vfs {
         policy: u64,
         stop_magic: bool,
     ) -> Result<ResolvedEntry> {
+        self.begin_proc_query();
         if path.is_empty() {
             return Err(Errno(2));
         }
@@ -1618,51 +1714,90 @@ impl Vfs {
                 return Err(Errno(36));
             }
             current = self.follow_mounts(current)?;
+            self.bind_proc_path(&mut current)?;
             Self::check_resolve_mount(&parent, &current, policy)?;
             if !parts.is_empty() || follow_final || trailing {
                 if policy & (2 | 4 | 8 | 16) != 0 && self.is_proc_magic_link(&current) {
                     return Err(Errno(40));
                 }
-                // An nsfs magic link names a kernel object, not a pathname such
-                // as "uts:[123]". Leave the canonical endpoint for open/stat.
+                // An nsfs magic link names an original kernel object, not its
+                // display label. Accept that object once for open/metadata.
                 if parts.is_empty()
                     && !trailing
-                    && self.uses_pseudo(&current)
-                    && self.namespace_for_path(&current)?.is_some()
+                    && (self.uses_pseudo(&current)
+                        || current
+                            .mount
+                            .as_ref()
+                            .is_some_and(|m| m.namespace.is_some()))
                 {
-                    if policy & 1 != 0 {
-                        return Err(Errno(18));
+                    if let Some(namespace) = self.namespace_for_path(&current)? {
+                        if policy & 1 != 0 {
+                            return Err(Errno(18));
+                        }
+                        let target = retain_magic.then(|| {
+                            ResolvedTarget::Descriptor(self.namespace_description(
+                                namespace,
+                                current.mount.clone().map(OpenMount::Owner),
+                            ))
+                        });
+                        return Ok((current, target));
                     }
-                    return Ok((current, None));
                 }
-                if stop_magic
-                    && parts.is_empty()
-                    && !trailing
-                    && self.uses_pseudo(&current)
-                    && (self.proc_fd_description_normalized(&current)?.is_some()
-                        || self.proc_exe_node_normalized(&current)?.is_some())
-                {
-                    // Reopening/stat of an anonymous FD retains its full OFD,
-                    // even when no inode can represent it (pipes, sockets).
-                    return Ok((current, None));
-                }
-                if self.uses_pseudo(&current) && (retain_magic || !parts.is_empty()) {
-                    if let Some((node, label, mount)) = self.proc_magic_node_normalized(&current)? {
+                if stop_magic && parts.is_empty() && !trailing && self.uses_pseudo(&current) {
+                    if let Some(open) = self.proc_fd_description_normalized(&current)? {
                         Self::check_resolve_mount(
                             &current,
                             &ResolvedPath {
-                                key: label.clone(),
-                                mount: mount.clone(),
+                                key: Vec::new(),
+                                proc_binding: None,
+                                mount: self.mount_for_path(open.borrow().mount.as_ref()),
                             },
                             policy,
                         )?;
-                        if parts.is_empty() && !trailing {
-                            return Ok((current, Some((node, label, mount))));
+                        return Ok((current, Some(ResolvedTarget::Descriptor(open))));
+                    }
+                    if let Some(file) = self.proc_exe_node_normalized(&current)? {
+                        Self::check_resolve_mount(
+                            &current,
+                            &ResolvedPath {
+                                key: file.label.clone(),
+                                proc_binding: None,
+                                mount: file.mount.clone(),
+                            },
+                            policy,
+                        )?;
+                        return Ok((current, Some(ResolvedTarget::Inode(file))));
+                    }
+                }
+                let directory = if self.uses_pseudo(&current) && !retain_magic && parts.is_empty() {
+                    self.proc_directory_node_normalized(&current)?
+                } else {
+                    None
+                };
+                if self.uses_pseudo(&current)
+                    && (retain_magic || !parts.is_empty() || directory.is_some())
+                {
+                    let magic = match directory {
+                        Some(directory) => Some(directory),
+                        None => self.proc_magic_node_normalized(&current)?,
+                    };
+                    if let Some(file) = magic {
+                        Self::check_resolve_mount(
+                            &current,
+                            &ResolvedPath {
+                                proc_binding: None,
+                                key: file.label.clone(),
+                                mount: file.mount.clone(),
+                            },
+                            policy,
+                        )?;
+                        if parts.is_empty() && !trailing && retain_magic {
+                            return Ok((current, Some(ResolvedTarget::Inode(file))));
                         }
-                        if !matches!(node.borrow().content, Content::Directory) {
+                        if !matches!(file.node.borrow().content, Content::Directory) {
                             return Err(Errno(20));
                         }
-                        current = self.location(&node, &mount)?;
+                        current = self.location(&file.node, &file.mount)?;
                         continue;
                     }
                 }
@@ -1740,14 +1875,13 @@ impl Vfs {
                 return Err(Errno(2));
             }
             let description = self.descriptor(dirfd as u32)?.open.clone();
-            if let FdKind::Node(path) = &description.borrow().kind {
-                self.check_proc_inspection(
-                    &ResolvedPath {
-                        key: path.clone(),
-                        mount: self.mount_for_path(description.borrow().mount.as_ref()),
-                    },
-                    true,
-                )?;
+            if let Some(path) = self.proc_description_path(&description.borrow()) {
+                self.begin_proc_query();
+                self.refresh_proc_source(&path)?;
+                self.check_proc_inspection(&path, true)?;
+                if let Some(target) = self.proc_directory_readlink(&path)? {
+                    return Ok(target);
+                }
             }
             self.refresh_pseudo_fd(dirfd as u32)?;
             let open = description.borrow();
@@ -1759,6 +1893,9 @@ impl Vfs {
         }
         let dest = self.resolve_final(dirfd, path, false)?;
         self.check_proc_inspection(&dest, true)?;
+        if let Some(target) = self.proc_directory_readlink(&dest)? {
+            return Ok(target);
+        }
         let node = self.node(&dest)?;
         let n = node.borrow();
         match &n.content {
@@ -2109,53 +2246,103 @@ impl Vfs {
             self.resolve_entry_policy(dirfd, plain, true, false, policy, false)?;
             return Err(Errno(21));
         }
-        if policy == 0 {
-            if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
-                return Ok(fd);
-            }
-        }
         let membership = self
             .query
             .as_ref()
             .map_or_else(|| self.shared_files(), |q| q.files.clone());
-        let mut reservation = membership.reserve()?;
-        let (p, _) = self.resolve_entry_policy(
+        let reservation = membership.reserve()?;
+        let (mut p, target) = self.resolve_entry_policy(
             dirfd,
             path,
             flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0,
-            policy != 0,
+            true,
             policy,
-            false,
+            true,
         )?;
-        // Only NO_XDEV alone can follow a final magic link. Validate the entire
-        // traversal first; syscall execution serializes namespace mutations.
-        if policy == 1 {
-            drop(reservation);
-            if let Some(fd) = self.open_proc_fd(dirfd, path, flags)? {
-                return Ok(fd);
+        let magic = match target {
+            Some(ResolvedTarget::Inode(file)) => Some(file),
+            Some(ResolvedTarget::Descriptor(open)) => {
+                let original = open.borrow();
+                if original.node.is_none() || original.namespace_resource.is_some() {
+                    drop(original);
+                    return self.reopen_proc_description(open, flags, publication, reservation);
+                }
+                drop(original);
+                Some(self.proc_open_node(&open, &p)?)
             }
-            reservation = membership.reserve()?;
-        }
+            None => None,
+        };
+        let forced_node = if let Some(file) = &magic {
+            // Reopen the original inode through the ordinary open algorithm.
+            // The accepted resource stays alive until this fresh OFD is ready.
+            p = self
+                .location(&file.node, &file.mount)
+                .unwrap_or(ResolvedPath {
+                    key: file.label.clone(),
+                    proc_binding: file
+                        .node
+                        .proc_node
+                        .get()
+                        .and_then(|proc| proc.binding.clone()),
+                    mount: file.mount.clone(),
+                });
+            Some(file.node.clone())
+        } else {
+            None
+        };
         if flags & O_PATH == 0 {
             self.check_proc_inspection(&p, false)?;
         }
-        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
-            p.writable()?;
-        }
-        let oom = self.oom_for_path(&p);
-        let network_control = self.network_control(&p);
-        if oom.is_none()
-            && network_control.is_none()
-            && self.uses_pseudo(&p)
-            && self.pseudo_readonly(&p)
-            && (flags & 3 != 0 || flags & 0x240 != 0)
-        {
-            return Err(Errno(30));
-        }
-        let mut existed = match self.node(&p) {
+        let original = magic.as_ref().and_then(|m| m.file.as_ref());
+        let oom = original
+            .and_then(|o| o.oom.clone())
+            .or_else(|| self.oom_for_path(&p));
+        let network_control = original
+            .and_then(|o| o.network_control.clone())
+            .or_else(|| self.network_control(&p));
+        let mount_file = (flags & O_PATH == 0)
+            .then(|| self.proc_mount_file(&p))
+            .flatten();
+        let check_write = || -> Result<()> {
+            if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
+                p.writable()?;
+            }
+            if oom.is_none()
+                && network_control.is_none()
+                && self.uses_pseudo(&p)
+                && self.pseudo_readonly(&p)
+                && (flags & 3 != 0 || flags & 0x240 != 0)
+            {
+                return Err(Errno(30));
+            }
+            Ok(())
+        };
+        let mut runtime_file = None;
+        let mut existed = match forced_node.clone().map_or_else(|| self.node(&p), Ok) {
             Ok(node) => {
+                if flags & 0xc0 == 0xc0 {
+                    return Err(Errno(17));
+                }
+                check_write()?;
+                let proc_regular = {
+                    let n = node.borrow();
+                    n.volatile && matches!(n.content, Content::File(_))
+                };
+                if flags & (O_PATH | 3) == 0
+                    && oom.is_none()
+                    && network_control.is_none()
+                    && mount_file.is_none()
+                    && proc_regular
+                {
+                    runtime_file = self.proc_runtime_file(&p);
+                }
                 if let Some(query) = &self.query {
                     let n = node.borrow();
+                    // O_NOFOLLOW errors need no owner-only file capability.
+                    // Decide before classifying whether a data open is shared.
+                    if flags & O_PATH == 0 && matches!(n.content, Content::Symlink(_)) {
+                        return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
+                    }
                     let pty = p
                         .mount
                         .as_ref()
@@ -2170,8 +2357,14 @@ impl Vfs {
                         };
                     if !pty
                         && node.simple_device.is_none()
+                        && oom.is_none()
+                        && network_control.is_none()
+                        && mount_file.is_none()
+                        && runtime_file.is_none()
+                        && !(node.proc_node.get().is_some()
+                            && (flags & O_PATH != 0 || matches!(n.content, Content::Directory)))
                         && (n.volatile
-                            || n.seals.is_some()
+                            || n.seals.is_some() && magic.as_ref().is_none_or(|m| m.file.is_none())
                             || !matches!(n.content, Content::File(_) | Content::Directory))
                     {
                         return query.defer();
@@ -2182,8 +2375,8 @@ impl Vfs {
             Err(Errno(2)) => false,
             Err(e) => return Err(e),
         };
-        if existed && flags & 0xc0 == 0xc0 {
-            return Err(Errno(17));
+        if !existed {
+            check_write()?;
         }
         #[cfg(all(feature = "hostfs", unix))]
         let mut created_host_file = None;
@@ -2221,7 +2414,7 @@ impl Vfs {
                 }
             }
         }
-        let node = self.node(&p)?;
+        let node = forced_node.map_or_else(|| self.node(&p), Ok)?;
         {
             let n = node.borrow();
             self.check_device_open(&n, flags)?;
@@ -2235,7 +2428,7 @@ impl Vfs {
                 return Err(Errno(6));
             }
             if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
-                return Err(Errno(40));
+                return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
             }
             if matches!(n.content, Content::Directory) && flags & 3 != 0 {
                 return Err(Errno(21));
@@ -2287,12 +2480,12 @@ impl Vfs {
                 .transpose()?
                 .flatten(),
         };
+        let truncate = flags & 0x200 != 0
+            && !Self::cgroup_mount(&p)
+            && oom.is_none()
+            && network_control.is_none();
         if self.query.is_none() {
-            if flags & 0x200 != 0
-                && !Self::cgroup_mount(&p)
-                && oom.is_none()
-                && network_control.is_none()
-            {
+            if truncate {
                 let mut n = node.borrow_mut();
                 if let Content::File(b) = &mut n.content {
                     b.truncate(0)?;
@@ -2366,12 +2559,11 @@ impl Vfs {
         } else {
             None
         };
-        let mount_file = if flags & O_PATH == 0 {
-            self.proc_mount_file(&p)
+        let notification = if let Some(original) = original {
+            inotify::FileClose::reopen(&node, flags, original.notification.as_ref())
         } else {
-            None
+            self.notification_open(&p, &node, flags)
         };
-        let notification = self.notification_open(&p, &node, flags);
         let read_node = if flags & O_PATH == 0 && flags & 3 == 0 {
             match &node.borrow().content {
                 Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
@@ -2386,12 +2578,17 @@ impl Vfs {
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    oom,
+                    network_control,
+                    mount_file,
+                    runtime_file,
                     socket: None,
                     _disk_file: disk_file,
                     #[cfg(all(feature = "hostfs", unix))]
                     host_file,
                     native_image: None,
                     mount_resource: std::sync::OnceLock::new(),
+                    mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: None,
                     file_authority: Default::default(),
@@ -2427,18 +2624,14 @@ impl Vfs {
                     kernel_log,
                     notification,
                 }),
-                position: 0,
                 mount: p.mount.map(OpenMount::Owner),
                 anonymous: None,
                 namespace: None,
-                network_control,
-                mount_file,
-                oom,
             }),
             cloexec: (flags & O_CLOEXEC != 0).into(),
         };
         if let Some(query) = &self.query {
-            if flags & 0x200 != 0 || query.capture_open {
+            if truncate || query.capture_open {
                 let OpenHandle::Shared(shared) = &descriptor.open else {
                     return query.defer();
                 };
@@ -2729,18 +2922,29 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(file) = &o.mount_file {
-            let bytes = file.read(o.position, count);
-            o.position += bytes.len() as u64;
+            let mut position = o.file_position.lock().unwrap();
+            let bytes = file.read(position.value, count);
+            position.value += bytes.len() as u64;
+            return Ok(bytes);
+        }
+        if let Some(file) = &o.runtime_file {
+            let mut position = o.file_position.lock().unwrap();
+            let bytes = file.read(position.value, count)?;
+            position.value += bytes.len() as u64;
             return Ok(bytes);
         }
         if let Some(control) = &o.network_control {
-            let data = control.read(o.position, count);
-            o.position += data.len() as u64;
+            let mut position = o.file_position.lock().unwrap();
+            let data = control.read(position.value, count);
+            position.value += data.len() as u64;
             return Ok(data);
         }
-        if let Some(data) = Self::oom_read(&o, o.position, count)? {
-            o.position += data.len() as u64;
-            return Ok(data);
+        if o.oom.is_some() {
+            let mut position = o.file_position.lock().unwrap();
+            if let Some(data) = Self::oom_read(&o, position.value, count)? {
+                position.value += data.len() as u64;
+                return Ok(data);
+            }
         }
         if let Some(events::SharedControl::Cgroup(file)) = &o.control {
             let mut position = o.file_position.lock().unwrap();
@@ -2880,7 +3084,7 @@ impl Vfs {
         offset: Option<u64>,
     ) -> Result<usize> {
         let file_size_limit = self.file_size_limit.get();
-        let mut o = descriptor.open.borrow_mut();
+        let o = descriptor.open.borrow();
         if let Some(mount) = &o.mount {
             mount.writable()?;
         }
@@ -2890,13 +3094,14 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(control) = &o.network_control {
+            let mut position = o.file_position.lock().unwrap();
             let count = control.write(
                 bytes,
-                offset.unwrap_or(o.position),
+                offset.unwrap_or(position.value),
                 self.credentials.euid == 0 || self.credentials.has_cap(capabilities::NET_ADMIN),
             )?;
             if offset.is_none() {
-                o.position += count as u64;
+                position.value += count as u64;
             }
             return Ok(count);
         }
@@ -3089,6 +3294,9 @@ impl Vfs {
         if let Some(file) = &o.mount_file {
             return Ok(file.read(offset, count));
         }
+        if let Some(file) = &o.runtime_file {
+            return file.read(offset, count);
+        }
         if let Some(control) = &o.network_control {
             return Ok(control.read(offset, count));
         }
@@ -3142,7 +3350,7 @@ impl Vfs {
         Self::seek_description(&o_descriptor, offset, whence)
     }
     fn seek_description(o_descriptor: &Descriptor, offset: i64, whence: u32) -> Result<u64> {
-        let mut o = o_descriptor.open.borrow_mut();
+        let o = o_descriptor.open.borrow();
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
@@ -3154,7 +3362,7 @@ impl Vfs {
             };
         }
         if matches!(o.anonymous, Some(events::Anonymous::Signal(_))) {
-            return Ok(o.position);
+            return Ok(o.file_position.lock().unwrap().value);
         }
         if o.kind == FdKind::Terminal {
             return Err(Errno(29));
@@ -3181,16 +3389,9 @@ impl Vfs {
             }
         };
         let mut file_position = o.file_position.lock().unwrap();
-        let regular = o.oom.is_none() && o.network_control.is_none() && o.mount_file.is_none();
         let base = match whence {
             0 => 0,
-            1 => {
-                if regular {
-                    file_position.value as i64
-                } else {
-                    o.position as i64
-                }
-            }
+            1 => file_position.value as i64,
             2 => length as i64,
             _ => return Err(Errno(22)),
         };
@@ -3198,13 +3399,7 @@ impl Vfs {
             .checked_add(offset)
             .filter(|&n| n >= 0)
             .ok_or(Errno(22))?;
-        if regular {
-            file_position.value = new as u64;
-        }
-        drop(file_position);
-        if !regular {
-            o.position = new as u64;
-        }
+        file_position.value = new as u64;
         Ok(new as u64)
     }
     fn stat_node(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
@@ -3244,6 +3439,7 @@ impl Vfs {
         out[32..40].copy_from_slice(&rdev.to_le_bytes());
         let size = match &node.content {
             Content::File(b) if !node.volatile => b.len(),
+            Content::Symlink(_) if node.volatile && node.device == 2 => 0,
             Content::Symlink(target) => target.len() as u64,
             _ => 0,
         };
@@ -3294,6 +3490,7 @@ impl Vfs {
                     prefix.push(b'/');
                 }
                 let at = ResolvedPath {
+                    proc_binding: None,
                     key: path,
                     mount: self.mount_for_path(mount),
                 };
@@ -3328,15 +3525,26 @@ impl Vfs {
         path: &[u8],
         nofollow: bool,
     ) -> Result<([u8; 128], u64)> {
-        if !nofollow {
-            if let Some(open) = self.proc_fd_description(dirfd, path)? {
+        let (p, magic) =
+            self.resolve_entry_policy(dirfd, path, !nofollow, !nofollow, 0, !nofollow)?;
+        match magic {
+            Some(ResolvedTarget::Descriptor(open)) => {
                 let open = open.borrow();
                 return self
                     .stat_open(&open)
-                    .map(|stat| (stat, open.mount.as_ref().map_or(17, |m| m.id)));
+                    .map(|stat| (stat, Self::open_mount_id(&open)));
             }
+            Some(ResolvedTarget::Inode(file)) => {
+                let id = file.mount.as_ref().map_or(1, |m| m.id);
+                return self
+                    .stat_inode(
+                        &file.node,
+                        file.mount.clone().map(OpenMount::Owner).as_ref(),
+                    )
+                    .map(|stat| (stat, id));
+            }
+            None => {}
         }
-        let p = self.resolve_final(dirfd, path, !nofollow)?;
         let id = p.mount.as_ref().map_or(1, |m| m.id);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &p.filesystem(self).host {
@@ -3357,7 +3565,19 @@ impl Vfs {
         self.stat_open(&open)
             .map(|stat| (stat, Self::open_mount_id(&open)))
     }
+    fn namespace_stat(id: u64) -> [u8; 128] {
+        let mut stat = [0; 128];
+        stat[..8].copy_from_slice(&17u64.to_le_bytes());
+        stat[8..16].copy_from_slice(&id.to_le_bytes());
+        stat[16..20].copy_from_slice(&0o100444u32.to_le_bytes());
+        stat[20..24].copy_from_slice(&1u32.to_le_bytes());
+        stat[56..60].copy_from_slice(&4096u32.to_le_bytes());
+        stat
+    }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
+        if let Some(namespace) = &o.namespace_resource {
+            return Ok(Self::namespace_stat(namespace.id()));
+        }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(file) = &o.host_file {
             return file.stat();
@@ -3502,6 +3722,13 @@ impl Vfs {
             return Err(Errno(20));
         }
         let p = self.location(node, &self.mount_for_path(o.mount.as_ref()))?;
+        if p.proc_binding
+            .as_ref()
+            .and_then(|scope| scope.at(&p, self.proc_namespace(&p).id()))
+            .is_some_and(|scope| !scope.target.present())
+        {
+            return Ok(Vec::new());
+        }
         let filesystem = p.filesystem(self);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {

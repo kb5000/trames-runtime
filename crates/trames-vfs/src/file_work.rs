@@ -6,6 +6,76 @@ use super::*;
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
+    fn proc_read(&self, command: &FileCommand) -> Option<proc_file::ProcRead> {
+        let FileCommand::Read { count, offset } = command else {
+            return None;
+        };
+        let open = &self.0.open;
+        let file = open.runtime_file.as_ref()?;
+        if !file.live_payload() {
+            return None;
+        }
+        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
+            return Some(proc_file::ProcRead::Complete(Err(Errno(9))));
+        }
+        if let Some(offset) = offset {
+            return Some(if *offset > i64::MAX as u64 {
+                proc_file::ProcRead::Complete(Err(Errno(22)))
+            } else {
+                file.read_payload(*offset, *count)
+            });
+        }
+        let mut position = open.file_position.lock().unwrap();
+        let result = file.read_payload(position.value, *count);
+        if let proc_file::ProcRead::Complete(Ok(bytes)) = &result {
+            position.value += bytes.len() as u64;
+        }
+        Some(result)
+    }
+    fn waits(&self, command: &FileCommand) -> bool {
+        matches!(command, FileCommand::Transfer(t) if t.borrow().waits())
+            || matches!(command, FileCommand::Read { .. })
+                && self
+                    .0
+                    .open
+                    .runtime_file
+                    .as_ref()
+                    .is_some_and(|file| file.live_payload())
+    }
+    /// Finish through the caller's existing mm before FileOutput can overwrite
+    /// its source. None leaves both guest output and the original f_pos intact.
+    pub fn proc_read_local(
+        &self,
+        command: &FileCommand,
+        memory: &impl trames_memory::CpuMemory,
+    ) -> Option<Result<FileValue>> {
+        let FileCommand::Read { count, offset } = command else {
+            return None;
+        };
+        let open = &self.0.open;
+        let file = open.runtime_file.as_ref()?;
+        if !file.live_payload() {
+            return None;
+        }
+        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
+            return Some(Err(Errno(9)));
+        }
+        if let Some(offset) = offset {
+            if *offset > i64::MAX as u64 {
+                return Some(Err(Errno(22)));
+            }
+            return file
+                .read_local(*offset, *count, memory)
+                .map(|r| r.map(FileValue::Bytes));
+        }
+        let mut position = open.file_position.lock().unwrap();
+        file.read_local(position.value, *count, memory).map(|r| {
+            r.map(|bytes| {
+                position.value += bytes.len() as u64;
+                FileValue::Bytes(bytes)
+            })
+        })
+    }
     pub fn status_flags(&self) -> u32 {
         self.0.open.flags.get()
     }
@@ -92,7 +162,9 @@ impl SharedFd {
     }
     pub fn file_target(&self) -> Option<FileTarget> {
         let open = &self.open;
-        if open.control.is_some() || !open.node.as_ref().is_some_and(|node| node.regular_file) {
+        if open.control.is_some()
+            || !open.proc_control() && !open.node.as_ref().is_some_and(|node| node.regular_file)
+        {
             return None;
         }
         Some(FileTarget(self.clone()))
@@ -171,6 +243,7 @@ pub struct FileWork {
     open: Option<Box<PreparedOpen>>,
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
+    proc_wait: Vec<trames_memory::MemoryRead>,
 }
 struct FileActive(Arc<Inode>);
 impl Drop for FileActive {
@@ -197,19 +270,38 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
-    pub fn transfer_waiting(&self) -> bool {
-        matches!(&self.command,FileCommand::Transfer(t) if t.borrow().waits())
+    pub fn waiting(&self) -> bool {
+        !self.proc_wait.is_empty()
+            || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
-    pub fn transfer_ready(&self) -> bool {
+    pub fn ready(&self) -> bool {
         match &self.command {
             FileCommand::Transfer(t) => t.borrow().ready(),
-            _ => true,
+            _ => self.proc_wait.iter().all(|page| page.ready()),
         }
     }
-    pub fn transfer_wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+    pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
         match &self.command {
             FileCommand::Transfer(t) => t.borrow().wait_sources(signal),
-            _ => unreachable!("transfer wait"),
+            _ => Ok(TransferWait {
+                subscriptions: self.proc_wait.iter().map(|p| p.subscribe(signal)).collect(),
+                native: Vec::new(),
+                deadline: None,
+            }),
+        }
+    }
+    fn proc_outcome(result: proc_file::ProcRead, work: impl FnOnce() -> Self) -> FileOutcome {
+        match result {
+            proc_file::ProcRead::Complete(result) => FileOutcome::Complete(FileReply {
+                result: result.map(FileValue::Bytes),
+                file_size_signal: false,
+                scratch: None,
+            }),
+            proc_file::ProcRead::Waiting(pages) => {
+                let mut work = work();
+                work.proc_wait = pages;
+                FileOutcome::Waiting(work)
+            }
         }
     }
     pub fn transfer_native_fds(&self) -> Vec<HostFd> {
@@ -256,6 +348,7 @@ impl FileWork {
             open: None,
             sync_targets: None,
             namespace: None,
+            proc_wait: Vec::new(),
         }
     }
     pub fn host_work(&self) -> bool {
@@ -277,6 +370,7 @@ impl FileWork {
             open: None,
             sync_targets: None,
             namespace: None,
+            proc_wait: Vec::new(),
         }
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
@@ -290,6 +384,7 @@ impl FileWork {
             open: None,
             sync_targets: None,
             namespace: None,
+            proc_wait: Vec::new(),
         }
     }
     pub fn queued(mut self) -> Self {
@@ -338,10 +433,11 @@ impl FileWork {
     /// Joined caller execution, with the same original VFS ownership contract.
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
     pub fn run_owned(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
+        if let Some(result) = target.proc_read(&command) {
+            return Self::proc_outcome(result, || Self::from_vfs(vfs, target, command));
+        }
         let result = command.execute_target(vfs, &target);
-        if result.as_ref().is_err_and(|e| e.0 == 11)
-            && matches!(&command,FileCommand::Transfer(t) if t.borrow().waits())
-        {
+        if result.as_ref().is_err_and(|e| e.0 == 11) && target.waits(&command) {
             return FileOutcome::Waiting(Self::from_vfs(vfs, target, command));
         }
         let signal = vfs.take_file_size_signal();
@@ -362,11 +458,12 @@ impl FileWork {
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileOutcome {
+        if let Some(result) = target.proc_read(&command) {
+            return Self::proc_outcome(result, || Self::new(paths, target, command));
+        }
         match paths.file_command(&target, &command, false) {
             Some((result, signal)) => {
-                if result.as_ref().is_err_and(|e| e.0 == 11)
-                    && matches!(&command,FileCommand::Transfer(t) if t.borrow().waits())
-                {
+                if result.as_ref().is_err_and(|e| e.0 == 11) && target.waits(&command) {
                     return FileOutcome::Waiting(Self::new(paths, target, command));
                 }
                 let scratch = match &mut command {
@@ -397,6 +494,13 @@ impl FileWork {
         self
     }
     pub fn run(mut self) -> FileOutcome {
+        if let Some(result) = self
+            .target
+            .as_ref()
+            .and_then(|target| target.proc_read(&self.command))
+        {
+            return Self::proc_outcome(result, || self);
+        }
         if let Some(namespace) = &self.namespace {
             return match namespace.run(&self.paths) {
                 Some(result) => FileOutcome::Complete(FileReply {
@@ -430,7 +534,7 @@ impl FileWork {
         };
         match reply {
             Some((mut result, signal)) => {
-                if result.as_ref().is_err_and(|e| e.0 == 11) && self.transfer_waiting() {
+                if result.as_ref().is_err_and(|e| e.0 == 11) && self.waiting() {
                     return FileOutcome::Waiting(self);
                 }
                 if result.is_ok() {

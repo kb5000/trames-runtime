@@ -1632,6 +1632,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         snapshot.direct.swap_disk_cache(&mut file_cache);
                     }
                     let stats = &mut job.stats;
+                    if let Some(snapshot) = &work.syscalls {
+                        snapshot.io_signals.proc_view.account(elapsed, index);
+                    }
                     stats.elapsed += elapsed;
                     stats.after = after;
                     stats.worker = index;

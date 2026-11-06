@@ -16,10 +16,46 @@ pub(super) struct Authority {
     pub(super) file_layout_exclusive: bool,
     pub(super) capture_open: bool,
     pub(super) open_work: Rc<RefCell<Option<file_work::PreparedOpen>>>,
+    pub(super) namespace_uses: ActiveMounts,
     // Keep the private weak mount registry alive, including detached mounts.
-    _mounts: Vec<Rc<Mount>>,
+    _mounts: Vec<Arc<Mount>>,
+}
+#[derive(Default)]
+pub(super) struct ActiveMounts {
+    active: Cell<bool>,
+    uses: RefCell<Vec<mounts::MountUse>>,
+}
+// A cloned control view is not a second execution of an in-flight operation.
+impl Clone for ActiveMounts {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+impl ActiveMounts {
+    pub(super) fn begin(&self) {
+        self.active.set(true);
+    }
+    pub(super) fn finish(&self) -> Vec<mounts::MountUse> {
+        self.active.set(false);
+        std::mem::take(&mut *self.uses.borrow_mut())
+    }
+    fn pin(&self, mount: Option<&Arc<Mount>>) {
+        if !self.active.get() {
+            return;
+        }
+        let Some(mount) = mount else {
+            return;
+        };
+        let mut uses = self.uses.borrow_mut();
+        if !uses.iter().any(|usage| usage.is_for(&mount.identity)) {
+            uses.push(mounts::MountUse::new(mount.identity.clone()));
+        }
+    }
 }
 impl Authority {
+    pub(super) fn pin_mount(&self, mount: Option<&Arc<Mount>>) {
+        self.namespace_uses.pin(mount);
+    }
     pub(super) fn file_root(vfs: &Vfs) -> Self {
         Self {
             files: vfs.shared_files(),
@@ -32,6 +68,7 @@ impl Authority {
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
+            namespace_uses: ActiveMounts::default(),
             _mounts: Vec::new(),
         }
     }
@@ -47,6 +84,7 @@ impl Authority {
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
+            namespace_uses: ActiveMounts::default(),
             _mounts: Vec::new(),
         }
     }
@@ -87,11 +125,14 @@ impl Authority {
             return self.defer();
         };
         let file = file?;
-        if file
-            .open
-            .node
-            .as_ref()
-            .is_some_and(|n| n.simple_device.is_none() && n.borrow().volatile)
+        if file.open.node.as_ref().is_some_and(|n| {
+            let state = n.borrow();
+            n.simple_device.is_none()
+                && state.volatile
+                && !(n.proc_node.get().is_some()
+                    && (file.open.flags.get() & O_PATH != 0
+                        || matches!(state.content, Content::Directory)))
+        }) && !file.open.proc_control()
             && !file
                 .open
                 .mount_resource
@@ -112,7 +153,13 @@ pub(super) fn ordinary_mount(mount: &Mount) -> bool {
     }
     matches!(
         mount.kind,
-        mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Overlay | mounts::Kind::Cgroup
+        mounts::Kind::Root
+            | mounts::Kind::Tmpfs
+            | mounts::Kind::Overlay
+            | mounts::Kind::Cgroup
+            | mounts::Kind::Proc
+            | mounts::Kind::Sysfs
+            | mounts::Kind::Nsfs
     ) || cfg!(all(feature = "hostfs", unix)) && host_mount(mount)
 }
 #[cfg(all(feature = "hostfs", unix))]
@@ -130,9 +177,9 @@ pub struct PathQueries {
     pub(super) view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
-// afresh, including mount projections, pseudo state, dummy FD table and namespaces.
-// Canonical cwd/root resources cross only through their original Arc fs_struct;
-// its PathsStore always constructs fresh private Rc mount projections.
+// afresh, including pseudo state, dummy FD table and private registry containers.
+// Mount topology and namespace authority are original synchronized Arc resources.
+// Canonical cwd/root resources cross through their original Arc fs_struct.
 // Source resources cross only as their existing Send+Sync Arc capabilities,
 // including the actual pseudo inode cache and synchronized cgroup resource
 // graph. No owner Process/CPU/Memory or unsynchronized task projection crosses.
@@ -150,28 +197,32 @@ unsafe impl Send for PathQueries {}
 impl Vfs {
     pub fn path_queries(&self) -> PathQueries {
         let mut view = Vfs::empty(self.fs.clone());
-        let mut mounts = BTreeMap::new();
-        let mut project =
-            |mount: &Rc<Mount>| Mount::query_projection(mount.shared.clone(), &mut mounts);
         view.context.share_paths(&self.context);
-        if let Some(namespace) = &self.mounts {
-            let table = namespace.0.borrow();
-            view.mounts = Some(MountNamespace(Rc::new(RefCell::new(mounts::Table {
-                events: table.events.clone(),
-                id: table.id,
-                root: project(&table.root),
-                mounts: table.mounts.iter().map(&mut project).collect(),
-            }))));
+        view.mounts = self
+            .mounts
+            .as_ref()
+            .map(|n| MountNamespace(Arc::new(SharedCell::new(mounts::Table::project(&n.0)))));
+        let mut mounts = BTreeMap::new();
+        if let Some(namespace) = &view.mounts {
+            for mount in &namespace.0.borrow().mounts {
+                mounts.insert(Arc::as_ptr(&mount.shared) as usize, mount.clone());
+            }
         }
         let registry: Vec<_> = self
             .mount_registry
             .borrow()
             .iter()
-            .filter_map(Weak::upgrade)
-            .map(|m| project(&m))
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|mount| Mount::query_projection(mount.shared.clone(), &mut mounts))
             .collect();
-        *view.mount_registry.borrow_mut() = registry.iter().map(Rc::downgrade).collect();
+        *view.mount_registry.borrow_mut() = registry.iter().map(Arc::downgrade).collect();
         view.credentials = self.credentials.clone();
+        view.uts = self.uts.clone();
+        view.network = self.network.clone();
+        view.root_network = self.root_network.clone();
+        view.ipc_namespace = self.ipc_namespace.clone();
+        view.pid_children = self.pid_children.clone();
+        view.embedding_terminal.set(self.embedding_terminal.get());
         view.cgroups = self.cgroups.clone();
         view.pid = self.pid;
         view.pid_ns = self.pid_ns.clone();
@@ -189,6 +240,9 @@ impl Vfs {
             let mut pseudo = view.pseudo.borrow_mut();
             pseudo.enabled = source.enabled;
             pseudo.nodes = source.nodes.clone();
+            pseudo.source = source.source.clone();
+            pseudo.boot_id = source.boot_id.clone();
+            pseudo.video_device = source.video_device;
         }
         view.query = Some(Authority {
             files: self
@@ -207,7 +261,8 @@ impl Vfs {
             file_layout_exclusive: false,
             capture_open: false,
             open_work: Default::default(),
-            _mounts: mounts.into_values().collect(),
+            namespace_uses: ActiveMounts::default(),
+            _mounts: registry,
         });
         PathQueries {
             view: RefCell::new(view),
@@ -332,6 +387,7 @@ impl PathQueries {
         self.query(|view| {
             // Accept once, before output validation. The deciding operation
             // retains this original OFD even if another worker reuses its FD.
+            view.begin_proc_query();
             let descriptor = view.descriptor(fd)?;
             preflight()?;
             view.getdents_description(&descriptor, count)

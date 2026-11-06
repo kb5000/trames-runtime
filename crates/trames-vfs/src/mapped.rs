@@ -623,7 +623,7 @@ impl MappedData {
 #[derive(Clone)]
 enum MappingMount {
     Shared(Arc<mounts::MountIdentity>),
-    Owner(Rc<Mount>),
+    Owner(Arc<Mount>),
 }
 impl MappingMount {
     fn new(mount: &OpenMount) -> Self {
@@ -1451,7 +1451,7 @@ mod tests {
                 let open = descriptor.open.borrow();
                 (open.node.clone().unwrap(), open.mount.clone())
             };
-            let weak = Rc::downgrade(&v.mount_for_path(mount.as_ref()).unwrap());
+            let weak = Arc::downgrade(&v.mount_for_path(mount.as_ref()).unwrap());
             let resource = Arc::downgrade(&mount.as_ref().unwrap().identity);
             let mapping = FileMapping::create(
                 v.descriptor(fd).unwrap().open,
@@ -1541,7 +1541,7 @@ mod tests {
         assert!(resource.upgrade().is_none());
     }
     #[test]
-    fn mapping_under_namespace_control_retains_owner_and_has_no_worker_lease() {
+    fn mapping_under_namespace_control_retains_original_shared_authority() {
         let mut v = Vfs::default();
         v.set_runtime_info(
             1,
@@ -1564,7 +1564,7 @@ mod tests {
         v.mount(Some(b"/data"), b"/namespace", None, 4096, None)
             .unwrap();
         let fd = v.open_at(AT_FDCWD, b"/namespace", 2, 0).unwrap();
-        assert!(v.shared_files().lookup(fd).is_none());
+        assert!(v.shared_files().lookup(fd).is_some());
         drop(v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap());
         let (node, mount) = {
             let descriptor = v.descriptor(fd).unwrap();
@@ -1574,7 +1574,7 @@ mod tests {
                 MappingMount::new(open.mount.as_ref().unwrap()),
             )
         };
-        assert!(matches!(mount, MappingMount::Owner(_)));
+        assert!(matches!(mount, MappingMount::Shared(_)));
         let mapping = FileMapping::create(
             v.descriptor(fd).unwrap().open,
             node,
@@ -1584,7 +1584,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(mapping.writer.as_ref().unwrap().shared().is_none());
+        assert!(mapping.writer.as_ref().unwrap().shared().is_some());
         v.close(fd).unwrap();
         drop(v);
         assert!(control.upgrade().is_some());

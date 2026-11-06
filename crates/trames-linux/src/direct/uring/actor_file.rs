@@ -5,6 +5,8 @@ use trames_vfs::{FileCommand, FileOutcome, FileTarget, FileValue, FileWork};
 
 pub(super) struct FileIo {
     pub(super) result: Arc<crate::FileResult>,
+    pub(super) wait_revision: u64,
+    waiting: Option<FileWork>,
     parts: Vec<(u64, usize)>,
     buffer: Option<Arc<trames_memory::PinnedBuffer>>,
     address: u64,
@@ -46,8 +48,27 @@ impl UringActor {
     }
 }
 impl FileIo {
+    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+        match &self.waiting {
+            Some(work) => {
+                work.wait_sources(signal)
+                    .expect("data reads subscribe to original memory resources")
+                    .subscriptions
+            }
+            None => vec![self.result.subscribe(signal)],
+        }
+    }
+    fn take_outcome(&mut self) -> Option<FileOutcome> {
+        if let Some(work) = &self.waiting {
+            if !work.ready() {
+                return None;
+            }
+            return Some(self.waiting.take().unwrap().run());
+        }
+        self.result.take()
+    }
     fn finish(
-        &self,
+        &mut self,
         outcome: FileOutcome,
         request: &Request,
         memory: &mut impl CpuMemory,
@@ -55,7 +76,11 @@ impl FileIo {
         signal: Option<&Arc<dyn trames_vfs::TaskSignal>>,
     ) -> Result<(i32, bool)> {
         match outcome {
-            FileOutcome::Waiting(_) => unreachable!("io_uring has no stream transfer command"),
+            FileOutcome::Waiting(work) => {
+                self.waiting = Some(work);
+                self.wait_revision = self.wait_revision.wrapping_add(1);
+                Err(Errno(11))
+            }
             FileOutcome::Owner(_) => unreachable!("io_uring data work has no namespace command"),
             FileOutcome::Layout(work) => {
                 actor.layouts.lock().unwrap().push(UringFileLayout {
@@ -176,8 +201,8 @@ pub(super) fn execute(
     actor: &UringActor,
     ring: &Uring,
 ) -> Option<Result<(i32, bool)>> {
-    if let Some(io) = &call.file {
-        return Some(match io.result.take() {
+    if let Some(io) = &mut call.file {
+        return Some(match io.take_outcome() {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
         });
@@ -187,12 +212,27 @@ pub(super) fn execute(
         Ok(parameters) => parameters,
         Err(e) => return Some(Err(e)),
     };
-    let io = FileIo {
+    let mut io = FileIo {
         result: Arc::default(),
+        wait_revision: 0,
+        waiting: None,
         parts,
         buffer: request.buffer.clone(),
         address: request.sqe.address(),
     };
+    if let Some(result) = file.proc_read_local(&command, memory) {
+        return Some(io.finish(
+            FileOutcome::Complete(trames_vfs::FileReply {
+                result,
+                file_size_signal: false,
+                scratch: None,
+            }),
+            request,
+            memory,
+            actor,
+            execution.signal.as_ref(),
+        ));
+    }
     let native = file.host_work(&command);
     if request.nowait() && native {
         return Some(Err(Errno(11)));
@@ -235,10 +275,20 @@ pub(super) fn execute(
             Some(FileWork::run_inline(&paths, file, command))
         }
     };
-    if request.nowait() && matches!(outcome, Some(FileOutcome::Layout(_))) {
+    if request.nowait()
+        && matches!(
+            outcome,
+            Some(FileOutcome::Layout(_) | FileOutcome::Waiting(_))
+        )
+    {
         return Some(Err(Errno(11)));
     }
-    if queued || matches!(outcome, Some(FileOutcome::Layout(_))) {
+    if queued
+        || matches!(
+            outcome,
+            Some(FileOutcome::Layout(_) | FileOutcome::Waiting(_))
+        )
+    {
         let result = match outcome {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
@@ -267,8 +317,8 @@ pub(super) fn open(
     mode: u32,
     policy: u64,
 ) -> Option<Result<(i32, bool)>> {
-    if let Some(io) = &call.file {
-        return Some(match io.result.take() {
+    if let Some(io) = &mut call.file {
+        return Some(match io.take_outcome() {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution.signal.as_ref()),
             None => Err(Errno(11)),
         });
@@ -288,8 +338,10 @@ pub(super) fn open(
             None => paths.take_open_work()?,
         }
     };
-    let io = FileIo {
+    let mut io = FileIo {
         result: Arc::default(),
+        wait_revision: 0,
+        waiting: None,
         parts: Vec::new(),
         buffer: None,
         address: 0,

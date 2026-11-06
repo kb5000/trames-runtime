@@ -20,6 +20,21 @@ pub(super) enum SlotOpen {
 pub(super) struct Slot {
     pub(super) open: SlotOpen,
     pub(super) cloexec: CloseOnExec,
+    pub(super) proc: Option<ProcMetadata>,
+}
+#[derive(Clone)]
+pub(super) struct ProcMetadata {
+    open: std::sync::Weak<SharedOpenDescription>,
+    label: Option<Vec<u8>>,
+    namespace: bool,
+    mount: Option<std::sync::Weak<mounts::MountData>>,
+}
+pub(super) struct ProcDescriptor {
+    pub fd: u32,
+    pub descriptor: Descriptor,
+    pub label: Option<Vec<u8>>,
+    pub namespace: bool,
+    pub mount: Option<Arc<mounts::MountData>>,
 }
 impl Slot {
     pub(super) fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
@@ -36,6 +51,22 @@ impl Slot {
     }
     fn from_descriptor(d: &Descriptor) -> Self {
         Self {
+            proc: matches!(d.open, OpenHandle::Owner(_)).then(|| {
+                let open = d.open.borrow();
+                ProcMetadata {
+                    open: Arc::downgrade(&open.shared),
+                    label: open
+                        .namespace
+                        .as_ref()
+                        .map(linux_namespace::NamespaceHandle::label)
+                        .or_else(|| open.anonymous.as_ref().map(|a| a.name().to_vec())),
+                    namespace: open.namespace.is_some(),
+                    mount: open.mount.as_ref().map(|m| match m {
+                        OpenMount::Owner(m) => Arc::downgrade(&m.shared),
+                        OpenMount::Shared(m) => Arc::downgrade(m),
+                    }),
+                }
+            }),
             open: match &d.open {
                 OpenHandle::Shared(open) => SlotOpen::Shared(open.clone()),
                 OpenHandle::Owner(_) => {
@@ -227,6 +258,7 @@ impl ReservedFd {
                     self.fd,
                     Slot {
                         open: SlotOpen::Shared(open),
+                        proc: None,
                         cloexec: descriptor.cloexec
                     }
                 )
@@ -270,6 +302,7 @@ impl ReservedPair {
                 fd,
                 Slot {
                     open: SlotOpen::Shared(open),
+                    proc: None,
                     cloexec: descriptor.cloexec,
                 },
             );
@@ -298,6 +331,37 @@ pub(super) enum PollOpen {
     Epoll(Arc<SharedOpenDescription>),
 }
 impl SharedFiles {
+    pub(super) fn proc_descriptions(&self) -> Vec<ProcDescriptor> {
+        let entries = self.0.entries.lock().unwrap();
+        entries
+            .iter()
+            .filter_map(|(&fd, slot)| {
+                let (open, label, namespace, mount) = match &slot.open {
+                    SlotOpen::Shared(open) => (open.clone(), None, false, None),
+                    SlotOpen::Owner(..) => {
+                        let metadata = slot.proc.as_ref()?;
+                        (
+                            metadata.open.upgrade()?,
+                            metadata.label.clone(),
+                            metadata.namespace,
+                            metadata.mount.as_ref().and_then(std::sync::Weak::upgrade),
+                        )
+                    }
+                };
+                let descriptor = Descriptor {
+                    open: OpenHandle::Shared(open),
+                    cloexec: slot.cloexec.clone(),
+                };
+                descriptor.ready().is_ok().then_some(ProcDescriptor {
+                    fd,
+                    descriptor,
+                    label,
+                    namespace,
+                    mount,
+                })
+            })
+            .collect()
+    }
     fn closed(&self) -> bool {
         self.0.owners.load(Ordering::Relaxed) == 0
     }
@@ -598,6 +662,7 @@ impl SharedFiles {
             fd,
             Slot {
                 open: SlotOpen::Shared(open),
+                proc: None,
                 cloexec: cloexec.into(),
             },
         );
@@ -638,6 +703,7 @@ impl SharedFiles {
                 new,
                 Slot {
                     open: SlotOpen::Shared(open),
+                    proc: None,
                     cloexec: (flags & O_CLOEXEC != 0).into(),
                 },
             );

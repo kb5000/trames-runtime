@@ -30,7 +30,7 @@ impl Eq for OfdIdentity {}
 
 #[derive(Clone)]
 pub(super) enum OpenMount {
-    Owner(Rc<Mount>),
+    Owner(Arc<Mount>),
     Shared(Arc<mounts::MountData>),
 }
 impl std::ops::Deref for OpenMount {
@@ -105,28 +105,26 @@ impl OpenDescription {
         let namespace = shared
             .namespace_resource
             .as_ref()
-            .map(linux_namespace::SharedNamespace::owner_projection);
+            .and_then(linux_namespace::SharedNamespace::owner_projection);
         Self {
             shared,
-            position: 0,
             anonymous,
-
             namespace,
-            oom: None,
-            network_control: None,
-            mount_file: None,
             mount,
         }
     }
     /// Metadata-only admission for remaining owner controls. The weak lease
     /// cannot extend last-close life or publish a complete shared OFD.
     pub(super) fn query_metadata(&self) -> Option<std::sync::Weak<SharedOpenDescription>> {
-        if matches!(
-            self.namespace_resource,
-            Some(linux_namespace::SharedNamespace::Net(_))
-        ) {
-            // A bound nsfs open retains owner mount control, but network
-            // identity lookup needs only this immutable shared capability.
+        if self.namespace_resource.is_some() {
+            // A bound nsfs open retains its original owner control. Numeric
+            // nsfs/mount metadata alone does not grant a complete description.
+            if let Some(mount) = &self.mount {
+                self.mount_resource.get_or_init(|| match mount {
+                    OpenMount::Owner(mount) => mount.shared.clone(),
+                    OpenMount::Shared(mount) => mount.clone(),
+                });
+            }
             return Some(Arc::downgrade(&self.shared));
         }
         let node = self.node.as_ref()?.borrow();
@@ -146,13 +144,14 @@ impl OpenDescription {
         }
         Some(Arc::downgrade(&self.shared))
     }
-    fn shareable(&self) -> bool {
+    pub(super) fn shareable(&self) -> bool {
         if matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
             || self.anonymous.is_some() && self.control.is_none()
             || self.namespace.is_some() && self.namespace_resource.is_none()
-            || self.oom.is_some()
-            || self.network_control.is_some()
-            || self.mount_file.is_some()
+            || self
+                .namespace_resource
+                .as_ref()
+                .is_some_and(|namespace| !namespace.complete())
         {
             return false;
         }
@@ -164,6 +163,10 @@ impl OpenDescription {
 }
 impl OpenHandle {
     pub(super) fn new(open: OpenDescription) -> Self {
+        if let Some(mount) = &open.mount {
+            open.mount_use
+                .get_or_init(|| mounts::MountUse::new(mount.identity.clone()));
+        }
         if open.shareable() {
             let mount = match &open.mount {
                 None => Some(None),
@@ -288,7 +291,7 @@ mod tests {
             let open = descriptor.open.borrow();
             let mount = open.mount.as_ref().unwrap();
             (
-                Rc::downgrade(&v.mount_for_path(Some(mount)).unwrap()),
+                Arc::downgrade(&v.mount_for_path(Some(mount)).unwrap()),
                 Arc::downgrade(open.mount_resource.get().unwrap()),
                 Arc::downgrade(&mount.fs.shared),
                 Arc::downgrade(open.node.as_ref().unwrap()),

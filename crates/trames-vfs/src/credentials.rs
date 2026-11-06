@@ -339,7 +339,7 @@ impl Vfs {
         gid: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let (path, node) = self.metadata_target(dirfd, path, !nofollow)?;
+        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, !nofollow)?;
         path.writable()?;
         self.chown_node(node, uid, gid, true)
     }

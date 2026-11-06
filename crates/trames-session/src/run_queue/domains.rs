@@ -66,6 +66,7 @@ struct Entry<C: Cpu> {
     notified: bool,
     owned: bool,
     mm_only: bool,
+    proc_reads: bool,
     requested: Option<Instant>,
     quiescent: Option<Instant>,
 }
@@ -78,6 +79,7 @@ pub(super) struct Domains<C: Cpu> {
 pub(crate) struct Checkpoint<C: Cpu> {
     pub ids: BTreeSet<u64>,
     pub mm_only: bool,
+    pub proc_reads: bool,
     pub jobs: Vec<Box<Job<C>>>,
     pub requested: Instant,
     pub quiescent: Instant,
@@ -108,6 +110,7 @@ impl<C: Cpu> Domains<C> {
             notified: false,
             owned: false,
             mm_only: false,
+            proc_reads: false,
             requested: None,
             quiescent: None,
         });
@@ -152,6 +155,14 @@ impl<C: Cpu> Domains<C> {
             entry.quiescent = None;
             entry.domain.pause();
         }
+    }
+    pub fn pause_proc_reads(&mut self, pid: u32) -> bool {
+        let Some(&id) = self.tasks.get(&pid) else {
+            return false;
+        };
+        self.pause_bytes(id);
+        self.entries.get_mut(&id).unwrap().proc_reads = true;
+        true
     }
     pub fn running(&mut self, pid: u32) {
         let entry = self.entry(pid);
@@ -272,6 +283,7 @@ impl<C: Cpu> Domains<C> {
                 .collect();
             return Some(Checkpoint::<C> {
                 mm_only: ids.iter().all(|id| self.entries[id].mm_only),
+                proc_reads: ids.iter().any(|id| self.entries[id].proc_reads),
                 ids,
                 jobs,
                 requested,
@@ -293,6 +305,7 @@ impl<C: Cpu> Domains<C> {
             entry.domain.pause();
             entry.owned = true;
             entry.mm_only = checkpoint.mm_only;
+            entry.proc_reads = checkpoint.proc_reads;
             entry.requested = Some(checkpoint.requested);
             entry.quiescent = Some(checkpoint.quiescent);
         } else {
@@ -356,6 +369,7 @@ impl<C: Cpu> Domains<C> {
             entry.domain.paused.store(false, Ordering::Relaxed);
             entry.requested = None;
             entry.quiescent = None;
+            entry.proc_reads = false;
             ready.append(&mut entry.jobs);
         }
         // Give preempted peers their first claim before the mapping callers.

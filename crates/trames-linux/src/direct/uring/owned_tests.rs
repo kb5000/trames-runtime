@@ -67,6 +67,180 @@ impl trames_vfs::SignalReader for SignalQueue {
     }
 }
 #[test]
+fn proc_image_reads_use_original_mm_for_fixed_fds_vectors_and_registered_buffers() {
+    use std::sync::atomic::Ordering;
+    use trames_vfs::{ProcRefresh, ProcSource, ProcTask, ProcessInfo, ProcessView, RuntimeInfo};
+    struct Task {
+        view: Weak<ProcessView>,
+        identity: u64,
+    }
+    impl ProcTask for Task {
+        fn identity(&self) -> u64 {
+            self.identity
+        }
+        fn pid(&self) -> u32 {
+            7
+        }
+        fn observe(&self, demand: ProcRefresh, residency: Option<usize>) -> Option<ProcessInfo> {
+            self.view
+                .upgrade()?
+                .observe_with_residency(demand, residency)
+        }
+        fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
+            self.view.upgrade()?.memory_report()
+        }
+    }
+    struct Source(Arc<Task>);
+    impl ProcSource for Source {
+        fn observe(&self, query: trames_vfs::ProcQuery<'_>) -> RuntimeInfo {
+            RuntimeInfo {
+                processes: self.0.observe(query.demand, None).into_iter().collect(),
+                ..Default::default()
+            }
+        }
+        fn task(&self, pid: u32) -> Option<Arc<dyn ProcTask>> {
+            (pid == 7).then(|| self.0.clone() as Arc<dyn ProcTask>)
+        }
+    }
+    for title in [false, true] {
+        for same_mm in [false, true] {
+            for op in [22, 1, 4] {
+                for offset in [0u64, 2] {
+                    let (mut l, mut m, ring_fd, ring) = setup(8);
+                    let mut remote = Memory::default();
+                    remote.map(0x1000, PAGE_SIZE * 4, Permissions::RW).unwrap();
+                    let image = if same_mm { &mut m } else { &mut remote };
+                    image.write(0x3ff8, b"cmd\0A=1\0B=2\0").unwrap();
+                    if title {
+                        image.write(0x3ff8, b"changed-title\0").unwrap();
+                    }
+                    image.set_image_ranges(trames_memory::ImageRanges {
+                        arguments: (0x3ff8, 0x3ffc),
+                        environment: (0x3ffc, 0x4004),
+                    });
+                    let report = image.memory_report();
+                    let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let count = activations.clone();
+                    report.bind_read_waker(Arc::new(move |_| {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }));
+                    let process = Arc::new(ProcessView::default());
+                    process.publish_with_memory(
+                        &ProcessInfo {
+                            pid: 7,
+                            tgid: 7,
+                            ..Default::default()
+                        },
+                        l.vfs.proc_resources(),
+                        Some(report),
+                    );
+                    l.vfs.set_proc_source(Arc::new(Source(Arc::new(Task {
+                        identity: process.identity(),
+                        view: Arc::downgrade(&process),
+                    }))));
+                    let path = if title {
+                        b"/proc/7/cmdline".as_slice()
+                    } else {
+                        b"/proc/7/environ".as_slice()
+                    };
+                    let file = l
+                        .vfs
+                        .path_queries()
+                        .open_at_resolve(-100, path, 0, 0, 0, &trames_vfs::DirectFiles::default())
+                        .unwrap()
+                        .unwrap();
+                    let alias = l.vfs.dup(file, 32, false).unwrap();
+                    register_files(&mut l, &mut m, ring_fd, &[file as i32]);
+                    let mut entry = if op == 1 {
+                        for (at, value) in [
+                            (0x2000, 0x3000u64),
+                            (0x2008, 3),
+                            (0x2010, 0x3100),
+                            (0x2018, 5),
+                        ] {
+                            m.write_array(at, value.to_le_bytes()).unwrap();
+                        }
+                        data(op, 0, 0x2000, 2, 91, 1)
+                    } else {
+                        data(op, 0, 0x3000, 8, 91, 1)
+                    };
+                    if op == 4 {
+                        register_buffers(&mut l, &mut m, ring_fd, 0x3000, 8);
+                    }
+                    entry[8..16].copy_from_slice(&offset.to_le_bytes());
+                    l.vfs.close(file).unwrap();
+                    assert_eq!(l.vfs.eventfd(1, 0).unwrap(), file);
+                    add(&mut m, &ring, entry);
+                    let mut epoch = UringEpoch::default();
+                    let snapshot = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
+                    snapshot.ensure_context(
+                        Some(&l.vfs.path_queries()),
+                        Some(&l.vfs.descriptor_factory()),
+                        &trames_vfs::DirectFiles::default(),
+                        None,
+                        None,
+                    );
+                    let mut attempt = start(&snapshot, ring_fd, 1, 1, &mut m);
+                    let mut rounds = 0;
+                    loop {
+                        match attempt {
+                            IoAttempt::Complete(value) => {
+                                assert_eq!(value, Ok(1));
+                                break;
+                            }
+                            IoAttempt::Blocked(wait) => {
+                                assert!(!same_mm, "caller-mm bytes need no activation");
+                                rounds += 1;
+                                assert!(
+                                    rounds <= if title { 2 } else { 1 },
+                                    "one wake per newly discovered dependency batch"
+                                );
+                                assert!(remote.activate_proc_reads());
+                                assert!(wait.signal.ready());
+                                attempt = snapshot.resume(wait, &mut m);
+                            }
+                            _ => panic!("complete proc read must not require the owner"),
+                        }
+                    }
+                    assert_eq!(
+                        activations.load(Ordering::Relaxed),
+                        if same_mm {
+                            0
+                        } else if title {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                    let expected = if title {
+                        &b"changed-title\0"[offset as usize..offset as usize + 8]
+                    } else {
+                        &b"A=1\0B=2\0"[offset as usize..]
+                    };
+                    assert_eq!(cq(&mut m, &ring), (91, expected.len() as i32));
+                    let actual = if op == 1 {
+                        let mut bytes = vec![0; expected.len()];
+                        m.read(0x3000, &mut bytes[..3]).unwrap();
+                        m.read(0x3100, &mut bytes[3..]).unwrap();
+                        bytes
+                    } else {
+                        let mut bytes = vec![0; expected.len()];
+                        m.read(0x3000, &mut bytes).unwrap();
+                        bytes
+                    };
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        l.vfs.seek(alias, 0, 1),
+                        Ok(0),
+                        "positioned reads preserve f_pos"
+                    );
+                    assert!(epoch.finish().is_empty());
+                }
+            }
+        }
+    }
+}
+#[test]
 fn signalfd_uring_read_vector_fixed_and_poll_keep_submitter_and_original_ofd() {
     for op in [22, 1, 4, 6] {
         let (mut l, mut m, fd, r) = setup(8);

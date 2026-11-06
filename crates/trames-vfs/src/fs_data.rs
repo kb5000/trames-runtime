@@ -79,6 +79,9 @@ impl FsHandle {
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
     }
+    pub(super) fn layer_uses(&self) -> Option<Arc<overlay::LayerUses>> {
+        self.overlay.as_ref().map(|overlay| overlay.layer_uses())
+    }
 }
 impl<G: Deref<Target = Filesystem>> Deref for FsBorrow<'_, G> {
     type Target = Filesystem;

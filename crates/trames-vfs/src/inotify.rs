@@ -431,7 +431,8 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        let (_, node) = self.metadata_target(AT_FDCWD, path, mask & 0x02000000 == 0)?;
+        let MetadataTarget { node, _magic, .. } =
+            self.metadata_target(AT_FDCWD, path, mask & 0x02000000 == 0)?;
         let n = node.borrow();
         if mask & 0x01000000 != 0 && !matches!(n.content, Content::Directory) {
             return Err(Errno(20));
@@ -473,6 +474,7 @@ impl Vfs {
         }
         Some((
             self.node(&ResolvedPath {
+                proc_binding: None,
                 key: path[..i.max(1)].to_vec(),
                 mount: path.mount.clone(),
             })

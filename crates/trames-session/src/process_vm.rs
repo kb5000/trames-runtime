@@ -9,6 +9,7 @@ impl<C: Cpu> Kernel<C> {
         epoch: &crate::run_queue::Epoch<C>,
         mut checkpoint: crate::run_queue::Checkpoint<C>,
         io: &mut impl GuestOutput,
+        proc_waits: &mut Vec<super::proc::ProcReadWait<C>>,
     ) -> Result<bool, RuntimeError> {
         let began = Instant::now();
         let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(&checkpoint);
@@ -30,19 +31,38 @@ impl<C: Cpu> Kernel<C> {
             drop(job.work.memory.take());
             job.work.cpu.clear_exclusive();
         }
+        let lifecycle_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
+            && checkpoint
+                .jobs
+                .iter()
+                .filter(|job| job.checkpoint.is_some())
+                .all(|job| matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281));
+        if checkpoint.proc_reads && !lifecycle_only {
+            let mut wait = self.proc_read_wait();
+            let mut ids = std::collections::BTreeSet::new();
+            let mut pending = false;
+            for job in &checkpoint.jobs {
+                let memory = &self.processes[&job.work.pid].memory;
+                if ids.insert(memory.coordinator_ownership().0) {
+                    wait.subscriptions
+                        .push(memory.subscribe_parallel_idle(&wait.signal));
+                    pending |= !memory.parallel_views_quiescent();
+                }
+            }
+            if pending {
+                wait.checkpoint = Some(checkpoint);
+                proc_waits.push(wait);
+                return Ok(true);
+            }
+        }
         let result = (|| {
             for done in epoch.take_retired() {
                 self.accept_source_return(done)?;
             }
             self.process_exits(Some(epoch))?;
-            let metadata =
-                !checkpoint.mm_only || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
-            let lifecycle_only = checkpoint.jobs.iter().any(|job| job.checkpoint.is_some())
-                && checkpoint
-                    .jobs
-                    .iter()
-                    .filter(|job| job.checkpoint.is_some())
-                    .all(|job| matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281));
+            let metadata = checkpoint.proc_reads
+                || !checkpoint.mm_only
+                || checkpoint.jobs.iter().any(|job| job.checkpoint.is_some());
             let mut created = Vec::new();
             let mut committed = std::collections::BTreeSet::new();
             for job in checkpoint.jobs.iter().filter(|_| metadata) {
@@ -54,8 +74,22 @@ impl<C: Cpu> Kernel<C> {
                             return Ok(false);
                         }
                         p.memory.commit_retired_parallel()?;
+                        if checkpoint.proc_reads {
+                            // Clone/exec can proceed with an accepted external
+                            // borrower. Preserve the original mm's pending read;
+                            // resume lifecycle first, then take a pure read
+                            // scope. Waiting for idle here would miss external
+                            // release while the resumed CPU Views still exist.
+                            self.proc_source
+                                .as_ref()
+                                .unwrap()
+                                .request_read(p.memory.memory_report());
+                        }
                     } else {
                         p.memory.commit_parallel()?;
+                        if checkpoint.proc_reads {
+                            assert!(p.memory.activate_proc_reads());
+                        }
                     }
                 }
             }
@@ -199,6 +233,7 @@ impl<C: Cpu> Kernel<C> {
                     p.cpu_time += elapsed;
                     self.cpu_total += elapsed;
                     self.per_cpu[job.stats.worker] += elapsed;
+                    p.signals.io.proc_view.account(elapsed, job.stats.worker);
                     self.vm_checkpoint_time[6] += elapsed;
                     self.context_switches += 1;
                     self.vm_checkpoint_batch[0] += u64::from(!used_window);

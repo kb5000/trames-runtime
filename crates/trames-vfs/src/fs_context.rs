@@ -29,8 +29,8 @@ pub(super) struct Paths {
     pub host_cwd: Option<Arc<hostfs::OpenFile>>,
     pub cwd_node: Option<NodeRef>,
     pub root_node: Option<NodeRef>,
-    pub cwd_mount: Option<Rc<Mount>>,
-    pub root_mount: Option<Rc<Mount>>,
+    pub cwd_mount: Option<Arc<Mount>>,
+    pub root_mount: Option<Arc<Mount>>,
 }
 // Canonical fs_struct path resources contain no owner Rc. A control view may
 // project mount topology locally, but cwd/root and their detached traversal pins
@@ -45,8 +45,39 @@ struct SharedPaths {
     root_mount: Option<Arc<mounts::MountData>>,
     _cwd_pin: Option<mounts::DirectoryPin>,
     _root_pin: Option<mounts::DirectoryPin>,
+    _cwd_use: Option<mounts::MountUse>,
+    _root_use: Option<mounts::MountUse>,
+}
+/// Read-only authority over the original fs_struct paths, with fresh private
+/// mount projections for each observer. It is not a task or namespace owner.
+#[derive(Clone)]
+pub(super) struct PathSource(std::sync::Weak<SharedCell<SharedPaths>>);
+impl PathSource {
+    pub(super) fn directories(&self) -> (Option<ProcDirectory>, Option<ProcDirectory>) {
+        self.0
+            .upgrade()
+            .map_or((None, None), |paths| paths.borrow().directories())
+    }
+    pub(super) fn install(&self, context: &mut FsContext) {
+        if let Some(paths) = self.0.upgrade() {
+            context.paths.shared = paths;
+        }
+    }
 }
 impl SharedPaths {
+    fn directories(&self) -> (Option<ProcDirectory>, Option<ProcDirectory>) {
+        let directory = |mount: &Option<Arc<mounts::MountData>>, node: &Option<NodeRef>| {
+            let mount = mount.as_ref()?;
+            Some(ProcDirectory {
+                node: node.as_ref().unwrap_or(&mount.root).clone(),
+                mount: mount.clone(),
+            })
+        };
+        (
+            directory(&self.cwd_mount, &self.cwd_node),
+            directory(&self.root_mount, &self.root_node),
+        )
+    }
     fn from_paths(paths: &Paths) -> Self {
         let cwd_mount = paths.cwd_mount.as_ref().map(|m| m.shared.clone());
         let root_mount = paths.root_mount.as_ref().map(|m| m.shared.clone());
@@ -57,6 +88,12 @@ impl SharedPaths {
             root_node: paths.root_node.clone(),
             _cwd_pin: cwd_mount.clone().map(mounts::DirectoryPin::new),
             _root_pin: root_mount.clone().map(mounts::DirectoryPin::new),
+            _cwd_use: cwd_mount
+                .as_ref()
+                .map(|m| mounts::MountUse::new(m.identity.clone())),
+            _root_use: root_mount
+                .as_ref()
+                .map(|m| mounts::MountUse::new(m.identity.clone())),
             cwd_mount,
             root_mount,
         }
@@ -68,10 +105,13 @@ pub(super) struct PathStore {
     // Only this control view owns these Rc projections. Keep current mounts
     // alive for owner-only weak namespace snapshots, without retaining every
     // directory the process has ever visited.
-    projections: RefCell<Vec<Rc<Mount>>>,
-    pub(super) registry: Rc<RefCell<Vec<Weak<Mount>>>>,
+    projections: RefCell<Vec<Arc<Mount>>>,
+    pub(super) registry: Rc<RefCell<Vec<std::sync::Weak<Mount>>>>,
 }
 impl PathStore {
+    pub(super) fn directories(&self) -> (Option<ProcDirectory>, Option<ProcDirectory>) {
+        self.shared.borrow().directories()
+    }
     fn project(&self, state: &SharedPaths) -> Paths {
         // Most reads keep the same mount resources, even when cwd's inode has
         // changed. Reuse this view's projections instead of rebuilding a mount
@@ -102,7 +142,12 @@ impl PathStore {
         let mut cache = BTreeMap::new();
         // Actual owner mounts retain their original namespace controls and
         // mutable topology; a query's registry contains only fresh projections.
-        for mount in self.registry.borrow().iter().filter_map(Weak::upgrade) {
+        for mount in self
+            .registry
+            .borrow()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
             cache.insert(Arc::as_ptr(&mount.shared) as usize, mount);
         }
         for mount in self.projections.borrow().iter() {
@@ -220,6 +265,9 @@ impl Clone for FsContext {
     }
 }
 impl Vfs {
+    pub(super) fn path_source(&self) -> PathSource {
+        PathSource(Arc::downgrade(&self.context.paths.shared))
+    }
     pub fn shares_context_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.context.paths.shared, &other.context.paths.shared)
     }

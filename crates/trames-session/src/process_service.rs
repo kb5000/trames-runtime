@@ -65,6 +65,9 @@ impl<C: Cpu> Kernel<C> {
         if request.number == 222 && p.seccomp.mode() == 0 {
             let began = Instant::now();
             let result = p.linux.mmap_additive(a, &mut p.memory)?;
+            if self.proc_source.is_some() {
+                p.memory.memory_report();
+            }
             self.parallel_memory_time += began.elapsed();
             self.vm_local_syscalls += 1;
             // Every result is final, including errors. No mapping effect can

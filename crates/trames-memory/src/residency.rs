@@ -36,6 +36,9 @@ pub(super) struct Account {
     native: std::sync::Mutex<BTreeMap<usize, std::sync::Weak<dyn crate::HardwareRange>>>,
 }
 impl Account {
+    pub(super) fn resident_bytes(&self) -> usize {
+        self.local.used.load(Ordering::Relaxed) + self.native_resident()
+    }
     pub(super) fn native_allowed(&self) -> bool {
         self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
             && self
@@ -234,7 +237,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().resident_bytes();
         }
-        self.account.local.used.load(Ordering::Relaxed) + self.account.native_resident()
+        self.account.resident_bytes()
     }
     /// Bind a fresh runtime to one aggregate guest budget before workers start.
     pub fn set_total_limit(&mut self, limit: usize) -> Result<(), MemoryError> {

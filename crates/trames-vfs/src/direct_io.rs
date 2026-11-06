@@ -511,7 +511,9 @@ impl DirectFd {
         matches!(self.resource, ByteResource::NetlinkPoll(_))
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        let resource = if let Some(log) = &open.kernel_log {
+        let resource = if let Some(file) = &open.mount_file {
+            ByteResource::Mounts(file.watch.clone())
+        } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
         } else if let Some(local) = &open.local {
             match local.direct().or_else(|| local.direct_message()) {

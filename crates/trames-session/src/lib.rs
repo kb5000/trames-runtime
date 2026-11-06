@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! ELF, initial Linux stack, CPU slices, and syscall dispatch composition.
 // Retained OFDs expand the worker graph checked by Rust's auto-trait solver.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 use std::fmt;
 use trames_elf::{ElfError, LoadedElf};
 use trames_engine::{Cpu, CpuFault};
@@ -10,6 +10,7 @@ mod clock;
 mod devices;
 mod futex;
 mod gpu;
+mod proc_views;
 mod process;
 mod run_queue;
 mod signal_actions;
@@ -778,6 +779,36 @@ mod tests {
         assert_ne!(trames_cpu::HWCAP2 & (1 << 14), 0);
         assert!(e.memory.fetch_u32(sp).is_err());
         assert!(e.memory.read_u64(STACK_TOP - STACK_SIZE - 8).is_err());
+        let image = e.memory.memory_report().image_ranges().unwrap();
+        assert_eq!(image.arguments, (arg0, env0));
+        assert_eq!(image.environment, (env0, STACK_TOP));
+        e.memory.write(sp + 8, &0x1234u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            e.memory.memory_report().image_ranges(),
+            Some(image),
+            "pointer-array rewrites do not replace the original proc string spans"
+        );
+    }
+    #[test]
+    fn image_ranges_exclude_exec_filename_and_keep_empty_environment_empty() {
+        let mut e = elf();
+        let sp = initial_stack_bytes::<Cpu>(
+            &mut e,
+            &[b"program".to_vec()],
+            &[],
+            &trames_vfs::Credentials::default(),
+            RuntimeOptions::default(),
+            Some(b"/different/filename"),
+        )
+        .unwrap();
+        let arg0 = e.memory.read_u64(sp + 8).unwrap();
+        let image = e.memory.memory_report().image_ranges().unwrap();
+        assert_eq!(image.arguments, (arg0, arg0 + 8));
+        assert_eq!(image.environment, (arg0 + 8, arg0 + 8));
+        assert!(
+            image.environment.1 < STACK_TOP,
+            "AT_EXECFN bytes are outside argv/envp"
+        );
     }
     #[test]
     fn argument_limits_and_nuls_fail() {

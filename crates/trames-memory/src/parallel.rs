@@ -255,6 +255,7 @@ pub(super) struct Frame {
     native_retryable: std::sync::atomic::AtomicBool,
     native_one_shot: std::sync::atomic::AtomicBool,
     native_live_private: std::sync::atomic::AtomicBool,
+    proc_anonymous: std::sync::atomic::AtomicBool,
     error: Option<MemoryError>,
     pub(super) bytes: Arc<ConcurrentPage>,
     pub(super) charge: Arc<Charge>,
@@ -268,6 +269,8 @@ pub(super) struct Frame {
 }
 impl Frame {
     fn refresh_content_metadata(&self, page: &Page) {
+        self.proc_anonymous
+            .store(page.proc_anonymous(), Ordering::Relaxed);
         self.native_retryable
             .store(page.native_retryable(), Ordering::Relaxed);
         self.native_one_shot
@@ -530,6 +533,7 @@ fn prepare_frame(
         backing_domain: page.parallel_domain(),
         native_retryable: std::sync::atomic::AtomicBool::new(page.native_retryable()),
         native_one_shot: std::sync::atomic::AtomicBool::new(page.native_one_shot()),
+        proc_anonymous: std::sync::atomic::AtomicBool::new(page.proc_anonymous()),
         native_live_private: std::sync::atomic::AtomicBool::new(
             page.backing
                 .as_ref()
@@ -585,6 +589,7 @@ pub(super) struct Snapshot {
     positions: Slots<Option<usize>>,
     backing_revision: u64,
     identity: u64,
+    original_identity: u64,
     code_revision: u64,
     pages: BTreeMap<u64, usize>,
     frames: Slots<Frame>,
@@ -1004,6 +1009,30 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn proc_address_space(&self) -> Option<u64> {
+        Some(self.snapshot.original_identity)
+    }
+    fn proc_read_chunk(&self, address: u64, out: &mut [u8]) -> Option<Result<(), MemoryError>> {
+        Some((|| {
+            let address = address & 0x00ffffffffffffff;
+            if out.len() > (PAGE_SIZE - address % PAGE_SIZE) as usize {
+                return Err(MemoryError::InvalidRange);
+            }
+            if out.is_empty() {
+                return Ok(());
+            }
+            let frame = self.frame(address, Access::Read)?;
+            if frame.proc_anonymous.load(Ordering::Relaxed)
+                || frame.bytes.private_source && frame.bytes.dirty.load(Ordering::Relaxed) != 0
+            {
+                self.ensure_resident(frame)?;
+                self.read_fragment(frame, (address % PAGE_SIZE) as usize, out);
+                Ok(())
+            } else {
+                Err(MemoryError::BackingIo(95))
+            }
+        })())
+    }
     fn shared_futex_key(&self, address: u64) -> Result<Option<(u64, u64, u64)>, MemoryError> {
         let address = address & 0x00ff_ffff_ffff_ffff;
         Memory::end(address, 4)?;
@@ -1537,6 +1566,7 @@ impl Memory {
             positions,
             backing_revision,
             identity: self.identity,
+            original_identity: self.original_identity,
             code_revision: self.code_revision,
             pages,
             // Backing-epoch refreshes can retain the same ConcurrentPages in

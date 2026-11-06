@@ -26,6 +26,17 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Immutable original mm identity, independent of decoder revision wraps.
+    /// This is only consulted by accepted proc reads, never ordinary accesses.
+    fn proc_address_space(&self) -> Option<u64> {
+        None
+    }
+    /// Proc image bytes accept anonymous pages (including private COW), as
+    /// Linux FOLL_ANON does. None means this backend has no such capability;
+    /// it must defer before exposing bytes or changing an OFD offset.
+    fn proc_read_chunk(&self, _address: u64, _out: &mut [u8]) -> Option<Result<(), MemoryError>> {
+        None
+    }
     /// Kernel resource registration may require this mm's structural owner to
     /// stabilize/relocate pages. Ordinary byte access never queries this hook.
     fn pin_buffer_rw(
@@ -142,6 +153,15 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn proc_address_space(&self) -> Option<u64> {
+        self.shared.as_ref().map_or_else(
+            || Some(self.original_identity),
+            |m| m.borrow().proc_address_space(),
+        )
+    }
+    fn proc_read_chunk(&self, address: u64, out: &mut [u8]) -> Option<Result<(), MemoryError>> {
+        Some(self.read_proc_chunk(address, out))
+    }
     fn pin_buffer_rw(
         &mut self,
         address: u64,

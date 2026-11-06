@@ -217,12 +217,17 @@ impl Vfs {
         target.extend_from_slice(name);
         let open = OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                oom: None,
+                network_control: None,
+                mount_file: None,
+                runtime_file: None,
                 socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
+                mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
                 file_authority: Default::default(),
@@ -245,12 +250,8 @@ impl Vfs {
                 kernel_log: None,
                 notification: None,
             }),
-            position: 0,
             anonymous: None,
             namespace: None,
-            network_control: None,
-            mount_file: None,
-            oom: None,
             mount: None,
         };
         Ok(open)

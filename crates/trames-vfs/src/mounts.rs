@@ -30,7 +30,7 @@ pub(super) enum Kind {
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
-    pub parent: Rc<Mount>,
+    pub parent: Arc<Mount>,
     pub node: NodeRef,
     pub fallback: Vec<u8>,
 }
@@ -68,6 +68,7 @@ pub(super) struct MountInit {
 // Resource identity is independent of parent topology. Overlay layers must
 // retain this identity rather than the old root's parent chain after pivot.
 pub(super) struct MountIdentity {
+    users: std::sync::atomic::AtomicUsize,
     #[cfg(all(feature = "hostfs", unix))]
     has_children: std::sync::atomic::AtomicBool,
     pub id: u64,
@@ -89,7 +90,7 @@ pub(super) struct MountData {
     parent: Arc<SharedCell<Option<SharedAttachment>>>,
     // Namespace descriptors remain owner controls; their topology must not be
     // projected as a complete shared mount capability.
-    _owner_control: bool,
+    namespace: Option<linux_namespace::NamespaceHandle>,
 }
 // One lease per actual shared directory OFD, independent of FD aliases.
 // This retains detached traversal topology only while directory users need it.
@@ -98,6 +99,36 @@ impl DirectoryPin {
     pub(super) fn new(mount: Arc<MountData>) -> Self {
         mount.directory_users.fetch_add(1, Ordering::Relaxed);
         Self(mount)
+    }
+}
+/// A real file/fs/image use, independent of metadata allocation references.
+/// One lease belongs to the actual OFD or fs_struct, not each query projection
+/// or accepted alias. Plain resource Arcs keep bytes/metadata alive only.
+pub(super) struct MountUse {
+    mount: Arc<MountIdentity>,
+    _layers: Option<Arc<overlay::LayerUses>>,
+}
+impl MountUse {
+    pub(super) fn is_for(&self, mount: &Arc<MountIdentity>) -> bool {
+        Arc::ptr_eq(&self.mount, mount)
+    }
+    pub(super) fn new(mount: Arc<MountIdentity>) -> Self {
+        let layers = mount.fs.layer_uses();
+        mount.users.fetch_add(1, Ordering::Relaxed);
+        Self {
+            mount,
+            _layers: layers,
+        }
+    }
+}
+impl MountIdentity {
+    pub(super) fn in_use(&self) -> bool {
+        self.users.load(Ordering::Relaxed) != 0
+    }
+}
+impl Drop for MountUse {
+    fn drop(&mut self) {
+        self.mount.users.fetch_sub(1, Ordering::Relaxed);
     }
 }
 impl Drop for DirectoryPin {
@@ -126,15 +157,15 @@ impl MountFlags {
     }
 }
 pub(super) struct MountParent {
-    owner: RefCell<Option<Attachment>>,
+    owner: SharedCell<Option<Attachment>>,
     shared: Arc<SharedCell<Option<SharedAttachment>>>,
 }
 pub(super) struct ParentWrite<'a> {
-    owner: std::cell::RefMut<'a, Option<Attachment>>,
+    owner: std::sync::RwLockWriteGuard<'a, Option<Attachment>>,
     shared: &'a SharedCell<Option<SharedAttachment>>,
 }
 impl MountParent {
-    pub fn borrow(&self) -> std::cell::Ref<'_, Option<Attachment>> {
+    pub fn borrow(&self) -> std::sync::RwLockReadGuard<'_, Option<Attachment>> {
         self.owner.borrow()
     }
     pub fn borrow_mut(&self) -> ParentWrite<'_> {
@@ -180,6 +211,9 @@ impl Drop for ParentWrite<'_> {
     }
 }
 pub(super) struct Mount {
+    // An installed/detached owner topology uses its overlay layers. Read-only
+    // Rc projections leave this empty; retaining their FsHandle is observation.
+    _layers: Option<Arc<overlay::LayerUses>>,
     pub shared: Arc<MountData>,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
     pub parent: MountParent,
@@ -191,21 +225,8 @@ impl std::ops::Deref for Mount {
     }
 }
 impl Mount {
-    // Namespace controls cannot cross a worker boundary. Metadata/resource
-    // ancestry is complete only when every retained parent is shared too.
     pub(super) fn shared_resources(&self) -> Option<Arc<MountData>> {
-        let mut at = self.shared.clone();
-        for _ in 0..MAX_MOUNTS {
-            if at._owner_control {
-                return None;
-            }
-            let parent = at.parent.borrow().as_ref().map(|a| a._parent.clone());
-            let Some(parent) = parent else {
-                return Some(self.shared.clone());
-            };
-            at = parent;
-        }
-        None
+        Some(self.shared.clone())
     }
     pub(super) fn new(init: MountInit) -> Self {
         #[cfg(all(feature = "hostfs", unix))]
@@ -222,8 +243,9 @@ impl Mount {
                 .as_ref()
                 .map(SharedAttachment::from_owner),
         ));
-        let owner_control = init.namespace.is_some();
+        let namespace = init.namespace.clone();
         let identity = Arc::new(MountIdentity {
+            users: Default::default(),
             #[cfg(all(feature = "hostfs", unix))]
             has_children: std::sync::atomic::AtomicBool::new(false),
             id: init.id,
@@ -244,32 +266,35 @@ impl Mount {
             directory_users: Default::default(),
             identity,
             parent: parent.clone(),
-            _owner_control: owner_control,
+            namespace,
         });
         let parent = shared.parent.clone();
+        let layers = shared.fs.layer_uses();
         Self {
+            _layers: layers,
             shared,
             namespace: init.namespace,
             parent: MountParent {
-                owner: init.parent,
+                owner: SharedCell::new(init.parent.into_inner()),
                 shared: parent,
             },
         }
     }
     // Overlay sources are validated Root/Tmpfs directory capabilities. Their
     // byte/storage identity is independent of the current namespace ancestry.
-    pub(super) fn layer_projection(identity: Arc<MountIdentity>) -> Rc<Self> {
+    pub(super) fn layer_projection(identity: Arc<MountIdentity>) -> Arc<Self> {
         let parent = Arc::new(SharedCell::new(None));
-        Rc::new(Self {
+        Arc::new(Self {
+            _layers: None,
             shared: Arc::new(MountData {
                 directory_users: Default::default(),
                 identity,
                 parent: parent.clone(),
-                _owner_control: false,
+                namespace: None,
             }),
             namespace: None,
             parent: MountParent {
-                owner: RefCell::new(None),
+                owner: SharedCell::new(None),
                 shared: parent,
             },
         })
@@ -277,8 +302,8 @@ impl Mount {
     /// A private Rc topology over shared resources. No owner Rc is retained.
     pub(super) fn query_projection(
         shared: Arc<MountData>,
-        cache: &mut BTreeMap<usize, Rc<Self>>,
-    ) -> Rc<Self> {
+        cache: &mut BTreeMap<usize, Arc<Self>>,
+    ) -> Arc<Self> {
         let key = Arc::as_ptr(&shared) as usize;
         if let Some(mount) = cache.get(&key) {
             return mount.clone();
@@ -288,31 +313,32 @@ impl Mount {
             node: a._node.clone(),
             fallback: a._fallback.clone(),
         });
-        let mount = Rc::new(Self {
+        let mount = Arc::new(Self {
+            _layers: None,
             parent: MountParent {
-                owner: RefCell::new(parent),
+                owner: SharedCell::new(parent),
                 shared: shared.parent.clone(),
             },
+            namespace: shared.namespace.clone(),
             shared,
-            namespace: None,
         });
         cache.insert(key, mount.clone());
         mount
     }
-    pub(super) fn resource_projection(shared: Arc<MountData>) -> Rc<Self> {
-        debug_assert!(!shared._owner_control);
+    pub(super) fn resource_projection(shared: Arc<MountData>) -> Arc<Self> {
         let parent = shared.parent.borrow().as_ref().map(|a| Attachment {
             parent: Self::resource_projection(a._parent.clone()),
             node: a._node.clone(),
             fallback: a._fallback.clone(),
         });
-        Rc::new(Self {
+        Arc::new(Self {
+            _layers: None,
             parent: MountParent {
-                owner: RefCell::new(parent),
+                owner: SharedCell::new(parent),
                 shared: shared.parent.clone(),
             },
+            namespace: shared.namespace.clone(),
             shared,
-            namespace: None,
         })
     }
 }
@@ -365,13 +391,52 @@ impl MountData {
 }
 pub(super) struct Table {
     pub id: u64,
-    pub root: Rc<Mount>,
-    pub mounts: Vec<Rc<Mount>>,
+    pub root: Arc<Mount>,
+    pub mounts: Vec<Arc<Mount>>,
     pub events: Arc<watch::MountEvents>,
+    // A query-local topology snapshot is observation, never mutable authority.
+    // Accepted nsfs opens upgrade this original resource instead.
+    original: Option<std::sync::Weak<SharedCell<Table>>>,
+}
+impl Table {
+    fn new(id: u64, root: Arc<Mount>, mounts: Vec<Arc<Mount>>) -> Self {
+        Self {
+            id,
+            root,
+            mounts,
+            events: Arc::default(),
+            original: None,
+        }
+    }
+    pub(super) fn project(source: &Arc<SharedCell<Self>>) -> Self {
+        let table = source.borrow();
+        let mut cache = BTreeMap::new();
+        let mut project =
+            |mount: &Arc<Mount>| Mount::query_projection(mount.shared.clone(), &mut cache);
+        Self {
+            id: table.id,
+            root: project(&table.root),
+            mounts: table.mounts.iter().map(&mut project).collect(),
+            events: table.events.clone(),
+            original: Some(
+                table
+                    .original
+                    .clone()
+                    .unwrap_or_else(|| Arc::downgrade(source)),
+            ),
+        }
+    }
 }
 #[derive(Clone)]
-pub struct MountNamespace(pub(super) Rc<RefCell<Table>>);
+pub struct MountNamespace(pub(super) Arc<SharedCell<Table>>);
 impl MountNamespace {
+    pub(super) fn original(&self) -> Option<Self> {
+        let original = self.0.borrow().original.clone();
+        match original {
+            Some(weak) => weak.upgrade().map(Self),
+            None => Some(self.clone()),
+        }
+    }
     pub fn id(&self) -> u64 {
         self.0.borrow().id
     }
@@ -382,7 +447,8 @@ impl MountNamespace {
 #[derive(Clone)]
 pub struct ResolvedPath {
     pub(super) key: Vec<u8>,
-    pub(super) mount: Option<Rc<Mount>>,
+    pub(super) mount: Option<Arc<Mount>>,
+    pub(super) proc_binding: Option<Arc<proc_source::ProcPath>>,
 }
 impl std::fmt::Debug for ResolvedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -421,7 +487,11 @@ impl<const N: usize> PartialEq<&[u8; N]> for ResolvedPath {
 }
 impl From<Vec<u8>> for ResolvedPath {
     fn from(key: Vec<u8>) -> Self {
-        Self { key, mount: None }
+        Self {
+            key,
+            mount: None,
+            proc_binding: None,
+        }
     }
 }
 impl ResolvedPath {
@@ -445,7 +515,10 @@ impl ResolvedPath {
 }
 pub(super) trait PathArg {
     fn key(&self) -> &[u8];
-    fn mount(&self) -> Option<&Rc<Mount>> {
+    fn mount(&self) -> Option<&Arc<Mount>> {
+        None
+    }
+    fn proc_binding(&self) -> Option<&Arc<proc_source::ProcPath>> {
         None
     }
 }
@@ -465,10 +538,13 @@ impl PathArg for Vec<u8> {
     }
 }
 impl PathArg for ResolvedPath {
+    fn proc_binding(&self) -> Option<&Arc<proc_source::ProcPath>> {
+        self.proc_binding.as_ref()
+    }
     fn key(&self) -> &[u8] {
         &self.key
     }
-    fn mount(&self) -> Option<&Rc<Mount>> {
+    fn mount(&self) -> Option<&Arc<Mount>> {
         self.mount.as_ref()
     }
 }
@@ -482,7 +558,7 @@ impl Vfs {
             .get(b"/".as_slice())
             .cloned()
             .ok_or(Errno(2))?;
-        let root = Rc::new(Mount::new(MountInit {
+        let root = Arc::new(Mount::new(MountInit {
             id: 1,
             fs: self.fs.clone(),
             root,
@@ -504,7 +580,7 @@ impl Vfs {
             (4, b"/dev/pts".as_slice(), Kind::Devpts, 10),
         ] {
             let node = self.pseudo_node(path)?.ok_or(Errno(2))?;
-            mounts.push(Rc::new(Mount::new(MountInit {
+            mounts.push(Arc::new(Mount::new(MountInit {
                 id,
                 fs: self.fs.clone(),
                 root: node.clone(),
@@ -525,7 +601,7 @@ impl Vfs {
         let point = self.pseudo_node(b"/sys/fs/cgroup")?.ok_or(Errno(2))?;
         let fs = self.cgroups.borrow().fs.clone();
         let cgroup_root = fs.borrow().paths[b"/".as_slice()].clone();
-        mounts.push(Rc::new(Mount::new(MountInit {
+        mounts.push(Arc::new(Mount::new(MountInit {
             id: 5,
             fs,
             root: cgroup_root,
@@ -549,24 +625,23 @@ impl Vfs {
             paths.root_mount = Some(root.clone());
         }
         self.register_mounts(&mounts)?;
-        self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
-            events: Arc::default(),
-            id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+        self.mounts = Some(MountNamespace(Arc::new(SharedCell::new(Table::new(
+            NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
-        }))));
+        )))));
         Ok(())
     }
     // Resolve owner topology only for pathname/namespace operations. Ordinary
     // OFD data/flag access uses shared mount resources without Rc projections.
-    pub(super) fn mount_for_path(&self, mount: Option<&OpenMount>) -> Option<Rc<Mount>> {
+    pub(super) fn mount_for_path(&self, mount: Option<&OpenMount>) -> Option<Arc<Mount>> {
         mount.map(|mount| match mount {
             OpenMount::Owner(owner) => owner.clone(),
             OpenMount::Shared(shared) => self
                 .mount_registry
                 .borrow()
                 .iter()
-                .filter_map(Weak::upgrade)
+                .filter_map(std::sync::Weak::upgrade)
                 .find(|owner| Arc::ptr_eq(&owner.shared, shared))
                 .unwrap_or_else(|| Mount::resource_projection(shared.clone())),
         })
@@ -574,16 +649,24 @@ impl Vfs {
     pub(super) fn location(
         &self,
         node: &NodeRef,
-        mount: &Option<Rc<Mount>>,
+        mount: &Option<Arc<Mount>>,
     ) -> Result<ResolvedPath> {
         // Pseudo endpoints are stored separately. Looking in an unrelated disk
         // map first turns every proc FD snapshot into a full rootfs scan.
         if node.borrow().volatile {
+            if let Some(proc) = node.proc_node.get() {
+                return Ok(ResolvedPath {
+                    key: proc.path.clone(),
+                    mount: mount.clone(),
+                    proc_binding: proc.binding.clone(),
+                });
+            }
             if let Some(query) = &self.query {
                 return query.defer();
             }
             if let Some(key) = self.pseudo.borrow().path_of(node) {
                 return Ok(ResolvedPath {
+                    proc_binding: None,
                     key,
                     mount: mount.clone(),
                 });
@@ -597,6 +680,7 @@ impl Vfs {
             None => self.path_of(node)?,
         };
         Ok(ResolvedPath {
+            proc_binding: None,
             key,
             mount: mount.clone(),
         })
@@ -615,6 +699,7 @@ impl Vfs {
                 .root
                 .clone();
             Ok(ResolvedPath {
+                proc_binding: None,
                 key: root.root_path(),
                 mount: Some(root),
             })
@@ -645,7 +730,7 @@ impl Vfs {
                     .borrow()
                     .iter()
                     .rev()
-                    .filter_map(Weak::upgrade)
+                    .filter_map(std::sync::Weak::upgrade)
                     .find(|m| {
                         (self.pseudo.borrow().enabled
                             || !matches!(
@@ -653,13 +738,19 @@ impl Vfs {
                                 Kind::Proc | Kind::Sysfs | Kind::Devpts | Kind::Cgroup
                             ))
                             && m.parent.borrow().as_ref().is_some_and(|a| {
-                                Rc::ptr_eq(&a.parent, current) && a.key() == path.key
+                                Arc::ptr_eq(&a.parent, current) && a.key() == path.key
                             })
                     });
             let Some(next) = next else {
                 return Ok(path);
             };
+            let binding = next
+                .root
+                .proc_node
+                .get()
+                .and_then(|proc| proc.binding.clone());
             path = ResolvedPath {
+                proc_binding: binding,
                 key: next.root_path(),
                 mount: Some(next),
             };
@@ -683,6 +774,7 @@ impl Vfs {
                 return Ok(at);
             };
             at = ResolvedPath {
+                proc_binding: None,
                 key: a.key(),
                 mount: Some(a.parent),
             };
@@ -722,6 +814,7 @@ impl Vfs {
             suffix = tail;
             let a = m.parent.borrow().clone().ok_or(Errno(2))?;
             at = ResolvedPath {
+                proc_binding: None,
                 key: a.key(),
                 mount: Some(a.parent),
             };
@@ -733,11 +826,31 @@ impl Vfs {
             return Err(Errno(1));
         }
         let old = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
+        // Linux copy_mnt_ns omits mount-namespace nsfs bindings and everything
+        // mounted on them. Retaining an older namespace here would defeat the
+        // ordered bind rule and allow reference cycles after unshare.
+        let mounts: Vec<_> = old
+            .mounts
+            .iter()
+            .filter(|mount| {
+                let mut current = Some((*mount).clone());
+                while let Some(mount) = current {
+                    if matches!(
+                        mount.namespace,
+                        Some(linux_namespace::NamespaceHandle::Mount(_))
+                    ) {
+                        return false;
+                    }
+                    current = mount.parent.borrow().as_ref().map(|a| a.parent.clone());
+                }
+                true
+            })
+            .collect();
         let mut copies = BTreeMap::new();
-        for m in &old.mounts {
+        for m in &mounts {
             copies.insert(
                 m.id,
-                Rc::new(Mount::new(MountInit {
+                Arc::new(Mount::new(MountInit {
                     id: new_mount_id()?,
                     fs: m.fs.clone(),
                     root: m.root.clone(),
@@ -752,7 +865,7 @@ impl Vfs {
                 })),
             );
         }
-        for m in &old.mounts {
+        for m in &mounts {
             if let Some(a) = m.parent.borrow().as_ref() {
                 *copies[&m.id].parent.borrow_mut() = Some(Attachment {
                     parent: copies[&a.parent.id].clone(),
@@ -761,13 +874,13 @@ impl Vfs {
                 });
             }
         }
-        let remap = |mount: &mut Option<Rc<Mount>>| {
+        let remap = |mount: &mut Option<Arc<Mount>>| {
             if let Some(new) = mount.as_ref().and_then(|m| copies.get(&m.id)) {
                 *mount = Some(new.clone());
             }
         };
         let root = copies[&old.root.id].clone();
-        let mounts: Vec<_> = old.mounts.iter().map(|m| copies[&m.id].clone()).collect();
+        let mounts: Vec<_> = mounts.iter().map(|m| copies[&m.id].clone()).collect();
         drop(old);
         self.register_mounts(&mounts)?;
         // CLONE_NEWNS/unshare also detaches fs_struct. Keep the VFS API correct
@@ -780,12 +893,11 @@ impl Vfs {
             remap(&mut paths.cwd_mount);
             remap(&mut paths.root_mount);
         }
-        self.mounts = Some(MountNamespace(Rc::new(RefCell::new(Table {
-            events: Arc::default(),
-            id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+        self.mounts = Some(MountNamespace(Arc::new(SharedCell::new(Table::new(
+            NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
-        }))));
+        )))));
         Ok(())
     }
 }
@@ -858,7 +970,14 @@ impl Vfs {
     pub(super) fn mount_location(&self, path: &[u8], follow: bool) -> Result<ResolvedPath> {
         let (path, magic) = self.resolve_entry(AT_FDCWD, path, follow, true)?;
         match magic {
-            Some((node, _, mount)) => self.location(&node, &mount),
+            Some(ResolvedTarget::Inode(file)) => self.location(&file.node, &file.mount),
+            Some(ResolvedTarget::Descriptor(open)) => {
+                if open.borrow().namespace_resource.is_some() {
+                    return Ok(path);
+                }
+                let file = self.proc_open_node(&open, &path)?;
+                self.location(&file.node, &file.mount)
+            }
             // Mount syscalls select the top mount even when pathname walking
             // starts at a retained cwd and consumes only ".". In particular,
             // pivot_root(".", ".") stacks the old root on that cwd until
@@ -904,7 +1023,7 @@ impl Vfs {
         if self
             .mounts
             .as_ref()
-            .is_none_or(|ns| !ns.0.borrow().mounts.iter().any(|m| Rc::ptr_eq(m, &parent)))
+            .is_none_or(|ns| !ns.0.borrow().mounts.iter().any(|m| Arc::ptr_eq(m, &parent)))
         {
             return Err(Errno(22));
         }
@@ -967,10 +1086,10 @@ impl Vfs {
             }
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let moved = source.mount.as_ref().ok_or(Errno(22))?;
-            let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
+            let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
             if !self.is_mount_root(&source)
-                || Rc::ptr_eq(moved, &table.root)
-                || !table.mounts.iter().any(|mount| Rc::ptr_eq(mount, moved))
+                || Arc::ptr_eq(moved, &table.root)
+                || !table.mounts.iter().any(|mount| Arc::ptr_eq(mount, moved))
             {
                 return Err(Errno(22));
             }
@@ -981,7 +1100,7 @@ impl Vfs {
             }
             let mut ancestor = Some(parent.clone());
             while let Some(mount) = ancestor {
-                if Rc::ptr_eq(&mount, moved) {
+                if Arc::ptr_eq(&mount, moved) {
                     return Err(Errno(40));
                 }
                 ancestor = mount.parent.borrow().as_ref().map(|a| a.parent.clone());
@@ -1007,14 +1126,18 @@ impl Vfs {
         let mut devpts = None;
         let mut namespace = None;
         if flags & BIND != 0 {
-            if let Some(open) = self.proc_fd_description(AT_FDCWD, source.ok_or(Errno(22))?)? {
+            let (_, target) =
+                self.resolve_entry_policy(AT_FDCWD, source.ok_or(Errno(22))?, true, true, 0, true)?;
+            if let Some(ResolvedTarget::Descriptor(open)) = target {
                 namespace = open.borrow().namespace.clone();
             }
         }
-        // Binding a mount namespace into a mount table requires namespace
-        // cycle collection. Keep that unsupported rather than leak Rc cycles.
-        if matches!(namespace, Some(linux_namespace::NamespaceHandle::Mount(_))) {
-            return Err(Errno(95));
+        // Linux mnt_ns_loop: bindings point strictly toward newer namespaces.
+        // This preserves actual ownership without a cycle collector/service.
+        if let Some(linux_namespace::NamespaceHandle::Mount(target)) = &namespace {
+            if ns.id() >= target.id() {
+                return Err(Errno(22));
+            }
         }
         let (fs, root, root_key, mount_kind, attrs) = if let Some(handle) = &namespace {
             if matches!(target_node.borrow().content, Content::Directory) {
@@ -1066,7 +1189,7 @@ impl Vfs {
             devpts = m.devpts.clone();
             if flags & REC != 0 {
                 for child in &ns.0.borrow().mounts {
-                    if Rc::ptr_eq(child, m) {
+                    if Arc::ptr_eq(child, m) {
                         continue;
                     }
                     let mut at = child.clone();
@@ -1074,7 +1197,7 @@ impl Vfs {
                         let Some(a) = at.parent.borrow().clone() else {
                             break;
                         };
-                        if Rc::ptr_eq(&a.parent, m) {
+                        if Arc::ptr_eq(&a.parent, m) {
                             let key = a.key();
                             if below(&key, &source.key) {
                                 additions.push(child.clone());
@@ -1223,6 +1346,12 @@ impl Vfs {
         if ns.0.borrow().mounts.len() + additions.len() + 1 > MAX_MOUNTS {
             return Err(Errno(28));
         }
+        if additions.iter().any(|mount| {
+            matches!(&mount.namespace,
+            Some(linux_namespace::NamespaceHandle::Mount(target)) if ns.id() >= target.id())
+        }) {
+            return Err(Errno(22));
+        }
         let proc_ns = if namespace.is_some() {
             None
         } else if flags & 4096 != 0 {
@@ -1232,7 +1361,7 @@ impl Vfs {
         } else {
             (mount_kind == Kind::Proc).then(|| self.pid_ns.clone())
         };
-        let root = Rc::new(Mount::new(MountInit {
+        let root = Arc::new(Mount::new(MountInit {
             id: new_mount_id()?,
             fs,
             root,
@@ -1288,10 +1417,10 @@ impl Vfs {
             return Err(Errno(22));
         }
         let mut table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
-        if Rc::ptr_eq(mount, &table.root) {
+        if Arc::ptr_eq(mount, &table.root) {
             return Err(Errno(16));
         }
-        if !table.mounts.iter().any(|m| Rc::ptr_eq(m, mount)) {
+        if !table.mounts.iter().any(|m| Arc::ptr_eq(m, mount)) {
             return Err(Errno(22));
         }
         let mut ids = vec![mount.id];
@@ -1311,13 +1440,7 @@ impl Vfs {
                 break;
             }
         }
-        if flags & 2 == 0
-            && (ids.len() > 1
-                || Rc::strong_count(mount) > 2
-                || Arc::strong_count(&mount.shared) > 1
-                || Arc::strong_count(&mount.identity) > 1
-                || mount.writers.active())
-        {
+        if flags & 2 == 0 && (ids.len() > 1 || mount.in_use() || mount.writers.active()) {
             return Err(Errno(16));
         }
         let detached: Vec<_> = table
@@ -1355,18 +1478,18 @@ impl Vfs {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         let current_root = self.root_location()?;
         if !self.is_mount_root(&new)
-            || !Rc::ptr_eq(&new_mount, &old_mount)
+            || !Arc::ptr_eq(&new_mount, &old_mount)
             || !below(&old.key, &new.key)
             || !self.is_mount_root(&current_root)
         {
             return Err(Errno(22));
         }
         let mut table = ns.0.borrow_mut();
-        if Rc::ptr_eq(&new_mount, &table.root)
+        if Arc::ptr_eq(&new_mount, &table.root)
             || current_root
                 .mount
                 .as_ref()
-                .is_none_or(|m| !Rc::ptr_eq(m, &table.root))
+                .is_none_or(|m| !Arc::ptr_eq(m, &table.root))
         {
             return Err(Errno(16));
         }
@@ -1384,12 +1507,12 @@ impl Vfs {
         self.rebase_pivot_context(&previous, &new_mount);
         Ok(())
     }
-    fn rebase_pivot_context(&mut self, previous: &Rc<Mount>, new: &Rc<Mount>) {
+    fn rebase_pivot_context(&mut self, previous: &Arc<Mount>, new: &Arc<Mount>) {
         let mut paths = self.context.paths.borrow_mut();
         if paths
             .cwd_mount
             .as_ref()
-            .is_some_and(|m| Rc::ptr_eq(m, previous))
+            .is_some_and(|m| Arc::ptr_eq(m, previous))
             && paths
                 .cwd_node
                 .as_ref()
@@ -1402,7 +1525,7 @@ impl Vfs {
             || paths
                 .root_mount
                 .as_ref()
-                .is_some_and(|m| Rc::ptr_eq(m, previous))
+                .is_some_and(|m| Arc::ptr_eq(m, previous))
                 && paths
                     .root_node
                     .as_ref()
@@ -1416,23 +1539,20 @@ impl Vfs {
         let previous = before.context.paths.borrow().root_mount.clone();
         if let (Some(ours), Some(theirs), Some(previous)) = (&self.mounts, &after.mounts, &previous)
         {
-            if Rc::ptr_eq(&ours.0, &theirs.0) {
+            if Arc::ptr_eq(&ours.0, &theirs.0) {
                 let new = theirs.0.borrow().root.clone();
                 self.rebase_pivot_context(previous, &new);
             }
         }
     }
     pub fn mount_id_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<u64> {
-        if !nofollow {
-            if let Some(o) = self.proc_fd_description(dirfd, path)? {
-                return Ok(o.borrow().mount.as_ref().map_or(17, |m| m.id));
-            }
+        let (path, target) =
+            self.resolve_entry_policy(dirfd, path, !nofollow, !nofollow, 0, !nofollow)?;
+        match target {
+            Some(ResolvedTarget::Descriptor(open)) => Ok(Self::open_mount_id(&open.borrow())),
+            Some(ResolvedTarget::Inode(file)) => Ok(file.mount.as_ref().map_or(1, |m| m.id)),
+            None => Ok(path.mount.as_ref().map_or(1, |m| m.id)),
         }
-        Ok(self
-            .resolve_final(dirfd, path, !nofollow)?
-            .mount
-            .as_ref()
-            .map_or(1, |m| m.id))
     }
     pub fn mount_id_fd(&self, fd: u32) -> Result<u64> {
         let o_descriptor = self.descriptor(fd)?;
@@ -1471,8 +1591,8 @@ pub(super) fn new_mount_id() -> Result<u64> {
         })
         .map_err(|_| Errno(28))
 }
-fn copy_mount(m: &Mount) -> Result<Rc<Mount>> {
-    Ok(Rc::new(Mount::new(MountInit {
+fn copy_mount(m: &Mount) -> Result<Arc<Mount>> {
+    Ok(Arc::new(Mount::new(MountInit {
         id: new_mount_id()?,
         fs: m.fs.clone(),
         root: m.root.clone(),
@@ -1622,7 +1742,7 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             let Some(root_path) = mount_absolute(&root_mount, &root_key, &table.root) else {
                 continue;
             };
-            if Rc::ptr_eq(m, &root_mount) {
+            if Arc::ptr_eq(m, &root_mount) {
                 target = b"/".to_vec();
                 filesystem_root = root_key;
             } else {
@@ -1781,7 +1901,7 @@ mod tests {
         let at = v.mount_location(b"/dst", true).unwrap();
         let mount = at.mount.as_ref().unwrap();
         let shared = mount.shared.clone();
-        assert!(!shared._owner_control);
+        assert!(shared.namespace.is_none());
         assert_eq!(shared.parent.borrow().as_ref().unwrap()._parent.id, 1);
         let filesystem = Arc::downgrade(&shared.fs.shared);
         let root = Arc::downgrade(&shared.root);
@@ -1888,6 +2008,85 @@ mod tests {
         assert_eq!(read(&mut child, b"/dst/file"), b"shared");
     }
     #[test]
+    fn namespace_bind_order_unshare_and_last_close_match_linux() {
+        fn refresh(v: &mut Vfs) {
+            v.set_runtime_info(
+                1,
+                RuntimeInfo {
+                    processes: vec![ProcessInfo {
+                        pid: 1,
+                        tgid: 1,
+                        fds: v.fd_snapshot(),
+                        namespaces: v.namespace_snapshot(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let mut older = setup();
+        older.import_file(b"/ns-alias", Vec::new()).unwrap();
+        let oldfd = older.open_at(AT_FDCWD, b"/proc/self/ns/mnt", 0, 0).unwrap();
+        let mut newer = older.clone();
+        newer.unshare_mounts().unwrap();
+        refresh(&mut newer);
+        let original = Arc::downgrade(&newer.mounts.as_ref().unwrap().0);
+        let open = older.namespace_description(
+            linux_namespace::NamespaceHandle::Mount(newer.mounts.as_ref().unwrap().clone()),
+            None,
+        );
+        let newfd = older
+            .shared_files()
+            .reserve()
+            .unwrap()
+            .publish(
+                Descriptor {
+                    open,
+                    cloexec: false.into(),
+                },
+                None,
+            )
+            .unwrap();
+        refresh(&mut older);
+        let oldpath = format!("/proc/self/fd/{oldfd}");
+        let newpath = format!("/proc/self/fd/{newfd}");
+        assert_eq!(
+            older.mount(Some(oldpath.as_bytes()), b"/ns-alias", None, 4096, None),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            newer.mount(Some(oldpath.as_bytes()), b"/ns-alias", None, 4096, None),
+            Err(Errno(22))
+        );
+        older
+            .mount(Some(newpath.as_bytes()), b"/ns-alias", None, 4096, None)
+            .unwrap();
+        let bound = older.open_at(AT_FDCWD, b"/ns-alias", 0, 0).unwrap();
+        assert_eq!(older.stat_fd(bound).unwrap(), older.stat_fd(newfd).unwrap());
+        // Hidden namespace bindings and their children are omitted together.
+        older
+            .mount(Some(b"/src/file"), b"/ns-alias", None, 4096, None)
+            .unwrap();
+        older.unshare_mounts().unwrap();
+        let plain = older.open_at(AT_FDCWD, b"/ns-alias", 0, 0).unwrap();
+        assert_eq!(older.namespace_type(plain), Ok(None));
+        assert_eq!(older.read(plain, 16).unwrap(), b"");
+        older.close(plain).unwrap();
+        older.close(oldfd).unwrap();
+        older.close(newfd).unwrap();
+        drop(newer);
+        assert!(
+            original.upgrade().is_some(),
+            "opened nsfs alias retains original table"
+        );
+        older.close(bound).unwrap();
+        older.reap_detached_mounts();
+        assert!(
+            original.upgrade().is_none(),
+            "no mount namespace reference cycle"
+        );
+    }
+    #[test]
     fn recursive_bind_preserves_nested_tmpfs_and_pivot_root() {
         let mut v = setup();
         v.mkdir_at(AT_FDCWD, b"/src/sub", 0o755).unwrap();
@@ -1969,7 +2168,7 @@ mod tests {
 }
 
 impl Vfs {
-    pub(super) fn register_mounts(&self, mounts: &[Rc<Mount>]) -> Result<()> {
+    pub(super) fn register_mounts(&self, mounts: &[Arc<Mount>]) -> Result<()> {
         self.reap_detached_mounts();
         let mut resources = self.mount_resources.borrow_mut();
         resources.retain(|m| m.strong_count() != 0);
@@ -1978,8 +2177,16 @@ impl Vfs {
         // unrelated containers and can make unshare fail before init starts.
         let mut registry = self.mount_registry.borrow_mut();
         registry.retain(|m| m.strong_count() != 0);
-        resources.extend(mounts.iter().map(|m| Arc::downgrade(&m.identity)));
-        registry.extend(mounts.iter().map(Rc::downgrade));
+        for mount in mounts {
+            let resource = Arc::downgrade(&mount.identity);
+            if !resources.iter().any(|old| old.ptr_eq(&resource)) {
+                resources.push(resource);
+            }
+            let mount = Arc::downgrade(mount);
+            if !registry.iter().any(|old| old.ptr_eq(&mount)) {
+                registry.push(mount);
+            }
+        }
         Ok(())
     }
     pub(super) fn reap_detached_mounts(&self) {
@@ -1994,16 +2201,16 @@ impl Vfs {
                             .parent
                             .borrow()
                             .as_ref()
-                            .is_some_and(|a| Rc::ptr_eq(&a.parent, m))
+                            .is_some_and(|a| Arc::ptr_eq(&a.parent, m))
                     })
                     .count();
-                Rc::strong_count(m) > internal || m.directory_users.load(Ordering::Relaxed) != 0
+                Arc::strong_count(m) > internal || m.directory_users.load(Ordering::Relaxed) != 0
             })
         });
     }
 }
 
-fn mount_absolute(mount: &Rc<Mount>, key: &[u8], root: &Rc<Mount>) -> Option<Vec<u8>> {
+pub(super) fn mount_absolute(mount: &Arc<Mount>, key: &[u8], root: &Arc<Mount>) -> Option<Vec<u8>> {
     let mut at = mount.clone();
     let mut key = key.to_vec();
     let mut suffix = Vec::new();
@@ -2022,7 +2229,7 @@ fn mount_absolute(mount: &Rc<Mount>, key: &[u8], root: &Rc<Mount>) -> Option<Vec
         let mut tail = key[cut..].to_vec();
         tail.extend(suffix);
         suffix = tail;
-        if Rc::ptr_eq(&at, root) {
+        if Arc::ptr_eq(&at, root) {
             return Some(if suffix.is_empty() {
                 b"/".to_vec()
             } else {

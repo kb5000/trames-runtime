@@ -17,10 +17,14 @@ mod native_access;
 pub mod parallel;
 pub use parallel::page::MutablePage as SharedPage;
 mod pinned;
-pub use pinned::PinnedBuffer;
+pub use pinned::{PinnedBuffer, ReadBuffer};
 mod raw;
+mod read_export;
+pub use read_export::MemoryRead;
+mod report;
 mod reservations;
 mod residency;
+pub use report::{ImageRanges, MemoryReport};
 mod slots;
 use backing::Backed;
 pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource};
@@ -237,9 +241,12 @@ pub struct Memory {
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
     limit: usize,
     account: std::sync::Arc<Account>,
+    report_cache: RefCell<Option<(u64, MemoryReport, std::sync::Arc<report::ReportOwner>)>>,
+    image_ranges: Option<ImageRanges>,
     revision: u64,
     code_revision: u64,
     identity: u64,
+    original_identity: u64,
     shared: Option<Rc<RefCell<Memory>>>,
     has_backings: bool,
     has_external_code: bool,
@@ -268,6 +275,7 @@ impl Clone for Memory {
             self.fork_epoch.set(self.fork_epoch.get().wrapping_add(1));
         }
         let account = self.fork_account();
+        let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         let mut cloned = Self {
             mmu: self.mmu.empty_like(),
             pages: self.pages.clone(),
@@ -305,9 +313,12 @@ impl Clone for Memory {
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit: self.limit,
             account,
+            report_cache: RefCell::new(None),
+            image_ranges: self.image_ranges,
             revision: self.revision,
             code_revision: self.code_revision,
-            identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
+            identity,
+            original_identity: identity,
             shared: None,
             has_backings: self.has_backings,
             has_external_code: self.has_external_code,
@@ -412,6 +423,7 @@ impl Memory {
         Ok(())
     }
     pub fn new(limit: usize) -> Self {
+        let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         Self {
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
@@ -426,9 +438,12 @@ impl Memory {
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
             limit,
             account: Account::new(limit),
+            report_cache: RefCell::new(None),
+            image_ranges: None,
             revision: 0,
             code_revision: 0,
-            identity: NEXT_SPACE.fetch_add(1, Ordering::Relaxed),
+            identity,
+            original_identity: identity,
             shared: None,
             has_backings: false,
             has_external_code: false,
@@ -772,6 +787,7 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
+        self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.retire_anonymous_range(address, end);
         if self.anonymous.overlaps(address, end) {
@@ -843,6 +859,7 @@ impl Memory {
         if self.anonymous.ranges.len() >= MAX_PAGE_DESCRIPTORS {
             return Err(MemoryError::Limit);
         }
+        self.invalidate_proc_reads(address, end);
         self.advance_code_revision();
         self.anonymous.insert(
             address,
@@ -893,6 +910,7 @@ impl Memory {
             }
         }
         self.check_reservation_split(address, end, 0)?;
+        self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.advance_code_revision();
         let mut reserved: Vec<_> = self

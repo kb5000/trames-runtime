@@ -248,6 +248,7 @@ impl<C: Cpu> Kernel<C> {
         if pid != p.tgid {
             if let Some(leader) = self.processes.get(&p.tgid) {
                 p.started = leader.started;
+                p.signals.io.inherit_proc_pid(&leader.signals.io);
             }
         }
         let old_memory = Self::install_exec(p, image, self.started);
@@ -299,6 +300,9 @@ impl<C: Cpu> Kernel<C> {
             p.wait_event.bind_presence(&p.signals.presence);
             p.linux.vfs.set_process_context(p.tgid);
             self.publish_task(p.tgid, p);
+        }
+        if pid == p.tgid {
+            self.publish_task(pid, p);
         }
         drop(old_presence);
         self.retire_detached_memory(old_memory)?;
@@ -501,17 +505,55 @@ mod tests {
             .import_executable(b"/image", elf(&[0x14000000]))
             .unwrap();
         leader.memory.write(0x1000, b"/image\0").unwrap();
+        k.install_proc_source(&leader, None);
+        k.publish_task(1, &leader);
+        let proc_leader =
+            trames_vfs::ProcSource::task(&**k.proc_source.as_ref().unwrap(), 1).unwrap();
+        let paths = leader.linux.vfs.path_queries();
+        let files = trames_vfs::DirectFiles::default();
+        let mut reads = Vec::new();
+        let mut opened = Vec::new();
+        for path in [b"/proc/self/comm".as_slice(), b"/proc/self/maps"] {
+            let fd = paths
+                .open_at_resolve(AT_FDCWD, path, 0, 0, 0, &files)
+                .unwrap()
+                .unwrap();
+            opened.push(fd);
+            let target = leader
+                .linux
+                .vfs
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .file_target()
+                .unwrap();
+            reads.push(trames_vfs::FileWork::from_vfs(
+                &leader.linux.vfs,
+                target,
+                trames_vfs::FileCommand::Read {
+                    count: 65536,
+                    offset: Some(0),
+                },
+            ));
+        }
+        drop(paths);
         let mut io = trames_linux::CapturedOutput::default();
         k.syscall(1, &mut leader, 220, [0x10900, 0, 0, 0, 0, 0], &mut io)
             .unwrap();
         k.processes.insert(1, leader);
         let mut caller = k.processes.remove(&2).unwrap();
+        let proc_thread =
+            trames_vfs::ProcSource::task(&**k.proc_source.as_ref().unwrap(), 2).unwrap();
         caller.started = origin;
         caller.cpu_time = Duration::from_millis(3);
         caller.poll_deadline = Some(origin);
         caller.socket_deadline = Some(origin);
         caller.signals.set_mask(2);
         caller.signals.wait_mask = Some(4);
+        // An accepted guarded borrower may keep physical storage after the
+        // last task execs. It must not keep the old Linux mm logically alive.
+        let retained_memory = caller.memory.parallel_view(&mut k.parallel_memory).unwrap();
 
         let image = Kernel::<trames_cpu::Cpu>::prepare_exec_request(
             &caller,
@@ -532,6 +574,72 @@ mod tests {
 
         assert!(!k.processes.contains_key(&1));
         assert!(caller.signals.presence.present());
+        let view = proc_leader
+            .observe(trames_vfs::ProcRefresh::Metadata, None)
+            .unwrap();
+        assert_eq!(view.pid, 1);
+        assert_eq!(view.identity, proc_leader.identity());
+        assert!(proc_thread
+            .observe(trames_vfs::ProcRefresh::Metadata, None)
+            .is_none());
+        let results = std::thread::spawn(move || {
+            reads
+                .into_iter()
+                .map(|read| {
+                    let trames_vfs::FileOutcome::Complete(reply) = read.run() else {
+                        panic!("proc read returned to owner")
+                    };
+                    let trames_vfs::FileValue::Bytes(bytes) = reply.result.unwrap() else {
+                        panic!("read bytes")
+                    };
+                    bytes
+                })
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(results[0], b"image\n");
+        assert_eq!(
+            results[1], b"",
+            "the old maps FD must not read the replacement mm"
+        );
+        let paths = caller.linux.vfs.path_queries();
+        let reopened = paths
+            .open_at_resolve(
+                AT_FDCWD,
+                format!("/proc/self/fd/{}", opened[1]).as_bytes(),
+                0,
+                0,
+                0,
+                &files,
+            )
+            .expect("proc maps FD reopens on its worker")
+            .unwrap();
+        let target = caller
+            .linux
+            .vfs
+            .shared_files()
+            .lookup(reopened)
+            .unwrap()
+            .unwrap()
+            .file_target()
+            .unwrap();
+        let trames_vfs::FileOutcome::Complete(reply) = trames_vfs::FileWork::from_vfs(
+            &caller.linux.vfs,
+            target,
+            trames_vfs::FileCommand::Read {
+                count: 65536,
+                offset: None,
+            },
+        )
+        .run() else {
+            panic!("fresh maps read returned to owner")
+        };
+        assert!(
+            matches!(reply.result, Ok(trames_vfs::FileValue::Bytes(bytes)) if !bytes.is_empty()),
+            "reopen uses the current mm rather than cloning the old open plan"
+        );
+        drop(retained_memory);
     }
     struct Wake(mpsc::Sender<()>);
     impl trames_vfs::IoWake for Wake {

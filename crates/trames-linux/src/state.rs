@@ -35,7 +35,7 @@ pub struct Linux {
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub executable_path: Vec<u8>,
-    pub executable_file: Option<std::rc::Rc<trames_vfs::ExecutableFile>>,
+    pub executable_file: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
     pub command_name: Vec<u8>,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,

@@ -436,6 +436,7 @@ impl Memory {
         if self.anonymous.ranges.len() >= MAX_PAGE_DESCRIPTORS {
             return Err(MemoryError::Limit);
         }
+        self.invalidate_proc_reads(address, end);
         self.advance_code_revision();
         self.anonymous.insert(
             address,

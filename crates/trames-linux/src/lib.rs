@@ -83,6 +83,13 @@ pub struct HostSpawn {
 pub const HOST_RUNNING: i32 = i32::MIN;
 
 pub trait GuestOutput {
+    /// Read-only host accounting can run on the querying executor. Adapters
+    /// retain their actual provider, not a periodically copied memory hint.
+    fn host_memory_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
+        None
+    }
     /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
     /// Queried only for memory/proc metadata, never on CPU/native byte access.
     fn host_memory(&self) -> Option<HostMemoryInfo> {

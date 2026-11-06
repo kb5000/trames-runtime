@@ -43,15 +43,17 @@ impl MountWatch {
 }
 pub(crate) struct MountFile {
     pub watch: Arc<MountWatch>,
-    snapshot: NamespaceSnapshot,
+    snapshot: SharedNamespaceSnapshot,
     info: bool,
     // Open proc mount files pin their original namespace and process root.
-    _namespace: MountNamespace,
-    _root: Option<(Rc<Mount>, NodeRef)>,
+    _namespace: Arc<SharedCell<Table>>,
+    _root: Option<(Arc<Mount>, NodeRef)>,
+    _root_use: Option<MountUse>,
 }
 impl MountFile {
     pub fn text(&self) -> Vec<u8> {
-        table_text(&self.snapshot, self.info)
+        let (snapshot, _lease) = self.snapshot.project();
+        table_text(&snapshot, self.info)
     }
     pub fn read(&self, offset: u64, count: usize) -> Vec<u8> {
         let text = self.text();
@@ -61,7 +63,7 @@ impl MountFile {
 }
 
 impl Vfs {
-    pub(crate) fn proc_mount_file(&self, path: &ResolvedPath) -> Option<Rc<MountFile>> {
+    pub(crate) fn proc_mount_file(&self, path: &ResolvedPath) -> Option<Arc<MountFile>> {
         if !self.uses_pseudo(path) {
             return None;
         }
@@ -82,22 +84,26 @@ impl Vfs {
             .find(|p| p.pid == pid)?
             .namespaces
             .clone();
-        let namespace = MountNamespace(snapshot.mount.upgrade()?);
+        let namespace = MountNamespace(snapshot.mount.upgrade()?).original()?.0;
         let root = snapshot
             .root
             .as_ref()
             .and_then(|(m, n)| Some((m.upgrade()?, n.upgrade()?)));
-        let events = namespace.0.borrow().events.clone();
+        let events = namespace.borrow().events.clone();
         let generation = events.generation.load(Ordering::Relaxed);
-        Some(Rc::new(MountFile {
+        let root_use = root
+            .as_ref()
+            .map(|(mount, _)| MountUse::new(mount.identity.clone()));
+        Some(Arc::new(MountFile {
             watch: Arc::new(MountWatch {
                 events,
                 observed: AtomicU64::new(generation),
             }),
-            snapshot,
+            snapshot: snapshot.shared(),
             info: key == b"mountinfo",
             _namespace: namespace,
             _root: root,
+            _root_use: root_use,
         }))
     }
 }
@@ -123,6 +129,42 @@ mod tests {
         vfs.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
         vfs.mkdir_at(AT_FDCWD, b"/b", 0o755).unwrap();
         vfs
+    }
+    #[test]
+    fn mount_file_keeps_its_open_process_root_after_the_task_changes_chroot() {
+        let mut owner = vfs();
+        owner.mkdir_at(AT_FDCWD, b"/jail", 0o755).unwrap();
+        owner
+            .mount(None, b"/jail", Some(b"tmpfs"), 0, None)
+            .unwrap();
+        let root = owner
+            .open_at(AT_FDCWD, b"/", O_PATH | O_DIRECTORY, 0)
+            .unwrap();
+        let proc = owner
+            .open_at(AT_FDCWD, b"/proc", O_PATH | O_DIRECTORY, 0)
+            .unwrap();
+        let mut target = owner.clone();
+        target.chdir(b"/jail").unwrap();
+        target.chroot(b"/jail").unwrap();
+        target.set_runtime_info(
+            2,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 2,
+                    tgid: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let fd = target
+            .open_at(proc as i32, b"self/mountinfo", 0, 0)
+            .unwrap();
+        target.chdir_fd(root).unwrap();
+        target.chroot(b".").unwrap();
+        assert_eq!(owner.umount(b"/jail", 0), Err(Errno(16)));
+        target.close(fd).unwrap();
+        owner.umount(b"/jail", 0).unwrap();
     }
     #[test]
     fn moved_subtree_keeps_mount_ids_open_files_and_rejects_cycles() {
@@ -188,6 +230,68 @@ mod tests {
         child.close(fd).unwrap();
         v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
         assert!(nested.epoll_wait(1).unwrap().is_empty());
+    }
+    #[test]
+    fn accepted_mount_reads_share_offsets_and_keep_live_topology_after_owner_exit() {
+        fn bytes(work: FileWork) -> Vec<u8> {
+            assert!(!work.host_work());
+            let FileOutcome::Complete(reply) = work.run() else {
+                panic!("mount read must finish on its caller")
+            };
+            let FileValue::Bytes(bytes) = reply.result.unwrap() else {
+                panic!("read bytes")
+            };
+            bytes
+        }
+        let mut v = vfs();
+        let fd = v.open_at(AT_FDCWD, b"/proc/self/mountinfo", 0, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let target = v
+            .shared_files()
+            .lookup(fd)
+            .unwrap()
+            .unwrap()
+            .file_target()
+            .unwrap();
+        let namespace = Arc::downgrade(&v.mounts.as_ref().unwrap().0);
+        let first = FileWork::from_vfs(
+            &v,
+            target.clone(),
+            FileCommand::Read {
+                count: 7,
+                offset: None,
+            },
+        );
+        let first = std::thread::spawn(move || bytes(first)).join().unwrap();
+        assert_eq!(
+            v.read(alias, 9).unwrap(),
+            v.pread(fd, 16, 0).unwrap()[7..16]
+        );
+        assert_eq!(v.seek(alias, 0, 1), Ok(16));
+        assert_eq!(first, v.pread(fd, 7, 0).unwrap());
+        v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
+        // The read-only namespace lease is not an open reference to every mount.
+        v.umount(b"/a", 0).unwrap();
+        v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
+        v.mount(Some(b"/a"), b"/b", None, 8192, None).unwrap();
+        let read = FileWork::from_vfs(
+            &v,
+            target.clone(),
+            FileCommand::Read {
+                count: 65536,
+                offset: Some(0),
+            },
+        );
+        drop(target);
+        drop(v);
+        assert!(namespace.upgrade().is_some());
+        let text =
+            String::from_utf8(std::thread::spawn(move || bytes(read)).join().unwrap()).unwrap();
+        assert!(text.contains(" /b ") && !text.contains(" /a "));
+        assert!(
+            namespace.upgrade().is_none(),
+            "last accepted read releases the namespace"
+        );
     }
     #[test]
     fn noatime_authority_and_worker_reads_use_the_live_status_flag() {

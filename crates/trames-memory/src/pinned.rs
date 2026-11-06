@@ -16,6 +16,18 @@ pub struct PinnedBuffer {
     length: usize,
     parts: Vec<(Arc<PinnedPage>, usize, usize)>,
 }
+/// A scoped byte reader cannot gain writable pin authority over a read-only
+/// guest mapping. It uses the original region guards and physical ownership.
+#[derive(Clone)]
+pub struct ReadBuffer(PinnedBuffer);
+impl ReadBuffer {
+    pub fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.0.read(offset, length)
+    }
+    pub fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
+        self.0.read_into(offset, out)
+    }
+}
 impl PinnedBuffer {
     pub fn range(&self, address: u64, length: usize) -> Result<usize, MemoryError> {
         let address = address & 0x00ffffffffffffff;
@@ -105,15 +117,30 @@ impl Memory {
     /// Anonymous private heap/stack pages are supported first. Live file/shared
     /// backings need provider-specific pin/truncate semantics and return ENOTSUP.
     pub fn pin_rw(&mut self, address: u64, length: usize) -> Result<PinnedBuffer, MemoryError> {
+        self.pin_anonymous(address, length, true)
+    }
+    /// Register only a requested anonymous read range at an existing quiescent
+    /// mm boundary. Opening a proc file must not register speculative pages.
+    pub fn pin_read(&mut self, address: u64, length: usize) -> Result<ReadBuffer, MemoryError> {
+        self.pin_anonymous(address, length, false).map(ReadBuffer)
+    }
+    fn pin_anonymous(
+        &mut self,
+        address: u64,
+        length: usize,
+        write: bool,
+    ) -> Result<PinnedBuffer, MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow_mut().pin_rw(address, length);
+            return shared.borrow_mut().pin_anonymous(address, length, write);
         }
         if length == 0 {
             return Err(MemoryError::InvalidRange);
         }
         let address = address & 0x00ffffffffffffff;
         self.check(address, length, Access::Read)?;
-        self.check(address, length, Access::Write)?;
+        if write {
+            self.check(address, length, Access::Write)?;
+        }
         self.materialize_descriptors(address, length);
         let mut cursor = address;
         let end = address
@@ -122,7 +149,8 @@ impl Memory {
         // All unsupported providers are rejected before promoting any page.
         while cursor < end {
             let frame = self.frame(cursor & !(PAGE_SIZE - 1)).unwrap();
-            if self.frames[frame].as_ref().unwrap().backing.is_some() {
+            let page = self.frames[frame].as_ref().unwrap();
+            if page.backing.is_some() && (write || !page.proc_anonymous()) {
                 return Err(MemoryError::BackingIo(95));
             }
             cursor = (cursor | (PAGE_SIZE - 1)) + 1;
@@ -201,6 +229,64 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_pin_supports_readonly_pages_without_widening_guest_permissions() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory.write(0x1ffe, b"read").unwrap();
+        memory
+            .protect(0x1000, PAGE_SIZE * 2, Permissions::R)
+            .unwrap();
+        let read = memory.pin_read(0x1ffe, 4).unwrap();
+        assert_eq!(read.read(0, 4).unwrap(), b"read");
+        assert!(memory.write(0x1ffe, b"nope").is_err());
+        assert!(memory.pin_rw(0x1ffe, 4).is_err());
+        assert!(read.read(4, 1).is_err());
+        let mut unchanged = [9; 2];
+        assert!(read.read_into(3, &mut unchanged).is_err());
+        assert_eq!(unchanged, [9; 2]);
+        memory
+            .protect(0x1000, PAGE_SIZE * 2, Permissions::RW)
+            .unwrap();
+        let mut cpu = memory.parallel_view(&mut Default::default()).unwrap();
+        // SAFETY: the sole CPU uses the original pin-aware frame admission;
+        // the read lease adds no Memory or View and pins only these two pages.
+        assert!(unsafe { cpu.try_exclusive_private() });
+        cpu.write(0x1ffe, b"live").unwrap();
+        assert_eq!(
+            std::thread::spawn(move || read.read(0, 4))
+                .join()
+                .unwrap()
+                .unwrap(),
+            b"live"
+        );
+        drop(cpu);
+        memory.commit_parallel().unwrap();
+    }
+    #[test]
+    fn read_pin_keeps_original_cow_and_arena_bytes_through_fork_unmap_and_reuse() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory.write(0x1ffc, b"original").unwrap();
+        let before = memory.clone();
+        memory
+            .protect(0x1000, PAGE_SIZE * 2, Permissions::R)
+            .unwrap();
+        let read = memory.pin_read(0x1ffc, 8).unwrap();
+        let after = memory.clone();
+        memory
+            .protect(0x1000, PAGE_SIZE * 2, Permissions::RW)
+            .unwrap();
+        memory.write(0x1ffc, b"modified").unwrap();
+        assert_eq!(read.read(0, 8).unwrap(), b"modified");
+        assert_eq!(before.read_array::<8>(0x1ffc).unwrap(), *b"original");
+        assert_eq!(after.read_array::<8>(0x1ffc).unwrap(), *b"original");
+        memory.unmap(0x1000, PAGE_SIZE * 2).unwrap();
+        memory.map(0x1000, PAGE_SIZE * 2, Permissions::RW).unwrap();
+        memory.write(0x1ffc, b"new-data").unwrap();
+        assert_eq!(read.read(0, 8).unwrap(), b"modified");
+        assert_eq!(memory.read_array::<8>(0x1ffc).unwrap(), *b"new-data");
+    }
     #[test]
     fn shared_pin_transfers_across_threads_and_keeps_residency_until_last_owner() {
         fn shared<T: Send + Sync>() {}

@@ -49,6 +49,7 @@ impl<C: Cpu> Kernel<C> {
         if memory.coordinator_ownership().1 != 1 {
             return Ok(());
         }
+        memory.retire_memory_report();
         if memory.parallel_views_quiescent() {
             return memory.commit_parallel();
         }
@@ -121,6 +122,9 @@ impl<C: Cpu> Kernel<C> {
     }
     fn finish_source_memory(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
         let p = &self.processes[&pid];
+        if p.memory.coordinator_ownership().1 == 1 {
+            p.memory.retire_memory_report();
+        }
         let borrowed =
             p.memory.coordinator_ownership().1 == 1 && !p.memory.parallel_views_quiescent();
         self.exits.waits.remove(&pid);

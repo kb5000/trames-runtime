@@ -68,6 +68,18 @@ pub fn build_initial_stack(
         arguments.push(push_string(&mut elf.memory, &mut cursor, value)?);
     }
     arguments.reverse();
+    // Keep the actual contiguous string spans on their original mm. Loaded
+    // host vectors and later pointer-array edits are not proc byte authority.
+    let arg_start = arguments[0];
+    let arg_end = arguments.last().unwrap() + argv.last().unwrap().len() as u64 + 1;
+    let env_start = environment.first().copied().unwrap_or(arg_end);
+    let env_end = environment
+        .last()
+        .map_or(arg_end, |last| last + envp.last().unwrap().len() as u64 + 1);
+    elf.memory.set_image_ranges(trames_memory::ImageRanges {
+        arguments: (arg_start, arg_end),
+        environment: (env_start, env_end),
+    });
     cursor -= 16;
     let mut entropy = [0; 16];
     crate::fill_entropy(&mut entropy)

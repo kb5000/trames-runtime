@@ -349,8 +349,17 @@ impl NamespaceWork {
     pub(super) fn run(&self, paths: &PathQueries) -> Option<Result<FileValue>> {
         let mut view = paths.view.borrow_mut();
         view.query.as_ref().unwrap().clear_deferred();
+        // A background namespace operation owns the mounts it actually walks,
+        // not every mount in its private metadata projection. Keep these uses
+        // through host I/O, then release them outside the lookup algorithms.
+        view.query.as_ref().unwrap().namespace_uses.begin();
         let result = self.call.execute(&mut view);
-        (!view.query.as_ref().unwrap().take_deferred()).then_some(result)
+        let query = view.query.as_ref().unwrap();
+        let uses = query.namespace_uses.finish();
+        let deferred = query.take_deferred();
+        drop(view);
+        drop(uses);
+        (!deferred).then_some(result)
     }
     pub(super) fn run_owner(&self, paths: &PathQueries, owner: &mut Vfs) -> Result<FileValue> {
         // Rare owner-only proc/task/mount descriptions retain the original
@@ -393,6 +402,43 @@ impl NamespaceWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executing_namespace_io_pins_only_walked_mounts_until_completion() {
+        use std::time::{Duration, Instant};
+        let mut owner = Vfs::default();
+        for path in [b"/used".as_slice(), b"/unrelated"] {
+            owner.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+            owner.mount(None, path, Some(b"tmpfs"), 0, None).unwrap();
+        }
+        let at = owner.mount_location(b"/used", true).unwrap();
+        let used = at.mount.as_ref().unwrap().identity.clone();
+        let namespace = at.filesystem(&owner).namespace.clone();
+        drop(at);
+        let work = owner.path_queries().namespace_work(NamespaceCall::Mkdir {
+            fd: AT_FDCWD,
+            path: b"/used/new".to_vec(),
+            mode: 0o755,
+        });
+        let blocked = namespace.lock().unwrap();
+        let worker = std::thread::spawn(move || finish(work));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !used.in_use() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let active = used.in_use();
+        let in_use = owner.umount(b"/used", 0);
+        let unrelated = owner.umount(b"/unrelated", 0);
+        drop(blocked);
+        let completed = worker.join().unwrap();
+        assert!(
+            active,
+            "operation reached its original mount before blocking on namespace I/O"
+        );
+        assert_eq!(in_use, Err(Errno(16)));
+        assert_eq!(unrelated, Ok(()));
+        assert!(matches!(completed, Ok(FileValue::Count(0))));
+        owner.umount(b"/used", 0).unwrap();
+    }
     fn finish(work: FileWork) -> Result<FileValue> {
         match work.run() {
             FileOutcome::Complete(reply) => reply.result,

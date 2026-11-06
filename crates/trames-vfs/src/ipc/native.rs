@@ -241,12 +241,17 @@ fn io_errno(e: io::Error) -> Errno {
 impl SharedOpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Arc<Self> {
         Arc::new(Self {
+            oom: None,
+            network_control: None,
+            mount_file: None,
+            runtime_file: None,
             socket: None,
             _disk_file: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_file: None,
             native_image: None,
             mount_resource: std::sync::OnceLock::new(),
+            mount_use: Default::default(),
             directory_mount: Default::default(),
             namespace_resource: None,
             file_authority: Default::default(),
@@ -899,12 +904,17 @@ impl Importer {
         fs.track_inode(&node)?;
         drop(fs);
         Ok(Arc::new(SharedOpenDescription {
+            oom: None,
+            network_control: None,
+            mount_file: None,
+            runtime_file: None,
             socket: None,
             _disk_file: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_file: None,
             native_image: None,
             mount_resource: std::sync::OnceLock::new(),
+            mount_use: Default::default(),
             directory_mount: Default::default(),
             namespace_resource: None,
             file_authority: Default::default(),

@@ -54,12 +54,126 @@ pub struct FdInfo {
     pub mount_id: u64,
     pub socket: Option<trames_net::SocketInfo>,
     pub signal_mask: Option<u64>,
-    open: OpenWeak,
+    pub(super) open: OpenWeak,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proc_cache_pressure_reclaims_unreferenced_entries_and_preserves_open_inodes() {
+        let mut cache = PseudoFs::default();
+        let open = cache
+            .cache(0, b"/proc/1/status", file(b"old"), 0o100444)
+            .unwrap();
+        for i in 0..35_000 {
+            cache
+                .cache(
+                    0,
+                    format!("/proc/{}/status", i + 2).as_bytes(),
+                    file(b""),
+                    0o100444,
+                )
+                .unwrap();
+        }
+        let again = cache
+            .cache(0, b"/proc/1/status", file(b"new"), 0o100444)
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&open, &again),
+            "a live open inode stays interned"
+        );
+        assert!(cache.nodes.borrow().entries.len() < 4096);
+        assert!(cache.nodes.borrow().identities.is_empty());
+    }
+    #[test]
+    fn proc_cache_pressure_retires_original_dead_pids_even_with_retained_inodes() {
+        struct Task(std::sync::atomic::AtomicBool);
+        impl ProcTask for Task {
+            fn identity(&self) -> u64 {
+                1
+            }
+            fn pid(&self) -> u32 {
+                1
+            }
+            fn present(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+            fn observe(&self, _: ProcRefresh, _: Option<usize>) -> Option<ProcessInfo> {
+                Some(ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    identity: 1,
+                    ..Default::default()
+                })
+            }
+            fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
+                None
+            }
+        }
+        let mut cache = PseudoFs::default();
+        let task = Arc::new(Task(std::sync::atomic::AtomicBool::new(true)));
+        struct Source(Arc<Task>);
+        impl ProcSource for Source {
+            fn task(&self, pid: u32) -> Option<Arc<dyn ProcTask>> {
+                (pid == 1).then(|| self.0.clone() as Arc<dyn ProcTask>)
+            }
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                RuntimeInfo {
+                    processes: self
+                        .0
+                        .observe(ProcRefresh::Metadata, None)
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+        }
+        let owner = Vfs::default();
+        owner.set_proc_source(Arc::new(Source(task.clone())));
+        let query = owner.path_queries();
+        let binding = query
+            .view
+            .borrow()
+            .resolve(AT_FDCWD, b"/proc/1")
+            .unwrap()
+            .proc_binding;
+        let open = cache
+            .cache_process(0, b"/proc/1", Content::Directory, 0o40555, 1, None)
+            .unwrap();
+        open.proc_node
+            .set(proc_source::ProcNode {
+                path: b"/proc/1".to_vec(),
+                binding,
+            })
+            .unwrap_or_else(|_| panic!("fresh inode"));
+        task.0.store(false, Ordering::Relaxed);
+        for i in 0..4096 {
+            cache
+                .cache(
+                    0,
+                    format!("/proc/{}/status", i + 2).as_bytes(),
+                    file(b""),
+                    0o100444,
+                )
+                .unwrap();
+        }
+        assert!(!cache
+            .nodes
+            .borrow()
+            .entries
+            .contains_key(&(0, b"/proc/1".to_vec())));
+        assert!(!cache
+            .nodes
+            .borrow()
+            .identities
+            .contains_key(&(0, b"/proc/1".to_vec())));
+        assert_eq!(
+            open.borrow().mode,
+            0o40555,
+            "retirement leaves the retained inode valid"
+        );
+    }
     fn snapshot(v: &mut Vfs) {
         v.set_runtime_info(
             1,
@@ -604,6 +718,7 @@ mod tests {
 }
 #[derive(Clone, Default)]
 pub struct ProcessInfo {
+    pub identity: u64,
     pub pid: u32,
     pub processor: u32,
     pub nice: i32,
@@ -616,6 +731,7 @@ pub struct ProcessInfo {
     pub state: char,
     pub credentials: Credentials,
     pub namespaces: NamespaceSnapshot,
+    pub namespace_projection: Option<Rc<linux_namespace::NamespaceProjection>>,
     pub namespace_ids: [Vec<u32>; 4],
     pub command: Vec<u8>,
     pub cgroup: Vec<u8>,
@@ -624,9 +740,13 @@ pub struct ProcessInfo {
     pub seccomp_filters: usize,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
+    pub arguments_bytes: Option<Vec<u8>>,
+    pub environment_bytes: Option<Vec<u8>>,
     pub executable: Vec<u8>,
-    pub executable_file: Option<Weak<ExecutableFile>>,
+    pub executable_file: Option<std::sync::Weak<ExecutableFile>>,
     pub cwd: Vec<u8>,
+    pub cwd_directory: Option<ProcDirectory>,
+    pub root_directory: Option<ProcDirectory>,
     pub mapped_bytes: usize,
     pub virtual_bytes: u64,
     pub maps: Vec<u8>,
@@ -669,16 +789,19 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
-    boot_id: std::cell::OnceCell<Result<Vec<u8>>>,
+    pub(super) boot_id: Arc<std::sync::OnceLock<Result<Vec<u8>>>>,
     pub(super) video_device: bool,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
+    pub(super) source: Option<Arc<dyn proc_source::ProcSource>>,
     pub(super) nodes: Arc<SharedCell<PseudoNodes>>,
 }
 #[derive(Default)]
 pub(super) struct PseudoNodes {
     pub(super) entries: BTreeMap<(u64, Vec<u8>), NodeRef>,
+    identities: BTreeMap<(u64, Vec<u8>), u64>,
     next_inode: u64,
+    next_gc: usize,
 }
 impl PseudoFs {
     pub(super) fn path_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
@@ -696,8 +819,24 @@ impl PseudoFs {
         content: Content,
         mode: u32,
     ) -> Result<NodeRef> {
+        self.cache_process(ns, path, content, mode, 0, None)
+    }
+    fn cache_process(
+        &mut self,
+        ns: u64,
+        path: &[u8],
+        content: Content,
+        mode: u32,
+        identity: u64,
+        namespace: Option<&PidNamespace>,
+    ) -> Result<NodeRef> {
         let mut nodes = self.nodes.borrow_mut();
-        if let Some(node) = nodes.entries.get(&(ns, path.to_vec())).cloned() {
+        let key = (ns, path.to_vec());
+        if nodes.identities.get(&key).copied().unwrap_or(0) != identity {
+            nodes.entries.remove(&key);
+            nodes.identities.remove(&key);
+        }
+        if let Some(node) = nodes.entries.get(&key).cloned() {
             drop(nodes);
             debug_assert_eq!(node.simple_device, simple_device::Kind::content(&content));
             if node.simple_device.is_none() {
@@ -705,8 +844,66 @@ impl PseudoFs {
             }
             return Ok(node);
         }
-        if nodes.entries.len() >= 32768 {
-            return Err(Errno(28));
+        if nodes.entries.len() >= nodes.next_gc.max(4096) {
+            nodes.next_gc = nodes.entries.len().saturating_add(4096);
+            // Sweep only on insertion pressure, never on every proc lookup.
+            // Task observation can touch other original resources, so perform
+            // it without holding the inode cache lock.
+            let candidates: Vec<_> = nodes
+                .entries
+                .iter()
+                .map(|(key, node)| {
+                    (
+                        key.clone(),
+                        node.identity,
+                        node.proc_node.get().and_then(|p| p.binding.clone()),
+                    )
+                })
+                .collect();
+            drop(nodes);
+            let retired: Vec<_> = candidates
+                .into_iter()
+                .filter_map(|(key, inode, binding)| {
+                    (namespace.is_some_and(|ns| !ns.namespace_alive(key.0))
+                        || binding.is_some_and(|p| !p.target.present()))
+                    .then_some((key, inode))
+                })
+                .collect();
+            nodes = self.nodes.borrow_mut();
+            for (key, inode) in retired {
+                if nodes.entries.get(&key).is_some_and(|n| n.identity == inode) {
+                    nodes.entries.remove(&key);
+                    nodes.identities.remove(&key);
+                }
+            }
+            // Live open inodes stay interned. Unreferenced cache entries may
+            // be reclaimed just as VFS dentries/inodes can be reclaimed on
+            // Linux. Retained guest objects are not subject to a cache quota.
+            nodes.entries.retain(|_, n| Arc::strong_count(n) > 1);
+            let PseudoNodes {
+                entries,
+                identities,
+                ..
+            } = &mut *nodes;
+            identities.retain(|key, _| entries.contains_key(key));
+            nodes.next_gc = nodes.entries.len().saturating_add(4096);
+            // Another resolver could have populated this key while the cache
+            // lock was released. Do not replace its accepted live inode.
+            if nodes.identities.get(&key).copied().unwrap_or(0) != identity {
+                nodes.entries.remove(&key);
+                nodes.identities.remove(&key);
+            }
+            if let Some(node) = nodes.entries.get(&key).cloned() {
+                drop(nodes);
+                debug_assert_eq!(node.simple_device, simple_device::Kind::content(&content));
+                if node.simple_device.is_none() {
+                    node.borrow_mut().content = content;
+                }
+                return Ok(node);
+            }
+        }
+        if identity != 0 {
+            nodes.identities.insert(key, identity);
         }
         nodes.next_inode = nodes.next_inode.checked_add(1).ok_or(Errno(28))?;
         let node = Arc::new(Inode::new(Node {
@@ -857,6 +1054,7 @@ impl Vfs {
         self.pseudo.borrow_mut().video_device = true;
     }
     pub fn set_runtime_info(&mut self, pid: u32, mut runtime: RuntimeInfo) {
+        self.begin_proc_query();
         self.pid = pid;
         if let Some(p) = runtime.processes.iter_mut().find(|p| p.pid == pid) {
             p.namespaces = self.namespace_snapshot();
@@ -904,11 +1102,21 @@ impl Vfs {
             }
             true
         });
+        {
+            let mut nodes = pseudo.nodes.borrow_mut();
+            let PseudoNodes {
+                entries,
+                identities,
+                ..
+            } = &mut *nodes;
+            identities.retain(|key, _| entries.contains_key(key));
+        }
         pseudo.enabled = true;
         pseudo.runtime = runtime;
     }
     pub fn set_process_context(&mut self, pid: u32) {
         self.pid = pid;
+        self.begin_proc_query();
     }
     pub fn process_context(&self) -> u32 {
         self.pid
@@ -919,93 +1127,13 @@ impl Vfs {
             .iter()
             .filter(|(_, descriptor)| descriptor.ready().is_ok())
             .map(|(&fd, d)| {
-                let o = d.open.borrow();
-                let node = o.node.clone().or_else(|| {
-                    if matches!(o.kind, FdKind::Terminal) {
-                        self.node(b"/dev/pts/0").ok()
-                    } else {
-                        None
-                    }
-                });
-                let inode = node.as_ref().map_or_else(
-                    || {
-                        o.namespace.as_ref().map_or_else(
-                            || o.pipe.as_ref().map_or(o.id, |p| p.pipe.inode),
-                            linux_namespace::NamespaceHandle::id,
-                        )
-                    },
-                    |n| n.borrow().inode,
-                );
-                let target = if let Some(ns) = &o.namespace {
-                    ns.label()
-                } else {
-                    match &o.kind {
-                        FdKind::Node(path) => o
-                            .node
-                            .as_ref()
-                            .and_then(|n| {
-                                self.location(n, &self.mount_for_path(o.mount.as_ref()))
-                                    .map(|p| self.path_visible(&p).unwrap_or(p.key))
-                                    .ok()
-                            })
-                            .unwrap_or_else(|| {
-                                let mut p = path.clone();
-                                p.extend_from_slice(b" (deleted)");
-                                p
-                            }),
-                        FdKind::Terminal if o.pty.is_some() => {
-                            let end = o.pty.as_ref().expect("PTY");
-                            if end.master {
-                                b"/dev/ptmx".to_vec()
-                            } else {
-                                format!("/dev/pts/{}", end.pair.number).into_bytes()
-                            }
-                        }
-                        FdKind::Terminal => node
-                            .as_ref()
-                            .and_then(|n| self.path_of(n).ok())
-                            .unwrap_or_else(|| b"/dev/pts/0".to_vec()),
-                        FdKind::Anonymous if o.native_image.is_some() => {
-                            b"anon_inode:[trames-image]".to_vec()
-                        }
-                        FdKind::Anonymous => o
-                            .anonymous
-                            .as_ref()
-                            .expect("anonymous description")
-                            .name()
-                            .to_vec(),
-                        FdKind::Socket => format!("socket:[{inode}]").into_bytes(),
-                        FdKind::PipeRead | FdKind::PipeWrite => {
-                            format!("pipe:[{inode}]").into_bytes()
-                        }
-                        FdKind::Stdin | FdKind::Stdout | FdKind::Stderr => {
-                            format!("pipe:[{inode}]").into_bytes()
-                        }
-                    }
-                };
-                FdInfo {
-                    signal_mask: match o.anonymous {
-                        Some(events::Anonymous::Signal(ref mask)) => Some(mask.get()),
-                        _ => None,
-                    },
+                self.fd_info(
                     fd,
-                    target,
-                    position: o.current_position(),
-                    flags: o.flags.get() | if d.cloexec.get() { O_CLOEXEC } else { 0 },
-                    inode,
-                    mount_id: o.mount.as_ref().map_or(
-                        if o.namespace.is_some() {
-                            17
-                        } else if matches!(o.kind, FdKind::Terminal) {
-                            4
-                        } else {
-                            1
-                        },
-                        |m| m.id,
-                    ),
-                    socket: o.socket.as_ref().and_then(|s| s.info()),
-                    open: d.open.downgrade(),
-                }
+                    &d.open.borrow(),
+                    d.cloexec.get(),
+                    d.open.downgrade(),
+                    None,
+                )
             })
             .collect()
     }
@@ -1025,86 +1153,6 @@ impl Vfs {
         } else {
             Ok(())
         }
-    }
-    pub(super) fn proc_fd_description(
-        &self,
-        dirfd: i32,
-        path: &[u8],
-    ) -> Result<Option<OpenHandle>> {
-        // A query view resolves once through the common walker. Traversing
-        // any pseudo/magic endpoint defers before returning metadata.
-        if self.query.is_some() {
-            return Ok(None);
-        }
-        if !self.pseudo.borrow().enabled {
-            return Ok(None);
-        }
-        // Use the common walker's normal mount, permission and symlink rules,
-        // stopping at the complete proc endpoint before following display text.
-        // The alias itself can live on overlayfs or tmpfs, such as nginx's
-        // error.log -> /dev/stderr -> /proc/self/fd/2 chain.
-        let actual = self
-            .resolve_entry_policy(dirfd, path, true, false, 0, true)?
-            .0;
-        if actual.mount.as_ref().is_some_and(|m| m.namespace.is_some()) || self.uses_pseudo(&actual)
-        {
-            if let Some(ns) = self.namespace_for_path(&actual)? {
-                return Ok(Some(
-                    self.namespace_description(ns, actual.mount.map(OpenMount::Owner)),
-                ));
-            }
-        }
-        if !self.uses_pseudo(&actual) {
-            return Ok(None);
-        }
-        if let Some(open) = self.proc_fd_description_normalized(&actual)? {
-            return Ok(Some(open));
-        }
-        let Some((node, label, mount)) = self.proc_exe_node_normalized(&actual)? else {
-            return Ok(None);
-        };
-        let owner = {
-            let metadata = node.borrow();
-            (metadata.uid, metadata.gid)
-        };
-        Ok(Some(OpenHandle::new(OpenDescription {
-            shared: Arc::new(SharedOpenDescription {
-                socket: None,
-                _disk_file: None,
-                #[cfg(all(feature = "hostfs", unix))]
-                host_file: None,
-                native_image: None,
-                mount_resource: std::sync::OnceLock::new(),
-                directory_mount: Default::default(),
-                namespace_resource: None,
-                file_authority: Default::default(),
-                tcp_publication: Default::default(),
-                socket_control: None,
-                control: None,
-                read_node: None,
-                id: self.open_id(),
-                owner,
-                kind: FdKind::Node(label),
-                flags: (0).into(),
-                file_position: Arc::default(),
-                flock: std::sync::OnceLock::new(),
-                ofd_records: Default::default(),
-                node: Some(node),
-                pipe: None,
-                pty: None,
-                local: None,
-                bridge: None,
-                kernel_log: None,
-                notification: None,
-            }),
-            position: 0,
-            anonymous: None,
-            namespace: None,
-            network_control: None,
-            mount_file: None,
-            oom: None,
-            mount: mount.map(OpenMount::Owner),
-        })))
     }
     pub(super) fn proc_fd_description_normalized(
         &self,
@@ -1165,16 +1213,87 @@ impl Vfs {
         &self,
         path: &ResolvedPath,
     ) -> Result<Option<ResolvedInode>> {
+        if let Some(directory) = self.proc_directory_node_normalized(path)? {
+            return Ok(Some(directory));
+        }
         if let Some(open) = self.proc_fd_description_normalized(path)? {
-            let o = open.borrow();
-            let node = o.node.clone().ok_or(Errno(13))?;
-            let label = match &o.kind {
-                FdKind::Node(label) => label.clone(),
-                _ => path.to_vec(),
-            };
-            return Ok(Some((node, label, self.mount_for_path(o.mount.as_ref()))));
+            return self.proc_open_node(&open, path).map(Some);
         }
         self.proc_exe_node_normalized(path)
+    }
+    pub(super) fn proc_open_node(
+        &self,
+        open: &OpenHandle,
+        path: &ResolvedPath,
+    ) -> Result<ResolvedInode> {
+        let o = open.borrow();
+        let node = o.node.clone().ok_or(Errno(13))?;
+        let label = match &o.kind {
+            FdKind::Node(label) => label.clone(),
+            _ => path.to_vec(),
+        };
+        Ok(ResolvedInode {
+            node,
+            label,
+            mount: self.mount_for_path(o.mount.as_ref()),
+            file: Some(o.shared.clone()),
+            _image: None,
+            _directory: None,
+        })
+    }
+    pub(super) fn proc_directory_node_normalized(
+        &self,
+        path: &ResolvedPath,
+    ) -> Result<Option<ResolvedInode>> {
+        let Some(rest) = path.strip_prefix(b"/proc/") else {
+            return Ok(None);
+        };
+        let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+        let (group, pid, kind) = match parts.as_slice() {
+            [pid, kind @ (b"cwd" | b"root")] => (None, *pid, *kind),
+            [group, b"task", pid, kind @ (b"cwd" | b"root")] => (Some(*group), *pid, *kind),
+            _ => return Ok(None),
+        };
+        self.refresh_proc_source(path)?;
+        let number = |part: &[u8]| std::str::from_utf8(part).ok()?.parse::<u32>().ok();
+        let pseudo = self.pseudo.borrow();
+        let runtime = self.proc_runtime(path, &pseudo.runtime);
+        let process = runtime
+            .processes
+            .iter()
+            .find(|p| {
+                Some(p.pid) == number(pid)
+                    && group.is_none_or(|group| Some(p.tgid) == number(group))
+            })
+            .ok_or(Errno(2))?;
+        if !self.may_inspect(path, &runtime, process) {
+            return Err(Errno(13));
+        }
+        let directory = if kind == b"cwd" {
+            &process.cwd_directory
+        } else {
+            &process.root_directory
+        };
+        let Some(directory) = directory else {
+            return if pseudo.source.is_some() {
+                Err(Errno(2))
+            } else {
+                Ok(None)
+            };
+        };
+        let mount = self.mount_for_path(Some(&OpenMount::Shared(directory.mount.clone())));
+        let label = self
+            .location(&directory.node, &mount)
+            .map(|p| p.key)
+            .unwrap_or_default();
+        Ok(Some(ResolvedInode {
+            node: directory.node.clone(),
+            label,
+            mount,
+            file: None,
+            _image: None,
+            _directory: Some(mounts::MountUse::new(directory.mount.identity.clone())),
+        }))
     }
     pub(super) fn proc_exe_node_normalized(
         &self,
@@ -1204,31 +1323,33 @@ impl Vfs {
         if !self.may_inspect(path, &runtime, process) {
             return Err(Errno(13));
         }
-        let Some(file) = process.executable_file.as_ref().and_then(Weak::upgrade) else {
+        let Some(file) = process
+            .executable_file
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
             return Ok(None);
         };
-        Ok(Some((
-            file.node.clone(),
-            file.label.clone(),
-            file.mount.clone(),
-        )))
+        Ok(Some(ResolvedInode {
+            node: file.node.clone(),
+            label: file.label.clone(),
+            mount: file
+                .mount
+                .as_ref()
+                .and_then(|mount| self.mount_for_path(Some(&OpenMount::Shared(mount.clone())))),
+            file: None,
+            _image: Some(file),
+            _directory: None,
+        }))
     }
-    pub(super) fn open_proc_fd(
+    pub(super) fn reopen_proc_description(
         &mut self,
-        dirfd: i32,
-        path: &[u8],
+        accepted: OpenHandle,
         flags: u32,
-    ) -> Result<Option<u32>> {
-        if flags & O_NOFOLLOW != 0 {
-            return Ok(None);
-        }
-        let Some(open) = self.proc_fd_description(dirfd, path)? else {
-            return Ok(None);
-        };
-        let original = open.borrow();
-        if flags & 0xc0 == 0xc0 {
-            return Err(Errno(17));
-        }
+        publication: Option<&DirectFiles>,
+        reservation: fd_table::ReservedFd,
+    ) -> Result<u32> {
+        let original = accepted.borrow();
         if original.socket.is_some()
             || original.local.is_some()
             || original.anonymous.is_some()
@@ -1236,166 +1357,71 @@ impl Vfs {
         {
             return Err(Errno(6));
         }
-        if flags & O_DIRECTORY != 0
-            && !original
-                .node
-                .as_ref()
-                .is_some_and(|n| matches!(n.borrow().content, Content::Directory))
-        {
+        if flags & O_DIRECTORY != 0 {
             return Err(Errno(20));
         }
-        if flags & O_PATH != 0 {
-            // O_PATH references the inode without admitting data reads/writes.
-        } else if let Some(node) = &original.node {
-            let n = node.borrow();
-            self.check_device_open(&n, flags)?;
-            if (flags & 3 != 1 && !self.allowed(&n, 4)) || (flags & 3 != 0 && !self.allowed(&n, 2))
-            {
-                return Err(Errno(13));
-            }
-        } else if (flags & 3 != 1 && original.flags.get() & 3 == 1)
-            || (flags & 3 != 0 && original.flags.get() & 3 == 0)
+        if flags & O_PATH == 0
+            && ((flags & 3 != 1 && original.flags.get() & 3 == 1)
+                || (flags & 3 != 0 && original.flags.get() & 3 == 0))
         {
             return Err(Errno(13));
         }
-        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
-            if let Some(m) = &original.mount {
-                m.writable()?;
-            }
-            if let Some(node) = &original.node {
-                self.overlay_prepare(
-                    &ResolvedPath {
-                        key: Vec::new(),
-                        mount: self.mount_for_path(original.mount.as_ref()),
-                    },
-                    node,
-                    flags & 0x200 != 0,
-                )?;
+        if let Some(query) = &self.query {
+            if !original.shareable() {
+                return query.defer();
             }
         }
-        let fd = self.available(0)?;
-        let pipe = if let Some(node) = &original.node {
-            if let Content::Fifo(pipe) = &node.borrow().content {
-                PipeEnd::open(pipe, flags)?
-            } else {
-                original.pipe.clone()
-            }
-        } else {
-            original.pipe.clone()
-        };
-        let notification = original.node.as_ref().and_then(|node| {
-            inotify::FileClose::reopen(node, flags, original.notification.as_ref())
-        });
-        // Reopening a proc magic link is a fresh device open, not dup(). In
-        // particular, runc reopens an O_PATH ptmx handle to allocate a new PTY.
-        let pty = if flags & O_PATH != 0 {
-            None
-        } else if let Some(node) = &original.node {
-            match node.borrow().content {
-                Content::Device(Device::Ptmx) => {
-                    let key = match &original.kind {
-                        FdKind::Node(path) => path.clone(),
-                        _ if original.mount.as_ref().is_some_and(|m| m.devpts.is_some()) => {
-                            b"/ptmx".to_vec()
-                        }
-                        _ => b"/dev/ptmx".to_vec(),
-                    };
-                    Some(self.allocate_pty(&ResolvedPath {
-                        key,
-                        mount: self.mount_for_path(original.mount.as_ref()),
-                    })?)
-                }
-                Content::Device(Device::Pts(id, _)) if id != 0 => {
-                    let pair = self.pty_by_id(id).ok_or(Errno(5))?;
-                    if pair.locked.load(std::sync::atomic::Ordering::Relaxed)
-                        || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return Err(Errno(5));
-                    }
-                    Some(pty::PtyEnd::new(pair, false))
-                }
-                _ => original.pty.clone(),
-            }
-        } else {
-            original.pty.clone()
-        };
-        let descriptor = OpenDescription {
-            mount_file: None,
-            shared: Arc::new(SharedOpenDescription {
-                socket: None,
-                _disk_file: None,
-                #[cfg(all(feature = "hostfs", unix))]
-                host_file: None,
-                native_image: None,
-                mount_resource: std::sync::OnceLock::new(),
-                directory_mount: Default::default(),
-                namespace_resource: original.namespace_resource.clone(),
-                file_authority: Default::default(),
-                tcp_publication: Default::default(),
-                socket_control: None,
-                control: None,
-                read_node: if flags & O_PATH == 0 && flags & 3 == 0 {
-                    original
-                        .node
-                        .as_ref()
-                        .and_then(|node| match &node.borrow().content {
-                            Content::File(storage::FileData::Lower(source)) => Some(source.clone()),
-                            _ => None,
-                        })
-                } else {
-                    None
-                },
-                id: self.open_id(),
-                owner: original.owner,
-                kind: if pty.is_some() {
-                    FdKind::Terminal
-                } else {
-                    original.kind.clone()
-                },
-                flags: (flags & !O_CLOEXEC).into(),
-                file_position: Arc::default(),
-                flock: std::sync::OnceLock::new(),
-                ofd_records: Default::default(),
-                node: original.node.clone(),
-                pipe,
-                pty,
-                local: original.local.clone(),
-                bridge: original.bridge.clone(),
-                kernel_log: None,
-                notification,
+        let descriptor = Descriptor {
+            open: OpenHandle::new(OpenDescription {
+                shared: Arc::new(SharedOpenDescription {
+                    oom: None,
+                    network_control: None,
+                    mount_file: None,
+                    runtime_file: None,
+                    socket: None,
+                    _disk_file: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_file: None,
+                    native_image: None,
+                    mount_resource: Default::default(),
+                    mount_use: Default::default(),
+                    directory_mount: Default::default(),
+                    namespace_resource: original.namespace_resource.clone(),
+                    file_authority: Default::default(),
+                    tcp_publication: Default::default(),
+                    socket_control: None,
+                    control: None,
+                    read_node: None,
+                    id: self.open_id(),
+                    owner: original.owner,
+                    kind: original.kind.clone(),
+                    flags: (flags & !O_CLOEXEC).into(),
+                    file_position: Arc::default(),
+                    flock: Default::default(),
+                    ofd_records: Default::default(),
+                    node: None,
+                    pipe: original.pipe.clone(),
+                    pty: original.pty.clone(),
+                    local: None,
+                    bridge: original.bridge.clone(),
+                    kernel_log: None,
+                    notification: None,
+                }),
+                anonymous: None,
+                namespace: original.namespace.clone(),
+                mount: original.mount.clone(),
             }),
-            position: 0,
-            anonymous: None,
-            namespace: original.namespace.clone(),
-            network_control: original.network_control.clone(),
-            oom: original.oom.clone(),
-            mount: original.mount.clone(),
+            cloexec: (flags & O_CLOEXEC != 0).into(),
         };
-        drop(original);
-        self.fds.insert(
-            fd,
-            Descriptor {
-                open: OpenHandle::new(descriptor),
-                cloexec: (flags & O_CLOEXEC != 0).into(),
-            },
-        );
-        if flags & 0x200 != 0
-            && self.descriptor(fd)?.open.borrow().oom.is_none()
-            && self.descriptor(fd)?.open.borrow().network_control.is_none()
-            && self
-                .descriptor(fd)?
-                .open
-                .borrow()
-                .node
-                .as_ref()
-                .is_some_and(|n| matches!(n.borrow().content, Content::File(_)))
-        {
-            if let Err(error) = self.truncate_fd(fd, 0) {
-                self.fds.remove(&fd);
-                return Err(error);
+        if let Some(query) = &self.query {
+            if !matches!(&descriptor.open, OpenHandle::Shared(_)) {
+                return query.defer();
             }
         }
-        Ok(Some(fd))
+        if let Some(publication) = publication {
+            publication.publish_open(self, &descriptor.open.borrow());
+        }
+        reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))
     }
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
         let path = self.resolve(AT_FDCWD, path)?;
@@ -1406,7 +1432,7 @@ impl Vfs {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
         let mut out = self.mount_statfs(o.mount.as_deref())?;
-        if o.namespace.is_some()
+        if o.namespace_resource.is_some()
             || o.socket.is_some()
             || o.local.is_some()
             || (o.pipe.is_some() && o.node.is_none())
@@ -1416,7 +1442,7 @@ impl Vfs {
             out.fill(0);
             let magic = if o.native_image.is_some() {
                 0x444d4142u64
-            } else if o.namespace.is_some() {
+            } else if o.namespace_resource.is_some() {
                 0x6e736673u64
             } else if o.anonymous.is_some() {
                 0x09041934u64
@@ -1433,14 +1459,10 @@ impl Vfs {
     pub(super) fn refresh_pseudo_fd(&self, fd: u32) -> Result<()> {
         let o_descriptor = self.descriptor(fd)?;
         let o = o_descriptor.open.borrow();
-        if o.oom.is_some() || o.network_control.is_some() {
+        if o.proc_control() {
             return Ok(());
         }
-        if let FdKind::Node(key) = &o.kind {
-            let path = ResolvedPath {
-                key: key.clone(),
-                mount: self.mount_for_path(o.mount.as_ref()),
-            };
+        if let Some(path) = self.proc_description_path(&o) {
             if self.uses_pseudo(&path) && self.pseudo_readonly(&path) {
                 self.pseudo_node(&path)?;
             }
@@ -1461,13 +1483,18 @@ impl Vfs {
             return Ok(None);
         }
         if let Some(query) = &self.query {
-            if path != b"/dev" && !path.starts_with(b"/dev/") {
+            if path != b"/dev"
+                && !path.starts_with(b"/dev/")
+                && self.pseudo.borrow().source.is_none()
+            {
                 return query.defer();
             }
         }
+        self.refresh_proc_source(at)?;
         let content = self.pseudo_content(at)?;
         if let Some((content, mode)) = content {
-            let node = self.pseudo.borrow_mut().cache(
+            let identity = self.proc_path_identity(at);
+            let node = self.pseudo.borrow_mut().cache_process(
                 if path.starts_with(b"/proc")
                     && self.proc_namespace(at).is_nested()
                     // The rootfs mountpoint placeholder is shared by every
@@ -1482,7 +1509,24 @@ impl Vfs {
                 path,
                 content,
                 mode,
+                identity,
+                Some(self.pid_namespace()),
             )?;
+            if self.pseudo.borrow().source.is_some() {
+                let binding = at
+                    .proc_binding()
+                    .and_then(|p| p.at(path, self.proc_namespace(at).id()));
+                let numeric = path
+                    .strip_prefix(b"/proc/")
+                    .and_then(|rest| rest.split(|b| *b == b'/').next())
+                    .is_some_and(|part| part.first().is_some_and(u8::is_ascii_digit));
+                if !numeric || binding.is_some() {
+                    node.proc_node.get_or_init(|| proc_source::ProcNode {
+                        path: path.to_vec(),
+                        binding,
+                    });
+                }
+            }
             if let Some(rest) = path.strip_prefix(b"/proc/") {
                 let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
                 // Raw clone threads can have distinct credentials. Task paths
@@ -1518,7 +1562,10 @@ impl Vfs {
         }
         Ok(None)
     }
-    fn pseudo_content<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<(Content, u32)>> {
+    pub(super) fn pseudo_content<P: PathArg + ?Sized>(
+        &self,
+        at: &P,
+    ) -> Result<Option<(Content, u32)>> {
         let path = at.key();
         if let Some(content) = simple_device::builtin(path) {
             return Ok(Some(content));
@@ -1746,8 +1793,24 @@ impl Vfs {
                 if parts.len() == i + 1 {
                     let value = match key {
                         b"fd" | b"fdinfo" | b"net" | b"ns" => return Ok(directory()),
-                        b"cwd" => return Ok(link(p.cwd.clone())),
-                        b"root" => return Ok(link(b"/".to_vec())),
+                        b"cwd" => {
+                            if pseudo.source.is_some() {
+                                return Ok(link(Vec::new()));
+                            }
+                            return Ok(link(p.cwd_directory.as_ref().map_or_else(
+                                || Ok(p.cwd.clone()),
+                                |dir| self.proc_directory_display(dir),
+                            )?));
+                        }
+                        b"root" => {
+                            if pseudo.source.is_some() {
+                                return Ok(link(Vec::new()));
+                            }
+                            return Ok(link(p.root_directory.as_ref().map_or_else(
+                                || Ok(b"/".to_vec()),
+                                |dir| self.proc_directory_display(dir),
+                            )?));
+                        }
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
                         b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
@@ -1758,8 +1821,14 @@ impl Vfs {
                         b"cgroup" => {
                             [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
                         }
-                        b"cmdline" => nul_list(&p.arguments),
-                        b"environ" => nul_list(&p.environment),
+                        b"cmdline" => p
+                            .arguments_bytes
+                            .clone()
+                            .unwrap_or_else(|| nul_list(&p.arguments)),
+                        b"environ" => p
+                            .environment_bytes
+                            .clone()
+                            .unwrap_or_else(|| nul_list(&p.environment)),
                         b"auxv" => p.auxiliary.clone(),
                         b"maps" => p.maps.clone(),
                         b"mounts" => mounts::table_text(&p.namespaces, false),
@@ -2259,6 +2328,7 @@ impl Vfs {
         Ok(None)
     }
     pub(super) fn pseudo_children<P: PathArg + ?Sized>(&self, at: &P) -> Result<Vec<Vec<u8>>> {
+        self.refresh_proc_source_with(at, true)?;
         let path = at.key();
         if let Some(tail) = path.strip_prefix(b"/sys/devices/system/cpu/cpu") {
             let parts: Vec<_> = tail.split(|c| *c == b'/').collect();

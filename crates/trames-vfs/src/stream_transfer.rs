@@ -523,7 +523,7 @@ mod tests {
         let FileOutcome::Waiting(work) = work.run() else {
             panic!("backpressure")
         };
-        assert!(!work.transfer_ready());
+        assert!(!work.ready());
         assert_eq!(v.read(r, 4).unwrap(), b"keep");
         v.write(w, b"next").unwrap();
         let original = v.dup(write, 100, false).unwrap();
@@ -531,7 +531,7 @@ mod tests {
         let [reused, _] = v.pipe(0).unwrap();
         assert_eq!(reused, write);
         v.read(out, PIPE_CAPACITY).unwrap();
-        assert!(work.transfer_ready());
+        assert!(work.ready());
         assert_eq!(finish(work), Ok(4));
         assert_eq!(v.read(out, 4).unwrap(), b"next");
         v.write(original, b"x").unwrap();

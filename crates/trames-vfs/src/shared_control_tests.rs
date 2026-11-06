@@ -115,6 +115,7 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
         (b"ipc", linux_namespace::CLONE_NEWIPC),
         (b"cgroup", linux_namespace::CLONE_NEWCGROUP),
         (b"net", linux_namespace::CLONE_NEWNET),
+        (b"mnt", CLONE_NEWNS),
     ];
     let mut fds = Vec::new();
     for (kind, _) in kinds {
@@ -145,11 +146,12 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
     v.unshare_ipc().unwrap();
     v.unshare_cgroup().unwrap();
     v.unshare_net().unwrap();
-    let imported = std::thread::spawn(move || factory.receive_local_rights(rights, 5, true))
+    v.unshare_mounts().unwrap();
+    let imported = std::thread::spawn(move || factory.receive_local_rights(rights, 6, true))
         .join()
         .unwrap();
     assert!(!imported.1);
-    assert_eq!(imported.0.len(), 5);
+    assert_eq!(imported.0.len(), 6);
     for ((fd, (_, kind)), inode) in imported.0.iter().zip(kinds).zip(ids) {
         assert_eq!(v.namespace_type(*fd), Ok(Some(kind)));
         assert_eq!(v.stat_fd(*fd).unwrap()[8..16], inode);
@@ -166,13 +168,14 @@ fn complete_namespace_ofds_cross_workers_and_keep_original_setns_authority() {
         .unwrap();
     v.setns(imported.0[4], linux_namespace::CLONE_NEWNET)
         .unwrap();
+    v.setns(imported.0[5], CLONE_NEWNS).unwrap();
     v.import_file(b"/pinned", vec![]).unwrap();
     v.mount(Some(b"/proc/self/ns/uts"), b"/pinned", None, 4096, None)
         .unwrap();
     let bound = v.open_at(AT_FDCWD, b"/pinned", 0, 0).unwrap();
     assert!(
-        files.lookup(bound).is_none(),
-        "nsfs mount topology remains owner control"
+        files.lookup(bound).is_some(),
+        "bound nsfs topology retains complete original authority"
     );
     assert_eq!(
         v.namespace_type(bound),

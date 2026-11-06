@@ -195,9 +195,7 @@ fn owner_only_mixed_rights_and_shared_unix_rights_observe_one_cycle_graph() {
             ..Default::default()
         },
     );
-    let legacy = v
-        .open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
-        .unwrap();
+    let legacy = v.epoll_create(0).unwrap();
     let factory = v.descriptor_factory();
     assert!(factory.send_local_rights(&[legacy]).is_none());
     v.local_socket(a)

@@ -486,7 +486,7 @@ fn queued_disk_sync_keeps_the_actual_ofd_after_ring_close_until_host_work_finish
 }
 
 #[test]
-fn owner_only_registered_files_keep_original_read_and_close_semantics() {
+fn proc_control_registered_files_keep_original_resource_and_complete_on_source() {
     let (mut l, mut m, fd, r) = setup(8);
     let oom = Arc::new(trames_vfs::OomTask::default());
     l.vfs.set_runtime_info(
@@ -506,11 +506,13 @@ fn owner_only_registered_files_keep_original_read_and_close_semantics() {
         .vfs
         .open_at(-100, b"/proc/self/oom_score_adj", 0, 0)
         .unwrap();
-    assert!(l.vfs.shared_files().lookup(file).is_none());
+    assert!(l.vfs.shared_files().lookup(file).unwrap().is_ok());
     m.write_array(0x1200, file.to_le_bytes()).unwrap();
     l.uring_register([fd as u64, 2, 0x1200, 1, 0, 0], &mut m)
         .unwrap();
     l.vfs.close(file).unwrap();
+    let replacement = l.vfs.eventfd(3, 0).unwrap();
+    assert_eq!(replacement, file);
     let mut files = trames_vfs::FileEpoch::default();
     assert!(files.capture_uring(&l.vfs, true).is_empty());
     let mut epoch = UringEpoch::default();
@@ -521,22 +523,17 @@ fn owner_only_registered_files_keep_original_read_and_close_semantics() {
     add(&mut m, &r, read);
     assert!(matches!(
         enter(&d, fd, 1, 1, &mut m, &t),
-        IoAttempt::Checkpoint
+        IoAttempt::Complete(Ok(1))
     ));
-    assert_eq!(r.load_queue(0), 0);
-    assert_eq!(
-        l.uring_enter([fd as u64, 1, 1, 1, 0, 0], &mut m, None, 7),
-        Ok((1, true))
-    );
     let completion = cq(&mut m, &r);
     assert_eq!(completion.0, 77);
-    assert!(completion.1 > 0);
+    assert_eq!(completion.1, 2);
+    assert_eq!(m.read_array::<2>(0x2200).unwrap(), *b"0\n");
     assert!(matches!(
         d.urings.register([fd as u64, 3, 0, 0, 0, 0], &mut m, 7),
-        Some(IoAttempt::Checkpoint)
+        Some(IoAttempt::Complete(Ok(0)))
     ));
-    l.uring_register([fd as u64, 3, 0, 0, 0, 0], &mut m)
-        .unwrap();
+    assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
     assert!(epoch.finish().is_empty());
     files.finish();
 }

@@ -178,12 +178,17 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
     Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                oom: None,
+                network_control: None,
+                mount_file: None,
+                runtime_file: None,
                 socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
+                mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
                 file_authority: Default::default(),
@@ -206,12 +211,8 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
                 kernel_log: None,
                 notification: None,
             }),
-            position: 0,
             anonymous: None,
             namespace: None,
-            network_control: None,
-            mount_file: None,
-            oom: None,
             mount: end.pair.mount.clone().map(OpenMount::Shared),
         }),
         cloexec: (flags & O_CLOEXEC != 0).into(),

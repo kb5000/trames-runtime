@@ -26,6 +26,7 @@ impl std::ops::Deref for LayerPath {
 impl LayerPath {
     fn resolved(&self) -> ResolvedPath {
         ResolvedPath {
+            proc_binding: None,
             key: self.key.clone(),
             mount: Some(Mount::layer_projection(self.identity.clone())),
         }
@@ -111,6 +112,9 @@ fn snapshot(paths: &Tree) -> BTreeMap<Vec<u8>, Entry> {
         .collect()
 }
 pub(super) struct Overlay {
+    // Metadata/FsHandle observers retain no semantic layer use. Namespace
+    // owners and real OFD/fs/image users share a lease only while needed.
+    layer_uses: std::sync::Mutex<std::sync::Weak<LayerUses>>,
     pub(super) device: u64,
     // Retain backing mount capabilities across detach / mount namespace copies.
     lowers: Vec<Layer>,
@@ -122,6 +126,28 @@ pub(super) struct Overlay {
     dirty: SharedCell<BTreeSet<usize>>,
     userxattr: bool,
     options: Vec<u8>,
+}
+pub(super) struct LayerUses {
+    _layers: Vec<mounts::MountUse>,
+}
+impl Overlay {
+    pub(super) fn layer_uses(&self) -> Arc<LayerUses> {
+        let mut published = self.layer_uses.lock().unwrap();
+        if let Some(uses) = published.upgrade() {
+            return uses;
+        }
+        let uses = Arc::new(LayerUses {
+            _layers: self
+                .lowers
+                .iter()
+                .chain(self.upper.iter())
+                .chain(self.work.iter())
+                .map(|layer| mounts::MountUse::new(layer.at.identity.clone()))
+                .collect(),
+        });
+        *published = Arc::downgrade(&uses);
+        uses
+    }
 }
 fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
@@ -624,6 +650,7 @@ impl Vfs {
                 return Err(Errno(13));
             }
             let at = ResolvedPath {
+                proc_binding: None,
                 key: w.key(b"/work"),
                 mount: w.at.resolved().mount,
             };
@@ -643,6 +670,7 @@ impl Vfs {
             return Err(Errno(28));
         }
         let o = Arc::new(Overlay {
+            layer_uses: Default::default(),
             device: NEXT_DEVICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             lowers,
             upper,
@@ -978,7 +1006,7 @@ mod tests {
             let at = v.mount_location(b"/lower", true).unwrap();
             let mount = at.mount.as_ref().unwrap();
             (
-                Rc::downgrade(mount),
+                Arc::downgrade(mount),
                 Arc::downgrade(&mount.identity),
                 mount.id,
             )
@@ -998,6 +1026,30 @@ mod tests {
         assert_eq!(read(&mut v, b"/merged/file"), b"lower");
         v.umount(b"/merged", 0).unwrap();
         assert!(resource.upgrade().is_none());
+    }
+    #[test]
+    fn retained_metadata_does_not_pin_overlay_layers_but_an_open_file_does() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        v.mount(None, b"/lower", Some(b"tmpfs"), 0, None).unwrap();
+        write(&mut v, b"/lower/file", b"data");
+        mount(&mut v);
+        let source = v.proc_resources();
+        let mut observed = ProcessInfo::default();
+        source.observe(&mut observed, ProcRefresh::Namespaces);
+        let fd = v.open_at(AT_FDCWD, b"/merged/file", 0, 0).unwrap();
+        let accepted = v.shared_files().lookup(fd).unwrap().unwrap();
+        v.close(fd).unwrap();
+        v.umount(b"/merged", 2).unwrap();
+        assert_eq!(
+            v.umount(b"/lower", 0),
+            Err(Errno(16)),
+            "accepted overlay reads retain real layer use"
+        );
+        std::thread::spawn(move || drop(accepted)).join().unwrap();
+        v.umount(b"/lower", 0).unwrap();
+        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true)).unwrap();
+        assert!(old.contains(" /merged ") && old.contains(" /lower "));
     }
     fn write(v: &mut Vfs, path: &[u8], data: &[u8]) {
         let fd = v.open_at(AT_FDCWD, path, 0x242, 0o644).unwrap();

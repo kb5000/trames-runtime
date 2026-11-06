@@ -12,6 +12,8 @@ use std::{
 use trames_vfs::{AsyncOwner, AsyncOwners, IoSignal, PidNamespace};
 #[path = "io_guest.rs"]
 mod guest;
+#[path = "io_proc.rs"]
+mod proc_views;
 #[path = "io_scheduling.rs"]
 mod scheduling;
 
@@ -166,6 +168,10 @@ pub struct IoContext {
     pub alt_stack: AltStack,
 }
 pub struct IoTask {
+    pub proc_view: trames_vfs::ProcessView,
+    proc_pid: RwLock<Option<Arc<proc_views::ProcPid>>>,
+    proc_limits: std::sync::OnceLock<Arc<crate::limits::Limits>>,
+    proc_group: std::sync::OnceLock<Arc<Group>>,
     pub scheduling: crate::scheduling::Attributes,
     pub inbox: Inbox,
     process: std::sync::OnceLock<Arc<Inbox>>,
@@ -190,6 +196,10 @@ pub struct IoTask {
 impl Default for IoTask {
     fn default() -> Self {
         Self {
+            proc_view: Default::default(),
+            proc_pid: Default::default(),
+            proc_limits: Default::default(),
+            proc_group: Default::default(),
             scheduling: Default::default(),
             inbox: Default::default(),
             process: Default::default(),
@@ -706,6 +716,7 @@ impl IoDirectory {
         {
             return;
         }
+        task.bind_proc_pid(pid);
         task.pid.store(pid, Ordering::Relaxed);
         task.tgid.store(tgid, Ordering::Relaxed);
         task.group.store(group, Ordering::Relaxed);
@@ -725,6 +736,9 @@ impl IoDirectory {
                     members: RwLock::default(),
                 })
             });
+            if key.0 == 1 {
+                task.proc_group.get_or_init(|| group.clone());
+            }
             let mut members = group.members.write().unwrap();
             members.retain(|t| t.upgrade().is_some_and(|t| t.identifies(key.0, key.1)));
             if !members.iter().any(|t| t.ptr_eq(&Arc::downgrade(task))) {

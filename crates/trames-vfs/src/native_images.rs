@@ -29,12 +29,17 @@ impl ImageFds for Images {
         // Construct the complete OFD before publishing one slot. The table
         // mutex covers membership only; no native operation runs under it.
         let open = Arc::new(SharedOpenDescription {
+            oom: None,
+            network_control: None,
+            mount_file: None,
+            runtime_file: None,
             socket: None,
             _disk_file: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_file: None,
             native_image: Some(image),
             mount_resource: Default::default(),
+            mount_use: Default::default(),
             directory_mount: Default::default(),
             namespace_resource: None,
             file_authority: Default::default(),
@@ -67,6 +72,7 @@ impl ImageFds for Images {
             Slot {
                 open: SlotOpen::Shared(open),
                 cloexec: true.into(),
+                proc: None,
             },
         );
         self.files.changed(&mut entries);

@@ -354,6 +354,7 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
+        self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.retire_anonymous_range(address, end);
         self.advance_code_revision();

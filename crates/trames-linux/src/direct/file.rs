@@ -339,6 +339,17 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
         let paths = self.paths.as_ref()?;
+        if let Some(result) = target.proc_read_local(&command, memory) {
+            return Some(self.finish_file_reply(
+                trames_vfs::FileReply {
+                    result,
+                    file_size_signal: false,
+                    scratch: None,
+                },
+                output,
+                memory,
+            ));
+        }
         let action = if target.host_work(&command) {
             PreparedAction::Host {
                 work: trames_vfs::FileWork::new(paths, target, command),
@@ -454,7 +465,7 @@ impl DirectSyscalls {
         let original = work.target().cloned();
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = vec![result.subscribe(&signal)];
-        if work.transfer_waiting() {
+        if work.waiting() {
             result.complete(trames_vfs::FileOutcome::Waiting(work));
         } else if work.host_work() {
             let Some(executor) = &self.file_executor else {
@@ -582,6 +593,17 @@ impl DirectSyscalls {
                 };
             (file, command, output)
         };
+        if let Some(result) = file.proc_read_local(&command, memory) {
+            return Some(self.complete_file_attempt(
+                trames_vfs::FileReply {
+                    result,
+                    file_size_signal: false,
+                    scratch: None,
+                },
+                output,
+                memory,
+            ));
+        }
         Some(if file.host_work_owned(&command) {
             self.submit_file_work(
                 trames_vfs::FileWork::from_vfs(vfs, file, command),
@@ -620,8 +642,8 @@ impl DirectSyscalls {
             .as_ref()
             .and_then(|w| w.lock().unwrap().take());
         if let Some(work) = waiting {
-            if !work.transfer_ready() {
-                return self.park_transfer(pending, work, number, args, signal, memory, target);
+            if !work.ready() {
+                return self.park_file(pending, work, number, args, signal, memory, target);
             }
             pending.result.begin();
             if work.host_work() {
@@ -638,7 +660,7 @@ impl DirectSyscalls {
         }
         match pending.result.take() {
             Some(trames_vfs::FileOutcome::Waiting(work)) => {
-                self.park_transfer(pending, work, number, args, signal, memory, target)
+                self.park_file(pending, work, number, args, signal, memory, target)
             }
             Some(trames_vfs::FileOutcome::Complete(reply)) => {
                 self.complete_file_attempt(reply, pending.output, memory)
@@ -679,7 +701,7 @@ impl DirectSyscalls {
         }
     }
     #[allow(clippy::too_many_arguments)]
-    fn park_transfer(
+    fn park_file(
         &self,
         mut pending: FilePending,
         work: trames_vfs::FileWork,
@@ -691,7 +713,7 @@ impl DirectSyscalls {
     ) -> IoAttempt {
         let _ = memory;
         signal.reset();
-        let wait = match work.transfer_wait_sources(&signal) {
+        let wait = match work.wait_sources(&signal) {
             Ok(wait) => wait,
             Err(_) => return self.complete(number, args, Err(Errno(5))),
         };
@@ -706,7 +728,7 @@ impl DirectSyscalls {
                 }
             }
         }
-        if work.transfer_ready() {
+        if work.ready() {
             signal.notify();
         }
         pending.result.begin();

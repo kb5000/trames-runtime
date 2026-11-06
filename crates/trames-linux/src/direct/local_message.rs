@@ -488,19 +488,9 @@ mod tests {
         u32::from_le_bytes(m.read_array(at).unwrap())
     }
     fn owner_control(v: &mut Vfs) -> u32 {
-        v.set_runtime_info(
-            1,
-            trames_vfs::RuntimeInfo {
-                processes: vec![trames_vfs::ProcessInfo {
-                    pid: 1,
-                    tgid: 1,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        );
-        v.open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
-            .unwrap()
+        // Proc controls are now shared resources; epoll still has an original
+        // owner-side watch graph and exercises the actual legacy handoff.
+        v.epoll_create(0).unwrap()
     }
     fn direct(v: &Vfs) -> DirectSyscalls {
         DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory())

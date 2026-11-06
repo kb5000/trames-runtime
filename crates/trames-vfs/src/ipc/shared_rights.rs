@@ -196,6 +196,7 @@ impl DescriptorFactory {
                     fd_table::Slot {
                         open: fd_table::SlotOpen::Shared(open.clone()),
                         cloexec: cloexec.into(),
+                        proc: None,
                     },
                 );
                 debug_assert!(previous.is_none());

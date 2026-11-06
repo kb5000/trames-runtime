@@ -1002,7 +1002,7 @@ impl Vfs {
         });
         filesystem.host = Some(backend.clone());
         let root = backend.lookup(&filesystem, b"/")?;
-        let mount = Rc::new(Mount::new(MountInit {
+        let mount = Arc::new(Mount::new(MountInit {
             id: mounts::new_mount_id()?,
             fs: filesystem,
             root,

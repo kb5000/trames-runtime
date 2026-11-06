@@ -313,7 +313,7 @@ impl UringActor {
         let mut call = self.accepted.lock().unwrap().remove(&key)?;
         let before = (
             call.socket.as_ref().map(|s| s.uring_wait_kind()),
-            call.file.is_some(),
+            call.file.as_ref().map(|f| f.wait_revision),
         );
         let original = request;
         let mut selected_view;
@@ -345,7 +345,7 @@ impl UringActor {
         let changed = before
             != (
                 call.socket.as_ref().map(|s| s.uring_wait_kind()),
-                call.file.is_some(),
+                call.file.as_ref().map(|f| f.wait_revision),
             );
         original.selection = selection;
         self.accepted.lock().unwrap().insert(key, call);
@@ -359,19 +359,16 @@ impl UringActor {
         ring: &Uring,
         sequence: u64,
         signal: &Arc<IoSignal>,
-    ) -> Option<trames_vfs::IoSubscription> {
-        let (socket, file) = {
+    ) -> Option<Vec<trames_vfs::IoSubscription>> {
+        let socket = {
             let accepted = self.accepted.lock().unwrap();
             let call = accepted.get(&(ring as *const Uring as usize, sequence))?;
-            (
-                call.socket.clone(),
-                call.file.as_ref().map(|f| f.result.clone()),
-            )
+            if let Some(file) = &call.file {
+                return Some(file.subscribe(signal));
+            }
+            call.socket.clone()
         };
-        if let Some(file) = file {
-            return Some(file.subscribe(signal));
-        }
-        socket?.uring_subscribe(signal)
+        socket?.uring_subscribe(signal).map(|s| vec![s])
     }
     pub(crate) fn rings(&self) -> Vec<Arc<Uring>> {
         let mut rings = self.rings.lock().unwrap();

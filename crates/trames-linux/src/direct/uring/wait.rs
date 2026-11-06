@@ -153,10 +153,10 @@ impl RingWaitOps for Ring {
         // Resource subscriptions may enter their actual native socket or host
         // event object. Never retain the ring's metadata lock across them.
         for (sequence, resource, file, events) in interests {
-            if let Some(subscription) = actor.subscribe(self, sequence, signal) {
+            if let Some(subscriptions) = actor.subscribe(self, sequence, signal) {
                 let key = LocalSource::Control(self as *const Uring as usize, sequence);
                 sources.local.remove(&key);
-                sources.local(key, || vec![subscription]);
+                sources.local(key, || subscriptions);
                 continue;
             }
             if let Some(resource) = &resource {

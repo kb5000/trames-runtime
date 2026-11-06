@@ -156,6 +156,17 @@ pub struct CgroupTask {
     member: Arc<Member>,
 }
 impl CgroupTask {
+    pub fn path(&self) -> Vec<u8> {
+        let cg = self.groups.borrow();
+        let id = cg
+            .tasks
+            .get(&self.pid())
+            .filter(|m| Arc::ptr_eq(m, &self.member))
+            .map_or(ROOT, |m| m.group());
+        cg.groups
+            .get(&id)
+            .map_or_else(|| b"/".to_vec(), |g| g.path.clone())
+    }
     pub fn pid(&self) -> u32 {
         self.member.pid.load(Ordering::Relaxed)
     }

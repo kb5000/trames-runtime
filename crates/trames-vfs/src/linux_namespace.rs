@@ -168,9 +168,10 @@ pub(super) enum NamespaceHandle {
     Ipc(Arc<IpcNamespace>),
     Cgroup(Arc<CgroupNamespace>),
 }
-// Complete shared namespace capabilities. Mount topology remains owner-owned.
+// Complete namespace resources, including the original synchronized mount table.
 #[derive(Clone)]
 pub(super) enum SharedNamespace {
+    Mount(MountNamespace),
     Uts(UtsNamespace),
     Pid(PidNamespace),
     Net(Arc<RootNetwork>),
@@ -185,17 +186,31 @@ impl SharedNamespace {
             NamespaceHandle::Net(n) => Self::Net(n.clone()),
             NamespaceHandle::Ipc(n) => Self::Ipc(n.clone()),
             NamespaceHandle::Cgroup(n) => Self::Cgroup(n.clone()),
-            _ => return None,
+            NamespaceHandle::Mount(n) => Self::Mount(n.original()?),
         })
     }
-    pub(super) fn owner_projection(&self) -> NamespaceHandle {
+    pub(super) fn complete(&self) -> bool {
+        true
+    }
+    pub(super) fn id(&self) -> u64 {
         match self {
+            Self::Mount(n) => n.id(),
+            Self::Uts(n) => n.id(),
+            Self::Pid(n) => n.id(),
+            Self::Net(n) => n.inode,
+            Self::Ipc(n) => n.inode,
+            Self::Cgroup(n) => n.inode,
+        }
+    }
+    pub(super) fn owner_projection(&self) -> Option<NamespaceHandle> {
+        Some(match self {
+            Self::Mount(n) => NamespaceHandle::Mount(n.clone()),
             Self::Uts(n) => NamespaceHandle::Uts(n.clone()),
             Self::Pid(n) => NamespaceHandle::Pid(n.clone()),
             Self::Net(n) => NamespaceHandle::Net(n.clone()),
             Self::Ipc(n) => NamespaceHandle::Ipc(n.clone()),
             Self::Cgroup(n) => NamespaceHandle::Cgroup(n.clone()),
-        }
+        })
     }
 }
 
@@ -240,8 +255,101 @@ pub struct NamespaceSnapshot {
     cgroup: std::sync::Weak<CgroupNamespace>,
     pub(super) pid: std::sync::Weak<pid_namespace::PidSpace>,
     pub(super) pid_children: std::sync::Weak<pid_namespace::PidSpace>,
-    pub(super) mount: Weak<RefCell<mounts::Table>>,
-    pub(super) root: Option<(Weak<Mount>, std::sync::Weak<Inode>)>,
+    pub(super) mount: std::sync::Weak<SharedCell<mounts::Table>>,
+    pub(super) root: Option<(std::sync::Weak<Mount>, std::sync::Weak<Inode>)>,
+}
+
+/// Weak original namespace resources for a dynamic proc observer. Metadata
+/// does not retain a task or namespace; an accepted nsfs open acquires authority.
+#[derive(Clone, Default)]
+pub struct SharedNamespaceSnapshot {
+    uts: std::sync::Weak<Uts>,
+    net: std::sync::Weak<RootNetwork>,
+    ipc: std::sync::Weak<IpcNamespace>,
+    cgroup: std::sync::Weak<CgroupNamespace>,
+    pid: std::sync::Weak<pid_namespace::PidSpace>,
+    pid_children: std::sync::Weak<pid_namespace::PidSpace>,
+    mount: std::sync::Weak<SharedCell<mounts::Table>>,
+    root: Option<(std::sync::Weak<mounts::MountData>, std::sync::Weak<Inode>)>,
+}
+
+/// Query-local lifetime for freshly projected weak namespace metadata.
+/// It is never stored in a shared task directory or transferred independently.
+pub struct NamespaceProjection {
+    pub(super) _mount: Option<MountNamespace>,
+    pub(super) _root: Option<Arc<Mount>>,
+}
+impl NamespaceSnapshot {
+    pub fn shared(&self) -> SharedNamespaceSnapshot {
+        SharedNamespaceSnapshot {
+            uts: self.uts.clone(),
+            net: self.net.clone(),
+            ipc: self.ipc.clone(),
+            cgroup: self.cgroup.clone(),
+            pid: self.pid.clone(),
+            pid_children: self.pid_children.clone(),
+            mount: self
+                .mount
+                .upgrade()
+                .and_then(|n| MountNamespace(n).original())
+                .map_or_else(std::sync::Weak::new, |n| Arc::downgrade(&n.0)),
+            root: self
+                .root
+                .as_ref()
+                .and_then(|(m, n)| Some((Arc::downgrade(&m.upgrade()?.shared), n.clone()))),
+        }
+    }
+}
+impl SharedNamespaceSnapshot {
+    pub fn metadata(&self) -> NamespaceSnapshot {
+        NamespaceSnapshot {
+            uts: self.uts.clone(),
+            net: self.net.clone(),
+            ipc: self.ipc.clone(),
+            cgroup: self.cgroup.clone(),
+            pid: self.pid.clone(),
+            pid_children: self.pid_children.clone(),
+            mount: std::sync::Weak::new(),
+            root: None,
+        }
+    }
+    pub fn project(&self) -> (NamespaceSnapshot, Rc<NamespaceProjection>) {
+        let mount = self
+            .mount
+            .upgrade()
+            .map(|table| MountNamespace(Arc::new(SharedCell::new(mounts::Table::project(&table)))));
+        let mut cache = BTreeMap::new();
+        if let Some(namespace) = &mount {
+            for m in &namespace.0.borrow().mounts {
+                cache.insert(Arc::as_ptr(&m.shared) as usize, m.clone());
+            }
+        }
+        let root = self.root.as_ref().and_then(|(mount, node)| {
+            Some((
+                Mount::query_projection(mount.upgrade()?, &mut cache),
+                node.clone(),
+            ))
+        });
+        let snapshot = NamespaceSnapshot {
+            uts: self.uts.clone(),
+            net: self.net.clone(),
+            ipc: self.ipc.clone(),
+            cgroup: self.cgroup.clone(),
+            pid: self.pid.clone(),
+            pid_children: self.pid_children.clone(),
+            mount: mount
+                .as_ref()
+                .map_or_else(std::sync::Weak::new, |n| Arc::downgrade(&n.0)),
+            root: root.as_ref().map(|(m, n)| (Arc::downgrade(m), n.clone())),
+        };
+        (
+            snapshot,
+            Rc::new(NamespaceProjection {
+                _mount: mount,
+                _root: root.map(|(m, _)| m),
+            }),
+        )
+    }
 }
 
 impl Vfs {
@@ -257,10 +365,10 @@ impl Vfs {
             mount: self
                 .mounts
                 .as_ref()
-                .map_or_else(Weak::new, |n| Rc::downgrade(&n.0)),
+                .map_or_else(std::sync::Weak::new, |n| Arc::downgrade(&n.0)),
             root: paths.root_mount.as_ref().map(|m| {
                 (
-                    Rc::downgrade(m),
+                    Arc::downgrade(m),
                     Arc::downgrade(paths.root_node.as_ref().unwrap_or(&m.root)),
                 )
             }),
@@ -392,7 +500,12 @@ impl Vfs {
                 self.pid_children = ns;
             }
             NamespaceHandle::Mount(ns) => {
-                let root = ns.0.borrow().root.clone();
+                let ns = ns.original().ok_or(Errno(2))?;
+                let (root, mounts) = {
+                    let table = ns.0.borrow();
+                    (table.root.clone(), table.mounts.clone())
+                };
+                self.register_mounts(&mounts)?;
                 self.mounts = Some(ns);
                 let mut paths = self.context.paths.borrow_mut();
                 paths.root_node = Some(root.root.clone());
@@ -466,9 +579,11 @@ impl Vfs {
                 .upgrade()
                 .ok_or(Errno(2))?,
             )),
-            _ => NamespaceHandle::Mount(MountNamespace(
-                process.namespaces.mount.upgrade().ok_or(Errno(2))?,
-            )),
+            _ => NamespaceHandle::Mount(
+                MountNamespace(process.namespaces.mount.upgrade().ok_or(Errno(2))?)
+                    .original()
+                    .ok_or(Errno(2))?,
+            ),
         }))
     }
     pub(super) fn namespace_description(
@@ -478,12 +593,17 @@ impl Vfs {
     ) -> OpenHandle {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                oom: None,
+                network_control: None,
+                mount_file: None,
+                runtime_file: None,
                 socket: None,
                 _disk_file: None,
                 #[cfg(all(feature = "hostfs", unix))]
                 host_file: None,
                 native_image: None,
                 mount_resource: std::sync::OnceLock::new(),
+                mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: SharedNamespace::capture(&ns),
                 file_authority: Default::default(),
@@ -506,12 +626,8 @@ impl Vfs {
                 kernel_log: None,
                 notification: None,
             }),
-            position: 0,
             anonymous: None,
             namespace: Some(ns),
-            network_control: None,
-            mount_file: None,
-            oom: None,
             mount,
         })
     }

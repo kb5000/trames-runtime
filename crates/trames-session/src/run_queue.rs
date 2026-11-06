@@ -742,6 +742,9 @@ impl<C: Cpu> Epoch<C> {
         self.ready_slots.store(slots, Ordering::Relaxed);
     }
     fn ready(&self, q: &mut Queues<C>, job: Box<Job<C>>) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(false);
+        }
         q.idle_notified = false;
         let slot = job.stats.worker;
         if job.stats.assignments != 0
@@ -946,6 +949,18 @@ impl<C: Cpu> Epoch<C> {
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
         self.queues.lock().unwrap().domains.take()
     }
+    /// Locate the scheduler's current domain through an actual original task.
+    /// The owner selected that task by MemoryReport resource identity, never a
+    /// decoder epoch number or a PID from a prior incarnation.
+    pub fn request_proc_reads(&self, pid: u32) -> bool {
+        let mut q = self.queues.lock().unwrap();
+        if !q.domains.pause_proc_reads(pid) {
+            return false;
+        }
+        self.capture_paused(&mut q);
+        self.notify(&mut q);
+        true
+    }
     /// The existing owner may briefly execute guest code only when no worker
     /// can claim an unrelated job. This reserves logical CPU capacity without
     /// adding an execution slot or pausing unrelated address spaces.
@@ -1110,6 +1125,7 @@ impl<C: Cpu> Epoch<C> {
                 job.stats.worker = slot;
                 if let Some(snapshot) = &mut work.syscalls {
                     snapshot.processor = slot as u32;
+                    snapshot.io_signals.proc_view.dispatched(slot);
                 }
                 q.running += 1;
                 q.domains.running(work.pid);
@@ -1156,6 +1172,9 @@ impl<C: Cpu> Epoch<C> {
         }
     }
     pub fn park(&self, mut job: Box<Job<C>>, waiting: Option<WaitState>) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(waiting.is_some());
+        }
         let mut q = self.queues.lock().unwrap();
         job.rearm_signals();
         q.running -= 1;
@@ -1195,6 +1214,9 @@ impl<C: Cpu> Epoch<C> {
     /// Source-task maintenance reuses the task's existing wait subscriptions.
     /// It cannot complete an unrelated syscall or rearm a hardware/GPU wait.
     pub fn park_maintenance(&self, mut job: Box<Job<C>>) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(job.guest_waiting());
+        }
         let mut q = self.queues.lock().unwrap();
         job.rearm_signals();
         q.running -= 1;
@@ -1230,6 +1252,9 @@ impl<C: Cpu> Epoch<C> {
         mut job: Box<Job<C>>,
         wait: Arc<trames_memory::HardwareWait>,
     ) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(true);
+        }
         let weak = Arc::downgrade(self);
         let pid = job.work.pid;
         wait.subscribe(move || {
@@ -1264,6 +1289,9 @@ impl<C: Cpu> Epoch<C> {
         self.notify(&mut q);
     }
     pub fn park_io(&self, mut job: Box<Job<C>>, pending: trames_linux::PendingIo) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(true);
+        }
         let mut q = self.queues.lock().unwrap();
         job.rearm_signals();
         q.running -= 1;
@@ -1284,6 +1312,9 @@ impl<C: Cpu> Epoch<C> {
         self.notify(&mut q);
     }
     pub fn park_gpu(&self, mut job: Box<Job<C>>, pending: crate::gpu::Pending) {
+        if let Some(snapshot) = &job.work.syscalls {
+            snapshot.io_signals.proc_view.waiting(true);
+        }
         let mut q = self.queues.lock().unwrap();
         job.rearm_signals();
         q.running -= 1;
