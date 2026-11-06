@@ -1065,6 +1065,8 @@ mod tests {
             (true, 172, false, false),
             (true, 0xff00, false, false),
             (true, 283, false, false),
+            (true, 278, false, false),
+            (true, 278, true, true),
             (true, 179, true, false),
             (true, 0xff00, true, true),
         ] {

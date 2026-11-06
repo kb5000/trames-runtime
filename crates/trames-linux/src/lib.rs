@@ -13,6 +13,8 @@ pub use syscall_diagnostics::SyscallDiagnostics;
 mod credentials;
 pub use credentials::{credential_call, credential_entry, credential_mutation, CredentialResult};
 mod descriptor_create;
+mod entropy;
+pub use entropy::getrandom;
 mod direct;
 pub use direct::{
     epoll_parameters, epoll_scatter, Aio, DirectSyscalls, FileBoundary, FileCheckpoint,

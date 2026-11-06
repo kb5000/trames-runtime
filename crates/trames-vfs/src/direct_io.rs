@@ -1167,6 +1167,16 @@ impl DirectFd {
     pub fn is_simple_device(&self) -> bool {
         matches!(self.resource, ByteResource::SimpleDevice(_))
     }
+    pub fn is_entropy_device(&self) -> bool {
+        matches!(
+            self.resource,
+            ByteResource::SimpleDevice(simple_device::Kind::Random | simple_device::Kind::Urandom)
+        )
+    }
+    pub fn entropy_control(&self) -> Option<Result<u64>> {
+        self.is_entropy_device()
+            .then_some(Err(Errno(if self.flags & O_PATH != 0 { 9 } else { 25 })))
+    }
     pub fn is_kmsg(&self) -> bool {
         matches!(self.resource, ByteResource::Kmsg(_))
     }

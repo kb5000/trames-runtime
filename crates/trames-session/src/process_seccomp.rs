@@ -820,6 +820,207 @@ impl<C: Cpu> Kernel<C> {
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
     #[test]
+    fn entropy_fd_controls_preserve_access_and_policy_without_owner_fallback() {
+        for path in [b"/dev/random".as_slice(), b"/dev/urandom"] {
+            for flags in [0, 1, 2, trames_vfs::O_PATH] {
+                for policy in [None, Some(ALLOW), Some(0x5002a)] {
+                    let mut p = super::super::tests::process();
+                    p.linux
+                        .vfs
+                        .set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+                    let fd = p.linux.vfs.open_at(-100, path, flags, 0).unwrap();
+                    // A source yield makes both jobs run even if one host
+                    // thread starts after the other has spent its first budget.
+                    for (index, word) in [
+                        0xaa1403e0u32,
+                        0xd28003a8,
+                        0xd4000001,
+                        0xaa0003f3,
+                        0xd2800f88,
+                        0xd4000001,
+                        0x17fffffa,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        p.memory
+                            .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                            .unwrap();
+                    }
+                    p.memory
+                        .protect(
+                            0x4000,
+                            trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RX,
+                        )
+                        .unwrap();
+                    p.cpu.set_x(8, 29);
+                    p.cpu.set_x(20, fd as u64);
+                    p.cpu.set_x(1, 0x80045200);
+                    p.cpu.set_x(2, u64::MAX);
+                    p.signals.io.scheduling.set_affinity(3);
+                    if let Some(value) = policy {
+                        p.seccomp.push(Arc::new(
+                            Filter::validate(vec![
+                                i(0x20, 0, 0, 0),
+                                i(0x15, 0, 1, 29),
+                                i(6, 0, 0, value),
+                                i(6, 0, 0, ALLOW),
+                            ])
+                            .unwrap(),
+                        ));
+                    }
+                    let peer = p.fork();
+                    peer.family.set_parent(1);
+                    let mut k = super::super::tests::kernel();
+                    k.cpu_count = 2;
+                    k.workers = crate::workers::Pool::new(2);
+                    k.per_cpu = vec![Duration::ZERO; 2];
+                    k.processes.insert(1, p);
+                    k.processes.insert(2, peer);
+                    let expected = if policy == Some(0x5002a) {
+                        -42i64
+                    } else if flags & trames_vfs::O_PATH != 0 {
+                        -9
+                    } else {
+                        -25
+                    } as u64;
+                    // A budget can expire before a host worker first starts.
+                    // Require both guest observations, rather than assuming
+                    // that one fixed epoch scheduled every task.
+                    for _ in 0..8 {
+                        let limit = k.instructions + 20_000;
+                        assert!(k
+                            .parallel_epoch(
+                                &mut trames_linux::CapturedOutput::default(),
+                                limit,
+                                true
+                            )
+                            .unwrap());
+                        if k.processes.values().all(|p| p.cpu.x(19) == expected) {
+                            break;
+                        }
+                    }
+                    assert!(k.syscalls > 100);
+                    assert!(k.processes.values().all(|p| p.cpu.x(19) == expected),
+                        "entropy FD path={path:?} flags={flags:#x} policy={policy:?} expected={expected:#x} observed={:?}",
+                        k.processes.values().map(|p| (p.cpu.pc,p.cpu.x(0),p.cpu.x(1),p.cpu.x(8),p.cpu.x(19))).collect::<Vec<_>>());
+                    if policy.is_some() {
+                        assert_eq!(k.processes.read(&1).seccomp.evaluations(), k.syscalls);
+                    }
+                    assert_eq!(k.service_requests, 0);
+                    assert!(
+                        k.cohort_return_syscalls.is_empty(),
+                        "{:?}",
+                        k.cohort_return_syscalls
+                    );
+                    assert_eq!(k.vm_checkpoint_groups, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entropy_completes_on_sources_with_original_memory_and_one_policy_decision() {
+        for policy in [None, Some(ALLOW), Some(0x5002a)] {
+            for (address, count, flags, expected) in [
+                (0x1800, 64, 0, 64i64),
+                (0x1800, 64, 1, 64),
+                (0x1800, 64, 2, 64),
+                (0x1800, 64, 3, 64),
+                (0x1800, 64, 1u64 << 32, 64),
+                (u64::MAX, 0, 0, -14),
+                (0, 0, 0, 0),
+                (0, 1, 0, -14),
+                (u64::MAX, 1, 0, -14),
+                (u64::MAX, 1, 4, -22),
+                (0x4000, 32, 0, -14),
+            ] {
+                let mut p = super::super::tests::process();
+                // Reload x0 each time; syscall return values cannot become the
+                // next output pointer. Keep the original operands in x20..22.
+                for (index, word) in [
+                    0xaa1403e0u32,
+                    0xaa1503e1,
+                    0xaa1603e2,
+                    0xd28022c8,
+                    0xd4000001,
+                    0xaa0003f3,
+                    0xd2800f88,
+                    0xd4000001,
+                    0x17fffff8,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    p.memory
+                        .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu.set_x(8, 278);
+                p.cpu.set_x(20, address);
+                p.cpu.set_x(21, count);
+                p.cpu.set_x(22, flags);
+                p.signals.io.scheduling.set_affinity(3);
+                if let Some(value) = policy {
+                    p.seccomp.push(Arc::new(
+                        Filter::validate(vec![
+                            i(0x20, 0, 0, 0),
+                            i(0x15, 0, 1, 278),
+                            i(6, 0, 0, value),
+                            i(6, 0, 0, ALLOW),
+                        ])
+                        .unwrap(),
+                    ));
+                }
+                let peer = p.fork();
+                peer.family.set_parent(1);
+                let mut k = super::super::tests::kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                let expected = if policy == Some(0x5002a) {
+                    -42i64
+                } else {
+                    expected
+                } as u64;
+                for _ in 0..8 {
+                    let limit = k.instructions + 20_000;
+                    assert!(k
+                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
+                        .unwrap());
+                    if k.processes.values().all(|p| p.cpu.x(19) == expected) {
+                        break;
+                    }
+                }
+                assert!(k.syscalls > 100);
+                assert!(k.processes.values().all(|p| p.cpu.x(19) == expected),
+                    "entropy address={address:#x} count={count} flags={flags:#x} policy={policy:?} expected={expected:#x} observed={:?}",
+                    k.processes.values().map(|p| (p.cpu.pc,p.cpu.x(19))).collect::<Vec<_>>());
+                if policy.is_some() {
+                    assert_eq!(k.processes.read(&1).seccomp.evaluations(), k.syscalls);
+                }
+                assert_eq!(k.service_requests, 0);
+                assert!(
+                    k.cohort_return_syscalls.is_empty(),
+                    "{:?}",
+                    k.cohort_return_syscalls
+                );
+                assert_eq!(k.vm_checkpoint_groups, 0);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_entries_complete_on_sources_with_one_policy_decision_and_original_diagnostics() {
         for number in [99u32, 100, 293, 0x7fff_ffff, u32::MAX] {
             for policy in [None, Some(ALLOW), Some(0x5002a)] {

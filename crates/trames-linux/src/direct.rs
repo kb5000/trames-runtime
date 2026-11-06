@@ -712,7 +712,7 @@ impl DirectSyscalls {
         } else if matches!(number, 206 | 207 | 210..=212 | 269) {
             fd.is_unix()
         } else if number == 29 {
-            fd.has_readable_bytes()
+            fd.has_readable_bytes() || fd.is_entropy_device()
         } else {
             matches!(number, 63..=66) && !fd.is_epoll() && !fd.is_poll_only()
         }
@@ -720,6 +720,7 @@ impl DirectSyscalls {
     fn supports_fd_call(number: u32, args: [u64; 6], fd: &trames_vfs::DirectFd) -> bool {
         Self::supports_fd(number, fd)
             && (number != 29
+                || fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
                 || args[1] as u32 == 0x541b
                 || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413)
                 || fd.pty_endpoint().is_some()
@@ -779,6 +780,9 @@ impl DirectSyscalls {
         }
         self.supports(number, args[0] as u32)
             && (number != 29
+                || self.descriptors.get(args[0] as u32).is_some_and(|fd| {
+                    fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                })
                 || args[1] as u32 == 0x541b
                 || self
                     .descriptors
@@ -910,6 +914,13 @@ impl DirectSyscalls {
     ) -> Option<Result<u64, Errno>> {
         if !Self::supports_fd_call(number, args, fd) {
             return None;
+        }
+        if number == 29 && fd.is_entropy_device() {
+            // This kernel has no guest entropy pool/credit/reseed controls.
+            // Preserve the existing ENOTTY without reading the unused pointer
+            // or loaning this original OFD to the coordinator. FIONBIO/FIOASYNC
+            // remain with their shared flag/subscription implementations.
+            return fd.entropy_control();
         }
         // Addressed packet calls bind their target/input once at the retained
         // entry, before any queue effect, rather than probing then re-resolving.
@@ -1802,6 +1813,39 @@ mod tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     use trames_vfs::{Vfs, O_NONBLOCK};
+    #[test]
+    fn entropy_controls_keep_the_original_ofd_and_do_not_touch_unused_guest_pointers() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        let mut memory = memory();
+        for path in [b"/dev/random".as_slice(), b"/dev/urandom"] {
+            let fd = v.open_at(-100, path, 2, 0).unwrap();
+            let direct = DirectSyscalls::new(v.direct_descriptors());
+            let original = direct.descriptors.get(fd).unwrap();
+            for request in [0x541b, 0x80045200, 0x40045201, 0x5207, 0xdeadbeef] {
+                let args = [fd as u64, request, u64::MAX, 0, 0, 0];
+                assert!(direct.supports_call(29, args));
+                assert_eq!(direct.invoke(29, args, &mut memory), Some(Err(Errno(25))));
+            }
+            for request in [0x5421, 0x5452] {
+                assert!(!direct.supports_call(29, [fd as u64, request, 0, 0, 0, 0]));
+            }
+            v.close(fd).unwrap();
+            let replacement = v.open_at(-100, b"/dev/zero", 2, 0).unwrap();
+            assert_eq!(replacement, fd);
+            assert!(!direct.descriptors.get(fd).unwrap().is_entropy_device());
+            assert_eq!(
+                direct.transfer_fd(
+                    &original,
+                    29,
+                    [fd as u64, 0x80045200, u64::MAX, 0, 0, 0],
+                    &mut memory
+                ),
+                Some(Err(Errno(25)))
+            );
+            v.close(replacement).unwrap();
+        }
+    }
     #[test]
     fn membership_changes_resolve_live_slots_and_final_close_before_owner_handoff() {
         let mut v = Vfs::default();

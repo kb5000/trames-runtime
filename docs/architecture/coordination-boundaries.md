@@ -1,14 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 62, original execution-lease
-memory barriers and their complete waiting/lifecycle consumers, reviewed on 2026-11-07.
-The prior runtime baseline is `c2d8643c924def8ff813b2d31de3dfc54cd64c26`.
+This is the consolidated implementation audit through stage 63, source entropy
+and original random-device controls, reviewed on 2026-11-07.
+The prior runtime baseline is `a4c1f20115757f72c6a023b81b9b13aa791db90f`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 62 moves the supported membarrier subsystem
+The Kernel owner still exists. Stage 63 moves getrandom into one shared source/solo
+ABI over the executor's original memory interface and host CSPRNG. Random-device
+control requests return their existing unsupported errors on the original OFD;
+FIONBIO/FIOASYNC retain their shared flag/subscription implementation. Existing
+random-device scalar/vector/positioned reads/writes, poll and random UUID paths
+are validated together. No guest entropy pool, worker service or fence is added.
+
+Stage 62 moves the supported membarrier subsystem
 to original execution leases: query/registration and errors complete locally;
 private barriers visit the original mm, global barriers visit this Linux instance's
 current execution domains. Requested actors acknowledge hardware fences before the
@@ -58,6 +65,7 @@ is not a claim that all coordinator work is removed.
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
 | Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
 | Memory barriers | Supported membarrier query/register/private/global/get-registrations run on source workers; original active execution leases acknowledge requested fences | Tracing and capability-less/solo embeddings keep their joined path. Unsupported sync-core/rseq/global-expedited commands remain unsupported. Ordinary memory accesses acquire no new synchronization |
+| Entropy and random devices | getrandom, original random/urandom OFDs and UUID resources run on the caller; unsupported random-device controls return locally on the accepted OFD | Explicit tracing and absent descriptor capabilities retain their own route. Supported getrandom flags remain 0..3 and the existing transfer bound/fault behavior is retained; guest entropy credit/reseed controls remain unsupported |
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
@@ -1992,3 +2000,42 @@ The coordinator, actual host lifecycle, explicit tracing, unsupported operations
 excluded resource bodies and exceptional native/memory publication remain in the
 current inventory. Global here does not synchronize other host applications or
 GPU DMA; native device API synchronization retains its own contract.
+
+## 63. Source entropy and original random-device controls — 2026-11-07
+
+getrandom(278) now uses one ABI implementation for the original execution View
+and solo/owner memory. The calling executor invokes the existing host CSPRNG;
+it neither sends a syscall service nor returns the cohort. The same permission,
+whole-output preflight, 1 MiB transfer bound and guest-memory write path remain.
+There is no new entropy pool, guest PRNG, global lock, disk job, fence or thread.
+Loader/ASLR entropy continues to use the same CSPRNG helper. Device and UUID
+entropy already use that host provider on their calling resource path.
+
+Flags use Linux's unsigned 32-bit argument, correcting rejection of register high
+bits. Flags 0..3 remain supported; GRND_INSECURE is not added. Zero-length requests
+retain the original address-range check: NULL is accepted, while an address above
+the guest user range returns EFAULT. Native ARM64 Linux verifies both cases and
+the flag truncation. This follows the unsigned flags and import-before-output
+roles in [Linux's random driver](https://github.com/torvalds/linux/blob/master/drivers/char/random.c).
+The existing whole-range EFAULT behavior remains more conservative than Linux's
+possible partial output across a later fault; this batch does not change it.
+
+Random-device admission checks the original inode/OFD kind, not its pathname.
+Unsupported entropy ioctls keep ENOTTY (EBADF for O_PATH) without reading their
+unused guest pointer or entering the coordinator. FIONBIO and FIOASYNC are
+excluded from this error-only path: their original flag and notification code
+still applies. Accepted controls retain the original OFD across close/replacement;
+the numeric descriptor slot is not re-resolved after effects. Other descriptor
+kinds retain their actual admission and do not inherit random-device behavior.
+
+Policy admission stays on the existing entry: raw, ALLOW and ERRNO tests assert
+one decision, original memory permissions and no services, cohort returns or VM
+checkpoints. O_PATH/read-only/write-only access and close/reuse are covered. Real
+HVF/interpreter programs validate 1/4/12 CPUs, scalar/vector/positioned random
+device reads/writes, nonblocking status, poll, UUID and boot_id. The native Linux
+fixture uses the same calls; the macOS reference measures the host getentropy
+provider, without pretending that macOS exposes Linux getrandom/seccomp/proc.
+
+See [validation and timings](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-entropy-20261107.json).
+Explicit tracing, legacy resources and actual host/backend events remain in the
+current consolidated inventory; this is not removal of the entire Kernel owner.

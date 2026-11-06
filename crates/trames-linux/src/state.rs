@@ -1225,17 +1225,7 @@ impl Linux {
                 self.vfs.flock(a[0] as u32, a[1] as u32)?;
                 Ok(0)
             },
-            278 => {
-                if a[2] & !3 != 0 {
-                    return Err(Errno(22));
-                }
-                let count = a[1].min(MAX_WRITE as u64) as usize;
-                Self::check(memory, a[0], count, Access::Write)?;
-                let mut bytes = vec![0; count];
-                super::fill_entropy(&mut bytes)?;
-                memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
-                Ok(count as u64)
-            },
+            278 => crate::getrandom(a, memory),
             198..=212 | 242 => self.network_syscall(number, a, memory),
             269 => self.send_messages(a, memory),
             65 => self.readv(a, memory, io),
