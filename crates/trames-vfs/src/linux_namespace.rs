@@ -479,12 +479,32 @@ impl Vfs {
             .namespace
             .clone()
             .ok_or(Errno(22))?;
+        self.set_namespace(ns, kind)
+    }
+    pub(super) fn check_namespace(&self, ns: &NamespaceHandle, kind: u64) -> Result<()> {
         if kind != 0 && kind != ns.kind() {
             return Err(Errno(22));
         }
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
+        if let NamespaceHandle::Pid(ns) = ns {
+            if !self.pid_ns.contains(ns) {
+                return Err(Errno(22));
+            }
+        }
+        if matches!(ns, NamespaceHandle::Mount(_)) {
+            if !self.credentials.has_cap(capabilities::SYS_CHROOT) {
+                return Err(Errno(1));
+            }
+            if self.context_shared() {
+                return Err(Errno(22));
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn set_namespace(&mut self, ns: NamespaceHandle, kind: u64) -> Result<()> {
+        self.check_namespace(&ns, kind)?;
         match ns {
             NamespaceHandle::Net(ns) => {
                 self.network = ns.network.borrow().clone();
@@ -494,9 +514,6 @@ impl Vfs {
             NamespaceHandle::Cgroup(ns) => self.cgroup_namespace = ns,
             NamespaceHandle::Uts(ns) => self.uts = ns,
             NamespaceHandle::Pid(ns) => {
-                if !self.pid_ns.contains(&ns) {
-                    return Err(Errno(22));
-                }
                 self.pid_children = ns;
             }
             NamespaceHandle::Mount(ns) => {

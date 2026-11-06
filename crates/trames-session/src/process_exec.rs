@@ -260,6 +260,7 @@ impl<C: Cpu> Kernel<C> {
             .collect();
         for id in ids {
             if let Some(mut t) = self.processes.remove(&id) {
+                t.linux.vfs.sync_task_namespaces();
                 // These CPUs were accounted before de-threading. Preserve the
                 // process projection without counting their global time twice.
                 p.cpu_time += t.cpu_time;
@@ -273,6 +274,7 @@ impl<C: Cpu> Kernel<C> {
                 t.linux.exit_tid(&mut t.memory);
                 self.wake_futex(&t, address, 1, u32::MAX);
                 t.linux.vfs.release_descriptors();
+                t.linux.vfs.retire_context();
                 t.space.retire();
                 Self::release_vfork(&mut t);
                 self.retire_detached_memory(std::mem::take(&mut t.memory))?;

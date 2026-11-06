@@ -26,6 +26,15 @@ impl WaylandGrant {
     }
 }
 impl WaylandAuth {
+    /// A namespace switch changes Files lookup, never the native service root.
+    pub fn with_files(&self, files: SharedFiles) -> Self {
+        Self {
+            source: self
+                .source
+                .as_ref()
+                .map(|(_, services)| (files, services.clone())),
+        }
+    }
     pub fn resolve(&self, fd: u32) -> Result<WaylandGrant> {
         let (files, services) = self.source.as_ref().ok_or(Errno(95))?;
         let services = services.upgrade().ok_or(Errno(95))?;

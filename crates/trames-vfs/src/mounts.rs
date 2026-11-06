@@ -835,6 +835,9 @@ impl Vfs {
         }
         let admin = self.mount_admin()?;
         let _lease = admin.enter();
+        self.unshare_mounts_locked()
+    }
+    pub(super) fn unshare_mounts_locked(&mut self) -> Result<()> {
         let old = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
         // Linux copy_mnt_ns omits mount-namespace nsfs bindings and everything
         // mounted on them. Retaining an older namespace here would defeat the
@@ -895,7 +898,7 @@ impl Vfs {
         self.register_mounts(&mounts)?;
         // CLONE_NEWNS/unshare also detaches fs_struct. Keep the VFS API correct
         // when called directly with a shared context, not only through Kernel.
-        if self.context.paths.is_shared() {
+        if self.context.paths.has_observers() {
             self.unshare_context();
         }
         {

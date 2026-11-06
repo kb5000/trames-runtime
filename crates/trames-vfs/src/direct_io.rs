@@ -1570,6 +1570,13 @@ pub struct NativeEvents {
     owner: std::thread::Thread,
 }
 impl NativeEvents {
+    /// Retarget future event lookup while preserving the original host wake.
+    pub fn with_files(&self, files: SharedFiles) -> Self {
+        Self {
+            files,
+            owner: self.owner.clone(),
+        }
+    }
     pub fn event(&self, fd: u32) -> Result<NativeEvent> {
         let file = self.files.lookup(fd).unwrap_or(Err(Errno(22)))?;
         match &file.open.control {

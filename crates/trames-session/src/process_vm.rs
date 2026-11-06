@@ -126,6 +126,7 @@ impl<C: Cpu> Kernel<C> {
                 assert!(matches!(outcome, SliceOutcome::Syscall { .. }));
                 let pid = job.work.pid;
                 let mut p = self.processes.remove(&pid).expect("paused task");
+                p.linux.vfs.sync_task_namespaces();
                 assert!(!p.linux.trace);
                 p.cpu = std::mem::take(&mut job.work.cpu);
                 let control = p.signals.io.lifecycle().enter(&p.signals.io, pid);

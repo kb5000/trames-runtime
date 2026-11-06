@@ -1,7 +1,42 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One Linux fs_struct per CLONE_FS domain; no per-syscall peer propagation.
 use super::*;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+
+/// One original task's fs_struct membership, independently of path observers.
+#[derive(Clone)]
+pub struct FsOwner(Arc<TaskFs>);
+struct TaskFs {
+    users: Arc<AtomicUsize>,
+    active: AtomicBool,
+}
+impl FsOwner {
+    fn new(users: &Arc<AtomicUsize>) -> Self {
+        users.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::new(TaskFs {
+            users: users.clone(),
+            active: AtomicBool::new(true),
+        }))
+    }
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn retire(&self) {
+        self.0.retire();
+    }
+}
+impl TaskFs {
+    fn retire(&self) {
+        if self.active.swap(false, Ordering::Relaxed) {
+            self.users.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for TaskFs {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
 
 /// A shared scalar, also usable by workers without retaining paths or a VFS.
 #[derive(Clone)]
@@ -105,6 +140,7 @@ pub(super) struct PathStore {
     projections: RefCell<Vec<Arc<Mount>>>,
     pub(super) registry: mounts::Registry,
     contexts: Arc<std::sync::Mutex<Contexts>>,
+    users: Arc<AtomicUsize>,
 }
 struct Contexts {
     paths: Vec<std::sync::Weak<SharedCell<SharedPaths>>>,
@@ -130,6 +166,7 @@ impl Default for PathStore {
                 prune_at: 64,
             })),
             shared,
+            users: Arc::default(),
             projections: RefCell::default(),
             registry: mounts::Registry::default(),
         }
@@ -218,6 +255,7 @@ impl PathStore {
     fn shared(&self) -> Self {
         Self {
             shared: self.shared.clone(),
+            users: self.users.clone(),
             projections: RefCell::default(),
             registry: self.registry.clone(),
             contexts: self.contexts.clone(),
@@ -230,6 +268,7 @@ impl PathStore {
         let paths = self.borrow();
         let result = Self {
             shared: Arc::new(SharedCell::new(SharedPaths::from_paths(&paths))),
+            users: Arc::default(),
             projections: RefCell::default(),
             registry: self.registry.clone(),
             contexts: self.contexts.clone(),
@@ -270,7 +309,7 @@ impl PathStore {
             true
         });
     }
-    pub fn is_shared(&self) -> bool {
+    pub fn has_observers(&self) -> bool {
         Arc::strong_count(&self.shared) > 1
     }
 }
@@ -296,19 +335,76 @@ impl Drop for PathsWrite<'_> {
         self.store.remember(&self.paths);
     }
 }
-#[derive(Default)]
+/// Original fs_struct resources only; private pathname caches do not cross.
+#[derive(Clone)]
+pub(super) struct ContextPublication {
+    shared: Arc<SharedCell<SharedPaths>>,
+    users: Arc<AtomicUsize>,
+    contexts: Arc<std::sync::Mutex<Contexts>>,
+    mask: Umask,
+    owner: Option<FsOwner>,
+}
+impl ContextPublication {
+    pub(super) fn same_owner(&self, context: &FsContext) -> bool {
+        match (&self.owner, &context.owner) {
+            (Some(a), Some(b)) => a.same(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    pub(super) fn install(&self, registry: mounts::Registry) -> FsContext {
+        FsContext {
+            paths: PathStore {
+                shared: self.shared.clone(),
+                users: self.users.clone(),
+                contexts: self.contexts.clone(),
+                projections: RefCell::default(),
+                registry,
+            },
+            mask: self.mask.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+}
 pub(super) struct FsContext {
     pub paths: PathStore,
     mask: Umask,
+    owner: Option<FsOwner>,
+}
+impl Default for FsContext {
+    fn default() -> Self {
+        let paths = PathStore::default();
+        Self {
+            owner: Some(FsOwner::new(&paths.users)),
+            paths,
+            mask: Umask::default(),
+        }
+    }
 }
 impl FsContext {
+    pub(super) fn publication(&self, owner: Option<FsOwner>) -> ContextPublication {
+        ContextPublication {
+            shared: self.paths.shared.clone(),
+            users: self.paths.users.clone(),
+            contexts: self.paths.contexts.clone(),
+            mask: self.mask.clone(),
+            owner,
+        }
+    }
+
+    pub(super) fn disown(&mut self) {
+        self.owner = None;
+    }
+
     pub(super) fn share_mask(&mut self, other: &Self) {
         self.mask = other.mask.clone();
     }
     /// Original fs_struct resources; local mount projections are always fresh.
     pub(super) fn share_paths(&mut self, other: &Self) {
+        self.owner = None;
         self.paths = PathStore {
             shared: other.paths.shared.clone(),
+            users: other.paths.users.clone(),
             projections: RefCell::default(),
             registry: self.paths.registry.clone(),
             contexts: other.paths.contexts.clone(),
@@ -319,13 +415,23 @@ impl FsContext {
         Self {
             paths: self.paths.shared(),
             mask: self.mask.clone(),
+            owner: Some(FsOwner::new(&self.paths.users)),
+        }
+    }
+}
+impl Drop for FsContext {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.retire();
         }
     }
 }
 impl Clone for FsContext {
     fn clone(&self) -> Self {
+        let paths = self.paths.fork();
         Self {
-            paths: self.paths.fork(),
+            owner: Some(FsOwner::new(&paths.users)),
+            paths,
             mask: self.mask.fork(),
         }
     }
@@ -336,6 +442,17 @@ impl Vfs {
     }
     pub fn shares_context_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.context.paths.shared, &other.context.paths.shared)
+    }
+    pub fn context_owner(&self) -> Option<FsOwner> {
+        self.context.owner.clone()
+    }
+    pub fn retire_context(&self) {
+        if let Some(owner) = &self.context.owner {
+            owner.retire();
+        }
+    }
+    pub fn context_shared(&self) -> bool {
+        self.context.paths.users.load(Ordering::Relaxed) > 1
     }
     pub fn unshare_context(&mut self) {
         self.context = self.context.clone();
@@ -354,6 +471,54 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fs_membership_counts_tasks_not_queries_and_retires_before_collection() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<FsOwner>();
+        let mut task = Vfs::default();
+        let queries = task.path_queries();
+        let retained = queries.retain_context();
+        assert!(!task.context_shared());
+        let peer = task.clone_with_resources(false, true);
+        assert!(task.context_shared());
+        let identity = peer.context_owner().unwrap();
+        std::thread::spawn(move || identity.retire())
+            .join()
+            .unwrap();
+        assert!(!task.context_shared(), "a departed task is not an fs user");
+        assert!(
+            task.shares_context_with(&peer),
+            "cold projections still exist"
+        );
+        let peer = task.clone_with_resources(false, true);
+        assert!(task.context_shared());
+        let old = task.context_owner().unwrap();
+        task.unshare_context();
+        assert!(!task.context_shared());
+        assert!(
+            !peer.context_shared(),
+            "replacement retires its old membership"
+        );
+        old.retire();
+        assert!(!peer.context_shared(), "duplicate retirement is idempotent");
+        drop((queries, retained));
+    }
+
+    #[test]
+    fn mount_unshare_preserves_an_accepted_observers_original_context() {
+        let mut task = Vfs::default();
+        let observer = task.path_queries();
+        let old_namespace = task.mounts.as_ref().unwrap().id();
+        assert!(!task.context_shared());
+        task.unshare_mounts().unwrap();
+        assert_ne!(task.mounts.as_ref().unwrap().id(), old_namespace);
+        let old = observer.view.borrow();
+        assert_eq!(old.mounts.as_ref().unwrap().id(), old_namespace);
+        assert!(!task.shares_context_with(&old));
+        assert_eq!(old.cwd().unwrap(), b"/");
+        assert_eq!(task.cwd().unwrap(), b"/");
+    }
 
     #[test]
     fn shared_paths_and_mask_are_live_while_fork_copies_the_context() {

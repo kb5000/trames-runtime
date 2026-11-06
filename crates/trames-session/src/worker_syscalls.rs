@@ -19,6 +19,7 @@ pub(super) struct Exit {
 pub(super) struct ExitResources<'a> {
     pub task: &'a Arc<trames_kernel::signal::IoTask>,
     pub files: &'a trames_vfs::FileTableOwner,
+    pub context: Option<&'a trames_vfs::FsOwner>,
     pub parents: &'a trames_kernel::task_parent::Parents,
     pub uid: u32,
     pub futex: &'a crate::futex::Authority,
@@ -49,6 +50,9 @@ impl ExitResources<'_> {
             }
         }
         self.files.retire(self.task.tgid());
+        if let Some(context) = self.context {
+            context.retire();
+        }
         if let Some(space) = &self.native {
             space.retire();
         }
@@ -79,7 +83,9 @@ pub(super) struct Snapshot {
     pub owner_syscalls: bool,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
+    pub namespaces: Option<trames_vfs::TaskNamespaces>,
     pub exit_files: Option<trames_vfs::FileTableOwner>,
+    pub exit_context: Option<trames_vfs::FsOwner>,
     pub children: Arc<trames_kernel::children::Children>,
     pub limits: Option<trames_kernel::limits::Authority>,
     pub timers: Option<Arc<trames_kernel::timers::Timers>>,
@@ -103,6 +109,62 @@ pub(super) struct Snapshot {
     pub uts: Option<trames_vfs::UtsAccess>,
     pub direct: trames_linux::DirectSyscalls,
     pub futex: crate::futex::Authority,
+}
+
+impl<C: Cpu> crate::workers::Work<C> {
+    pub fn namespace_work(&mut self, number: u32, args: [u64; 6]) -> trames_vfs::TaskNamespaceWork {
+        let snapshot = self.syscalls.as_mut().expect("namespace task");
+        let state = snapshot.namespaces.take().expect("current namespace state");
+        if number == 97 {
+            let task = &snapshot.io_signals;
+            let allowed = self.pid == task.tgid()
+                && task
+                    .lifecycle()
+                    .members()
+                    .iter()
+                    .all(|(pid, _)| *pid == self.pid);
+            state.unshare(args[0], allowed)
+        } else if number == 436 {
+            state.close_range(args[0] as u32, args[1] as u32, args[2] as u32)
+        } else {
+            state.setns(args[0] as u32, args[1])
+        }
+    }
+    pub fn finish_namespaces(
+        &mut self,
+        state: trames_vfs::TaskNamespaces,
+        result: Result<u64, Errno>,
+    ) {
+        let snapshot = self.syscalls.as_mut().expect("namespace task");
+        if result.is_ok() && state.changed() {
+            let resources = state.resources();
+            snapshot.streams = resources.streams.clone();
+            snapshot.fd_flags = resources.flags.clone();
+            snapshot.umask = resources.umask.clone();
+            snapshot.uts = Some(resources.uts.clone());
+            if let Some(gpu) = &mut self.gpu {
+                gpu.images = Some(resources.images.clone());
+                gpu.auth = gpu.auth.with_files(resources.files.clone());
+                gpu.events = gpu
+                    .events
+                    .as_ref()
+                    .map(|events| events.with_files(resources.files.clone()));
+            }
+            if let Some(audio) = &mut self.audio {
+                audio.events = audio.events.with_files(resources.files.clone());
+            }
+            snapshot.direct.refresh_namespaces(resources);
+            snapshot.exit_files = Some(state.files_owner());
+            snapshot.exit_context = state.context_owner();
+            snapshot
+                .io_signals
+                .proc_view
+                .replace_resources(state.proc_resources());
+        }
+        snapshot.namespaces = Some(state);
+        self.cpu
+            .set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+    }
 }
 
 /// These operations change or inspect this mm's mappings, without changing
@@ -600,6 +662,7 @@ impl Snapshot {
             ExitResources {
                 task: &self.io_signals,
                 files,
+                context: self.exit_context.as_ref(),
                 parents: &self.io_routes.directory.parents,
                 uid: self.io_routes.uid,
                 futex: &self.futex,
@@ -633,7 +696,7 @@ impl Snapshot {
             || self.direct.supports_socket_control(cpu.x(8) as u32)
             || self.direct.supports_path_query(cpu.x(8) as u32)
             || self.direct.supports_epoll_control(cpu.x(8) as u32)
-            || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
+            || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115 | 436)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {
             return false;
@@ -648,7 +711,7 @@ impl Snapshot {
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
             && !(cpu.x(8) as u32 == 214 && cpu.x(0) == 0)
-            && !(cpu.x(8) as u32 == 436 && cpu.x(2) as u32 == 4)
+            && !(cpu.x(8) as u32 == 436 && cpu.x(2) as u32 & 2 == 0)
             && !self
                 .direct
                 .supports_call(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))
@@ -996,7 +1059,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1130,7 +1195,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1194,7 +1261,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1302,7 +1371,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -1374,7 +1445,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,

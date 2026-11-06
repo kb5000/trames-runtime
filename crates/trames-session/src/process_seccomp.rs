@@ -590,7 +590,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -807,7 +809,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -913,7 +917,9 @@ mod tests {
                     owner_syscalls: false,
                     vfork_release: None,
                     native_space: None,
+                    namespaces: None,
                     exit_files: None,
+                    exit_context: None,
                     children: Default::default(),
                     limits: None,
                     timers: Some(timers),
@@ -1046,7 +1052,9 @@ mod tests {
                     owner_syscalls: false,
                     vfork_release: None,
                     native_space: None,
+                    namespaces: None,
                     exit_files: None,
+                    exit_context: None,
                     children: Default::default(),
                     limits: None,
                     timers: None,
@@ -1165,7 +1173,9 @@ mod tests {
                     owner_syscalls: false,
                     vfork_release: None,
                     native_space: None,
+                    namespaces: None,
                     exit_files: None,
+                    exit_context: None,
                     children: Default::default(),
                     limits: None,
                     timers: None,
@@ -1292,7 +1302,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -1446,6 +1458,249 @@ mod tests {
                     assert!(!v.read(notify, 4096).unwrap().is_empty());
                 } else {
                     assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+                }
+            }
+        }
+    }
+    #[test]
+    fn task_namespace_entries_apply_one_policy_decision_before_resource_effects() {
+        use super::super::tests::{kernel, process};
+        for allowed in [false, true] {
+            for (number, args) in [
+                (97, [0x600, 0, 0]),
+                (268, [900, 0, 0]),
+                (436, [0, u32::MAX as u64, 2]),
+                (436, [0, u32::MAX as u64, 0]),
+                (436, [0, u32::MAX as u64, 4]),
+            ] {
+                let mut p = process();
+                let fd = p.linux.vfs.eventfd(0, 0).unwrap();
+                p.memory
+                    .write_array(0x4000, 0xd4000001u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .write_array(0x4004, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .write_array(0x4500, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu.set_x(8, number);
+                for (i, arg) in args.iter().enumerate() {
+                    p.cpu.set_x(i, *arg);
+                }
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })])
+                        .unwrap(),
+                ));
+                let memory = p.memory.share();
+                let mut peer = p.fork_with_memory(memory);
+                peer.tgid = 2;
+                peer.cpu = Cpu::new(0x4500, 0x9000);
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                assert!(k
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                    .unwrap());
+                let p = &k.processes[&1];
+                let peer = &k.processes[&2];
+                let expected = if !allowed {
+                    error(Errno(123))
+                } else if number == 268 {
+                    error(Errno(9))
+                } else {
+                    0
+                };
+                assert_eq!(p.cpu.x(0), expected);
+                assert_eq!(p.seccomp.evaluations(), 1);
+                assert_eq!(k.service_requests, 0);
+                let detached = allowed && (number == 97 || number == 436 && args[2] & 2 != 0);
+                assert_eq!(
+                    p.linux.vfs.shares_descriptors_with(&peer.linux.vfs),
+                    !detached
+                );
+                assert_eq!(
+                    p.linux.vfs.shares_context_with(&peer.linux.vfs),
+                    !(allowed && number == 97)
+                );
+                if allowed && number == 436 {
+                    if args[2] == 4 {
+                        assert_ne!(p.linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC, 0);
+                        assert_ne!(peer.linux.vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC, 0);
+                    } else {
+                        assert_eq!(p.linux.vfs.flags(fd), Err(Errno(9)));
+                        assert_eq!(peer.linux.vfs.flags(fd).is_ok(), detached);
+                    }
+                } else {
+                    assert!(p.linux.vfs.flags(fd).is_ok());
+                }
+            }
+        }
+    }
+    #[test]
+    fn task_namespace_switch_refreshes_all_source_consumers_without_owner_returns() {
+        use super::super::tests::{kernel, process};
+        for slots in [1, 2] {
+            for filtered in [false, true] {
+                let mut p = process();
+                p.linux.vfs.mkdir_at(AT_FDCWD, b"/private", 0o755).unwrap();
+                p.linux.vfs.set_runtime_info(
+                    1,
+                    trames_vfs::RuntimeInfo {
+                        processes: vec![trames_vfs::ProcessInfo {
+                            pid: 1,
+                            tgid: 1,
+                            namespaces: p.linux.vfs.namespace_snapshot(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                let uts = p
+                    .linux
+                    .vfs
+                    .open_at(AT_FDCWD, b"/proc/self/ns/uts", 0, 0)
+                    .unwrap();
+                let old_fd = p.linux.vfs.eventfd(5, 0).unwrap();
+                p.memory.write(0x1200, b"/private\0").unwrap();
+                p.memory.write(0x1300, b"source").unwrap();
+                let flags = 0x600
+                    | trames_vfs::CLONE_NEWUTS
+                    | trames_vfs::CLONE_NEWNET
+                    | trames_vfs::CLONE_NEWIPC
+                    | trames_vfs::CLONE_NEWCGROUP
+                    | trames_vfs::CLONE_NEWNS;
+                let calls = [
+                    (97, [flags, 0, 0]),
+                    (49, [0x1200, 0, 0]),
+                    (166, [0o077, 0, 0]),
+                    (57, [old_fd as u64, 0, 0]),
+                    (19, [11, 0, 0]),
+                    (161, [0x1300, 6, 0]),
+                    (160, [0x2000, 0, 0]),
+                    (268, [uts as u64, trames_vfs::CLONE_NEWUTS, 0]),
+                    (160, [0x2400, 0, 0]),
+                ];
+                let mov = |r: u32, value: u64| {
+                    [
+                        0xd2800000 | ((value as u32 & 0xffff) << 5) | r,
+                        0xf2a00000 | (((value as u32 >> 16) & 0xffff) << 5) | r,
+                    ]
+                };
+                let mut code = mov(20, 0x1000).to_vec();
+                for (index, (number, args)) in calls.iter().enumerate() {
+                    for (r, arg) in args.iter().enumerate() {
+                        code.extend(mov(r as u32, *arg));
+                    }
+                    code.extend(mov(8, *number));
+                    code.extend([0xd4000001, 0xf9000000 | ((index as u32) << 10) | (20 << 5)]);
+                }
+                code.extend(mov(28, 1));
+                code.push(0x14000000);
+                for (i, word) in code.iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .write_array(0x4500, 0x14000000u32.to_le_bytes())
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                if filtered {
+                    p.seccomp
+                        .push(Arc::new(Filter::validate(vec![i(6, 0, 0, ALLOW)]).unwrap()));
+                }
+                let shared_memory = p.memory.share();
+                let mut peer = p.fork_with_memory(shared_memory);
+                peer.tgid = 2;
+                peer.cpu = Cpu::new(0x4500, 0x9000);
+                peer.family.set_parent(1);
+                let mut k = kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                for _ in 0..16 {
+                    assert!(k
+                        .parallel_epoch(
+                            &mut trames_linux::CapturedOutput::default(),
+                            k.instructions + 100_000,
+                            true
+                        )
+                        .unwrap());
+                    if k.processes[&1].cpu.x(28) == 1 {
+                        break;
+                    }
+                }
+                let p = &k.processes[&1];
+                let peer = &k.processes[&2];
+                assert_eq!(p.cpu.x(28), 1, "slots={slots} filtered={filtered}");
+                for index in [0, 1, 3, 5, 6, 7, 8] {
+                    assert_eq!(
+                        p.memory.read_u64(0x1000 + index * 8).unwrap(),
+                        0,
+                        "call {index}"
+                    );
+                }
+                assert_eq!(p.memory.read_u64(0x1010).unwrap(), 0o022);
+                assert_eq!(p.memory.read_array::<6>(0x2041).unwrap(), *b"source");
+                assert_eq!(p.memory.read_array::<6>(0x2441).unwrap(), *b"trames");
+                assert_eq!(p.linux.vfs.cwd().unwrap(), b"/private");
+                assert_eq!(peer.linux.vfs.cwd().unwrap(), b"/");
+                assert_eq!(p.linux.vfs.umask(), 0o077);
+                assert_eq!(peer.linux.vfs.umask(), 0o022);
+                assert!(!p.linux.vfs.shares_descriptors_with(&peer.linux.vfs));
+                let fresh = p.memory.read_u64(0x1020).unwrap() as u32;
+                assert_eq!(
+                    p.linux
+                        .vfs
+                        .shared_files()
+                        .lookup(fresh)
+                        .unwrap()
+                        .unwrap()
+                        .direct_byte()
+                        .unwrap()
+                        .read(8)
+                        .unwrap(),
+                    11u64.to_le_bytes()
+                );
+                assert_eq!(
+                    peer.linux
+                        .vfs
+                        .shared_files()
+                        .lookup(old_fd)
+                        .unwrap()
+                        .unwrap()
+                        .direct_byte()
+                        .unwrap()
+                        .read(8)
+                        .unwrap(),
+                    5u64.to_le_bytes()
+                );
+                assert_eq!(k.syscalls, calls.len() as u64);
+                assert_eq!(k.service_requests, 0);
+                assert!(!k.cohort_return_syscalls.contains_key(&97));
+                assert!(!k.cohort_return_syscalls.contains_key(&268));
+                if filtered {
+                    assert_eq!(p.seccomp.evaluations(), calls.len() as u64);
                 }
             }
         }
@@ -1915,7 +2170,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -2197,7 +2454,6 @@ mod tests {
                 (25, 4, O_NONBLOCK as u64, O_NONBLOCK),
                 (29, 0x5421, 0x1000, O_NONBLOCK),
                 (25, 2, 1, trames_vfs::O_CLOEXEC),
-                (436, u32::MAX as u64, 4, trames_vfs::O_CLOEXEC),
             ] {
                 let mut p = super::super::tests::process();
                 let [fd, _] = p.linux.vfs.pipe(0).unwrap();
@@ -2212,7 +2468,9 @@ mod tests {
                     owner_syscalls: false,
                     vfork_release: None,
                     native_space: None,
+                    namespaces: None,
                     exit_files: None,
+                    exit_context: None,
                     children: Default::default(),
                     limits: None,
                     timers: None,
@@ -2261,7 +2519,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2319,7 +2579,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2370,7 +2632,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2431,7 +2695,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2492,7 +2758,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2555,7 +2823,9 @@ mod tests {
                 owner_syscalls: false,
                 vfork_release: None,
                 native_space: None,
+                namespaces: None,
                 exit_files: None,
+                exit_context: None,
                 children: Default::default(),
                 limits: None,
                 timers: None,
@@ -2613,7 +2883,9 @@ mod tests {
                     owner_syscalls: false,
                     vfork_release: None,
                     native_space: None,
+                    namespaces: None,
                     exit_files: None,
+                    exit_context: None,
                     children: Default::default(),
                     limits: None,
                     timers: None,

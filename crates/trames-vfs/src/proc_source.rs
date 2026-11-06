@@ -569,6 +569,7 @@ process_metadata! {
     ignored: u64,
     caught: u64,
 }
+#[derive(Clone)]
 struct ProcessImage {
     metadata: ProcessMetadata,
     resources: ProcResources,
@@ -643,6 +644,14 @@ impl ProcessView {
     }
     pub fn publish(&self, info: &ProcessInfo, resources: ProcResources) {
         self.publish_with_memory(info, resources, None);
+    }
+    /// Task namespace/Files replacement preserves the loaded image and its mm.
+    /// Only an overlapping observer requires a cold copy; ordinary reads keep
+    /// their existing single image observation and no extra synchronization.
+    pub fn replace_resources(&self, resources: ProcResources) {
+        if let Some(image) = self.image.write().unwrap().as_mut() {
+            Arc::make_mut(image).resources = resources;
+        }
     }
     pub fn publish_with_memory(
         &self,

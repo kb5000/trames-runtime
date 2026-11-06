@@ -216,6 +216,7 @@ impl<C: Cpu> Kernel<C> {
             self.processes.insert(pid, p);
             return Ok(());
         };
+        p.linux.vfs.sync_task_namespaces();
         p.linux.vfs.set_lock_owner(p.tgid);
         if last {
             p.linux.vfs.release_process_locks();
@@ -224,10 +225,12 @@ impl<C: Cpu> Kernel<C> {
         Self::cancel_native_task(&p);
         p.linux.cancel_uring(&mut p.memory, pid);
         let files = p.linux.vfs.file_table_owner();
+        let context = p.linux.vfs.context_owner();
         let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
         let exit = crate::worker_syscalls::ExitResources {
             task,
             files: &files,
+            context: context.as_ref(),
             parents: &p.signals.io_directory.parents,
             uid: p.linux.vfs.credentials.uid,
             futex: &futex,

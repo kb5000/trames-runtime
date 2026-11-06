@@ -1,8 +1,8 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 54, original mount topology
-transactions and fs_struct root replacement, reviewed on 2026-11-06.
-The prior executable baseline is `b26b2ad732663e6aedb665a3e3bc61b676b9746e`.
+This is the consolidated implementation audit through stage 55, original task namespace membership
+and complete Files/fs lifetime, reviewed on 2026-11-06.
+The prior executable baseline is `b06c97a3e83e4ed81a08400cfe2991f224810dae`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
@@ -25,7 +25,8 @@ this table or by the number of migration stages.
 | Residual generic FD/network compatibility | In-cohort owner service when the actual resource is admitted; only the caller waits | Refusal before effects uses the joined owner path. Candidate syscall numbers do not mean ordinary admitted calls take this route |
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export or actual mapping invalidation needs only the original mm admission boundary. Legacy embeddings without a provider keep joined snapshots; task namespace membership mutations and policy remain separate |
-| Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Task namespace membership (unshare/setns), tracing and genuinely excluded path controls keep separate boundaries |
+| Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
+| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and actual seccomp lifecycle effects remain. Clone namespace creation retains creator-mm custody; credentials and unsupported user/time namespace semantics remain separate |
 | Tracing and mutable security policy | Joined task-policy boundary where required | Installation/TSYNC and signal/termination effects remain. Untraced continuous-worker custody entries finish pure ERRNO/unsupported TRACE/USER_NOTIF decisions before mm quiescence; accepted decisions travel once |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
@@ -39,19 +40,16 @@ or prestart every configured CPU. Scheduler, resource processing,
 communication and full-stop costs must be measured separately. UI-thread affinity
 and the native disk/device pools are not additional Linux coordinators.
 
-Stage 53 removed the `/proc/self/exe` opens left by the historical stage 51
-execveat fixture. Stage 54 removes admitted mount/umount/pivot_root topology work
-from joined dispatch. In the new multi-CPU mount compatibility fixture, only the
-final console ioctl and the explicit unshare administration return the cohort;
-mount operations request no owner service. These are fixture-specific results,
-not their prevalence in Firefox or every container workload.
+Stage 55 removes supported task namespace membership changes from joined
+dispatch, including Files/fs detachment and every captured resource consumer.
+The multi-CPU namespace compatibility fixture requests no owner service and has
+no unshare/setns/close_range cohort returns; its final console ioctl still returns.
+These are fixture-specific results, not prevalence in Firefox or all containers.
 
-The next task-namespace subsystem must replace the remaining epoch-frozen
-membership captures together: Files/fs, UTS, network/IPC/cgroup namespaces,
-pid-for-children, descriptor factories, signal/readiness and proc observers.
-Moving just unshare/setns entry points would leave those consumers on old
-resources. Credentials, actual owner-control graphs and structural mapping
-publication also remain separate boundaries.
+Credentials/capabilities, task/image construction, structural mapping publication,
+actual excluded control bodies, tracing/security and generic unhandled dispatch
+remain separate boundaries. Source-owned control lifetime does not imply that
+every control operation itself has moved to a worker.
 
 ## Execution model
 
@@ -976,3 +974,71 @@ Credentials, unsupported newer mount APIs/propagation modes, tracing/security,
 excluded pathname controls and generic unhandled dispatch remain explicit limits.
 The native Linux, interpreter/HVF, timing and local regression evidence is in
 [stage 54 validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-mount-20261106.json).
+
+
+## Original task namespace membership and complete Files/fs lifetime — 2026-11-06
+
+Stage 55 moves supported unshare/setns and close_range as one subsystem. Calling
+workers retain a private resolver over original Files, fs_struct, UTS, mount,
+network, IPC, cgroup and pid-for-children resources. A real membership change
+prepares a candidate, commits once, then publishes only the original per-task
+bindings. Failed preparation discards the candidate without detaching the old
+Files/fs membership. The task's owner imports committed bindings before service,
+scoped clone/exec/VM custody, CPU collection or retirement; it never replays the
+namespace operation. Serial execution consumes one candidate directly. Non-mount
+setns replaces a validated task-local handle, and private/no-unshare close_range
+uses the actual Files table without a candidate or publication.
+
+The source refreshes future DirectSyscalls, paths, descriptor factories, UTS/umask,
+network, native image/event/audio resources, exit ownership and dynamic proc
+observers together. Existing native wake targets and service roots are retained.
+Accepted AIO/io_uring operations keep their original descriptors, paths and
+execution context; only future SQE acceptance gets the new context. Ring actor
+roots and task cancellation authority survive the switch. There is no ordinary
+syscall version check, extra guest-memory barrier, new service thread or polling
+message bus.
+
+Files membership now retains each complete OFD, including excluded cold control
+objects. Their former Rc control wrapper becomes Arc with object-local RwLock;
+the full contained graph is Send+Sync, asserted at compile time. Ordinary Shared
+OFD I/O is unchanged and acquires no new control lock. Private descriptor caches
+are observations rather than owners. A copied table duplicates CLOEXEC and current
+open slots, shares existing OFDs and the current limit, and omits unpublished
+numeric reservations. Last-close and native callbacks run outside membership's
+mutex. The unsafe Send resolver proof remains a private Rc island: exported
+capabilities contain only owned original resources, never references to its VFS.
+
+FsOwner counts actual task membership independently of path observers. Exit,
+exec and detachment retire it idempotently, even before cold owner projections
+are collected. Retained path contexts still keep their accepted roots. Mount
+setns checks actual task sharing plus SYS_ADMIN/SYS_CHROOT, following Linux
+[mntns_install](https://github.com/torvalds/linux/blob/master/fs/namespace.c).
+Detachment avoids copying an already-private Files/fs domain, consistent with
+[ksys_unshare](https://github.com/torvalds/linux/blob/master/kernel/fork.c).
+
+A busy original mount transaction retains the accepted target namespace even if
+its FD closes or is reused. Original readiness parks the caller; another existing
+worker can resume it. Caught signals/STOP do not discard accepted uninterruptible
+work; fatal retirement uses current task owners. Seccomp entry decisions travel
+once, including ERRNO refusals and close_range variants. No global task scan is
+needed to test fs sharing.
+
+Concentrated validation covers source/serial commit and rollback, target retention,
+waiting/cancellation, repeated publication/collection, actual fs ownership, native
+notification reuse, accepted async SQE resources, filtered denials, and the common
+Linux ABI. Native ARM Linux, HVF and interpreter fixtures cover 1/2/4/12 CPUs with
+and without an ALLOW filter. An isolated Docker/runc lifecycle checks real container
+namespace setup. Both iPad targets compile; no physical iPad performance claim is
+made. The [stage 55 record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-task-namespace-20261106.json)
+contains hashes, all timing pairs and product validation.
+
+Five alternating unprofiled pairs (64 checked namespace rounds per worker) show
+2.70x/3.41x/6.94x at 2/4/12 CPUs. One CPU remains about 6% slower (5.955 to 6.314 ms
+per 64 rounds), after eliminating unnecessary view copies and refreshes. The
+unchanged proc control spans 0.99x–1.01x and does not establish a general speedup.
+These figures are namespace-microbenchmark results, not Firefox or Geekbench.
+
+Unsupported user/time namespaces, credentials/capabilities, clone's task graph
+construction, tracing/security effects, excluded control bodies and generic
+unhandled dispatch remain explicit. This completes the supported task namespace
+membership batch, not global coordinator removal.

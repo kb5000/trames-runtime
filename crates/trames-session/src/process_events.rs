@@ -144,6 +144,22 @@ impl<C: Cpu> Kernel<C> {
         progress
     }
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
+        if let State::Namespace(wait) = &p.state {
+            if wait.ready() {
+                if let Some((state, result)) = wait.run() {
+                    p.linux.vfs.adopt_task_namespaces(state);
+                    p.signals
+                        .io
+                        .proc_view
+                        .replace_resources(p.linux.vfs.proc_resources());
+                    p.cpu.set_x(0, result.unwrap_or_else(error));
+                    p.state = State::Ready;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if matches!(&p.state, State::Completion(release) if release.finished()) {
             p.state = State::Ready;
             return true;

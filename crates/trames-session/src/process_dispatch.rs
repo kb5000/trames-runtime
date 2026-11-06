@@ -11,6 +11,12 @@ impl<C: Cpu> Kernel<C> {
         uring_epoch: &mut trames_linux::UringEpoch,
         network_epoch: &mut trames_vfs::NetworkEpoch,
     ) -> Box<crate::run_queue::Job<C>> {
+        self.processes
+            .get_mut(&id)
+            .expect("dispatch task")
+            .linux
+            .vfs
+            .sync_task_namespaces();
         let p = &self.processes[&id];
         let gpu = (accelerated(p, trames_vulkan::AUXV_KEY, trames_vulkan::PROFILE)
             || accelerated(p, trames_video::AUXV_KEY, trames_video::PROFILE))
@@ -66,6 +72,8 @@ impl<C: Cpu> Kernel<C> {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(trames_kernel::children::Wait { number, args }),
             ))
+        } else if let State::Namespace(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Namespace(wait.clone()))
         } else if let State::Completion(release) = &p.state {
             Some(crate::run_queue::WaitState::Completion(
                 crate::run_queue::CompletionWait::new(release.clone()),
@@ -75,6 +83,8 @@ impl<C: Cpu> Kernel<C> {
         } else {
             None
         };
+        p.linux.vfs.set_lock_owner(p.tgid);
+        let namespaces = p.linux.vfs.task_namespaces();
         let c = &p.linux.vfs.credentials;
         let direct_files = if !p.linux.trace {
             file_epoch.capture(&p.linux.vfs, true)
@@ -97,7 +107,9 @@ impl<C: Cpu> Kernel<C> {
                 owner_syscalls: p.linux.trace,
                 vfork_release: p.vfork.clone(),
                 native_space: Some(p.space.clone()),
+                namespaces: Some(namespaces),
                 exit_files: Some(p.linux.vfs.file_table_owner()),
+                exit_context: p.linux.vfs.context_owner(),
                 children: p.children.clone(),
                 limits: Some(limits),
                 timers: Some(self.timers.clone()),

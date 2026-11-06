@@ -28,6 +28,7 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) -> Option<u64> {
         let p = self.processes.get_mut(&request.pid)?;
+        p.linux.vfs.sync_task_namespaces();
         // The worker already evaluated its immutable epoch filter. Recheck
         // here before any VFS effects, using the actual post-SVC PC/arguments.
         // Installation/TSYNC cannot change authority until all CPUs join.
@@ -187,7 +188,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: p.children.clone(),
             limits: None,
             timers: None,

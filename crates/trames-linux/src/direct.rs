@@ -214,6 +214,7 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    signal_reader: Option<Arc<dyn trames_vfs::SignalReader>>,
     task_signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
     aio: Option<(Aio, trames_vfs::NativeEvents)>,
     paths: Option<trames_vfs::PathQueries>,
@@ -241,6 +242,31 @@ pub struct DirectSyscalls {
     completed: Cell<u64>,
 }
 impl DirectSyscalls {
+    /// Change only future syscall/SQE acceptance. Accepted async work owns its
+    /// old paths, descriptors and execution context until it completes.
+    pub fn refresh_namespaces(&mut self, resources: trames_vfs::TaskNamespaceResources) {
+        self.descriptors = resources
+            .descriptors
+            .with_signal_reader(self.signal_reader.clone());
+        self.network = resources.network;
+        self.membership = Some(resources.files.clone());
+        self.files = resources.direct_files;
+        self.paths = Some(resources.paths);
+        let mut factory = resources.factory;
+        if let Some(identity) = self.local_identity {
+            factory = factory.with_local_identity(identity);
+        }
+        self.resources = Some(factory);
+        if let Some((_, events)) = &mut self.aio {
+            *events = events.with_files(resources.files.clone());
+        }
+        self.urings.refresh_namespaces(
+            resources.files,
+            &self.files,
+            self.descriptors.clone(),
+            resources.uring_files,
+        );
+    }
     /// The original task's ring roots remain usable after FD close/reuse.
     pub fn cancel_task_uring(&self, owner: u64, task: u32) {
         self.urings.cancel_task(owner, task);
@@ -251,6 +277,7 @@ impl DirectSyscalls {
         }
     }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
+        self.signal_reader = Some(reader.clone());
         self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
         if let Some(descriptors) = self.urings.descriptors.take() {
             self.urings.descriptors = Some(descriptors.with_signal_reader(Some(reader)));
@@ -267,6 +294,7 @@ impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
         let membership = descriptors.shared_files();
         Self {
+            signal_reader: None,
             task_signal: None,
             aio: None,
             paths: None,
@@ -511,6 +539,16 @@ impl DirectSyscalls {
     pub fn invoke_membership(&self, number: u32, args: [u64; 6]) -> Option<Result<u64, Errno>> {
         let files = self.membership.as_ref()?;
         let result = match number {
+            436 if args[2] as u32 & 2 == 0 => Some(
+                files
+                    .close_range(
+                        args[0] as u32,
+                        args[1] as u32,
+                        args[2] as u32,
+                        self.lock_context.as_ref()?.owner,
+                    )
+                    .map(|()| 0),
+            ),
             23 => files.duplicate(args[0] as u32, 0, false),
             24 => files.duplicate_to(
                 args[0] as u32,

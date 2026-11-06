@@ -173,7 +173,7 @@ pub struct PathQueries {
     pub(super) view: RefCell<Vfs>,
 }
 // SAFETY: `Vfs::path_queries` constructs every Rc/RefCell/Cell reachable here
-// afresh, including pseudo state and the dummy FD table. Mount lookup/retirement
+// afresh, including pseudo state and descriptor-cache facades. Mount lookup/retirement
 // registries contain only synchronized original resources.
 // Mount topology and namespace authority are original synchronized Arc resources.
 // Canonical cwd/root resources cross through their original Arc fs_struct.
@@ -187,7 +187,9 @@ pub struct PathQueries {
 // mutates only the original Arc-backed instance/inode marks, never query-local Rc.
 // Ordinary opens publish
 // Arc-backed descriptions; no Rc-backed owner control enters shared membership.
-// The dummy FD table remains private and empty. Adding an API that
+// Task namespace transactions may install an observation-only descriptor facade
+// over complete synchronized membership. Its cache Rc remains private, and its
+// inactive owner does not retire another task. Adding an API that
 // leaks/retains a local Rc outside this island requires revisiting this proof.
 unsafe impl Send for PathQueries {}
 

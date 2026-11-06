@@ -644,7 +644,7 @@ impl MappingMount {
 #[derive(Clone)]
 struct MappingWriter {
     _lease: WriteLease,
-    _owner: Option<Rc<RefCell<OpenDescription>>>,
+    _owner: Option<Arc<SharedCell<OpenDescription>>>,
 }
 impl MappingWriter {
     fn new(

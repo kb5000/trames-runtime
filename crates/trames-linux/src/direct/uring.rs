@@ -707,6 +707,25 @@ pub struct UringSnapshot {
     context: std::sync::OnceLock<Arc<actor::Execution>>,
 }
 impl UringSnapshot {
+    pub(super) fn refresh_namespaces(
+        &mut self,
+        membership: trames_vfs::SharedFiles,
+        files: &trames_vfs::DirectFiles,
+        descriptors: trames_vfs::DirectFds,
+        retained: BTreeMap<usize, trames_vfs::PreparedFile>,
+    ) {
+        self.membership = Some(membership);
+        self.files = files.clone();
+        self.descriptors = Some(descriptors);
+        // Old ring roots and their already accepted OFDs stay alive even when
+        // absent from the new Files table. Only new acceptance gets new paths.
+        self.retained_files.extend(retained);
+        self.context.take();
+        #[cfg(test)]
+        {
+            self.rings.clear();
+        }
+    }
     pub(super) fn cancel_task(&self, owner: u64, task: u32) {
         let actor = self
             .actor

@@ -11,7 +11,7 @@ use std::sync::{
 pub(super) enum SlotOpen {
     Shared(Arc<SharedOpenDescription>),
     Owner(
-        usize,
+        OpenHandle,
         Option<std::sync::Weak<SharedOpenDescription>>,
         Option<std::sync::Weak<SharedOpenDescription>>,
     ),
@@ -37,6 +37,16 @@ pub(super) struct ProcDescriptor {
     pub mount: Option<Arc<mounts::MountData>>,
 }
 impl Slot {
+    fn release_record_locks(&self, owner: u32) {
+        match &self.open {
+            SlotOpen::Shared(open) => open.release_record_locks(owner),
+            SlotOpen::Owner(..) => {
+                if let Some(open) = self.proc.as_ref().and_then(|p| p.open.upgrade()) {
+                    open.release_record_locks(owner);
+                }
+            }
+        }
+    }
     pub(super) fn shared_open(&self) -> Option<Result<&Arc<SharedOpenDescription>>> {
         let SlotOpen::Shared(open) = &self.open else {
             return None;
@@ -70,7 +80,7 @@ impl Slot {
             open: match &d.open {
                 OpenHandle::Shared(open) => SlotOpen::Shared(open.clone()),
                 OpenHandle::Owner(_) => {
-                    SlotOpen::Owner(d.open.identity(), d.open.borrow().query_metadata(), {
+                    SlotOpen::Owner(d.open.clone(), d.open.borrow().query_metadata(), {
                         let open = d.open.borrow();
                         (open.socket.is_some()
                             || matches!(open.control, Some(events::SharedControl::Epoll(_))))
@@ -133,9 +143,9 @@ impl MembershipEntries {
         self.free.clear();
     }
 }
-/// Actual membership, not a snapshot. Shared slots own complete admitted OFDs;
-/// owner slots publish weak metadata/control capabilities while their Rc
-/// projections remain on the owner.
+/// Actual membership, not a snapshot. Every slot retains its complete OFD.
+/// Cold controls have object-local synchronization; weak metadata capabilities
+/// still do not grant their callers permission to execute a control body.
 #[derive(Clone)]
 pub struct SharedFiles(
     pub(super) Arc<Membership>,
@@ -161,9 +171,6 @@ struct TaskFiles {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileTableRetirement {
     pub last_owner: bool,
-    /// Original excluded control projections still need their existing owner
-    /// destructor. Shared OFDs have already closed on the retiring executor.
-    pub owner_controls: usize,
 }
 impl FileTableOwner {
     fn initial(files: &SharedFiles) -> Self {
@@ -185,19 +192,38 @@ impl FileTableOwner {
             active: AtomicBool::new(active),
         }))
     }
+    pub(super) fn observation(files: &SharedFiles) -> Self {
+        Self(Arc::new(TaskFiles {
+            membership: files.0.clone(),
+            active: AtomicBool::new(false),
+        }))
+    }
+    pub(super) fn detach(&self) {
+        self.retire_inner(None);
+    }
     pub fn retire(&self, lock_owner: u32) -> Option<FileTableRetirement> {
         self.retire_inner(Some(lock_owner))
     }
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     fn retire_inner(&self, lock_owner: Option<u32>) -> Option<FileTableRetirement> {
-        if !self.0.active.swap(false, Ordering::Relaxed) {
+        self.0.retire(lock_owner)
+    }
+}
+impl Drop for TaskFiles {
+    fn drop(&mut self) {
+        self.retire(None);
+    }
+}
+impl TaskFiles {
+    fn retire(&self, lock_owner: Option<u32>) -> Option<FileTableRetirement> {
+        if !self.active.swap(false, Ordering::Relaxed) {
             return None;
         }
-        let files = &self.0.membership;
+        let files = &self.membership;
         if files.owners.fetch_sub(1, Ordering::Relaxed) != 1 {
-            return Some(FileTableRetirement {
-                last_owner: false,
-                owner_controls: 0,
-            });
+            return Some(FileTableRetirement { last_owner: false });
         }
         let removed = {
             let mut entries = files.entries.lock().unwrap();
@@ -210,24 +236,15 @@ impl FileTableOwner {
             }
             removed
         };
-        let mut owner_controls = 0;
         // Last-close can wake another executor or enter a native callback.
         // Neither an owner projection nor the membership mutex is borrowed.
-        for slot in removed.values() {
-            match &slot.open {
-                SlotOpen::Shared(open) => {
-                    if let Some(owner) = lock_owner {
-                        open.release_record_locks(owner);
-                    }
-                }
-                SlotOpen::Owner(..) => owner_controls += 1,
+        if let Some(owner) = lock_owner {
+            for slot in removed.values() {
+                slot.release_record_locks(owner);
             }
         }
         drop(removed);
-        Some(FileTableRetirement {
-            last_owner: true,
-            owner_controls,
-        })
+        Some(FileTableRetirement { last_owner: true })
     }
 }
 /// An unpublished numeric slot. Rollback releases only this reservation.
@@ -361,6 +378,9 @@ impl SharedFiles {
                 })
             })
             .collect()
+    }
+    pub(super) fn task_shared(&self) -> bool {
+        self.0.owners.load(Ordering::Relaxed) > 1
     }
     fn closed(&self) -> bool {
         self.0.owners.load(Ordering::Relaxed) == 0
@@ -719,6 +739,35 @@ impl SharedFiles {
         }
         Some(Ok(new))
     }
+    pub fn close_range(&self, first: u32, last: u32, flags: u32, owner: u32) -> Result<()> {
+        if first > last || flags & !6 != 0 {
+            return Err(Errno(22));
+        }
+        let removed = {
+            let mut entries = self.0.entries.lock().unwrap();
+            if flags & 4 != 0 {
+                for (_, slot) in entries.range(first..=last) {
+                    slot.cloexec.set(true);
+                }
+                return Ok(());
+            }
+            let fds: Vec<_> = entries.range(first..=last).map(|(&fd, _)| fd).collect();
+            let removed: Vec<_> = fds
+                .into_iter()
+                .filter_map(|fd| entries.remove(&fd))
+                .collect();
+            if !removed.is_empty() {
+                self.changed(&mut entries);
+            }
+            removed
+        };
+        for slot in &removed {
+            slot.release_record_locks(owner);
+        }
+        // Complete controls and native callbacks release outside Files' mutex.
+        drop(removed);
+        Ok(())
+    }
     pub fn close(&self, fd: u32, lock_owner: u32) -> Option<Result<()>> {
         let removed = {
             let mut entries = self.0.entries.lock().unwrap();
@@ -762,33 +811,18 @@ impl Entry<'_> {
             Ok(())
         }
     }
-    fn owned(&self) -> Descriptor {
-        Descriptor {
-            open: self.open.owned(),
-            cloexec: self.cloexec.clone(),
-        }
-    }
 }
 /// A bounded metadata inspection, with no allocation or extra OFD ownership.
 /// Resource I/O and callbacks must use a separate retained lookup lease.
 pub(super) struct Entries<'a> {
     membership: std::sync::MutexGuard<'a, MembershipEntries>,
-    owners: std::cell::Ref<'a, TableState>,
 }
 impl Entries<'_> {
-    fn entry<'a>(&'a self, fd: u32, slot: &'a Slot) -> Entry<'a> {
+    fn entry<'a>(&'a self, slot: &'a Slot) -> Entry<'a> {
         Entry {
             open: match &slot.open {
                 SlotOpen::Shared(open) => OpenView::Shared(open),
-                SlotOpen::Owner(identity, _, _) => {
-                    let descriptor = self
-                        .owners
-                        .entries
-                        .get(&fd)
-                        .expect("owner membership has its control");
-                    assert_eq!(descriptor.open.identity(), *identity);
-                    OpenView::Owner(&descriptor.open)
-                }
+                SlotOpen::Owner(open, _, _) => OpenView::Owner(open),
             },
             cloexec: &slot.cloexec,
         }
@@ -796,23 +830,15 @@ impl Entries<'_> {
     pub(super) fn iter(&self) -> impl Iterator<Item = (&u32, Entry<'_>)> {
         self.membership
             .iter()
-            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
+            .map(|(fd, slot)| (fd, self.entry(slot)))
     }
     pub(super) fn values(&self) -> impl Iterator<Item = Entry<'_>> {
         self.iter().map(|(_, entry)| entry)
     }
-    pub(super) fn range(
-        &self,
-        range: std::ops::RangeInclusive<u32>,
-    ) -> impl Iterator<Item = (&u32, Entry<'_>)> {
-        self.membership
-            .range(range)
-            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
-    }
     pub(super) fn last_key_value(&self) -> Option<(&u32, Entry<'_>)> {
         self.membership
             .last_key_value()
-            .map(|(fd, slot)| (fd, self.entry(*fd, slot)))
+            .map(|(fd, slot)| (fd, self.entry(slot)))
     }
     #[cfg(test)]
     pub(super) fn contains_key(&self, fd: &u32) -> bool {
@@ -839,7 +865,7 @@ impl Descriptor {
     }
 }
 /// CLONE_FILES retains this exact table; fork copies membership/CLOEXEC only.
-/// The owner index retains only excluded controls, never shared endpoint OFDs.
+/// Private caches never own descriptions; every lifetime belongs to membership.
 pub(super) struct DescriptorTable(Rc<RefCell<TableState>>, SharedFiles, FileTableOwner);
 impl Default for DescriptorTable {
     fn default() -> Self {
@@ -853,8 +879,6 @@ impl Default for DescriptorTable {
 }
 #[derive(Default)]
 struct TableState {
-    // Only SlotOpen::Owner entries have a descriptor in this index.
-    entries: BTreeMap<u32, Descriptor>,
     observed: u64,
     pub(super) identity: Rc<DescriptorVersion>,
     pub(super) metadata: Rc<DescriptorMetadata>,
@@ -872,6 +896,18 @@ pub(super) struct DescriptorVersion {
     pub(super) timers: OnceCell<Vec<std::sync::Weak<TimerFd>>>,
 }
 impl DescriptorTable {
+    pub(super) fn observe(files: SharedFiles) -> Self {
+        let owner = FileTableOwner::observation(&files);
+        Self(Rc::default(), files, owner)
+    }
+    pub(super) fn adopt(files: SharedFiles, owner: FileTableOwner) -> Self {
+        debug_assert!(Arc::ptr_eq(&files.0, &owner.0.membership));
+        Self(Rc::default(), files, owner)
+    }
+    pub(super) fn disown(&mut self) {
+        self.2 = FileTableOwner::observation(&self.1);
+    }
+
     pub(super) fn bind_limit(&mut self, limit: Arc<std::sync::atomic::AtomicU32>) {
         self.1 .1 = limit;
     }
@@ -938,30 +974,10 @@ impl DescriptorTable {
     pub(super) fn retire(&self, lock_owner: u32) {
         self.2.retire(lock_owner);
     }
-    pub(super) fn retire_owner_controls(&self, lock_owner: Option<u32>) {
-        if self.1 .0.owners.load(Ordering::Relaxed) != 0 {
-            return;
-        }
-        let removed = std::mem::take(&mut self.0.borrow_mut().entries);
-        if let Some(owner) = lock_owner {
-            for descriptor in removed.values() {
-                descriptor.open.borrow().release_record_locks(owner);
-            }
-        }
-        drop(removed);
-    }
-    fn descriptor(&self, fd: u32, slot: &Slot) -> Descriptor {
+    fn descriptor(&self, slot: &Slot) -> Descriptor {
         let open = match &slot.open {
             SlotOpen::Shared(open) => OpenHandle::Shared(open.clone()),
-            SlotOpen::Owner(identity, _, _) => {
-                let state = self.0.borrow();
-                let descriptor = state
-                    .entries
-                    .get(&fd)
-                    .expect("owner membership has its control");
-                assert_eq!(descriptor.open.identity(), *identity);
-                descriptor.open.clone()
-            }
+            SlotOpen::Owner(open, _, _) => open.clone(),
         };
         Descriptor {
             open,
@@ -971,14 +987,13 @@ impl DescriptorTable {
     pub(super) fn entries(&self) -> Entries<'_> {
         Entries {
             membership: self.1 .0.entries.lock().unwrap(),
-            owners: self.0.borrow(),
         }
     }
     /// Lookup retains the original OFD independently of FD removal or reuse.
     /// No table borrow survives into resource I/O or last-close callbacks.
     pub(super) fn get(&self, fd: &u32) -> Option<Descriptor> {
         let entries = self.1 .0.entries.lock().unwrap();
-        entries.get(fd).map(|slot| self.descriptor(*fd, slot))
+        entries.get(fd).map(|slot| self.descriptor(slot))
     }
     pub(super) fn lookup(&self, fd: u32) -> Result<Descriptor> {
         let descriptor = self.get(&fd).ok_or(Errno(9))?;
@@ -1010,23 +1025,16 @@ impl DescriptorTable {
         descriptor: Descriptor,
         entries: &mut MembershipEntries,
     ) -> Option<Descriptor> {
-        let old = entries.get(&fd).map(|slot| self.descriptor(fd, slot));
+        let old = entries.get(&fd).map(|slot| self.descriptor(slot));
         let slot = Slot::from_descriptor(&descriptor);
-        let mut state = self.0.borrow_mut();
-        if matches!(descriptor.open, OpenHandle::Owner(_)) {
-            state.entries.insert(fd, descriptor);
-        } else {
-            state.entries.remove(&fd);
-        }
         entries.insert(fd, slot);
         self.1.changed(entries);
         old
     }
     pub(super) fn remove(&mut self, fd: &u32) -> Option<Descriptor> {
         let mut entries = self.1 .0.entries.lock().unwrap();
-        let descriptor = entries.get(fd).map(|slot| self.descriptor(*fd, slot))?;
+        let descriptor = entries.get(fd).map(|slot| self.descriptor(slot))?;
         entries.remove(fd);
-        self.0.borrow_mut().entries.remove(fd);
         self.1.changed(&mut entries);
         Some(descriptor)
     }
@@ -1041,19 +1049,18 @@ impl DescriptorTable {
         allow: impl FnOnce(&Descriptor) -> bool,
     ) -> Result<Option<Descriptor>> {
         let mut entries = self.1 .0.entries.lock().unwrap();
-        let descriptor = self.descriptor(fd, entries.get(&fd).ok_or(Errno(9))?);
+        let descriptor = self.descriptor(entries.get(&fd).ok_or(Errno(9))?);
         descriptor.ready()?;
         if !allow(&descriptor) {
             return Ok(None);
         }
         entries.remove(&fd);
-        self.0.borrow_mut().entries.remove(&fd);
         self.1.changed(&mut entries);
         Ok(Some(descriptor))
     }
     pub(super) fn duplicate(&mut self, old: u32, min: u32, cloexec: bool) -> Result<u32> {
         let mut entries = self.1 .0.entries.lock().unwrap();
-        let mut descriptor = self.descriptor(old, entries.get(&old).ok_or(Errno(9))?);
+        let mut descriptor = self.descriptor(entries.get(&old).ok_or(Errno(9))?);
         descriptor.ready()?;
         if min >= MAX_FDS {
             return Err(Errno(22));
@@ -1081,13 +1088,13 @@ impl DescriptorTable {
             return Err(Errno(9));
         }
         let mut entries = self.1 .0.entries.lock().unwrap();
-        let mut descriptor = self.descriptor(old, entries.get(&old).ok_or(Errno(9))?);
+        let mut descriptor = self.descriptor(entries.get(&old).ok_or(Errno(9))?);
         descriptor.ready()?;
         if entries.reserved.contains(&new) {
             return Err(Errno(16));
         }
         if let Some(target) = entries.get(&new) {
-            self.descriptor(new, target).ready()?;
+            self.descriptor(target).ready()?;
         }
         descriptor.cloexec = (flags & O_CLOEXEC != 0).into();
         Ok(self.install(new, descriptor, &mut entries))
@@ -1096,20 +1103,18 @@ impl DescriptorTable {
         let mut entries = self.1 .0.entries.lock().unwrap();
         let descriptors = entries
             .iter()
-            .map(|(&fd, slot)| (fd, self.descriptor(fd, slot)))
+            .map(|(&fd, slot)| (fd, self.descriptor(slot)))
             .collect();
         if !entries.is_empty() {
             self.1.changed(&mut entries);
         }
         entries.clear();
-        self.0.borrow_mut().entries.clear();
         descriptors
     }
 }
 impl Drop for DescriptorTable {
     fn drop(&mut self) {
         self.2.retire_inner(None);
-        self.retire_owner_controls(None);
     }
 }
 impl TableState {
@@ -1131,49 +1136,55 @@ impl TableState {
         }
     }
 }
-impl Clone for DescriptorTable {
-    fn clone(&self) -> Self {
-        let source = self.entries();
-        let free = source.membership.free.clone();
-        let mut owners = BTreeMap::new();
-        let entries = source
+impl SharedFiles {
+    /// Copy files_struct membership on the caller. Original descriptions,
+    /// including cold controls, retain their own lifetime; CLOEXEC is private.
+    /// In-flight numeric reservations are not open descriptors in the new table.
+    pub fn fork(&self) -> (Self, FileTableOwner) {
+        let source = self.0.entries.lock().unwrap();
+        let mut free = source.free.clone();
+        for fd in &source.reserved {
+            free.release(*fd);
+        }
+        let slots = source
             .iter()
-            .map(|(&fd, entry)| {
-                let mut descriptor = entry.owned();
-                descriptor.cloexec = descriptor.cloexec.fork();
-                let slot = Slot::from_descriptor(&descriptor);
-                if matches!(descriptor.open, OpenHandle::Owner(_)) {
-                    owners.insert(fd, descriptor);
-                }
-                (fd, slot)
+            .map(|(&fd, slot)| {
+                let mut copy = slot.clone();
+                copy.cloexec = slot.cloexec.fork();
+                (fd, copy)
             })
             .collect();
         drop(source);
-        // Resource identities are unchanged by fork. Reuse prepared owner
-        // capabilities/masks, but bind live lookups to each new membership.
-        // Per-descriptor metadata also gets a new ownership domain.
-        let files = SharedFiles(
+        let files = Self(
             Arc::new(Membership {
-                local_ownership: self.1 .0.local_ownership.clone(),
+                local_ownership: self.0.local_ownership.clone(),
                 entries: Mutex::new(MembershipEntries {
-                    slots: entries,
+                    slots,
                     free,
                     reserved: Default::default(),
                 }),
                 revision: AtomicU64::new(0),
                 owners: AtomicUsize::new(1),
             }),
-            Arc::new(std::sync::atomic::AtomicU32::new(self.1.descriptor_limit())),
+            self.1.clone(),
         );
+        let owner = FileTableOwner::initial(&files);
+        (files, owner)
+    }
+}
+impl Clone for DescriptorTable {
+    fn clone(&self) -> Self {
+        let (files, owner) = self.1.copy_limit().fork();
+        // Resource identities are unchanged by fork. Reuse prepared capability
+        // caches, while binding live lookups and CLOEXEC to the new membership.
         Self(
             Rc::new(RefCell::new(TableState {
-                entries: owners,
                 observed: 0,
                 identity: self.identity(),
                 metadata: Rc::default(),
             })),
-            files.clone(),
-            FileTableOwner::initial(&files),
+            files,
+            owner,
         )
     }
 }
@@ -1181,6 +1192,52 @@ impl Clone for DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_fork_retains_control_identity_and_skips_unpublished_reservations() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<OpenHandle>();
+        send_sync::<SharedFiles>();
+        let mut v = Vfs::default();
+        let epoll = v.epoll_create(O_CLOEXEC).unwrap();
+        let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
+        v.epoll_ctl(epoll, 1, reader, 1, 123).unwrap();
+        let control = match v.descriptor(epoll).unwrap().open {
+            OpenHandle::Owner(control) => Arc::downgrade(&control),
+            _ => panic!("complete epoll control"),
+        };
+        let files = v.shared_files();
+        let reservation = files.reserve().unwrap();
+        let reserved = reservation.fd;
+        let (copy, owner) = std::thread::spawn(move || files.fork()).join().unwrap();
+        assert_eq!(copy.reserve().unwrap().fd, reserved);
+        let mut child = Vfs {
+            fds: DescriptorTable(Rc::default(), copy.clone(), owner),
+            ..Vfs::default()
+        };
+        assert_eq!(child.flags(epoll).unwrap() & O_CLOEXEC, O_CLOEXEC);
+        child
+            .fds
+            .membership()
+            .cloexec_range(reader, reader)
+            .unwrap();
+        assert_eq!(v.flags(reader).unwrap() & O_CLOEXEC, 0);
+        v.close_all();
+        drop(v);
+        assert!(control.upgrade().is_some());
+        child.write(writer, b"x").unwrap();
+        assert_eq!(
+            child.epoll_wait(epoll, 8, |_, _| Ok(None)).unwrap(),
+            vec![(1, 123)]
+        );
+        let child_owner = child.file_table_owner();
+        std::thread::spawn(move || child_owner.retire(1))
+            .join()
+            .unwrap();
+        assert!(control.upgrade().is_none());
+        assert!(matches!(copy.lookup(reader), Some(Err(Errno(9)))));
+        drop(reservation);
+    }
+
     #[test]
     fn source_task_retires_real_membership_before_owner_projection_collection() {
         let mut v = Vfs::default();
@@ -1211,13 +1268,7 @@ mod tests {
             .join()
             .unwrap()
             .unwrap();
-        assert_eq!(
-            result,
-            FileTableRetirement {
-                last_owner: true,
-                owner_controls: 0
-            }
-        );
+        assert_eq!(result, FileTableRetirement { last_owner: true });
         assert!(matches!(files.lookup(writer), Some(Err(Errno(9)))));
         assert_eq!(
             accepted.read(1).unwrap(),
@@ -1254,7 +1305,7 @@ mod tests {
             .join()
             .unwrap()
             .unwrap();
-        assert_eq!(result.owner_controls, 0);
+        assert!(result.last_owner);
         assert!(identity.upgrade().is_none());
         assert_eq!(v.flags(alias), Err(Errno(9)));
     }
@@ -1340,12 +1391,12 @@ mod tests {
         );
     }
     #[test]
-    fn excluded_control_retirement_keeps_an_explicit_owner_destructor_boundary() {
+    fn control_retirement_releases_original_object_on_the_source() {
         let mut v = Vfs::default();
         let epoll = v.epoll_create(0).unwrap();
         let open = Arc::downgrade(&v.descriptor(epoll).unwrap().open.borrow().shared);
         let control = match v.descriptor(epoll).unwrap().open {
-            OpenHandle::Owner(control) => Rc::downgrade(&control),
+            OpenHandle::Owner(control) => Arc::downgrade(&control),
             _ => panic!("legacy control must retain its original owner projection"),
         };
         let mut epoch = crate::FileEpoch::default();
@@ -1357,18 +1408,12 @@ mod tests {
             .join()
             .unwrap()
             .unwrap();
-        assert_eq!(
-            result,
-            FileTableRetirement {
-                last_owner: true,
-                owner_controls: 1
-            }
-        );
-        assert!(open.upgrade().is_some());
-        assert!(control.upgrade().is_some());
+        assert_eq!(result, FileTableRetirement { last_owner: true });
+        assert!(open.upgrade().is_none());
+        assert!(control.upgrade().is_none());
         assert!(matches!(files.lookup(epoll), Some(Err(Errno(9)))));
-        // Cold ownership, not a whole-cohort join: captured source capabilities
-        // remain live while the real private Rc control is destroyed here.
+        // Execution observations may retain shared poll resources, never the
+        // complete control. Collection is only the task projection cleanup.
         v.collect_retired_descriptors();
         assert!(control.upgrade().is_none());
         drop((captured, bytes));

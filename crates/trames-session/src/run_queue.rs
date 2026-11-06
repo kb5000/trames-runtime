@@ -24,6 +24,7 @@ pub(super) enum WaitState {
     Signal(Arc<SignalWait>),
     Child(Arc<ChildWait>),
     Completion(Arc<CompletionWait>),
+    Namespace(Arc<NamespaceWait>),
     Futex {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
@@ -32,6 +33,49 @@ pub(super) enum WaitState {
         deadline: Instant,
         remaining: u64,
     },
+}
+/// One accepted namespace operation, including its retained target and state.
+/// The mutex protects transfer between a parked job and its next executor.
+/// It never serializes different tasks or ordinary syscalls.
+pub(super) struct NamespaceWait {
+    work: Mutex<Option<trames_vfs::TaskNamespaceWork>>,
+    subscription: Mutex<Option<trames_vfs::IoSubscription>>,
+}
+impl NamespaceWait {
+    pub fn new(work: trames_vfs::TaskNamespaceWork) -> Arc<Self> {
+        Arc::new(Self {
+            work: Mutex::new(Some(work)),
+            subscription: Mutex::default(),
+        })
+    }
+    pub fn ready(&self) -> bool {
+        self.work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|w| w.ready())
+    }
+    pub fn bind(&self, signal: &Arc<trames_vfs::IoSignal>) {
+        *self.subscription.lock().unwrap() = self
+            .work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.subscribe(signal));
+    }
+    pub fn run(&self) -> Option<(trames_vfs::TaskNamespaces, Result<u64, trames_vfs::Errno>)> {
+        let work = self.work.lock().unwrap().take()?;
+        match work.run() {
+            trames_vfs::TaskNamespaceAttempt::Complete(state, result) => {
+                self.subscription.lock().unwrap().take();
+                Some((state, result))
+            }
+            trames_vfs::TaskNamespaceAttempt::Waiting(work) => {
+                *self.work.lock().unwrap() = Some(work);
+                None
+            }
+        }
+    }
 }
 pub(super) struct CompletionWait {
     pub release: Arc<trames_kernel::completion::Completion>,
@@ -92,7 +136,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
-            Self::OwnerEvent | Self::Child(_) | Self::Completion(_) => None,
+            Self::OwnerEvent | Self::Child(_) | Self::Completion(_) | Self::Namespace(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
@@ -340,7 +384,8 @@ impl<C: Cpu> Job<C> {
             return None;
         }
         Some(
-            matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
+            matches!(self.waiting, Some(WaitState::Namespace(_)))
+                || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
                 || self.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -405,11 +450,15 @@ impl<C: Cpu> Job<C> {
                     .gpu_pending
                     .as_ref()
                     .is_some_and(|g| g.compile.is_some() && !g.waiting())
+                || matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
                 || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished())
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
                         && io.signal.ready()
                 });
+        }
+        if matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready()) {
+            return true;
         }
         if let Some(WaitState::Completion(wait)) = &self.waiting {
             if wait.release.finished() {
@@ -439,7 +488,8 @@ impl<C: Cpu> Job<C> {
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
+                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_)))
+                            || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
                                 .retry
@@ -830,6 +880,9 @@ impl<C: Cpu> Epoch<C> {
             }
             if let Some(WaitState::Completion(wait)) = &job.waiting {
                 wait.bind(&snapshot.io_signals, &signal);
+            }
+            if let Some(WaitState::Namespace(wait)) = &job.waiting {
+                wait.bind(&signal);
             }
             snapshot.io_wake = Some(signal);
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);

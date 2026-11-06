@@ -12,7 +12,7 @@ mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
 mod hostfs;
 use fs_context::FsContext;
-pub use fs_context::Umask;
+pub use fs_context::{FsOwner, Umask};
 use fs_data::{FsBorrow, FsHandle};
 mod async_io;
 mod credentials;
@@ -98,6 +98,11 @@ pub use locks::{
     ProcessRecordLocks, RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER,
 };
 mod linux_namespace;
+mod task_namespace;
+pub use task_namespace::{
+    TaskNamespaceAttempt, TaskNamespaceOwnerAttempt, TaskNamespaceResources, TaskNamespaceWork,
+    TaskNamespaces,
+};
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, CLONE_NEWPID};
 mod namespace;
@@ -133,7 +138,7 @@ use std::{
     cell::{Cell, OnceCell, RefCell},
     collections::{BTreeMap, VecDeque},
     fmt,
-    rc::{Rc, Weak},
+    rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -714,6 +719,7 @@ impl ProcRefresh {
 
 pub struct Vfs {
     signal_reader: RefCell<Option<Arc<dyn SignalReader>>>,
+    task_namespace_publication: OnceCell<Arc<task_namespace::Publication>>,
     query: Option<path_queries::Authority>,
     network: trames_net::Network,
     native_services: Arc<SharedCell<Option<Arc<ipc::NativeServices>>>>,
@@ -777,7 +783,9 @@ impl Vfs {
         self.fds.share_limit(&other.fds);
     }
     pub fn shared_files(&self) -> SharedFiles {
-        self.fds.worker_membership()
+        self.query
+            .as_ref()
+            .map_or_else(|| self.fds.worker_membership(), |q| q.files.clone())
     }
     /// Clone task context while choosing the Linux FD ownership domain.
     /// CLONE_FILES never allocates a temporary private FD map or flag cells.
@@ -787,6 +795,7 @@ impl Vfs {
     pub fn clone_with_resources(&self, shared_files: bool, shared_fs: bool) -> Self {
         Self {
             signal_reader: RefCell::new(self.signal_reader.borrow().clone()),
+            task_namespace_publication: OnceCell::new(),
             query: self.query.clone(),
             network: self.network.clone(),
             native_services: self.native_services.clone(),
@@ -846,6 +855,7 @@ impl Vfs {
         context.paths.registry = mount_registry.clone();
         Self {
             signal_reader: RefCell::new(None),
+            task_namespace_publication: OnceCell::new(),
             query: None,
             network,
             native_services: Arc::default(),
@@ -2681,26 +2691,11 @@ impl Vfs {
         self.reap_detached_mounts();
     }
     pub fn close_range(&mut self, first: u32, last: u32, flags: u32) -> Result<()> {
-        if first > last || flags & !6 != 0 {
-            return Err(Errno(22));
-        }
-        // The scheduler detaches CLONE_FILES views before UNSHARE reaches here.
-        if flags & 4 != 0 {
-            return fd_status::mark_cloexec_range(
-                first,
-                last,
-                self.fds.entries().iter().map(|(&fd, d)| (fd, d.cloexec)),
-            );
-        }
-        let fds: Vec<_> = self
-            .fds
-            .entries()
-            .range(first..=last)
-            .map(|(&fd, _)| fd)
-            .collect();
-        for fd in fds {
-            self.close(fd)?;
-        }
+        // Task namespace transactions detach Files before UNSHARE reaches here.
+        self.shared_files()
+            .close_range(first, last, flags, self.lock_owner)?;
+        self.reap_local_rights();
+        self.reap_detached_mounts();
         Ok(())
     }
     pub fn close_all(&mut self) {
@@ -2728,7 +2723,6 @@ impl Vfs {
     /// Collect owner-local projections after the original FileTableOwner has
     /// retired. Source exits must not re-run descriptor or process-lock release.
     pub fn collect_retired_descriptors(&mut self) {
-        self.fds.retire_owner_controls(Some(self.lock_owner));
         self.detach_file_table();
         self.reap_local_rights();
         self.reap_detached_mounts();

@@ -746,3 +746,58 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
     files.finish();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn namespace_switch_preserves_accepted_sqe_context_and_refreshes_new_submissions() {
+    let (mut l, mut m, fd, r) = setup(16);
+    l.vfs.mkdir_at(-100, b"/old", 0o755).unwrap();
+    l.vfs.mkdir_at(-100, b"/new", 0o755).unwrap();
+    l.vfs.chdir(b"/old").unwrap();
+    let [reader, writer] = l.vfs.pipe(0).unwrap();
+    let mut peer = l.vfs.clone_with_resources(true, true);
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut d = direct(&l, &m, &mut UringEpoch::default(), &caps);
+    let t = target();
+    m.write(0x2100, b"accepted\0").unwrap();
+    add(&mut m, &r, scalar(22, reader, 0x2200, 1, 1));
+    let mut open = scalar(18, (-100i32) as u32, 0x2100, 0o600, 2);
+    open[1] = 2; // IO_DRAIN: preserve imported path and fs until read completes.
+    open[28..32].copy_from_slice(&0x42u32.to_le_bytes());
+    add(&mut m, &r, open);
+    assert!(matches!(
+        enter(&d, fd, 2, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(2))
+    ));
+    let actor = l.uring_actor_root().get().unwrap().clone();
+    let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+    assert!(background.progress(&mut m));
+    let trames_vfs::TaskNamespaceAttempt::Complete(state, result) =
+        l.vfs.task_namespaces().unshare(0x600, true).run()
+    else {
+        panic!("uncontended Files/fs");
+    };
+    assert_eq!(result, Ok(0));
+    d.refresh_namespaces(state.resources());
+    l.vfs.adopt_task_namespaces(state);
+    l.vfs.chdir(b"/new").unwrap();
+    assert!(Arc::ptr_eq(&actor, l.uring_actor_root().get().unwrap()));
+    m.write(0x2100, b"fresh\0").unwrap();
+    // Original accepted request must not re-read this changed guest pointer.
+    peer.write(writer, b"x").unwrap();
+    assert!(background.progress(&mut m));
+    assert_eq!(cq(&mut m, &r), (1, 1));
+    let (tag, old_fd) = cq(&mut m, &r);
+    assert_eq!(tag, 2);
+    assert!(old_fd >= 0);
+    assert!(peer.stat_at(-100, b"/old/accepted").is_ok());
+    assert!(l.vfs.stat_at(-100, b"/new/accepted").is_err());
+    assert_eq!(l.vfs.flags(old_fd as u32), Err(Errno(9)));
+    open[1] = 0;
+    open[32..40].copy_from_slice(&3u64.to_le_bytes());
+    let new_fd = submit(&d, &mut m, fd, &r, open, &t);
+    assert!(new_fd >= 0);
+    assert!(l.vfs.flags(new_fd as u32).is_ok());
+    assert!(l.vfs.stat_at(-100, b"/new/fresh").is_ok());
+    assert!(peer.stat_at(-100, b"/old/fresh").is_err());
+}

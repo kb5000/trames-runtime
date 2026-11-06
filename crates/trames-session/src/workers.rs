@@ -686,7 +686,7 @@ impl<C: Cpu> Starter<C> {
                                         snapshot.io_signals.lifecycle().request_exit(sig as i32);
                                         continue;
                                     }
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -699,7 +699,7 @@ impl<C: Cpu> Starter<C> {
                                         }
                                         continue;
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -741,6 +741,17 @@ impl<C: Cpu> Starter<C> {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(crate::run_queue::WaitState::Namespace(wait)) = &job.waiting {
+                                if wait.ready() {
+                                    if let Some((state, result)) = wait.run() {
+                                        work.finish_namespaces(state, result);
+                                        job.waiting = None;
+                                        continue;
+                                    }
+                                }
+                                maintenance = true;
+                                break SliceOutcome::Yield { instructions: 0 };
                             }
                             if work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
                                 if job.hardware_wait.as_ref().is_some_and(|w|w.ready()) {job.hardware_wait=None;}
@@ -966,6 +977,30 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             if matches!(result, SliceOutcome::Syscall { .. }) {
                                 work.cpu.clear_exclusive();
                                 if work.syscalls.as_ref().is_some_and(|s| s.owner_syscalls) { break result; }
+                                if (matches!(work.cpu.x(8) as u32, 97 | 268) || work.cpu.x(8) as u32 == 436 && work.cpu.x(2) as u32 & 2 != 0)
+                                    && work.syscalls.as_ref().is_some_and(|s| s.namespaces.is_some()) {
+                                    let number = work.cpu.x(8) as u32;
+                                    let args = std::array::from_fn(|i| work.cpu.x(i));
+                                    let snapshot = work.syscalls.as_ref().unwrap();
+                                    let began = snapshot.profile.then(Instant::now);
+                                    let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
+                                    if !entry.allowed() { job.seccomp_entry = Some(entry); break result; }
+                                    let attempt = work.namespace_work(number, args).run();
+                                    if let Some(began) = began { syscall_time += began.elapsed(); }
+                                    syscalls += 1;
+                                    match attempt {
+                                        trames_vfs::TaskNamespaceAttempt::Complete(state, result) => {
+                                            work.finish_namespaces(state, result);
+                                            continue;
+                                        }
+                                        trames_vfs::TaskNamespaceAttempt::Waiting(pending) => {
+                                            let wait = crate::run_queue::NamespaceWait::new(pending);
+                                            if let Some(signal) = work.syscalls.as_ref().and_then(|s| s.io_wake.as_ref()) { wait.bind(signal); }
+                                            parked = Some(crate::run_queue::WaitState::Namespace(wait));
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
+                                    }
+                                }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
                                     if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { syscalls += 1; continue; }
                                     let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
@@ -979,7 +1014,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             || snapshot.direct.supports_local_message(work.cpu.x(8) as u32, work.cpu.x(0) as u32)
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_epoll_control(work.cpu.x(8) as u32)
-                                            || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115)
+                                            || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115 | 436)
                                             || work.cpu.x(8) as u32 == 25
                                                 && matches!(work.cpu.x(1), 0 | 1030))
                                 }) {
@@ -1966,7 +2001,9 @@ mod tests {
             owner_syscalls: false,
             vfork_release: None,
             native_space: None,
+            namespaces: None,
             exit_files: None,
+            exit_context: None,
             children: Default::default(),
             limits: None,
             timers: None,
@@ -2242,6 +2279,8 @@ mod tests {
                 snapshot.io_signals.bind_thread_addresses(&addresses);
                 let original = snapshot.io_signals.clone();
                 let mut vfs = trames_vfs::Vfs::default();
+                let fs_peer = vfs.clone_with_resources(false, true);
+                assert!(fs_peer.context_shared());
                 let [reader, writer] = vfs.pipe(trames_vfs::O_NONBLOCK).unwrap();
                 let accepted = vfs
                     .shared_files()
@@ -2260,6 +2299,7 @@ mod tests {
                 space.with(|resources| resources.gpu = Some(context));
                 snapshot.native_space = Some(space.clone());
                 snapshot.exit_files = Some(vfs.file_table_owner());
+                snapshot.exit_context = vfs.context_owner();
                 caller.syscalls = Some(snapshot);
                 epoch.add(crate::run_queue::Job::new(
                     caller,
@@ -2302,6 +2342,10 @@ mod tests {
                 let mut rest = epoch.drain();
                 let completed = returned.or_else(|| rest.pop()).unwrap();
                 assert!(rest.is_empty(), "accepted CPU was returned twice");
+                assert!(
+                    !fs_peer.context_shared(),
+                    "source exit retires fs membership before collection"
+                );
                 vfs.collect_retired_descriptors();
                 original.finish_exit(30);
                 assert_eq!(completed.thread_exit, Some(23 << 8));

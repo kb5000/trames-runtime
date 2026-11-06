@@ -92,6 +92,7 @@ enum State {
     Sleep(Instant, u64),
     Suspend(u64),
     Completion(Arc<trames_kernel::completion::Completion>),
+    Namespace(Arc<crate::run_queue::NamespaceWait>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -155,8 +156,10 @@ impl<C: Cpu> Process<C> {
         matches!(self.state, State::Ready) && !self.stopped()
     }
     fn stop_held(&self) -> bool {
-        matches!(self.state, State::Gpu { .. } | State::Blocked(2, _))
-            || matches!(&self.state, State::Completion(release) if !release.finished())
+        matches!(
+            self.state,
+            State::Gpu { .. } | State::Blocked(2, _) | State::Namespace(_)
+        ) || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.file_checkpoint.is_some()
             || self
                 .retained_file
@@ -178,6 +181,7 @@ impl<C: Cpu> Process<C> {
                     | State::Sigwait { .. }
                     | State::Suspend(_)
                     | State::Completion(_)
+                    | State::Namespace(_)
                     | State::Blocked(95 | 260, _)
             ) || self.worker_io_candidate(id)
                 || self.worker_gpu_candidate())
@@ -270,6 +274,9 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
+        if matches!(self.state, State::Namespace(_)) {
+            return !self.linux.trace;
+        }
         if !matches!(self.state, State::Blocked(..)) {
             return false;
         }
@@ -1381,6 +1388,7 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn close_exit_files(&self, p: &mut Process<C>) {
+        p.linux.vfs.sync_task_namespaces();
         p.linux.executable_file = None;
         p.space.retire();
         p.linux.vfs.set_lock_owner(p.tgid);
@@ -1388,6 +1396,7 @@ impl<C: Cpu> Kernel<C> {
             p.linux.vfs.release_process_locks();
         }
         p.linux.vfs.release_descriptors();
+        p.linux.vfs.retire_context();
     }
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         self.children_dirty.set(true);
@@ -1793,6 +1802,9 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         }
         let action = p.signals.actions.get(sig as usize);
+        if action.handler > 1 && matches!(p.state, State::Namespace(_)) {
+            return Ok(false);
+        }
         // Submitted regular-file work is not restarted from a guest pointer.
         // Caught signals wait for its accepted result/copyout, like ordinary
         // non-interruptible disk I/O. KILL/STOP keep their existing disposition.
@@ -2169,74 +2181,34 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(None)
             }
-            97 => {
-                const ALLOWED: u64 = trames_vfs::CLONE_NEWUTS
-                    | trames_vfs::CLONE_NEWNS
-                    | trames_vfs::CLONE_NEWPID
-                    | trames_vfs::CLONE_NEWNET
-                    | trames_vfs::CLONE_NEWIPC
-                    | trames_vfs::CLONE_NEWCGROUP
-                    | 0x200
-                    | 0x400;
-                if a[0] & !ALLOWED != 0 {
-                    return Err(Errno(22));
+            97 | 268 | 436 => {
+                let attempt = if number == 97 {
+                    let allowed = pid == p.tgid
+                        && p.signals
+                            .io
+                            .lifecycle()
+                            .members()
+                            .iter()
+                            .all(|(other, _)| *other == pid);
+                    p.linux
+                        .vfs
+                        .task_namespaces()
+                        .unshare(a[0], allowed)
+                        .run_owner(&mut p.linux.vfs)
+                } else if number == 436 {
+                    p.linux
+                        .vfs
+                        .close_range_task(a[0] as u32, a[1] as u32, a[2] as u32)
+                } else {
+                    p.linux.vfs.setns_task(a[0] as u32, a[1])
+                };
+                match attempt {
+                    trames_vfs::TaskNamespaceOwnerAttempt::Complete(result) => result.map(Some),
+                    trames_vfs::TaskNamespaceOwnerAttempt::Waiting(work) => {
+                        p.state = State::Namespace(crate::run_queue::NamespaceWait::new(*work));
+                        Ok(None)
+                    }
                 }
-                if a[0] & trames_vfs::CLONE_NEWPID != 0
-                    && (pid != p.tgid
-                        || self
-                            .processes
-                            .values()
-                            .any(|t| t.tgid == p.tgid && !matches!(t.state, State::Zombie(_))))
-                {
-                    return Err(Errno(22));
-                }
-                let mut view = p.linux.vfs.clone_with_resources(
-                    a[0] & 0x400 == 0,
-                    a[0] & (0x200 | trames_vfs::CLONE_NEWNS) == 0,
-                );
-                if a[0] & trames_vfs::CLONE_NEWPID != 0 {
-                    view.unshare_pid()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWUTS != 0 {
-                    view.unshare_uts()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWNS != 0 {
-                    view.unshare_mounts()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWNET != 0 {
-                    view.unshare_net()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWIPC != 0 {
-                    view.unshare_ipc()?;
-                }
-                if a[0] & trames_vfs::CLONE_NEWCGROUP != 0 {
-                    view.unshare_cgroup()?;
-                }
-                p.linux.vfs = view;
-                Ok(Some(0))
-            }
-            268 => {
-                if p.linux.vfs.namespace_type(a[0] as u32)? == Some(trames_vfs::CLONE_NEWNS)
-                    && self.processes.values().any(|other| {
-                        other.linux.vfs.shares_context_with(&p.linux.vfs)
-                            && !matches!(other.state, State::Zombie(_))
-                    })
-                {
-                    return Err(Errno(22));
-                }
-                p.linux.vfs.setns(a[0] as u32, a[1])?;
-                Ok(Some(0))
-            }
-            436 => {
-                let (first, last, flags) = (a[0] as u32, a[1] as u32, a[2] as u32);
-                if first > last || flags & !6 != 0 {
-                    return Err(Errno(22));
-                }
-                if flags & 2 != 0 {
-                    p.linux.vfs.unshare_descriptors();
-                }
-                p.linux.vfs.close_range(first, last, flags)?;
-                Ok(Some(0))
             }
             168 => {
                 if a[0] != 0 {
@@ -2841,6 +2813,7 @@ impl<C: Cpu> Kernel<C> {
         io: &mut I,
         syscall: impl FnOnce(&mut Self, u32, &mut Process<C>, &mut I) -> Result<Option<u64>, Errno>,
     ) {
+        p.linux.vfs.sync_task_namespaces();
         if p.byte_wait.as_ref().is_some_and(|wait| {
             !wait.signal.ready()
                 && !wait.external_wait()
@@ -4304,6 +4277,7 @@ impl<C: Cpu> Kernel<C> {
                         | State::Suspend(_)
                         | State::Blocked(95 | 260, _)
                         | State::Completion(_)
+                        | State::Namespace(_)
                 ) && !p.linux.trace)
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
@@ -4688,6 +4662,7 @@ impl<C: Cpu> Kernel<C> {
             .processes
             .get_mut(&done.pid)
             .expect("dispatched process");
+        p.linux.vfs.sync_task_namespaces();
         p.cpu = done.cpu;
         p.signals.finish_io();
         if let Some(entry) = done.seccomp_entry {
@@ -4762,6 +4737,7 @@ impl<C: Cpu> Kernel<C> {
                 crate::run_queue::WaitState::Child(wait) => {
                     State::Blocked(wait.request.number, wait.request.args)
                 }
+                crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
                 crate::run_queue::WaitState::Completion(wait) => {
                     State::Completion(wait.release.clone())
                 }
