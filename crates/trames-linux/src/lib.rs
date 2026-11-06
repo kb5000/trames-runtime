@@ -8,6 +8,8 @@ pub mod image;
 pub mod vdso;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
 mod bpf;
+mod syscall_diagnostics;
+pub use syscall_diagnostics::SyscallDiagnostics;
 mod credentials;
 pub use credentials::{credential_call, credential_entry, credential_mutation, CredentialResult};
 mod descriptor_create;

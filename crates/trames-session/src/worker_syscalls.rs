@@ -82,6 +82,7 @@ impl ExitResources<'_> {
 
 pub(super) struct Snapshot {
     pub owner_syscalls: bool,
+    pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
     pub namespaces: Option<trames_vfs::TaskNamespaces>,
@@ -462,7 +463,17 @@ pub(super) fn futex_queue(
     }
 }
 
+fn unknown_syscall<C: Cpu>(number: u32, args: [u64; 6]) -> bool {
+    !trames_linux::DirectSyscalls::aio_call(number)
+        && !trames_linux::Linux::has_syscall(number, args)
+        && !crate::process::Kernel::<C>::has_session_syscall(number, args)
+}
+
 impl Snapshot {
+    fn unknown_entry<C: Cpu>(&self, cpu: &C) -> bool {
+        self.diagnostics.is_some()
+            && unknown_syscall::<C>(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))
+    }
     pub fn begin_child_wait(
         &self,
         request: trames_kernel::children::Wait,
@@ -788,6 +799,7 @@ impl Snapshot {
             && !service_candidate(cpu, self)
             && !self.futex_queue(cpu)
             && !self.futex_wait(cpu)
+            && !self.unknown_entry(cpu)
         {
             return false;
         }
@@ -1025,6 +1037,11 @@ impl Snapshot {
                 }
                 Ok(0)
             })(),
+            _ if self.unknown_entry(cpu) => Ok(self.diagnostics.as_ref()?.unsupported(
+                cpu.x(8) as u32,
+                cpu.pc(),
+                std::array::from_fn(|i| cpu.x(i)),
+            )),
             _ => return None,
         };
         Some(result.unwrap_or_else(|error| 0u64.wrapping_sub(error.0 as u64)))
@@ -1037,6 +1054,21 @@ mod tests {
 
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn recognized_entries_and_legacy_diagnostic_embeddings_keep_their_actual_handlers() {
+        assert!(unknown_syscall::<Cpu>(99, [0; 6]));
+        for number in [
+            0, 1, 4, 292, 13, 31, 56, 93, 94, 98, 113, 142, 167, 179, 220, 221, 236, 268, 277, 280,
+            283, 425, 426, 427, 452,
+        ] {
+            assert!(
+                !unknown_syscall::<Cpu>(number, [0; 6]),
+                "recognized syscall {number}"
+            );
+        }
+        // AArch64 dispatch intentionally truncates x8 to its low 32 bits.
+        assert!(!unknown_syscall::<Cpu>(((1u64 << 32) | 172) as u32, [0; 6]));
+    }
     #[test]
     fn queue_abi_checks_before_effects_and_owner_and_view_share_the_same_implementation() {
         fn check(memory: &impl CpuMemory) {
@@ -1126,6 +1158,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1157,6 +1190,9 @@ mod tests {
         };
         let mut view = memory.parallel_view(&mut Default::default()).unwrap();
         let mut cpu = Cpu::new(0x4004, 0);
+        cpu.set_x(8, 99);
+        assert!(!snapshot.unknown_entry(&cpu));
+        assert_eq!(snapshot.invoke(&cpu, &mut view), None);
         cpu.set_x(8, 98);
         cpu.set_x(0, 0x1004);
         cpu.set_x(1, 129);
@@ -1262,6 +1298,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1328,6 +1365,7 @@ mod tests {
             .unwrap();
         let mut snapshot = Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1438,6 +1476,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -1512,6 +1551,7 @@ mod tests {
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,

@@ -1060,10 +1060,12 @@ mod tests {
     }
     #[test]
     fn cohort_return_profile_excludes_local_calls_and_disabled_profiling() {
-        for (profile, number, returned) in [
-            (false, 0xff00, false),
-            (true, 172, false),
-            (true, 0xff00, true),
+        for (profile, number, returned, trace) in [
+            (false, 0xff00, false, false),
+            (true, 172, false, false),
+            (true, 0xff00, false, false),
+            (true, 283, true, false),
+            (true, 0xff00, true, true),
         ] {
             let mut k = super::super::tests::kernel();
             k.cpu_count = 2;
@@ -1073,6 +1075,7 @@ mod tests {
             for id in 1..=2 {
                 let mut p = super::super::tests::process();
                 p.tgid = id;
+                p.linux.trace = trace;
                 p.vm_id = id as u64;
                 p.signals.io.scheduling.set_affinity(1 << (id - 1));
                 code(&mut p, &[0xd4000001, 0x17ffffff]);

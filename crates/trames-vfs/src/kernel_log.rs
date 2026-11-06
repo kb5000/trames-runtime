@@ -19,6 +19,19 @@ pub struct KernelLogAccess {
     authorized: bool,
 }
 impl KernelLogAccess {
+    /// Kernel-produced diagnostics use the original log independently of the
+    /// caller's permission to read it through syslog or /dev/kmsg.
+    pub fn log_syscall(
+        &self,
+        pid: u32,
+        number: u64,
+        pc: u64,
+        args: [u64; 6],
+        errno: u32,
+        comm: &[u8],
+    ) {
+        self.log.log_syscall(pid, number, pc, args, errno, comm);
+    }
     pub fn syslog(&self, action: u32, count: usize) -> Result<Vec<u8>> {
         self.log.syslog(action, count, self.authorized)
     }
@@ -30,6 +43,19 @@ impl KernelLogAccess {
     }
 }
 impl KernelLog {
+    fn log_syscall(&self, pid: u32, number: u64, pc: u64, args: [u64; 6], errno: u32, comm: &[u8]) {
+        self.append(
+            4,
+            &format!(
+                "pid={pid} syscall={}({}) pc={:#x} args={:x?} unsupported errno={errno} comm={:?}",
+                number,
+                syscall_names::name(number),
+                pc,
+                args,
+                String::from_utf8_lossy(&comm[..comm.len().min(15)])
+            ),
+        );
+    }
     pub(super) fn append(&self, priority: u32, message: &str) {
         let mut state = self.state.lock().unwrap();
         let before = state.next;
@@ -339,18 +365,8 @@ impl Vfs {
         self.kernel_log.append(priority, message);
     }
     pub fn log_syscall(&self, number: u64, pc: u64, args: [u64; 6], errno: u32, comm: &[u8]) {
-        self.log(
-            4,
-            &format!(
-                "pid={} syscall={}({}) pc={:#x} args={:x?} unsupported errno={errno} comm={:?}",
-                self.pid,
-                number,
-                syscall_names::name(number),
-                pc,
-                args,
-                String::from_utf8_lossy(&comm[..comm.len().min(15)])
-            ),
-        );
+        self.kernel_log
+            .log_syscall(self.pid, number, pc, args, errno, comm);
     }
     /// Authority is sampled only for an immutable worker epoch; credential or
     /// namespace changes still join before a replacement capability is issued.

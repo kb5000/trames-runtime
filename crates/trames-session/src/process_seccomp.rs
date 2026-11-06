@@ -819,6 +819,78 @@ impl<C: Cpu> Kernel<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    #[test]
+    fn unknown_entries_complete_on_sources_with_one_policy_decision_and_original_diagnostics() {
+        for number in [99u32, 100, 293, 0x7fff_ffff, u32::MAX] {
+            for policy in [None, Some(ALLOW), Some(0x5002a)] {
+                let mut p = super::super::tests::process();
+                let log = p.linux.vfs.kernel_log_capability();
+                p.linux.command_name = b"unknown-entry-long-name".to_vec();
+                p.linux.vfs.credentials = trames_vfs::Credentials::user(1234, 1234);
+                for (index, word) in [0xd4000001u32, 0xaa0003f3, 0x17fffffe].iter().enumerate() {
+                    p.memory
+                        .write_array(0x4000 + index as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu.set_x(8, number as u64);
+                put_args(&mut p.cpu, [u64::MAX; 6]);
+                p.signals.io.scheduling.set_affinity(3);
+                if let Some(value) = policy {
+                    p.seccomp
+                        .push(Arc::new(Filter::validate(vec![i(6, 0, 0, value)]).unwrap()));
+                }
+                let mut peer = p.fork();
+                peer.family.set_parent(1);
+                peer.cpu.set_x(8, number as u64);
+                let mut k = super::super::tests::kernel();
+                k.cpu_count = 2;
+                k.workers = crate::workers::Pool::new(2);
+                k.per_cpu = vec![Duration::ZERO; 2];
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                assert!(k
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 20_000, true)
+                    .unwrap());
+                assert!(k.syscalls > 100);
+                let expected = if policy == Some(0x5002a) {
+                    (-42i64) as u64
+                } else {
+                    (-38i64) as u64
+                };
+                for task in k.processes.values() {
+                    assert_eq!(task.cpu.x(19), expected);
+                }
+                if policy.is_some() {
+                    assert_eq!(k.processes.read(&1).seccomp.evaluations(), k.syscalls);
+                }
+                assert_eq!(k.service_requests, 0);
+                assert!(
+                    k.cohort_return_syscalls.is_empty(),
+                    "{:?}",
+                    k.cohort_return_syscalls
+                );
+                let bytes = log.syslog(3, 65536).unwrap();
+                let text = String::from_utf8(bytes).unwrap();
+                if policy == Some(0x5002a) {
+                    assert!(!text.contains("unsupported errno=38"));
+                } else {
+                    assert!(
+                        text.contains("unsupported errno=38 comm=\"unknown-entry-l\""),
+                        "{text}"
+                    );
+                    assert!(text.contains("pc=0x4000"), "{text}");
+                }
+            }
+        }
+    }
+
     fn program(memory: &mut Memory, decision: u32) {
         memory.write_array(0x1800, 4u16.to_le_bytes()).unwrap();
         memory.write_array(0x1808, 0x1900u64.to_le_bytes()).unwrap();
@@ -1913,6 +1985,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -2144,6 +2217,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -2252,6 +2326,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
+                    diagnostics: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2385,6 +2460,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
+                    diagnostics: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2504,6 +2580,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
+                    diagnostics: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -2632,6 +2709,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -3623,6 +3701,7 @@ mod tests {
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,
@@ -3927,6 +4006,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
+                    diagnostics: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,
@@ -3978,6 +4058,7 @@ mod tests {
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4038,6 +4119,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4091,6 +4173,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4154,6 +4237,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4217,6 +4301,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4282,6 +4367,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 owner_syscalls: false,
+                diagnostics: None,
                 vfork_release: None,
                 native_space: None,
                 namespaces: None,
@@ -4342,6 +4428,7 @@ mod tests {
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
                     owner_syscalls: false,
+                    diagnostics: None,
                     vfork_release: None,
                     native_space: None,
                     namespaces: None,

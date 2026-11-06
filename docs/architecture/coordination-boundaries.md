@@ -1,14 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 60, original BPF
-program administration and cgroup device-policy consumers, reviewed on 2026-11-07.
-The prior runtime baseline is `38cdbba7a1967863a77fb0e432ec59cfa46e153c`.
+This is the consolidated implementation audit through stage 61, generated syscall
+dispatch recognition and source completion of unimplemented entries, reviewed on 2026-11-07.
+The prior runtime baseline is `a1b8759dff09e2b8e1fa85607cde25e73b71544c`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 60 moves supported BPF program load, identity,
+The Kernel owner still exists. Stage 61 generates entry recognition from the actual
+Linux and session dispatch arms. Truly unimplemented syscall numbers now complete
+with the original ENOSYS diagnostic on the calling worker, after one seccomp
+decision. Known handlers, explicit tracing and legacy diagnostic-less embeddings
+retain their actual routes. Ordinary already-handled calls do not execute this
+cold classifier; AIO's pre-dispatch entry uses the same original AIO predicate.
+
+Stage 60 moves supported BPF program load, identity,
 ID reopening, device attach/replace/detach/query and their target-path dependencies
 to the calling worker. The same original registry, Files table, immutable programs
 and cgroup device graph feed source and solo execution. Verifier work runs outside
@@ -44,7 +51,7 @@ is not a claim that all coordinator work is removed.
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
-| Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
+| Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings, tracing and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
 Initial guest admission and exceptional legacy/control rescheduling still involve
@@ -1861,3 +1868,53 @@ Unchanged CPU/backend/device acceptance is reused. Physical iPad, Firefox, Docke
 and stable deployment are not claimed for this batch. Generic dispatch, actual
 shared-mm quiescence, exceptional native import, tracing/legacy resources and host
 lifecycle still remain in the inventory above.
+
+
+## 61. Generated syscall entry recognition and unimplemented completion — 2026-11-07
+
+The canonical Linux and session dispatch methods now use one shared macro that
+emits both their original match expressions and conservative entry recognition.
+Numeric arms own their entire number even when a subcommand/resource guard refuses;
+explicit dynamic arms reuse their pure ABI predicate. There is no separately
+maintained list of unsupported numbers that can silently shadow a future handler.
+The AIO wrapper before those tables is excluded with its existing `aio_call`
+predicate; new pre-dispatch families must expose and reuse their entry predicate.
+
+At the cold end of source dispatch, an entry owned by neither table nor the AIO
+wrapper returns ENOSYS without a cohort return or owner service. The lookup is not
+added to ordinary file/socket/futex/native/memory fast paths. Filtered unknown calls
+use their already captured architectural entry decision. ERRNO/TRACE/USER_NOTIF,
+TRAP and termination keep the existing seccomp handling; an allowed unknown call
+logs exactly once before completing. Explicit syscall tracing still joins.
+
+A retained diagnostic capability owns only the original session log, numeric task
+identity and bounded command name. It retains no Process/VFS/Files projection or
+mutable guest pointer. Source and solo diagnostic formatting share one function,
+including the SVC address, argument words, original PID and command truncation.
+Writing a kernel-produced diagnostic does not require the guest's permission to
+read that log; the existing log bound/rate limit and reader wakeups are unchanged.
+Changing a task name or executable still crosses its existing lifecycle boundary
+before new source work is captured. Legacy embeddings without diagnostic authority
+retain their explicit joined behavior.
+
+Macro tests cover numeric ranges, binding patterns, repeated numeric guards and
+pure dynamic predicates. Process tests cover multiple unknown numbers, invalid
+guest pointers, raw/ALLOW/ERRNO policy, exactly one decision, original unprivileged
+diagnostics, zero service/cohort returns, and the retained tracing/known-handler
+boundary. Recognition tests include pre-dispatch AIO, credentials, scheduling,
+namespace, memory, device, lifecycle and lower-32-bit syscall numbering.
+
+See [public validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-dispatch-20261107.json).
+Known excluded resource/subcommand bodies and the actual host/native/memory/tracing
+boundaries remain; this is not removal of all generic dispatch or the Kernel owner.
+
+
+Stage-61 timing interpretation: 1,000 raw/ALLOW unknown calls per thread avoid the
+repeated cohort returns, while filter-denied controls already completed locally in
+the baseline. Their short 4/12-CPU runs regress by about 0.9/3.3 ms. With 100,000
+denied calls, median wall time is about 2% higher at 4/12 CPUs and 5% at one CPU;
+all samples, including a one-CPU outlier, are retained. This does not establish
+zero overhead or identify the fixed-latency cause. No extra policy check was added
+to the early denial path, but scheduling/initial memory publication and generated
+code layout remain possible contributors requiring separate evidence. Do not
+translate the unknown-call gains into Firefox/Geekbench scores.

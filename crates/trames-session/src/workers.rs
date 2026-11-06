@@ -2191,6 +2191,7 @@ mod tests {
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,

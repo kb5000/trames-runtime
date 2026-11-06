@@ -1909,18 +1909,19 @@ impl<C: Cpu> Kernel<C> {
         }
         result
     }
-    fn syscall(
+    trames_shared::syscall_dispatch! {
+        number number, args a;
+        fn syscall(
         &mut self,
         pid: u32,
         p: &mut Process<C>,
         number: u32,
         a: [u64; 6],
         io: &mut impl GuestOutput,
-    ) -> Result<Option<u64>, Errno> {
-        if trames_linux::credential_entry(number, a) {
-            return self.credential_call(pid, p, number, a).map(Some);
-        }
-        match number {
+    ) -> Result<Option<u64>, Errno>;
+        pub(super) fn has_session_syscall;
+        {
+            @dynamic number if trames_linux::credential_entry(number, a) => self.credential_call(pid, p, number, a).map(Some),
             25 | 29
                 if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
                     || number == 29 && a[1] as u32 == 0x5452 =>
@@ -1946,7 +1947,7 @@ impl<C: Cpu> Kernel<C> {
                     flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
                 };
                 value.map(Some)
-            }
+            },
             // The joined path uses the same bounded scratch as an existing
             // service call. Keep capacity across syscalls instead of allocating
             // and zeroing a new transfer buffer for every positioned write.
@@ -1993,7 +1994,7 @@ impl<C: Cpu> Kernel<C> {
                     }
                     result => result.map(|()| Some(0)),
                 }
-            }
+            },
             426 => {
                 p.linux.set_uring_clock(self.started);
                 p.linux.set_file_executor(self.workers.file_executor());
@@ -2021,7 +2022,7 @@ impl<C: Cpu> Kernel<C> {
                     p.uring_wait = Some((submitted, ring, deadline));
                     Ok(None)
                 }
-            }
+            },
             277 => self.seccomp(p, a).map(Some),
             167 if a[0] == 21 => Ok(Some(p.seccomp.mode() as u64)),
             167 if a[0] == 22 => match a[1] {
@@ -2031,9 +2032,9 @@ impl<C: Cpu> Kernel<C> {
                 2 => self.seccomp(p, [1, 0, a[2], 0, 0, 0]).map(Some),
                 _ => Err(Errno(22)),
             },
-            number if trames_kernel::scheduling::call(number) => {
+            @dynamic number if trames_kernel::scheduling::call(number) => {
                 self.scheduling(p, number, a).map(Some)
-            }
+            },
             236 => Self::mempolicy(p, a),
             142 => self.reboot_guest(pid, p, a),
             93 | 94 => {
@@ -2043,7 +2044,7 @@ impl<C: Cpu> Kernel<C> {
                     self.exit(pid, p, (a[0] as u8 as i32) << 8);
                 }
                 Ok(None)
-            }
+            },
             97 | 268 | 436 => {
                 let attempt = if number == 97 {
                     let allowed = pid == p.tgid
@@ -2072,7 +2073,7 @@ impl<C: Cpu> Kernel<C> {
                         Ok(None)
                     }
                 }
-            }
+            },
             168 => {
                 if a[0] != 0 {
                     Linux::check(&p.memory, a[0], 4, Access::Write)?;
@@ -2091,20 +2092,20 @@ impl<C: Cpu> Kernel<C> {
                         .map_err(|_| Errno(14))?;
                 }
                 Ok(Some(0))
-            }
+            },
             172 => Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64)),
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),
             173 => Ok(Some(p.linux.vfs.visible_pid(p.family.parent()) as u64)),
             96 => {
                 p.linux.dispatch(&mut p.cpu, &mut p.memory, io);
                 Ok(Some(p.linux.vfs.visible_pid(pid) as u64))
-            }
+            },
             220 => {
                 self.reap_waited();
                 birth::Birth::capture(self).publish_family(pid, p);
                 let child = birth::Birth::capture(self).clone_task(pid, p, a)?;
                 Ok(child.publish(&self.processes.directory()))
-            }
+            },
             221 | 281 => {
                 let Some(image) = Self::prepare_exec_request(
                     p,
@@ -2122,7 +2123,7 @@ impl<C: Cpu> Kernel<C> {
                     self.backend_error = Some(format!("{error:?}"));
                 }
                 Ok(None)
-            }
+            },
             98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
             260 => self.wait(pid, p, a),
             95 => self.waitid(p, a),
@@ -2132,11 +2133,11 @@ impl<C: Cpu> Kernel<C> {
                 }
                 p.parentage.set_death_signal(a[1] as u32);
                 Ok(Some(0))
-            }
+            },
             167 if a[0] == 2 => {
                 write_u32(&mut p.memory, a[1], p.parentage.death_signal())?;
                 Ok(Some(0))
-            }
+            },
             167 if matches!(a[0], 36 | 37) => match a[0] {
                 36 => {
                     p.family.set_subreaper(a[1] != 0);
@@ -2157,7 +2158,7 @@ impl<C: Cpu> Kernel<C> {
                     p.cpu.set_sme_config(config);
                     Ok(Some(value))
                 }
-            }
+            },
             167 if !matches!(a[0], 15 | 16) => Err(Errno(22)),
             72 | 73 => self.poll(p, number, a, io),
             22 | 441 => self.epoll(p, number, a, io),
@@ -2169,7 +2170,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 p.signals.action_call(a, &mut p.memory)?;
                 Ok(Some(0))
-            }
+            },
             135 => p.signals.mask_call(a, &mut p.memory).map(Some),
             136 => p
                 .signals
@@ -2186,11 +2187,11 @@ impl<C: Cpu> Kernel<C> {
                 p.signals.set_mask(mask);
                 p.state = State::Suspend(old);
                 Ok(None)
-            }
+            },
             139 => {
                 Self::sigreturn(p)?;
                 Ok(None)
-            }
+            },
             129 => self.signal(pid, p, a[0] as i32, a[1] as u32).map(Some),
             130 => self
                 .thread_signal(pid, p, a[0] as u32, None, a[1] as u32)
@@ -2201,7 +2202,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 self.thread_signal(pid, p, a[1] as u32, Some(a[0] as u32), a[2] as u32)
                     .map(Some)
-            }
+            },
             154 => {
                 if a[1] > i32::MAX as u64 {
                     return Err(Errno(22));
@@ -2249,7 +2250,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 self.publish_io_tasks(Some((pid, p)));
                 Ok(Some(0))
-            }
+            },
             155 | 156 => {
                 let id = if a[0] == 0 {
                     p.tgid
@@ -2268,7 +2269,7 @@ impl<C: Cpu> Kernel<C> {
                         .visible_pid(if number == 155 { group } else { session })
                         as u64,
                 ))
-            }
+            },
             157 => {
                 if p.group == p.tgid || self.processes.values().any(|c| c.group == p.tgid) {
                     return Err(Errno(1));
@@ -2283,13 +2284,13 @@ impl<C: Cpu> Kernel<C> {
                 }
                 self.publish_io_tasks(Some((pid, p)));
                 Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64))
-            }
+            },
             101 | 115 => {
                 let (deadline, remaining) =
                     crate::worker_syscalls::sleep_parameters(&p.memory, number, a, self.started)?;
                 p.state = State::Sleep(deadline, remaining);
                 Ok(None)
-            }
+            },
             113 | 114 => crate::worker_syscalls::clock_with_boot(
                 &mut p.memory,
                 number,
@@ -2325,7 +2326,7 @@ impl<C: Cpu> Kernel<C> {
                 out[104..108].copy_from_slice(&1u32.to_le_bytes());
                 p.memory.write(a[0], &out).map_err(|_| Errno(14))?;
                 Ok(Some(0))
-            }
+            },
             31 => self.ioprio_get(pid, p, a[0], a[1]).map(Some),
             132 => Self::sigaltstack(p, a[0], a[1]).map(Some),
             283 => Self::membarrier(p, a[0], a[1]).map(Some),
@@ -2344,7 +2345,7 @@ impl<C: Cpu> Kernel<C> {
                 } else {
                     Ok(None)
                 }
-            }
+            },
             25 if matches!(a[1], 7 | 38) => {
                 let request = match p.record_wait.take() {
                     Some(r) => r,
@@ -2374,14 +2375,14 @@ impl<C: Cpu> Kernel<C> {
                     }
                     Err(e) => Err(e),
                 }
-            }
+            },
             63 | 64 | 65 | 66 | 29
                 if (number != 29 || a[1] as u32 != 0x5421)
                     && p.linux.vfs.fd_kind(a[0] as u32)? == FdKind::Terminal =>
             {
                 self.terminal_call(pid, p, number, a, io)
-            }
-            _ => {
+            },
+            @fallback => {
                 if number == 56 {
                     if let Some(fd) = p.pending_open {
                         if p.linux.vfs.fifo_open_ready(fd)? {
@@ -2484,6 +2485,7 @@ impl<C: Cpu> Kernel<C> {
                     Ok(Some(raw))
                 }
             }
+
         }
     }
     fn call(

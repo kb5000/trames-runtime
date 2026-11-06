@@ -1148,17 +1148,20 @@ impl Linux {
             memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
         ))
     }
-    pub(crate) fn syscall(
+    trames_shared::syscall_dispatch! {
+        number number, args a;
+        pub(crate) fn syscall(
         &mut self,
         number: u64,
         a: [u64; 6],
         memory: &mut Memory,
         io: &mut impl GuestOutput,
-    ) -> Result<u64> {
-        match number {
+    ) -> Result<u64>;
+        pub fn has_syscall;
+        {
             5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
-            }
+            },
             92 => match a[0] as u32 {
                 // Only the native AArch64 Linux execution domain exists.
                 // Query and reselect it; other personality modes stay unsupported.
@@ -1179,21 +1182,21 @@ impl Linux {
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
-            }
+            },
             71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
                 self.file_syscall(number, a, memory, io)
-            }
+            },
             279 => {
                 let name = Self::path(memory, a[0])?;
                 Ok(self.vfs.memfd_create(&name, a[1] as u32)? as u64)
-            }
+            },
             69 | 70 => self.positioned_vector(a, memory, number == 70),
             291 => self.statx(a, memory),
             436 => {
                 self.vfs
                     .close_range(a[0] as u32, a[1] as u32, a[2] as u32)?;
                 Ok(0)
-            }
+            },
             116 => crate::syslog(&self.vfs.kernel_log_capability(), a, memory),
             19 | 26 | 59 => crate::descriptor_create::call(
                 &self.vfs.descriptor_factory(),
@@ -1209,19 +1212,19 @@ impl Linux {
                 self.vfs
                     .epoll_ctl(a[0] as u32, a[1] as u32, a[2] as u32, events, data)?;
                 Ok(0)
-            }
+            },
             27 => {
                 let path = Self::path(memory, a[1])?;
                 Ok(self.vfs.inotify_add(a[0] as u32, &path, a[2] as u32)? as u64)
-            }
+            },
             28 => {
                 self.vfs.inotify_remove(a[0] as u32, a[1] as i32)?;
                 Ok(0)
-            }
+            },
             32 => {
                 self.vfs.flock(a[0] as u32, a[1] as u32)?;
                 Ok(0)
-            }
+            },
             278 => {
                 if a[2] & !3 != 0 {
                     return Err(Errno(22));
@@ -1232,7 +1235,7 @@ impl Linux {
                 super::fill_entropy(&mut bytes)?;
                 memory.write(a[0], &bytes).map_err(|_| Errno(14))?;
                 Ok(count as u64)
-            }
+            },
             198..=212 | 242 => self.network_syscall(number, a, memory),
             269 => self.send_messages(a, memory),
             65 => self.readv(a, memory, io),
@@ -1240,24 +1243,24 @@ impl Linux {
                 let path = Self::path(memory, a[0])?;
                 self.vfs.truncate_at(&path, a[1])?;
                 Ok(0)
-            }
+            },
             46 => {
                 self.vfs.truncate_fd(a[0] as u32, a[1])?;
                 Ok(0)
-            }
+            },
             47 => {
                 self.vfs.allocate_fd(a[0] as u32, a[1], a[2], a[3])?;
                 Ok(0)
-            }
+            },
             67 | 68 => self.positioned(a, memory, number == 68),
             82 | 83 => {
                 self.vfs.sync_fd(a[0] as u32, number == 83)?;
                 Ok(0)
-            }
+            },
             81 => {
                 self.vfs.sync()?;
                 Ok(0)
-            }
+            },
             23 => Ok(self.vfs.dup(a[0] as u32, 0, false)? as u64),
             24 => Ok(self.vfs.dup3(a[0] as u32, a[1] as u32, a[2] as u32)? as u64),
             63 => self.read(a, memory, io),
@@ -1269,11 +1272,11 @@ impl Linux {
                     .vfs
                     .open_at(a[0] as i32, &path, a[2] as u32, a[3] as u32)?
                     as u64)
-            }
+            },
             57 => {
                 self.vfs.close(a[0] as u32)?;
                 Ok(0)
-            }
+            },
             62 => self.fd_query(62, a, memory),
             61 => {
                 let count = a[2].min(MAX_WRITE as u64) as usize;
@@ -1282,11 +1285,11 @@ impl Linux {
                 let bytes = self.vfs.getdents(a[0] as u32, count)?;
                 memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
                 Ok(bytes.len() as u64)
-            }
+            },
             79 => {
                 let (stat, _) = self.prepare_stat(a, memory);
                 Self::finish_stat(a, memory, stat)
-            }
+            },
             80 => self.fd_query(80, a, memory),
             25 if matches!(a[1], 1 | 3) => self.fd_query(25, a, memory),
             25 => {
@@ -1336,7 +1339,7 @@ impl Linux {
                     .expect("owner lock normalization cannot defer"),
                     _ => Err(Errno(22)),
                 }
-            }
+            },
             29 => {
                 if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
                     return Err(Errno(9));
@@ -1367,7 +1370,7 @@ impl Linux {
                 } else {
                     Err(Errno(25))
                 }
-            }
+            },
             48 | 439 => {
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));
@@ -1385,7 +1388,7 @@ impl Linux {
                     flags & 0x100 != 0,
                 )?;
                 Ok(0)
-            }
+            },
             78 => {
                 if a[3] == 0 {
                     return Err(Errno(22));
@@ -1398,12 +1401,12 @@ impl Linux {
                     .write(a[2], &target[..count])
                     .map_err(|_| Errno(14))?;
                 Ok(count as u64)
-            }
+            },
             96 => {
                 // Linux records this address without touching user memory.
                 self.thread_addresses.set_clear_tid(a[0]);
                 Ok(self.vfs.visible_pid(self.vfs.process_context()) as u64)
-            }
+            },
             98 => {
                 if !a[0].is_multiple_of(4) {
                     return Err(Errno(22));
@@ -1422,7 +1425,7 @@ impl Linux {
                     }
                     _ => Err(Errno(38)),
                 }
-            }
+            },
             125 | 126 => Ok(match a[0] as u32 {
                 1 | 2 => {
                     if number == 125 {
@@ -1446,7 +1449,7 @@ impl Linux {
                     }
                 }
                 Ok(0)
-            }
+            },
             172 => Ok(1),
             173 => Ok(0),
             167 if matches!(a[0], 15 | 16) => {
@@ -1469,7 +1472,7 @@ impl Linux {
                     memory.write(a[1], &name).map_err(|_| Errno(14))?;
                 }
                 Ok(0)
-            }
+            },
             169 => {
                 if a[0] != 0 {
                     Self::check(memory, a[0], 16, Access::Write)?;
@@ -1492,8 +1495,8 @@ impl Linux {
                     memory.write(a[1], &[0; 8]).map_err(|_| Errno(14))?;
                 }
                 Ok(0)
-            }
-            number if crate::credential_entry(number as u32, a) => {
+            },
+            @dynamic number if crate::credential_entry(number as u32, a) => {
                 let dumpable = self.vfs.dumpable_state();
                 crate::credential_call(
                     &mut self.vfs.credentials,
@@ -1505,11 +1508,11 @@ impl Linux {
                     |_| Err(Errno(3)),
                 )
                 .map(|result| result.value)
-            }
+            },
             166 => {
                 let previous = self.vfs.set_umask(a[0] as u32);
                 Ok(previous as u64)
-            }
+            },
             216 => self.mremap(a, memory),
             227 => {
                 if !a[0].is_multiple_of(PAGE_SIZE) || a[2] & !7 != 0 || a[2] & 5 == 5 {
@@ -1521,7 +1524,7 @@ impl Linux {
                 let len = Self::page_length(a[1])?;
                 memory.sync_range(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
-            }
+            },
             232 => {
                 if a[1] == 0 {
                     return if a[0].is_multiple_of(PAGE_SIZE) {
@@ -1538,7 +1541,7 @@ impl Linux {
                 Self::check(memory, a[2], resident.len(), Access::Write)?;
                 memory.write(a[2], &resident).map_err(|_| Errno(14))?;
                 Ok(0)
-            }
+            },
             233 => {
                 if !a[0].is_multiple_of(PAGE_SIZE) {
                     return Err(Errno(22));
@@ -1558,14 +1561,14 @@ impl Linux {
                         .map_err(Self::memory_errno)?;
                 }
                 Ok(0)
-            }
+            },
             214 => Ok(self.brk(a[0], memory)),
             222 => self.mmap(a, memory),
             215 => {
                 let len = Self::page_length(a[1])?;
                 memory.unmap(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
-            }
+            },
             226 => {
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));
@@ -1590,8 +1593,9 @@ impl Linux {
                     )
                     .map_err(Self::memory_errno)?;
                 Ok(0)
-            }
-            _ => Err(Errno(38)),
+            },
+            @fallback => Err(Errno(38)),
+
         }
     }
 }

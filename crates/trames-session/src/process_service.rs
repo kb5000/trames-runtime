@@ -189,6 +189,7 @@ mod tests {
         put_args(&mut cpu, a);
         let snapshot = crate::worker_syscalls::Snapshot {
             owner_syscalls: false,
+            diagnostics: None,
             vfork_release: None,
             native_space: None,
             namespaces: None,

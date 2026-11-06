@@ -172,6 +172,7 @@ impl Dispatch {
             control: control.clone(),
             syscalls: Some(crate::worker_syscalls::Snapshot {
                 owner_syscalls: p.linux.trace,
+                diagnostics: Some(p.linux.syscall_diagnostics(id)),
                 vfork_release: p.vfork.clone(),
                 native_space: Some(p.space.clone()),
                 namespaces: Some(namespaces),
