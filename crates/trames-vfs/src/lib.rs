@@ -2375,6 +2375,8 @@ impl Vfs {
                         && network_control.is_none()
                         && mount_file.is_none()
                         && runtime_file.is_none()
+                        && !(Self::cgroup_mount(&p)
+                            && matches!(n.content, Content::Directory | Content::File(_)))
                         && !(node.proc_node.get().is_some()
                             && (flags & O_PATH != 0 || matches!(n.content, Content::Directory)))
                         && (n.volatile

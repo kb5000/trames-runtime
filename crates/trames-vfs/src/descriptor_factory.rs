@@ -13,6 +13,7 @@ pub struct DescriptorFactory {
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
     devices: cgroup::DeviceAuthority,
+    pub(super) cgroups: Arc<SharedCell<cgroup::Cgroups>>,
 }
 pub(super) fn next_id(ids: &AtomicU64) -> u64 {
     (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)
@@ -29,6 +30,7 @@ impl Vfs {
             local_identity: self.local_sender_credentials(),
             pid_namespace: self.pid_namespace().clone(),
             devices: self.device_access(),
+            cgroups: self.cgroups.clone(),
         }
     }
 }

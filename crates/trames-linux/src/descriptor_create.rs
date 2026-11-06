@@ -10,6 +10,7 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64, Errno>> {
     Some(match number {
+        280 => crate::bpf::call(factory, a, memory),
         74 => {
             let mask = match Linux::signalfd_parameters(a, memory) {
                 Ok(mask) => mask,

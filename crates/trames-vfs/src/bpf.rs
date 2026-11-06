@@ -32,14 +32,7 @@ pub(super) struct Registry {
     programs: BTreeMap<u32, std::sync::Weak<Program>>,
 }
 impl Registry {
-    fn load(&mut self, kind: u32, bytes: &[u8]) -> Result<Arc<Program>> {
-        let code = verify(bytes)?;
-        // CGroupSKB loading is needed by older libbpf/cilium attach probes.
-        // Accept genuinely executable, context-independent programs only.
-        // Packet context access and SKB attachment remain unsupported.
-        if kind == 8 && code.iter().any(|i| i.code == 0x61) {
-            return Err(Errno(22));
-        }
+    fn publish(&mut self, kind: u32, code: Vec<Insn>) -> Result<Arc<Program>> {
         self.programs.retain(|_, p| p.strong_count() != 0);
         if self.programs.len() >= MAX_PROGRAMS {
             return Err(Errno(28));
@@ -186,15 +179,49 @@ impl Vfs {
         self.bpf_load_program(15, code)
     }
     pub fn bpf_load_program(&mut self, kind: u32, code: &[u8]) -> Result<u32> {
+        self.descriptor_factory().bpf_load_program(kind, code)
+    }
+    pub fn bpf_get_fd(&mut self, id: u32) -> Result<u32> {
+        self.descriptor_factory().bpf_get_fd(id)
+    }
+    pub fn bpf_program_identity(&self, fd: u32) -> Result<[u8; 8]> {
+        self.descriptor_factory().bpf_program_identity(fd)
+    }
+    #[cfg(test)]
+    pub(super) fn bpf_program(&self, fd: u32) -> Result<Arc<Program>> {
+        self.descriptor_factory().bpf_program(fd)
+    }
+}
+impl DescriptorFactory {
+    pub fn bpf_authorized(&self) -> Result<()> {
+        if !self.local_credentials().has_cap(capabilities::SYS_ADMIN) {
+            return Err(Errno(1));
+        }
+        Ok(())
+    }
+    pub fn bpf_load_program(&self, kind: u32, code: &[u8]) -> Result<u32> {
         self.bpf_authorized()?;
-        self.available(0)?;
+        let reserved = self.files.reserve()?;
         if !matches!(kind, 8 | 15) {
             return Err(Errno(22));
         }
-        let program = self.cgroups.borrow_mut().bpf.load(kind, code)?;
-        self.anonymous(O_CLOEXEC, events::Anonymous::Bpf(program))
+        // Verification is pure and bounded. Do it before the original registry
+        // transaction, so independent callers do not serialize their verifier.
+        let code = verify(code)?;
+        if kind == 8 && code.iter().any(|i| i.code == 0x61) {
+            return Err(Errno(22));
+        }
+        let program = self.cgroups.borrow_mut().bpf.publish(kind, code)?;
+        reserved.publish(
+            events::anonymous_descriptor(
+                self.open_id(),
+                O_CLOEXEC,
+                events::Anonymous::Bpf(program),
+            ),
+            None,
+        )
     }
-    pub fn bpf_get_fd(&mut self, id: u32) -> Result<u32> {
+    pub fn bpf_get_fd(&self, id: u32) -> Result<u32> {
         self.bpf_authorized()?;
         let program = self
             .cgroups
@@ -204,7 +231,15 @@ impl Vfs {
             .get(&id)
             .and_then(std::sync::Weak::upgrade)
             .ok_or(Errno(2))?;
-        self.anonymous(O_CLOEXEC, events::Anonymous::Bpf(program))
+        let reserved = self.files.reserve()?;
+        reserved.publish(
+            events::anonymous_descriptor(
+                self.open_id(),
+                O_CLOEXEC,
+                events::Anonymous::Bpf(program),
+            ),
+            None,
+        )
     }
     /// Stable info prefix supported by the guest device-program registry.
     pub fn bpf_program_identity(&self, fd: u32) -> Result<[u8; 8]> {
@@ -215,10 +250,11 @@ impl Vfs {
         Ok(info)
     }
     pub(super) fn bpf_program(&self, fd: u32) -> Result<Arc<Program>> {
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
-        match &o.anonymous {
-            Some(events::Anonymous::Bpf(p)) if o.flags.get() & O_PATH == 0 => Ok(p.clone()),
+        let file = self.files.lookup(fd).ok_or(Errno(22))??;
+        match &file.open.control {
+            Some(events::SharedControl::Bpf(p)) if file.open.flags.get() & O_PATH == 0 => {
+                Ok(p.clone())
+            }
             _ => Err(Errno(22)),
         }
     }
@@ -227,6 +263,183 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_cgroup_path_consumers_share_original_targets_and_control_files() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        struct Source;
+        impl ProcSource for Source {
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                RuntimeInfo::default()
+            }
+        }
+        v.set_proc_source(Arc::new(Source));
+        let paths = v.path_queries();
+        let files = DirectFiles::default();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/source", 0o755)
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/source/leaf", 0o755)
+            .unwrap();
+        let parent = paths
+            .open_at_resolve(
+                AT_FDCWD,
+                b"/sys/fs/cgroup/source",
+                O_DIRECTORY,
+                0,
+                0,
+                &files,
+            )
+            .unwrap()
+            .unwrap();
+        let leaf = paths
+            .open_at_resolve(parent as i32, b"leaf", O_PATH, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        let control = paths
+            .open_at_resolve(leaf as i32, b"cgroup.freeze", 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.read(control, 32).unwrap(), b"0\n");
+        assert!(paths
+            .getdents(parent, 4096, || Ok(()))
+            .unwrap()
+            .unwrap()
+            .windows(4)
+            .any(|s| s == b"leaf"));
+        let factory = v.descriptor_factory();
+        let program = factory.bpf_load_program(15, &constant(1)).unwrap();
+        factory.bpf_attach_device(leaf, program, 2, 0).unwrap();
+        assert_eq!(factory.bpf_query_device(leaf, false).unwrap().1.len(), 1);
+        // A deleted target cannot be redirected through the reused pathname.
+        v.unlink_at(AT_FDCWD, b"/sys/fs/cgroup/source/leaf", true)
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/source/leaf", 0o755)
+            .unwrap();
+        assert_eq!(factory.bpf_query_device(leaf, false), Err(Errno(19)));
+        let replacement = paths
+            .open_at_resolve(parent as i32, b"leaf", O_PATH, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert!(factory
+            .bpf_query_device(replacement, true)
+            .unwrap()
+            .1
+            .is_empty());
+    }
+    #[test]
+    fn parallel_factories_publish_original_programs_and_attachments_without_owner_collection() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/policy", 0o755)
+            .unwrap();
+        let target = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/policy", O_PATH, 0)
+            .unwrap();
+        let factory = v.descriptor_factory();
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let factory = factory.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let fd = factory.bpf_load_program(15, &constant(1)).unwrap();
+                    let info = factory.bpf_program_identity(fd).unwrap();
+                    let id = u32::from_le_bytes(info[4..].try_into().unwrap());
+                    factory.bpf_attach_device(target, fd, 2, 0).unwrap();
+                    factory.files.close(fd, 1).unwrap().unwrap();
+                    barrier.wait();
+                    let (flags, ids) = factory.bpf_query_device(target, false).unwrap();
+                    assert_eq!((flags, ids.len()), (2, 12));
+                    assert!(ids.contains(&id));
+                    let reopened = factory.bpf_get_fd(id).unwrap();
+                    assert_eq!(factory.bpf_program_identity(reopened).unwrap(), info);
+                    barrier.wait();
+                    factory.bpf_detach_device(target, reopened).unwrap();
+                    factory.files.close(reopened, 1).unwrap().unwrap();
+                    barrier.wait();
+                    assert_eq!(factory.bpf_get_fd(id), Err(Errno(2)));
+                    id
+                })
+            })
+            .collect();
+        let ids: std::collections::BTreeSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 12);
+        assert_eq!(v.bpf_query_device(target, false).unwrap(), (0, vec![]));
+        // Owner observation sees the original Files publication immediately.
+        assert_eq!(v.fd_snapshot().len(), 4);
+    }
+    #[test]
+    fn factory_policy_keeps_original_files_and_refreshes_new_call_credentials() {
+        let mut v = Vfs::default();
+        let original = v.descriptor_factory();
+        let (detached, _owner) = original.files.fork();
+        let mut fresh = original.clone();
+        fresh.files = detached;
+        let fd = fresh.bpf_load_program(15, &constant(1)).unwrap();
+        assert_eq!(original.bpf_program_identity(fd), Err(Errno(9)));
+        let id = u32::from_le_bytes(
+            fresh.bpf_program_identity(fd).unwrap()[4..]
+                .try_into()
+                .unwrap(),
+        );
+        let reopened = original.bpf_get_fd(id).unwrap();
+        assert_eq!(
+            v.bpf_program_identity(reopened),
+            fresh.bpf_program_identity(fd)
+        );
+        v.credentials = Credentials::user(1000, 1000);
+        let unprivileged = v.descriptor_factory();
+        assert_eq!(
+            unprivileged.bpf_load_program(15, &constant(1)),
+            Err(Errno(1))
+        );
+        assert_eq!(unprivileged.bpf_get_fd(id), Err(Errno(1)));
+        // An already captured call retains submission authority; future calls
+        // use the refreshed factory, as other descriptor controls do.
+        assert!(original.bpf_get_fd(id).is_ok());
+    }
+    #[test]
+    fn removing_a_cgroup_during_source_policy_queries_never_uses_a_stale_group_index() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let program = v.bpf_load_device(&constant(1)).unwrap();
+        for _ in 0..32 {
+            v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/removed", 0o755)
+                .unwrap();
+            let target = v
+                .open_at(AT_FDCWD, b"/sys/fs/cgroup/removed", O_PATH, 0)
+                .unwrap();
+            let source = v.descriptor_factory();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let peer_start = start.clone();
+            let peer = std::thread::spawn(move || {
+                peer_start.wait();
+                for _ in 0..128 {
+                    assert!(matches!(
+                        source.bpf_query_device(target, true),
+                        Ok(_) | Err(Errno(19))
+                    ));
+                    assert!(matches!(
+                        source.bpf_attach_device(target, program, 2, 0),
+                        Ok(()) | Err(Errno(17 | 19))
+                    ));
+                    assert!(matches!(
+                        source.bpf_detach_device(target, program),
+                        Ok(()) | Err(Errno(2 | 19))
+                    ));
+                }
+            });
+            start.wait();
+            v.unlink_at(AT_FDCWD, b"/sys/fs/cgroup/removed", true)
+                .unwrap();
+            peer.join().unwrap();
+            assert_eq!(v.bpf_query_device(target, false), Err(Errno(19)));
+            v.close(target).unwrap();
+        }
+    }
     fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
         let mut bytes = [code, dst | src << 4, 0, 0, 0, 0, 0, 0];
         bytes[2..4].copy_from_slice(&off.to_le_bytes());
@@ -391,11 +604,14 @@ mod tests {
         let mut registry = Registry::default();
         let mut programs = Vec::new();
         for _ in 0..MAX_PROGRAMS {
-            programs.push(registry.load(15, &constant(1)).unwrap());
+            programs.push(registry.publish(15, verify(&constant(1)).unwrap()).unwrap());
         }
-        assert!(matches!(registry.load(15, &constant(1)), Err(Errno(28))));
+        assert!(matches!(
+            registry.publish(15, verify(&constant(1)).unwrap()),
+            Err(Errno(28))
+        ));
         programs.pop();
-        assert!(registry.load(15, &constant(1)).is_ok());
+        assert!(registry.publish(15, verify(&constant(1)).unwrap()).is_ok());
     }
     #[test]
     fn worker_program_lease_keeps_identity_and_releases_registry_quota() {

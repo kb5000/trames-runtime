@@ -340,7 +340,7 @@ impl DirectSyscalls {
         if number == 425 {
             self.paths.is_some()
         } else {
-            matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199) && self.resources.is_some()
+            matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199 | 280) && self.resources.is_some()
         }
     }
     pub fn invoke_creation(

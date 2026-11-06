@@ -40,8 +40,8 @@ struct DeviceRules {
     programs: Vec<Arc<bpf::Program>>,
     flags: u32,
 }
-/// The actual device attachment graph. Structural task/cgroup changes still
-/// join; live program attachments and their parent resources are shared.
+/// The actual device attachment graph. Calling workers use the same hierarchy
+/// transaction for topology/attachment changes and original rules for access.
 pub(super) struct DeviceAccess {
     parent: Option<Arc<DeviceAccess>>,
     rules: SharedCell<DeviceRules>,
@@ -659,13 +659,13 @@ impl Cgroups {
             .retain(|n| n.strong_count() != 0);
     }
 }
-impl Vfs {
+impl DescriptorFactory {
     fn bpf_group(&self, fd: u32) -> Result<u64> {
-        let open_descriptor = self.descriptor(fd)?;
-        let open = open_descriptor.open.borrow();
+        let file = self.files.lookup(fd).ok_or(Errno(9))??;
+        let open = &file.open;
         if !open
-            .mount
-            .as_ref()
+            .mount_resource
+            .get()
             .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
         {
             return Err(Errno(9));
@@ -677,7 +677,7 @@ impl Vfs {
             }
             (node.inode, node.links != 0)
         };
-        if !linked || !self.cgroups.borrow().groups.contains_key(&id) {
+        if !linked {
             return Err(Errno(19));
         }
         Ok(id)
@@ -704,6 +704,7 @@ impl Vfs {
             None
         };
         let cg = self.cgroups.borrow_mut();
+        let group = cg.groups.get(&id).ok_or(Errno(19))?;
         // ALLOW_OVERRIDE is not supported. Preserve the original ancestor and
         // descendant constraints; each attachment's fields share one lock.
         if cg.ancestors(id).iter().skip(1).any(|a| {
@@ -721,7 +722,7 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
-        let mut rules = cg.groups[&id].devices.rules.borrow_mut();
+        let mut rules = group.devices.rules.borrow_mut();
         if !rules.programs.is_empty() && rules.flags != flags & 2 {
             return Err(Errno(22));
         }
@@ -751,7 +752,8 @@ impl Vfs {
         let id = self.bpf_group(target)?;
         let program = self.bpf_program(program)?;
         let cg = self.cgroups.borrow_mut();
-        let mut rules = cg.groups[&id].devices.rules.borrow_mut();
+        let group = cg.groups.get(&id).ok_or(Errno(19))?;
+        let mut rules = group.devices.rules.borrow_mut();
         let index = rules
             .programs
             .iter()
@@ -767,6 +769,7 @@ impl Vfs {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let cg = self.cgroups.borrow();
+        cg.groups.get(&id).ok_or(Errno(19))?;
         let groups = if effective {
             cg.ancestors(id)
         } else {
@@ -782,6 +785,25 @@ impl Vfs {
             }
         }
         Ok((flags, ids))
+    }
+}
+impl Vfs {
+    pub fn bpf_attach_device(
+        &self,
+        target: u32,
+        program: u32,
+        flags: u32,
+        replace: u32,
+    ) -> Result<()> {
+        self.descriptor_factory()
+            .bpf_attach_device(target, program, flags, replace)
+    }
+    pub fn bpf_detach_device(&self, target: u32, program: u32) -> Result<()> {
+        self.descriptor_factory().bpf_detach_device(target, program)
+    }
+    pub fn bpf_query_device(&self, target: u32, effective: bool) -> Result<(u32, Vec<u32>)> {
+        self.descriptor_factory()
+            .bpf_query_device(target, effective)
     }
     pub(super) fn device_access(&self) -> DeviceAuthority {
         if let Some(query) = &self.query {

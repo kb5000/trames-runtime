@@ -1,15 +1,20 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 58, scoped-memory
-activation, completion and mapped-file layout transactions, reviewed on
-2026-11-06. The prior runtime baseline is
-`4962de8d33d15b97e31d6ff61ba31ca099eec536`.
+This is the consolidated implementation audit through stage 60, original BPF
+program administration and cgroup device-policy consumers, reviewed on 2026-11-07.
+The prior runtime baseline is `38cdbba7a1967863a77fb0e432ec59cfa46e153c`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 59 moves the complete supported seccomp
+The Kernel owner still exists. Stage 60 moves supported BPF program load, identity,
+ID reopening, device attach/replace/detach/query and their target-path dependencies
+to the calling worker. The same original registry, Files table, immutable programs
+and cgroup device graph feed source and solo execution. Verifier work runs outside
+the short registry transaction; no resource thread or cohort pause is introduced.
+
+Stage 59 moves the complete supported seccomp
 policy subsystem to original task/group resources: strict/filter installation,
 TSYNC, prctl queries, all supported entry decisions, SIGSYS and termination effects,
 proc visibility, birth/exec inheritance and accepted-call cancellation. Policy
@@ -36,6 +41,7 @@ is not a claim that all coordinator work is removed.
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
 | Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Tracing and capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
+| BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Joined owner path if no source completion, resource wait, service or scoped checkpoint handled the exit | This remains a general coverage fallback, including unsupported entries that the joined kernel may finish with an errno. The owner dependency is not limited to the named examples above |
@@ -160,7 +166,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | --- | --- | --- | --- |
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold task projections now complete on source workers; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. The complete task and original-resource child builder are movable; pure lifecycle scopes claim nonblocking original task/mm/group custody on existing workers without VmReady/Service requests. Exec preparation/commit, nonleader identity replacement, failed-image recovery and detached old-mm retirement use original resources. Supported mixed mapping/lifecycle scopes now use the same source authority. Native image loading retains accepted resources on the original task and uses the existing disk pool; waiting releases task/mm permits and the CPU slot. Resident private-store namespace lookup/errors remain local. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Supported signals, credentials/capabilities, affinity and seccomp installation/TSYNC/result effects are source-owned; explicit tracing and capability-less embeddings remain | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. ERRNO/unsupported TRACE/USER_NOTIF, TRAP and KILL use original source resources. Tracing retains its explicit boundary; accepted ALLOW calls can still encounter an excluded underlying resource. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
-| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. BPF administration retains its original owner boundary. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
+| Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. Supported BPF administration now uses original source registry/Files/hierarchy transactions; unsupported APIs keep their original errors. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
 | Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, legacy epoll creation admission, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
@@ -1807,3 +1813,51 @@ ring resources, exceptional native imports, host/embedding administration and
 last-resort SVC/HLT/fault dispatch. Supported policy no longer supplies a reason
 for those dependencies; an ALLOW result does not make an excluded resource safe
 to run locally. The stage-56 Docker cleanup timeout remains unattributed.
+
+
+## 60. Original BPF programs and cgroup device-policy administration — 2026-11-07
+
+Supported BPF commands 5/8/9/13/15/16 share one byte ABI for source and solo calls.
+Original descriptor factories retain the actual Files, cgroup registry and caller
+credentials; credential/namespace changes refresh future factories through the
+existing task publication. Accepted resources do not follow a later FD reuse.
+Programs are immutable, interpreted guest device filters; nothing reaches the
+host kernel. Existing SKB probe limitations, verifier language, capabilities and
+unsupported-command errors remain unchanged.
+
+Loading reserves an actual FD before verification, then publishes the verified
+program and descriptor. Pure bounded verification runs outside the cgroup lock.
+Registry IDs and quotas still account for original FD, attachment and active
+resource leases; ID reopening upgrades the same weak registry entry. Source close,
+dup, fork/exec and SCM_RIGHTS use the existing complete shared OFDs. No owner
+projection has to collect a newly published program before another worker uses it.
+
+Attach/replace/detach/query take the original hierarchy transaction and per-group
+rules. The transaction checks group existence before indexing it: an open target
+can be removed concurrently, and must return ENODEV rather than panic or bind to a
+replacement at the same pathname. Ancestor/descendant attachment constraints and
+atomic replacement preserve the existing shared device-access graph. Ordinary
+device checks acquire no new synchronization, permissions or mapping work.
+
+Real-fixture diagnostics also exposed cgroup target opens returning the cohort.
+Cgroup directory and control-file opens now use their existing shared filesystem
+identities; relative dirfd lookup, enumeration and original control OFDs need no
+process snapshot. Deleted/recreated paths cannot redirect accepted targets. The
+legacy proc-source-less embedding boundary is preserved rather than fabricating a
+process provider.
+
+Validation includes both local runtime CI workflows, final affected VFS/Linux ABI
+and process checks, both iPad compile targets, and 18 real HVF/interpreter runs at
+1/4/12 CPUs with raw and ALLOW-filtered parallel BPF administration. Native ARM64
+Linux executes the same identity and threaded control fixture. Tests cover twelve
+simultaneous program/attachment publishers, lifetime/ID reopening, Files separation,
+credential refresh, concurrent cgroup removal and query copyout faults. A pre-existing
+TSYNC regression test now waits for all three guest observations with a deadline,
+instead of assuming four global instruction budgets schedule every host thread.
+The zero-service/cohort-return assertions are retained.
+
+See [public validation and measurements](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-bpf-20261107.json).
+Unchanged CPU/backend/device acceptance is reused. Physical iPad, Firefox, Docker
+and stable deployment are not claimed for this batch. Generic dispatch, actual
+shared-mm quiescence, exceptional native import, tracing/legacy resources and host
+lifecycle still remain in the inventory above.

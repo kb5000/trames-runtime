@@ -886,7 +886,7 @@ impl Snapshot {
                     )
                 })
             }
-            number @ (19 | 26 | 59 | 74 | 85 | 198 | 199) => {
+            number @ (19 | 26 | 59 | 74 | 85 | 198 | 199 | 280) => {
                 self.direct
                     .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
             }

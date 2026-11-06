@@ -662,6 +662,15 @@ impl Vfs {
         // Pseudo endpoints are stored separately. Looking in an unrelated disk
         // map first turns every proc FD snapshot into a full rootfs scan.
         if node.borrow().volatile {
+            if let Some(mount) = mount.as_ref().filter(|m| m.kind == Kind::Cgroup) {
+                // cgroup directories and control files have original shared
+                // filesystem identities; no process/proc snapshot is needed.
+                return Ok(ResolvedPath {
+                    key: mount.key_of(node).ok_or(Errno(2))?,
+                    mount: Some(mount.clone()),
+                    proc_binding: None,
+                });
+            }
             if let Some(proc) = node.proc_node.get() {
                 return Ok(ResolvedPath {
                     key: proc.path.clone(),

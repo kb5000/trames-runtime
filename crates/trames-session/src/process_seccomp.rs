@@ -917,7 +917,11 @@ mod tests {
             k.processes.insert(1, p);
             k.processes.insert(2, peer);
             k.processes.insert(3, foreign);
-            for _ in 0..4 {
+            // A global instruction budget can be consumed by a runnable peer
+            // before another host thread is scheduled. Wait for the complete
+            // observation, not four budgets or just the first of three SVCs.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
                 assert!(k
                     .parallel_epoch(
                         &mut trames_linux::CapturedOutput::default(),
@@ -925,9 +929,11 @@ mod tests {
                         true
                     )
                     .unwrap());
-                if k.processes.read(&2).cpu.x(21) == (-42i64) as u64 {
+                let peer = k.processes.read(&2);
+                if (peer.cpu.x(21), peer.cpu.x(22), peer.cpu.x(23)) == ((-42i64) as u64, 1, 2) {
                     break;
                 }
+                assert!(Instant::now() < deadline, "peer did not observe TSYNC");
             }
             let p = k.processes.read(&1);
             let peer = k.processes.read(&2);
@@ -3430,7 +3436,7 @@ mod tests {
     }
     #[test]
     fn shared_resource_creation_and_close_complete_on_workers_with_one_seccomp_decision() {
-        for number in [19u32, 26, 59, 85, 198] {
+        for number in [19u32, 26, 59, 85, 198, 280] {
             for decision in [None, Some(ALLOW), Some(0x5007b)] {
                 let mut p = super::super::tests::process();
                 p.memory.write(0x1800, &[0; 8]).unwrap();
@@ -3441,7 +3447,24 @@ mod tests {
                         .configure_network(trames_vfs::NetworkMode::Loopback)
                         .unwrap();
                 }
-                let initial = if number == 198 {
+                if number == 280 {
+                    let mut attr = [0u8; 152];
+                    attr[..4].copy_from_slice(&15u32.to_le_bytes());
+                    attr[4..8].copy_from_slice(&2u32.to_le_bytes());
+                    attr[8..16].copy_from_slice(&0x1a00u64.to_le_bytes());
+                    attr[16..24].copy_from_slice(&0x1b00u64.to_le_bytes());
+                    p.memory.write(0x1900, &attr).unwrap();
+                    p.memory
+                        .write(
+                            0x1a00,
+                            &[0xb7, 0, 0, 0, 1, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0],
+                        )
+                        .unwrap();
+                    p.memory.write(0x1b00, b"GPL\0").unwrap();
+                }
+                let initial = if number == 280 {
+                    5
+                } else if number == 198 {
                     2
                 } else if number == 59 {
                     0x1800
@@ -3452,7 +3475,15 @@ mod tests {
                 };
                 let mut code = vec![
                     mov(0, initial),
-                    mov(1, u32::from(number == 198)),
+                    mov(
+                        1,
+                        if number == 280 {
+                            0x1900
+                        } else {
+                            u32::from(number == 198)
+                        },
+                    ),
+                    mov(2, if number == 280 { 152 } else { 0 }),
                     mov(8, number),
                     0xd4000001,
                 ];
