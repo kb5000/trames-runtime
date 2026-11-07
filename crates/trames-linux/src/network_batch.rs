@@ -44,6 +44,11 @@ impl Linux {
         if self.vfs.fd_kind(a[0] as u32)? != FdKind::Socket {
             return Err(Errno(88));
         }
+        let packet_unix = self
+            .vfs
+            .direct_descriptors()
+            .get(a[0] as u32)
+            .is_some_and(|fd| matches!(fd.local_kind(), 2 | 5));
         let count = (a[2] as u32).min(1024) as u64;
         let mut completed = 0;
         while completed < count {
@@ -68,7 +73,7 @@ impl Linux {
                     }
                 }
                 Err(error) => {
-                    if error.0 == 32 && flags & 0x4000 == 0 {
+                    if error.0 == 32 && !packet_unix && flags & 0x4000 == 0 {
                         self.batch_pipe_signal = true;
                     }
                     return if completed == 0 {

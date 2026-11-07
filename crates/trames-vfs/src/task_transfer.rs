@@ -56,7 +56,6 @@ fn full_vfs_handoff_retains_queued_controls_namespaces_and_original_files() {
         );
         assert_eq!(child.read(reader, 1).unwrap(), b"x");
         child.close(fds[0]).unwrap();
-        child.reap_local_rights();
     });
     drop(parent);
     assert!(

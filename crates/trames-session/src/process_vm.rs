@@ -347,12 +347,6 @@ impl<C: Cpu> Kernel<C> {
             {
                 return Ok(true);
             }
-            // Only actual owner-only control projections require this join.
-            // Ordinary Unix rights and native-service transport run directly
-            // on resource notifications / the existing idle executor.
-            if root.linux.vfs.local_rights_need_owner() {
-                return Ok(true);
-            }
             if root.linux.vfs.live_ptys().iter().any(|pair| {
                 pair.host_resize_pending
                     .load(std::sync::atomic::Ordering::Relaxed)

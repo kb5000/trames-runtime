@@ -113,7 +113,6 @@ fn concurrent_unix_rights_cannot_publish_a_reciprocal_owning_cycle() {
         v.close(fd).unwrap();
     }
     assert!(weak.iter().all(|p| p.upgrade().is_none()));
-    assert!(!v.local_rights_need_owner());
 }
 
 #[test]
@@ -151,7 +150,6 @@ fn shared_unix_rights_keep_original_ofd_across_reuse_peek_and_worker_import() {
     v.write(second[0], b"two").unwrap();
     assert_eq!(v.read(d, 3).unwrap(), b"two");
     assert_eq!(v.read(c, 8).unwrap(), 99u64.to_le_bytes());
-    assert!(v.local_rights.entries.borrow().is_empty());
 }
 
 #[test]
@@ -176,7 +174,6 @@ fn raw_worker_read_discards_unix_rights_and_releases_the_original_socket() {
     );
     assert!(weak.upgrade().is_none());
     assert_eq!(v.read(c, 8).unwrap(), 73u64.to_le_bytes());
-    assert!(!v.local_rights_need_owner());
 }
 
 #[test]
@@ -217,7 +214,6 @@ fn complete_epoll_and_shared_unix_rights_observe_one_cycle_graph() {
         tx.send_local_message(b"allowed", 0, &rights, [1, 0, 0]),
         Some(Ok(7))
     );
-    assert!(v.local_rights.entries.borrow().is_empty());
 }
 
 #[test]
@@ -415,13 +411,12 @@ fn worker_final_close_releases_shared_unix_rights_without_owner_reap() {
         .unwrap();
     v.close(queued).unwrap();
     assert!(weak.upgrade().is_some());
-    assert!(!v.local_rights_need_owner());
+
     std::thread::spawn(move || factory.files.close(b, 1).unwrap().unwrap())
         .join()
         .unwrap();
-    assert!(!v.local_rights_need_owner());
+
     assert!(weak.upgrade().is_none());
-    assert!(!v.local_rights_need_owner());
 }
 
 #[test]
@@ -692,4 +687,101 @@ fn concurrent_ring_registration_and_fd_transfer_cannot_publish_a_reciprocal_cycl
         v.close(descriptor).unwrap();
     }
     assert!(weak.upgrade().is_none());
+}
+
+// A complete original projection can still be intentionally opaque to byte or
+// control execution. Passing its lifetime must never require a Kernel ledger.
+fn opaque(v: &mut Vfs, fd: u32) -> OpenWeak {
+    let descriptor = v.descriptor(fd).unwrap();
+    let metadata = descriptor.open.borrow().shared.clone();
+    let open = OpenHandle::Owner(Arc::new(SharedCell::new(
+        OpenDescription::shared_projection(metadata),
+    )));
+    let weak = open.downgrade();
+    v.fds.insert(
+        fd,
+        Descriptor {
+            open,
+            cloexec: descriptor.cloexec,
+        },
+    );
+    weak
+}
+#[test]
+fn mixed_opaque_rights_retain_original_controls_and_import_on_source_after_close_reuse() {
+    let mut v = Vfs::default();
+    let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+    let event = v.eventfd(41, 0).unwrap();
+    let ep = v.epoll_create(0).unwrap();
+    v.epoll_ctl(ep, 1, event, 1, 77).unwrap();
+    let original = opaque(&mut v, ep);
+    let factory = v.descriptor_factory();
+    let rights = std::thread::spawn({
+        let factory = factory.clone();
+        move || factory.send_local_rights(&[event, ep]).unwrap().unwrap()
+    })
+    .join()
+    .unwrap();
+    v.close(ep).unwrap();
+    assert_eq!(v.eventfd(99, 0).unwrap(), ep);
+    let sender = v.direct_descriptors().get(tx).unwrap();
+    assert_eq!(
+        std::thread::spawn(move || sender.send_local_message(b"x", 0, &rights, [1, 0, 0]))
+            .join()
+            .unwrap(),
+        Some(Ok(1))
+    );
+    let receiver = v.direct_descriptors().get(rx).unwrap();
+    let packet = std::thread::spawn(move || receiver.recv_local_message(1, 0).unwrap().unwrap())
+        .join()
+        .unwrap();
+    let got = std::thread::spawn(move || factory.receive_local_rights(packet.rights, 2, true))
+        .join()
+        .unwrap();
+    assert!(!got.1);
+    assert_eq!(got.0.len(), 2);
+    assert!(OpenHandle::ptr_eq(
+        &v.descriptor(got.0[1]).unwrap().open,
+        &original.upgrade().unwrap()
+    ));
+    assert_eq!(
+        v.epoll_wait(got.0[1], 1, |_, _| Ok(None)).unwrap(),
+        vec![(1, 77)]
+    );
+    assert_eq!(v.read(ep, 8).unwrap(), 99u64.to_le_bytes());
+    for fd in got.0 {
+        v.close(fd).unwrap();
+    }
+    assert!(original.upgrade().is_none());
+}
+#[test]
+fn opaque_ring_ownership_rejects_cycles_and_final_close_needs_no_owner_reap() {
+    let mut v = Vfs::default();
+    let [a, b] = v.socketpair(1, 1, 0).unwrap();
+    let (fd, ring) = v.uring_create(4, 8).unwrap();
+    let carried = v.retain_uring_file(a).unwrap();
+    ring.state.lock().unwrap().files = Some(vec![Some(ring.bind_file(&carried).unwrap())]);
+    let original = opaque(&mut v, fd);
+    let factory = v.descriptor_factory();
+    let rights = factory.send_local_rights(&[fd]).unwrap().unwrap();
+    let tx = v.direct_descriptors().get(b).unwrap();
+    assert_eq!(
+        tx.send_local_message(b"cycle", 0, &rights, [1, 0, 0]),
+        Some(Err(Errno(95)))
+    );
+    drop(rights);
+    v.close(fd).unwrap();
+    assert!(original.upgrade().is_none());
+    let fd = v.eventfd(7, 0).unwrap();
+    let original = opaque(&mut v, fd);
+    let file = v.retain_uring_file(fd).unwrap();
+    v.close(fd).unwrap();
+    assert!(original.upgrade().is_some());
+    assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+    std::thread::spawn(move || drop(file)).join().unwrap();
+    assert!(
+        original.upgrade().is_none(),
+        "last complete projection closes on the releasing worker"
+    );
+    assert_eq!(v.read(fd, 8).unwrap(), 99u64.to_le_bytes());
 }

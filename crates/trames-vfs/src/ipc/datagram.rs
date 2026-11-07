@@ -41,7 +41,7 @@ impl Vfs {
         }
         socket.check_datagram_send(bytes.len(), flags)?;
         let target = self.local_datagram_core(&socket.core, destination)?;
-        target.send_owner_checked(&self.local_rights, bytes, flags, rights, credentials)
+        target.send_local_checked(bytes, flags, rights, credentials)
     }
 }
 
@@ -90,45 +90,14 @@ impl LocalDatagram {
             source,
         )
     }
-    fn send_owner_checked(
+    fn send_local_checked(
         &self,
-        owner: &OwnerLedger,
         bytes: &[u8],
         flags: u32,
         rights: LocalRights,
         credentials: [u32; 3],
     ) -> Result<usize> {
-        let peer = self.receiver()?;
-        if let Some(shared) = rights.shared() {
-            let source = self.source.name.borrow().clone();
-            return self.channel.resource.send_addressed(
-                bytes,
-                flags,
-                shared_rights::QueuedRights::for_receiver(&peer, shared)?,
-                credentials,
-                source,
-            );
-        }
-        let graph = ownership::Ownership::legacy(&peer, &rights)?;
-        let channel = &self.channel;
-        let id = channel
-            .next_right
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| Errno(75))?;
-        owner.insert(channel, 0, id, Ancillary { rights });
-        let source = self.source.name.borrow().clone();
-        let result = channel.resource.send_addressed(
-            bytes,
-            flags,
-            Some(shared_rights::QueuedRights::legacy(id, graph)),
-            credentials,
-            source,
-        );
-        if result.is_err() {
-            let unused = owner.remove(channel, id);
-            drop(unused);
-        }
-        result
+        self.send_shared_checked(bytes, flags, rights.shared(), credentials)
     }
 }
 
@@ -151,7 +120,7 @@ impl LocalSocket {
             peer: Arc::downgrade(&peer),
             channel,
         };
-        target.send_owner_checked(&self.owner, bytes, flags, rights, identity)
+        target.send_local_checked(bytes, flags, rights, identity)
     }
 }
 
@@ -254,6 +223,15 @@ impl LocalOperation {
     }
 }
 impl Vfs {
+    /// Resolve using this executor's original path authority, without making a
+    /// detached query projection. The accepted target retains its real resource.
+    pub fn resolve_local_datagram(
+        &self,
+        socket: &LocalOperation,
+        destination: Option<&[u8]>,
+    ) -> Result<LocalDatagram> {
+        self.local_datagram_core(socket.core(), destination)
+    }
     pub(crate) fn local_datagram_core(
         &self,
         socket: &Arc<LocalResource>,
@@ -289,7 +267,7 @@ impl Vfs {
                 Some(self.local_datagram_core(socket.core(), destination))
             })
             .expect("owner resolves datagram target")?
-            .send_owner_checked(&self.local_rights, bytes, flags, rights, identity)
+            .send_local_checked(bytes, flags, rights, identity)
     }
 }
 
@@ -318,7 +296,7 @@ mod tests {
             v.send_rights(&[event]).unwrap(),
         )
         .unwrap();
-        assert!(v.local_rights.entries.borrow().is_empty());
+
         // Datagram credentials were always captured at send, even if passcred
         // was enabled after enqueue. Keep that behavior outside the ledger.
         receiver.set_reuse(16, 1).unwrap();
@@ -341,7 +319,7 @@ mod tests {
         assert_eq!(v.read(aliases[0], 8).unwrap(), 73u64.to_le_bytes());
         assert_ne!(v.flags(aliases[0]).unwrap() & O_CLOEXEC, 0);
         assert_eq!(receiver.recv(9, 0).unwrap().data, b"abcd");
-        assert!(v.local_rights.entries.borrow().is_empty());
+
         v.local_connect(&sender, destination).unwrap();
         sender.send(b"core", 0).unwrap();
         assert_eq!(receiver.recv(9, 0).unwrap().data, b"core");
@@ -399,6 +377,5 @@ mod tests {
             assert_eq!(received.credentials, Some([n as u32 + 1, 0, 0]));
             assert!(seen.insert(received.data));
         }
-        assert!(v.local_rights.entries.borrow().is_empty());
     }
 }

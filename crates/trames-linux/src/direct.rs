@@ -86,12 +86,11 @@ impl RetainedByte {
     pub fn pty_endpoint(&self) -> Option<(Arc<trames_vfs::PtyEnd>, u32)> {
         self.fd.retained_pty()
     }
-    pub fn local_owner_identity(&self) -> Option<trames_vfs::OfdIdentity> {
-        self.message().map(|_| self.fd.ofd_identity())
+    pub fn packet_unix(&self) -> bool {
+        matches!(self.fd.local_kind(), 2 | 5)
     }
-    pub fn local_owner(&self) -> Option<trames_vfs::RetainedFd> {
-        self.message()?;
-        Some(self.fd.shared_file()?.retained())
+    pub fn ofd_identity(&self) -> trames_vfs::OfdIdentity {
+        self.fd.ofd_identity()
     }
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.shares_with(std::iter::once(&self.fd))
@@ -861,6 +860,18 @@ impl DirectSyscalls {
         }
         result
     }
+    fn byte_pipe_signal(
+        &self,
+        fd: &trames_vfs::DirectFd,
+        number: u32,
+        args: [u64; 6],
+        result: Result<u64, Errno>,
+    ) -> Result<u64, Errno> {
+        if result == Err(Errno(32)) && matches!(fd.local_kind(), 2 | 5) {
+            return result;
+        }
+        self.pipe_signal(number, args, result)
+    }
     fn complete_tcp(&self, result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
@@ -1411,7 +1422,13 @@ impl DirectSyscalls {
             Ok(file)
                 if file.fd.is_unix() && file.fd.local_kind() != 1 && file.message().is_none() =>
             {
-                IoAttempt::ByteCheckpoint(file)
+                match self.prepare_packet_byte(&file, number, args, memory) {
+                    Some(Ok(file)) => {
+                        self.start_byte(file, number, args, memory, pid, target, false)
+                    }
+                    Some(Err(error)) => self.complete_byte(&file, Err(error)),
+                    None => IoAttempt::ByteCheckpoint(file),
+                }
             }
             Ok(file) => self.start_byte(file, number, args, memory, pid, target, false),
             Err(error) => self.complete(number, args, Err(error)),
@@ -1448,6 +1465,29 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         checkpoint_pipe: bool,
     ) -> IoAttempt {
+        self.start_byte_in(
+            file,
+            number,
+            args,
+            memory,
+            pid,
+            target,
+            checkpoint_pipe,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_byte_in(
+        &self,
+        file: RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+        checkpoint_pipe: bool,
+        original_paths: Option<&trames_vfs::Vfs>,
+    ) -> IoAttempt {
         let mut file = file;
         let result = if matches!(number, 63 | 65)
             && file.fd.is_signalfd()
@@ -1466,14 +1506,14 @@ impl DirectSyscalls {
             }
             Some(result)
         } else {
-            self.transfer_retained(&file, number, args, memory)
+            self.transfer_retained(&file, number, args, memory, original_paths)
         };
         match result {
             Some(Err(Errno(11)))
                 if !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
             Some(result) => {
                 let result = if checkpoint_pipe {
-                    self.pipe_signal(number, args, result)
+                    self.byte_pipe_signal(&file.fd, number, args, result)
                 } else {
                     result
                 };
@@ -1489,7 +1529,7 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = file.subscribe(&signal);
-        self.resume_inner(
+        self.resume_inner_in(
             PendingIo {
                 aio: None,
                 number,
@@ -1513,6 +1553,7 @@ impl DirectSyscalls {
             },
             memory,
             checkpoint_pipe,
+            original_paths,
         )
     }
     /// Retry the retained request, never the numeric FD. Subscribe only after
@@ -1581,9 +1622,18 @@ impl DirectSyscalls {
     }
     fn resume_inner(
         &self,
+        pending: PendingIo,
+        memory: &mut impl CpuMemory,
+        checkpoint_pipe: bool,
+    ) -> IoAttempt {
+        self.resume_inner_in(pending, memory, checkpoint_pipe, None)
+    }
+    fn resume_inner_in(
+        &self,
         mut pending: PendingIo,
         memory: &mut impl CpuMemory,
         checkpoint_pipe: bool,
+        original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         if Self::aio_call(pending.number) {
             return self.start_retained_aio(
@@ -1670,7 +1720,8 @@ impl DirectSyscalls {
         let result = if let Some(fd) = &pending.native_tcp {
             self.transfer_tcp(fd, pending.number, pending.args, memory)
         } else if let Some(file) = &pending.retained_byte {
-            let Some(result) = self.transfer_retained(file, pending.number, pending.args, memory)
+            let Some(result) =
+                self.transfer_retained(file, pending.number, pending.args, memory, original_paths)
             else {
                 if file.fd.is_pty() || file.fd.is_unix() {
                     return IoAttempt::ByteCheckpoint(pending.retained_byte.take().unwrap());
@@ -1730,7 +1781,11 @@ impl DirectSyscalls {
             }
             result => {
                 let result = if checkpoint_pipe {
-                    self.pipe_signal(pending.number, pending.args, result)
+                    if let Some(file) = &pending.retained_byte {
+                        self.byte_pipe_signal(&file.fd, pending.number, pending.args, result)
+                    } else {
+                        self.pipe_signal(pending.number, pending.args, result)
+                    }
                 } else {
                     result
                 };
@@ -1760,7 +1815,7 @@ impl DirectSyscalls {
             return match self.transfer_fd(&file.fd, number, args, memory)? {
                 Err(Errno(11)) if !file.fd.nonblocking() => None,
                 result => {
-                    let result = self.pipe_signal(number, args, result);
+                    let result = self.byte_pipe_signal(&file.fd, number, args, result);
                     self.complete_byte(&file, result);
                     Some(result)
                 }

@@ -1,14 +1,23 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 64, retirement of the production
-FD/network compatibility RPC, reviewed on 2026-11-07.
-The prior runtime baseline is `0c2adca6acb919750007eb97aa686e8a06f555a8`.
+This is the consolidated implementation audit through stage 65, closure of the Unix
+ancillary lifetime and message handoff subsystem, reviewed on 2026-11-07.
+The prior runtime baseline is `4d6926ba47d574250557314ea9335cb5ac4d8f1a`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 64 deletes the FD/network compatibility
+The Kernel owner still exists. Stage 65 removes the Unix ancillary owner ledger,
+its reaping-triggered cohort join, the mixed-rights exclusion and the separate
+accepted-message owner executor. Ordinary and opaque SCM_RIGHTS sets retain the
+actual full original OFDs. Capture, import, final release, accepted packet retry
+and sendmmsg completion use the same source resource path. io_uring's opaque FD
+lifetime now retains its original object directly; actual excluded SQE execution
+remains a separate boundary. Existing cycle rejection and iterative destruction
+are retained. No new coordinator, resource-service thread or global lock is added.
+
+Stage 64 deletes the FD/network compatibility
 RPC as an execution category: there is no Service event, caller-View loan,
 request/reply transport, service admission classifier, owner service handler or
 in-flight service state. Original console resources, complete epoll controls and
@@ -201,7 +210,6 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
 | POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination uses original source group cleanup; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
-| Unix ancillary owner controls | SCM_RIGHTS that contains an actual excluded owner control; owner-ledger reaping and a legacy destination/control projection | Retained original endpoint/rights handoff and owner graph work. Portable Unix sockets/rights and ordinary native Wayland transport already share the real resource graph. A mixed owner set is still excluded. | [message handoff](../../crates/trames-linux/src/direct/local_message.rs), [rights ledger](../../crates/trames-vfs/src/ipc.rs), [portable graph](../../crates/trames-vfs/src/ipc/shared_rights.rs) |
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. Existing workers commit and rebuild supported Views, including proc byte activation and cold-mm cleanup; unsupported backing and tracing/security effects retain explicit boundaries. Retained external byte borrowers park only the actual dependency. Pure policy errors complete before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap publishes directly. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Original backing publication leases identify affected mms. Existing workers return their bytes, then the same disk pool runs the accepted mutation while holding its original exclusive ticket. New aliases wait on that backing; original mmap/OFD authority survives cancellation. No process-wide pause counters or actor scan remain. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
 | io_uring owner escalation | Actual owner resource/SQE or unavailable event subscription/source pump; unsupported structural authority | Canonical ring state stays shared. Production mapped-layout SQEs use the original FileLayouts resource; `owner_required` still hands excluded owner work back to the Kernel. Accepted SQEs keep their original source context. Source background progress on sleep/futex is ordinarily event-driven. No separate ring service thread exists. New namespace SQE opcodes are not added by the namespace batch. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
@@ -211,7 +219,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
-source completion/park, in-cohort service or scoped VM request stops the current
+source completion/park or scoped VM request stops the current
 cohort before joined handling. Consequently a complete removal audit must include
 that catch-all, not just enumerate mount/proc or other named controls. The exact
 entry and admission checks are in [workers](../../crates/trames-session/src/workers.rs)
@@ -252,11 +260,11 @@ not make the same per-operation persistence promise.
 
 `service_requests=0` is insufficient to prove owner independence. A direct
 checkpoint, unsupported SVC/HLT, signal/control action or legacy scheduling wake
-can end a cohort without sending a Service event. Conversely an in-cohort service
-can complete while peer CPUs continue. Inspect together:
+can end a cohort without incrementing the historical service counters. The
+production Service transport was deleted in stage 64. Inspect together:
 
 1. source worker/direct/file/socket/uring completions and retained identities;
-2. Service requests and caller wait;
+2. actual resource wait and original executor completion (historical service fields remain zero);
 3. cohort rounds and stop/dispatch time;
 4. affected-mm VM checkpoint groups, wait/commit/resume timing;
 5. native entry retries, mapping delta/coarse comparisons, resource and disk time;
@@ -2109,3 +2117,66 @@ speedup claim. The stage-61 short denied-control issue remains unattributed.
 
 See [stage 64 evidence](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/fd-compatibility-closure-20261107.json)
 for hashes, initial failures, corrected test assumptions and unchanged boundaries.
+
+
+## 65. Unix ancillary lifetime and accepted-message closure — 2026-11-07
+
+This batch retires an entire remaining execution category, including its lifetime
+and retry dependencies. It does not merely broaden the portable-rights predicate.
+
+- `OwnerLedger`, `OwnerView`, channel rights IDs, owner graph variants and the
+  `local_rights_need_owner` cohort-control gate are deleted. A queued message owns
+  its real original descriptions, including mixed opaque controls. Ordinary
+  already-shared rights keep their compact Arc-slice representation.
+- Capture is one original Files transaction. Opaque metadata work happens outside
+  that membership lock. Import stages complete original slots before publication;
+  truncation, final release and callbacks run after releasing Files. Descriptor
+  numbers can close/reuse without retargeting accepted rights.
+- The existing ownership graph still rejects unsupported socket/ring cycles and
+  drains nested releases iteratively. Opaque ring participation uses its actual
+  underlying graph; it does not turn an excluded ring control into an admitted
+  byte/SQE body. io_uring fixed/submitted opaque files own their actual RetainedFd,
+  removing token/ledger collection without broadening execution authority.
+- The separate `progress_owned`/`start_owned_local_message`/owner batch executor and
+  duplicate retained-message owner lease are deleted. Accepted single/batch calls
+  retain endpoint, captured authority, rights, current item and resolved target.
+  Backpressure, output faults, STOP/CONT, close/reuse and partial completion use
+  the same prepared ABI and resource subscriptions; blocked tasks return their slot.
+- Solo/cold composition borrows its original VFS resolver for this invocation.
+  It uses the same prepared transfer and wait implementation as workers, without
+  constructing a private PathQueries VFS on every ready call. Ordinary byte I/O
+  also avoids an unused pathname projection. The borrowed VFS is never stored in
+  a pending request or moved across threads; accepted resources carry lifetime.
+
+Native ARM64 Linux comparison corrected an existing signal error: stream EPIPE
+raises SIGPIPE unless suppressed, including a partially successful sendmmsg;
+Unix datagram and seqpacket EPIPE do not raise it. Source scalar/vector/message/
+batch and solo completion now make the same distinction using the accepted OFD.
+A deterministic original-resource test closes the stream peer after the first
+batch delivery and verifies positive partial progress plus exactly one signal.
+See the [Linux reference implementation](https://github.com/torvalds/linux/blob/v6.17/net/unix/af_unix.c)
+and [stage 65 evidence](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/unix-ancillary-closure-20261107.json).
+
+The `Unix ancillary owner controls` row is removed from the current inventory.
+Actual opaque control/SQE bodies, excluded dynamic pathname providers, explicit
+tracing, absent embedding capabilities and native/host lifecycle boundaries remain
+listed under their own resources. A mixed SCM_RIGHTS set or outstanding rights
+alone no longer demands a coordinator join. This is not completion of the overall
+coordinator-removal project or a whole-browser performance claim.
+
+Validation completes both local runtime workflows, 563/562 VFS cases on Mac/Linux,
+253 Linux ABI cases, 383 process cases on each host, both iPad compile targets,
+96 real HVF/interpreter cases at 1/4/12 CPUs and 144 native ARM64 Linux cases.
+No tested Mac Unix message call returned its cohort; service counters remain zero.
+Linux process assertions pass with a serial outer runner after one-epoch seccomp
+assumptions flaked under parallel test load; no production/test assertion was weakened.
+
+Three alternating pairs measure stream EPIPE/SIGPIPE batches at 200 calls/thread:
+4 CPUs 34.953 -> 2.172 ms, 12 CPUs 211.687 -> 7.202 ms (raw policy).
+Ordinary rights and proc-FD-path transport remain near their already-source
+multi-core baseline. At 20,000 single-CPU rounds, ordinary rights vary by +0.20%
+(raw) and +0.74% (ALLOW); cheap error controls still cost +3.19% to +5.64%.
+The pre-integration per-call pathname projection regression was measured and
+removed. Old incorrect datagram/seqpacket signal results are excluded from paired
+performance claims. Native Linux, exact runners, short-run variation and full
+limitations are recorded in the linked evidence; no browser speedup is inferred.

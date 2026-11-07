@@ -194,23 +194,6 @@ impl Ownership {
             graph.insert_deferred(Node::Ring(Arc::downgrade(receiver)), vec![target], None);
         (result.map(Some), retired)
     }
-    pub(super) fn legacy(
-        receiver: &Arc<LocalResource>,
-        rights: &LocalRights,
-    ) -> Result<Option<Arc<Link>>> {
-        let targets: Vec<_> = rights
-            .0
-            .iter()
-            .filter_map(|o| Node::open(&o.borrow().shared))
-            .collect();
-        if targets.is_empty() {
-            return Ok(None);
-        }
-        let graph = receiver.ownership.upgrade().ok_or(Errno(9))?;
-        graph
-            .insert(Node::Socket(Arc::downgrade(receiver)), targets, None)
-            .map(Some)
-    }
 }
 impl Link {
     pub(crate) fn belongs_to_ring(&self, ring: &Uring) -> bool {

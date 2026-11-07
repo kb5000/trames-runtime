@@ -1056,7 +1056,6 @@ mod tests {
             assert_eq!(native.rcv_msg(&mut bytes, &mut rights).unwrap(), 0);
         }
         assert!(services.registry.lock().unwrap().connections.is_empty());
-        assert!(!vfs.local_rights_need_owner());
     }
     #[test]
     fn native_rights_and_clipboard_pipes_progress_without_owner_projections() {

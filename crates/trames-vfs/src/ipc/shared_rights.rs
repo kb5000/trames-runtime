@@ -3,29 +3,90 @@
 use super::*;
 
 #[derive(Clone, Default)]
-pub struct SharedRights(Option<Arc<[Arc<SharedOpenDescription>]>>, bool);
+pub struct SharedRights(Option<RightsSet>, bool);
+#[derive(Clone)]
+enum RightsSet {
+    Shared(Arc<[Arc<SharedOpenDescription>]>),
+    Original(Arc<[CarriedOpen]>),
+}
+impl RightsSet {
+    fn metadata(&self) -> impl Iterator<Item = &Arc<SharedOpenDescription>> {
+        let (shared, original) = match self {
+            Self::Shared(v) => (Some(v), None),
+            Self::Original(v) => (None, Some(v)),
+        };
+        shared.into_iter().flat_map(|v| v.iter()).chain(
+            original
+                .into_iter()
+                .flat_map(|v| v.iter())
+                .map(CarriedOpen::metadata),
+        )
+    }
+    fn originals(&self) -> impl Iterator<Item = OpenHandle> + '_ {
+        let (shared, original) = match self {
+            Self::Shared(v) => (Some(v), None),
+            Self::Original(v) => (None, Some(v)),
+        };
+        shared
+            .into_iter()
+            .flat_map(|v| v.iter())
+            .cloned()
+            .map(OpenHandle::Shared)
+            .chain(
+                original
+                    .into_iter()
+                    .flat_map(|v| v.iter())
+                    .map(CarriedOpen::original),
+            )
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Shared(v) => v.len(),
+            Self::Original(v) => v.len(),
+        }
+    }
+}
+#[derive(Clone)]
+enum CarriedOpen {
+    Shared(Arc<SharedOpenDescription>),
+    Original {
+        open: OpenHandle,
+        metadata: Arc<SharedOpenDescription>,
+    },
+}
+impl CarriedOpen {
+    fn new(open: OpenHandle) -> Self {
+        match open {
+            OpenHandle::Shared(open) => Self::Shared(open),
+            open => {
+                let metadata = open.borrow().shared.clone();
+                Self::Original { open, metadata }
+            }
+        }
+    }
+    fn metadata(&self) -> &Arc<SharedOpenDescription> {
+        match self {
+            Self::Shared(open) => open,
+            Self::Original { metadata, .. } => metadata,
+        }
+    }
+    fn original(&self) -> OpenHandle {
+        match self {
+            Self::Shared(open) => OpenHandle::Shared(open.clone()),
+            Self::Original { open, .. } => open.clone(),
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) enum QueuedRights {
-    Owner(u64),
-    OwnerGraph {
-        id: u64,
-        _graph: Arc<ownership::Link>,
-    },
     Shared(SharedRights),
     Owned(Arc<ownership::Link>),
 }
 impl QueuedRights {
-    pub fn owner(&self) -> Option<u64> {
-        match self {
-            Self::Owner(id) | Self::OwnerGraph { id, .. } => Some(*id),
-            Self::Shared(_) | Self::Owned(_) => None,
-        }
-    }
     pub fn into_shared(self) -> Option<SharedRights> {
         match self {
             Self::Shared(rights) => Some(rights),
             Self::Owned(link) => Some(link.rights()),
-            _ => None,
         }
     }
     pub fn for_receiver(
@@ -40,33 +101,39 @@ impl QueuedRights {
             Ok(Some(Self::Shared(rights)))
         }
     }
-    pub fn legacy(id: u64, link: Option<Arc<ownership::Link>>) -> Self {
-        link.map_or(Self::Owner(id), |link| Self::OwnerGraph {
-            id,
-            _graph: link,
-        })
-    }
 }
 impl LocalRights {
-    pub(super) fn shared(&self) -> Option<SharedRights> {
+    pub(super) fn shared(&self) -> SharedRights {
+        let mut opens = Vec::with_capacity(self.0.len());
         let mut unix = false;
-        self.0
-            .iter()
-            .map(|open| match open {
-                OpenHandle::Shared(open) => {
-                    unix |= open.local.is_some()
-                        || matches!(open.control, Some(events::SharedControl::Uring(_)));
-                    Some(open.clone())
-                }
-                OpenHandle::Owner(_) => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(|opens| SharedRights::new(opens, unix))
+        for open in &self.0 {
+            let OpenHandle::Shared(open) = open else {
+                return SharedRights::from_handles(self.0.iter().cloned());
+            };
+            unix |= open.local.is_some()
+                || matches!(open.control, Some(events::SharedControl::Uring(_)));
+            opens.push(open.clone());
+        }
+        SharedRights::new(opens, unix)
     }
 }
 impl SharedRights {
     pub(super) fn new(opens: Vec<Arc<SharedOpenDescription>>, unix: bool) -> Self {
-        Self((!opens.is_empty()).then(|| opens.into()), unix)
+        Self(
+            (!opens.is_empty()).then(|| RightsSet::Shared(opens.into())),
+            unix,
+        )
+    }
+    fn from_handles(opens: impl IntoIterator<Item = OpenHandle>) -> Self {
+        let opens: Vec<_> = opens.into_iter().map(CarriedOpen::new).collect();
+        let unix = opens.iter().any(|o| {
+            o.metadata().local.is_some()
+                || matches!(o.metadata().control, Some(events::SharedControl::Uring(_)))
+        });
+        Self(
+            (!opens.is_empty()).then(|| RightsSet::Original(opens.into())),
+            unix,
+        )
     }
     pub fn is_empty(&self) -> bool {
         self.0.is_none()
@@ -78,10 +145,10 @@ impl SharedRights {
         self.0.as_ref().map_or(0, |opens| opens.len())
     }
     pub(super) fn iter(&self) -> impl Iterator<Item = &Arc<SharedOpenDescription>> {
-        self.0.iter().flat_map(|opens| opens.iter())
+        self.0.iter().flat_map(RightsSet::metadata)
     }
     pub fn local(&self) -> LocalRights {
-        LocalRights(self.iter().cloned().map(OpenHandle::Shared).collect())
+        LocalRights(self.0.iter().flat_map(RightsSet::originals).collect())
     }
 }
 
@@ -95,7 +162,7 @@ impl channel::Resource {
         identity: [u32; 3],
     ) -> Option<Result<usize>> {
         if rights.is_empty() {
-            return Some(self.send_credentials(side, bytes, flags, None, Some(identity)));
+            return Some(self.send_credentials(side, bytes, flags, Some(identity)));
         }
         Some(self.send_shared(side, bytes, flags, rights.clone(), Some(identity)))
     }
@@ -142,8 +209,8 @@ impl channel::Resource {
 }
 
 impl DescriptorFactory {
-    /// Missing/invalid descriptors retain normal error order. An owner-only
-    /// object defers the complete message before any bytes or rights are sent.
+    /// One original Files transaction captures complete descriptions. Opaque
+    /// control lifetime does not grant additional byte/control execution authority.
     pub fn send_local_rights(&self, fds: &[u32]) -> Option<Result<SharedRights>> {
         if fds.is_empty() {
             return Some(Ok(SharedRights::default()));
@@ -151,24 +218,49 @@ impl DescriptorFactory {
         if fds.len() > 253 {
             return Some(Err(Errno(22)));
         }
-        let entries = self.files.0.entries.lock().unwrap();
-        let mut rights = Vec::with_capacity(fds.len());
-        let mut unix = false;
-        for fd in fds {
-            let Some(slot) = entries.get(fd) else {
-                return Some(Err(Errno(9)));
-            };
-            let open = slot.shared_open()?;
-            let open = match open {
-                Ok(open) => open,
-                Err(e) => return Some(Err(e)),
-            };
-            unix |= open.local.is_some()
-                || matches!(open.control, Some(events::SharedControl::Uring(_)));
-            rights.push(open.clone());
-        }
-        Some(Ok(SharedRights::new(rights, unix)))
+        let (shared, originals) = {
+            let entries = self.files.0.entries.lock().unwrap();
+            let mut shared = Vec::with_capacity(fds.len());
+            let mut originals: Option<Vec<OpenHandle>> = None;
+            for fd in fds {
+                let Some(slot) = entries.get(fd) else {
+                    return Some(Err(Errno(9)));
+                };
+                match &slot.open {
+                    fd_table::SlotOpen::Shared(open) => {
+                        if open.pipe.as_ref().is_some_and(|p| p.has_waiter()) {
+                            return Some(Err(Errno(9)));
+                        }
+                        if let Some(originals) = &mut originals {
+                            originals.push(OpenHandle::Shared(open.clone()));
+                        } else {
+                            shared.push(open.clone());
+                        }
+                    }
+                    fd_table::SlotOpen::Owner(open, ..) => {
+                        originals
+                            .get_or_insert_with(|| {
+                                std::mem::take(&mut shared)
+                                    .into_iter()
+                                    .map(OpenHandle::Shared)
+                                    .collect()
+                            })
+                            .push(open.clone());
+                    }
+                }
+            }
+            (shared, originals)
+        };
+        Some(Ok(if let Some(originals) = originals {
+            SharedRights::from_handles(originals)
+        } else {
+            let unix = shared.iter().any(|o| {
+                o.local.is_some() || matches!(o.control, Some(events::SharedControl::Uring(_)))
+            });
+            SharedRights::new(shared, unix)
+        }))
     }
+
     /// Import into the original real Files domain as one publication. Excess
     /// rights are dropped after releasing Files; no resource destructor or
     /// readiness callback executes under that membership lock.
@@ -181,31 +273,38 @@ impl DescriptorFactory {
         if rights.is_empty() {
             return (Vec::new(), false);
         }
+        let originals = rights
+            .0
+            .iter()
+            .flat_map(RightsSet::originals)
+            .take(capacity)
+            .map(|open| {
+                fd_table::Slot::from_descriptor(&Descriptor {
+                    open,
+                    cloexec: cloexec.into(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut slots = originals.into_iter();
         let mut fds = Vec::new();
         {
             let mut entries = self.files.0.entries.lock().unwrap();
-            for open in rights.iter().take(capacity) {
+            while slots.len() != 0 {
                 let Some(fd) = entries
                     .available(0)
                     .filter(|fd| *fd < self.files.descriptor_limit())
                 else {
                     break;
                 };
-                let previous = entries.insert(
-                    fd,
-                    fd_table::Slot {
-                        open: fd_table::SlotOpen::Shared(open.clone()),
-                        cloexec: cloexec.into(),
-                        proc: None,
-                    },
-                );
-                debug_assert!(previous.is_none());
+                assert!(entries.insert(fd, slots.next().unwrap()).is_none());
                 fds.push(fd);
             }
             if !fds.is_empty() {
                 self.files.changed(&mut entries);
             }
         }
+        drop(slots);
+
         let truncated = fds.len() < rights.len();
         (fds, truncated)
     }

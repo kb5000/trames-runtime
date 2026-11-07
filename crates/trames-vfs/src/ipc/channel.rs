@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Shared AF_UNIX bytes/state. Rights are opaque tokens, resolved only by the
-//! owning VFS thread; no Rc, guest pointer or descriptor table crosses here.
+//! Shared AF_UNIX bytes/state and original owning rights. No guest pointer or
+//! mutable descriptor table crosses a queued message.
 use super::super::*;
 use super::shared_rights::{QueuedRights, SharedRights};
 use crate::readiness::Readiness;
@@ -42,9 +42,6 @@ pub(crate) struct Resource {
     pub readiness: Arc<Readiness>,
 }
 impl Resource {
-    pub(super) fn alive(&self, side: usize) -> bool {
-        self.data.lock().unwrap().alive[side]
-    }
     pub fn kind(&self) -> u32 {
         self.kind
     }
@@ -162,7 +159,7 @@ impl Resource {
         });
         Ok(())
     }
-    pub fn close(&self, side: usize) -> Vec<u64> {
+    pub fn close(&self, side: usize) {
         let packets = self.change(|data| {
             data.alive[side] = false;
             data.used[side] = 0;
@@ -171,11 +168,7 @@ impl Resource {
             }
             std::mem::take(&mut data.queues[side])
         });
-        // Rights can run final-close callbacks; never drop them under Data.
-        packets
-            .into_iter()
-            .filter_map(|p| p.rights.as_ref().and_then(QueuedRights::owner))
-            .collect()
+        drop(packets); // Final close and owning-graph retirement run outside Data.
     }
     pub fn send_check(&self, side: usize, flags: u32) -> Result<()> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -188,17 +181,9 @@ impl Resource {
         side: usize,
         bytes: &[u8],
         flags: u32,
-        rights: Option<u64>,
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
-        self.send_ancillary(
-            side,
-            bytes,
-            flags,
-            rights.map(QueuedRights::Owner),
-            identity,
-            Vec::new(),
-        )
+        self.send_ancillary(side, bytes, flags, None, identity, Vec::new())
     }
     pub(super) fn send_shared(
         &self,
@@ -299,8 +284,8 @@ impl Resource {
             Ok(count)
         })
     }
-    /// None is before effects for actual owner-only rights. Shared metadata is
-    /// returned outside Data, including when a raw byte read discards rights.
+    /// Ancillary data leaves Data before final-close callbacks. Plain byte
+    /// projections may defer before consuming a packet requiring ancillary ABI.
     pub fn recv(
         &self,
         side: usize,
@@ -308,7 +293,7 @@ impl Resource {
         flags: u32,
         allow_rights: bool,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, if allow_rights { 2 } else { 0 })
+        self.recv_mode(side, count, flags, allow_rights)
     }
     pub(crate) fn recv_portable(
         &self,
@@ -316,14 +301,14 @@ impl Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, 1)
+        self.recv_mode(side, count, flags, true)
     }
     fn recv_mode(
         &self,
         side: usize,
         count: usize,
         flags: u32,
-        mode: u8,
+        ancillary: bool,
     ) -> Option<Result<Received>> {
         if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Some(Err(Errno(95)));
@@ -353,11 +338,10 @@ impl Resource {
             }
             if self.kind != 1 {
                 let packet = queue.front().expect("packet");
-                if mode == 1 && packet.rights.as_ref().is_some_and(|r| r.owner().is_some())
-                    || mode == 0
-                        && (packet.rights.is_some()
-                            || packet.credentials.is_some()
-                            || packet.timestamp.is_some())
+                if !ancillary
+                    && (packet.rights.is_some()
+                        || packet.credentials.is_some()
+                        || packet.timestamp.is_some())
                 {
                     return None;
                 }
@@ -387,7 +371,7 @@ impl Resource {
                 if packet.credentials != credentials || packet.timestamp != timestamp {
                     break;
                 }
-                if mode == 0 && (packet.credentials.is_some() || packet.timestamp.is_some()) {
+                if !ancillary && (packet.credentials.is_some() || packet.timestamp.is_some()) {
                     return None;
                 }
                 let n = (count - bytes.len()).min(packet.data.len());
@@ -396,9 +380,7 @@ impl Resource {
                     // A plain prefix ending before the rights-bearing packet
                     // can complete locally. Crossing its boundary defers the
                     // entire call before any queue or guest-memory effects.
-                    if mode == 0
-                        || mode == 1 && packet.rights.as_ref().is_some_and(|r| r.owner().is_some())
-                    {
+                    if !ancillary {
                         return None;
                     }
                     rights = packet.rights.clone();

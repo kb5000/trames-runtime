@@ -172,13 +172,4 @@ impl<R: Clone> PreparedTransfer<R> {
             Self::Packet(prepared) => prepared.progress(memory, io),
         }
     }
-    pub fn owner(
-        &self,
-        rights: impl Fn(&R) -> trames_vfs::LocalRights,
-    ) -> PreparedTransfer<trames_vfs::LocalRights> {
-        match self {
-            Self::Message(prepared) => PreparedTransfer::Message(prepared.owner(rights)),
-            Self::Packet(prepared) => PreparedTransfer::Packet(prepared.clone()),
-        }
-    }
 }

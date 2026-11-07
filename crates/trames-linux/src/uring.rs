@@ -81,12 +81,10 @@ impl Linux {
     }
     pub(crate) fn uring_register(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let ring = self.vfs.uring(a[0] as u32)?;
-        let result = register(&ring, a, memory, true, |fd| {
+        register(&ring, a, memory, true, |fd| {
             Some(self.vfs.retain_uring_file(fd))
         })
-        .expect("owner has original Files and pin authority");
-        self.vfs.reap_uring_files();
-        result
+        .expect("owner has original Files and pin authority")
     }
 
     fn uring_request(
@@ -298,7 +296,7 @@ impl Linux {
         if changed || count != 0 {
             ring.notify_completion(event);
         }
-        self.vfs.reap_uring_files();
+
         changed || count != 0
     }
     /// Existing joined scheduling checkpoints drive only rings with accepted
@@ -327,7 +325,6 @@ impl Linux {
     pub fn cancel_uring(&mut self, memory: &mut Memory, task: u32) {
         let owner = memory.instruction_identity().0;
         crate::UringActor::cancel_task_rings(self.uring_rings(), owner, task);
-        self.vfs.reap_uring_files();
     }
     pub fn uring_deadline(&self) -> Option<Instant> {
         self.uring_rings()

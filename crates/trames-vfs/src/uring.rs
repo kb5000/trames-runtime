@@ -122,7 +122,7 @@ impl RetainedFd {
 pub struct UringFile {
     lease: Option<Arc<ipc::ownership::Link>>,
     file: SharedFd,
-    owner: Option<(u64, Arc<()>)>,
+    original: Option<RetainedFd>,
 }
 impl UringFile {
     pub fn socket_control(&self) -> Option<Result<SocketControlOperation>> {
@@ -134,7 +134,7 @@ impl UringFile {
         })
     }
     pub fn shared_file(&self) -> Option<SharedFd> {
-        self.owner.is_none().then(|| self.file.clone())
+        self.original.is_none().then(|| self.file.clone())
     }
     pub fn is_eventfd(&self) -> bool {
         matches!(
@@ -143,7 +143,7 @@ impl UringFile {
         )
     }
     pub fn is_signalfd(&self) -> bool {
-        self.owner.is_none()
+        self.original.is_none()
             && matches!(
                 self.file.open.control,
                 Some(events::SharedControl::Signal(_))
@@ -156,21 +156,14 @@ impl UringFile {
         self.file.ofd_identity()
     }
     pub fn retained(&self) -> RetainedFd {
-        assert!(self.owner.is_none(), "owner control needs its original VFS");
+        assert!(
+            self.original.is_none(),
+            "owner control needs its original VFS"
+        );
         self.file.clone().retained()
     }
-    fn retained_in(&self, vfs: &Vfs) -> RetainedFd {
-        if let Some((id, _)) = &self.owner {
-            vfs.local_rights
-                .uring
-                .borrow()
-                .get(id)
-                .expect("original owner control ledger")
-                .1
-                .clone()
-        } else {
-            self.retained()
-        }
+    fn retained_in(&self, _vfs: &Vfs) -> RetainedFd {
+        self.original.clone().unwrap_or_else(|| self.retained())
     }
     pub fn same_file(&self, other: &Self) -> bool {
         self.identity() == other.identity()
@@ -241,7 +234,7 @@ impl RetainedFd {
             .map(|file| UringFile {
                 lease: None,
                 file,
-                owner: None,
+                original: None,
             })
             .ok_or(Errno(95))
     }
@@ -467,7 +460,7 @@ impl Uring {
             lease.map(|lease| UringFile {
                 lease,
                 file: file.file.clone(),
-                owner: file.owner.clone(),
+                original: file.original.clone(),
             }),
             UringRetirement(retired),
         )
@@ -796,19 +789,12 @@ impl Vfs {
         if retained.shared_file().is_some() {
             return retained.uring_file();
         }
-        self.reap_uring_files();
-        let id = trames_memory::new_backing_identity();
-        let token = Arc::new(());
         let file = SharedFd::new(retained.0.open.borrow().shared.clone());
-        self.local_rights.retain_uring(id, &token, retained);
         Ok(UringFile {
             lease: None,
             file,
-            owner: Some((id, token)),
+            original: Some(retained),
         })
-    }
-    pub fn reap_uring_files(&self) {
-        self.local_rights.reap_uring();
     }
     pub fn retain_uring_fd(&self, fd: u32) -> Result<RetainedFd> {
         let descriptor = self.descriptor(fd)?;

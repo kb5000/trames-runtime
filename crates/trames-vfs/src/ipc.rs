@@ -57,7 +57,6 @@ impl LocalRights {
 }
 struct Channel {
     resource: Arc<channel::Resource>,
-    next_right: AtomicU64,
 }
 impl Channel {
     fn ends(&self) -> &[std::sync::Weak<LocalResource>; 2] {
@@ -92,7 +91,6 @@ impl LocalChannel {
         Self {
             initial: std::sync::Mutex::new(Some(Arc::new(Channel {
                 resource: channel::Resource::new(kind, false),
-                next_right: AtomicU64::new(0),
             }))),
             paired: Default::default(),
         }
@@ -122,167 +120,11 @@ impl LocalChannel {
         self.paired.get().map_or(0, |binding| binding.side)
     }
 }
-struct OwnerEntry {
-    channel: std::sync::Weak<Channel>,
-    side: usize,
-    data: Ancillary,
-}
-#[derive(Default)]
-pub(super) struct OwnerLedger {
-    // Only legacy control ownership edits this count. Empty ordinary socket
-    // views do not acquire either ledger lock just to release their projection.
-    // Publication/consumption still synchronize through the channel/ring and
-    // the original ledger guards; this scalar carries no payload visibility.
-    pending: std::sync::atomic::AtomicUsize,
-    entries: SharedCell<BTreeMap<(usize, u64), OwnerEntry>>,
-    pub(super) uring: SharedCell<BTreeMap<u64, (std::sync::Weak<()>, RetainedFd)>>,
-}
-impl OwnerLedger {
-    fn closed_entries(&self) -> Vec<((usize, u64), std::sync::Weak<Channel>)> {
-        let candidates: Vec<_> = self
-            .entries
-            .borrow()
-            .iter()
-            .map(|(key, entry)| (*key, entry.channel.clone(), entry.side))
-            .collect();
-        // Socket operations acquire their channel before this ledger. Inspect
-        // liveness without ledger custody; closure of an endpoint is final.
-        candidates
-            .into_iter()
-            .filter_map(|(key, channel, side)| {
-                channel
-                    .upgrade()
-                    .is_none_or(|channel| !channel.resource.alive(side))
-                    .then_some((key, channel))
-            })
-            .collect()
-    }
-    fn reap(&self) {
-        if self.pending.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        self.reap_uring();
-        loop {
-            let closed = self.closed_entries();
-            let removed: Vec<_> = {
-                let mut entries = self.entries.borrow_mut();
-                let removed: Vec<_> = closed
-                    .into_iter()
-                    .filter_map(|(key, channel)| {
-                        entries
-                            .get(&key)
-                            .is_some_and(|entry| entry.channel.ptr_eq(&channel))
-                            .then(|| entries.remove(&key))
-                            .flatten()
-                    })
-                    .collect();
-                self.pending.fetch_sub(removed.len(), Ordering::Relaxed);
-                removed
-            };
-            if removed.is_empty() {
-                break;
-            }
-            // A released owner FD may close another channel. Drop outside the
-            // ledger borrow, then drain only newly closed resources.
-            drop(removed);
-        }
-    }
-    pub(super) fn retain_uring(&self, id: u64, token: &Arc<()>, file: RetainedFd) {
-        let mut entries = self.uring.borrow_mut();
-        assert!(entries.insert(id, (Arc::downgrade(token), file)).is_none());
-        self.pending.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(super) fn reap_uring(&self) {
-        if self.pending.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        // A retained control retires on the thread collecting its original
-        // token. Destructors run after ledger custody, including nested closes.
-        let removed: Vec<_> = {
-            let mut entries = self.uring.borrow_mut();
-            let dead: Vec<_> = entries
-                .iter()
-                .filter_map(|(id, (live, _))| (live.strong_count() == 0).then_some(*id))
-                .collect();
-            let removed: Vec<_> = dead
-                .into_iter()
-                .filter_map(|id| entries.remove(&id))
-                .collect();
-            self.pending.fetch_sub(removed.len(), Ordering::Relaxed);
-            removed
-        };
-        drop(removed);
-    }
-    fn needs_reap(&self) -> bool {
-        if self.pending.load(Ordering::Relaxed) == 0 {
-            return false;
-        }
-        if self
-            .uring
-            .borrow()
-            .values()
-            .any(|(live, _)| live.strong_count() == 0)
-        {
-            return true;
-        }
-        !self.closed_entries().is_empty()
-    }
-    fn insert(&self, channel: &Arc<Channel>, side: usize, id: u64, data: Ancillary) {
-        let previous = {
-            let mut entries = self.entries.borrow_mut();
-            let previous = entries.insert(
-                (Arc::as_ptr(channel) as usize, id),
-                OwnerEntry {
-                    channel: Arc::downgrade(channel),
-                    side,
-                    data,
-                },
-            );
-            if previous.is_none() {
-                self.pending.fetch_add(1, Ordering::Relaxed);
-            }
-            previous
-        };
-        drop(previous);
-    }
-    fn get(&self, channel: &Arc<Channel>, id: u64) -> Ancillary {
-        self.entries
-            .borrow()
-            .get(&(Arc::as_ptr(channel) as usize, id))
-            .expect("queued rights")
-            .data
-            .clone()
-    }
-    fn remove(&self, channel: &Arc<Channel>, id: u64) -> Option<Ancillary> {
-        let mut entries = self.entries.borrow_mut();
-        let removed = entries.remove(&(Arc::as_ptr(channel) as usize, id));
-        if removed.is_some() {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-        }
-        removed.map(|entry| entry.data)
-    }
-}
 /// Ancillary access to the same actual shared socket resource.
 /// No mutable connection or address state is stored in this projection.
 pub struct LocalSocket {
     core: Arc<LocalResource>,
-    // Fields drop in declaration order: release the core before reaping its
-    // legacy control rights on the releasing view's thread.
-    owner: OwnerView,
     _ownership: Option<Arc<ownership::Ownership>>,
-}
-#[derive(Clone, Default)]
-pub(super) struct OwnerView(Arc<OwnerLedger>);
-impl std::ops::Deref for OwnerView {
-    type Target = OwnerLedger;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Drop for OwnerView {
-    fn drop(&mut self) {
-        self.0.reap();
-    }
 }
 impl std::ops::Deref for LocalSocket {
     type Target = LocalResource;
@@ -291,10 +133,6 @@ impl std::ops::Deref for LocalSocket {
     }
 }
 
-#[derive(Clone)]
-struct Ancillary {
-    rights: LocalRights,
-}
 pub struct LocalResource {
     ownership: std::sync::Weak<ownership::Ownership>,
     namespace: Arc<SharedCell<LocalNamespace>>,
@@ -438,10 +276,7 @@ impl LocalResource {
         Arc::get_mut(&mut resource)
             .expect("pair before resource publication")
             .ends = [Arc::downgrade(a), Arc::downgrade(b)];
-        let channel = Arc::new(Channel {
-            resource,
-            next_right: AtomicU64::new(0),
-        });
+        let channel = Arc::new(Channel { resource });
         for (side, (end, peer)) in [(a, b), (b, a)].into_iter().enumerate() {
             *end.peer_name.borrow_mut() = peer.name.borrow().clone();
             end.peer_credentials.set(peer.credentials.get());
@@ -598,7 +433,6 @@ impl LocalResource {
             self.side(),
             bytes,
             flags,
-            None,
             Some(self.credentials.get()),
         )
     }
@@ -627,53 +461,19 @@ impl LocalSocket {
         }
         let binding = self.channel.borrow();
         if rights.is_empty() {
-            return binding.resource.send_credentials(
-                self.side(),
-                bytes,
-                flags,
-                None,
-                Some(credentials),
-            );
+            return binding
+                .resource
+                .send_credentials(self.side(), bytes, flags, Some(credentials));
         }
-        // Portable sets exclude Unix owning graphs. Their actual resources
-        // travel with the packet without an owner-only ledger.
-        if let Some(shared) = rights.shared() {
-            return binding.resource.send_shared(
-                self.side(),
-                bytes,
-                flags,
-                shared,
-                Some(credentials),
-            );
-        }
-        binding.resource.send_check(self.side(), flags)?;
-        let peer = binding.ends()[1 - self.side()]
-            .upgrade()
-            .ok_or(Errno(if self.kind == 2 { 111 } else { 32 }))?;
-        let graph = ownership::Ownership::legacy(&peer, &rights)?;
-        if self.kind == 1 && bytes.is_empty() {
-            return Ok(0);
-        }
-        let id = binding
-            .next_right
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| Errno(75))?;
-        self.owner
-            .insert(&binding, 1 - self.side(), id, Ancillary { rights });
-        let result = binding.resource.send_ancillary(
+        binding.resource.send_shared(
             self.side(),
             bytes,
             flags,
-            Some(shared_rights::QueuedRights::legacy(id, graph)),
+            rights.shared(),
             Some(credentials),
-            Vec::new(),
-        );
-        if result.is_err() {
-            let unused = self.owner.remove(&binding, id);
-            drop(unused); // Never destroy rights while borrowing their ledger.
-        }
-        result
+        )
     }
+
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
         if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
@@ -689,28 +489,17 @@ impl LocalSocket {
             .resource
             .recv(self.side(), count, flags, true)
             .expect("owner may receive rights")?;
-        let ancillary = if let Some(rights) = received.rights {
-            if let Some(id) = rights.owner() {
-                if flags & 2 != 0 {
-                    self.owner.get(&binding, id)
-                } else {
-                    self.owner.remove(&binding, id).expect("received rights")
-                }
-            } else {
-                Ancillary {
-                    rights: rights.into_shared().expect("shared rights").local(),
-                }
-            }
-        } else {
-            Ancillary {
-                rights: LocalRights::default(),
-            }
-        };
+        let rights = received.rights.map_or_else(LocalRights::default, |rights| {
+            rights
+                .into_shared()
+                .expect("complete carried rights")
+                .local()
+        });
         Ok(LocalReceived {
             data: received.data,
             length: received.length,
             truncated: received.truncated,
-            rights: ancillary.rights,
+            rights,
             credentials: if self.passcred.load(Ordering::Relaxed) {
                 received.credentials.or(Some([0, 65534, 65534]))
             } else {
@@ -755,11 +544,10 @@ impl Drop for LocalResource {
     }
 }
 impl LocalSocket {
-    pub(super) fn view(core: Arc<LocalResource>, owner: OwnerView) -> Rc<Self> {
+    pub(super) fn view(core: Arc<LocalResource>) -> Rc<Self> {
         let ownership = core.ownership.upgrade();
         Rc::new(Self {
             core,
-            owner,
             _ownership: ownership,
         })
     }
@@ -767,13 +555,7 @@ impl LocalSocket {
 
 impl Vfs {
     pub fn local_view(&self, core: Arc<LocalResource>) -> Rc<LocalSocket> {
-        LocalSocket::view(core, self.local_rights.clone())
-    }
-    pub fn reap_local_rights(&self) {
-        self.local_rights.reap();
-    }
-    pub fn local_rights_need_owner(&self) -> bool {
-        self.local_rights.needs_reap()
+        LocalSocket::view(core)
     }
     fn new_local(&self, kind: u32) -> Result<Rc<LocalSocket>> {
         self.new_local_in(kind, &self.root_network)
@@ -793,7 +575,7 @@ impl Vfs {
             network.clone(),
             Arc::downgrade(&self.shared_files().0.local_ownership),
         )?;
-        Ok(LocalSocket::view(core, self.local_rights.clone()))
+        Ok(LocalSocket::view(core))
     }
 
     pub(super) fn local_description(
@@ -805,6 +587,7 @@ impl Vfs {
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    owner,
                     console: Default::default(),
                     oom: None,
                     network_control: None,
@@ -825,7 +608,6 @@ impl Vfs {
                     control: None,
                     read_node: None,
                     id,
-                    owner,
                     kind: FdKind::Socket,
                     flags: (2 | (flags & O_NONBLOCK)).into(),
                     file_position: Arc::default(),
@@ -928,7 +710,7 @@ impl Vfs {
             );
         }
         drop(rights);
-        self.reap_local_rights();
+
         (free, truncated)
     }
     pub fn local_socket(&self, fd: u32) -> Result<Option<Rc<LocalSocket>>> {
@@ -938,7 +720,7 @@ impl Vfs {
             .borrow()
             .local
             .clone()
-            .map(|core| LocalSocket::view(core, self.local_rights.clone())))
+            .map(LocalSocket::view))
     }
     pub fn socketpair(&mut self, family: u32, kind: u32, protocol: u32) -> Result<[u32; 2]> {
         self.descriptor_factory()

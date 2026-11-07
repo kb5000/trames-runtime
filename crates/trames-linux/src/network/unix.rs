@@ -388,23 +388,6 @@ pub(crate) fn prepare_message<I: MessageIo>(
     }
 }
 impl<R: Clone> PreparedMessage<R> {
-    fn owner(
-        &self,
-        rights: impl Fn(&R) -> trames_vfs::LocalRights,
-    ) -> PreparedMessage<trames_vfs::LocalRights> {
-        PreparedMessage {
-            frame: self.frame.clone(),
-            args: self.args,
-            receive: self.receive,
-            send: self
-                .send
-                .as_ref()
-                .map(|(bytes, value, identity)| (bytes.clone(), rights(value), *identity)),
-        }
-    }
-    /// A later VM transaction can invalidate an imported destination. Recheck
-    /// those original ranges before consuming a queued message, without
-    /// importing another header/iovec or changing their accepted addresses.
     pub(crate) fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
         if !self.receive {
             return Ok(());
@@ -556,29 +539,6 @@ impl<R: Clone> PreparedMessage<R> {
     }
 }
 
-pub(crate) fn progress_owned(
-    prepared: &PreparedTransfer<trames_vfs::SharedRights>,
-    vfs: &mut trames_vfs::Vfs,
-    socket: &std::rc::Rc<trames_vfs::LocalSocket>,
-    nonblocking: u32,
-    memory: &mut impl CpuMemory,
-    datagram: Option<&DatagramState>,
-) -> Result<u64> {
-    prepared.recheck(memory)?;
-    prepared
-        .owner(trames_vfs::SharedRights::local)
-        .progress(
-            memory,
-            &mut OwnerMessage {
-                vfs,
-                socket,
-                nonblocking,
-                datagram,
-            },
-        )
-        .expect("owner accepted Unix transfer")
-}
-
 fn packet_transfer(
     number: u32,
     args: [u64; 6],
@@ -651,27 +611,6 @@ impl Message {
             destination,
         })
     }
-}
-
-pub(crate) fn batch_owner_message(
-    vfs: &mut trames_vfs::Vfs,
-    socket: &std::rc::Rc<trames_vfs::LocalSocket>,
-    args: [u64; 6],
-    memory: &mut impl CpuMemory,
-    datagram: Option<&DatagramState>,
-) -> Result<u64> {
-    message(
-        211,
-        args,
-        memory,
-        &mut OwnerMessage {
-            vfs,
-            socket,
-            nonblocking: 0,
-            datagram,
-        },
-    )
-    .expect("owner batch item")
 }
 
 #[cfg(test)]

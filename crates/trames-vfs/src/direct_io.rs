@@ -1387,7 +1387,7 @@ impl DirectFd {
         }
         match &self.resource {
             ByteResource::Unix { data, side } => {
-                data.send_credentials(*side, bytes, flags, None, credentials)
+                data.send_credentials(*side, bytes, flags, credentials)
             }
             ByteResource::UnixDatagram(_) => self
                 .local_operation()

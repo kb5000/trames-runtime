@@ -59,7 +59,7 @@ impl Slot {
             },
         )
     }
-    fn from_descriptor(d: &Descriptor) -> Self {
+    pub(super) fn from_descriptor(d: &Descriptor) -> Self {
         Self {
             proc: matches!(d.open, OpenHandle::Owner(_)).then(|| {
                 let open = d.open.borrow();

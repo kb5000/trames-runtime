@@ -738,7 +738,6 @@ pub struct Vfs {
     uts: UtsNamespace,
     root_network: Arc<linux_namespace::RootNetwork>,
     path_bindings: ipc::PathBindings,
-    local_rights: ipc::OwnerView,
     ipc_namespace: Arc<linux_namespace::IpcNamespace>,
     cgroup_namespace: Arc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
@@ -823,7 +822,6 @@ impl Vfs {
             uts: self.uts.clone(),
             root_network: self.root_network.clone(),
             path_bindings: self.path_bindings.clone(),
-            local_rights: self.local_rights.clone(),
             ipc_namespace: self.ipc_namespace.clone(),
             cgroup_namespace: self.cgroup_namespace.clone(),
             pid_ns: self.pid_ns.clone(),
@@ -876,7 +874,6 @@ impl Vfs {
             uts: UtsNamespace::default(),
             root_network,
             path_bindings: ipc::PathBindings::default(),
-            local_rights: Default::default(),
             ipc_namespace: Arc::default(),
             cgroup_namespace: Arc::default(),
             pid_ns: pid_ns.clone(),
@@ -2686,13 +2683,13 @@ impl Vfs {
             if !self.detached_mounts.borrow().is_empty() {
                 self.reap_detached_mounts();
             }
-            self.reap_local_rights();
+
             return result;
         }
         let descriptor = self.fds.close(fd)?;
         self.release_record_locks(&descriptor);
         drop(descriptor);
-        self.reap_local_rights();
+
         self.reap_detached_mounts();
         Ok(())
     }
@@ -2710,7 +2707,7 @@ impl Vfs {
         // Task namespace transactions detach Files before UNSHARE reaches here.
         self.shared_files()
             .close_range(first, last, flags, self.lock_owner)?;
-        self.reap_local_rights();
+
         self.reap_detached_mounts();
         Ok(())
     }
@@ -2720,7 +2717,7 @@ impl Vfs {
             self.release_record_locks(d);
         }
         drop(descriptors);
-        self.reap_local_rights();
+
         self.reap_detached_mounts();
     }
     /// Detach a task's view while another task retains the shared file table.
@@ -2740,7 +2737,7 @@ impl Vfs {
     /// retired. Source exits must not re-run descriptor or process-lock release.
     pub fn collect_retired_descriptors(&mut self) {
         self.detach_file_table();
-        self.reap_local_rights();
+
         self.reap_detached_mounts();
     }
     pub fn file_table_owner(&self) -> FileTableOwner {

@@ -26,6 +26,7 @@ struct Message<'a> {
     identity: [u32; 3],
     datagram: Option<&'a crate::network::unix::DatagramState>,
     paths: Option<&'a trames_vfs::PathQueries>,
+    original_paths: Option<&'a trames_vfs::Vfs>,
 }
 impl crate::network::unix::MessageIo for Message<'_> {
     type Rights = trames_vfs::SharedRights;
@@ -61,7 +62,13 @@ impl crate::network::unix::MessageIo for Message<'_> {
                 flags,
                 rights,
                 identity,
-                || self.paths?.local_datagram(&datagram.source, destination),
+                || {
+                    if let Some(vfs) = self.original_paths {
+                        Some(vfs.resolve_local_datagram(&datagram.source, destination))
+                    } else {
+                        self.paths?.local_datagram(&datagram.source, destination)
+                    }
+                },
             );
         }
         if destination.is_some() {
@@ -94,77 +101,6 @@ impl crate::network::unix::MessageIo for Message<'_> {
     }
 }
 impl DirectSyscalls {
-    /// Raw read/readv can encounter legacy ancillary data too. Keep the actual
-    /// accepted OFD through the owner handoff, never reopen its numeric slot.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_owned_local_byte(
-        &self,
-        file: RetainedByte,
-        vfs: &mut trames_vfs::Vfs,
-        number: u32,
-        args: [u64; 6],
-        memory: &mut impl CpuMemory,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-    ) -> IoAttempt {
-        if file.fd.is_unix() && file.fd.local_kind() != 1 {
-            let direct = Self::default()
-                .with_resources(vfs.descriptor_factory())
-                .with_local_identity(
-                    self.local_identity
-                        .unwrap_or_else(|| vfs.local_sender_credentials()),
-                );
-            let prepared = match direct
-                .prepare_local_fd(&file.fd, number, args, memory)
-                .expect("owner datagram ABI")
-            {
-                Ok(prepared) => prepared,
-                Err(error) => return self.complete_byte(&file, Err(error)),
-            };
-            let owner = file
-                .fd
-                .shared_file()
-                .expect("accepted datagram OFD")
-                .retained();
-            return direct.start_owned_local_message(prepared, vfs, &owner, memory, pid, target);
-        }
-        let socket = file
-            .fd
-            .shared_file()
-            .expect("accepted Unix OFD")
-            .retained()
-            .local_socket(vfs)
-            .expect("original Unix socket");
-        let read = |count| socket.recv(count, 0).map(|received| received.data);
-        let write = |bytes: &[u8]| {
-            vfs.local_send_credentials(
-                &socket,
-                bytes,
-                0,
-                None,
-                trames_vfs::LocalRights::default(),
-                self.local_identity
-                    .unwrap_or_else(|| vfs.local_sender_credentials()),
-            )
-            .map(|count| count as u64)
-        };
-        let records = file.fd.readv_records();
-        let mut retry = || match number {
-            63 => Linux::read_transport(args, memory, read),
-            64 => Linux::write_transport(args, memory, &mut self.scratch.borrow_mut(), write),
-            65 => Linux::readv_transport_mode(args, memory, records, read),
-            66 => Linux::writev_transport_mode(
-                args,
-                memory,
-                &mut self.scratch.borrow_mut(),
-                false,
-                write,
-            ),
-            _ => unreachable!("raw Unix byte entry"),
-        };
-        let result = retry();
-        self.finish_owned_local(file, number, args, result, pid, target, retry)
-    }
     fn prepare_local_fd(
         &self,
         fd: &trames_vfs::DirectFd,
@@ -211,6 +147,7 @@ impl DirectSyscalls {
             identity,
             datagram: datagram.as_ref(),
             paths: self.paths.as_ref(),
+            original_paths: None,
         };
         Some(
             crate::network::unix::prepare_transfer(number, args, memory, &io)?.map(|prepared| {
@@ -254,23 +191,31 @@ impl DirectSyscalls {
     ) -> Option<Result<RetainedByte, Errno>> {
         self.prepare_local_fd(&file.fd, number, args, memory)
     }
-    pub fn start_owned_local_transfer(
+    /// Same accepted ABI on the caller's original path context. No private VFS
+    /// projection is constructed for a ready solo message or its byte consumers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_local_transfer(
         &self,
+        retained: Option<RetainedByte>,
         number: u32,
         args: [u64; 6],
-        vfs: &mut trames_vfs::Vfs,
+        vfs: &trames_vfs::Vfs,
         memory: &mut impl CpuMemory,
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
-        let fd = vfs.direct_descriptors().get(args[0] as u32)?;
-        if !fd.is_unix() {
-            return None;
-        }
-        Some(match self.prepare_local_fd(&fd, number, args, memory)? {
+        let prepared = if let Some(file) = retained {
+            Ok(file)
+        } else {
+            let fd = vfs.direct_descriptors().get(args[0] as u32)?;
+            if !fd.is_unix() {
+                return None;
+            }
+            self.prepare_local_fd(&fd, number, args, memory)?
+        };
+        Some(match prepared {
             Ok(file) => {
-                let owner = fd.shared_file().expect("accepted Unix OFD").retained();
-                self.start_owned_local_message(file, vfs, &owner, memory, pid, target)
+                self.start_byte_in(file, number, args, memory, pid, target, false, Some(vfs))
             }
             Err(error) => self.complete(number, args, Err(error)),
         })
@@ -281,6 +226,7 @@ impl DirectSyscalls {
         number: u32,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
+        original_paths: Option<&trames_vfs::Vfs>,
     ) -> Option<Result<u64, Errno>> {
         if let ByteOperation::Signal(read) = &file.operation {
             return Some(read.check(&file.fd, memory));
@@ -290,7 +236,17 @@ impl DirectSyscalls {
                 let Transfer::Batch(batch) = &accepted.transfer else {
                     unreachable!()
                 };
-                return batch.progress(self, accepted, &file.fd, memory, None);
+                let result = batch.progress(self, accepted, &file.fd, memory, original_paths);
+                if let Some(task) = self
+                    .task_signal
+                    .as_ref()
+                    .filter(|_| matches!(result, Some(Ok(_))))
+                {
+                    if batch.take_pipe_signal() {
+                        task.raise(13);
+                    }
+                }
+                return result;
             };
             if let Err(error) = prepared.recheck(memory) {
                 return Some(Err(error));
@@ -303,90 +259,12 @@ impl DirectSyscalls {
                     identity: accepted.identity,
                     datagram: datagram.as_ref(),
                     paths: self.paths.as_ref(),
+                    original_paths,
                 },
             )
         } else {
             self.transfer_fd(&file.fd, number, args, memory)
         }
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_owned_local_message(
-        &self,
-        file: RetainedByte,
-        vfs: &mut trames_vfs::Vfs,
-        owner: &trames_vfs::RetainedFd,
-        memory: &mut impl CpuMemory,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-    ) -> IoAttempt {
-        let accepted = file.message().cloned().expect("accepted local message");
-        let number = accepted.number;
-        let args = accepted.args;
-        let socket = owner.local_socket(vfs).expect("original local OFD");
-        let nonblocking = if file.fd.nonblocking() { 0x40 } else { 0 };
-        let fd = file.fd.clone();
-        let mut retry = || match &accepted.transfer {
-            Transfer::Single { prepared, datagram } => crate::network::unix::progress_owned(
-                prepared,
-                vfs,
-                &socket,
-                nonblocking,
-                memory,
-                datagram.as_ref(),
-            ),
-            Transfer::Batch(batch) => batch
-                .progress(self, &accepted, &fd, memory, Some((vfs, &socket)))
-                .expect("owner batch progress"),
-        };
-        let result = retry();
-        self.finish_owned_local(file, number, args, result, pid, target, retry)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn finish_owned_local(
-        &self,
-        file: RetainedByte,
-        number: u32,
-        args: [u64; 6],
-        result: Result<u64, Errno>,
-        pid: u32,
-        target: &Weak<dyn IoWake>,
-        retry: impl FnOnce() -> Result<u64, Errno>,
-    ) -> IoAttempt {
-        if result != Err(Errno(11))
-            || file.fd.nonblocking()
-            || socket_flags(number, args) & 0x40 != 0
-        {
-            return self.complete_byte(&file, result);
-        }
-        let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = file.subscribe(&signal);
-        // Subscribe then retry on the original owner: capacity/data becoming
-        // ready before subscription must not leave this call parked forever.
-        let result = retry();
-        if result != Err(Errno(11)) {
-            return self.complete_byte(&file, result);
-        }
-        IoAttempt::Blocked(PendingIo {
-            aio: None,
-            number,
-            args,
-            deadline: None,
-            signal,
-            flock: None,
-            retained_byte: Some(file),
-            retained_socket: None,
-            native_tcp: None,
-            resource_deadline: None,
-            retained_poll: None,
-            epoll_revision: None,
-            _subscriptions: subscriptions,
-            host_subscription: None,
-            socket_subscriptions: Vec::new(),
-            uring: None,
-            poll_uring: None,
-            file: None,
-            target: target.clone(),
-        })
     }
     pub(super) fn local_message(
         &self,
@@ -405,6 +283,7 @@ impl DirectSyscalls {
                 fd,
                 datagram: None,
                 paths: self.paths.as_ref(),
+                original_paths: None,
                 identity: self
                     .local_identity
                     .unwrap_or_else(|| factory.local_sender_credentials()),
@@ -525,7 +404,6 @@ mod tests {
         v.write(imported, b"alive").unwrap();
         assert_eq!(v.read(peer, 5).unwrap(), b"alive");
         assert_eq!(v.read(carried, 8).unwrap(), 99u64.to_le_bytes());
-        assert!(!v.local_rights_need_owner());
     }
     #[test]
     fn parked_shared_unix_rights_receive_resumes_without_an_owner_checkpoint() {
@@ -923,7 +801,7 @@ mod tests {
         let file = wait.retained_byte.clone().unwrap();
         drop(wait);
         let owner = v.retain_uring_fd(rx).unwrap();
-        assert!(owner.ofd_identity() == file.local_owner_identity().unwrap());
+        assert!(owner.ofd_identity() == file.ofd_identity());
         v.close(rx).unwrap();
         assert_eq!(v.eventfd(99, 0).unwrap(), rx);
         m.write(0x1000, &[0xff; 56]).unwrap();
@@ -1261,14 +1139,23 @@ mod tests {
         assert_eq!(v.read(tx, 8).unwrap(), 99u64.to_le_bytes());
     }
     #[test]
-    fn batch_partial_epipe_keeps_positive_count_and_defers_only_task_signal_delivery() {
+    fn batch_partial_datagram_epipe_returns_count_without_signal_or_owner_handoff() {
+        #[derive(Default)]
+        struct Signals(std::sync::atomic::AtomicUsize);
+        impl trames_vfs::TaskSignal for Signals {
+            fn raise(&self, signal: u32) {
+                assert_eq!(signal, 13);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         for no_signal in [false, true] {
             let (mut v, tx, rx) = datagrams();
             let bad = v.local_create(2, 0).unwrap();
             let socket = v.local_socket(bad).unwrap().unwrap();
             v.local_bind(&socket, b"\x01\x00/broken\0").unwrap();
             socket.shutdown(0).unwrap();
-            let d = datagram_direct(&v);
+            let signals = Arc::new(Signals::default());
+            let d = datagram_direct(&v).with_task_signal(signals.clone());
             let mut m = memory();
             batch_headers(&mut m, 2);
             m.write(0x1400, b"\x01\x00/target\0").unwrap();
@@ -1289,27 +1176,8 @@ mod tests {
             let attempt = d
                 .start(269, args, &mut m, 1, &Arc::downgrade(&target), None)
                 .unwrap();
-            if no_signal {
-                assert!(matches!(attempt, IoAttempt::Complete(Ok(1))));
-            } else {
-                let file = match attempt {
-                    IoAttempt::ByteCheckpoint(file) => file,
-                    _ => panic!("SIGPIPE needs task authority"),
-                };
-                assert!(file.batch_pipe_signal());
-                let owner = file.local_owner().unwrap();
-                assert!(matches!(
-                    d.start_owned_local_message(
-                        file,
-                        &mut v,
-                        &owner,
-                        &mut m,
-                        1,
-                        &Arc::downgrade(&target)
-                    ),
-                    IoAttempt::Complete(Ok(1))
-                ));
-            }
+            assert!(matches!(attempt, IoAttempt::Complete(Ok(1))));
+            assert_eq!(signals.0.load(std::sync::atomic::Ordering::Relaxed), 0);
             assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
             assert_eq!(v.read(rx, 4), Err(Errno(11)));
         }
@@ -1381,5 +1249,114 @@ mod tests {
             IoAttempt::Complete(Ok(1024))
         ));
         assert_eq!(v.read(rx, 4096).unwrap(), b"abcd".repeat(1024));
+    }
+}
+
+#[cfg(test)]
+mod signal_interleaving_tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions};
+    struct Shut(trames_vfs::LocalOperation);
+    impl IoWake for Shut {
+        fn wake_io(&self, _: &Arc<IoSignal>) {
+            self.0.shutdown(0).unwrap();
+        }
+    }
+    #[derive(Default)]
+    struct Signals(std::sync::atomic::AtomicUsize);
+    impl trames_vfs::TaskSignal for Signals {
+        fn raise(&self, n: u32) {
+            assert_eq!(n, 13);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn closed_unix_transports_match_linux_sigpipe_for_scalar_vector_message_and_batch() {
+        for kind in [1, 2, 5] {
+            for number in [64, 66, 206, 211, 269] {
+                for no_signal in [false, true] {
+                    if no_signal && matches!(number, 64 | 66) {
+                        continue;
+                    }
+                    let mut v = trames_vfs::Vfs::default();
+                    let [tx, rx] = v.socketpair(1, kind, 0).unwrap();
+                    v.local_socket(rx).unwrap().unwrap().shutdown(0).unwrap();
+                    let raised = Arc::new(Signals::default());
+                    let direct = DirectSyscalls::new(v.direct_descriptors())
+                        .with_resources(v.descriptor_factory())
+                        .with_task_signal(raised.clone());
+                    let mut m = Memory::default();
+                    m.map(0x1000, 4096, Permissions::RW).unwrap();
+                    m.write(0x1100, b"x").unwrap();
+                    m.write_array(0x1200, 0x1100u64.to_le_bytes()).unwrap();
+                    m.write_array(0x1208, 1u64.to_le_bytes()).unwrap();
+                    m.write_array(0x1310, 0x1200u64.to_le_bytes()).unwrap();
+                    m.write_array(0x1318, 1u64.to_le_bytes()).unwrap();
+                    let flags = if no_signal { 0x4000 } else { 0 };
+                    let args = match number {
+                        64 => [tx as u64, 0x1100, 1, 0, 0, 0],
+                        66 => [tx as u64, 0x1200, 1, 0, 0, 0],
+                        206 => [tx as u64, 0x1100, 1, flags, 0, 0],
+                        211 => [tx as u64, 0x1300, flags, 0, 0, 0],
+                        _ => [tx as u64, 0x1300, 1, flags, 0, 0],
+                    };
+                    let receiver = v.descriptor_factory().local_operation(rx).unwrap().unwrap();
+                    let wake: Arc<dyn IoWake> = Arc::new(Shut(receiver));
+                    assert!(
+                        matches!(
+                            direct
+                                .start(number, args, &mut m, 1, &Arc::downgrade(&wake), None)
+                                .unwrap(),
+                            IoAttempt::Complete(Err(Errno(32)))
+                        ),
+                        "kind={kind} number={number}"
+                    );
+                    assert_eq!(
+                        raised.0.load(std::sync::atomic::Ordering::Relaxed),
+                        usize::from(kind == 1 && !no_signal),
+                        "kind={kind} number={number}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn partial_stream_batch_signals_once_after_peer_shutdown_between_messages() {
+        let mut v = trames_vfs::Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let receiver = v.descriptor_factory().local_operation(rx).unwrap().unwrap();
+        let wake: Arc<dyn IoWake> = Arc::new(Shut(receiver));
+        let signal = IoSignal::new(1, Arc::downgrade(&wake));
+        let _subscription = v.direct_descriptors().get(rx).unwrap().subscribe(&signal);
+        let raised = Arc::new(Signals::default());
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_resources(v.descriptor_factory())
+            .with_task_signal(raised.clone());
+        let mut m = Memory::default();
+        m.map(0x1000, 4096, Permissions::RW).unwrap();
+        m.write(0x1100, b"x").unwrap();
+        m.write_array(0x1200, 0x1100u64.to_le_bytes()).unwrap();
+        m.write_array(0x1208, 1u64.to_le_bytes()).unwrap();
+        for header in [0x1300, 0x1340] {
+            m.write_array(header + 16, 0x1200u64.to_le_bytes()).unwrap();
+            m.write_array(header + 24, 1u64.to_le_bytes()).unwrap();
+        }
+        let target: Arc<dyn IoWake> = wake.clone();
+        assert!(matches!(
+            direct
+                .start(
+                    269,
+                    [tx as u64, 0x1300, 2, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None
+                )
+                .unwrap(),
+            IoAttempt::Complete(Ok(1))
+        ));
+        assert_eq!(raised.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(m.read_array::<4>(0x1338).unwrap(), 1u32.to_le_bytes());
+        assert_eq!(m.read_array::<4>(0x1378).unwrap(), [0; 4]);
     }
 }

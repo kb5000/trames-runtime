@@ -131,7 +131,6 @@ fn owning_unix_rights_cross_forked_files_and_close_reuse_without_owner_services(
                 counter.to_le_bytes()
             );
             assert_eq!(task.seccomp.evaluations(), 10);
-            assert!(!task.linux.vfs.local_rights_need_owner());
         }
         assert_eq!(
             k.processes
@@ -1275,7 +1274,12 @@ fn filtered_unix_rights_resume_on_one_worker_after_owner_fd_reuse_without_rechec
         .unwrap());
     let mut p = k.processes.remove(&1).unwrap();
     assert!(matches!(p.state, State::Blocked(212, _)));
-    assert!(p.retained_message_owner.is_some());
+    assert!(p
+        .byte_wait
+        .as_ref()
+        .and_then(|w| w.retained_byte.as_ref())
+        .or(p.retained_byte.as_ref())
+        .is_some_and(|f| f.local_message_entry().is_some()));
     Kernel::queue_one(1, &mut p, 19, 0);
     assert_eq!(k.deliver(1, &mut p), Ok(true));
     assert!(p.stopped());
@@ -2009,7 +2013,7 @@ fn joined_unix_raw_reads_keep_legacy_ancillary_and_original_wait_after_reuse() {
 }
 
 #[test]
-fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reuse() {
+fn local_message_resume_uses_the_worker_accepted_ofd_after_membership_reuse() {
     let mut p = super::tests::process();
     let mut k = super::tests::kernel();
     let [tx, rx] = p.linux.vfs.socketpair(1, 1, 0).unwrap();
@@ -2039,15 +2043,14 @@ fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reu
         trames_linux::IoAttempt::Blocked(wait) => wait.retained_byte.unwrap(),
         _ => panic!("expected original message wait"),
     };
-    let identity = file.local_owner_identity().unwrap();
+    let identity = file.ofd_identity();
     let files = p.linux.vfs.shared_files();
     std::thread::spawn(move || files.close(rx, 1).unwrap().unwrap())
         .join()
         .unwrap();
     assert_eq!(p.linux.vfs.eventfd(99, 0).unwrap(), rx);
     let call = crate::run_queue::IoCall::from_byte(file, 212, args);
-    p.retain_local_message_owner(Some(&call));
-    assert!(p.retained_message_owner.as_ref().unwrap().ofd_identity() == identity);
+    assert!(call.retained_byte.as_ref().unwrap().ofd_identity() == identity);
     p.retained_byte = call.retained_byte.clone();
     p.linux
         .vfs
@@ -2066,7 +2069,7 @@ fn local_message_owner_handoff_uses_the_worker_accepted_ofd_after_membership_reu
     assert_eq!(p.cpu.x(0), 4);
     assert_eq!(p.memory.read_array::<4>(0x1100).unwrap(), *b"real");
     assert_eq!(p.linux.vfs.read(rx, 8).unwrap(), 99u64.to_le_bytes());
-    assert!(p.retained_message_owner.is_none());
+    assert!(p.retained_byte.is_none() && p.byte_wait.is_none());
 }
 
 #[test]
@@ -2651,7 +2654,7 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
 }
 
 #[test]
-fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filter_entry() {
+fn partial_worker_datagram_epipe_keeps_count_and_filter_entry_without_a_signal() {
     for no_signal in [false, true] {
         let mut p = super::tests::process();
         let mut k = super::tests::kernel();
@@ -2733,10 +2736,7 @@ fn partial_worker_batch_epipe_queues_one_task_signal_and_keeps_the_original_filt
         }
         assert_eq!(k.processes.read(&1).memory.read_u64(0x1800).unwrap(), 1);
         assert_eq!(k.processes.read(&1).seccomp.evaluations(), 3);
-        assert_eq!(
-            k.processes.read(&1).signals.io.inbox.contains_key(&13),
-            !no_signal
-        );
+        assert!(!k.processes.read(&1).signals.io.inbox.contains_key(&13));
         let p = &mut *k.processes.get_mut(&1).unwrap();
         assert_eq!(p.linux.vfs.read(rx, 4).unwrap(), b"data");
         assert_eq!(p.linux.vfs.read(rx, 4), Err(Errno(11)));
