@@ -2,6 +2,10 @@
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 #![recursion_limit = "512"]
 mod bpf;
+mod console;
+#[cfg(unix)]
+pub use console::NativeConsole;
+pub use console::{CapturedBytes, CapturedConsole, ConsoleCallbacks, ConsoleIo, ConsoleStream};
 pub mod capabilities;
 mod cgroup;
 pub use cgroup::{CgroupBirth, CgroupTask};
@@ -65,7 +69,7 @@ pub use readiness::{IoSignal, IoSubscription, IoWake};
 mod signal_reader;
 pub use signal_reader::SignalReader;
 pub use timer_io::TimerFd;
-pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness};
+pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness, ReadinessDriver};
 mod epoll;
 mod events;
 mod uring;
@@ -228,6 +232,7 @@ struct OpenDescription {
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Legacy ancillary, task and mount control projections retain owner ownership.
 struct SharedOpenDescription {
+    console: std::sync::OnceLock<console::ConsoleEndpoint>,
     oom: Option<std::sync::Weak<OomTask>>,
     network_control: Option<network::Control>,
     mount_file: Option<Arc<mounts::watch::MountFile>>,
@@ -932,6 +937,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            console: Default::default(),
                             oom: None,
                             network_control: None,
                             mount_file: None,
@@ -1282,6 +1288,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            console: Default::default(),
                             oom: None,
                             network_control: None,
                             mount_file: None,
@@ -2594,6 +2601,7 @@ impl Vfs {
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    console: Default::default(),
                     oom,
                     network_control,
                     mount_file,
@@ -3388,6 +3396,7 @@ impl Vfs {
                 Content::Terminal | Content::Fifo(_) => return Err(Errno(29)),
             }
         };
+        drop(n);
         let mut file_position = o.file_position.lock().unwrap();
         let base = match whence {
             0 => 0,

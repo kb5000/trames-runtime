@@ -169,7 +169,7 @@ mod tests {
             assert_eq!(epoch.drain().len(), 2);
             assert!(epoch.collect_lifecycle(&mut k).is_none());
             while let Some(event) = k.workers.event_timeout(Duration::ZERO).unwrap() {
-                assert!(!matches!(event, Event::VmReady | Event::Service(_)));
+                assert!(!matches!(event, Event::VmReady));
             }
             assert_eq!(k.vm_checkpoint_groups, 1);
         }

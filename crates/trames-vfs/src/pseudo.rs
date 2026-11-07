@@ -1377,6 +1377,7 @@ impl Vfs {
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    console: Default::default(),
                     oom: None,
                     network_control: None,
                     mount_file: None,

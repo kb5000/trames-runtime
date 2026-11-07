@@ -4,10 +4,6 @@
 //! Task handoff uses retained views; admitted path metadata uses the common
 //! resolver and shared inode objects. Lifecycle and namespace changes still join.
 //! No queue lock spans interpreter or native execution.
-#[cfg(all(test, trames_interpreter_conformance))]
-#[path = "coordination_cost.rs"]
-mod coordination_cost;
-
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -66,7 +62,7 @@ pub(super) struct Work<C: Cpu> {
     pub pid: u32,
     pub cpu: C,
     // Keep worker-local translation caches stationary through preparation,
-    // queues and services. Interpreter/native code still borrows the View itself.
+    // queues and resource waits. Interpreter/native code still borrows the View itself.
     pub memory: Option<Box<View>>,
     pub control: Arc<Control>,
     pub syscalls: Option<crate::worker_syscalls::Snapshot>,
@@ -163,120 +159,10 @@ pub(super) struct Done<C: Cpu> {
 }
 pub(super) enum Event<C: Cpu> {
     Done(Box<Done<C>>),
-    Service(Box<Request<C>>),
     EpochStopped(usize),
     VmReady,
     Retired,
     Idle,
-}
-/// A production request retains the task's original allocation and View. The
-/// coordinator may access this stopped caller, never Process::memory/CPU.
-pub(super) struct Request<C: Cpu> {
-    pub pid: u32,
-    pub pc: u64,
-    pub number: u32,
-    pub args: [u64; 6],
-    target: ReturnTo<C>,
-}
-// The test-only transport deliberately keeps its original by-value View
-// envelope for the existing coordinator cost experiment. Production has only
-// the small Cohort variant and no reply channel.
-#[cfg_attr(test, allow(clippy::large_enum_variant))]
-enum ReturnTo<C: Cpu> {
-    Cohort(ServiceReturn<C>),
-    #[cfg(all(test, trames_interpreter_conformance))]
-    Thread {
-        memory: View,
-        reply: mpsc::Sender<Reply>,
-    },
-}
-struct ServiceReturn<C: Cpu> {
-    job: Option<Box<crate::run_queue::Job<C>>>,
-    epoch: Arc<crate::run_queue::Epoch<C>>,
-    began: Instant,
-}
-impl<C: Cpu> Drop for ServiceReturn<C> {
-    fn drop(&mut self) {
-        if let Some(mut job) = self.job.take() {
-            job.stats.service_wait += self.began.elapsed();
-            // Return failure, wake idle workers and release the retained View.
-            // No dropped request can leave the cohort asleep indefinitely.
-            self.epoch.end_service(job, Err(()));
-        }
-    }
-}
-#[cfg(all(test, trames_interpreter_conformance))]
-struct Reply {
-    memory: View,
-    value: Option<u64>,
-    reply: mpsc::Sender<Reply>,
-}
-impl<C: Cpu> Request<C> {
-    fn for_epoch(
-        mut job: Box<crate::run_queue::Job<C>>,
-        epoch: Arc<crate::run_queue::Epoch<C>>,
-    ) -> Self {
-        job.stats.service_waits += 1;
-        epoch.start_service(job.work.pid);
-        Self {
-            pid: job.work.pid,
-            pc: job.work.cpu.pc(),
-            number: job.work.cpu.x(8) as u32,
-            args: std::array::from_fn(|i| job.work.cpu.x(i)),
-            target: ReturnTo::<C>::Cohort(ServiceReturn::<C> {
-                job: Some(job),
-                epoch,
-                began: Instant::now(),
-            }),
-        }
-    }
-    pub fn memory(&self) -> &View {
-        match &self.target {
-            ReturnTo::<C>::Cohort(pending) => pending
-                .job
-                .as_ref()
-                .unwrap()
-                .work
-                .memory
-                .as_deref()
-                .unwrap(),
-            #[cfg(all(test, trames_interpreter_conformance))]
-            ReturnTo::<C>::Thread { memory, .. } => memory,
-        }
-    }
-    pub fn memory_mut(&mut self) -> &mut View {
-        match &mut self.target {
-            ReturnTo::<C>::Cohort(pending) => pending
-                .job
-                .as_mut()
-                .unwrap()
-                .work
-                .memory
-                .as_deref_mut()
-                .unwrap(),
-            #[cfg(all(test, trames_interpreter_conformance))]
-            ReturnTo::<C>::Thread { memory, .. } => memory,
-        }
-    }
-    /// None checkpoints before effects. A completed operation must always
-    /// return its result, including when a concurrent stop has been requested.
-    pub fn respond(self, value: Option<u64>) {
-        match self.target {
-            ReturnTo::<C>::Cohort(mut pending) => {
-                let mut job = pending.job.take().unwrap();
-                job.stats.service_wait += pending.began.elapsed();
-                pending.epoch.end_service(job, Ok(value));
-            }
-            #[cfg(all(test, trames_interpreter_conformance))]
-            ReturnTo::<C>::Thread { memory, reply } => {
-                let _ = reply.send(Reply {
-                    memory,
-                    value,
-                    reply: reply.clone(),
-                });
-            }
-        }
-    }
 }
 fn native_fault(
     error: trames_accel::native::Error,
@@ -550,33 +436,26 @@ impl<C: Cpu> Pool<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub fn complete(&mut self) -> Result<Done<C>, ()> {
-        loop {
-            let event = self.receive.recv().map_err(|_| ())?;
-            match self.received(event) {
-                Event::<C>::Done(done) => return Ok(*done),
-                Event::<C>::Service(request) => request.respond(None),
-                Event::<C>::EpochStopped(_)
-                | Event::<C>::VmReady
-                | Event::<C>::Idle
-                | Event::<C>::Retired => return Err(()),
-            }
+        let event = self.receive.recv().map_err(|_| ())?;
+        match self.received(event) {
+            Event::<C>::Done(done) => Ok(*done),
+            Event::<C>::EpochStopped(_)
+            | Event::<C>::VmReady
+            | Event::<C>::Idle
+            | Event::<C>::Retired => Err(()),
         }
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub fn complete_timeout(&mut self, timeout: Duration) -> Result<Option<Done<C>>, ()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.event_timeout(deadline.saturating_duration_since(Instant::now()))? {
-                Some(Event::<C>::Done(done)) => return Ok(Some(*done)),
-                Some(Event::<C>::Service(request)) => request.respond(None),
-                Some(
-                    Event::<C>::EpochStopped(_)
-                    | Event::<C>::VmReady
-                    | Event::<C>::Idle
-                    | Event::<C>::Retired,
-                ) => return Err(()),
-                None => return Ok(None),
-            }
+        match self.event_timeout(timeout)? {
+            Some(Event::<C>::Done(done)) => Ok(Some(*done)),
+            Some(
+                Event::<C>::EpochStopped(_)
+                | Event::<C>::VmReady
+                | Event::<C>::Idle
+                | Event::<C>::Retired,
+            ) => Err(()),
+            None => Ok(None),
         }
     }
 }
@@ -628,15 +507,13 @@ impl<C: Cpu> Starter<C> {
                 let mut direct_scratch = Vec::new();
                 let mut file_cache = trames_vfs::DiskReadCache::default();
                 let barrier_pending = Arc::new(AtomicBool::new(false));
-                #[cfg(all(test, trames_interpreter_conformance))] let (reply, response) = mpsc::channel();
-                #[cfg(all(test, trames_interpreter_conformance))] let mut reply = Some(reply);
                 while let Ok(command) = receive.recv() {
                     let (epoch, mut single) = match command {
                         #[cfg(all(test, trames_interpreter_conformance))]
                         Command::<C>::One(work) => (None, Some(crate::run_queue::Job::<C>::new(*work, u64::MAX, index, None))),
                         Command::<C>::Epoch(epoch) => (Some(epoch), None),
                     };
-                    loop {
+                loop {
                     let Some(mut job) = (if let Some(epoch) = &epoch { epoch.take_with_engine(index, &mut engine) } else { single.take() }) else { break };
                     let domain = job.domain.clone();
                     let work = &mut job.work;
@@ -648,7 +525,6 @@ impl<C: Cpu> Starter<C> {
                     let mut thread_exit = None;
                     let mut fatal_fault = None;
                     let mut yielded = false;
-                    let mut service = false;
                     let mut vm_checkpoint = false;
                     let mut interrupt_prepared = false;
                     let execution_guard = domain.as_ref().and_then(|domain| domain.enter(index, barrier_pending.clone()));
@@ -667,8 +543,6 @@ impl<C: Cpu> Starter<C> {
                     let mut credit = 0;
                     let mut syscalls = 0;
                     let mut syscall_time = Duration::ZERO;
-                    #[allow(unused_mut)] let mut serviced_syscalls = 0;
-                    #[allow(unused_mut)] let mut service_wait = Duration::ZERO;
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
                             if work.control.stop.load(Ordering::Acquire) {
@@ -1632,9 +1506,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                 }
                                             }
                                         }
-                                        // Legacy embeddings without original task custody.
-                                        service = true;
-                                        break SliceOutcome::Yield { instructions: 0 };
+                                        unreachable!("local VM execution requires original task custody");
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                         && snapshot.seccomp.mode() == 0
@@ -1652,48 +1524,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                     {
                                         break result;
                                     }
-                                    if crate::worker_syscalls::service_candidate(
-                                        &work.cpu, snapshot,
-                                    ) {
-                                        if epoch.is_some() {
-                                            service = true;
-                                            break SliceOutcome::Yield { instructions: 0 };
-                                        }
-                                        #[cfg(not(test))] unreachable!("single dispatch is test-only");
-                                        #[cfg(all(test, trames_interpreter_conformance))] {
-                                        let began = Instant::now();
-                                        if profile_native_overlap {
-                                            active.fetch_sub(1, Ordering::Relaxed);
-                                        }
-                                        running = false;
-                                        let request = Request::<C> {
-                                            pid: work.pid,
-                                            pc: work.cpu.pc(),
-                                            number: work.cpu.x(8) as u32,
-                                            args: std::array::from_fn(|i| work.cpu.x(i)),
-                                            target: ReturnTo::<C>::Thread {
-                                                memory: *work.memory.take().expect("worker view"),
-                                                reply: reply.take().expect("worker reply channel"),
-                                            },
-                                        };
-                                        assert!(
-                                            done.send(Event::<C>::Service(Box::new(request))).is_ok(),
-                                            "coordinator receiver"
-                                        );
-                                        // Never abandon an in-flight request on stop: it
-                                        // may already have consumed input or written bytes.
-                                        let answer = response.recv().expect("coordinator response");
-                                        work.memory = Some(Box::new(answer.memory));
-                                        reply = Some(answer.reply);
-                                        service_wait += began.elapsed();
-                                        if let Some(value) = answer.value {
-                                            work.cpu.set_x(0, value);
-                                            serviced_syscalls += 1;
-                                            continue;
-                                        }
-                                        break result;
-                                        }
-                                    }
+
                                 }
                             }
                             if let SliceOutcome::NativeCall {
@@ -1826,8 +1657,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     // Syscall, deferred native, fault and yield request a checkpoint
                     // immediately, before the coordinator receives this message.
-                    if thread_exit.is_none() && !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !service && !vm_checkpoint { work.control.stop(); }
-                    let elapsed = began.elapsed().saturating_sub(service_wait);
+                    if thread_exit.is_none() && !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !vm_checkpoint { work.control.stop(); }
+                    let elapsed = began.elapsed();
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
                         active.fetch_sub(1, Ordering::Relaxed);
@@ -1847,8 +1678,6 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     stats.instructions += instructions;
                     stats.chunks += chunks;
                     stats.syscalls += syscalls;
-                    stats.serviced_syscalls += serviced_syscalls;
-                    stats.service_wait += service_wait;
                     stats.syscall_time += syscall_time;
                     stats.assignments += 1;
                     stats.gpu.merge(gpu_stats);
@@ -1868,7 +1697,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     stats.native.merge(std::mem::take(&mut registry.metrics));
                     stats.rejected_native = rejected_native.or(stats.rejected_native);
                     if let Some(lease)=control_lease {
-                        let held=job.stop_hold().map(|held|held || service || vm_checkpoint || (!maintenance && !yielded && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && matches!(outcome,Some(SliceOutcome::Syscall{..}|SliceOutcome::NativeCall{..}|SliceOutcome::Fault(_)))));
+                        let held=job.stop_hold().map(|held|held || vm_checkpoint || (!maintenance && !yielded && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && matches!(outcome,Some(SliceOutcome::Syscall{..}|SliceOutcome::NativeCall{..}|SliceOutcome::Fault(_)))));
                         lease.finish(held);
                     }
                     if let Some(task)=job.work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()) {task.acknowledge();}
@@ -1877,11 +1706,6 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     if let Some(epoch) = &epoch {
                         if vm_checkpoint {
                             epoch.checkpoint(job, outcome.expect("VM syscall outcome"));
-                            continue;
-                        }
-                        if service {
-                            let request = Request::<C>::for_epoch(job, epoch.clone());
-                            assert!(done.send(Event::<C>::Service(Box::new(request))).is_ok(), "coordinator receiver");
                             continue;
                         }
                         if maintenance { epoch.park_maintenance(job); continue; }
@@ -1936,8 +1760,8 @@ impl<C: Cpu> Drop for Pool<C> {
                 epoch.stop();
             }
         }
-        // A stopped worker may be parked waiting for a queued service request.
-        // Return its view before joining; no request is abandoned or replayed.
+        // Parked resource jobs retain their own completion and original View.
+        // Collect the CPU actors before draining the existing native I/O pool.
         while self.workers.iter().any(|slot| {
             slot.lock()
                 .unwrap()
@@ -1945,7 +1769,6 @@ impl<C: Cpu> Drop for Pool<C> {
                 .is_some_and(|w| w.control.is_some())
         }) {
             match self.event_timeout(Duration::from_millis(10)) {
-                Ok(Some(Event::<C>::Service(request))) => request.respond(None),
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
                 Ok(Some(Event::<C>::VmReady | Event::<C>::Idle | Event::<C>::Retired)) => {}
                 Ok(None) => {
@@ -1999,9 +1822,7 @@ mod tests {
 
     use super::*;
     use std::cell::Cell;
-    use trames_memory::{
-        CpuMemory, Memory, MemoryError, NativeMemory, PageBacking, Permissions, PAGE_SIZE,
-    };
+    use trames_memory::{Memory, MemoryError, NativeMemory, PageBacking, Permissions, PAGE_SIZE};
 
     #[test]
     fn source_handler_translates_retained_sender_after_its_task_is_gone() {
@@ -2240,7 +2061,6 @@ mod tests {
             processor: 1,
             cpus: 4,
             profile: true,
-            streams: Default::default(),
 
             fd_flags: Default::default(),
             umask: Default::default(),
@@ -2251,6 +2071,40 @@ mod tests {
         }
     }
 
+    fn direct_read_work(vfs: &trames_vfs::Vfs, fd: u32) -> (Work, Memory) {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory
+            .write_array(0x1000, 0xd4000001u32.to_le_bytes())
+            .unwrap();
+        memory
+            .write_array(0x1004, 0x14000000u32.to_le_bytes())
+            .unwrap();
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        let mut snapshot = syscall_snapshot();
+        snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
+        let mut cpu = Cpu::new(0x1000, 0);
+        cpu.set_x(8, 63);
+        cpu.set_x(0, fd as u64);
+        cpu.set_x(1, 0x2000);
+        cpu.set_x(2, 8);
+        (
+            Work {
+                task: None,
+                audio: None,
+                gpu: None,
+                pid: 1,
+                cpu,
+                memory: Some(Box::new(
+                    memory.parallel_view(&mut Default::default()).unwrap(),
+                )),
+                control: Arc::new(Control::new(100)),
+                syscalls: Some(snapshot),
+            },
+            memory,
+        )
+    }
     #[test]
     fn child_waits_and_signal_restarts_share_one_slot_without_owner_requests() {
         for (number, caught, restart, adopted) in [
@@ -2363,7 +2217,7 @@ mod tests {
             let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
             if !matches!(event, Some(Event::EpochStopped(0))) {
                 epoch.stop();
-                panic!("child wait completion missing: number={number} caught={caught} restart={restart} adopted={adopted} event={}", match event {None=>"none",Some(Event::Service(_))=>"service",Some(Event::Done(_))=>"done",Some(Event::Idle)=>"idle",Some(Event::VmReady)=>"vm",Some(Event::Retired)=>"retired",Some(Event::EpochStopped(_))=>"other worker"});
+                panic!("child wait completion missing: number={number} caught={caught} restart={restart} adopted={adopted} event={}", match event {None=>"none",Some(Event::Done(_))=>"done",Some(Event::Idle)=>"idle",Some(Event::VmReady)=>"vm",Some(Event::Retired)=>"retired",Some(Event::EpochStopped(_))=>"other worker"});
             }
             let done = epoch.drain();
             let caller = done.iter().find(|d| d.pid == 1).unwrap();
@@ -3294,6 +3148,118 @@ mod tests {
             assert_eq!(state.frames, 0);
             memory.commit_parallel().unwrap();
             assert_eq!(memory.read_u64(0x2000).unwrap(), 10);
+        }
+    }
+    #[test]
+    fn host_console_releases_only_slot_and_retains_original_output_across_stop_and_fd_reuse() {
+        struct Disk(Mutex<Option<(trames_vfs::FileWork, Arc<trames_linux::FileResult>)>>);
+        impl trames_linux::FileExecutor for Disk {
+            fn submit_file(
+                &self,
+                work: trames_vfs::FileWork,
+                result: Arc<trames_linux::FileResult>,
+            ) {
+                *self.0.lock().unwrap() = Some((work, result));
+            }
+        }
+        for cancel in [false, true] {
+            let disk = Arc::new(Disk(Mutex::new(None)));
+            let bytes = trames_vfs::CapturedBytes::default();
+            let written = bytes.clone();
+            let console = Arc::new(
+                trames_vfs::ConsoleCallbacks::new(
+                    |_| Ok(Vec::new()),
+                    move |_, data| {
+                        written.append(data);
+                        Ok(data.len().min(1))
+                    },
+                    |_, events| (events, [0; 2]),
+                )
+                .host(),
+            );
+            let mut v = trames_vfs::Vfs::default();
+            v.bind_console(console);
+            let (mut source, mut memory) = direct_read_work(&v, 1);
+            source.cpu.set_x(8, 64);
+            source.cpu.set_x(2, 1);
+            drop(source.memory.take());
+            memory.write(0x2000, b"x").unwrap();
+            source.memory = Some(Box::new(
+                memory.parallel_view(&mut Default::default()).unwrap(),
+            ));
+            source.syscalls.as_mut().unwrap().direct =
+                trames_linux::DirectSyscalls::new(v.direct_descriptors())
+                    .with_membership(v.shared_files())
+                    .with_paths(v.path_queries())
+                    .with_file_executor(disk.clone());
+            let control = source.control.clone();
+            let epoch = crate::run_queue::Epoch::new(control.clone());
+            epoch.add(crate::run_queue::Job::new(source, 1, 0, None));
+            epoch.add(crate::run_queue::Job::new(
+                work(2, &[0xd4000001], 0, control),
+                1,
+                0,
+                None,
+            ));
+            let mut pool = Pool::new(1);
+            pool.ensure(0).unwrap();
+            pool.launch(0, epoch.clone()).unwrap();
+            assert!(matches!(
+                pool.event_timeout(Duration::from_secs(5)).unwrap(),
+                Some(Event::EpochStopped(0))
+            ));
+            let mut done = epoch.drain();
+            let source = done.remove(done.iter().position(|d| d.pid == 1).unwrap());
+            assert_eq!(
+                done[0].instructions, 1,
+                "the only CPU executes its peer while native bytes are queued"
+            );
+            assert_eq!(
+                source.syscalls,
+                0,
+                "x0={} outcome={:?} queued={} bytes={:?}",
+                source.cpu.x(0),
+                source.outcome,
+                disk.0.lock().unwrap().is_some(),
+                bytes
+            );
+            assert_eq!(source.serviced_syscalls, 0);
+            assert!(
+                bytes.is_empty(),
+                "native write must not execute on the CPU worker"
+            );
+            memory.commit_parallel().unwrap();
+            let pending = source
+                .io
+                .unwrap()
+                .file
+                .expect("retain original file completion");
+            v.close(1).unwrap();
+            assert_eq!(v.eventfd(99, 0).unwrap(), 1);
+            let (work, result) = disk
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("existing file executor must receive native console bytes");
+            if cancel {
+                drop(pending);
+                result.complete(work.run());
+            } else {
+                result.complete(work.run());
+                // A single result application after stop consumes no replacement FD.
+                let reply = trames_linux::DirectSyscalls::default().start_retained_file(
+                    pending,
+                    64,
+                    [1, 0x2000, 1, 0, 0, 0],
+                    &mut memory,
+                    1,
+                    &epoch.io_target,
+                );
+                assert!(matches!(reply, trames_linux::IoAttempt::Complete(Ok(1))));
+            }
+            assert_eq!(bytes.snapshot(), b"x");
+            assert_eq!(v.read(1, 8).unwrap(), 99u64.to_le_bytes());
         }
     }
     #[test]
@@ -4273,239 +4239,6 @@ mod tests {
     }
 
     #[test]
-    fn cohort_services_release_one_slot_keep_views_and_complete_after_stop_once() {
-        let control = Arc::new(Control::new(100));
-        let epoch = crate::run_queue::Epoch::new(control.clone());
-        let mut view_addresses = Vec::new();
-        for pid in 1..=2 {
-            let mut task = work(
-                pid,
-                &[0xd4000001, 0xaa0003f3, 0xd4000001, 0x14000000],
-                7,
-                control.clone(),
-            );
-            task.cpu.set_x(8, 62);
-            task.syscalls = Some(syscall_snapshot());
-            let job = crate::run_queue::Job::new(task, 1, 0, None);
-            view_addresses.push(job.work.memory.as_deref().unwrap() as *const View as usize);
-            epoch.add(job);
-        }
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        pool.launch(0, epoch.clone()).unwrap();
-        let next = |pool: &mut Pool| {
-            let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-            else {
-                panic!("one worker must submit both services without awaiting the first reply");
-            };
-            request
-        };
-        let first = next(&mut pool);
-        let second = next(&mut pool);
-        assert_eq!((first.pid, second.pid, epoch.pending_services()), (1, 2, 2));
-        for request in [&first, &second] {
-            assert_eq!(
-                request.memory() as *const View as usize,
-                view_addresses[request.pid as usize - 1]
-            );
-        }
-        second.respond(Some(0x22));
-        let again = next(&mut pool);
-        assert_eq!(
-            (again.pid, again.args[0], epoch.pending_services()),
-            (2, 0x22, 2)
-        );
-        assert_eq!(again.memory() as *const View as usize, view_addresses[1]);
-        epoch.stop();
-        first.respond(Some(0x11));
-        again.respond(Some(0x33));
-        assert!(matches!(
-            pool.event_timeout(Duration::from_secs(5)).unwrap(),
-            Some(Event::EpochStopped(0))
-        ));
-        let mut results = epoch.drain();
-        results.sort_by_key(|r| r.pid);
-        assert_eq!(
-            (
-                results[0].cpu.x(0),
-                results[1].cpu.x(0),
-                results[1].cpu.x(19)
-            ),
-            (0x11, 0x33, 0x22)
-        );
-        assert_eq!(results.iter().map(|r| r.serviced_syscalls).sum::<u64>(), 3);
-        assert_eq!(results.iter().map(|r| r.service_waits).sum::<u64>(), 3);
-        assert_eq!(results.iter().map(|r| r.instructions).sum::<u64>(), 4);
-        assert_eq!(control.remaining.load(Ordering::Relaxed), 96);
-        assert!(results
-            .iter()
-            .all(|r| matches!(r.outcome, Some(SliceOutcome::Yield { .. }))));
-    }
-    #[test]
-    fn dropped_cohort_request_wakes_idle_slot_and_returns_failure_instead_of_hanging() {
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        let control = Arc::new(Control::new(100));
-        let epoch = crate::run_queue::Epoch::new(control.clone());
-        epoch.add(crate::run_queue::Job::new(query_work(control), 1, 0, None));
-        pool.launch(0, epoch.clone()).unwrap();
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing request");
-        };
-        drop(request);
-        assert!(matches!(
-            pool.event_timeout(Duration::from_secs(5)).unwrap(),
-            Some(Event::EpochStopped(0))
-        ));
-        assert_eq!(epoch.pending_services(), 0);
-        let done = epoch.drain().pop().unwrap();
-        assert!(done.outcome.is_none());
-        assert_eq!(
-            (
-                done.instructions,
-                done.service_waits,
-                done.serviced_syscalls
-            ),
-            (1, 1, 0)
-        );
-    }
-    #[test]
-    fn cohort_service_checkpoint_returns_original_svc_without_counting_a_completion() {
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        let control = Arc::new(Control::new(100));
-        let epoch = crate::run_queue::Epoch::new(control.clone());
-        let task = query_work(control.clone());
-        let args: [u64; 6] = std::array::from_fn(|i| task.cpu.x(i));
-        epoch.add(crate::run_queue::Job::new(task, 1, 0, None));
-        pool.launch(0, epoch.clone()).unwrap();
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing request");
-        };
-        request.respond(None);
-        assert!(matches!(
-            pool.event_timeout(Duration::from_secs(5)).unwrap(),
-            Some(Event::EpochStopped(0))
-        ));
-        let done = epoch.drain().pop().unwrap();
-        assert!(matches!(
-            done.outcome,
-            Some(SliceOutcome::Syscall { instructions: 0 })
-        ));
-        assert_eq!(std::array::from_fn::<_, 6, _>(|i| done.cpu.x(i)), args);
-        assert_eq!((done.instructions, done.serviced_syscalls), (1, 0));
-        assert_eq!(control.remaining.load(Ordering::Relaxed), 99);
-    }
-
-    #[test]
-    fn cohort_native_peer_finishes_on_the_same_slot_while_service_is_unanswered() {
-        let control = Arc::new(Control::new(1000));
-        let epoch = crate::run_queue::Epoch::new(control.clone());
-        epoch.add(crate::run_queue::Job::new(
-            query_work(control.clone()),
-            1,
-            0,
-            None,
-        ));
-        let (mut peer, mut bytes) =
-            native_work(3, [0x2000, 0x72, 128], Permissions::RW, control.clone());
-        peer.pid = 2;
-        epoch.add(crate::run_queue::Job::new(peer, 1, 0, None));
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        pool.launch(0, epoch.clone()).unwrap();
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing request");
-        };
-        // No answer: this same host worker must execute the native peer and
-        // reach its cold boundary instead of blocking on a reply channel.
-        assert!(matches!(
-            pool.event_timeout(Duration::from_secs(5)).unwrap(),
-            Some(Event::EpochStopped(0))
-        ));
-        assert_eq!(epoch.pending_services(), 1);
-        request.respond(Some(0x55));
-        let mut results = epoch.drain();
-        results.sort_by_key(|r| r.pid);
-        assert_eq!(results[0].cpu.x(0), 0x55);
-        assert_eq!(results[0].serviced_syscalls, 1);
-        assert_eq!(results[1].native.worker_calls, 1);
-        assert_eq!(results.iter().map(|r| r.instructions).sum::<u64>(), 7);
-        assert_eq!(control.remaining.load(Ordering::Relaxed), 993);
-        bytes.commit_parallel().unwrap();
-        assert_eq!(bytes.read_array::<128>(0x2000).unwrap(), [0x72; 128]);
-    }
-    #[test]
-    fn pool_drop_returns_cohort_requests_without_waiting_for_a_reply_thread() {
-        let (finished, completion) = mpsc::channel();
-        thread::spawn(move || {
-            let mut pool = Pool::new(1);
-            pool.ensure(0).unwrap();
-            let control = Arc::new(Control::new(100));
-            let epoch = crate::run_queue::Epoch::new(control.clone());
-            epoch.add(crate::run_queue::Job::new(query_work(control), 1, 0, None));
-            pool.launch(0, epoch.clone()).unwrap();
-            let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-            else {
-                panic!("missing request");
-            };
-            assert!(pool.send.send(Event::Service(request)).is_ok());
-            drop(pool);
-            assert_eq!(epoch.pending_services(), 0);
-            assert_eq!(epoch.drain().len(), 1);
-            finished.send(()).unwrap();
-        });
-        completion
-            .recv_timeout(Duration::from_secs(5))
-            .expect("cohort shutdown must return requests");
-    }
-
-    fn query_work(control: Arc<Control>) -> Work {
-        let mut job = work(1, &[0xd4000001, 0x14000000], 0, control);
-        job.cpu.set_x(8, 62);
-        job.cpu.set_x(1, 0);
-        job.syscalls = Some(syscall_snapshot());
-        job
-    }
-    fn direct_read_work(vfs: &trames_vfs::Vfs, fd: u32) -> (Work, Memory) {
-        let mut memory = Memory::default();
-        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
-        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
-        memory
-            .write_array(0x1000, 0xd4000001u32.to_le_bytes())
-            .unwrap();
-        memory
-            .write_array(0x1004, 0x14000000u32.to_le_bytes())
-            .unwrap();
-        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
-        let mut snapshot = syscall_snapshot();
-        snapshot.streams = vfs.stream_descriptors();
-        snapshot.direct = trames_linux::DirectSyscalls::new(vfs.direct_descriptors());
-        let mut cpu = Cpu::new(0x1000, 0);
-        cpu.set_x(8, 63);
-        cpu.set_x(0, fd as u64);
-        cpu.set_x(1, 0x2000);
-        cpu.set_x(2, 8);
-        (
-            Work {
-                task: None,
-                audio: None,
-                gpu: None,
-                pid: 1,
-                cpu,
-                memory: Some(Box::new(
-                    memory.parallel_view(&mut Default::default()).unwrap(),
-                )),
-                control: Arc::new(Control::new(100)),
-                syscalls: Some(snapshot),
-            },
-            memory,
-        )
-    }
-    #[test]
     fn native_notification_source_can_appear_after_park_and_fd_close_without_owner_service() {
         let mut vfs = trames_vfs::Vfs::default();
         let events = vfs.native_events();
@@ -4548,7 +4281,6 @@ mod tests {
             memory.read_u64(0x2000),
             done.waits
         );
-        assert_eq!(epoch.pending_services(), 0);
         assert_eq!(memory.read_u64(0x2000).unwrap(), 1);
         assert_eq!(vfs.read(fd, 8).unwrap(), 93u64.to_le_bytes());
     }
@@ -4634,7 +4366,6 @@ mod tests {
                 assert_eq!(done.cpu.x(0), expected as u64);
                 assert_eq!(done.instructions, 6);
                 assert_eq!(done.native.checkpoint_retries, 0);
-                assert_eq!(epoch.pending_services(), 0);
                 memory.commit_parallel().unwrap();
                 if !audio && candidate == fd {
                     assert!(vfs.has_native_event_sources());
@@ -4719,96 +4450,7 @@ mod tests {
         memory.commit_parallel().unwrap();
         assert_eq!(memory.read_array::<8>(0x2000).unwrap(), [0; 8]);
     }
-    #[test]
-    fn reusable_reply_channel_handles_many_requests_and_views_without_replay() {
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        let mut job = work(
-            1,
-            &[0xd4000001, 0x17ffffff],
-            0,
-            Arc::new(Control::new(1000)),
-        );
-        job.cpu.set_x(8, 62);
-        job.syscalls = Some(syscall_snapshot());
-        pool.dispatch(0, job).unwrap();
-        for i in 0..128u64 {
-            let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-            else {
-                panic!("missing request")
-            };
-            if i != 0 {
-                assert_eq!(request.args[0], i - 1);
-            }
-            assert_eq!(
-                request.memory().read_array::<4>(0x1000).unwrap(),
-                0xd4000001u32.to_le_bytes()
-            );
-            request.respond(Some(i));
-        }
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing final request")
-        };
-        assert_eq!(request.args[0], 127);
-        request.respond(None);
-        let done = pool.complete().unwrap();
-        assert_eq!(done.serviced_syscalls, 128);
-        assert_eq!(done.instructions, 257);
-        assert!(matches!(done.outcome, Some(SliceOutcome::Syscall { .. })));
-    }
-    #[test]
-    fn dropping_an_unanswered_request_disconnects_a_reusable_reply_receiver() {
-        let mut pool = Pool::new(1);
-        pool.ensure(0).unwrap();
-        pool.dispatch(0, query_work(Arc::new(Control::new(100))))
-            .unwrap();
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing request")
-        };
-        drop(request);
-        let done = pool
-            .complete_timeout(Duration::from_secs(5))
-            .unwrap()
-            .expect("worker did not unblock");
-        assert!(done.outcome.is_none());
-    }
 
-    #[test]
-    fn native_peer_finishes_while_a_syscall_caller_is_parked_without_a_global_stop() {
-        let mut pool = Pool::new(2);
-        pool.ensure(0).unwrap();
-        pool.ensure(1).unwrap();
-        let control = Arc::new(Control::new(100_000));
-        pool.dispatch(0, query_work(control.clone())).unwrap();
-        let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("missing query request");
-        };
-        assert!(!control.stop.load(Ordering::Acquire));
-        let (mut peer, mut bytes) =
-            native_work(3, [0x2000, 0x72, 128], Permissions::RW, control.clone());
-        peer.pid = 2;
-        pool.dispatch(1, peer).unwrap();
-        let Some(Event::Done(peer)) = pool.event_timeout(Duration::from_secs(5)).unwrap() else {
-            panic!("native peer could not progress while caller waited");
-        };
-        assert_eq!(peer.pid, 2);
-        assert_eq!(peer.native.worker_calls, 1);
-        assert!(matches!(peer.outcome, Some(SliceOutcome::Syscall { .. })));
-        // Peer checkpoint arrived while this request was in flight. A completed
-        // result must still be committed, never replayed on the coordinator.
-        request.respond(Some(0x55));
-        let caller = pool.complete().unwrap();
-        assert_eq!(caller.cpu.x(0), 0x55);
-        assert_eq!(caller.instructions, 1);
-        assert_eq!(caller.serviced_syscalls, 1);
-        assert!(matches!(caller.outcome, Some(SliceOutcome::Yield { .. })));
-        bytes.commit_parallel().unwrap();
-        assert_eq!(bytes.read_array::<128>(0x2000).unwrap(), [0x72; 128]);
-        assert_eq!(control.remaining.load(Ordering::Relaxed), 100_000 - 7);
-    }
     #[test]
     fn production_native_calls_do_not_update_global_overlap_instrumentation() {
         let mut pool = Pool::with_profiling(1, false);
@@ -4826,29 +4468,6 @@ mod tests {
         assert_eq!(pool.active_native.load(Ordering::Relaxed), 0);
         bytes.commit_parallel().unwrap();
         assert_eq!(bytes.read_array::<128>(0x2000).unwrap(), [0x72; 128]);
-    }
-
-    #[test]
-    fn pool_drop_drains_a_queued_request_and_returns_its_view_before_join() {
-        let (finished, completion) = mpsc::channel();
-        thread::spawn(move || {
-            let mut pool = Pool::new(1);
-            pool.ensure(0).unwrap();
-            let active = pool.active.clone();
-            pool.dispatch(0, query_work(Arc::new(Control::new(100))))
-                .unwrap();
-            let Some(Event::Service(request)) = pool.event_timeout(Duration::from_secs(5)).unwrap()
-            else {
-                panic!("missing query request");
-            };
-            assert!(pool.send.send(Event::Service(request)).is_ok());
-            drop(pool);
-            assert_eq!(active.load(Ordering::Relaxed), 0);
-            finished.send(()).unwrap();
-        });
-        completion
-            .recv_timeout(Duration::from_secs(5))
-            .expect("pool shutdown must drain requests");
     }
 
     #[test]

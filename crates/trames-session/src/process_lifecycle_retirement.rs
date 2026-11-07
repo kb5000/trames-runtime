@@ -89,10 +89,7 @@ mod tests {
                 assert_eq!(family.status(), Some(19 << 8));
                 assert!(!k.processes.read(&2).signals.io.live());
                 while let Some(event) = k.workers.event_timeout(Duration::ZERO).unwrap() {
-                    assert!(!matches!(
-                        event,
-                        Event::VmReady | Event::Retired | Event::Service(_)
-                    ));
+                    assert!(!matches!(event, Event::VmReady | Event::Retired));
                 }
             }
         }
@@ -173,10 +170,7 @@ mod tests {
             );
             assert!(epoch.collect_lifecycle(&mut k).is_none());
             while let Some(event) = k.workers.event_timeout(Duration::ZERO).unwrap() {
-                assert!(!matches!(
-                    event,
-                    Event::VmReady | Event::Retired | Event::Service(_)
-                ));
+                assert!(!matches!(event, Event::VmReady | Event::Retired));
             }
             assert_eq!(k.vm_checkpoint_groups, 1);
         }

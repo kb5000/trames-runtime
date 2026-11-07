@@ -180,7 +180,7 @@ fn raw_worker_read_discards_unix_rights_and_releases_the_original_socket() {
 }
 
 #[test]
-fn owner_only_mixed_rights_and_shared_unix_rights_observe_one_cycle_graph() {
+fn complete_epoll_and_shared_unix_rights_observe_one_cycle_graph() {
     let mut v = Vfs::default();
     let [a, b] = v.socketpair(1, 1, 0).unwrap();
     let [c, d] = v.socketpair(1, 1, 0).unwrap();
@@ -197,7 +197,7 @@ fn owner_only_mixed_rights_and_shared_unix_rights_observe_one_cycle_graph() {
     );
     let legacy = v.epoll_create(0).unwrap();
     let factory = v.descriptor_factory();
-    assert!(factory.send_local_rights(&[legacy]).is_none());
+    assert!(factory.send_local_rights(&[legacy]).unwrap().is_ok());
     v.local_socket(a)
         .unwrap()
         .unwrap()

@@ -10,6 +10,7 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64, Errno>> {
     Some(match number {
+        20 => factory.epoll_create(a[0] as u32).map(u64::from),
         280 => crate::bpf::call(factory, a, memory),
         74 => {
             let mask = match Linux::signalfd_parameters(a, memory) {

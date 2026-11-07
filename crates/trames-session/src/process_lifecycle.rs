@@ -736,7 +736,7 @@ mod tests {
             assert!(epoch.collect_lifecycle(&mut k).is_none());
             assert_eq!(k.vm_checkpoint_groups, u64::from(!cancel));
             while let Some(event) = k.workers.event_timeout(Duration::ZERO).unwrap() {
-                assert!(!matches!(event, Event::VmReady | Event::Service(_)));
+                assert!(!matches!(event, Event::VmReady));
             }
             drop(result);
             drop(original);
@@ -810,10 +810,6 @@ mod tests {
                         Some(Event::EpochStopped(_)) => stopped += 1,
                         Some(Event::Retired) => {}
                         Some(Event::VmReady | Event::Idle) => owner_events += 1,
-                        Some(Event::Service(request)) => {
-                            owner_events += 1;
-                            request.respond(None);
-                        }
                         _ => panic!("source fork did not finish"),
                     }
                     if stopped == epoch.active_slots().count_ones() {
@@ -1067,7 +1063,7 @@ mod tests {
             assert_eq!(epoch.drain().len(), if cancel { 3 } else { 4 });
             while let Some(event) = k.workers.event_timeout(Duration::ZERO).unwrap() {
                 assert!(
-                    !matches!(event, Event::VmReady | Event::Service(_)),
+                    !matches!(event, Event::VmReady),
                     "source scope requested owner work"
                 );
             }

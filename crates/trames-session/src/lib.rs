@@ -232,6 +232,7 @@ pub struct RuntimeMetrics {
     pub worker_task_resumes: u64,
     pub worker_task_yields: u64,
     pub worker_io_waits: u64,
+    /// Retained diagnostic compatibility field; always zero after RPC retirement.
     pub worker_service_waits: u64,
     pub worker_file_syscalls: u64,
     pub worker_socket_syscalls: u64,
@@ -241,17 +242,17 @@ pub struct RuntimeMetrics {
     pub worker_fd_syscalls: u64,
     pub worker_gpu_calls: u64,
     pub worker_gpu_waits: u64,
-    /// FD services requested while peer workers retain their running views.
+    /// Retained diagnostic compatibility field; the FD/network RPC no longer exists.
     pub service_requests: u64,
     /// Host disk reads submitted during CPU epochs (not all guest reads).
     pub disk_reads: u64,
     pub peak_disk_reads: usize,
     pub disk_read_bytes: u64,
-    /// Completed in-epoch services; also included in total syscalls.
+    /// Retained diagnostic compatibility field; always zero after RPC retirement.
     pub serviced_syscalls: u64,
-    /// Summed parked caller time, excluded from worker CPU elapsed accounting.
+    /// Retained diagnostic compatibility field; always zero after RPC retirement.
     pub service_wait_time: std::time::Duration,
-    /// Peak tracking is collected with profile_syscalls; parked RPC callers
+    /// Peak tracking is collected with profile_syscalls; parked resource callers
     /// are excluded. Production avoids its shared counter updates.
     pub peak_parallel_cpus: usize,
     /// Global native-overlap instrumentation, collected with profile_syscalls.

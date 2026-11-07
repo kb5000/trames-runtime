@@ -69,6 +69,7 @@ impl FileResult {
 #[derive(Clone)]
 pub enum FileOutput {
     None,
+    Write,
     Scalar(u64),
     Vectors(Vec<(u64, usize)>),
     Stat(u64),
@@ -405,7 +406,7 @@ impl DirectSyscalls {
         }
         self.completed.set(self.completed.get() + 1);
         self.file_completed.set(self.file_completed.get() + 1);
-        let transfer = matches!(output, FileOutput::CopyOffsets { .. });
+        let transfer = matches!(output, FileOutput::CopyOffsets { .. } | FileOutput::Write);
         let result = output.apply(reply.result, memory);
         if transfer && result == Err(Errno(32)) {
             if let Some(task) = &self.task_signal {
@@ -847,7 +848,7 @@ pub(super) fn import(
                     bytes: std::mem::take(scratch),
                     offset,
                 },
-                FileOutput::None,
+                FileOutput::Write,
             ))
         }
         66 | 70 | 287 => {
@@ -868,7 +869,7 @@ pub(super) fn import(
                 } else {
                     Command::Write { bytes, offset }
                 },
-                FileOutput::None,
+                FileOutput::Write,
             ))
         }
         46 => Ok((Command::Truncate(a[1]), FileOutput::None)),

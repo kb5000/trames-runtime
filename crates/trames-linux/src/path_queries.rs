@@ -22,7 +22,7 @@ pub(super) fn call(
                 Ok(bytes.len() as u64)
             }))
         }
-        62 => q.directory_seek(a[0] as u32, a[1] as i64, a[2] as u32),
+        62 => Some(q.seek_fd(a[0] as u32, a[1] as i64, a[2] as u32)),
         27 => {
             let path = match Linux::path(memory, a[1]) {
                 Ok(path) => path,

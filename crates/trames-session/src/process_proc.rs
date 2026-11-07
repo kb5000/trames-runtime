@@ -1048,6 +1048,10 @@ mod tests {
     fn actual_proc_metadata_and_body_svcs_finish_on_workers_in_one_cohort() {
         struct Output;
         impl GuestOutput for Output {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 Ok(false)
             }

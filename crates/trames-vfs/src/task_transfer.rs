@@ -22,10 +22,7 @@ fn full_vfs_handoff_retains_queued_controls_namespaces_and_original_files() {
         .unwrap();
     let ns_identity = parent.stat_fd(namespace).unwrap();
     let epoll = parent.epoll_create(O_CLOEXEC).unwrap();
-    let control = match parent.descriptor(epoll).unwrap().open {
-        OpenHandle::Owner(control) => Arc::downgrade(&control),
-        _ => panic!("original epoll control"),
-    };
+    let control = parent.descriptor(epoll).unwrap().open.downgrade();
     let [reader, writer] = parent.pipe(O_NONBLOCK).unwrap();
     parent.epoll_ctl(epoll, 1, reader, 1, 91).unwrap();
     let [sender, receiver] = parent.socketpair(1, 1, 0).unwrap();

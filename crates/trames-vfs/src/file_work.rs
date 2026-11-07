@@ -33,6 +33,15 @@ impl FileTarget {
         Some(result)
     }
     fn waits(&self, command: &FileCommand) -> bool {
+        if self.0.open.console.get().is_some()
+            && self.0.open.flags.get() & O_NONBLOCK == 0
+            && matches!(
+                command,
+                FileCommand::Read { offset: None, .. } | FileCommand::Write { offset: None, .. }
+            )
+        {
+            return true;
+        }
         matches!(command, FileCommand::Transfer(t) if t.borrow().waits())
             || matches!(command, FileCommand::Read { .. })
                 && self
@@ -95,6 +104,12 @@ impl FileTarget {
             .map(|node| node.layout.get_or_init(Default::default).clone())
     }
     pub fn host_work_owned(&self, command: &FileCommand) -> bool {
+        if let Some(console) = self.0.open.console.get() {
+            return matches!(
+                command,
+                FileCommand::Read { offset: None, .. } | FileCommand::Write { offset: None, .. }
+            ) && console.io.host_work();
+        }
         if self
             .0
             .open
@@ -126,6 +141,12 @@ impl FileTarget {
         }
     }
     pub fn host_work(&self, operation: &FileCommand) -> bool {
+        if let Some(console) = self.0.open.console.get() {
+            return matches!(
+                operation,
+                FileCommand::Read { offset: None, .. } | FileCommand::Write { offset: None, .. }
+            ) && console.io.host_work();
+        }
         if let FileCommand::Transfer(transfer) = operation {
             return transfer.borrow().host_work();
         }
@@ -171,6 +192,13 @@ impl SharedFd {
     }
     pub fn file_target(&self) -> Option<FileTarget> {
         let open = &self.open;
+        if open
+            .console
+            .get()
+            .is_some_and(|console| console.io.host_work())
+        {
+            return Some(FileTarget(self.clone()));
+        }
         if open.control.is_some()
             || !open.proc_control() && !open.node.as_ref().is_some_and(|node| node.regular_file)
         {
@@ -281,11 +309,21 @@ impl PreparedOpen {
 }
 impl FileWork {
     pub fn waiting(&self) -> bool {
+        if self.console_wait().is_some() {
+            return !self.ready();
+        }
         self.namespace.as_ref().is_some_and(|work| work.waiting())
             || !self.proc_wait.is_empty()
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
+        if let Some((console, writing)) = self.console_wait() {
+            return console
+                .io
+                .poll(console.stream, if writing { 4 } else { 1 })
+                .0
+                != 0;
+        }
         if let Some(work) = &self.namespace {
             return work.ready();
         }
@@ -295,6 +333,23 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some((console, writing)) = self.console_wait() {
+            let subscriptions = console.io.subscribe(signal);
+            let native: Vec<_> = console
+                .io
+                .native_wait_fds(console.stream)
+                .into_iter()
+                .map(|fd| (fd, writing))
+                .collect();
+            if subscriptions.is_empty() && native.is_empty() {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(TransferWait {
+                subscriptions,
+                native,
+                deadline: None,
+            });
+        }
         if let Some(work) = &self.namespace {
             return Ok(TransferWait {
                 subscriptions: work.subscribe(signal).into_iter().collect(),
@@ -326,10 +381,27 @@ impl FileWork {
         }
     }
     pub fn transfer_native_fds(&self) -> Vec<HostFd> {
+        if let Some((console, _)) = self.console_wait() {
+            return console.io.native_wait_fds(console.stream);
+        }
         match &self.command {
             FileCommand::Transfer(t) => t.borrow().native_wait_fds(),
             _ => Vec::new(),
         }
+    }
+
+    fn console_wait(&self) -> Option<(&console::ConsoleEndpoint, bool)> {
+        let target = self.target.as_ref()?;
+        if target.0.open.flags.get() & O_NONBLOCK != 0 {
+            return None;
+        }
+        let console = target.0.open.console.get()?;
+        let writing = match self.command {
+            FileCommand::Read { offset: None, .. } => false,
+            FileCommand::Write { offset: None, .. } => true,
+            _ => return None,
+        };
+        Some((console, writing))
     }
 
     /// Owned staging only, not file size or a guest mapping quota.
@@ -578,7 +650,9 @@ impl FileWork {
         };
         match reply {
             Some((mut result, signal)) => {
-                if result.as_ref().is_err_and(|e| e.0 == 11) && self.waiting() {
+                if result.as_ref().is_err_and(|e| e.0 == 11)
+                    && (self.console_wait().is_some() || self.waiting())
+                {
                     return FileOutcome::Waiting(self);
                 }
                 if result.is_ok() {
@@ -701,6 +775,30 @@ impl FileCommand {
     /// joined call does not allocate/swap a private files_struct just to reach
     /// the same resource, and close/reuse cannot retarget an accepted call.
     fn execute_target(&self, v: &mut Vfs, target: &FileTarget) -> Result<FileValue> {
+        if let Some(console) = target.0.open.console.get() {
+            let flags = target.0.open.flags.get();
+            match self {
+                Self::Read {
+                    count,
+                    offset: None,
+                } => {
+                    if flags & O_PATH != 0 || flags & 3 == 1 {
+                        return Err(Errno(9));
+                    }
+                    return console.read(*count).map(FileValue::Bytes);
+                }
+                Self::Write {
+                    bytes,
+                    offset: None,
+                } => {
+                    if flags & O_PATH != 0 || flags & 3 == 0 {
+                        return Err(Errno(9));
+                    }
+                    return console.write(bytes).map(|n| FileValue::Count(n as u64));
+                }
+                _ => {}
+            }
+        }
         let descriptor = Descriptor {
             open: OpenHandle::Shared(target.0.open.clone()),
             cloexec: false.into(),

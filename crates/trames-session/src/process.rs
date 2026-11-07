@@ -73,8 +73,6 @@ mod file_io;
 mod scheduling;
 #[path = "process_seccomp.rs"]
 pub(crate) mod seccomp;
-#[path = "process_service.rs"]
-mod service;
 #[path = "process_vm.rs"]
 mod vm;
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -641,7 +639,7 @@ pub(crate) struct Kernel<C: Cpu> {
     disk_reads: u64,
     peak_disk_reads: usize,
     disk_read_bytes: u64,
-    service_write_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
     serviced_syscalls: u64,
     service_wait: Duration,
     parallel_memory_time: Duration,
@@ -1971,7 +1969,7 @@ impl<C: Cpu> Kernel<C> {
                     a,
                     &mut p.memory,
                     number == 68,
-                    &mut self.service_write_buffer,
+                    &mut self.write_buffer,
                 )
                 .map(Some),
             69 | 70 => p
@@ -1980,7 +1978,7 @@ impl<C: Cpu> Kernel<C> {
                     a,
                     &mut p.memory,
                     number == 70,
-                    &mut self.service_write_buffer,
+                    &mut self.write_buffer,
                 )
                 .map(Some),
             32 => {
@@ -3881,6 +3879,10 @@ impl<C: Cpu> Kernel<C> {
         if self.cpu_count < 2 || !self.parallel_candidate() {
             return Ok(false);
         }
+        let console = io.source_console();
+        for p in self.processes.values() {
+            p.linux.vfs.bind_console(console.clone());
+        }
         // Mapping/signal effects precede dispatch. Ready services may take a
         // parked CPU's own View; mapping mutation waits for every CPU to return.
         let ids: Vec<_> = self.processes.keys().collect();
@@ -4205,12 +4207,6 @@ impl<C: Cpu> Kernel<C> {
                         break;
                     }
                 }
-                Some(crate::workers::Event::<C>::Service(request)) => {
-                    self.service_requests += 1;
-                    if !self.epoch_request(request, io) {
-                        break;
-                    }
-                }
                 None => {}
             }
         }
@@ -4218,8 +4214,7 @@ impl<C: Cpu> Kernel<C> {
         let began = Instant::now();
         // Native file work owns its resources and publishes directly to its
         // accepted source. Joining CPU Views never waits for unrelated disk I/O.
-        while stopped < epoch.active_slots().count_ones() as usize || epoch.pending_services() != 0
-        {
+        while stopped < epoch.active_slots().count_ones() as usize {
             match self
                 .workers
                 .event_timeout(Duration::from_secs(1))
@@ -4232,7 +4227,6 @@ impl<C: Cpu> Kernel<C> {
                     | crate::workers::Event::<C>::Idle
                     | crate::workers::Event::<C>::Retired,
                 ) => {}
-                Some(crate::workers::Event::<C>::Service(request)) => request.respond(None),
                 None => {}
             }
         }
@@ -5235,7 +5229,7 @@ pub(super) fn run<C: Cpu>(
         disk_reads: 0,
         peak_disk_reads: 0,
         disk_read_bytes: 0,
-        service_write_buffer: Vec::new(),
+        write_buffer: Vec::new(),
         serviced_syscalls: 0,
         service_wait: Duration::ZERO,
         parallel_memory_time: Duration::ZERO,
@@ -5505,6 +5499,10 @@ mod tests {
     fn host_root_signal_uses_guest_pending_delivery_without_signalling_other_jobs() {
         struct Control(Option<u32>);
         impl GuestOutput for Control {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn root_signal(&mut self) -> Option<u32> {
                 self.0.take()
             }
@@ -5604,6 +5602,10 @@ mod tests {
     fn host_command_signal_is_scoped_to_its_process_group() {
         struct Control;
         impl GuestOutput for Control {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn host_signal(&mut self) -> Option<(u32, u32)> {
                 None
             }
@@ -5613,6 +5615,10 @@ mod tests {
         }
         struct Signal(bool);
         impl GuestOutput for Signal {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn host_signal(&mut self) -> Option<(u32, u32)> {
                 if std::mem::take(&mut self.0) {
                     Some((2, 2))
@@ -5643,6 +5649,10 @@ mod tests {
     fn host_control_publishes_partial_context_and_fd_changes_before_error() {
         struct Control(u32);
         impl GuestOutput for Control {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn control(&mut self, vfs: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
                 vfs.close(self.0).unwrap();
                 vfs.set_umask(0o077);
@@ -6179,7 +6189,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_writer_checkpoint_delivers_sigpipe_from_original_endpoint() {
+    fn retained_writer_delivers_sigpipe_from_original_endpoint_on_source() {
         let mut k = kernel();
         let mut p = process();
         let [reader, writer] = p.linux.vfs.pipe(0).unwrap();
@@ -6195,19 +6205,21 @@ mod tests {
         let [replacement, _] = p.linux.vfs.pipe(0).unwrap();
         assert_eq!(replacement, writer);
         p.linux.vfs.close(reader).unwrap();
-        // A fresh worker checkpoints EPIPE for joined signal delivery.
-        let result = trames_linux::DirectSyscalls::default().start_retained_byte(
-            call.retained_byte.clone().unwrap(),
-            64,
-            args,
-            &mut p.memory,
-            1,
-            &Arc::downgrade(&k.byte_target),
-        );
-        assert!(matches!(result, trames_linux::IoAttempt::Checkpoint));
-        p.retained_byte = call.retained_byte;
-        k.call(1, &mut p, 64, args, &mut io);
-        assert_eq!(p.cpu.x(0), error(Errno(32)));
+        // A fresh worker completes EPIPE and signals the original task once.
+        let result = trames_linux::DirectSyscalls::default()
+            .with_task_signal(p.signals.io.clone())
+            .start_retained_byte(
+                call.retained_byte.clone().unwrap(),
+                64,
+                args,
+                &mut p.memory,
+                1,
+                &Arc::downgrade(&k.byte_target),
+            );
+        assert!(matches!(
+            result,
+            trames_linux::IoAttempt::Complete(Err(Errno(32)))
+        ));
         assert_ne!(p.pending_bits() & (1 << 12), 0);
         assert!(p.retained_byte.is_none());
     }
@@ -6989,7 +7001,7 @@ mod tests {
             disk_reads: 0,
             peak_disk_reads: 0,
             disk_read_bytes: 0,
-            service_write_buffer: Vec::new(),
+            write_buffer: Vec::new(),
             serviced_syscalls: 0,
             service_wait: Duration::ZERO,
             parallel_memory_time: Duration::ZERO,
@@ -7660,7 +7672,7 @@ mod tests {
         assert_eq!(exit.code, 0);
         assert_eq!(exit.instructions, 300022);
         assert_eq!(output.stdout.len(), 16);
-        for bytes in output.stdout.chunks_exact(8) {
+        for bytes in output.stdout.snapshot().chunks_exact(8) {
             assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 50000);
         }
         assert_eq!(k.processes.read(&1).memory.read_u64(0x8000).unwrap(), 50000);
@@ -8060,6 +8072,10 @@ mod tests {
     fn pure_queries_keep_a_bounded_serial_quantum_with_blocked_peers() {
         struct Polls(usize);
         impl GuestOutput for Polls {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.0 += 1;
                 Ok(true)
@@ -8203,6 +8219,10 @@ mod tests {
     fn continuous_peers_cancel_at_control_checkpoints_and_commit_the_exact_budget() {
         struct CancelAfterTwoPolls(usize);
         impl GuestOutput for CancelAfterTwoPolls {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.0 += 1;
                 Ok(self.0 < 3)
@@ -8504,17 +8524,44 @@ mod tests {
             }
         }
         struct Output {
-            entered: Option<mpsc::Sender<()>>,
-            resume: mpsc::Receiver<()>,
+            entered: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+            resume: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
         }
         impl GuestOutput for Output {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                let entered = self.entered.clone();
+                let resume = self.resume.clone();
+                Arc::new(
+                    trames_vfs::ConsoleCallbacks::new(
+                        |_| Ok(Vec::new()),
+                        move |_, bytes| {
+                            if let Some(sender) = entered.lock().unwrap().take() {
+                                sender.send(()).unwrap();
+                                resume
+                                    .lock()
+                                    .unwrap()
+                                    .recv_timeout(Duration::from_secs(5))
+                                    .unwrap();
+                            }
+                            Ok(bytes.len())
+                        },
+                        |_, events| (events & 5, [0; 2]),
+                    )
+                    .host(),
+                )
+            }
+
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 Ok(false)
             }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
-                if let Some(entered) = self.entered.take() {
+                if let Some(entered) = self.entered.lock().unwrap().take() {
                     entered.send(()).unwrap();
-                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
                 }
                 Ok(bytes.len())
             }
@@ -8646,8 +8693,8 @@ mod tests {
                 publish.send((observed, task, release_child)).unwrap();
                 go.recv().unwrap();
                 let mut output = Output {
-                    entered: owner_busy.then_some(entered),
-                    resume: owner_resume,
+                    entered: Arc::new(std::sync::Mutex::new(owner_busy.then_some(entered))),
+                    resume: Arc::new(std::sync::Mutex::new(owner_resume)),
                 };
                 let result = k.parallel_epoch(&mut output, u64::MAX / 2, true);
                 finished
@@ -8869,13 +8916,29 @@ mod tests {
     }
     #[test]
     fn indefinite_poll_waits_keep_host_stdin_as_an_external_source() {
-        struct Input(bool);
+        struct Input(Arc<std::sync::atomic::AtomicBool>);
         impl GuestOutput for Input {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                let ready = self.0.clone();
+                Arc::new(trames_vfs::ConsoleCallbacks::new(
+                    |_| Ok(Vec::new()),
+                    |_, bytes| Ok(bytes.len()),
+                    move |stream, events| {
+                        let ready = if stream == trames_vfs::ConsoleStream::Input {
+                            u16::from(ready.load(std::sync::atomic::Ordering::Relaxed))
+                        } else {
+                            4
+                        };
+                        (events & ready, [0; 2])
+                    },
+                ))
+            }
+
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
             fn stdin_ready(&mut self) -> std::io::Result<bool> {
-                Ok(self.0)
+                Ok(self.0.load(std::sync::atomic::Ordering::Relaxed))
             }
         }
         for number in [73, 72, 22, 441] {
@@ -8899,7 +8962,7 @@ mod tests {
                     8,
                 ]
             };
-            let mut input = Input(false);
+            let mut input = Input(Arc::new(std::sync::atomic::AtomicBool::new(false)));
             k.call(1, &mut p, number, a, &mut input);
             assert!(matches!(p.state, State::Blocked(n, _) if n == number));
             assert_eq!(p.linux.vfs.live_sockets(), 0);
@@ -8910,7 +8973,7 @@ mod tests {
                 write_u64(&mut p.memory, 0x1000, u32::MAX as u64).unwrap();
                 assert!(Kernel::waits_for_host_stdin(&p));
             }
-            input.0 = true;
+            input.0.store(true, std::sync::atomic::Ordering::Relaxed);
             k.call(1, &mut p, number, a, &mut input);
             assert!(matches!(p.state, State::Ready));
             assert_eq!(p.cpu.x(0), 1);
@@ -8920,7 +8983,13 @@ mod tests {
         let mut p = process();
         let [reader, _writer] = p.linux.vfs.pipe(0).unwrap();
         write_u64(&mut p.memory, 0x1000, reader as u64 | (1u64 << 32)).unwrap();
-        k.call(1, &mut p, 73, [0x1000, 1, 0, 0, 0, 0], &mut Input(false));
+        k.call(
+            1,
+            &mut p,
+            73,
+            [0x1000, 1, 0, 0, 0, 0],
+            &mut Input(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
         assert!(matches!(p.state, State::Blocked(73, _)));
         assert!(!Kernel::waits_for_host_stdin(&p));
     }
@@ -8928,6 +8997,17 @@ mod tests {
     fn stdio_eagain_blocks_only_without_nonblocking_flag() {
         struct Pending;
         impl GuestOutput for Pending {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(
+                    trames_vfs::ConsoleCallbacks::new(
+                        |_| Err(Errno(11)),
+                        |_, _| Err(Errno(11)),
+                        |_, _| (0, [0; 2]),
+                    )
+                    .readiness(Arc::default()),
+                )
+            }
+
             fn write(&mut self, _: OutputFd, _: &[u8]) -> std::io::Result<usize> {
                 Err(std::io::ErrorKind::WouldBlock.into())
             }
@@ -9689,6 +9769,27 @@ mod boundary_tests {
     fn terminal_resize_event_is_scoped_to_the_foreground_group() {
         struct Events(Option<TerminalEvent>);
         impl GuestOutput for Events {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(
+                    trames_vfs::ConsoleCallbacks::new(
+                        |_| Err(Errno(11)),
+                        |_, bytes| Ok(bytes.len()),
+                        |stream, events| {
+                            (
+                                events
+                                    & if stream == trames_vfs::ConsoleStream::Input {
+                                        0
+                                    } else {
+                                        4
+                                    },
+                                [0; 2],
+                            )
+                        },
+                    )
+                    .readiness(Arc::default()),
+                )
+            }
+
             fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
                 Ok(b.len())
             }

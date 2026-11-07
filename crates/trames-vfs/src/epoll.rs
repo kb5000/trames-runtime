@@ -26,6 +26,7 @@ pub(super) fn validate(op: u32, events: u32, old: Option<u32>, nested: bool) -> 
 
 #[derive(Default)]
 pub(super) struct LiveEpoll {
+    pub(super) legacy: Arc<SharedCell<BTreeMap<(u32, u64), events::Watch>>>,
     watches: RwLock<Arc<Vec<DirectWatch>>>,
     pub(super) cursor: Arc<Mutex<Option<(u32, u64)>>>,
     owners: AtomicUsize,

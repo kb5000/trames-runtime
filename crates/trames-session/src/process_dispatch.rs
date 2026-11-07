@@ -199,7 +199,6 @@ impl Dispatch {
                 processor: p.last_cpu as u32,
                 cpus: self.cpus,
                 profile: self.profile,
-                streams: p.linux.vfs.stream_descriptors(),
 
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),

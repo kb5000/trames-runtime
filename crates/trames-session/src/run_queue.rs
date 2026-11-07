@@ -752,7 +752,7 @@ struct Queues<C: Cpu> {
     parked: BTreeMap<u32, Box<Job<C>>>,
     members: BTreeSet<u32>,
     running: usize,
-    services: usize,
+    completing: usize,
     finished: Vec<Done<C>>,
     retirement_notified: bool,
     initial_slots: BTreeMap<u32, usize>,
@@ -1318,7 +1318,7 @@ impl<C: Cpu> Epoch<C> {
     pub fn idle(&self) -> bool {
         let q = self.queues.lock().unwrap();
         q.running == 0
-            && q.services == 0
+            && q.completing == 0
             && q.ready.is_empty()
             && !q.domains.any_paused()
             && self.lifecycle.get().is_none_or(|lifecycle| {
@@ -1389,43 +1389,43 @@ impl<C: Cpu> Epoch<C> {
             if let Some(lifecycle) = self.lifecycle.get() {
                 let retired = q.domains.take_retired();
                 if !retired.is_empty() {
-                    q.services += 1;
+                    q.completing += 1;
                     drop(q);
                     lifecycle.retire_memory_domains(retired);
                     q = self.queues.lock().unwrap();
-                    q.services -= 1;
+                    q.completing -= 1;
                     continue;
                 }
                 if lifecycle.layouts_ready() {
-                    q.services += 1;
+                    q.completing += 1;
                     drop(q);
                     lifecycle.pump_layouts(self);
                     q = self.queues.lock().unwrap();
-                    q.services -= 1;
+                    q.completing -= 1;
                     continue;
                 }
                 if lifecycle.retirement_ready() || q.retirement_notified {
-                    q.services += 1;
+                    q.completing += 1;
                     drop(q);
                     lifecycle.retire_ready(self);
                     q = self.queues.lock().unwrap();
-                    q.services -= 1;
+                    q.completing -= 1;
                     continue;
                 }
                 if lifecycle.proc_ready() {
-                    q.services += 1;
+                    q.completing += 1;
                     drop(q);
                     lifecycle.activate_reads(self);
                     q = self.queues.lock().unwrap();
-                    q.services -= 1;
+                    q.completing -= 1;
                     continue;
                 }
                 if lifecycle.memory_ready() {
-                    q.services += 1;
+                    q.completing += 1;
                     drop(q);
                     lifecycle.reclaim(self);
                     q = self.queues.lock().unwrap();
-                    q.services -= 1;
+                    q.completing -= 1;
                     continue;
                 }
                 if let Some((checkpoint, subscriptions)) = Self::claim_checkpoint(&mut q, true) {
@@ -1553,7 +1553,7 @@ impl<C: Cpu> Epoch<C> {
                 return Some(job);
             }
             if q.running == 0
-                && q.services == 0
+                && q.completing == 0
                 && q.ready.is_empty()
                 && deadline.is_none()
                 && !q.parked.values().any(|j| j.gpu_pending.is_some())
@@ -1784,60 +1784,6 @@ impl<C: Cpu> Epoch<C> {
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
     }
-    /// Transfer an execution slot to a request before publishing it. A queued
-    /// service prevents quiescence even when every worker has run out of work.
-    pub fn start_service(&self, pid: u32) {
-        let mut q = self.queues.lock().unwrap();
-        q.running -= 1;
-        q.services += 1;
-        q.domains.start_service(pid);
-        self.notify(&mut q);
-    }
-    pub fn pending_services(&self) -> usize {
-        self.queues.lock().unwrap().services
-    }
-    /// None checkpoints before effects; Err means an abandoned/panicked request.
-    /// Completed effects must commit even when stop raced with their completion.
-    pub fn end_service(&self, mut job: Box<Job<C>>, value: Result<Option<u64>, ()>) {
-        let mut q = self.queues.lock().unwrap();
-        q.services -= 1;
-        q.domains.end_service(job.work.pid);
-        match value {
-            Ok(None)
-                if job
-                    .work
-                    .syscalls
-                    .as_ref()
-                    .is_some_and(|s| s.io_signals.lifecycle().termination().is_some()) =>
-            {
-                if q.domains.paused(job.work.pid) {
-                    q.domains.hold(job);
-                    q.domains.notify_ready();
-                } else {
-                    self.ready(&mut q, job);
-                }
-            }
-            Ok(Some(value)) => {
-                job.work.cpu.set_x(0, value);
-                job.stats.serviced_syscalls += 1;
-                job.stats.resumes += 1;
-                if q.domains.paused(job.work.pid) {
-                    q.domains.hold(job);
-                    q.domains.notify_ready();
-                } else {
-                    self.ready(&mut q, job);
-                }
-            }
-            value => {
-                let outcome = value
-                    .ok()
-                    .map(|_| SliceOutcome::Syscall { instructions: 0 });
-                q.retired.push((job, outcome));
-                self.control.stop();
-            }
-        }
-        self.notify(&mut q);
-    }
     pub fn finish(&self, done: Done<C>) {
         let mut q = self.queues.lock().unwrap();
         q.running -= 1;
@@ -1931,7 +1877,10 @@ impl<C: Cpu> Epoch<C> {
     pub fn drain(&self) -> Vec<Done<C>> {
         let mut q = self.queues.lock().unwrap();
         assert_eq!(q.running, 0);
-        assert_eq!(q.services, 0, "in-flight service still owns a View");
+        assert_eq!(
+            q.completing, 0,
+            "in-flight resource completion still owns a View"
+        );
         let mut done = std::mem::take(&mut q.finished);
         q.retirement_notified = false;
         let mut jobs: Vec<_> = q.ready.drain(..).collect();

@@ -250,6 +250,7 @@ fn io_errno(e: io::Error) -> Errno {
 impl SharedOpenDescription {
     fn pipe_description(id: u64, owner: (u32, u32), pipe: Pipe, write: bool) -> Arc<Self> {
         Arc::new(Self {
+            console: Default::default(),
             oom: None,
             network_control: None,
             mount_file: None,
@@ -913,6 +914,7 @@ impl Importer {
         fs.track_inode(&node)?;
         drop(fs);
         Ok(Arc::new(SharedOpenDescription {
+            console: Default::default(),
             oom: None,
             network_control: None,
             mount_file: None,

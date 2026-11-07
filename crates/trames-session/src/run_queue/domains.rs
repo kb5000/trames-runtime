@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! VM quiescence owns jobs, never their guest bytes. The queue mutex publishes
 //! handoff; the relaxed bit only asks a running CPU to return its current slice.
-// Jobs retain their allocation through queues, services and VM checkpoints.
+// Jobs retain their allocation through queues and VM checkpoints.
 // Moving only Box pointers also avoids copying CPUs and translation caches.
 #![allow(clippy::vec_box)]
 use super::*;
@@ -145,7 +145,6 @@ struct Entry<C: Cpu> {
     keys: BTreeSet<(u8, u64)>,
     jobs: Vec<Box<Job<C>>>,
     running: usize,
-    services: usize,
     members: usize,
     notified: bool,
     owned: bool,
@@ -218,7 +217,6 @@ impl<C: Cpu> Domains<C> {
             keys,
             jobs: Vec::new(),
             running: 0,
-            services: 0,
             members: 0,
             notified: false,
             owned: false,
@@ -240,7 +238,7 @@ impl<C: Cpu> Domains<C> {
         entry.members -= 1;
         if entry.members == 0 {
             assert_eq!(entry.running, 0);
-            assert_eq!(entry.services, 0);
+
             assert!(entry.jobs.is_empty());
             if !entry.owned {
                 self.entries.remove(&id);
@@ -257,7 +255,7 @@ impl<C: Cpu> Domains<C> {
         let entry = self.entries.get_mut(&id).unwrap();
         assert!(entry.owned && entry.domain.paused());
         assert_eq!(entry.running, 0);
-        assert_eq!(entry.services, 0);
+
         entry.members -= 1;
     }
     pub fn contains(&self, id: u64) -> bool {
@@ -269,7 +267,7 @@ impl<C: Cpu> Domains<C> {
     pub fn suspended(&self, id: u64) -> bool {
         self.entries
             .get(&id)
-            .is_some_and(|entry| entry.domain.paused() && entry.running == 0 && entry.services == 0)
+            .is_some_and(|entry| entry.domain.paused() && entry.running == 0)
     }
     pub fn memory_owned(&self, id: u64) -> bool {
         self.entries
@@ -318,14 +316,7 @@ impl<C: Cpu> Domains<C> {
     pub fn returned(&mut self, pid: u32) {
         self.entry(pid).running -= 1;
     }
-    pub fn start_service(&mut self, pid: u32) {
-        let entry = self.entry(pid);
-        entry.running -= 1;
-        entry.services += 1;
-    }
-    pub fn end_service(&mut self, pid: u32) {
-        self.entry(pid).services -= 1;
-    }
+
     pub fn hold(&mut self, job: Box<Job<C>>) {
         let entry = self.entry(job.work.pid);
         assert!(entry.domain.paused() && !entry.owned);
@@ -372,11 +363,7 @@ impl<C: Cpu> Domains<C> {
             .entries
             .iter()
             .filter_map(|(&id, entry)| {
-                (entry.domain.paused()
-                    && entry.running == 0
-                    && entry.services == 0
-                    && !entry.owned
-                    && !entry.notified)
+                (entry.domain.paused() && entry.running == 0 && !entry.owned && !entry.notified)
                     .then_some(id)
             })
             .collect();
@@ -416,7 +403,6 @@ impl<C: Cpu> Domains<C> {
                 && entry.domain.paused()
                 && !entry.owned
                 && entry.running == 0
-                && entry.services == 0
                 && entry.jobs.iter().all(|job| job.work.task.is_some()))
             .then_some(id)
         })?;
@@ -464,7 +450,7 @@ impl<C: Cpu> Domains<C> {
             seen.extend(ids.iter().copied());
             if ids.iter().any(|id| {
                 let entry = &self.entries[id];
-                !entry.domain.paused() || entry.owned || entry.running != 0 || entry.services != 0
+                !entry.domain.paused() || entry.owned || entry.running != 0
             }) {
                 continue;
             }
@@ -517,7 +503,7 @@ impl<C: Cpu> Domains<C> {
         if checkpoint.ids.insert(id) {
             // A fork made a new mm. It has no execution or service actor yet.
             assert_eq!(entry.running, 0);
-            assert_eq!(entry.services, 0);
+
             assert!(entry.jobs.is_empty());
             entry.domain.pause();
             entry.owned = true;
@@ -613,7 +599,7 @@ impl<C: Cpu> Domains<C> {
         let mut jobs = Vec::new();
         for entry in self.entries.values_mut() {
             assert_eq!(entry.running, 0);
-            assert_eq!(entry.services, 0);
+
             assert!(!entry.owned, "coordinator still owns a VM checkpoint");
             jobs.append(&mut entry.jobs);
         }
@@ -1066,59 +1052,7 @@ mod tests {
             Some(SliceOutcome::Yield { .. })
         ));
     }
-    #[test]
-    fn vm_pause_waits_for_its_own_inflight_service_and_not_an_unrelated_service() {
-        let epoch = Epoch::new(Arc::new(Control::new(10000)));
-        let mut a = memory();
-        let mut b = memory();
-        let mut registry = Default::default();
-        let view = a.parallel_view(&mut registry).unwrap();
-        let sibling = view.clone();
-        epoch.add(job(1, Box::new(view), &epoch));
-        epoch.add(job(2, Box::new(sibling), &epoch));
-        epoch.add(job(
-            3,
-            Box::new(b.parallel_view(&mut registry).unwrap()),
-            &epoch,
-        ));
-        let caller = epoch.take(0).unwrap();
-        let mut own = epoch.take(1).unwrap();
-        let foreign = epoch.take(2).unwrap();
-        epoch.start_service(2);
-        epoch.start_service(3);
-        epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 1 });
-        assert!(epoch.take_checkpoint().is_none());
-        own.work
-            .memory
-            .as_deref_mut()
-            .unwrap()
-            .write(0x1000, b"original service")
-            .unwrap();
-        epoch.end_service(own, Ok(Some(16)));
-        let mut checkpoint = epoch.take_checkpoint().unwrap();
-        assert_eq!(checkpoint.jobs.len(), 2);
-        assert_eq!(epoch.pending_services(), 1);
-        assert_eq!(
-            checkpoint
-                .jobs
-                .iter()
-                .find(|j| j.work.pid == 2)
-                .unwrap()
-                .work
-                .cpu
-                .x(0),
-            16
-        );
-        for job in &mut checkpoint.jobs {
-            drop(job.work.memory.take());
-        }
-        a.commit_parallel().unwrap();
-        assert_eq!(a.read_array::<16>(0x1000).unwrap(), *b"original service");
-        epoch.restore_checkpoint(checkpoint, false);
-        epoch.end_service(foreign, Ok(Some(7)));
-        epoch.stop();
-        assert_eq!(epoch.drain().len(), 3);
-    }
+
     #[test]
     fn paused_io_keeps_original_ofd_and_box_then_consumes_a_wake_after_layout_change() {
         let epoch = Epoch::new(Arc::new(Control::new(10000)));

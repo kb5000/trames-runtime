@@ -348,6 +348,34 @@ pub(super) enum PollOpen {
     Epoll(Arc<SharedOpenDescription>),
 }
 impl SharedFiles {
+    /// Retain the complete original OFD for an observation, including control
+    /// descriptions whose byte operations have a separate implementation.
+    pub(super) fn observation_descriptor(&self, fd: u32) -> Result<Descriptor> {
+        let slot = self
+            .0
+            .entries
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .cloned()
+            .ok_or(Errno(9))?;
+        let open = match slot.open {
+            SlotOpen::Shared(open) => OpenHandle::Shared(open),
+            SlotOpen::Owner(open, ..) => open,
+        };
+        if open
+            .borrow()
+            .pipe
+            .as_ref()
+            .is_some_and(|pipe| pipe.has_waiter())
+        {
+            return Err(Errno(9));
+        }
+        Ok(Descriptor {
+            open,
+            cloexec: slot.cloexec,
+        })
+    }
     pub(super) fn proc_descriptions(&self) -> Vec<ProcDescriptor> {
         let entries = self.0.entries.lock().unwrap();
         entries
@@ -881,6 +909,7 @@ impl Default for DescriptorTable {
 /// The version marker and populated immutable arrays can be retained cheaply.
 #[derive(Clone, Default)]
 pub(super) struct TableState {
+    pub(super) console_bound: bool,
     observed: u64,
     identity: Arc<DescriptorVersion>,
     pub(super) flags: Option<(u64, FdFlags)>,
@@ -1196,10 +1225,7 @@ mod tests {
         let epoll = v.epoll_create(O_CLOEXEC).unwrap();
         let [reader, writer] = v.pipe(O_NONBLOCK).unwrap();
         v.epoll_ctl(epoll, 1, reader, 1, 123).unwrap();
-        let control = match v.descriptor(epoll).unwrap().open {
-            OpenHandle::Owner(control) => Arc::downgrade(&control),
-            _ => panic!("complete epoll control"),
-        };
+        let control = v.descriptor(epoll).unwrap().open.downgrade();
         let files = v.shared_files();
         let reservation = files.reserve().unwrap();
         let reserved = reservation.fd;
@@ -1390,10 +1416,7 @@ mod tests {
         let mut v = Vfs::default();
         let epoll = v.epoll_create(0).unwrap();
         let open = Arc::downgrade(&v.descriptor(epoll).unwrap().open.borrow().shared);
-        let control = match v.descriptor(epoll).unwrap().open {
-            OpenHandle::Owner(control) => Arc::downgrade(&control),
-            _ => panic!("legacy control must retain its original owner projection"),
-        };
+        let control = v.descriptor(epoll).unwrap().open.downgrade();
         let mut epoch = crate::FileEpoch::default();
         let captured = epoch.capture(&v, true);
         let bytes = v.direct_descriptors();

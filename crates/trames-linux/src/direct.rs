@@ -13,6 +13,8 @@ use trames_vfs::{IoSignal, IoSubscription, IoWake};
 mod aio;
 pub(crate) mod file;
 pub use aio::{Aio, RetainedAio};
+#[cfg(test)]
+mod console_tests;
 mod ip_message;
 mod local_message;
 pub(crate) mod namespace;
@@ -340,7 +342,8 @@ impl DirectSyscalls {
         if number == 425 {
             self.paths.is_some()
         } else {
-            matches!(number, 19 | 26 | 59 | 74 | 85 | 198 | 199 | 280) && self.resources.is_some()
+            matches!(number, 19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280)
+                && self.resources.is_some()
         }
     }
     pub fn invoke_creation(
@@ -699,6 +702,9 @@ impl DirectSyscalls {
         matches!(number, 63..=66) && self.raw_ip_socket(fd).is_some()
     }
     fn supports_fd(number: u32, fd: &trames_vfs::DirectFd) -> bool {
+        if matches!(number, 63..=70) && fd.host_console() {
+            return false;
+        }
         if number == 62 {
             fd.is_kmsg() || fd.positioned_bytes()
         } else if matches!(number, 67..=70) {
@@ -840,6 +846,21 @@ impl DirectSyscalls {
             _ => unreachable!("native TCP byte call"),
         }
     }
+    /// The original task owns signal routing. A resource error is final and
+    /// never replays through a joined syscall merely to publish SIGPIPE.
+    fn pipe_signal(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        result: Result<u64, Errno>,
+    ) -> Result<u64, Errno> {
+        if result == Err(Errno(32)) && signals_pipe(number, args) {
+            if let Some(task) = &self.task_signal {
+                task.raise(13);
+            }
+        }
+        result
+    }
     fn complete_tcp(&self, result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
         self.socket_completed.set(self.socket_completed.get() + 1);
@@ -858,8 +879,7 @@ impl DirectSyscalls {
     ) -> IoAttempt {
         match self.transfer_tcp(&fd, number, args, memory) {
             Err(Errno(11)) if !fd.nonblocking() => {}
-            Err(Errno(32)) if signals_pipe(number, args) => return IoAttempt::Checkpoint,
-            result => return self.complete_tcp(result),
+            result => return self.complete_tcp(self.pipe_signal(number, args, result)),
         }
         let deadline = saved_deadline.or_else(|| {
             fd.timeouts[usize::from(matches!(number, 63 | 65))]
@@ -1215,8 +1235,13 @@ impl DirectSyscalls {
             };
             match result {
                 Err(Errno(11)) if !self.nonblocking(number, args) => {}
-                Err(Errno(32)) if signals_pipe(number, args) => return Some(IoAttempt::Checkpoint),
-                result => return Some(self.complete(number, args, result)),
+                result => {
+                    return Some(self.complete(
+                        number,
+                        args,
+                        self.pipe_signal(number, args, result),
+                    ))
+                }
             }
             if number == 116 {
                 None
@@ -1293,6 +1318,9 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         let fd = self.descriptors.byte_file(file)?;
+        if fd.host_console() {
+            return None;
+        }
         if matches!(number, 67..=70) && !fd.positioned_bytes() {
             return None;
         }
@@ -1443,14 +1471,14 @@ impl DirectSyscalls {
         match result {
             Some(Err(Errno(11)))
                 if !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
-            Some(Err(Errno(32))) if checkpoint_pipe && signals_pipe(number, args) => {
-                return if file.message().is_some() {
-                    IoAttempt::ByteCheckpoint(file)
+            Some(result) => {
+                let result = if checkpoint_pipe {
+                    self.pipe_signal(number, args, result)
                 } else {
-                    IoAttempt::Checkpoint
-                }
+                    result
+                };
+                return self.complete_byte(&file, result);
             }
-            Some(result) => return self.complete_byte(&file, result),
             None => {
                 return if file.message().is_some() || file.fd.is_pty() || file.fd.is_unix() {
                     IoAttempt::ByteCheckpoint(file)
@@ -1700,10 +1728,14 @@ impl DirectSyscalls {
                 .min();
                 IoAttempt::Blocked(pending)
             }
-            Err(Errno(32)) if checkpoint_pipe && signals_pipe(pending.number, pending.args) => {
-                IoAttempt::Checkpoint
+            result => {
+                let result = if checkpoint_pipe {
+                    self.pipe_signal(pending.number, pending.args, result)
+                } else {
+                    result
+                };
+                self.complete_pending(&pending, result, memory)
             }
-            result => self.complete_pending(&pending, result, memory),
         }
     }
     /// Legacy single-assignment entry. None means no effects and the caller must
@@ -1727,8 +1759,8 @@ impl DirectSyscalls {
             };
             return match self.transfer_fd(&file.fd, number, args, memory)? {
                 Err(Errno(11)) if !file.fd.nonblocking() => None,
-                Err(Errno(32)) if signals_pipe(number, args) => None,
                 result => {
+                    let result = self.pipe_signal(number, args, result);
                     self.complete_byte(&file, result);
                     Some(result)
                 }
@@ -1738,8 +1770,8 @@ impl DirectSyscalls {
             if let Some(fd) = self.network.get(args[0] as u32) {
                 return match self.transfer_tcp(&fd, number, args, memory) {
                     Err(Errno(11)) if !fd.nonblocking() => None,
-                    Err(Errno(32)) if signals_pipe(number, args) => None,
                     result => {
+                        let result = self.pipe_signal(number, args, result);
                         self.complete_tcp(result);
                         Some(result)
                     }
@@ -1768,8 +1800,8 @@ impl DirectSyscalls {
         }
         match self.transfer(number, args, memory)? {
             Err(Errno(11)) if !self.nonblocking(number, args) => None,
-            Err(Errno(32)) if signals_pipe(number, args) => None,
             result => {
+                let result = self.pipe_signal(number, args, result);
                 self.complete(number, args, result);
                 Some(result)
             }
@@ -2901,7 +2933,7 @@ mod tests {
         vfs.close(peer).unwrap();
         assert_eq!(
             direct.invoke(206, [fd as u64, 0x1100, 1, 0, 0, 0], &mut m),
-            None
+            Some(Err(Errno(32)))
         );
         assert_eq!(
             direct.invoke(206, [fd as u64, 0x1100, 1, 0x4000, 0, 0], &mut m),
@@ -3521,8 +3553,11 @@ mod tests {
         );
         vfs.close(read).unwrap();
         assert!(wait.signal.ready());
-        assert!(matches!(direct.resume(wait, &mut m), IoAttempt::Checkpoint));
-        assert_eq!(direct.completed(), 1);
+        assert!(matches!(
+            direct.resume(wait, &mut m),
+            IoAttempt::Complete(Err(Errno(32)))
+        ));
+        assert_eq!(direct.completed(), 2);
     }
     #[test]
     fn blocked_eventfd_writer_and_pipe_eof_resume_without_replaying_completed_transfers() {
@@ -3651,7 +3686,7 @@ mod tests {
         );
     }
     #[test]
-    fn blocking_and_sigpipe_defer_without_effects_or_retrying_completed_io() {
+    fn blocking_waits_and_sigpipe_complete_without_replaying_io() {
         let mut vfs = Vfs::default();
         let [read, write] = vfs.pipe(0).unwrap();
         let direct = DirectSyscalls::new(vfs.direct_descriptors());
@@ -3670,9 +3705,9 @@ mod tests {
         vfs.close(read).unwrap();
         assert_eq!(
             direct.invoke(64, [write as u64, 0x1000, 5, 0, 0, 0], &mut m),
-            None
+            Some(Err(Errno(32)))
         );
-        assert_eq!(direct.completed(), 1);
+        assert_eq!(direct.completed(), 2);
         vfs.set_status_flags(write, O_NONBLOCK).unwrap();
     }
     #[test]

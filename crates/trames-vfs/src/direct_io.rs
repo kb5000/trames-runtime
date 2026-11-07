@@ -230,6 +230,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Console(console::ConsoleEndpoint),
     Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
     TcpPoll(trames_net::TcpPoll),
     NetlinkPoll(std::sync::Weak<NetSocket>),
@@ -507,11 +508,18 @@ impl DirectFd {
             origin: None,
         })
     }
+    /// Poll authority remains available while potentially blocking native bytes
+    /// use the already bounded host-file executor instead of occupying a CPU.
+    pub fn host_console(&self) -> bool {
+        matches!(&self.resource,ByteResource::Console(console) if console.io.host_work())
+    }
     pub fn is_netlink(&self) -> bool {
         matches!(self.resource, ByteResource::NetlinkPoll(_))
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
-        let resource = if let Some(file) = &open.mount_file {
+        let resource = if let Some(console) = open.console.get() {
+            ByteResource::Console(console.clone())
+        } else if let Some(file) = &open.mount_file {
             ByteResource::Mounts(file.watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
@@ -545,16 +553,7 @@ impl DirectFd {
                 Some(events::SharedControl::Inotify(instance)) => {
                     ByteResource::Inotify(instance.capability())
                 }
-                Some(events::SharedControl::Epoll(live)) => {
-                    if live.owner_count() != 0 {
-                        return None;
-                    }
-                    ByteResource::Epoll(DirectEpoll {
-                        signal_reader: None,
-                        watches: None,
-                        live: live.clone(),
-                    })
-                }
+                Some(events::SharedControl::Epoll(live)) => Self::epoll_byte(live)?,
                 None if open
                     .node
                     .as_ref()
@@ -581,6 +580,34 @@ impl DirectFd {
             origin: None,
         })
     }
+    fn epoll_byte(live: &Arc<epoll::LiveEpoll>) -> Option<ByteResource> {
+        let watches = if live.owner_count() == 0 {
+            None
+        } else {
+            let mut direct = Vec::new();
+            for (&key, watch) in live.legacy.borrow().iter() {
+                if watch.open.strong_count() == 0 {
+                    continue;
+                }
+                // Unbound embedding signalfds still need a caller signal reader.
+                if matches!(&watch.open,OpenWeak::Shared(w) if w.upgrade().is_some_and(|o|matches!(o.control,Some(events::SharedControl::Signal(_)))))
+                {
+                    return None;
+                }
+                direct.push((
+                    key,
+                    watch.state.clone(),
+                    WatchResource::capture(&watch.open, None)?,
+                ));
+            }
+            (!direct.is_empty()).then(|| Arc::new(direct))
+        };
+        Some(ByteResource::Epoll(DirectEpoll {
+            signal_reader: None,
+            watches,
+            live: live.clone(),
+        }))
+    }
     pub(super) fn with_ofd(mut self, file: SharedFd) -> Self {
         self._file = Some(file);
         self
@@ -590,6 +617,9 @@ impl DirectFd {
     // validated acyclic owner graph, so this traversal cannot cycle.
     fn shares_resource(&self, other: &Self) -> bool {
         match (&self.resource, &other.resource) {
+            (ByteResource::Console(a), ByteResource::Console(b)) => {
+                a.stream == b.stream && Arc::ptr_eq(&a.io, &b.io)
+            }
             (ByteResource::TcpPoll(a), ByteResource::TcpPoll(b)) => a.shares_socket(b),
             (ByteResource::NetlinkPoll(a), ByteResource::NetlinkPoll(b)) => {
                 std::sync::Weak::ptr_eq(a, b)
@@ -623,6 +653,7 @@ impl DirectFd {
     /// Native interests of this accepted resource, not every open watch.
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
         match &self.resource {
+            ByteResource::Console(console) => console.io.native_wait_fds(console.stream),
             ByteResource::TcpPoll(tcp) => tcp.poll_event_fd().map(Into::into).into_iter().collect(),
             ByteResource::Timer(timer) => timer.native_fd().into_iter().collect(),
             #[cfg(all(feature = "hostfs", unix))]
@@ -639,6 +670,7 @@ impl DirectFd {
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
+            ByteResource::Console(console) => console.io.subscribe(signal),
             ByteResource::NetlinkPoll(socket) => socket
                 .upgrade()
                 .and_then(|s| s.subscribe(signal))
@@ -717,7 +749,9 @@ impl DirectFd {
         }
     }
     pub(super) fn snapshot(open: &OpenDescription) -> Option<Self> {
-        let resource = if let Some(file) = &open.mount_file {
+        let resource = if let Some(console) = open.console.get() {
+            ByteResource::Console(console.clone())
+        } else if let Some(file) = &open.mount_file {
             ByteResource::Mounts(file.watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
@@ -727,31 +761,8 @@ impl DirectFd {
             ByteResource::Timer(timer.clone())
         } else if let Some(events::Anonymous::Inotify(instance)) = &open.anonymous {
             ByteResource::Inotify(instance.capability())
-        } else if let Some(events::Anonymous::Epoll {
-            watches, shared, ..
-        }) = &open.anonymous
-        {
-            let mut direct = Vec::new();
-            for (&key, watch) in watches {
-                if watch.open.strong_count() != 0 {
-                    // Remaining owner signal watches belong to the unbound
-                    // embedding API. Guest signalfd watches use the live index.
-                    if matches!(&watch.open, OpenWeak::Shared(w) if w.upgrade().is_some_and(|o|matches!(o.control,Some(events::SharedControl::Signal(_)))))
-                    {
-                        return None;
-                    }
-                    direct.push((
-                        key,
-                        watch.state.clone(),
-                        WatchResource::capture(&watch.open, None)?,
-                    ));
-                }
-            }
-            ByteResource::Epoll(DirectEpoll {
-                signal_reader: None,
-                watches: (!direct.is_empty()).then(|| Arc::new(direct)),
-                live: shared.clone(),
-            })
+        } else if let Some(events::Anonymous::Epoll { shared, .. }) = &open.anonymous {
+            Self::epoll_byte(shared)?
         } else if matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
             let end = open.pipe.as_ref()?;
             ByteResource::Pipe {
@@ -820,7 +831,7 @@ impl DirectFd {
                 watches, shared, ..
             }) => {
                 let mut direct = Vec::new();
-                for (&key, watch) in watches {
+                for (&key, watch) in watches.borrow().iter() {
                     if watch.open.strong_count() != 0 {
                         if matches!(&watch.open, OpenWeak::Shared(w) if w.upgrade().is_some_and(|o|matches!(o.control,Some(events::SharedControl::Signal(_)))))
                         {
@@ -1066,6 +1077,7 @@ impl DirectFd {
     }
     pub(super) fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
+            ByteResource::Console(console) => console.io.poll(console.stream, events),
             ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
             ByteResource::NetlinkPoll(socket) => socket.upgrade().map_or((32, [0; 2]), |s| {
                 (
@@ -1290,6 +1302,7 @@ impl DirectFd {
             return Some(Err(Errno(9)));
         }
         Some(match &self.resource {
+            ByteResource::Console(console) => console.read(count),
             ByteResource::Cgroup(file, Some(caller)) => {
                 let mut position = self
                     ._file
@@ -1396,6 +1409,7 @@ impl DirectFd {
             return Err(Errno(9));
         }
         match &self.resource {
+            ByteResource::Console(console) => console.write(bytes),
             ByteResource::Cgroup(file, Some(caller)) => {
                 let mut position = self
                     ._file
@@ -1719,6 +1733,7 @@ fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
             .flat_map(|fd| fd.native_wait_fds())
             .chain(
                 watches
+                    .borrow()
                     .values()
                     .filter(|watch| watch.state.lock().unwrap().armed)
                     .filter_map(|watch| watch.open.upgrade())

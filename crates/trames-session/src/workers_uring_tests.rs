@@ -29,7 +29,6 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
         processor: 0,
         cpus: 4,
         profile: false,
-        streams: Default::default(),
 
         fd_flags: Default::default(),
         umask: Default::default(),

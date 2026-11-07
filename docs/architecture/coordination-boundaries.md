@@ -1,14 +1,24 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 63, source entropy
-and original random-device controls, reviewed on 2026-11-07.
-The prior runtime baseline is `a4c1f20115757f72c6a023b81b9b13aa791db90f`.
+This is the consolidated implementation audit through stage 64, retirement of the production
+FD/network compatibility RPC, reviewed on 2026-11-07.
+The prior runtime baseline is `0c2adca6acb919750007eb97aa686e8a06f555a8`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-07
 
-The Kernel owner still exists. Stage 63 moves getrandom into one shared source/solo
+The Kernel owner still exists. Stage 64 deletes the FD/network compatibility
+RPC as an execution category: there is no Service event, caller-View loan,
+request/reply transport, service admission classifier, owner service handler or
+in-flight service state. Original console resources, complete epoll controls and
+FD observations execute from the source; native host bytes use the existing
+bounded I/O pool. EPIPE/SIGPIPE for source byte operations completes locally.
+The former service's blocking/error cases are not redirected to whole-cohort
+fallback. Separate excluded terminal, mixed wait, tracing and native/mapping
+boundaries remain in the inventory below.
+
+Stage 63 moves getrandom into one shared source/solo
 ABI over the executor's original memory interface and host CSPRNG. Random-device
 control requests return their existing unsupported errors on the original OFD;
 FIONBIO/FIOASYNC retain their shared flag/subscription implementation. Existing
@@ -101,19 +111,16 @@ flowchart LR
     Shared --> Disk[Existing bounded native disk pool]
     Disk --> Wait
     Entry --> Scope[Affected mm or backing checkpoint]
-    Entry --> Service[Admitted in-cohort compatibility service]
     Entry --> Join[Unhandled or explicit joined task/control exit]
     Scope --> Lifecycle[Existing worker: lifecycle, proc, cold mm and backing layout]
     Lifecycle --> Entry
     Scope --> Owner[Existing Kernel owner: excluded scopes and legacy embeddings]
-    Service --> Owner
     Join --> Owner
     Owner --> Entry
 ```
 
-Only the `Join` edge requires the current cohort to return its Views. `Scope`
-quiesces its actual mm/backing dependencies; `Service` loans the caller's View
-while peer CPUs continue, unless admission rejects it before effects.
+The `Join` edge requires the current cohort to return its Views. `Scope`
+quiesces its actual mm/backing dependencies. There is no compatibility RPC edge.
 
 The Kernel owner admits and collects execution cohorts and handles the remaining
 joined scopes. Original task membership and supported structural publication are
@@ -125,8 +132,6 @@ copied inputs and original resources, and publish results directly to the source
 The relevant scopes are:
 
 - **Resource wait:** only the caller parks; other CPUs continue.
-- **In-cohort owner service:** the caller's View is loaned to the existing owner;
-  other CPUs can continue. Refusal before effects can end the cohort.
 - **Affected-domain checkpoint:** only the required mm/backing users quiesce;
   the owner publishes their structural change.
 - **Joined owner path:** the current cohort ends, its Views return, then the owner
@@ -193,7 +198,6 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Signals and mutable security/task policy | Supported signals, credentials/capabilities, affinity and seccomp installation/TSYNC/result effects are source-owned; explicit tracing and capability-less embeddings remain | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. ERRNO/unsupported TRACE/USER_NOTIF, TRAP and KILL use original source resources. Tracing retains its explicit boundary; accepted ALLOW calls can still encounter an excluded underlying resource. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. Supported BPF administration now uses original source registry/Files/hierarchy transactions; unsupported APIs keep their original errors. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
 | Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
-| Residual generic FD/network compatibility service | A direct descriptor/control admission does not handle the actual resource; generic network controls, legacy epoll creation admission, lseek/fstat or eligible stream byte paths reach `service_candidate` | In-cohort owner service where admitted. Dynamic proc, tracing/filter restrictions, unsupported kind, blocking EAGAIN, EPIPE and internal unsupported results can reject it and request a joined owner path. Ordinary shared file/socket hot paths precede this service; its existence does not show their normal calls use it. | [candidate numbers](../../crates/trames-session/src/worker_syscalls.rs), [actual admission and effects](../../crates/trames-session/src/process_service.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
 | POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination uses original source group cleanup; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
@@ -2039,3 +2043,69 @@ provider, without pretending that macOS exposes Linux getrandom/seccomp/proc.
 See [validation and timings](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/worker-entropy-20261107.json).
 Explicit tracing, legacy resources and actual host/backend events remain in the
 current consolidated inventory; this is not removal of the entire Kernel owner.
+
+
+## 64. Retirement of the FD/network compatibility RPC — 2026-11-07
+
+This batch closes an execution entry, including its dependencies and refusal
+paths. It does not count individual migrated syscall arms as subsystem closure.
+The deleted production pieces are `Event::Service`, `Request`/`ReturnTo`, the
+reply channel and source wait, `service_candidate`, `process_service.rs`,
+`Linux::network_service`, and run-queue/domain service bookkeeping. The private
+legacy additive-mmap RPC is also gone; local VM jobs require original task
+custody. Old public service counters remain zero-valued diagnostic fields for
+product compatibility. Historical transport-only tests and the transport cost
+experiment are retired with their implementation; original-resource behavior,
+retirement, parking, seccomp and close/reuse tests remain.
+
+`GuestOutput::source_console` supplies the actual Send+Sync byte resource, with
+owned buffers and existing readiness. It contains no guest pointers or mutable
+Kernel/VFS control callback. CLI native descriptors are retained at capture;
+Mac boot output and iPad queues keep their original buffers. Dup, fork and queued
+operations retain the same OFD/provider after numeric FD replacement. Captured
+and UI queues execute on the calling worker. Potentially blocking native host
+bytes reuse the existing bounded file pool and return the CPU slot. Queue epoch
+changes are monotonic; callbacks run after buffer locks are released. No new
+reader/coordinator/service thread or polling bus is created. The old standalone
+CLI stdin reader is removed. Native OS I/O accepted by the existing file pool
+still has that pool's drain semantics; this does not add cancellation of an
+already executing host syscall.
+
+`epoll_create1` publishes a complete original control through Files. The original
+legacy/nested watch graph is shared alongside the existing live index, including
+fork, SCM_RIGHTS, source close and retirement. Polling retains the existing
+admission policy: sharing lifetime alone does not admit every legacy/nested wait
+or terminal control. Complete FD metadata/lseek retain the original description,
+rather than relying on an incomplete observation projection. Native/raw TCP and
+ordinary byte EPIPE return their final errno and signal the original source task;
+MSG_NOSIGNAL retains its existing behavior. None of these effects is replayed
+through a compatibility handler.
+
+Validation covers both local runtime workflows, process regressions, both iPad
+SDK targets, 36 real HVF/interpreter cases at 1/4/12 CPUs, and 54 native ARM64
+Linux references. Real matrix cases cover raw/ALLOW policy, FD metadata/epoll,
+scalar/vector console bytes and socket controls. Every HVF case has zero service
+requests and no cohort-return syscall. These are path measurements, not a claim
+that all remaining host or resource boundaries have disappeared.
+
+Paired medians, 200 iterations per guest thread, raw policy:
+
+| Workload | 4 CPUs before → after | 12 CPUs before → after | Native ARM64 Linux, 12 threads |
+| --- | ---: | ---: | ---: |
+| FD observations and epoll create/close | 62.146 → 3.690 ms | 350.819 → 12.147 ms | 1.467 ms |
+| Same plus scalar/vector console writes | 73.318 → 19.643 ms | 410.691 → 69.180 ms | 3.212 ms |
+| Same plus UDP socket controls | 70.300 → 9.713 ms | 380.888 → 27.267 ms | 2.325 ms |
+
+Three alternating-order pairs per case use exact signed runners; headless tests
+set `TRAMES_MAC_BUNDLED=1` to prevent normal launch redirection to an adjacent
+older app bundle. Native references use the same binary in the local ARM64 Linux
+CI environment (six virtual CPUs on this Mac), with stdout on local storage;
+evidence is copied to the shared directory after timing. This is a Linux syscall
+reference, not native macOS execution of Linux epoll. Short one-core metadata
+samples varied; 20,000-iteration paired controls across all six policy/workload
+combinations changed by -2.27% to +0.61%. There is still substantial absolute
+syscall and native-console pool overhead. This is not a browser or application
+speedup claim. The stage-61 short denied-control issue remains unattributed.
+
+See [stage 64 evidence](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/fd-compatibility-closure-20261107.json)
+for hashes, initial failures, corrected test assumptions and unchanged boundaries.

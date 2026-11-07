@@ -145,8 +145,7 @@ impl OpenDescription {
         Some(Arc::downgrade(&self.shared))
     }
     pub(super) fn shareable(&self) -> bool {
-        if matches!(self.anonymous, Some(events::Anonymous::Epoll { .. }))
-            || self.anonymous.is_some() && self.control.is_none()
+        if self.anonymous.is_some() && self.control.is_none()
             || self.namespace.is_some() && self.namespace_resource.is_none()
             || self
                 .namespace_resource

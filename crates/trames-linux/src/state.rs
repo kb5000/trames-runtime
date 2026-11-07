@@ -2060,7 +2060,7 @@ mod tests {
         let mut linux = Linux::new(0x3000);
         let mut m = memory();
         let mut out = CapturedOutput {
-            stdin: b"input".to_vec(),
+            stdin: b"input".to_vec().into(),
             ..CapturedOutput::default()
         };
         linux.vfs.import_file(b"/file", b"abc".to_vec()).unwrap();
@@ -2094,7 +2094,7 @@ mod tests {
         let mut linux = Linux::new(0x3000);
         let mut m = memory();
         let mut io = CapturedOutput {
-            stdin: b"abcd".to_vec(),
+            stdin: b"abcd".to_vec().into(),
             ..CapturedOutput::default()
         };
         for (i, value) in [0x1100u64, 1, ADDRESS_LIMIT, 3].into_iter().enumerate() {
@@ -2144,23 +2144,34 @@ mod tests {
 
     #[test]
     fn partial_vectored_output_is_returned_without_retry() {
-        struct Short(usize);
+        struct Short(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl GuestOutput for Short {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                let calls = self.0.clone();
+                std::sync::Arc::new(trames_vfs::ConsoleCallbacks::new(
+                    |_| Ok(Vec::new()),
+                    move |_, _| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok(1)
+                    },
+                    |_, events| (events, [0; 2]),
+                ))
+            }
             fn write(&mut self, _: OutputFd, _: &[u8]) -> std::io::Result<usize> {
-                self.0 += 1;
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(1)
             }
         }
         let mut linux = Linux::new(0x3000);
         let mut m = memory();
-        let mut out = Short(0);
+        let mut out = Short(Default::default());
         m.write(0x1000, &0x1100u64.to_le_bytes()).unwrap();
         m.write(0x1008, &3u64.to_le_bytes()).unwrap();
         assert_eq!(
             linux.syscall(66, [1, 0x1000, 1, 0, 0, 0], &mut m, &mut out),
             Ok(1)
         );
-        assert_eq!(out.0, 1);
+        assert_eq!(out.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -91,6 +91,9 @@ pub struct HostSpawn {
 pub const HOST_RUNNING: i32 = i32::MIN;
 
 pub trait GuestOutput {
+    /// Original byte resource, shared with execution workers. Lifecycle hooks
+    /// remain on the host; console bytes never call those hooks through RPC.
+    fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo>;
     /// Read-only host accounting can run on the querying executor. Adapters
     /// retain their actual provider, not a periodically copied memory hint.
     fn host_memory_source(
@@ -147,21 +150,25 @@ pub trait GuestOutput {
 
 #[derive(Default)]
 pub struct CapturedOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub stdin: Vec<u8>,
-    input_position: usize,
+    pub stdout: trames_vfs::CapturedBytes,
+    pub stderr: trames_vfs::CapturedBytes,
+    pub stdin: trames_vfs::CapturedBytes,
 }
 impl GuestOutput for CapturedOutput {
+    fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+        std::sync::Arc::new(trames_vfs::CapturedConsole {
+            input: self.stdin.clone(),
+            output: self.stdout.clone(),
+            error: self.stderr.clone(),
+        })
+    }
     fn poll_control(&mut self, _: &trames_vfs::Vfs) -> io::Result<bool> {
         Ok(false)
     }
     fn read_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.input_position = self.input_position.min(self.stdin.len());
-        let count = bytes.len().min(self.stdin.len() - self.input_position);
-        bytes[..count]
-            .copy_from_slice(&self.stdin[self.input_position..self.input_position + count]);
-        self.input_position += count;
+        let input = self.stdin.read(bytes.len());
+        let count = input.len();
+        bytes[..count].copy_from_slice(&input);
         Ok(count)
     }
     fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize> {
@@ -169,7 +176,7 @@ impl GuestOutput for CapturedOutput {
             OutputFd::Stdout => &mut self.stdout,
             OutputFd::Stderr => &mut self.stderr,
         }
-        .extend_from_slice(bytes);
+        .append(bytes);
         Ok(bytes.len())
     }
 }
@@ -288,13 +295,30 @@ mod tests {
     #[test]
     fn partial_write_and_error_are_never_retried() {
         struct Partial {
-            calls: usize,
-            fail: bool,
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
         impl GuestOutput for Partial {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                let calls = self.calls.clone();
+                let fail = self.fail.clone();
+                std::sync::Arc::new(trames_vfs::ConsoleCallbacks::new(
+                    |_| Ok(Vec::new()),
+                    move |_, _| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if fail.load(std::sync::atomic::Ordering::Relaxed) {
+                            Err(trames_vfs::Errno(4))
+                        } else {
+                            Ok(1)
+                        }
+                    },
+                    |_, events| (events, [0; 2]),
+                ))
+            }
             fn write(&mut self, _: OutputFd, _: &[u8]) -> io::Result<usize> {
-                self.calls += 1;
-                if self.fail {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                     Err(io::ErrorKind::Interrupted.into())
                 } else {
                     Ok(1)
@@ -304,17 +328,17 @@ mod tests {
         let mut m = Memory::default();
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let mut out = Partial {
-            calls: 0,
-            fail: false,
+            calls: Default::default(),
+            fail: Default::default(),
         };
         let mut c = write_cpu(1, 0x1000, 3);
         dispatch(&mut c, &m, &mut out);
         assert_eq!(c.x(0), 1);
-        assert_eq!(out.calls, 1);
-        out.fail = true;
+        assert_eq!(out.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        out.fail.store(true, std::sync::atomic::Ordering::Relaxed);
         c = write_cpu(1, 0x1000, 3);
         dispatch(&mut c, &m, &mut out);
         assert_eq!(c.x(0), errno(4));
-        assert_eq!(out.calls, 2);
+        assert_eq!(out.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

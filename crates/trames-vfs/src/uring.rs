@@ -655,7 +655,7 @@ impl Vfs {
             match &open.anonymous {
                 Some(events::Anonymous::Uring(r)) => rings.push(r.clone()),
                 Some(events::Anonymous::Epoll { watches, .. }) => {
-                    for watch in watches.values() {
+                    for watch in watches.borrow().values() {
                         if watch.state.lock().unwrap().armed {
                             if let Some(target) = watch.open.upgrade() {
                                 visit(&target.borrow(), rings)?;

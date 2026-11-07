@@ -104,7 +104,6 @@ pub(super) struct Snapshot {
     pub processor: u32,
     pub cpus: usize,
     pub profile: bool,
-    pub streams: trames_vfs::FdMask,
     pub fd_flags: trames_vfs::FdFlags,
     pub umask: trames_vfs::Umask,
     pub actions: crate::signal_actions::Actions,
@@ -206,7 +205,6 @@ impl<C: Cpu> crate::workers::Work<C> {
         let snapshot = self.syscalls.as_mut().expect("namespace task");
         if result.is_ok() && state.changed() {
             let resources = state.resources();
-            snapshot.streams = resources.streams.clone();
             snapshot.fd_flags = resources.flags.clone();
             snapshot.umask = resources.umask.clone();
             snapshot.uts = Some(resources.uts.clone());
@@ -248,25 +246,6 @@ pub(super) fn vm_entry<C: Cpu>(cpu: &C) -> bool {
 /// ALLOW entries. Namespace/Files/parent resources keep their own actual locks.
 pub(super) fn custody_entry<C: Cpu>(cpu: &C) -> bool {
     vm_entry(cpu) || matches!(cpu.x(8) as u32, 220 | 221 | 281)
-}
-
-/// These calls can request the coordinator without stopping peer CPUs. The
-/// service still admits the actual descriptor kind before doing any effects.
-pub(super) fn network_service_candidate(number: u32) -> bool {
-    matches!(number, 57 | 198 | 200..=205 | 208..=210 | 242)
-}
-pub(super) fn service_candidate<C: Cpu>(cpu: &C, snapshot: &Snapshot) -> bool {
-    match cpu.x(8) as u32 {
-        57 => snapshot.seccomp.mode() == 0 && snapshot.direct.socket_descriptor(cpu.x(0) as u32),
-        number if snapshot.seccomp.mode() == 0 && network_service_candidate(number) => true,
-        20 => snapshot.seccomp.mode() == 0,
-        62 | 80 => true,
-        63..=66 => {
-            let fd = cpu.x(0) as u32;
-            fd < trames_vfs::MAX_FDS && snapshot.streams[fd as usize / 64] & (1 << (fd % 64)) != 0
-        }
-        _ => false,
-    }
 }
 
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -797,7 +776,6 @@ impl Snapshot {
                 .direct
                 .supports_call(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))
             && !self.direct.supports_path_query(cpu.x(8) as u32)
-            && !service_candidate(cpu, self)
             && !self.futex_queue(cpu)
             && !self.futex_wait(cpu)
             && !self.unknown_entry(cpu)
@@ -899,10 +877,9 @@ impl Snapshot {
                     )
                 })
             }
-            number @ (19 | 26 | 59 | 74 | 85 | 198 | 199 | 280) => {
-                self.direct
-                    .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?
-            }
+            number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280) => self
+                .direct
+                .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
             number if self.direct.supports_path_query(number) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
@@ -1181,7 +1158,6 @@ mod tests {
             processor: 0,
             cpus: 4,
             profile: false,
-            streams: Default::default(),
 
             fd_flags: Default::default(),
             umask: Default::default(),
@@ -1322,7 +1298,6 @@ mod tests {
             processor: 0,
             cpus: 4,
             profile: false,
-            streams: Default::default(),
 
             fd_flags: Default::default(),
             umask: Default::default(),
@@ -1390,7 +1365,6 @@ mod tests {
             processor: 0,
             cpus: 4,
             profile: false,
-            streams: vfs.stream_descriptors(),
 
             fd_flags: vfs.fd_flags_snapshot(),
             umask: vfs.umask_capability(),
@@ -1419,7 +1393,6 @@ mod tests {
         assert_eq!(vfs.flags(fd).unwrap() & trames_vfs::O_CLOEXEC, 0);
         cpu.set_x(1, 0);
         assert_eq!(snapshot.invoke(&cpu, &mut memory), None);
-        assert!(!service_candidate(&cpu, &snapshot));
         snapshot.direct = trames_linux::DirectSyscalls::default()
             .with_membership(vfs.shared_files())
             .with_resources(vfs.descriptor_factory())
@@ -1502,7 +1475,6 @@ mod tests {
             processor: 0,
             cpus: 4,
             profile: false,
-            streams: vfs.stream_descriptors(),
 
             fd_flags: vfs.fd_flags_snapshot(),
             umask: vfs.umask_capability(),
@@ -1578,7 +1550,6 @@ mod tests {
             processor: 3,
             cpus: 4,
             profile: false,
-            streams: Default::default(),
 
             fd_flags: Default::default(),
             umask: Default::default(),

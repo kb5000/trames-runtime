@@ -700,6 +700,10 @@ mod tests {
     }
     struct Stop(Arc<AtomicBool>);
     impl GuestOutput for Stop {
+        fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+            std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+        }
+
         fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
             Ok(self.0.load(Ordering::Relaxed))
         }
@@ -718,6 +722,10 @@ mod tests {
             deadline: Instant,
         }
         impl GuestOutput for Completed {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
                 Ok(!self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
                     && Instant::now() < self.deadline)
@@ -1014,6 +1022,10 @@ mod tests {
     fn persistent_checks_keep_jobs_and_translations_until_actual_cancellation() {
         struct Polls(u64);
         impl GuestOutput for Polls {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.0 += 1;
                 Ok(self.0 == 5)
@@ -1104,6 +1116,10 @@ mod tests {
             finished: bool,
         }
         impl GuestOutput for Roundtrip {
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.checks += 1;
                 if self.checks == 3 {
@@ -1221,6 +1237,27 @@ mod tests {
             deadline: Instant,
         }
         impl GuestOutput for Input {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(
+                    trames_vfs::ConsoleCallbacks::new(
+                        |_| Ok(Vec::new()),
+                        |_, bytes| Ok(bytes.len()),
+                        |stream, events| {
+                            (
+                                events
+                                    & if stream == trames_vfs::ConsoleStream::Input {
+                                        0
+                                    } else {
+                                        4
+                                    },
+                                [0; 2],
+                            )
+                        },
+                    )
+                    .readiness(Arc::default()),
+                )
+            }
+
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.checks += 1;
                 if self.checks == 3 {

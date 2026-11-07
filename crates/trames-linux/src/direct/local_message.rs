@@ -487,9 +487,8 @@ mod tests {
     fn word(m: &Memory, at: u64) -> u32 {
         u32::from_le_bytes(m.read_array(at).unwrap())
     }
-    fn owner_control(v: &mut Vfs) -> u32 {
-        // Proc controls are now shared resources; epoll still has an original
-        // owner-side watch graph and exercises the actual legacy handoff.
+    fn epoll_control(v: &mut Vfs) -> u32 {
+        // Epoll transfers the original complete graph, including legacy watches.
         v.epoll_create(0).unwrap()
     }
     fn direct(v: &Vfs) -> DirectSyscalls {
@@ -834,27 +833,25 @@ mod tests {
         assert_eq!(v.bpf_get_fd(1), Err(Errno(2)));
     }
     #[test]
-    fn mixed_owner_rights_and_output_faults_defer_or_fail_before_queue_effects() {
+    fn mixed_epoll_rights_and_output_faults_keep_source_effect_order() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
         let event = v.eventfd(1, 0).unwrap();
-        let owner_socket = owner_control(&mut v);
+        let owner_socket = epoll_control(&mut v);
         let d = direct(&v);
         let mut m = memory();
         rights(&mut m, &[event, owner_socket]);
-        assert_eq!(d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m), None);
-        assert_eq!(v.readable_bytes(rx).unwrap(), Some(0));
         assert_eq!(
-            Linux::network_vfs(&mut v, 211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
-            Ok(4)
+            d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
         );
-        header(&mut m, 24);
-        assert_eq!(d.invoke(212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m), None);
         assert_eq!(v.readable_bytes(rx).unwrap(), Some(4));
+        header(&mut m, 24);
         assert_eq!(
-            Linux::network_vfs(&mut v, 212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
-            Ok(4)
+            d.invoke(212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+            Some(Ok(4))
         );
+        assert_eq!(v.readable_bytes(rx).unwrap(), Some(0));
         rights(&mut m, &[event]);
         assert_eq!(
             d.invoke(211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
@@ -911,10 +908,10 @@ mod tests {
         assert_eq!(v.read(event, 8).unwrap(), 99u64.to_le_bytes());
     }
     #[test]
-    fn blocked_receive_and_owner_fallback_keep_original_transport_and_output_ranges() {
+    fn blocked_receive_of_epoll_right_keeps_original_transport_and_output_ranges() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        let owner_socket = owner_control(&mut v);
+        let owner_socket = epoll_control(&mut v);
         let d = direct(&v);
         let mut m = memory();
         let target: Arc<dyn IoWake> = Arc::new(Target);
@@ -936,13 +933,8 @@ mod tests {
             .unwrap()
             .send_rights(b"real", 0, v.send_rights(&[owner_socket]).unwrap())
             .unwrap();
-        let file = match d.start_retained_byte(file, 212, args, &mut m, 1, &Arc::downgrade(&target))
-        {
-            IoAttempt::ByteCheckpoint(file) => file,
-            _ => panic!("owner-only right needs retained fallback"),
-        };
         assert!(matches!(
-            d.start_owned_local_message(file, &mut v, &owner, &mut m, 1, &Arc::downgrade(&target)),
+            d.start_retained_byte(file, 212, args, &mut m, 1, &Arc::downgrade(&target)),
             IoAttempt::Complete(Ok(4))
         ));
         assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"real");
@@ -1082,37 +1074,18 @@ mod tests {
             );
             let file = wait.retained_byte.clone().unwrap();
             drop(wait);
-            let owner = v.retain_uring_fd(rx).unwrap();
             // Freeze outputs once; neither an edited iovec nor changed capacity
             // may redirect copyout after wait/owner handoff.
             m.write_array(0x1100, 0x9000u64.to_le_bytes()).unwrap();
             m.write_array(0x1460, 0u32.to_le_bytes()).unwrap();
-            let owner_socket = owner_control(&mut v);
+            let owner_socket = epoll_control(&mut v);
             v.local_socket(tx)
                 .unwrap()
                 .unwrap()
                 .send_rights(b"real", 0, v.send_rights(&[owner_socket]).unwrap())
                 .unwrap();
-            let file = match d.start_retained_byte(
-                file,
-                recv_number,
-                args,
-                &mut m,
-                1,
-                &Arc::downgrade(&target),
-            ) {
-                IoAttempt::ByteCheckpoint(file) => file,
-                _ => panic!("legacy owning graph must defer before dequeue"),
-            };
             assert!(matches!(
-                d.start_owned_local_message(
-                    file,
-                    &mut v,
-                    &owner,
-                    &mut m,
-                    1,
-                    &Arc::downgrade(&target)
-                ),
+                d.start_retained_byte(file, recv_number, args, &mut m, 1, &Arc::downgrade(&target)),
                 IoAttempt::Complete(Ok(4))
             ));
             assert_eq!(m.read_array::<4>(0x1200).unwrap(), *b"real");
@@ -1245,11 +1218,11 @@ mod tests {
         assert_eq!(v.read(tx, 8).unwrap(), 99u64.to_le_bytes());
     }
     #[test]
-    fn batch_legacy_rights_handoff_resumes_at_the_original_next_item_after_source_reuse() {
+    fn batch_epoll_rights_complete_on_source_without_replaying_any_item() {
         let (mut v, tx, rx) = datagrams();
         v.local_connect(&v.local_socket(tx).unwrap().unwrap(), b"\x01\x00/target\0")
             .unwrap();
-        let legacy = owner_control(&mut v);
+        let legacy = epoll_control(&mut v);
         let d = datagram_direct(&v);
         let mut m = memory();
         batch_headers(&mut m, 3);
@@ -1258,14 +1231,11 @@ mod tests {
         m.write_array(0x1868, 24u64.to_le_bytes()).unwrap();
         let args = [tx as u64, 0x1800, 3, 0x4000, 0, 0];
         let target: Arc<dyn IoWake> = Arc::new(Target);
-        let file = match d
-            .start(269, args, &mut m, 1, &Arc::downgrade(&target), None)
-            .unwrap()
-        {
-            IoAttempt::ByteCheckpoint(f) => f,
-            _ => panic!("second item needs original owner"),
-        };
-        let owner = file.local_owner().unwrap();
+        assert!(matches!(
+            d.start(269, args, &mut m, 1, &Arc::downgrade(&target), None)
+                .unwrap(),
+            IoAttempt::Complete(Ok(3))
+        ));
         v.close(tx).unwrap();
         assert_eq!(v.eventfd(99, 0).unwrap(), tx);
         assert_eq!(
@@ -1277,10 +1247,6 @@ mod tests {
                 .data,
             b"abcd"
         );
-        assert!(matches!(
-            d.start_owned_local_message(file, &mut v, &owner, &mut m, 1, &Arc::downgrade(&target)),
-            IoAttempt::Complete(Ok(3))
-        ));
         let second = v.local_socket(rx).unwrap().unwrap().recv(4, 0).unwrap();
         assert_eq!(second.data, b"abcd");
         let (fds, truncated) = v.receive_rights(second.rights, 1, false);

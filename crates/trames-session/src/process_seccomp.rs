@@ -2210,7 +2210,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
@@ -2443,7 +2442,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: p.linux.vfs.stream_descriptors(),
 
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
@@ -2556,7 +2554,7 @@ mod tests {
                     processor: 0,
                     cpus: 4,
                     profile: false,
-                    streams: Default::default(),
+
                     fd_flags: Default::default(),
                     umask: Default::default(),
                     actions: p.signals.actions.shared(),
@@ -2688,7 +2686,7 @@ mod tests {
                     processor: 0,
                     cpus: 4,
                     profile: false,
-                    streams: Default::default(),
+
                     fd_flags: Default::default(),
                     umask: Default::default(),
                     actions: p.signals.actions.shared(),
@@ -2809,7 +2807,6 @@ mod tests {
                     processor: 0,
                     cpus: 4,
                     profile: false,
-                    streams: Default::default(),
 
                     fd_flags: Default::default(),
                     umask: Default::default(),
@@ -2886,7 +2883,7 @@ mod tests {
         ] {
             let mut p = super::super::tests::process();
             let [shared, _] = p.linux.vfs.pipe(0).unwrap();
-            let owner = kind == 2;
+            let owner = false; // All three original OFDs are now complete shared resources.
             let fd = match kind {
                 0 => shared,
                 1 => 0,
@@ -2939,7 +2936,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: p.linux.vfs.stream_descriptors(),
 
                 fd_flags: p.linux.vfs.fd_flags_snapshot(),
                 umask: p.linux.vfs.umask_capability(),
@@ -3932,7 +3928,6 @@ mod tests {
             processor: 0,
             cpus: 4,
             profile: false,
-            streams: Default::default(),
 
             fd_flags: Default::default(),
             umask: Default::default(),
@@ -4238,7 +4233,6 @@ mod tests {
                     processor: 0,
                     cpus: 4,
                     profile: false,
-                    streams: p.linux.vfs.stream_descriptors(),
 
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),
@@ -4291,7 +4285,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
@@ -4353,7 +4346,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
@@ -4408,7 +4400,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
@@ -4473,7 +4464,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: Default::default(),
@@ -4538,7 +4528,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: Default::default(),
@@ -4605,7 +4594,6 @@ mod tests {
                 processor: 0,
                 cpus: 4,
                 profile: false,
-                streams: Default::default(),
 
                 fd_flags: Default::default(),
                 umask: p.linux.vfs.umask_capability(),
@@ -4667,7 +4655,6 @@ mod tests {
                     processor: 0,
                     cpus: 4,
                     profile: false,
-                    streams: p.linux.vfs.stream_descriptors(),
 
                     fd_flags: p.linux.vfs.fd_flags_snapshot(),
                     umask: p.linux.vfs.umask_capability(),

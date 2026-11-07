@@ -12,7 +12,7 @@ pub(super) enum Anonymous {
     Event(Arc<direct_io::EventCounter>),
     Timer(Arc<TimerFd>),
     Epoll {
-        watches: BTreeMap<(u32, u64), Watch>,
+        watches: Arc<SharedCell<BTreeMap<(u32, u64), Watch>>>,
         cursor: Arc<Mutex<Option<(u32, u64)>>>,
         shared: Arc<epoll::LiveEpoll>,
     },
@@ -75,7 +75,7 @@ impl SharedControl {
             Self::Timer(timer) => Anonymous::Timer(timer.clone()),
             Self::Inotify(instance) => Anonymous::Inotify(instance.clone()),
             Self::Epoll(shared) => Anonymous::Epoll {
-                watches: BTreeMap::new(),
+                watches: shared.legacy.clone(),
                 cursor: shared.cursor.clone(),
                 shared: shared.clone(),
             },
@@ -83,6 +83,7 @@ impl SharedControl {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Watch {
     pub(super) open: OpenWeak,
     pub(super) state: Arc<Mutex<WatchState>>,
@@ -175,7 +176,7 @@ impl Anonymous {
                 watches, shared, ..
             } => {
                 if shared.ready_with(reader)
-                    || watches.values().any(|w| {
+                    || watches.borrow().values().any(|w| {
                         let state = w.state.lock().unwrap();
                         state.armed
                             && w.open.upgrade().is_some_and(|o| {
@@ -226,9 +227,7 @@ impl Vfs {
     pub(super) fn promote_tcp_epoll_watches(&self) {
         let descriptors = self.fds.entries();
         for descriptor in descriptors.values() {
-            let open_handle::OpenView::Owner(owner) = &descriptor.open else {
-                continue;
-            };
+            let owner = descriptor.open.owned();
             if !matches!(owner.borrow().control, Some(SharedControl::Epoll(_))) {
                 continue;
             }
@@ -239,6 +238,7 @@ impl Vfs {
             else {
                 continue;
             };
+            let mut watches = watches.borrow_mut();
             let promoted: Vec<_> = watches
                 .iter()
                 .filter_map(|(&key, watch)| {
@@ -257,7 +257,9 @@ impl Vfs {
             for (key, _, _) in &promoted {
                 watches.remove(key);
             }
-            shared.promote(promoted, watches.len());
+            let count = watches.len();
+            drop(watches);
+            shared.promote(promoted, count);
             FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -344,7 +346,7 @@ impl Vfs {
         self.anonymous(
             flags,
             Anonymous::Epoll {
-                watches: BTreeMap::new(),
+                watches: shared.legacy.clone(),
                 cursor: shared.cursor.clone(),
                 shared,
             },
@@ -412,7 +414,7 @@ impl Vfs {
                         return Err(Errno(40));
                     }
                     chain.push(at.identity());
-                    for child in watches.values().filter_map(|w| w.open.upgrade()) {
+                    for child in watches.borrow().values().filter_map(|w| w.open.upgrade()) {
                         check(&child, source, target, chain)?;
                     }
                     if OpenHandle::ptr_eq(at, source) {
@@ -449,6 +451,7 @@ impl Vfs {
         else {
             return Err(Errno(22));
         };
+        let mut watches = watches.borrow_mut();
         watches.retain(|_, w| w.open.strong_count() != 0);
         shared.set_owner_count(watches.len());
         // An admitted target has one live shared registration, not an owner
@@ -462,6 +465,7 @@ impl Vfs {
             if !nested && !unbound_signal {
                 if let Some(resource) = direct_io::WatchResource::capture(&target.downgrade(), None)
                 {
+                    drop(watches);
                     return shared
                         .update(key, op, events, data, resource)
                         .map(|()| false);
@@ -552,6 +556,7 @@ impl Vfs {
         }) = &o.anonymous
         {
             let generation = watches
+                .borrow()
                 .values()
                 .filter_map(|watch| watch.open.upgrade())
                 .map(|open| Self::poll_epoch_with(&open.borrow(), reader))
@@ -572,13 +577,14 @@ impl Vfs {
         let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous else {
             return Err(Errno(22));
         };
-        Ok(watches.values().any(|watch| {
+        let ready = watches.borrow().values().any(|watch| {
             watch.state.lock().unwrap().armed
                 && watch
                     .open
                     .upgrade()
                     .is_some_and(|open| open.borrow().kind == FdKind::Stdin)
-        }))
+        });
+        Ok(ready)
     }
     /// Observe readiness without consuming edges, disarming one-shot watches,
     /// acknowledging native notifications or advancing the delivery cursor.
@@ -599,7 +605,7 @@ impl Vfs {
         if shared.ready_with(self.signal_reader.borrow().as_ref()) {
             return Ok(true);
         }
-        for watch in watches.values() {
+        for watch in watches.borrow().values() {
             let state = watch.state.lock().unwrap();
             if !state.armed {
                 continue;
@@ -647,6 +653,11 @@ impl Vfs {
         }) = e.anonymous.as_mut()
         else {
             return Err(Errno(22));
+        };
+        let mut watches = {
+            let mut entries = watches.borrow_mut();
+            entries.retain(|_, w| w.open.strong_count() != 0);
+            entries.clone()
         };
         watches.retain(|_, w| w.open.strong_count() != 0);
         shared.set_owner_count(watches.len());
@@ -865,6 +876,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
     Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                console: Default::default(),
                 oom: None,
                 network_control: None,
                 mount_file: None,

@@ -289,6 +289,20 @@ impl DescriptorFactory {
             ))),
         )
     }
+    pub fn epoll_create(&self, flags: u32) -> Result<u32> {
+        if flags & !O_CLOEXEC != 0 {
+            return Err(Errno(22));
+        }
+        let shared = Arc::new(epoll::LiveEpoll::default());
+        self.anonymous(
+            flags,
+            events::Anonymous::Epoll {
+                watches: shared.legacy.clone(),
+                cursor: shared.cursor.clone(),
+                shared,
+            },
+        )
+    }
     pub fn timerfd(&self, clock: u32, flags: u32) -> Result<u32> {
         if !matches!(clock, 0 | 1 | 7) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
@@ -342,6 +356,7 @@ impl DescriptorFactory {
             |(end, kind, access)| Descriptor {
                 open: OpenHandle::new(OpenDescription {
                     shared: Arc::new(SharedOpenDescription {
+                        console: Default::default(),
                         oom: None,
                         network_control: None,
                         mount_file: None,

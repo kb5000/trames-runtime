@@ -381,6 +381,16 @@ impl PathQueries {
         })?;
         (eligible || result.is_err()).then_some(result)
     }
+    pub fn seek_fd(&self, fd: u32, offset: i64, whence: u32) -> Result<u64> {
+        let view = self.view.borrow();
+        let descriptor = view
+            .query
+            .as_ref()
+            .unwrap()
+            .files
+            .observation_descriptor(fd)?;
+        Vfs::seek_description(&descriptor, offset, whence)
+    }
     pub fn open_at_resolve(
         &self,
         dirfd: i32,
@@ -413,13 +423,24 @@ impl PathQueries {
         self.query(|v| v.stat_at_with_mount(dirfd, path, nofollow))
     }
     pub fn stat_fd_with_mount(&self, fd: u32) -> Option<Result<([u8; 128], u64)>> {
-        self.query(|v| v.stat_fd_with_mount(fd))
+        let view = self.view.borrow();
+        Some((|| {
+            let descriptor = view
+                .query
+                .as_ref()
+                .unwrap()
+                .files
+                .observation_descriptor(fd)?;
+            let open = descriptor.open.borrow();
+            view.stat_open(&open)
+                .map(|stat| (stat, Vfs::open_mount_id(&open)))
+        })())
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<[u8; 128]>> {
         self.query(|v| v.stat_at_flags(dirfd, path, nofollow))
     }
     pub fn stat_fd(&self, fd: u32) -> Option<Result<[u8; 128]>> {
-        self.query(|v| v.stat_fd(fd))
+        self.stat_fd_with_mount(fd).map(|r| r.map(|(stat, _)| stat))
     }
     pub fn mount_id_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<u64>> {
         self.query(|v| v.mount_id_at(dirfd, path, nofollow))
