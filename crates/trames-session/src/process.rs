@@ -4861,7 +4861,7 @@ impl<C: Cpu> Kernel<C> {
             }
             if !progress {
                 let external = self.exit_memory_pending() || self.layout_work.get().is_some_and(|l| l.pending()) || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
-                    p.retained_file.is_some() || p.file_checkpoint.is_some() || p.linux.has_pending_mmap() || p.layout_wait.is_some() ||
+                    p.exec_pending.is_some() || p.retained_file.is_some() || p.file_checkpoint.is_some() || p.linux.has_pending_mmap() || p.layout_wait.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
                         || matches!(p.state, State::Gpu { .. })
@@ -5048,7 +5048,11 @@ impl<C: Cpu> Kernel<C> {
             && native_fds.is_empty()
             && (!self.proc_owner_waits.is_empty()
                 || self.processes.values().any(|p| {
-                    p.linux.vfs.has_native_event_sources()
+                    // Accepted image jobs complete through the existing disk
+                    // pool and retain this thread's unpark token. A returned
+                    // cohort may leave no runnable CPU, socket or timer.
+                    p.exec_pending.is_some()
+                        || p.linux.vfs.has_native_event_sources()
                         || p.byte_wait
                             .as_ref()
                             .is_some_and(|wait| wait.notification_external())
@@ -6295,6 +6299,39 @@ mod tests {
         assert_eq!(result.unwrap().code, 0);
         assert_eq!(k.processes.read(&1).memory.read_u64(0x1000).unwrap(), 1);
         drop(event); // The native surface retains its producer through the wait.
+    }
+
+    #[test]
+    fn joined_exec_disk_completion_is_live_without_guest_or_native_event_peers() {
+        for delay in [Duration::ZERO, Duration::from_millis(20)] {
+            let mut k = kernel();
+            let mut p = process();
+            // This task has returned from its worker cohort while its accepted
+            // ELF load is still in the disk pool. On failure, continue after
+            // exec with the exact errno, then exit normally.
+            let code: Vec<_> = [0xaa0003fcu32, 0xd2800000, 0xd2800ba8, 0xd4000001]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            p.memory.write(0x4000, &code).unwrap();
+            p.memory
+                .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                .unwrap();
+            let pending = Arc::new(exec::Pending::new(std::thread::current()));
+            p.exec_pending = Some(exec::Preparation::Disk(pending.clone()));
+            p.state = State::Blocked(221, [0x1000, 0, 0, 0, 0, 0]);
+            k.processes.insert(1, p);
+            let producer = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                pending.complete(Err(Errno(5)));
+            });
+            let result = k.drive(&mut trames_linux::CapturedOutput::default(), 1000);
+            producer.join().unwrap();
+            assert_eq!(result.unwrap().code, 0);
+            assert_eq!(k.processes.read(&1).cpu.x(28), error(Errno(5)));
+            assert!(k.processes.read(&1).exec_pending.is_none());
+            assert_eq!(k.service_requests, 0);
+        }
     }
 
     #[test]

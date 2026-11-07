@@ -2180,3 +2180,27 @@ The pre-integration per-call pathname projection regression was measured and
 removed. Old incorrect datagram/seqpacket signal results are excluded from paired
 performance claims. Native Linux, exact runners, short-run variation and full
 limitations are recorded in the linked evidence; no browser speedup is inferred.
+
+
+### Stable-release gate: returned exec image completion — 2026-11-07
+
+Real 12-CPU Docker acceptance exposed a joined idle-liveness omission after a
+cohort returned with accepted ELF loads still in the existing disk pool. The
+parent was in vfork completion, its two children had blocked execve entries and
+pending image preparations, and no runnable CPU/socket/timer remained. The idle
+predicate omitted those preparations and reported Deadlock before disk completion.
+The old stable binary passed the identical isolated input; tracing or fewer CPUs
+could hide the timing window.
+
+The idle liveness and empty-FD wait branches now retain the original exec pending
+operation as an external completion. Its existing owner-thread unpark token wakes
+the existing driver, including completion-before-park. This adds no normal syscall
+or instruction check, no new coordinator, service thread or polling bus. Source
+image preparation and affected-mm custody remain unchanged.
+
+A deterministic whole-kernel regression covers immediate and delayed disk failure
+with no guest/native event peers: exec resumes with the accepted EIO and exits
+normally. All 384 process assertions pass on Mac and ARM64 Linux (two ignored),
+both runtime workflows and strict checks pass, and the corrected real 12-CPU
+Docker binary completes all eight start/health/exec/inspect/stop/remove cycles.
+The 1.5.4 release record contains exact final package/deployment evidence.
